@@ -22,7 +22,7 @@ use crystalline_service::{DomainAccess, Engine, EnvOverlay};
 use tokio::sync::Mutex;
 
 use super::github_app::{connect, owner_id};
-use super::github_webhook::{Fx, SECRET, ask, origin_repo, setup};
+use super::github_webhook::{Delivery, Fx, SECRET, ask, deliver, origin_repo, setup};
 
 /// The ids recorded for `domain`.
 fn recorded(fx: &Fx, domain: &str) -> Option<RepositoryIds> {
@@ -61,7 +61,7 @@ async fn restart(fx: &Fx) -> Arc<Engine> {
 }
 
 const MOVED: &str =
-    "the repository moved to newco/kb on GitHub; an admin must reconnect the domain";
+    "the repository moved to newco/kb on GitHub; disconnect the domain and connect it again";
 
 fn closed_reason(eng: &Engine, domain: &str) -> Option<String> {
     eng.github_access_closed()
@@ -119,7 +119,7 @@ async fn a_reused_name_is_closed() {
     assert_eq!(
         closed_reason(&fx.eng, "kb").as_deref(),
         Some(
-            "the name acme/kb now belongs to another repository on GitHub; an admin must reconnect the domain"
+            "the name acme/kb now belongs to another repository on GitHub; disconnect the domain and connect it again"
         )
     );
 }
@@ -181,4 +181,35 @@ async fn reconnecting_records_the_new_ids_and_opens_the_domain() {
     );
     assert!(fx.eng.github_people("kb").await.is_some());
     assert!(closed_reason(&fx.eng, "kb").is_none());
+}
+
+/// A transfer webhook for a domain with no ids recorded yet records the
+/// repository's id and the old owner's, so the close outlives a restart.
+#[tokio::test]
+async fn a_transfer_webhook_records_the_old_owner_so_a_restart_stays_closed() {
+    let fx = setup(Some(SECRET)).await;
+    let dir = fx.tmp.path().join("origins").join("kb");
+    let mut state = OriginState::load(&dir).unwrap().unwrap();
+    state.repository_ids = None;
+    state.save(&dir).unwrap();
+    let id = fx.forge.id_of("acme/kb").unwrap();
+    let payload = serde_json::json!({
+        "action": "transferred",
+        "changes": {"owner": {"from": {"organization": {"login": "acme", "id": owner_id("acme")}}}},
+        "repository": {"id": id, "full_name": "newco/kb", "name": "kb", "owner": {"login": "newco"}},
+        "installation": {"id": 1},
+    });
+    fx.forge.transfer("acme/kb", "newco/kb");
+    let resp = deliver(&fx, Delivery::signed("repository", "d-transfer", &payload)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        recorded(&fx, "kb"),
+        Some(RepositoryIds {
+            repository: id,
+            owner: owner_id("acme"),
+        })
+    );
+    let eng = restart(&fx).await;
+    assert!(eng.github_people("kb").await.is_none());
+    assert_eq!(closed_reason(&eng, "kb").as_deref(), Some(MOVED));
 }

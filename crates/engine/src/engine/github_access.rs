@@ -221,6 +221,18 @@ impl GithubSource for GithubApp {
     }
 }
 
+/// What is recorded about a domain's repository, for the governor's check
+/// of who the repository is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// The ids recorded when it was connected (or on its first lookup).
+    Ids(RepositoryIds),
+    /// Nothing yet: a domain connected before the ids were recorded.
+    Nothing,
+    /// The origin state could not be read: the check fails closed.
+    Unreadable,
+}
+
 /// The App as the governor sees it.
 #[derive(Clone)]
 pub(crate) enum GovernorApp {
@@ -254,10 +266,9 @@ pub(crate) trait GovernorEnv: Send + Sync {
     /// again, so its domain is open: who reads it changed. The engine runs
     /// the Reflection rescan a visibility change runs.
     fn reopened(&self) {}
-    /// Every domain connected to `repo`, with the repository ids recorded
-    /// for it (`None` while none are). A domain with no origin state at all
-    /// is left out.
-    fn recorded_ids(&self, _repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+    /// Every domain connected to `repo`, with what is recorded for it. A
+    /// domain with no origin state at all is left out.
+    fn recorded_ids(&self, _repo: &str) -> Vec<(String, Recorded)> {
         Vec::new()
     }
     /// Record `ids` for `domain`, which had none: trust on first use, for a
@@ -1007,40 +1018,54 @@ impl GithubGovernor {
 
     /// Whether the repository GitHub answered for `repo` is not the one its
     /// domains were connected to: the reason when it is not, `None` when it
-    /// is (or nothing is recorded or answered to compare). A domain with no
-    /// recorded ids records the answered ones (trust on first use). A
+    /// is (or nothing is recorded or answered to compare). An origin state
+    /// that cannot be read fails closed. A domain with no recorded ids
+    /// records the answered ones (trust on first use). A
     /// rename within the owner (the same ids under another name) is not a
     /// difference: the engine is told, and may follow it, but only when
     /// every domain on `repo` had its ids recorded and they match.
     fn identity_differs(&self, repo: &str, snapshot: &Snapshot) -> Option<String> {
         let live = snapshot.ids?;
-        let mut all_matched = true;
+        let key = repo_key(repo);
+        let connected = self
+            .env
+            .origins()
+            .iter()
+            .filter(|(_, r)| repo_key(r) == key)
+            .count();
+        let mut matched = 0;
         for (domain, recorded) in self.env.recorded_ids(repo) {
             match recorded {
-                None => {
-                    all_matched = false;
+                Recorded::Unreadable => {
+                    return Some(format!("the origin state of {domain} cannot be read"));
+                }
+                Recorded::Nothing => {
                     tracing::info!(
                         "the repository ids of {repo} are recorded for the domain {domain} on its first lookup"
                     );
                     self.env.record_ids(&domain, live);
                 }
-                Some(recorded) if recorded.repository != live.repository => {
+                Recorded::Ids(recorded) if recorded.repository != live.repository => {
                     return Some(format!(
-                        "the name {repo} now belongs to another repository on GitHub; an admin must reconnect the domain"
+                        "the name {repo} now belongs to another repository on GitHub; disconnect the domain and connect it again"
                     ));
                 }
-                Some(recorded) if recorded.owner != live.owner => {
+                Recorded::Ids(recorded) if recorded.owner != live.owner => {
                     let to = snapshot.live_name.as_deref().unwrap_or(repo);
                     return Some(format!(
-                        "the repository moved to {to} on GitHub; an admin must reconnect the domain"
+                        "the repository moved to {to} on GitHub; disconnect the domain and connect it again"
                     ));
                 }
-                Some(_) => {}
+                Recorded::Ids(_) => matched += 1,
             }
         }
-        if all_matched
+        // Followed only when every domain on the repository had its ids
+        // recorded and they match: a domain left out (no state) or recorded
+        // just now proves nothing.
+        if connected > 0
+            && matched == connected
             && let Some(live_name) = &snapshot.live_name
-            && repo_key(live_name) != repo_key(repo)
+            && repo_key(live_name) != key
         {
             self.env.renamed(repo, live_name);
         }
@@ -1246,9 +1271,8 @@ impl GithubGovernor {
                     // A plain lookup: a good one opens the domain, another
                     // "not there" keeps it closed for five more minutes.
                     me.snapshot(source, &repo).await;
-                    let mut state = lock(&me.state);
-                    state.rechecking.remove(&repo);
-                    if !state.failing.contains_key(&repo) {
+                    lock(&me.state).rechecking.remove(&repo);
+                    if !me.closed_keys().contains(&repo) {
                         reopened = true;
                     }
                     continue;
@@ -1516,7 +1540,7 @@ impl GovernorEnv for EngineEnv {
         self.engine.upgrade()?.domain_access.get().cloned()
     }
 
-    fn recorded_ids(&self, repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+    fn recorded_ids(&self, repo: &str) -> Vec<(String, Recorded)> {
         let Some(engine) = self.engine.upgrade() else {
             return Vec::new();
         };
@@ -1526,15 +1550,22 @@ impl GovernorEnv for EngineEnv {
             .into_iter()
             .filter(|(_, connected)| repo_key(connected) == key)
             .filter_map(|(domain, _)| {
-                let dir = engine.origin_state_dir(&domain).ok()?;
+                let Ok(dir) = engine.origin_state_dir(&domain) else {
+                    return Some((domain, Recorded::Unreadable));
+                };
                 match crystalline_remote::state::OriginState::load(&dir) {
-                    Ok(Some(state)) => Some((domain, state.repository_ids)),
+                    Ok(Some(state)) => Some((
+                        domain,
+                        state
+                            .repository_ids
+                            .map_or(Recorded::Nothing, Recorded::Ids),
+                    )),
                     Ok(None) => None,
                     Err(e) => {
                         tracing::warn!(
-                            "the origin state of the domain {domain} could not be read to compare its repository ids: {e}"
+                            "the origin state of the domain {domain} could not be read to compare its repository ids, so it is closed: {e}"
                         );
-                        None
+                        Some((domain, Recorded::Unreadable))
                     }
                 }
             })
@@ -1571,10 +1602,17 @@ impl GovernorEnv for EngineEnv {
         if engine.read_only {
             return;
         }
+        let owner = |name: &str| name.split_once('/').map(|(o, _)| o.to_ascii_lowercase());
+        if owner(old).is_none() || owner(old) != owner(live) {
+            tracing::warn!(
+                "GitHub answers {old} as {live}, under another owner; that is never followed on its own"
+            );
+            return;
+        }
         let old_key = repo_key(old);
         let live = live.to_string();
         runtime.spawn(async move {
-            if let Err(e) = engine.move_origin_repo(&old_key, &live) {
+            if let Err(e) = engine.move_origin_repo(&old_key, &live, &HashSet::new()) {
                 tracing::warn!(
                     "the domains of {old_key} could not be connected to its new name {live}: {e}"
                 );
@@ -2123,14 +2161,70 @@ impl super::Engine {
             return Ok(false);
         }
         tracing::warn!(
-            "GitHub says {old} moved to {new}; a move to another owner is not followed, so its domain is closed until an admin reconnects it"
+            "GitHub says {old} moved to {new}; a move to another owner is not followed, so its domain is closed until an admin connects it again"
         );
+        self.record_transferred_from(&old, payload).await;
         governor.close_moved(
             &old,
-            format!("the repository moved to {new} on GitHub; an admin must reconnect the domain"),
+            format!("the repository moved to {new} on GitHub; disconnect the domain and connect it again"),
         );
         governor.invalidate(Invalidate::Repo(new));
         Ok(true)
+    }
+
+    /// The ids recorded in `domain`'s origin state, if any can be read.
+    fn recorded_repository_ids(&self, domain: &str) -> Option<RepositoryIds> {
+        let dir = self.origin_state_dir(domain).ok()?;
+        crystalline_remote::state::OriginState::load(&dir)
+            .ok()
+            .flatten()?
+            .repository_ids
+    }
+
+    /// A transfer away from `old`: every domain connected to it that has no
+    /// ids recorded yet records the repository's id and the OLD owner's id
+    /// (`changes.owner.from.user.id` or `.organization.id`), so the lookup
+    /// after a restart sees another owner and keeps the domain closed. This
+    /// can only narrow: ids that do not match what GitHub answers close a
+    /// domain, never open one. Under each domain's origin lock; a lock held
+    /// longer than a few seconds (a pull) leaves the write to a background
+    /// task.
+    async fn record_transferred_from(&self, old: &str, payload: &serde_json::Value) {
+        let repository = payload
+            .pointer("/repository/id")
+            .and_then(serde_json::Value::as_u64);
+        let owner = payload
+            .pointer("/changes/owner/from/user/id")
+            .or_else(|| payload.pointer("/changes/owner/from/organization/id"))
+            .and_then(serde_json::Value::as_u64);
+        let (Some(repository), Some(owner)) = (repository, owner) else {
+            return;
+        };
+        let ids = RepositoryIds { repository, owner };
+        let key = repo_key(old);
+        for (domain, repo) in self.github_origins() {
+            if repo_key(&repo) != key {
+                continue;
+            }
+            let Ok(dir) = self.origin_state_dir(&domain) else {
+                continue;
+            };
+            let lock = self.origin_lock(&domain);
+            let write = async move {
+                let _held = lock.lock().await;
+                match write_repository_ids(&dir, ids, false) {
+                    Ok(true) => tracing::info!(
+                        "the repository ids of the domain {domain} were recorded from the transfer, so it stays closed"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "the repository ids of the domain {domain} could not be recorded from the transfer: {e}"
+                    ),
+                }
+            };
+            let task = tokio::spawn(write);
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        }
     }
 
     /// A repository was renamed from `old` to `new` (what the payload says).
@@ -2175,8 +2269,29 @@ impl super::Engine {
                 );
             }
             Some(live) => {
-                let moved = self.move_origin_repo(&old_key, &live)?;
-                for domain in connected.iter().filter(|d| !moved.contains(d)) {
+                // A domain whose recorded repository is another one (its
+                // name was reused before) is not this repository's.
+                let confirmed_id = payload
+                    .pointer("/repository/id")
+                    .and_then(serde_json::Value::as_u64);
+                let skip: HashSet<String> = connected
+                    .iter()
+                    .filter(|domain| {
+                        self.recorded_repository_ids(domain)
+                            .is_some_and(|ids| Some(ids.repository) != confirmed_id)
+                    })
+                    .cloned()
+                    .collect();
+                for domain in &skip {
+                    tracing::warn!(
+                        "GitHub says {old} is now {live}, but the domain {domain} was connected to another repository of that name, so it keeps its origin"
+                    );
+                }
+                let moved = self.move_origin_repo(&old_key, &live, &skip)?;
+                for domain in connected
+                    .iter()
+                    .filter(|d| !moved.contains(d) && !skip.contains(*d))
+                {
                     tracing::warn!(
                         "GitHub says {old} is now {live}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
                     );
@@ -2227,12 +2342,20 @@ impl super::Engine {
     /// repository `old_key` (lowercased) to `new`, in one write under the
     /// configuration lock, and then records the new name in each domain's
     /// origin state. Answers the domains moved.
-    fn move_origin_repo(&self, old_key: &str, new: &str) -> super::Result<Vec<String>> {
+    fn move_origin_repo(
+        &self,
+        old_key: &str,
+        new: &str,
+        skip: &HashSet<String>,
+    ) -> super::Result<Vec<String>> {
         let moved = {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
             let mut moved = Vec::new();
             for (name, entry) in file.domains.iter_mut() {
+                if skip.contains(name) {
+                    continue;
+                }
                 if let Some(origin) = entry.origin.as_mut()
                     && repo_key(&origin.repo) == old_key
                 {
@@ -2607,6 +2730,10 @@ mod tests {
         reopened: AtomicUsize,
         /// The ids recorded for each domain.
         recorded: Mutex<HashMap<String, RepositoryIds>>,
+        /// Domains `recorded_ids` leaves out (no origin state).
+        left_out: Mutex<HashSet<String>>,
+        /// Domains whose origin state cannot be read.
+        unreadable: Mutex<HashSet<String>>,
         /// Every rename the governor reported: (old, live).
         renames: Mutex<Vec<(String, String)>>,
     }
@@ -2624,12 +2751,25 @@ mod tests {
         fn reopened(&self) {
             self.reopened.fetch_add(1, Ordering::SeqCst);
         }
-        fn recorded_ids(&self, repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+        fn recorded_ids(&self, repo: &str) -> Vec<(String, Recorded)> {
             let recorded = lock(&self.recorded);
+            let left_out = lock(&self.left_out);
+            let unreadable = lock(&self.unreadable);
             lock(&self.origins)
                 .iter()
                 .filter(|(_, r)| repo_key(r) == repo_key(repo))
-                .map(|(domain, _)| (domain.clone(), recorded.get(domain).copied()))
+                .filter(|(domain, _)| !left_out.contains(domain))
+                .map(|(domain, _)| {
+                    let what = if unreadable.contains(domain) {
+                        Recorded::Unreadable
+                    } else {
+                        recorded
+                            .get(domain)
+                            .copied()
+                            .map_or(Recorded::Nothing, Recorded::Ids)
+                    };
+                    (domain.clone(), what)
+                })
                 .collect()
         }
         fn record_ids(&self, domain: &str, ids: RepositoryIds) {
@@ -2680,6 +2820,8 @@ mod tests {
             access: Some(Arc::new(DomainAccess::new(auth.clone()))),
             reopened: AtomicUsize::new(0),
             recorded: Mutex::new(HashMap::new()),
+            left_out: Mutex::new(HashSet::new()),
+            unreadable: Mutex::new(HashSet::new()),
             renames: Mutex::new(Vec::new()),
         });
         let governor = GithubGovernor::new(env.clone());
@@ -2901,7 +3043,7 @@ mod tests {
         assert!(rig.governor.closed_domains().contains(DOMAIN));
         assert_eq!(
             rig.governor.closed()[0].reason,
-            "the repository moved to other/handbook on GitHub; an admin must reconnect the domain"
+            "the repository moved to other/handbook on GitHub; disconnect the domain and connect it again"
         );
         // Asked again later, it is decided again, and the same.
         tokio::time::advance(FRESH_FOR).await;
@@ -2927,7 +3069,7 @@ mod tests {
         assert_eq!(
             rig.governor.closed()[0].reason,
             format!(
-                "the name {REPO} now belongs to another repository on GitHub; an admin must reconnect the domain"
+                "the name {REPO} now belongs to another repository on GitHub; disconnect the domain and connect it again"
             )
         );
     }
@@ -2946,6 +3088,32 @@ mod tests {
         assert_eq!(
             *lock(&rig.env.renames),
             vec![(REPO.to_string(), "acme/guide".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_domain_left_out_of_the_records_stops_a_rename() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.left_out).insert(DOMAIN.to_string());
+        rig.github.with(REPO, |r| {
+            r.ids = Some(IDS);
+            r.full_name = Some("other/handbook".to_string());
+        });
+        rig.knowledge("alice").await;
+        assert!(lock(&rig.env.renames).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_origin_state_closes_the_domain() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.unreadable).insert(DOMAIN.to_string());
+        rig.github.with(REPO, |r| r.ids = Some(IDS));
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(
+            rig.governor.closed()[0].reason,
+            format!("the origin state of {DOMAIN} cannot be read")
         );
     }
 
@@ -3027,8 +3195,7 @@ mod tests {
         let rig = rig().await;
         rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
         rig.knowledge("alice").await;
-        let reason =
-            "the repository moved to other/handbook on GitHub; an admin must reconnect the domain";
+        let reason = "the repository moved to other/handbook on GitHub; disconnect the domain and connect it again";
         rig.governor.close_moved(REPO, reason.into());
         assert!(rig.governor.closed_domains().contains(DOMAIN));
         assert_eq!(rig.governor.closed()[0].reason, reason);

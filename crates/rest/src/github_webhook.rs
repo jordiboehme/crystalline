@@ -14,7 +14,8 @@
 //! 2. At most [`CONCURRENT`] deliveries are read and handled at once; one
 //!    that finds no slot within [`SLOT_WAIT`] gets 503.
 //! 3. The body is read up to [`WEBHOOK_BODY_BYTES`]; a larger one is 413,
-//!    and no HMAC runs over it.
+//!    and no HMAC runs over it. One that has not arrived within
+//!    [`BODY_WAIT`] is 408, and its slot is free again.
 //! 4. A signature that does not match: 401, and nothing else happens.
 //! 5. No `X-GitHub-Delivery` or `X-GitHub-Event`: 400.
 //! 6. A delivery id seen in the last day: 200, and no work.
@@ -65,6 +66,10 @@ pub const CONCURRENT: usize = 4;
 /// How long a delivery waits for one of the [`CONCURRENT`] slots before it
 /// is answered 503, well inside the ten seconds GitHub waits.
 pub const SLOT_WAIT: Duration = Duration::from_secs(3);
+
+/// How long the body of a delivery may take to arrive once it has a slot.
+/// Past it the answer is 408 and the slot is free again.
+pub const BODY_WAIT: Duration = Duration::from_secs(10);
 
 /// What a delivery that could not be handled is answered. The details are in
 /// the log only.
@@ -172,6 +177,12 @@ fn for_log(value: Option<&str>) -> String {
             content_type = "application/problem+json",
         ),
         (
+            status = 408,
+            description = "The body did not arrive within ten seconds.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 413,
             description = "A body over 25 MiB, refused before the signature \
                            is checked.",
@@ -247,7 +258,22 @@ pub async fn receive(
         )
         .retry_after(10));
     };
-    let Ok(body) = axum::body::to_bytes(body, WEBHOOK_BODY_BYTES).await else {
+    // A body that does not arrive in time frees the slot (dropped with
+    // `_slot` on return), so four slow senders cannot hold the route.
+    let Ok(read) =
+        tokio::time::timeout(BODY_WAIT, axum::body::to_bytes(body, WEBHOOK_BODY_BYTES)).await
+    else {
+        tracing::warn!(
+            delivery = ?for_log(delivery),
+            event = ?for_log(event),
+            "a GitHub webhook delivery was refused: its body did not arrive within {} seconds",
+            BODY_WAIT.as_secs()
+        );
+        return Err(ApiError::request_timeout(
+            "the delivery's body did not arrive in time",
+        ));
+    };
+    let Ok(body) = read else {
         tracing::warn!(
             delivery = ?for_log(delivery),
             event = ?for_log(event),

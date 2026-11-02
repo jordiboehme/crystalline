@@ -9284,6 +9284,16 @@
               }
             }
           },
+          "408": {
+            "description": "The body did not arrive within ten seconds.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
           "413": {
             "description": "A body over 25 MiB, refused before the signature is checked.",
             "content": {

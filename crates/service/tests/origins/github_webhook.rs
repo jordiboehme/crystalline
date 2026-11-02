@@ -164,7 +164,7 @@ fn listings(forge: &Forge, repo: &str) -> usize {
 }
 
 /// One delivery, as GitHub sends it.
-struct Delivery<'a> {
+pub(crate) struct Delivery<'a> {
     event: &'a str,
     id: Option<&'a str>,
     body: Vec<u8>,
@@ -175,7 +175,7 @@ struct Delivery<'a> {
 impl<'a> Delivery<'a> {
     /// `payload` as event `event` with delivery id `id`, signed with
     /// [`SECRET`].
-    fn signed(event: &'a str, id: &'a str, payload: &Value) -> Delivery<'a> {
+    pub(crate) fn signed(event: &'a str, id: &'a str, payload: &Value) -> Delivery<'a> {
         let body = serde_json::to_vec(payload).unwrap();
         Delivery {
             event,
@@ -187,7 +187,7 @@ impl<'a> Delivery<'a> {
     }
 }
 
-async fn deliver(fx: &Fx, d: Delivery<'_>) -> reqwest::Response {
+pub(crate) async fn deliver(fx: &Fx, d: Delivery<'_>) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("{}{PATH}", fx.url))
         .header("content-type", "application/json")
@@ -596,7 +596,7 @@ async fn a_transferred_repository_closes_its_domain() {
     assert_eq!(closed[0].domain, "kb");
     assert_eq!(
         closed[0].reason,
-        "the repository moved to newco/kb on GitHub; an admin must reconnect the domain"
+        "the repository moved to newco/kb on GitHub; disconnect the domain and connect it again"
     );
     // An installation event that rechecks closed domains does not open it.
     let resp = deliver(
@@ -930,6 +930,16 @@ async fn status_without_the_body(
     headers: &[(&str, &str)],
     declared: usize,
 ) -> Option<u16> {
+    status_after_a_stall(fx, headers, declared, Duration::from_secs(3)).await
+}
+
+/// [`status_without_the_body`], waiting up to `wait` for the answer.
+async fn status_after_a_stall(
+    fx: &Fx,
+    headers: &[(&str, &str)],
+    declared: usize,
+    wait: Duration,
+) -> Option<u16> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(fx.addr).await.unwrap();
     let mut head = format!(
@@ -943,7 +953,7 @@ async fn status_without_the_body(
     stream.write_all(head.as_bytes()).await.unwrap();
     let mut answer = Vec::new();
     let mut buf = [0u8; 1024];
-    let read = tokio::time::timeout(Duration::from_secs(3), async {
+    let read = tokio::time::timeout(wait, async {
         loop {
             let n = stream.read(&mut buf).await.unwrap_or(0);
             if n == 0 {
@@ -1028,4 +1038,54 @@ async fn two_identical_deliveries_at_once_do_the_work_once() {
         .filter(|h| h.path == format!("/repositories/{id}"))
         .count();
     assert_eq!(asked, 1, "GitHub was asked once");
+}
+
+/// A body that does not arrive within ten seconds is answered 408 and its
+/// slot is free again: four stalled senders do not hold the route.
+#[tokio::test]
+async fn a_body_that_does_not_arrive_is_408_and_frees_its_slot() {
+    let fx = setup(Some(SECRET)).await;
+    let signature = format!("sha256={}", "a".repeat(64));
+    let headers = [
+        ("x-github-event", "ping"),
+        ("x-github-delivery", "d-slow"),
+        ("x-hub-signature-256", signature.as_str()),
+    ];
+    let stalled = |_| status_after_a_stall(&fx, &headers, 1024 * 1024, Duration::from_secs(20));
+    let answers = futures::future::join_all((0..4).map(stalled)).await;
+    assert_eq!(answers, vec![Some(408); 4]);
+    let resp = deliver(
+        &fx,
+        Delivery::signed("ping", "d-after", &json!({"zen": "Slow down."})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// A confirmed rename leaves a domain alone whose recorded repository is
+/// another one of that name (the name was reused before).
+#[tokio::test]
+async fn a_rename_skips_a_domain_recorded_for_another_repository() {
+    let fx = setup(Some(SECRET)).await;
+    let dir = fx.tmp.path().join("origins").join("kb");
+    let mut state = crystalline_remote::state::OriginState::load(&dir)
+        .unwrap()
+        .unwrap();
+    let mut ids = state.repository_ids.unwrap();
+    ids.repository = 999;
+    state.repository_ids = Some(ids);
+    state.save(&dir).unwrap();
+    let id = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.rename("acme/kb", "acme/handbook");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-skip",
+            &renamed("acme", "kb", "handbook", id),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
 }

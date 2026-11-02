@@ -7033,6 +7033,10 @@ export type ReceiveGithubWebhookErrors = {
      */
     401: ProblemDetail;
     /**
+     * The body did not arrive within ten seconds.
+     */
+    408: ProblemDetail;
+    /**
      * A body over 25 MiB, refused before the signature is checked.
      */
     413: ProblemDetail;

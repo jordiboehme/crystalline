@@ -200,6 +200,18 @@ impl ApiError {
         }
     }
 
+    /// A 408 for a body that did not arrive in time.
+    pub fn request_timeout(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            title: "request timeout",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+            home_url: None,
+        }
+    }
+
     /// A 413 for a body larger than the route takes.
     pub fn payload_too_large(detail: impl Into<String>) -> ApiError {
         ApiError {
