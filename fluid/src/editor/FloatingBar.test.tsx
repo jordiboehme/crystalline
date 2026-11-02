@@ -93,6 +93,14 @@ function openCell(main: EditorView, row: number, column: number): EditorView {
   return editor.view;
 }
 
+/** Gives `view` a layout: position `pos` sits at x = pos * 10 + `shift()`. */
+function fakeLayout(view: EditorView, shift: () => number): void {
+  view.coordsAtPos = (pos: number) => {
+    const left = pos * 10 + shift();
+    return { left, right: left, top: 100, bottom: 116 };
+  };
+}
+
 function altF10(target: Element): void {
   fireEvent.keyDown(target, { key: "F10", altKey: true, keyCode: 121 });
 }
@@ -172,9 +180,9 @@ describe("the floating bar on a text selection", () => {
       expect(h.context()?.kind).toBe("text");
     });
     h.show();
-    fireEvent.mouseDown(h.main.dom);
+    fireEvent.pointerDown(h.main.dom, { isPrimary: true });
     expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
-    fireEvent.mouseUp(document);
+    fireEvent.pointerUp(document, { isPrimary: true });
     expect(bar()).toBeInTheDocument();
   });
 
@@ -192,9 +200,71 @@ describe("the floating bar on a text selection", () => {
     // every selection at the same empty rect, so the press is what tells).
     // On the editor's frame: CodeMirror's own press handling, which would
     // move the selection, is not what is tested here.
-    fireEvent.mouseDown(h.main.dom);
-    fireEvent.mouseUp(document);
+    fireEvent.pointerDown(h.main.dom, { isPrimary: true });
+    fireEvent.pointerUp(document, { isPrimary: true });
     expect(bar()).toBeInTheDocument();
+  });
+
+  test("after Escape, a rect that only moved does not bring the bar back", async () => {
+    const h = harness();
+    let shift = 0;
+    fakeLayout(h.main, () => shift);
+    h.main.focus();
+    h.main.dispatch({ selection: { anchor: 0, head: 5 } });
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("text");
+    });
+    h.show();
+    // Into the bar and back out: the selection stays, the bar goes.
+    altF10(h.main.contentDOM);
+    await vi.waitFor(() => {
+      expect(quick("Bold")).toHaveFocus();
+    });
+    fireEvent.keyDown(quick("Bold"), { key: "Escape" });
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+    // A reflow (a peer's edit, a font load): the rect moves, nothing else.
+    shift = 40;
+    h.main.dispatch({
+      changes: { from: h.main.state.doc.length, insert: "x" },
+    });
+    await vi.waitFor(() => {
+      expect(h.context()?.rect.left).toBe(40);
+    });
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+    // The person moving the selection is a new place again.
+    h.main.dispatch({
+      selection: { anchor: 0, head: 3 },
+      userEvent: "select",
+    });
+    await vi.waitFor(() => {
+      expect(bar()).toBeInTheDocument();
+    });
+  });
+
+  test("a touch press hides the bar as a mouse press does", async () => {
+    const h = harness();
+    h.main.focus();
+    h.main.dispatch({ selection: { anchor: 0, head: 5 } });
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("text");
+    });
+    h.show();
+    fireEvent.pointerDown(h.main.dom, {
+      isPrimary: true,
+      pointerType: "touch",
+    });
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+    fireEvent.pointerUp(document, { isPrimary: true, pointerType: "touch" });
+    expect(bar()).toBeInTheDocument();
+  });
+
+  test("a selection that spans a table offers no bar", async () => {
+    const h = harness();
+    h.main.dispatch({
+      selection: { anchor: 0, head: h.main.state.doc.length },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(h.context()).toBeNull();
   });
 
   test("the bar hides when the focus leaves the editor", async () => {
@@ -340,5 +410,57 @@ describe("the floating bar in an open cell", () => {
       anchor: from,
       head: to,
     });
+  });
+
+  test("typing after Escape back into the cell keeps the bar hidden", async () => {
+    const h = harness();
+    const cell = openCell(h.main, 1, 1);
+    fakeLayout(cell, () => 0);
+    cell.dispatch({ selection: { anchor: cell.state.selection.main.head } });
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("cell");
+    });
+    h.show();
+    altF10(cell.contentDOM);
+    await vi.waitFor(() => {
+      expect(quick("Bold")).toHaveFocus();
+    });
+    fireEvent.keyDown(quick("Bold"), { key: "Escape" });
+    expect(cell.hasFocus).toBe(true);
+    const before = h.context()?.rect.left;
+    const head = cell.state.selection.main.head;
+    cell.dispatch({
+      changes: { from: head, insert: "z" },
+      selection: { anchor: head + 1 },
+      userEvent: "input.type",
+    });
+    await vi.waitFor(() => {
+      expect(h.context()?.rect.left).not.toBe(before);
+    });
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+  });
+
+  test("a bar reached by Alt+F10 does not keep a closed cell to return to", async () => {
+    const h = harness();
+    const cell = openCell(h.main, 1, 0);
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("cell");
+    });
+    h.show();
+    altF10(cell.contentDOM);
+    await vi.waitFor(() => {
+      expect(quick("Bold")).toHaveFocus();
+    });
+    // The verb lands in the new row's cell; the old cell view is gone.
+    fireEvent.click(quick("Insert row below"));
+    const landed = activeCell(h.main)?.view;
+    expect(landed).toBeDefined();
+    expect(landed).not.toBe(cell);
+    // Back in the bar by Tab rather than Alt+F10, then Escape.
+    act(() => {
+      quick("Bold").focus();
+    });
+    fireEvent.keyDown(quick("Bold"), { key: "Escape" });
+    expect(landed?.hasFocus).toBe(true);
   });
 });

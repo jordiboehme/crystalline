@@ -37,6 +37,8 @@ interface Hub {
   last: FloatingContext | undefined;
   /** The key of this hub's measure requests. */
   key: object;
+  /** How often the person moved a selection here (main or cell). */
+  moves: number;
 }
 
 const hubs = new WeakMap<EditorView, Hub>();
@@ -82,6 +84,30 @@ function inTable(state: EditorState, pos: number): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Whether `from`..`to` touches a table: an end inside one, or a table lying
+ * between the ends. The sticky bar's `toggleInline` would wrap such a span
+ * as it stands (it does not refuse it), and a mark across a table's rows
+ * breaks them, so the floating bar offers nothing there.
+ */
+function touchesTable(state: EditorState, from: number, to: number): boolean {
+  if (inTable(state, from) || inTable(state, to)) return true;
+  let found = false;
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (found) return false;
+      if (node.name === "Table" && node.from < to && node.to > from) {
+        found = true;
+        return false;
+      }
+      return true;
+    },
+  });
+  return found;
 }
 
 const EMPTY = { left: 0, top: 0, right: 0, bottom: 0 };
@@ -143,9 +169,7 @@ function derive(hub: Hub): FloatingContext {
   }
   const range = main.state.selection.main;
   if (range.empty) return null;
-  if (inTable(main.state, range.from) || inTable(main.state, range.to)) {
-    return null;
-  }
+  if (touchesTable(main.state, range.from, range.to)) return null;
   return {
     kind: "text",
     rect: toRect(rangeBox(main, range.from, range.to) ?? EMPTY),
@@ -185,6 +209,24 @@ function schedule(hub: Hub): void {
   });
 }
 
+/**
+ * Whether the person moved the selection in this update: a `select` user
+ * event (arrows, Shift+arrows, a click, select all). Typing, a peer's edit
+ * and the cell editor's own forwarding carry none, so a rect that moved for
+ * those reasons is not a new place.
+ */
+function selectedByHand(update: ViewUpdate): boolean {
+  return update.transactions.some((tr) => tr.isUserEvent("select"));
+}
+
+/**
+ * How often the person moved a selection on `main` or in its open cell. The
+ * bar compares it to tell a new place from a rect that only moved.
+ */
+export function selectionMoves(main: EditorView): number {
+  return hubs.get(main)?.moves ?? 0;
+}
+
 function changed(update: ViewUpdate): boolean {
   return (
     update.selectionSet ||
@@ -217,12 +259,14 @@ export function floatingContextListener(
           cell: null,
           last: undefined,
           key: {},
+          moves: 0,
         };
         hubs.set(view, this.hub);
         schedule(this.hub);
       }
 
       update(update: ViewUpdate): void {
+        if (selectedByHand(update)) this.hub.moves += 1;
         if (changed(update)) schedule(this.hub);
       }
 
@@ -259,9 +303,10 @@ export function floatingCell(main: EditorView): Extension {
       }
 
       update(update: ViewUpdate): void {
-        if (!changed(update)) return;
         const hub = hubs.get(main);
-        if (hub?.cell === this.view) schedule(hub);
+        if (hub?.cell !== this.view) return;
+        if (selectedByHand(update)) hub.moves += 1;
+        if (changed(update)) schedule(hub);
       }
 
       destroy(): void {

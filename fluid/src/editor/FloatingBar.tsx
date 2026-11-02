@@ -43,13 +43,20 @@ import type {
   MouseEvent,
   ReactElement,
 } from "react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import type { IconComponent } from "../components/primitives";
 import { IconButton } from "../components/primitives";
 import type { FloatingContext } from "./floatingContext";
-import { setFloatingFocus } from "./floatingContext";
+import { selectionMoves, setFloatingFocus } from "./floatingContext";
 import { activeCell } from "./grid/cellEditor";
 import {
   cellActionApplies,
@@ -158,7 +165,16 @@ export default function FloatingBar({
   useEffect(() => {
     contextNow.current = context;
   });
-  const [dismissed, setDismissed] = useState(false);
+  /**
+   * Set by Escape: the kind it was pressed on and the selection moves count
+   * then. A rect that only moved (a peer's edit, a reflow, typing) keeps the
+   * bar away; a new kind, a selection the person moved, or a press brings it
+   * back.
+   */
+  const [dismissed, setDismissed] = useState<{
+    kind: "text" | "cell" | null;
+    moves: number;
+  } | null>(null);
   const [pointerDown, setPointerDown] = useState(false);
   const [focused, setFocused] = useState(() => {
     const active = document.activeElement;
@@ -169,12 +185,21 @@ export default function FloatingBar({
   const focusDone = useRef(0);
   const [current, setCurrent] = useState<string | null>(null);
 
-  // A new context is a new place to stand by: an Escape held for the last.
-  // Set during render, React's pattern for state that follows a prop.
-  const [shownFor, setShownFor] = useState(context);
-  if (shownFor !== context) {
-    setShownFor(context);
-    setDismissed(false);
+  const dismiss = useCallback(() => {
+    setDismissed({
+      kind: contextNow.current?.kind ?? null,
+      moves: main ? selectionMoves(main) : 0,
+    });
+  }, [main]);
+
+  // A new place to stand by ends an Escape held for the last one. Set
+  // during render, React's pattern for state that follows a prop.
+  if (
+    dismissed !== null &&
+    (dismissed.kind !== (context?.kind ?? null) ||
+      (main !== null && dismissed.moves !== selectionMoves(main)))
+  ) {
+    setDismissed(null);
   }
 
   // The editor area: main's DOM (cell views and the Cell actions menu are
@@ -193,36 +218,37 @@ export default function FloatingBar({
     const onFocusOut = (event: FocusEvent) => {
       if (!inArea(event.relatedTarget)) setFocused(false);
     };
+    // Mouse, touch and pen alike: the primary pointer's press.
     let pressed = false;
-    const onDown = (event: globalThis.MouseEvent) => {
-      if (event.button !== 0) return;
+    const onDown = (event: PointerEvent) => {
+      if (!event.isPrimary || event.button !== 0) return;
       pressed = true;
       setPointerDown(true);
     };
     // A press in the editor ends in a new place (or the same one picked
     // again): an Escape held for the last one is over.
-    const onUp = () => {
-      if (!pressed) return;
+    const onUp = (event: PointerEvent) => {
+      if (!pressed || !event.isPrimary) return;
       pressed = false;
       setPointerDown(false);
-      setDismissed(false);
+      setDismissed(null);
     };
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setDismissed(true);
+      if (event.key === "Escape") dismiss();
     };
     document.addEventListener("focusin", onFocusIn);
     document.addEventListener("focusout", onFocusOut);
-    main.dom.addEventListener("mousedown", onDown);
-    document.addEventListener("mouseup", onUp);
+    main.dom.addEventListener("pointerdown", onDown);
+    document.addEventListener("pointerup", onUp);
     main.dom.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("focusin", onFocusIn);
       document.removeEventListener("focusout", onFocusOut);
-      main.dom.removeEventListener("mousedown", onDown);
-      document.removeEventListener("mouseup", onUp);
+      main.dom.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("pointerup", onUp);
       main.dom.removeEventListener("keydown", onKey);
     };
-  }, [main]);
+  }, [main, dismiss]);
 
   // Alt+F10, from the text or the cell.
   useEffect(() => {
@@ -230,7 +256,7 @@ export default function FloatingBar({
     return setFloatingFocus(main, (from) => {
       if (contextNow.current === null) return false;
       origin.current = from;
-      setDismissed(false);
+      setDismissed(null);
       setFocused(true);
       setPointerDown(false);
       setFocusAsked((n) => n + 1);
@@ -239,7 +265,11 @@ export default function FloatingBar({
   }, [main]);
 
   const visible =
-    main !== null && context !== null && !dismissed && !pointerDown && focused;
+    main !== null &&
+    context !== null &&
+    dismissed === null &&
+    !pointerDown &&
+    focused;
 
   const items: Item[] =
     visible && context.kind === "cell"
@@ -308,7 +338,7 @@ export default function FloatingBar({
   const back = () => {
     const to = origin.current ?? targetOf(main);
     origin.current = null;
-    setDismissed(true);
+    dismiss();
     to.focus();
   };
 
@@ -378,6 +408,9 @@ export default function FloatingBar({
           disabled={item.disabled ?? false}
           onClick={() => {
             item.run(main);
+            // The view Alt+F10 came from may be gone now (a verb that
+            // landed in another cell): Escape later returns to the target.
+            origin.current = null;
           }}
           {...roving(item.label)}
         />
@@ -413,6 +446,7 @@ export default function FloatingBar({
                   className={ITEM_CLASSES}
                   onSelect={() => {
                     runCellAction(main, label);
+                    origin.current = null;
                   }}
                 >
                   <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
@@ -428,6 +462,7 @@ export default function FloatingBar({
             onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               openCellActions(main, { x: rect.left, y: rect.bottom });
+              origin.current = null;
             }}
             {...roving("More table actions")}
           />
