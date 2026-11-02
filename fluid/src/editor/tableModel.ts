@@ -456,10 +456,12 @@ export function moveRow(
  * A ragged row too short for either column is left as it is: moving a cell it
  * does not have would mean inventing one.
  *
- * One whitespace rule keeps an edge line parseable: where the first cell of a
- * line without a leading pipe receives a cell, that cell's leading blanks are
- * dropped, because they would otherwise read as the line's indent (four of
- * them turn a table row into a code block).
+ * No cell is ever reformatted. One rule keeps a line without a leading pipe
+ * parseable: when the cell that lands in its first slot is empty or opens with
+ * a blank, the bare text would read as nothing or as the line's indent (four
+ * blanks turn a row into a code block), so that line gains an explicit leading
+ * pipe, the minimum for the cell to exist, as `addColumnBefore` does. A line
+ * with pipes on both edges is always byte-identical apart from the order.
  */
 export function moveColumn(
   model: TableModel,
@@ -481,14 +483,14 @@ export function moveColumn(
     if (moved === undefined) continue;
     order.splice(to - low, 0, moved);
 
-    const raws = order.map((from, slot) => {
-      const raw = slots[from]?.raw ?? "";
-      return low + slot === 0 && !line.leadingPipe ? raw.trimStart() : raw;
-    });
+    const raws = order.map((from) => slots[from]?.raw ?? "");
     const first = slots[0];
     const lastSlot = slots[slots.length - 1];
     if (!first || !lastSlot) continue;
-    const text = raws.join("|");
+    const bare = low === 0 && !line.leadingPipe;
+    const opening = raws[0] ?? "";
+    const needsPipe = bare && (opening === "" || /^\s/.test(opening));
+    const text = `${needsPipe ? "|" : ""}${raws.join("|")}`;
     if (text === line.text.slice(first.from, lastSlot.to)) continue;
     changes.push({
       from: line.start + first.from,

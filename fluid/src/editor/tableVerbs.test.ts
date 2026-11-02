@@ -408,6 +408,9 @@ describe("insert-before and move verbs, and the `at` position", () => {
       "|  |  |",
     );
     expect(tableMoveColumn(v, 1)).toBe(true);
+    expect(docText(v.state)).toBe(
+      "x\r\n\r\n| b | a |\r\n| --- | --- |\r\n|  |  |\r\n| 4 | 3 |\r\n| 2 | 1 |\r\n",
+    );
   });
 
   test("`at` names the cell, so a verb can edit a table the caret is not in", () => {
@@ -448,12 +451,21 @@ describe("insert-before and move verbs in a room", () => {
     v: EditorView;
     ytext: Y.Text;
     undoManager: Y.UndoManager;
+    shared: { transactions: number; observed: number };
   } {
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText("content");
     ytext.insert(0, ROOM);
     const undoManager = new Y.UndoManager(ytext);
     const awareness = new Awareness(ydoc);
+    // Counted after the room is seeded, so only the verb's own writes show.
+    const shared = { transactions: 0, observed: 0 };
+    ydoc.on("afterTransaction", (tr: Y.Transaction) => {
+      if (tr.changed.size > 0) shared.transactions += 1;
+    });
+    ytext.observe(() => {
+      shared.observed += 1;
+    });
     view = new EditorView({
       state: parsedState(
         EditorState.create({
@@ -468,7 +480,7 @@ describe("insert-before and move verbs in a room", () => {
       ),
       parent: document.body,
     });
-    return { v: view, ytext, undoManager };
+    return { v: view, ytext, undoManager, shared };
   }
 
   const verbs: [string, (v: EditorView) => boolean][] = [
@@ -480,8 +492,12 @@ describe("insert-before and move verbs in a room", () => {
 
   for (const [name, run] of verbs) {
     test(`${name} reaches the shared text once and one undo restores it`, () => {
-      const { v, ytext, undoManager } = room();
+      const { v, ytext, undoManager, shared } = room();
       expect(run(v)).toBe(true);
+      // One verb is exactly one Y transaction touching the text, and the text
+      // observer fires once for it.
+      expect(shared.transactions).toBe(1);
+      expect(shared.observed).toBe(1);
       expect(ytext.toJSON()).toBe(docText(v.state));
       expect(ytext.toJSON()).not.toBe(ROOM);
       // The verb is a single shared transaction, so one undo takes it all back.

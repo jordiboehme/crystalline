@@ -559,7 +559,6 @@ describe("insert-before and move verbs", () => {
   test("rows without edge pipes move and gain columns without gaining pipes", () => {
     const span = "a | b\n- | -\n1 | 2";
     const m = modelOf(span);
-    expect(apply(span, moveColumn(m, 0, 1) ?? [])).toBe("b|a \n-|- \n2|1 ");
     expect(apply(span, addColumnBefore(m, 1) ?? [])).toBe(
       "a | Column | b\n- | --- | -\n1 |  | 2",
     );
@@ -568,6 +567,58 @@ describe("insert-before and move verbs", () => {
     expect(apply(span, addColumnBefore(m, 0) ?? [])).toBe(
       "Column | a | b\n--- | - | -\n|  | 1 | 2",
     );
-    expect(apply(span, moveRow(m, 2, 2, "\n") ?? [])).toBe(span);
+  });
+
+  test("moveColumn on a pipeless table keeps every cell and every column", () => {
+    const span = "a | b\n- | -\n1 | 2";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 0, 1) ?? []);
+    // No cell is reformatted; the lines whose first slot would open with a
+    // blank gain one explicit leading pipe.
+    expect(out).toBe("| b|a \n| -|- \n| 2|1 ");
+    const after = parseTable(out);
+    expect(after?.columns).toBe(2);
+    expect(after?.lines.map((l) => l.cells.length)).toEqual([2, 2, 2]);
+    expect(after?.lines[0]?.cells.map((c) => c.raw)).toEqual([" b", "a"]);
+  });
+
+  test("moveColumn of an empty cell into the first slot of a pipeless line", () => {
+    const span = "x | y | z\n- | - | -\nx |  | z";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 1, 0) ?? []);
+    expect(out).toBe("| y |x | z\n| - |- | -\n|  |x | z");
+    const after = parseTable(out);
+    expect(after?.lines.map((l) => l.cells.length)).toEqual([3, 3, 3]);
+    expect(after?.lines[2]?.cells.map((c) => c.raw)).toEqual([
+      "  ",
+      "x ",
+      " z",
+    ]);
+  });
+
+  test("moveColumn of a blank-padded cell does not turn it into indent", () => {
+    const span = "a |      b | c\n- | - | -\n1 | 2 | 3";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 1, 0) ?? []);
+    expect(out.split("\n")[0]).toBe("|      b |a | c");
+    expect(parseTable(out)?.lines.map((l) => l.cells.length)).toEqual([
+      3, 3, 3,
+    ]);
+    // A cell with no leading blank needs no pipe: only the reordering shows.
+    const tight = "a|b|c\n-|-|-\n1|2|3";
+    expect(apply(tight, moveColumn(modelOf(tight), 1, 0) ?? [])).toBe(
+      "b|a|c\n-|-|-\n2|1|3",
+    );
+  });
+
+  test("moveRow moves a data row of a pipeless table", () => {
+    const span = "a | b\n- | -\n1 | 2\n3 | 4";
+    const m = modelOf(span);
+    expect(apply(span, moveRow(m, 3, 2, "\n") ?? [])).toBe(
+      "a | b\n- | -\n3 | 4\n1 | 2",
+    );
+    expect(apply(span, moveRow(m, 2, 3, "\n") ?? [])).toBe(
+      "a | b\n- | -\n3 | 4\n1 | 2",
+    );
   });
 });
