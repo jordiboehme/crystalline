@@ -306,6 +306,42 @@ async fn no_webhook_secret_configured_is_401() {
     assert_eq!(listings(&fx.forge, "acme/kb"), 1);
 }
 
+/// Without a GitHub App the route is not there for the internet: a 404,
+/// answered before the body is read, and no log line, so a stranger cannot
+/// fill the log of an instance that never set an App up.
+#[tokio::test]
+async fn without_an_app_the_route_is_404_and_logs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let eng = Arc::new(super::github_app::engine(tmp.path(), "http://127.0.0.1:1", &[]).await);
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    let state = RestState::new(eng.clone(), auth, &[]).unwrap();
+    let app = axum::Router::new().nest("/api/v1", router(state));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (logs, _guard) = crate::support::capture_logs();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let body = serde_json::to_vec(&member_event("acme/kb")).unwrap();
+    for signature in [None, Some(sign(SECRET, &body))] {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}{PATH}"))
+            .header("content-type", "application/json")
+            .header("x-github-event", "member")
+            .header("x-github-delivery", "d-1");
+        if let Some(signature) = signature {
+            req = req.header("x-hub-signature-256", signature);
+        }
+        let resp = req.body(body.clone()).send().await.unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+    assert!(
+        !logs.any_contains("webhook"),
+        "no log line: {:?}",
+        logs.lines()
+    );
+}
+
 #[tokio::test]
 async fn a_delivery_without_an_id_is_400_but_only_after_the_signature() {
     let fx = setup(Some(SECRET)).await;

@@ -169,10 +169,17 @@ fn for_log(value: Option<&str>) -> String {
         ),
         (
             status = 401,
-            description = "No webhook secret is configured, or the signature \
+            description = "The App has no webhook secret, or the signature \
                            is missing, not `sha256=` and 64 lowercase hex \
                            digits, or wrong. Nothing happened, and the first \
                            three are answered before the body is read.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "This instance has no GitHub App. Answered before \
+                           the body is read, and not logged.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -215,12 +222,23 @@ pub async fn receive(
     let delivery = header(&headers, "x-github-delivery");
     let event = header(&headers, "x-github-event");
     // The App slot may still have to be loaded, which can read the
-    // keychain: not on this thread.
+    // keychain: not on this thread. It is loaded once and kept.
     let engine = state.engine.clone();
-    let secret = tokio::task::spawn_blocking(move || engine.github_webhook_secret())
-        .await
-        .ok()
-        .flatten();
+    let (configured, secret) = tokio::task::spawn_blocking(move || {
+        (
+            engine.github_app_configured(),
+            engine.github_webhook_secret(),
+        )
+    })
+    .await
+    .unwrap_or((true, None));
+    // Without an App the route is not there: no log line, so a stranger
+    // cannot fill the log of an instance that never set an App up.
+    if !configured {
+        return Err(ApiError::not_found(
+            "this instance has no GitHub App, so it takes no webhook deliveries",
+        ));
+    }
     let Some(secret) = secret else {
         tracing::warn!(
             delivery = ?for_log(delivery),

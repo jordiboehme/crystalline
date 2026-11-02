@@ -7178,9 +7178,13 @@ export type ReceiveGithubWebhookErrors = {
      */
     400: ProblemDetail;
     /**
-     * No webhook secret is configured, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.
+     * The App has no webhook secret, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.
      */
     401: ProblemDetail;
+    /**
+     * This instance has no GitHub App. Answered before the body is read, and not logged.
+     */
+    404: ProblemDetail;
     /**
      * The body did not arrive within ten seconds.
      */
