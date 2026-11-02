@@ -20,6 +20,7 @@ pub mod overlay;
 pub mod overlay_files;
 pub mod overlay_journal;
 pub mod params;
+pub mod pending;
 #[doc(hidden)]
 pub mod poller;
 pub mod read_limit;

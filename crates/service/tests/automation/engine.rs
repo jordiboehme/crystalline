@@ -711,6 +711,7 @@ async fn direct_team_with(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();

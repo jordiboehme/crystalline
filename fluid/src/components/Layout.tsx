@@ -67,7 +67,7 @@ import {
 } from "../api/reflectionDomains";
 import type { DomainListing, DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
-import { useDomainWritable } from "../domainWritable";
+import { mayShareIn, useDomainWritable } from "../domainWritable";
 import { openWindow } from "../base";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
@@ -101,6 +101,7 @@ import {
 } from "../paths";
 import { PREFETCH } from "../prefetch";
 import { useWide } from "../useWide";
+import { GithubAccessBanner } from "./GithubAccessBanner";
 import { OutlineSlotContext } from "./outlineSlot";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { CreateDomainDialog } from "./CreateDomainDialog";
@@ -259,7 +260,25 @@ function useShareAction(): ShareAction {
   // where `github.share_identity` is `personal`, and it is the server's own
   // verdict - the very predicate the share routes gate on - rather than a rule
   // this side re-derives. The domain home already draws its share cards on it.
-  const sharer = capabilities.canShare;
+  //
+  // On a domain GitHub governs the listing row says it per domain: a GitHub
+  // writer who is no sharer by role may share that domain, and only that
+  // one, so the action stands on that domain's screens and never widens to
+  // the instance-wide summary, whose route the role still gates.
+  // `useMatch` rather than `useParams`, for the reason `DomainSidebar` spells
+  // out: inside a layout route the params are the layout's own, which are none.
+  const match = useMatch("/d/:domain/*");
+  const routeDomain = match?.params.domain ?? "";
+  const listing = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
+  const routeEntry = listing.data?.domains.find(
+    (entry) => entry.name === routeDomain,
+  );
+  const sharer =
+    capabilities.canShare ||
+    (routeEntry !== undefined && mayShareIn(capabilities, routeEntry));
 
   // Under the settings screen's own key, so an admin who has been there pays
   // nothing for it here. Admin-only, because the route is: an editor who may
@@ -286,11 +305,6 @@ function useShareAction(): ShareAction {
     !capabilities.readOnly &&
     (!admin || connection.data?.enabled === true);
 
-  // `useMatch` rather than `useParams`, for the reason `DomainSidebar` spells
-  // out: inside a layout route the params are the layout's own, which are none.
-  const match = useMatch("/d/:domain/*");
-  const routeDomain = match?.params.domain ?? "";
-
   // The card's own key and fetcher, and the same refusal to retry a decided
   // answer. On the domain's home screen that costs nothing at all, because the
   // sync and proposals cards are already asking; on every other screen under
@@ -310,6 +324,8 @@ function useShareAction(): ShareAction {
   // question widens to the whole instance, which is the one somebody standing
   // in a local domain and pressing Share would have meant anyway.
   const instanceWide = routeDomain === "" || status.isError;
+  // A sharer of this one domain only has no instance-wide question to ask.
+  const domainSharerOnly = !capabilities.canShare;
 
   const summary = useQuery({
     queryKey: SYNC_SUMMARY_KEY,
@@ -320,10 +336,14 @@ function useShareAction(): ShareAction {
     // missing connection rather than refusing over it, so this would be a
     // round trip whose every count is local state alone, to fill in a face
     // that is already saying the one thing a reader can act on.
-    enabled: visible && instanceWide && connection.data?.connected !== false,
+    enabled:
+      visible &&
+      instanceWide &&
+      !domainSharerOnly &&
+      connection.data?.connected !== false,
   });
 
-  if (!visible) {
+  if (!visible || (instanceWide && domainSharerOnly)) {
     return NO_SHARE;
   }
   // Said before anything about what is waiting, because it is the one reason
@@ -913,6 +933,7 @@ export function Layout() {
                       data-text={largeText ? "large" : undefined}
                       className="relative min-w-0 flex-1 py-6 focus:outline-none"
                     >
+                      {capabilities.canAdminister && <GithubAccessBanner />}
                       <Outlet />
                       <ReadyFlash />
                     </main>

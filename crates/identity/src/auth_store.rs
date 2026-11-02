@@ -264,6 +264,56 @@ pub struct IdentityLink {
     pub linked_by: String,
 }
 
+/// The GitHub account a Crystalline account is linked to. The numeric
+/// `github_id` is the identity (a login can be renamed or recycled); `login`
+/// is only a display cache that [`AuthStore::set_github_login`] refreshes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GithubLink {
+    /// The Crystalline account.
+    pub account: String,
+    /// The GitHub host in its one stored form: lowercase, trimmed, `github.com`
+    /// for GitHub.com and the bare Enterprise Server host (no scheme, no
+    /// path) otherwise. The same spelling `AppCredentials::host` carries.
+    pub host: String,
+    /// GitHub's numeric user id on that host.
+    pub github_id: u64,
+    /// The login last seen for the id, a cache.
+    pub login: String,
+    /// When the link was made.
+    pub linked_at: chrono::DateTime<chrono::Utc>,
+    /// False once the stored user token is known to be gone (revoked or
+    /// expired); the link itself stays.
+    pub token_live: bool,
+}
+
+/// The stored form of a GitHub host: trimmed and lowercased.
+fn normalize_github_host(host: &str) -> Result<String> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("a GitHub host must not be empty");
+    }
+    Ok(host)
+}
+
+const GITHUB_LINK_COLUMNS: &str = "account, host, github_id, login, linked_at, token_live";
+
+fn github_link_from_row(row: &Row) -> GithubLink {
+    GithubLink {
+        account: cell_text(row, 0).unwrap_or_default(),
+        host: cell_text(row, 1).unwrap_or_default(),
+        github_id: match row.get_value(2) {
+            Ok(Value::Integer(id)) => u64::try_from(id).unwrap_or_default(),
+            _ => 0,
+        },
+        login: cell_text(row, 3).unwrap_or_default(),
+        linked_at: cell_text(row, 4)
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .unwrap_or_default(),
+        token_live: matches!(row.get_value(5), Ok(Value::Integer(live)) if live != 0),
+    }
+}
+
 /// What [`AuthStore::provision_linked_user`] records as the linker when a
 /// first sign-in creates the account it links.
 pub const LINKED_BY_JIT: &str = "jit";
@@ -655,7 +705,20 @@ fn member_level_from_db(s: &str) -> MemberLevel {
 /// what the knowledge level gives: `Default` is "as knowledge",
 /// stored as SQL NULL so no sentinel value is written. There is no stored
 /// curator: curating follows from writing the engrams.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Ordered `Default < Reader < Contributor`, so the higher of two levels is
+/// their `max`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ReflectionLevel {
     /// As the knowledge level gives: a viewer reads and comments, `none`
@@ -794,6 +857,9 @@ pub enum RefusalKind {
     /// whitespace. A bad request rather than a fault, on the surfaces that can
     /// be handed one.
     InvalidName,
+    /// The GitHub account (host and numeric id) is already linked to another
+    /// Crystalline account. See [`AuthStore::link_github`].
+    GithubIdTaken,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -908,6 +974,22 @@ pub struct DomainMember {
     pub added_at: String,
 }
 
+/// One per-domain Reflection collaborator: an account given the Reflection
+/// reader or contributor level on one domain, beside whatever its engram
+/// access gives it there. A grant only raises the Reflection right; it never
+/// opens an engram.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ReflectionGrant {
+    /// The account's login name, folded by [`normalize_account_name`].
+    pub account: String,
+    /// `reader` or `contributor`, never `default`.
+    pub level: ReflectionLevel,
+    /// Who added or last changed this grant. An audit field, stored as given.
+    pub added_by: String,
+    /// RFC 3339, when this grant was last written.
+    pub added_at: String,
+}
+
 /// Fold a supplied domain name to the form this store keys on: trimmed, and
 /// otherwise left exactly as given.
 ///
@@ -966,7 +1048,11 @@ pub struct AuthStore {
 /// Create the tables on first open. `IF NOT EXISTS` throughout, so this is the
 /// same statement on an existing file. `account_write_domain` holds the write
 /// lists (`crystalline users writes`): no rows for an account means it has no
-/// list.
+/// list. `domain_reflection_grant` holds the per-domain Reflection
+/// collaborators ([`AuthStore::set_reflection_grant`]), on any domain kept as
+/// files, shared or private. `github_delivery` holds the GitHub App webhook
+/// deliveries of the last day ([`AuthStore::remember_delivery`]), so a
+/// replayed one does no work.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1025,6 +1111,10 @@ CREATE TABLE IF NOT EXISTS identity_link (
 CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
 CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
     ON identity_link (issuer, user);
+CREATE TABLE IF NOT EXISTS github_link (
+    account TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL, github_id INTEGER NOT NULL,
+    login TEXT NOT NULL, linked_at TEXT NOT NULL, token_live INTEGER NOT NULL DEFAULT 1);
+CREATE UNIQUE INDEX IF NOT EXISTS github_link_host_id ON github_link (host, github_id);
 CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id TEXT PRIMARY KEY,
     client_name TEXT NOT NULL,
@@ -1070,7 +1160,21 @@ CREATE TABLE IF NOT EXISTS account_write_domain (
     pattern TEXT NOT NULL,
     PRIMARY KEY (account, pattern)
 );
+CREATE TABLE IF NOT EXISTS domain_reflection_grant (
+    domain TEXT NOT NULL, account TEXT NOT NULL, level TEXT NOT NULL,
+    added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
+CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
 ";
+
+/// How long a GitHub webhook delivery id is remembered, one day in seconds:
+/// a replay inside it does no work (see [`AuthStore::remember_delivery`]).
+pub const DELIVERY_KEPT_SECS: i64 = 86_400;
+
+/// The sentence [`AuthStore::link_github`] refuses a GitHub account that is
+/// already linked to another Crystalline account with
+/// ([`RefusalKind::GithubIdTaken`]). Public so a surface can recognise the
+/// refusal by it and answer 409 with these words.
+pub const GITHUB_ID_TAKEN: &str = "this GitHub account is already linked to another Crystalline account; an admin can unlink it there";
 
 /// Prefix every MCP token is minted with, so a token is recognizable at a
 /// glance and distinct from a session cookie or a CSRF value. The remainder is
@@ -1740,7 +1844,9 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_reflection_grants_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.disown_domains_of(&name).await?;
@@ -1785,7 +1891,9 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_reflection_grants_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.disown_domains_of(&name).await?;
@@ -2130,6 +2238,241 @@ impl AuthStore {
             });
         }
         Ok(links)
+    }
+
+    /// Link `account` to the GitHub account `github_id` on `host`. Relinking
+    /// an account replaces its row (a fresh `linked_at`, a live token).
+    /// Refused with [`RefusalKind::GithubIdTaken`] when another account holds
+    /// the same `(host, id)`, and with [`RefusalKind::NoSuchAccount`] when
+    /// `account` does not exist. `host` is stored lowercase.
+    pub async fn link_github(
+        &self,
+        account: &str,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
+        let account = normalize_account_name(account)?;
+        let host = normalize_github_host(host)?;
+        let id = i64::try_from(github_id).context("a GitHub id out of range")?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("linking GitHub to user '{account}'"))?;
+        let result = async {
+            if self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(account.clone())],
+                )
+                .await?
+                .is_none()
+            {
+                return Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("no such user: '{account}'"),
+                ));
+            }
+            if self
+                .query_first(
+                    "SELECT 1 FROM github_link WHERE host = ?1 AND github_id = ?2 AND account <> ?3",
+                    vec![
+                        Value::Text(host.clone()),
+                        Value::Integer(id),
+                        Value::Text(account.clone()),
+                    ],
+                )
+                .await?
+                .is_some()
+            {
+                return Err(refuse(
+                    RefusalKind::GithubIdTaken,
+                    GITHUB_ID_TAKEN.to_string(),
+                ));
+            }
+            let now = chrono::Utc::now();
+            self.conn
+                .execute(
+                    "DELETE FROM github_link WHERE account = ?1",
+                    vec![Value::Text(account.clone())],
+                )
+                .await
+                .with_context(|| format!("replacing the GitHub link of user '{account}'"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO github_link (account, host, github_id, login, linked_at, token_live)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    vec![
+                        Value::Text(account.clone()),
+                        Value::Text(host.clone()),
+                        Value::Integer(id),
+                        Value::Text(login.to_string()),
+                        Value::Text(now.to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("linking GitHub to user '{account}'"))?;
+            Ok(GithubLink {
+                account: account.clone(),
+                host: host.clone(),
+                github_id,
+                login: login.to_string(),
+                linked_at: now,
+                token_live: true,
+            })
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// The GitHub link of one account, if it has one.
+    pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link WHERE account = ?1"),
+                vec![Value::Text(account)],
+            )
+            .await?
+            .map(|row| github_link_from_row(&row)))
+    }
+
+    /// The account linked to GitHub id `github_id` on `host`, if any.
+    pub async fn account_for_github(&self, host: &str, github_id: u64) -> Result<Option<String>> {
+        let host = normalize_github_host(host)?;
+        let Ok(id) = i64::try_from(github_id) else {
+            return Ok(None);
+        };
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                "SELECT account FROM github_link WHERE host = ?1 AND github_id = ?2",
+                vec![Value::Text(host), Value::Integer(id)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
+    }
+
+    /// Every GitHub link, by account.
+    pub async fn github_links(&self) -> Result<Vec<GithubLink>> {
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link ORDER BY account"),
+                (),
+            )
+            .await
+            .context("reading the GitHub links")?;
+        let mut links = Vec::new();
+        while let Some(row) = rows.next().await.context("reading the GitHub links")? {
+            links.push(github_link_from_row(&row));
+        }
+        Ok(links)
+    }
+
+    /// Refresh the cached login of an account's link after a rename on
+    /// GitHub. False when the account has no link.
+    pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE github_link SET login = ?2 WHERE account = ?1",
+                vec![Value::Text(account), Value::Text(login.to_string())],
+            )
+            .await
+            .context("updating the GitHub login")?;
+        Ok(changed > 0)
+    }
+
+    /// Record that the stored user token is gone; the link stays. False when
+    /// the account has no link.
+    pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE github_link SET token_live = 0 WHERE account = ?1",
+                vec![Value::Text(account)],
+            )
+            .await
+            .context("marking the GitHub token gone")?;
+        Ok(changed > 0)
+    }
+
+    /// Remove an account's GitHub link. True when there was one.
+    pub async fn unlink_github(&self, account: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM github_link WHERE account = ?1",
+                vec![Value::Text(account)],
+            )
+            .await
+            .context("removing the GitHub link")?;
+        Ok(changed > 0)
+    }
+
+    /// Remember the GitHub webhook delivery `id`, received now. True when it
+    /// is new, false when a delivery with this id was received in the last
+    /// day (a replay, which does no work). See
+    /// [`AuthStore::remember_delivery_at`].
+    pub async fn remember_delivery(&self, id: &str) -> Result<bool> {
+        self.remember_delivery_at(id, chrono::Utc::now().timestamp())
+            .await
+    }
+
+    /// [`AuthStore::remember_delivery`] at `now` (unix seconds). Deliveries
+    /// received more than [`DELIVERY_KEPT_SECS`] before `now` are pruned
+    /// first, in the same transaction, so the table holds one day and an id
+    /// older than that counts as new. The id is GitHub's
+    /// `X-GitHub-Delivery`, stored as given.
+    pub async fn remember_delivery_at(&self, id: &str, now: i64) -> Result<bool> {
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("remembering a GitHub delivery")?;
+        let result = async {
+            self.conn
+                .execute(
+                    "DELETE FROM github_delivery WHERE received_at < ?1",
+                    vec![Value::Integer(now.saturating_sub(DELIVERY_KEPT_SECS))],
+                )
+                .await
+                .context("pruning the GitHub deliveries")?;
+            let inserted = self
+                .conn
+                .execute(
+                    "INSERT INTO github_delivery (id, received_at) VALUES (?1, ?2)
+                     ON CONFLICT (id) DO NOTHING",
+                    vec![Value::Text(id.to_string()), Value::Integer(now)],
+                )
+                .await
+                .context("remembering a GitHub delivery")?;
+            Ok(inserted > 0)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Forget the GitHub webhook delivery `id`, so a redelivery of it is
+    /// handled: called when handling it failed.
+    pub async fn forget_delivery(&self, id: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM github_delivery WHERE id = ?1",
+                vec![Value::Text(id.to_string())],
+            )
+            .await
+            .context("forgetting a GitHub delivery")?;
+        Ok(())
     }
 
     /// Create an account for an identity nobody has seen before, and link it,
@@ -4148,6 +4491,60 @@ impl AuthStore {
         private: bool,
         owner: &str,
     ) -> Result<VisibilityWrite> {
+        self.write_visibility(domain, private, owner, true).await
+    }
+
+    /// Make a domain whose access follows GitHub private, recording `set_by`
+    /// as the one who chose it: the visibility half of connecting a GitHub
+    /// domain with readers `private` on an instance with a GitHub App.
+    ///
+    /// The same write as [`AuthStore::set_domain_visibility`] with `private =
+    /// true` (an already-private domain is left exactly as it stands), with
+    /// one difference: `set_by` may be the reserved machine owner's name,
+    /// [`crate::scope::OWNER_IDENTITY_NAME`], which no account holds, so the
+    /// live-account check is skipped for it. That is safe here and nowhere
+    /// else: on a governed domain the row means only "private", and its
+    /// `owner` and every membership row are never read (`decide_governed`
+    /// in the scope module). Any other `set_by` must still name a live
+    /// account.
+    pub async fn set_governed_private(
+        &self,
+        domain: &str,
+        set_by: &str,
+    ) -> Result<VisibilityWrite> {
+        let is_owner = normalize_account_name(set_by)? == crate::scope::OWNER_IDENTITY_NAME;
+        self.write_visibility(domain, true, set_by, !is_owner).await
+    }
+
+    /// Delete the acl row of `domain` and nothing else: the undo of
+    /// [`AuthStore::set_governed_private`] for a connect whose registration
+    /// failed after the row was written. No membership row is touched, so it
+    /// can never drop a member somebody else invited. Answers whether there
+    /// was a row.
+    pub async fn take_back_governed_private(&self, domain: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        let had = self.acl_of(&domain).await?.is_some();
+        self.conn
+            .execute(
+                "DELETE FROM domain_acl WHERE domain = ?1",
+                vec![Value::Text(domain.clone())],
+            )
+            .await
+            .with_context(|| format!("taking back the private record of domain '{domain}'"))?;
+        Ok(had)
+    }
+
+    /// The write behind [`AuthStore::set_domain_visibility`] and
+    /// [`AuthStore::set_governed_private`]; `check_owner` is whether a
+    /// privatizing write requires `owner` to be a live account.
+    async fn write_visibility(
+        &self,
+        domain: &str,
+        private: bool,
+        owner: &str,
+        check_owner: bool,
+    ) -> Result<VisibilityWrite> {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -4170,7 +4567,9 @@ impl AuthStore {
             if let Some(acl) = self.acl_of(&domain).await? {
                 return Ok(VisibilityWrite::AlreadyPrivate { owner: acl.owner });
             }
-            self.require_live_user(&owner).await?;
+            if check_owner {
+                self.require_live_user(&owner).await?;
+            }
             // Delete then insert rather than an upsert clause: two plain
             // statements inside the transaction that already serializes them,
             // with no dependence on which conflict syntax the embedded
@@ -4228,6 +4627,8 @@ impl AuthStore {
     /// which is how a caller can tell a private domain's records from a shared
     /// domain's absence of them.
     ///
+    /// Its Reflection collaborators go too, in the same transaction.
+    ///
     /// Write-list entries naming the domain are left alone: they match nothing
     /// until a domain of that name exists again.
     pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
@@ -4239,6 +4640,13 @@ impl AuthStore {
         let result = async {
             let was_private = self.acl_of(&domain).await?.is_some();
             self.delete_members_of_domain(&domain).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_reflection_grant WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
             self.conn
                 .execute(
                     "DELETE FROM domain_acl WHERE domain = ?1",
@@ -4253,9 +4661,9 @@ impl AuthStore {
     }
 
     /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
-    /// its `domain_member` rows and its `overlay_grant` rows (the draft
+    /// its `domain_member` rows, its `overlay_grant` rows (the draft
     /// share-links, revoked ones included, so the history stays with the
-    /// domain), in one transaction. For a domain rename, which has already
+    /// domain) and its Reflection collaborators, in one transaction. For a domain rename, which has already
     /// decided the name changes; this decides nothing.
     ///
     /// The renamed domain's records win. Rows already under `new` while `old`
@@ -4337,6 +4745,8 @@ impl AuthStore {
                 "SELECT 1 FROM domain_acl WHERE domain = ?1",
                 "SELECT 1 FROM domain_member WHERE domain = ?1",
                 "SELECT 1 FROM overlay_grant WHERE domain = ?1",
+                // A shared domain's grants are its only rows here.
+                "SELECT 1 FROM domain_reflection_grant WHERE domain = ?1",
             ] {
                 if self
                     .query_first(sql, vec![Value::Text(old.clone())])
@@ -4358,9 +4768,11 @@ impl AuthStore {
                 "DELETE FROM domain_acl WHERE domain = ?2",
                 "DELETE FROM domain_member WHERE domain = ?2",
                 "DELETE FROM overlay_grant WHERE domain = ?2",
+                "DELETE FROM domain_reflection_grant WHERE domain = ?2",
                 "UPDATE domain_acl SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_member SET domain = ?2 WHERE domain = ?1",
                 "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
+                "UPDATE domain_reflection_grant SET domain = ?2 WHERE domain = ?1",
             ] {
                 self.conn
                     .execute(sql, names.clone())
@@ -4654,6 +5066,161 @@ impl AuthStore {
             )
             .await?;
         Ok(reflection_level_from_db(row.and_then(|r| cell_text(&r, 0))))
+    }
+
+    /// Give `account` the Reflection level `level` on `domain`, or change the
+    /// level it holds there. A grant only raises what the account's engram
+    /// access gives (see `crate::scope`); it works on a shared and on a
+    /// private domain alike and opens no engram. The caller checks that the
+    /// domain is kept as files: this store does not know how a domain is
+    /// kept.
+    ///
+    /// Refused, inside the transaction that writes:
+    ///
+    /// * [`ReflectionLevel::Default`], which grants nothing; removing the
+    ///   grant says that ([`RefusalKind::EmptyMembership`]);
+    /// * an account that does not exist or is disabled, and the reserved
+    ///   name [`crate::scope::OWNER_IDENTITY_NAME`], which is the machine
+    ///   owner and curates every domain anyway ([`RefusalKind::NoSuchAccount`]).
+    ///
+    /// `added_by` is recorded as given (trimmed) and may not be empty.
+    pub async fn set_reflection_grant(
+        &self,
+        domain: &str,
+        account: &str,
+        level: ReflectionLevel,
+        added_by: &str,
+    ) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let added_by = added_by.trim().to_string();
+        if added_by.is_empty() {
+            bail!("recording a Reflection collaborator needs an actor to record it as");
+        }
+        if level == ReflectionLevel::Default {
+            return Err(refuse(
+                RefusalKind::EmptyMembership,
+                format!(
+                    "a Reflection collaborator needs the level reader or contributor; \
+                     to take '{account}' off domain '{domain}', use remove"
+                ),
+            ));
+        }
+        if account == crate::scope::OWNER_IDENTITY_NAME {
+            return Err(refuse(
+                RefusalKind::NoSuchAccount,
+                format!("'{account}' is the reserved name of the machine owner, not an account"),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let context = || format!("giving '{account}' the Reflection of domain '{domain}'");
+        let _guard = self.guard.lock().await;
+        self.begin_immediate().await.with_context(context)?;
+        let result = async {
+            self.require_live_user(&account).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                    vec![Value::Text(domain.clone()), Value::Text(account.clone())],
+                )
+                .await
+                .with_context(context)?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_reflection_grant (domain, account, level, added_by, added_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(account.clone()),
+                        Value::Text(level.as_str().to_string()),
+                        Value::Text(added_by.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(context)?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Take `account`'s Reflection grant on `domain` away. Answers whether
+    /// there was one.
+    pub async fn remove_reflection_grant(&self, domain: &str, account: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                vec![Value::Text(domain.clone()), Value::Text(account.clone())],
+            )
+            .await
+            .with_context(|| {
+                format!("taking the Reflection of domain '{domain}' from '{account}'")
+            })?;
+        Ok(changed > 0)
+    }
+
+    /// Every Reflection collaborator of `domain`, by account name.
+    pub async fn reflection_grants(&self, domain: &str) -> Result<Vec<ReflectionGrant>> {
+        let domain = normalize_domain(domain)?;
+        let context = || format!("listing the Reflection collaborators of domain '{domain}'");
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT account, level, added_by, added_at FROM domain_reflection_grant
+                 WHERE domain = ?1 ORDER BY account",
+                vec![Value::Text(domain.clone())],
+            )
+            .await
+            .with_context(context)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.with_context(context)? {
+            let Some(account) = cell_text(&row, 0) else {
+                continue;
+            };
+            let level = reflection_level_from_db(cell_text(&row, 1));
+            // An unreadable level grants nothing, so it is not listed as
+            // a grant either.
+            if level == ReflectionLevel::Default {
+                continue;
+            }
+            out.push(ReflectionGrant {
+                account,
+                level,
+                added_by: cell_text(&row, 2).unwrap_or_default(),
+                added_at: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `account`'s Reflection grant on `domain`, or `None` when it holds
+    /// none. A level this build cannot read is none: it fails closed.
+    pub async fn reflection_grant(
+        &self,
+        domain: &str,
+        account: &str,
+    ) -> Result<Option<ReflectionLevel>> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let row = self
+            .query_first(
+                "SELECT level FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                vec![Value::Text(domain), Value::Text(account)],
+            )
+            .await?;
+        Ok(
+            match reflection_level_from_db(row.and_then(|r| cell_text(&r, 0))) {
+                ReflectionLevel::Default => None,
+                level => Some(level),
+            },
+        )
     }
 
     /// Every private domain, by name. This is the whole input to the
@@ -4961,6 +5528,20 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Drop every Reflection grant `name` holds, for the reason
+    /// [`AuthStore::delete_memberships_of`] drops its membership rows: the
+    /// next account to take the name must not inherit them.
+    async fn delete_reflection_grants_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_reflection_grant WHERE account = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the Reflection grants of user '{name}'"))?;
+        Ok(())
+    }
+
     /// The two conflict checks and the insert that make one link, with no
     /// lock taken and no transaction opened.
     ///
@@ -5100,6 +5681,18 @@ impl AuthStore {
             row.as_ref().map(|row| row.get_value(0)),
             Some(Ok(Value::Integer(present))) if present != 0
         ))
+    }
+
+    /// Drop the GitHub link of one account, inside the removal transaction.
+    async fn delete_github_link_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM github_link WHERE account = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the GitHub link of user '{name}'"))?;
+        Ok(())
     }
 
     /// Drop every identity linked to one account. Called inside the removal
@@ -5467,6 +6060,48 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A GitHub delivery id is new once: the second time within a day it is
+    /// a replay.
+    #[tokio::test]
+    async fn a_delivery_is_remembered_once() {
+        let (_dir, store) = store().await;
+        assert!(store.remember_delivery("d-1").await.unwrap());
+        assert!(!store.remember_delivery("d-1").await.unwrap());
+        assert!(store.remember_delivery("d-2").await.unwrap());
+    }
+
+    /// A delivery older than a day is pruned, so its id counts as new again;
+    /// one younger than a day stays.
+    #[tokio::test]
+    async fn a_delivery_older_than_a_day_is_forgotten() {
+        let (_dir, store) = store().await;
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            store
+                .remember_delivery_at("old", now - 86_401)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .remember_delivery_at("young", now - 86_399)
+                .await
+                .unwrap()
+        );
+        assert!(store.remember_delivery_at("old", now).await.unwrap());
+        assert!(!store.remember_delivery_at("young", now).await.unwrap());
+    }
+
+    /// A delivery whose handling failed is forgotten, so GitHub's redelivery
+    /// is handled.
+    #[tokio::test]
+    async fn a_forgotten_delivery_is_new_again() {
+        let (_dir, store) = store().await;
+        assert!(store.remember_delivery("d-1").await.unwrap());
+        store.forget_delivery("d-1").await.unwrap();
+        assert!(store.remember_delivery("d-1").await.unwrap());
     }
 
     #[tokio::test]
@@ -6521,6 +7156,58 @@ mod tests {
         assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
     }
 
+    /// A governed domain made private at connect names who chose it. The
+    /// machine owner holds no account, so its reserved name is taken without
+    /// the live-account check; any other name still needs a live account,
+    /// and an already-private domain is left as it stands.
+    #[tokio::test]
+    async fn set_governed_private_takes_the_owner_name_and_leaves_a_private_domain_alone() {
+        let (_dir, store) = store().await;
+        assert_eq!(
+            store.set_governed_private("kb", "Owner").await.unwrap(),
+            VisibilityWrite::Written
+        );
+        assert_eq!(
+            store.domain_visibility("kb").await.unwrap().unwrap().owner,
+            "owner"
+        );
+        assert!(store.set_governed_private("ops", "nobody").await.is_err());
+        assert!(store.domain_visibility("ops").await.unwrap().is_none());
+        assert_eq!(
+            store.set_governed_private("kb", "owner").await.unwrap(),
+            VisibilityWrite::AlreadyPrivate {
+                owner: "owner".to_string()
+            }
+        );
+    }
+
+    /// Taking back a connect's private record deletes the acl row and no
+    /// membership row.
+    #[tokio::test]
+    async fn take_back_governed_private_deletes_only_the_acl_row() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .add_user("bea", "Bea", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .set_domain_visibility("kb", true, "ada")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("kb", "bea", MemberLevel::Viewer, None, "ada")
+            .await
+            .unwrap();
+        assert!(store.take_back_governed_private("kb").await.unwrap());
+        assert!(store.domain_visibility("kb").await.unwrap().is_none());
+        assert_eq!(store.domain_members("kb").await.unwrap().len(), 1);
+        assert!(!store.take_back_governed_private("kb").await.unwrap());
+    }
+
     /// The machine owner's own name is not a login.
     ///
     /// `owner` is the actor key every private draft the CLI, the control socket
@@ -7093,7 +7780,16 @@ mod tests {
                 .await
                 .unwrap();
             let conn = db.connect().unwrap();
-            let old = SCHEMA.replace("    reflection TEXT,\n", "");
+            // The per-domain grants table came later still (0.30.0).
+            let grants = SCHEMA
+                .find("CREATE TABLE IF NOT EXISTS domain_reflection_grant")
+                .unwrap();
+            let old = format!(
+                "{}{}",
+                &SCHEMA[..grants],
+                SCHEMA[grants..].split_once(";\n").unwrap().1
+            );
+            let old = old.replace("    reflection TEXT,\n", "");
             assert!(!old.contains("reflection"), "both columns are left out");
             conn.execute_batch(&old).await.unwrap();
         }
@@ -7109,6 +7805,10 @@ mod tests {
             ReflectionLevel::Default
         );
         assert_eq!(auth.user("ann").await.unwrap().unwrap().role, Role::None);
+        // The grants table is made on open.
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "keeper")
+            .await
+            .unwrap();
         auth.set_reflection_level("ann", ReflectionLevel::Contributor)
             .await
             .unwrap();
@@ -10612,6 +11312,336 @@ mod tests {
         assert!(
             text.contains(&minted.id.to_string()),
             "while the id still prints: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_github_id_links_to_one_account_per_host() {
+        let (_dir, auth) = store().await;
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+        }
+        let link = auth
+            .link_github("ann", "GitHub.com", 42, "ann-gh")
+            .await
+            .unwrap();
+        assert_eq!(link.host, "github.com");
+        assert_eq!(link.github_id, 42);
+        assert!(link.token_live);
+        let err = auth
+            .link_github("bea", "github.com", 42, "other")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::GithubIdTaken)
+        );
+        assert!(err.to_string().contains(
+            "this GitHub account is already linked to another Crystalline account; an admin can unlink it there"
+        ));
+        // The same id on another host is another person.
+        auth.link_github("bea", "ghe.example.com", 42, "bea-ghe")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.account_for_github("github.com", 42)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ann")
+        );
+        assert_eq!(
+            auth.account_for_github("ghe.example.com", 42)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bea")
+        );
+        assert_eq!(
+            auth.account_for_github("github.com", 7).await.unwrap(),
+            None
+        );
+        assert_eq!(auth.github_links().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn relinking_replaces_the_row() {
+        let (_dir, auth) = store().await;
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 1, "old")
+            .await
+            .unwrap();
+        auth.mark_github_token_gone("ann").await.unwrap();
+        let link = auth
+            .link_github("ann", "github.com", 2, "new")
+            .await
+            .unwrap();
+        assert_eq!(link.github_id, 2);
+        assert!(link.token_live, "a fresh link has a live token");
+        let all = auth.github_links().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].login, "new");
+        assert_eq!(
+            auth.account_for_github("github.com", 1).await.unwrap(),
+            None
+        );
+        // The same id again is a relink of one's own row, not a conflict.
+        auth.link_github("ann", "github.com", 2, "renamed")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.github_link_of("ann").await.unwrap().unwrap().login,
+            "renamed"
+        );
+        auth.set_github_login("ann", "again").await.unwrap();
+        assert_eq!(
+            auth.github_link_of("ann").await.unwrap().unwrap().login,
+            "again"
+        );
+        assert!(auth.unlink_github("ann").await.unwrap());
+        assert!(!auth.unlink_github("ann").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_removes_its_link() {
+        let (_dir, auth) = store().await;
+        auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+        }
+        auth.link_github("ann", "github.com", 5, "ann")
+            .await
+            .unwrap();
+        auth.link_github("bea", "github.com", 6, "bea")
+            .await
+            .unwrap();
+        auth.remove_user("ann").await.unwrap();
+        auth.remove_user_force("bea").await.unwrap();
+        assert!(auth.github_links().await.unwrap().is_empty());
+        auth.add_user("cy", "Cy", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("cy", "github.com", 5, "cy").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn marking_the_token_gone_keeps_the_link() {
+        let (_dir, auth) = store().await;
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 9, "ann")
+            .await
+            .unwrap();
+        assert!(auth.mark_github_token_gone("ann").await.unwrap());
+        let link = auth.github_link_of("ann").await.unwrap().unwrap();
+        assert!(!link.token_live);
+        assert_eq!(link.github_id, 9);
+        assert!(!auth.mark_github_token_gone("nobody").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_old_database_gains_the_table_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        {
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let start = SCHEMA
+                .find("CREATE TABLE IF NOT EXISTS github_link")
+                .unwrap();
+            let end = start + SCHEMA[start..].find("github_link_host_id").unwrap();
+            let end = end + SCHEMA[end..].find(";\n").unwrap() + 2;
+            let old = format!("{}{}", &SCHEMA[..start], &SCHEMA[end..]);
+            assert!(!old.contains("github_link"));
+            conn.execute_batch(&old).await.unwrap();
+        }
+        let auth = AuthStore::open(&path).await.unwrap();
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 3, "ann")
+            .await
+            .unwrap();
+        assert_eq!(auth.github_links().await.unwrap().len(), 1);
+    }
+
+    // ---- Per-domain Reflection collaborators (Task 3.4) ----
+
+    async fn reflection_grant_cast(auth: &AuthStore) {
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Viewer, "pw12345678")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reflection_grant_is_stored_listed_and_removed() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "Ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("eng", "bea", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        // A second write changes the level of the one row.
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Contributor, "keeper")
+            .await
+            .unwrap();
+        let grants = auth.reflection_grants("eng").await.unwrap();
+        let seen: Vec<(&str, ReflectionLevel, &str)> = grants
+            .iter()
+            .map(|g| (g.account.as_str(), g.level, g.added_by.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("ann", ReflectionLevel::Contributor, "keeper"),
+                ("bea", ReflectionLevel::Contributor, "boss"),
+            ]
+        );
+        assert_eq!(
+            auth.reflection_grant("eng", "ann").await.unwrap(),
+            Some(ReflectionLevel::Contributor)
+        );
+        assert_eq!(auth.reflection_grant("ops", "ann").await.unwrap(), None);
+        assert!(auth.remove_reflection_grant("eng", "ANN").await.unwrap());
+        assert!(!auth.remove_reflection_grant("eng", "ann").await.unwrap());
+        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_default_grant_is_refused() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        let err = auth
+            .set_reflection_grant("eng", "ann", ReflectionLevel::Default, "boss")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::EmptyMembership)
+        );
+        assert!(format!("{err}").contains("use remove"), "{err}");
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_grant_names_a_live_account() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_disabled("bea", true).await.unwrap();
+        for name in ["nobody", "bea", crate::scope::OWNER_IDENTITY_NAME] {
+            let err = auth
+                .set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                StoreRefusal::kind_of(&err),
+                Some(RefusalKind::NoSuchAccount),
+                "{name}: {err}"
+            );
+        }
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+    }
+
+    /// A shared domain has no acl, member or share-link row, so the grants
+    /// alone must carry the rename. Stale grants under the new name go.
+    #[tokio::test]
+    async fn renaming_a_domain_carries_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("ops", "bea", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        auth.rename_domain("eng", "ops").await.unwrap();
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        let moved: Vec<String> = auth
+            .reflection_grants("ops")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.account)
+            .collect();
+        assert_eq!(moved, vec!["ann".to_string()]);
+        // Again after a crash: nothing under the old name, nothing changes.
+        auth.rename_domain("eng", "ops").await.unwrap();
+        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_domain_drops_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("ops", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        assert!(!auth.forget_domain("eng").await.unwrap());
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
+    }
+
+    /// A grant left behind would be inherited by the next account to take
+    /// the name, as a membership row would.
+    #[tokio::test]
+    async fn removing_an_account_drops_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        for name in ["ann", "bea"] {
+            auth.set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
+                .await
+                .unwrap();
+        }
+        auth.remove_user("ann").await.unwrap();
+        auth.remove_user_force("bea").await.unwrap();
+        auth.add_user("ann", "ann", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
+    }
+
+    /// Making a domain shared forgets its members, never its Reflection
+    /// collaborators: a grant does not depend on the visibility.
+    #[tokio::test]
+    async fn a_grant_outlives_a_visibility_change_and_a_transfer() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_domain_visibility("eng", true, "bea")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "bea")
+            .await
+            .unwrap();
+        auth.add_user("cy", "cy", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        auth.transfer_domain("eng", "cy").await.unwrap();
+        auth.set_domain_visibility("eng", false, "cy")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.reflection_grant("eng", "ann").await.unwrap(),
+            Some(ReflectionLevel::Reader)
         );
     }
 }

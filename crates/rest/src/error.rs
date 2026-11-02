@@ -29,6 +29,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 
+use crate::auth_store::GITHUB_ID_TAKEN;
 use crate::engine::{EngineError, FILE_HOSTED_MARK, FILE_NO_HOST_MARK, ONLY_ELSEWHERE};
 
 /// An error response in RFC 9457 shape. `title` is a short stable slug a
@@ -192,6 +193,30 @@ impl ApiError {
         ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             title: "too many requests",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+            home_url: None,
+        }
+    }
+
+    /// A 408 for a body that did not arrive in time.
+    pub fn request_timeout(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            title: "request timeout",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+            home_url: None,
+        }
+    }
+
+    /// A 413 for a body larger than the route takes.
+    pub fn payload_too_large(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            title: "payload too large",
             detail: detail.into(),
             token_required: None,
             retry_after: None,
@@ -656,6 +681,13 @@ impl From<EngineError> for ApiError {
             EngineError::Conflict(ref text) if text.contains(ONLY_ELSEWHERE) => {
                 ApiError::conflict(detail)
             }
+            // And a seventh: a GitHub account that is already linked to
+            // another Crystalline account. The request is fine; the GitHub
+            // account is taken until an admin unlinks it there, and the
+            // store's sentence says so.
+            EngineError::Conflict(ref text) if text.contains(GITHUB_ID_TAKEN) => {
+                ApiError::conflict(detail)
+            }
             // And a sixth: a write into a file domain another instance on
             // this shared database hosts. The request is fine; this instance
             // is not the one that writes the domain.
@@ -697,8 +729,10 @@ impl From<anyhow::Error> for ApiError {
 /// them, since its message is the way out of a situation the request itself
 /// created and a 500 would file it as a server fault, and an organization
 /// policy refusal (single sign-on, OAuth app restrictions) beside it, which
-/// names the page that clears it - and a repository or proposal that does not
-/// exist becomes a 404.
+/// names the page that clears it, and a GitHub App not installed on the
+/// repository, whose message is the install url - and a repository or
+/// proposal that does not exist becomes a 404. An endpoint the GitHub server
+/// does not offer stays a 500.
 fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> ApiError {
     use crystalline_remote::RemoteError;
     match e {
@@ -712,6 +746,8 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }
+        | RemoteError::AppCredential(_)
+        | RemoteError::EndpointMissing { .. }
         | RemoteError::BaseUnavailable => internal_error(detail),
         RemoteError::RepoNotFound { .. }
         | RemoteError::NotADomain { .. }
@@ -726,6 +762,8 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
+        | RemoteError::AppNotInstalled { .. }
+        | RemoteError::UserNotFound { .. }
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }
@@ -788,6 +826,17 @@ mod tests {
         );
         let floored = ApiError::service_unavailable("busy").retry_after(0);
         assert_eq!(floored.retry_after, Some(1), "a wait is never zero seconds");
+    }
+
+    /// A GitHub account linked to another Crystalline account is a 409 that
+    /// carries the store's sentence, not the 422 a plain conflict gets.
+    #[test]
+    fn a_github_account_linked_elsewhere_is_409_with_the_sentence() {
+        let err: ApiError = EngineError::Conflict(GITHUB_ID_TAKEN.to_string()).into();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.detail, GITHUB_ID_TAKEN);
+        let plain: ApiError = EngineError::Conflict("something else".to_string()).into();
+        assert_eq!(plain.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

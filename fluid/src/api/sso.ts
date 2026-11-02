@@ -84,6 +84,15 @@ export function ssoSignInUrl(returnTo?: string): string {
 }
 
 /**
+ * The provider sign-in, landing on `path` afterwards: an absolute path on
+ * this instance that already carries the base path, such as an API route.
+ * {@link ssoSignInUrl} is the same for a screen of this app.
+ */
+export function ssoSignInUrlTo(path: string): string {
+  return `${API_BASE}/auth/oidc/login?return_to=${encodeURIComponent(path)}`;
+}
+
+/**
  * Start a sign-on that links its identity to the account already signed in,
  * and hand back where to navigate.
  *

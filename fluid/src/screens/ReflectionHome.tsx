@@ -41,6 +41,8 @@ import {
   DestructiveAction,
   READ_ONLY_REASON,
 } from "../components/DestructiveAction";
+import { GithubLinkHint } from "../components/GithubLinkHint";
+import { useUnlinkedFromGithub } from "../githubLink";
 import { useReflectionStatus } from "../components/ReflectionModeSwitch";
 import { ReflectionStateNotice } from "../components/ReflectionStateNotice";
 import { Avatar } from "../components/ReflectionThreads";
@@ -110,11 +112,24 @@ export default function ReflectionHome(): ReactElement {
       {s.state === "on" && (
         <OnHome domain={domain} mayWritePact={atLeast(s.right, "curate")} />
       )}
+      <UnlinkedReflectionHint
+        show={s.governance === "github" && s.private && !s.engramsVisible}
+      />
       {/* In every state, not only while it is on: a member must be able to
           leave a domain whose Reflection is pending or paused too. */}
       {s.member && !s.engramsVisible && <LeaveDomain domain={domain} />}
     </div>
   );
+}
+
+/** The unlinked hint on a private GitHub domain's Reflection. */
+function UnlinkedReflectionHint({
+  show,
+}: {
+  show: boolean;
+}): ReactElement | null {
+  const unlinked = useUnlinkedFromGithub(show);
+  return unlinked ? <GithubLinkHint /> : null;
 }
 
 function OnHome({

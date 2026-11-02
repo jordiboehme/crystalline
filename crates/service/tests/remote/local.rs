@@ -122,6 +122,9 @@ impl LocalMachine {
                 host: "github.com".to_string(),
                 user: "mock-user".to_string(),
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
             })
             .unwrap();
         }
@@ -785,7 +788,7 @@ async fn an_origin_added_beside_a_mount_steps_aside_and_a_copy_says_it_is_hidden
 
     let report = machine
         .engine
-        .origin_add("acme/other", Some("open"), None, Some("main"), None)
+        .origin_add("acme/other", Some("open"), None, Some("main"), None, None)
         .await
         .unwrap();
     assert_eq!(report["domain"], "open-local", "{report}");
@@ -797,7 +800,7 @@ async fn an_origin_added_beside_a_mount_steps_aside_and_a_copy_says_it_is_hidden
 
     let report = machine
         .engine
-        .origin_add("acme/platform", None, None, Some("main"), None)
+        .origin_add("acme/platform", None, None, Some("main"), None, None)
         .await
         .unwrap();
     assert_eq!(report["domain"], "platform-local", "{report}");
@@ -872,7 +875,7 @@ async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
     let set = machine.mount();
     let report = machine
         .engine
-        .origin_add("acme/platform", None, None, Some("main"), None)
+        .origin_add("acme/platform", None, None, Some("main"), None, None)
         .await
         .unwrap();
     let root = std::path::PathBuf::from(report["root"].as_str().unwrap());

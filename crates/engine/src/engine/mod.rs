@@ -692,6 +692,38 @@ pub trait ConnectAuth: Send + Sync {
         api_url: Option<&str>,
         token: &str,
     ) -> std::result::Result<String, RemoteError>;
+
+    /// Starts a GitHub App's device-flow sign-in, which sends no scope (an
+    /// App's permissions are its own). By default the same call as
+    /// [`ConnectAuth::start_device_flow`], so a test double that only
+    /// answers that one serves both.
+    async fn start_app_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        self.start_device_flow(auth_base, client_id).await
+    }
+
+    /// Runs a started device flow to completion, returning the whole grant:
+    /// a GitHub App's user token comes with a refresh token and its expiry,
+    /// which a link must keep. By default the token of
+    /// [`ConnectAuth::run_device_flow`] with nothing else, the shape of a
+    /// token that never expires.
+    async fn run_device_flow_grant(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<crystalline_remote::UserTokenGrant, RemoteError> {
+        let access_token = self.run_device_flow(auth_base, client_id, start).await?;
+        Ok(crystalline_remote::UserTokenGrant {
+            access_token,
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
+        })
+    }
 }
 
 /// The production [`ConnectAuth`]: delegates straight to
@@ -705,7 +737,8 @@ impl ConnectAuth for RealConnectAuth {
         auth_base: &str,
         client_id: &str,
     ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
-        crystalline_remote::github::auth::start_device_flow(auth_base, client_id).await
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, Some("repo"))
+            .await
     }
 
     async fn run_device_flow(
@@ -714,7 +747,9 @@ impl ConnectAuth for RealConnectAuth {
         client_id: &str,
         start: &crystalline_remote::DeviceFlowStart,
     ) -> std::result::Result<String, RemoteError> {
-        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start)
+            .await
+            .map(|grant| grant.access_token)
     }
 
     async fn validate_token(
@@ -723,6 +758,23 @@ impl ConnectAuth for RealConnectAuth {
         token: &str,
     ) -> std::result::Result<String, RemoteError> {
         crystalline_remote::github::auth::validate_token(api_url, token).await
+    }
+
+    async fn start_app_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, None).await
+    }
+
+    async fn run_device_flow_grant(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<crystalline_remote::UserTokenGrant, RemoteError> {
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
     }
 }
 
@@ -1126,6 +1178,24 @@ pub struct Engine {
     // leaves it as - reads exactly as an instance whose credential names
     // nobody. Production code never sets this either.
     origin_provider_override_login: Option<String>,
+    // The GitHub App this instance runs, read from the environment or the App
+    // store on the first origin operation that needs a credential (see
+    // `Engine::github_app_slot`). With no App it stays `Absent` and every
+    // provider is built from the instance credential exactly as before.
+    github_app: std::sync::RwLock<github_app::AppState>,
+    // The clock the App memory measures a failed keychain read against;
+    // `Instant::now` outside tests (see `Engine::with_app_clock`).
+    app_clock: github_app::AppClock,
+    // The clock a GitHub web-flow link's pending state is aged by;
+    // `Instant::now` outside tests (see `Engine::with_link_clock`).
+    link_clock: github_app::AppClock,
+    // The single-use links an agent session handed its person, keyed by
+    // nonce and aged on the link clock (see `Engine::mint_github_link`).
+    github_link_invites: std::sync::Mutex<github::LinkInvites>,
+    // Test-only: answers the App store read in place of the keychain and the
+    // file, so a test can stage a keychain that fails and then recovers.
+    #[cfg(any(test, feature = "testing"))]
+    app_store_lookup: Option<github_app::AppLookupFn>,
     // The Reflections marked for their backup commit, in memory: a restart
     // before a due backup loses the mark, and the next change marks it again
     // and commits both (the backup diffs the whole folder).
@@ -1180,6 +1250,11 @@ pub struct Engine {
     // a `connect` landing later - in this process or a standalone CLI writing
     // the same keychain item - is picked up on the very next call.
     github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    // One lock per account whose App user token is being refreshed, so two
+    // shares that find it expiring refresh it once: GitHub spends a refresh
+    // token on use, and a second exchange of the same one would be refused
+    // and cost the person their token. See `Engine::personal_user_token`.
+    personal_refresh: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -1306,6 +1381,15 @@ pub struct Engine {
     // file appear while the stack runs, the readers are unknown again and
     // the check fails closed until a restart installs the resolver.
     domain_access_absent: std::sync::OnceLock<std::path::PathBuf>,
+    // Who reads and writes the domains connected to GitHub through the
+    // GitHub App: one governor and one cache per engine, built on the first
+    // `Engine::knowledge_governor` and handed to every `DomainAccess` this
+    // engine is served through (the engine's own and the JSON API's), so
+    // they all answer from the same snapshots.
+    github_governor: std::sync::OnceLock<Arc<GithubGovernor>>,
+    // Whether a background load of the App slot is running
+    // (`Engine::preload_github_app`), so a request never starts a second one.
+    app_loading: Arc<std::sync::atomic::AtomicBool>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -1618,7 +1702,7 @@ pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
 pub use crystalline_core::threads::ThreadTarget;
-pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE};
+pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE, REPO_READERS_UNKNOWN};
 pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
@@ -1745,6 +1829,13 @@ const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and th
 /// that can say something sharper says it in its own layer.
 const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
 
+/// [`PERSONAL_TOKEN_MISSING`] on an instance with a GitHub App, where a
+/// person links GitHub through the App instead of connecting a token: what a
+/// `personal` share by an identity without an App user token is refused
+/// with. The machine owner has no account to link and connects without
+/// `--as`; its token alone is what its shares go out on.
+const PERSONAL_LINK_MISSING: &str = "This instance shares with personal GitHub identities through its GitHub App. Link yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal --as <account>' (without --as for this machine's owner), then share again.";
+
 /// The refusal an HTTP-MCP write gets when this instance shares personally and
 /// no agent identity is configured. HTTP MCP carries no user auth, so there is
 /// nobody to resolve a credential for until an admin names the account those
@@ -1799,12 +1890,15 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 ///
 /// Matched on the frozen text rather than on a variant of its own, because that
 /// text IS the distinguishing fact - [`PERSONAL_TOKEN_MISSING`] is produced at
-/// exactly one place ([`Engine::resolve_share_credential`]) and every other
+/// exactly one place ([`Engine::resolve_share_credential`]), its App
+/// counterpart [`PERSONAL_LINK_MISSING`] only where an App user token is
+/// missing or gone (`Engine::personal_user_token`), and every other
 /// refusal a preview can meet (an unset agent identity, a name no credential can
 /// be addressed under, no instance connection at all, an unreadable store) has
 /// to keep standing for both kinds of caller.
 fn is_personal_token_missing(e: &EngineError) -> bool {
-    matches!(e, EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING)
+    matches!(e, EngineError::Remote(RemoteError::Refused(text))
+        if text == PERSONAL_TOKEN_MISSING || text == PERSONAL_LINK_MISSING)
 }
 
 /// Turns a write failure on a PERSONAL credential into the teaching error that
@@ -2409,6 +2503,12 @@ impl Engine {
             moves_waiting: std::sync::atomic::AtomicUsize::new(0),
             origin_provider_override: None,
             origin_provider_override_login: None,
+            github_app: std::sync::RwLock::new(github_app::AppState::new()),
+            app_clock: Arc::new(Instant::now),
+            link_clock: Arc::new(Instant::now),
+            github_link_invites: std::sync::Mutex::new(github::LinkInvites::default()),
+            #[cfg(any(test, feature = "testing"))]
+            app_store_lookup: None,
             backup_marks: Default::default(),
             backup_held: Default::default(),
             reflection_walks: Default::default(),
@@ -2418,6 +2518,7 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             github_tokens: Arc::default(),
+            personal_refresh: std::sync::Mutex::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
@@ -2443,6 +2544,8 @@ impl Engine {
             domain_access: std::sync::OnceLock::new(),
             domain_access_unavailable: std::sync::OnceLock::new(),
             domain_access_absent: std::sync::OnceLock::new(),
+            github_governor: std::sync::OnceLock::new(),
+            app_loading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
@@ -3186,8 +3289,8 @@ impl Engine {
         if matches!(scope, crate::scope::Scope::Unrestricted) {
             return Ok(None);
         }
-        let visibility = access
-            .visibility(scope)
+        let visibility = self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let Some(mut hidden) = visibility.hidden else {
@@ -3234,8 +3337,8 @@ impl Engine {
         if matches!(scope, crate::scope::Scope::Unrestricted) {
             return Ok(crate::scope::DomainScreen::All);
         }
-        Ok(access
-            .visibility(scope)
+        Ok(self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
             .screen())
@@ -3261,6 +3364,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::DomainRight::Own);
         };
+        let scope = &self.scope_on(scope, domain);
         access.right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3281,6 +3385,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::DomainRight::Own);
         };
+        let scope = &self.scope_on(scope, domain);
         access.write_right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3560,6 +3665,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::ReflectionRight::Curate);
         };
+        let scope = &self.scope_on(scope, domain);
         access.reflection_right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3577,6 +3683,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };
+        let scope = &self.scope_on(scope, domain);
         access
             .reflection_list_refuses(scope, domain, need)
             .await
@@ -3601,6 +3708,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };
+        let scope = &self.scope_on(scope, domain);
         let answer = match needed {
             None => access.write_list_excludes(scope, domain).await,
             Some(needed) => access.write_list_refuses(scope, domain, needed).await,
@@ -3735,8 +3843,8 @@ impl Engine {
                 crate::read_limit::hidden().unwrap_or_default(),
             ));
         };
-        let visibility = access
-            .visibility(scope)
+        let visibility = self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut hidden = visibility.hidden.unwrap_or_default();
@@ -4172,31 +4280,41 @@ impl Engine {
                 continue;
             }
             // A page that cites a domain fewer people may read than this one
-            // is held back with its threads, its baseline and the files only
+            // is held back with its threads and the files only
             // it links: the branch is read by the repository's people, not
             // by this domain's readers.
             let mut held_pages: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
-                held_pages = self.too_wide_pages(&domain).await?;
-                let assets = self.held_assets(&domain, &held_pages).await?;
+                let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
+                // Decided from the bytes that go out as well as from the
+                // index: a file edited on disk before the index read it is
+                // held back too.
+                let files = crystalline_remote::reflections_backup::collect_backup(&spec, &root)?;
+                let mut pages: BTreeSet<String> =
+                    self.too_wide_pages(&domain).await?.into_iter().collect();
+                pages.extend(self.too_wide_in_files(&domain, &spec, &files).await?);
+                held_pages = pages.into_iter().collect();
+                let assets = self
+                    .held_assets(&domain, &held_pages, &spec, &files)
+                    .await?;
                 let held: std::collections::BTreeSet<String> = held_pages
                     .iter()
                     .flat_map(|page| {
+                        // The baselines never go out at all
+                        // (`reflections_backup::collect_backup`).
                         [
                             page.clone(),
                             crystalline_core::reflection::threads_path(page),
-                            crystalline_core::reflection::baseline_path(page),
                         ]
                     })
                     .chain(assets)
                     .collect();
-                let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
-                Ok(crystalline_remote::reflections_backup::backup_reflections(
+                Ok(crystalline_remote::reflections_backup::backup_collected(
                     provider.as_ref(),
                     &spec,
-                    &root,
                     &state_dir,
                     &format!("Back up the Reflection of {domain}"),
+                    files,
                     &held,
                 )
                 .await?)
@@ -4395,6 +4513,42 @@ impl Engine {
     pub fn with_connect_auth(mut self, auth: Arc<dyn ConnectAuth>) -> Engine {
         self.connect_auth = auth;
         self
+    }
+
+    /// Answer the GitHub App store read with `lookup` instead of the keychain
+    /// and the file. Test-only: lets a test stage a keychain read that fails
+    /// and one that later succeeds, which the real keychain cannot be made
+    /// to do on demand.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_app_store_lookup(mut self, lookup: github_app::AppLookupFn) -> Engine {
+        self.app_store_lookup = Some(lookup);
+        self
+    }
+
+    /// Read `clock` instead of the system clock for how long a failed App
+    /// keychain read is remembered. Test-only: lets a test step past the
+    /// minute instead of waiting for it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_app_clock(mut self, clock: github_app::AppClock) -> Engine {
+        self.app_clock = clock;
+        self
+    }
+
+    /// Read `clock` instead of the system clock for the age of a GitHub
+    /// web-flow link in flight (see [`Engine::link_clock_now`]). Test-only:
+    /// lets a test step past the ten minutes a state lives instead of
+    /// waiting for them.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_link_clock(mut self, clock: github_app::AppClock) -> Engine {
+        self.link_clock = clock;
+        self
+    }
+
+    /// The moment a GitHub web-flow link in flight is measured against: when
+    /// it started and whether its state has expired. The system clock
+    /// outside tests.
+    pub fn link_clock_now(&self) -> Instant {
+        (self.link_clock)()
     }
 
     /// Force the GitHub token store to a plain file under `dir`, never the
@@ -5276,6 +5430,15 @@ impl Engine {
             Some(root) if !entry.is_virtual() => ContentSource::File { root },
             _ => ContentSource::Virtual,
         }
+    }
+
+    /// Whether `name` is a registered domain kept as files (a folder on
+    /// disk), as opposed to a virtual domain kept in the database. A name
+    /// this engine does not register is not. Per-domain Reflection
+    /// collaborators are given only on a domain kept as files.
+    pub fn kept_as_files(&self, name: &str) -> bool {
+        self.domain_entry(name)
+            .is_ok_and(|entry| matches!(self.source_of(&entry), ContentSource::File { .. }))
     }
 
     /// Whether this domain reviews changes before they land. A name nobody
@@ -7342,11 +7505,25 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
+pub use github::{NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK};
+mod github_access;
+pub use github_access::{
+    CLOSE_GRACE, CONFIRM_TIMEOUT, ClosedDomain, FRESH_FOR, GithubEventOutcome, GithubGovernor,
+    GithubPerson, Invalidate, RETRY_AFTER_FAILURE, RepoReaders, STALE_FOR, as_mcp_call, level_for,
+};
+mod github_app;
+pub use github_app::{
+    APP_ALREADY_CONFIGURED, APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus,
+    SettledApp, UnusableApp, marker_names_host,
+};
+#[cfg(any(test, feature = "testing"))]
+pub use github_app::{AppKeychainSeam, AppLookupFn};
 mod kept;
 mod move_;
 mod name_report;
 mod names;
 mod origins;
+pub use origins::READERS_REQUIRED;
 mod read;
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};
@@ -7503,7 +7680,9 @@ pub struct GithubConnection {
     pub connected: bool,
     /// The account login, when connected.
     pub user: Option<String>,
-    /// "keyring" | "file" | "environment", when connected.
+    /// "keyring" | "file" | "environment", when connected; "GitHub App"
+    /// when only the instance's GitHub App connects it (then `user` is the
+    /// App's bot login, when known).
     pub token_store: Option<String>,
     /// A device flow waiting for the browser side.
     pub pending: Option<GithubPending>,
@@ -7547,7 +7726,69 @@ pub struct GithubIdentity {
     pub pending: Option<GithubPending>,
     /// The once-reported failure of this account's last device flow.
     pub error: Option<String>,
+    /// Set only by a disconnect that went through the App unlink and could
+    /// not revoke the token at GitHub: [`UNLINKED_NOT_REVOKED`].
+    pub warning: Option<String>,
 }
+
+/// One account's link to a GitHub account, as the profile and the CLI show
+/// it. Carries no token material: who the account is linked to, since when,
+/// whether the user token is still live, and the device flow's poll.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubLinkView {
+    /// Whether the account is linked.
+    pub linked: bool,
+    /// The GitHub login last seen for the linked id.
+    pub login: Option<String>,
+    /// GitHub's numeric user id.
+    pub github_id: Option<u64>,
+    /// The GitHub host of the link: `github.com` or the Enterprise Server
+    /// host.
+    pub host: Option<String>,
+    /// When the link was made.
+    pub linked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// False once the user token is known to be gone (revoked, or its
+    /// refresh token expired): the link stays and the person links again to
+    /// share personally.
+    pub token_live: bool,
+    /// This account's link device flow waiting for the browser side.
+    pub pending: Option<GithubPending>,
+    /// The once-reported failure of this account's last link device flow.
+    pub error: Option<String>,
+    /// Whether this instance has a GitHub App to link through, usable or
+    /// refused (a refused one still means the person should link, once an
+    /// admin fixes it). The profile picks its GitHub card by this.
+    pub app_configured: bool,
+}
+
+/// What [`Engine::unlink_github`] did, so a surface can tell the person
+/// whether the token still works at GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubUnlink {
+    /// The account had no link; nothing was touched.
+    NotLinked,
+    /// The link and its token are gone here, and GitHub revoked the token
+    /// (or no token was left to revoke).
+    Unlinked,
+    /// The link and its token are gone here, but the token could not be
+    /// revoked at GitHub (unreachable, refused, or the App has no client
+    /// secret), so it stays valid there until it expires.
+    NotRevoked,
+}
+
+impl GithubUnlink {
+    /// The sentence to tell the person, when there is one:
+    /// [`UNLINKED_NOT_REVOKED`] for [`GithubUnlink::NotRevoked`].
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            GithubUnlink::NotRevoked => Some(UNLINKED_NOT_REVOKED),
+            GithubUnlink::NotLinked | GithubUnlink::Unlinked => None,
+        }
+    }
+}
+
+/// What an unlink tells the person when GitHub did not revoke the token.
+pub const UNLINKED_NOT_REVOKED: &str = "unlinked here; GitHub could not be reached to revoke the token, revoke it in your GitHub settings";
 
 /// One in-flight GitHub device-flow sign-in, held by
 /// [`Engine::pending_connect`] so a second `configure` connect call while
@@ -8543,7 +8784,11 @@ fn default_branch_refusal(repo: &str, e: RemoteError) -> EngineError {
         RemoteError::AuthExpired
         | RemoteError::NotConnected
         | RemoteError::SsoAuthorizationRequired { .. }
-        | RemoteError::OauthAppRestricted { .. } => e.into(),
+        | RemoteError::OauthAppRestricted { .. }
+        // A credential problem, which naming a branch would not fix: the App
+        // is not installed on the repository, or cannot be used at all.
+        | RemoteError::AppNotInstalled { .. }
+        | RemoteError::AppCredential(_) => e.into(),
         other => RemoteError::Refused(format!(
             "could not read the default branch of {repo} ({other}), so nothing was added; \
              name the branch to track (--branch on the command line, branch in add_domain \
@@ -11424,6 +11669,9 @@ mod share_actor_tests {
                 host: "github.com".to_string(),
                 user: user.to_string(),
                 created_at: Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
             })
             .unwrap();
     }

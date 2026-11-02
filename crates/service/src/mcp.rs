@@ -294,6 +294,10 @@ const WRITE_TOOLS: [&str; 7] = [
     "remove_domain",
 ];
 
+/// What `add_domain` with `repo` and no `readers` is told on an instance
+/// with a GitHub App.
+const ADD_DOMAIN_NEEDS_READERS: &str = "add_domain needs readers: shared (everyone signed in) or private (only people with access on GitHub)";
+
 /// The Reflection tools hidden in read-only mode: `reflect` for the reason
 /// `evolve_engrams` is (every item it returns prescribes a write), the other
 /// two because they write. `read_reflection` is a read and stays listed.
@@ -566,6 +570,10 @@ enum Disclosure {
     /// A person may be behind the session, and its client cannot ask them:
     /// the write goes on, and a refusal says how they still can.
     NobodyToAsk,
+    /// A yes could not be recorded (who reads the page's GitHub repository
+    /// is not known right now): nobody is asked, and the write is refused
+    /// with why.
+    Refused(EngineError),
 }
 
 /// How long a disclosure question waits for its person: the second round of a
@@ -2066,6 +2074,8 @@ impl McpServer {
     /// accounts to hold a level, and every agent reaching it writes exactly
     /// what it always wrote. Step one still runs for it, and a private domain
     /// is invisible to it, so there is nothing there for step two to protect.
+    /// The one exception is a domain GitHub governs: there the open tier is
+    /// decided as `github.agent_identity`, and without one it never writes.
     ///
     /// That carve-out is read from the setting that creates the tier rather
     /// than from the absence of an identity, which are not the same statement.
@@ -2084,7 +2094,11 @@ impl McpServer {
             .require_domain(domain, scope)
             .await
             .map_err(to_error)?;
-        if matches!(scope, Scope::Anonymous) && !self.engine.auth_mcp() {
+        // Not on a domain GitHub governs: there the open tier is decided as
+        // `github.agent_identity`, or as anonymous (which never writes)
+        // without one (`Engine::write_access_block` asks through
+        // `Engine::scope_on`).
+        if self.engine.open_tier_carve_out(scope, domain) {
             return Ok(None);
         }
         // The role and the write list are asked whatever the lock says, so a
@@ -3336,7 +3350,7 @@ impl McpServer {
     #[tool(
         name = "move_engram",
         title = "Move engram",
-        description = "Move, rename or re-home an engram: a new path, a new permalink, a new domain, or any mix, as the knowledge base is reorganized. A move is a refactoring, so use this tool, never write_engram plus delete_engram, which loses recorded_at and the generated provenance. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. Every reference follows the engram to its new address: [[old]] and [[domain:old]] wikilinks, relation bullets and crystalline://domain/old URLs (a #fragment is kept) are rewritten in every domain you can see, and the receipt counts them (links_rewritten engrams, references_rewritten references, rewritten names them and marks one open in the editor landed live, links_failed names any engram whose references could not be rewritten); a link by title is left alone unless the domain changed. Relative Markdown links ([text](../p.md)) follow the file inside its domain; a move into another domain turns them, in the moved engram and in the engrams that link it, into wikilinks with the domain ([[domain:permalink|text]]), and links_failed names the moved engram when one of its links could not be turned. On a move into another domain the moved engram's own outgoing links follow too: each bare wikilink and relation bullet that resolved in the domain it leaves gains that domain's prefix ([[b]] becomes [[source:b]], a link by title names the permalink and keeps its words as display text, a |display text is kept), a link to the moved engram itself stays bare, and a prefix that names the destination is dropped, in the moved engram and in every destination engram the rewrite touches ([[dest:x]] becomes [[x]]). links_dead names every outgoing link of the moved engram that does not resolve after the move, as { link, reason }, reason unresolved_before for a link that was already dead (a #fragment in a wikilink target never resolves) and unresolved_after for one the move broke; it appears only when there is one. Set update_links to false to skip the rewrite. The permalink: omit it and it follows the move when it was in step with the old path, and stays when it was a deliberate custom one; permalink \"path\" derives it from the destination path, \"keep\" keeps it, any other value is the new permalink. Rename a permalink in place, for example to repair a permalink that drifted off its folder (evolve_engrams V109), by passing the engram's own current path as destination with permalink \"path\". A permalink another engram already holds is refused. A move that changes the address of an engram somebody has open in the editor saves their text first, then closes the editor and tells it the new address. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. A domain's MANIFEST.md cannot be moved away (a file domain needs it): edit it with edit_engram instead, or remove the domain to drop it. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move; a draft keeps its permalink unless you pass one, and references in other engrams follow when the team moves the engram.",
+        description = "Move, rename or re-home an engram: a new path, a new permalink, a new domain, or any mix, as the knowledge base is reorganized. A move is a refactoring, so use this tool, never write_engram plus delete_engram, which loses recorded_at and the generated provenance. The destination may stay inside the same domain: re-filing an engram into a topic subfolder as a cluster forms is a normal move. Every reference follows the engram to its new address: [[old]] and [[domain:old]] wikilinks, relation bullets and crystalline://domain/old URLs (a #fragment is kept) are rewritten in every domain you may write, and the receipt counts them (links_rewritten engrams, references_rewritten references, rewritten names them and marks one open in the editor landed live, links_failed names any engram whose references could not be rewritten, including one in a domain you may only read, whose link is left as it was); a link by title is left alone unless the domain changed. Relative Markdown links ([text](../p.md)) follow the file inside its domain; a move into another domain turns them, in the moved engram and in the engrams that link it, into wikilinks with the domain ([[domain:permalink|text]]), and links_failed names the moved engram when one of its links could not be turned. On a move into another domain the moved engram's own outgoing links follow too: each bare wikilink and relation bullet that resolved in the domain it leaves gains that domain's prefix ([[b]] becomes [[source:b]], a link by title names the permalink and keeps its words as display text, a |display text is kept), a link to the moved engram itself stays bare, and a prefix that names the destination is dropped, in the moved engram and in every destination engram the rewrite touches ([[dest:x]] becomes [[x]]). links_dead names every outgoing link of the moved engram that does not resolve after the move, as { link, reason }, reason unresolved_before for a link that was already dead (a #fragment in a wikilink target never resolves) and unresolved_after for one the move broke; it appears only when there is one. Set update_links to false to skip the rewrite. The permalink: omit it and it follows the move when it was in step with the old path, and stays when it was a deliberate custom one; permalink \"path\" derives it from the destination path, \"keep\" keeps it, any other value is the new permalink. Rename a permalink in place, for example to repair a permalink that drifted off its folder (evolve_engrams V109), by passing the engram's own current path as destination with permalink \"path\". A permalink another engram already holds is refused. A move that changes the address of an engram somebody has open in the editor saves their text first, then closes the editor and tells it the new address. A destination filename of index.md or log.md is refused: both names are reserved for the generated directory index and log. A domain's MANIFEST.md cannot be moved away (a file domain needs it): edit it with edit_engram instead, or remove the domain to drop it. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move; a draft keeps its permalink unless you pass one, and references in other engrams follow when the team moves the engram.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3674,6 +3688,9 @@ impl McpServer {
             Disclosure::Ask(question) => return Ok(question.into()),
             Disclosure::NobodyToAsk => true,
             Disclosure::Go => false,
+            Disclosure::Refused(e) => {
+                return Self::reflection_refused(e).map(CallToolResponse::from);
+            }
         };
         match self.engine.write_reflection(&p, &caller).await {
             Ok(v) => ok(v).map(CallToolResponse::from),
@@ -3718,9 +3735,15 @@ impl McpServer {
         state: Option<String>,
         ctx: &RequestContext<RoleServer>,
     ) -> Disclosure {
-        // An error here is the write's own refusal, and the write gives it.
-        let Ok(Some(ask)) = self.engine.reflection_disclosure_question(p, caller).await else {
-            return Disclosure::Go;
+        // An error here is the write's own refusal, and the write gives it;
+        // except a yes nobody could record, which a person is told instead
+        // of the reach refusal.
+        let ask = match self.engine.reflection_disclosure_question(p, caller).await {
+            Ok(Some(ask)) => Ok(ask),
+            Err(EngineError::Invalid(text)) if text == crate::engine::REPO_READERS_UNKNOWN => {
+                Err(EngineError::Invalid(text))
+            }
+            Ok(None) | Err(_) => return Disclosure::Go,
         };
         if self.gate.unattended
             || self
@@ -3731,6 +3754,10 @@ impl McpServer {
         {
             return Disclosure::Go;
         }
+        let ask = match ask {
+            Ok(ask) => ask,
+            Err(e) => return Disclosure::Refused(e),
+        };
         let key = disclosure_key(p, caller);
         if peer_gets_cache_hints(ctx) {
             if !confirmation_supported(ctx) {
@@ -3833,7 +3860,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), team (marks a domain shared through GitHub; added by the next share from a connected instance, never set), evolve_home (the one instance whose scheduled evolve runs work a team domain; filled in by the first scheduled evolve run at an instance with service.public_url, never set; unset it at the instance that should run evolve to move the home), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. On an instance with a GitHub App, connect (without a token) links the person's own account instead and needs no admin rights: it answers a single-use link in url to relay to the person, who opens it in a browser signed in here as the same account; it works once, within ten minutes. A local stdio session is told the command to run instead (crystalline connect github --personal). The App replaces the instance's own GitHub sign-in there; an admin sets the App with crystalline github app set. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), team (marks a domain shared through GitHub; added by the next share from a connected instance, never set), evolve_home (the one instance whose scheduled evolve runs work a team domain; filled in by the first scheduled evolve run at an instance with service.public_url, never set; unset it at the instance that should run evolve to move the home), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The github block also reports this instance's GitHub App read only (github.app: whether one is configured, its source, app id, client id and slug, whether the client secret and the webhook secret are set, and an error when the App cannot be used, for example a keychain that could not be read); check it when GitHub reads, pulls or shares fail. No secret is ever shown, and the App is never set or removed here: the operator runs crystalline github app set or remove. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3864,11 +3891,19 @@ impl McpServer {
         // CHANGES this instance - a set, an unset, and the three connect
         // fields that decide which GitHub identity it acts as - is an
         // instance change and is gated as one.
+        //
+        // One exception: on an instance with a GitHub App, `connect` without
+        // a token links the caller's own account to GitHub (a single-use link
+        // the person opens), which changes nothing about the instance, so any
+        // account may ask for it. `host` has no say there: the App fixes it.
+        let app_link = p.token.is_none()
+            && p.connect.as_deref() == Some("github")
+            && self.engine.github_app_configured();
         let changes = !p.set.is_empty()
             || !p.unset.is_empty()
-            || p.connect.is_some()
+            || (p.connect.is_some() && !app_link)
             || p.token.is_some()
-            || p.host.is_some();
+            || (p.host.is_some() && !app_link);
         if changes && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
             return refuse(refusal);
         }
@@ -3885,6 +3920,9 @@ impl McpServer {
             return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
         }
 
+        if app_link {
+            return self.github_link_answer(&ctx).await;
+        }
         if p.token.is_some() || p.connect.is_some() {
             let result = match (p.token.as_deref(), p.connect.as_deref()) {
                 (Some(token), _) => {
@@ -3924,10 +3962,70 @@ impl McpServer {
         self.ok_list(snapshot)
     }
 
+    /// `configure` with `connect: "github"` on an instance with a GitHub App:
+    /// a single-use link for the person behind this session to open
+    /// (`Engine::mint_github_link`), never the instance's own device flow.
+    ///
+    /// An unattended session is refused before anything else: it answers
+    /// people it has never met. A session that is not an account (the
+    /// machine owner on stdio, an agent on an instance that does not make
+    /// agents sign in) has nothing to link, so it is answered with the way
+    /// that does exist. Without `service.public_url` there is no address to
+    /// put in a link, so nothing is minted and the answer says so.
+    async fn github_link_answer(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if crystalline_engine::read_limit::current().is_some() {
+            return refuse(crystalline_engine::engine::UNATTENDED_LINK);
+        }
+        let account = match self.scope_of(ctx) {
+            Scope::User { account, .. } => account,
+            Scope::Unrestricted => {
+                return ok(json!({
+                    "connected": false,
+                    "url": Value::Null,
+                    "command": GITHUB_LINK_OWNER_COMMAND,
+                    "next_steps": GITHUB_LINK_OWNER_STEPS,
+                }));
+            }
+            // The agent identity stands in for the open tier on one governed
+            // domain only; it is not the person behind this session.
+            Scope::Anonymous | Scope::Agent { .. } => {
+                return ok(json!({
+                    "connected": false,
+                    "url": Value::Null,
+                    "next_steps": GITHUB_LINK_ANONYMOUS_STEPS,
+                }));
+            }
+        };
+        let config = self.engine.config();
+        let Some(public) = crystalline_engine::settings::public_base(&config) else {
+            return ok(json!({
+                "connected": false,
+                "url": Value::Null,
+                "next_steps": GITHUB_LINK_NO_PUBLIC_URL,
+            }));
+        };
+        let nonce = self.engine.mint_github_link(&account).map_err(to_error)?;
+        ok(json!({
+            "connected": false,
+            "url": public.join(&format!("/api/v1/github/link/go?n={nonce}")),
+            "expires_in": crystalline_engine::pending::PENDING_TTL.as_secs(),
+            "single_use": true,
+            "account": account,
+            "next_steps": format!(
+                "Give this link to the person. They open it in a browser signed in to \
+                 Crystalline as {account} and confirm at GitHub. It works once, within ten \
+                 minutes, and only for that account."
+            ),
+        }))
+    }
+
     #[tool(
         name = "add_domain",
         title = "Add domain",
-        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Without an explicit domain name, the name defaults to the MANIFEST's domain_name, then the folder or repository name. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. On an instance with a GitHub App, a team domain also needs readers: shared (everyone signed in reads it) or private (only people with access to the repository on GitHub read it); access to it follows GitHub, so who may read a possibly confidential repository is always said, never defaulted, and a call without readers is refused. Ask the user when you do not know. Without an App, readers is ignored. Without an explicit domain name, the name defaults to the MANIFEST's domain_name, then the folder or repository name. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3960,6 +4058,26 @@ impl McpServer {
             return Err(to_error(EngineError::Invalid(
                 "add_domain: repo and virtual are mutually exclusive; a team domain is file-backed"
                     .to_string(),
+            )));
+        }
+        if p.repo.is_none() && p.readers.is_some() {
+            return Err(to_error(EngineError::Invalid(
+                "add_domain: readers is for a team domain only; pass it with repo".to_string(),
+            )));
+        }
+        // On an instance with a GitHub App, access to a team domain follows
+        // GitHub and the agent has to say who may read it: asked here in the
+        // tool's own words, before anything is fetched. The engine refuses
+        // the same way for every other surface.
+        // Only once collaboration is on: off, the engine's own refusal says
+        // that first, which is the thing to fix.
+        if p.repo.is_some()
+            && p.readers.is_none()
+            && self.engine.config().github_enabled()
+            && self.engine.github_app_configured()
+        {
+            return Err(to_error(EngineError::Invalid(
+                ADD_DOMAIN_NEEDS_READERS.to_string(),
             )));
         }
 
@@ -4014,6 +4132,7 @@ impl McpServer {
                     p.path.as_deref(),
                     p.branch.as_deref(),
                     p.folder.as_deref(),
+                    p.readers,
                     progress,
                     &scope,
                 )
@@ -5305,9 +5424,12 @@ impl ServerHandler for McpServer {
         } else {
             None
         };
-        let response =
-            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
-                .await;
+        // As one MCP request: only then does the open tier act as
+        // `github.agent_identity` on a domain GitHub governs.
+        let response = crystalline_engine::engine::as_mcp_call(
+            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context)),
+        )
+        .await;
         match (note, response) {
             (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
                 result.content.push(ContentBlock::text(note));
@@ -5894,8 +6016,11 @@ impl ServerHandler for McpServer {
         // An engram's attachment is engram content: an unattended session
         // reads it within its read limit, as it does every tool.
         let limit = self.read_limit(&context).await;
-        crystalline_engine::read_limit::within(limit, self.read_resource_limited(request, context))
-            .await
+        crystalline_engine::engine::as_mcp_call(crystalline_engine::read_limit::within(
+            limit,
+            self.read_resource_limited(request, context),
+        ))
+        .await
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.
@@ -6259,6 +6384,21 @@ fn attach_configure_hint(value: &mut Value, configure_listed: bool) {
         obj.insert("configure".to_string(), json!(CONFIGURE_MANIFEST_HINT));
     }
 }
+
+/// The command that links the machine owner's GitHub identity, which has no
+/// account here to link through the App.
+const GITHUB_LINK_OWNER_COMMAND: &str = "crystalline connect github --personal";
+
+/// What the machine owner on stdio is told instead of a link.
+const GITHUB_LINK_OWNER_STEPS: &str = "This session runs as the machine owner, which has no account here to link a GitHub account to. Run this in a terminal on this machine: crystalline connect github --personal";
+
+/// What an agent that is not signed in as an account is told instead of a
+/// link.
+const GITHUB_LINK_ANONYMOUS_STEPS: &str = "This session is not signed in as an account, so there is no account to link a GitHub account to. The person signs in to Crystalline in a browser and connects GitHub from their profile.";
+
+/// What an agent is told when there is no public address to build a link
+/// with.
+const GITHUB_LINK_NO_PUBLIC_URL: &str = "Linking GitHub through the App needs service.public_url, which this instance does not have. An admin sets it (crystalline config set service.public_url <url>), then ask again.";
 
 /// Why a call naming a domain refuses a connect.
 const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";
@@ -6772,6 +6912,9 @@ fn to_error(e: EngineError) -> ErrorData {
 /// tells the caller the opposite of what the message says. The two
 /// organization-policy refusals sit in that same class for the same reason:
 /// nothing is broken here, and the message names the page that clears it.
+/// A GitHub App that is not installed on the repository joins them for the
+/// same reason (its message is the install url), while an endpoint the
+/// GitHub server does not offer is the server's state, not the caller's.
 /// This match is exhaustive over `RemoteError` so a new variant must be
 /// classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
@@ -6787,6 +6930,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }
+        | RemoteError::AppCredential(_)
+        | RemoteError::EndpointMissing { .. }
         | RemoteError::BaseUnavailable => ErrorData::internal_error(message, None),
         RemoteError::NotEnabled
         | RemoteError::NotConnected
@@ -6801,6 +6946,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
+        | RemoteError::AppNotInstalled { .. }
+        | RemoteError::UserNotFound { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }

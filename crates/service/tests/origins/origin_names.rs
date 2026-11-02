@@ -130,7 +130,7 @@ async fn a_nameless_connect_takes_the_name_the_manifest_declares() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -175,7 +175,7 @@ async fn a_nameless_connect_reads_the_manifest_under_the_subpath() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, Some("team/eng/"), None, None)
+        .origin_add(REPO, None, Some("team/eng/"), None, None, None)
         .await
         .unwrap();
 
@@ -198,7 +198,7 @@ async fn a_taken_manifest_name_steps_and_never_adopts_the_holder() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -238,7 +238,7 @@ async fn a_nameless_connect_without_a_declared_name_uses_the_repo_name() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -270,7 +270,7 @@ async fn the_repo_default_name_still_adopts_an_origin_less_domain_in_place() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -309,7 +309,7 @@ async fn an_explicit_name_at_connect_leaves_the_manifest_untouched() {
 
     let result = r
         .eng
-        .origin_add(REPO, Some("platform"), None, None, None)
+        .origin_add(REPO, Some("platform"), None, None, None, None)
         .await
         .unwrap();
 
@@ -353,7 +353,7 @@ async fn a_failed_manifest_read_falls_back_to_the_repo_name() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -372,7 +372,7 @@ async fn a_nameless_retry_of_a_declaring_repo_is_idempotent() {
 
     let first = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(first["domain"], "eng", "{first}");
@@ -380,7 +380,7 @@ async fn a_nameless_retry_of_a_declaring_repo_is_idempotent() {
 
     let second = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(second["domain"], "eng", "{second}");
@@ -396,7 +396,7 @@ async fn a_nameless_retry_of_a_declaring_repo_is_idempotent() {
     mock.fail_read_file();
     let third = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(third["domain"], "eng", "{third}");
@@ -417,13 +417,13 @@ async fn a_nameless_retry_after_a_step_is_idempotent() {
 
     let first = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(first["domain"], "eng-2", "{first}");
     let second = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(second["domain"], "eng-2", "{second}");
@@ -452,14 +452,14 @@ async fn a_nameless_connect_is_not_answered_by_an_explicitly_named_connection() 
 
     let named = r
         .eng
-        .origin_add(REPO, Some("eng-staging"), None, Some("staging"), None)
+        .origin_add(REPO, Some("eng-staging"), None, Some("staging"), None, None)
         .await
         .unwrap();
     assert_eq!(named["domain"], "eng-staging", "{named}");
 
     let nameless = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(nameless["domain"], "eng", "{nameless}");
@@ -479,7 +479,7 @@ async fn review_mode_right_after_a_named_connect_starts_immediately() {
     let mock = forge(&[("MANIFEST.md", bare_manifest())]);
     let r = rig(tmp.path(), mock, &[]).await;
     r.eng
-        .origin_add(REPO, Some("platform"), None, None, None)
+        .origin_add(REPO, Some("platform"), None, None, None, None)
         .await
         .unwrap();
 
@@ -515,7 +515,7 @@ async fn an_upstream_manifest_edit_after_a_named_connect_pulls_cleanly() {
     let mock = forge(&[("MANIFEST.md", bare_manifest())]);
     let r = rig(tmp.path(), mock.clone(), &[]).await;
     r.eng
-        .origin_add(REPO, Some("platform"), None, None, None)
+        .origin_add(REPO, Some("platform"), None, None, None, None)
         .await
         .unwrap();
 
@@ -556,7 +556,7 @@ async fn a_nameless_connect_finds_the_repo_connected_under_its_declared_name_exp
 
     let named = r
         .eng
-        .origin_add(REPO, Some("eng"), None, None, None)
+        .origin_add(REPO, Some("eng"), None, None, None, None)
         .await
         .unwrap();
     assert_eq!(named["domain"], "eng", "{named}");
@@ -564,7 +564,7 @@ async fn a_nameless_connect_finds_the_repo_connected_under_its_declared_name_exp
 
     let nameless = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(nameless["domain"], "eng", "{nameless}");
@@ -593,7 +593,7 @@ async fn a_nameless_adoption_keeps_an_explicit_name_origin() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
 
@@ -630,7 +630,7 @@ async fn a_local_refusal_of_the_repo_name_is_reported_when_the_forge_cannot_be_a
 
     let err = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap_err();
     assert!(
@@ -656,7 +656,7 @@ async fn a_declared_name_makes_a_refused_repo_name_moot() {
 
     let result = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(result["domain"], "eng", "{result}");
@@ -675,7 +675,7 @@ async fn a_pulled_domain_name_renames_a_derived_team_domain_after_the_pull() {
     let r = rig(tmp.path(), mock.clone(), &[]).await;
     let connected = r
         .eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(connected["domain"], "eng-knowledge", "{connected}");
@@ -738,7 +738,7 @@ async fn fixing_a_local_only_spelling_in_a_team_domain_is_a_local_change() {
     std::fs::write(mine_root.join("runbook.md"), engram("Runbook", "runbook")).unwrap();
     let r = rig(tmp.path(), mock, &[("mine", mine)]).await;
     r.eng
-        .origin_add(REPO, None, None, None, None)
+        .origin_add(REPO, None, None, None, None, None)
         .await
         .unwrap();
     r.eng.sync(None).await.unwrap();

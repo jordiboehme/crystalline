@@ -70,7 +70,9 @@ fn loop_caller(scope: &Scope) -> ReflectionCaller {
     match scope {
         Scope::Unrestricted => ReflectionCaller::owner(),
         Scope::User { account, .. } => ReflectionCaller::person(scope.clone(), account),
-        Scope::Anonymous => ReflectionCaller::person(Scope::Anonymous, "anonymous"),
+        Scope::Anonymous | Scope::Agent { .. } => {
+            ReflectionCaller::person(Scope::Anonymous, "anonymous")
+        }
     }
 }
 
@@ -79,7 +81,7 @@ fn share_actor(scope: &Scope) -> ShareActor {
     match scope {
         Scope::Unrestricted => ShareActor::Owner,
         Scope::User { account, .. } => ShareActor::Account(account.clone()),
-        Scope::Anonymous => ShareActor::HttpAgent,
+        Scope::Anonymous | Scope::Agent { .. } => ShareActor::HttpAgent,
     }
 }
 
@@ -1539,7 +1541,7 @@ impl Engine {
                         lease.holder.account.as_deref() == Some(account.as_str())
                     }
                     Scope::Unrestricted => lease.holder.account.is_none(),
-                    Scope::Anonymous => false,
+                    Scope::Anonymous | Scope::Agent { .. } => false,
                 };
                 if held {
                     out.push((lp, domain.clone()));

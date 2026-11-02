@@ -827,6 +827,9 @@ async fn build_embedded(
     // Reflection page this stack writes reaches every reader of its domain
     // and the backup branch, whether or not anybody reads it over HTTP here.
     install_domain_access(&engine).await;
+    // Env-defined team domains that should be private are closed here too,
+    // without a word: the daemon's start says it once.
+    engine.apply_env_readers_quietly().await?;
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
@@ -1165,6 +1168,7 @@ pub async fn run_tool(
     // A tool run here can write a Reflection page, which reaches every
     // reader of its domain: this command knows them as a daemon would.
     install_domain_access(&engine).await;
+    engine.apply_env_readers_quietly().await?;
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
     }
@@ -1559,6 +1563,7 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    let engine = std::sync::Arc::new(engine);
     // This machine's sources, as the daemon has them: a local copy a
     // connected server hides is refused here too (decision D19).
     if use_daemon(db, config_path) {
@@ -1570,7 +1575,9 @@ pub async fn domain_remove(
         && auth_path.exists()
     {
         let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
-        engine.set_domain_access(std::sync::Arc::new(crate::scope::DomainAccess::new(auth)));
+        engine.set_domain_access(std::sync::Arc::new(
+            crate::scope::DomainAccess::new(auth).with_governor(engine.knowledge_governor()),
+        ));
     }
     let report = engine
         .unregister_domain(name, &Scope::Unrestricted, purge, end_drafts)
@@ -1717,7 +1724,14 @@ pub use crystalline_engine::machine_rename_owner;
 /// ([`Engine::set_domain_access_unavailable`]) and then
 /// refuses every Reflection source outside its page's domain, never lets
 /// one through.
-pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::rest::AuthStore>> {
+pub(crate) async fn install_domain_access(
+    engine: &Arc<Engine>,
+) -> Option<Arc<crate::rest::AuthStore>> {
+    // Who reads a domain connected through the GitHub App follows GitHub,
+    // and the App is loaded off the request path, starting now. The
+    // governor is built first, so the load warms it up when it lands.
+    engine.github_governor();
+    engine.preload_github_app();
     let opened = match crystalline_core::config::web_auth_db_path() {
         // No store yet: no account and no private domain exist, so nothing
         // is opened (or created, which would change this machine's state
@@ -1735,7 +1749,10 @@ pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::
     match opened {
         Ok(auth) => {
             let auth = Arc::new(auth);
-            engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+            engine.set_domain_access(Arc::new(
+                crate::scope::DomainAccess::new(auth.clone())
+                    .with_governor(engine.knowledge_governor()),
+            ));
             Some(auth)
         }
         Err(why) => {
@@ -1884,12 +1901,19 @@ pub async fn domain_review(
 /// model download, and the domain is searchable via text immediately either
 /// way; embedding follows whenever the daemon (or a later `sync --embed`)
 /// gets to it.
+///
+/// `readers` says who may read the domain on an instance with a GitHub App
+/// (see [`Engine::origin_add`]); the standalone fallback installs this
+/// machine's accounts store first, so a private answer is recorded there as
+/// the daemon would record it.
+#[allow(clippy::too_many_arguments)]
 pub async fn origin_add(
     repo: &str,
     domain: Option<&str>,
     path: Option<&str>,
     branch: Option<&str>,
     folder: Option<&str>,
+    readers: Option<crate::params::Readers>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1898,6 +1922,7 @@ pub async fn origin_add(
         && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
             "path": path, "branch": branch, "folder": folder,
+            "readers": readers.map(crate::params::Readers::as_str),
         }))
         .await?
     {
@@ -1905,9 +1930,12 @@ pub async fn origin_add(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let engine =
+        Arc::new(open_standalone_reporting(loaded, &db_path, false, db, config_path).await?);
+    install_domain_access(&engine).await;
+    engine.apply_env_readers_quietly().await?;
     Ok(engine
-        .origin_add(repo, domain, path, branch, folder)
+        .origin_add(repo, domain, path, branch, folder, readers)
         .await?)
 }
 

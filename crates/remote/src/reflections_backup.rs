@@ -71,9 +71,12 @@ fn reflection_folders(root: &Path) -> Result<Vec<PathBuf>, RemoteError> {
 
 /// Every file under `root/reflections` the layout backs up
 /// (`PathClass::backs_up` with the Reflection in effect: pages, the pact,
-/// threads, the hidden baseline and the Reflection's files, never a temp or
-/// stray file), by repo path. A walk error is an error: an entry that cannot
-/// be read must never look like a deleted one.
+/// threads and the Reflection's files, never a temp or stray file), by repo
+/// path, less the hidden baselines under `.reflected/`: they are local state
+/// for telling a person's change apart, and a restore takes the pages as
+/// the baseline. A branch head that still holds one from an earlier backup
+/// loses it with the next commit. A walk error is an error: an entry that
+/// cannot be read must never look like a deleted one.
 pub(crate) fn collect(
     root: &Path,
     subpath: Option<&str>,
@@ -100,7 +103,7 @@ pub(crate) fn collect(
                 continue;
             }
             let rel = crystalline_core::slash_rel(root, entry.path());
-            if !layout.classify(&rel).backs_up() {
+            if !layout.classify(&rel).backs_up() || is_baseline(&rel) {
                 continue;
             }
             let repo = match prefix {
@@ -113,6 +116,17 @@ pub(crate) fn collect(
         }
     }
     Ok(out)
+}
+
+/// Whether the domain-relative path `rel` is a hidden baseline: a file
+/// under `.reflected/` in the Reflection folder (any spelling of its name).
+fn is_baseline(rel: &str) -> bool {
+    rel.split_once('/').is_some_and(|(_, inner)| {
+        matches!(
+            crystalline_core::reflection::classify(inner),
+            crystalline_core::reflection::ReflectionFile::Baseline { .. }
+        ) || inner.starts_with(&format!("{}/", crystalline_core::reflection::BASELINE_DIR))
+    })
 }
 
 fn load(state_dir: &Path) -> BackupState {
@@ -203,8 +217,38 @@ pub async fn backup_reflections(
     message: &str,
     held: &BTreeSet<String>,
 ) -> Result<BackupOutcome, RemoteError> {
+    let files = collect_backup(spec, domain_root)?;
+    backup_collected(provider, spec, state_dir, message, files, held).await
+}
+
+/// The files a backup of the domain at `domain_root` pushes, by repo path,
+/// with their bytes: what [`backup_reflections`] reads from disk. A caller
+/// that decides what to hold back from the very bytes that go out reads
+/// them here and hands them to [`backup_collected`].
+pub fn collect_backup(
+    spec: &OriginSpec,
+    domain_root: &Path,
+) -> Result<BTreeMap<String, Vec<u8>>, RemoteError> {
+    collect(domain_root, spec.subpath.as_deref())
+}
+
+/// The path below the Reflection folder of the repo path `path` a backup of
+/// `spec` collected, or `None` when it is not inside it.
+pub fn reflection_path<'a>(spec: &OriginSpec, path: &'a str) -> Option<&'a str> {
+    inner_path(path, prefix(spec))
+}
+
+/// [`backup_reflections`] for `files` read already ([`collect_backup`]):
+/// exactly these bytes go out, less `held`.
+pub async fn backup_collected(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state_dir: &Path,
+    message: &str,
+    mut files: BTreeMap<String, Vec<u8>>,
+    held: &BTreeSet<String>,
+) -> Result<BackupOutcome, RemoteError> {
     let mut state = load(state_dir);
-    let mut files = collect(domain_root, spec.subpath.as_deref())?;
     if !held.is_empty() {
         let sub = prefix(spec);
         files.retain(|path, _| !inner_path(path, sub).is_some_and(|inner| held.contains(inner)));
@@ -257,16 +301,29 @@ pub async fn backup_reflections(
             commit
         }
         Some(head) => {
-            for path in state.files.keys().filter(|p| !hashes.contains_key(*p)) {
-                // A head this instance did not write may no longer hold the
-                // path (the commit a crash kept from the state removed it
-                // already): a delete goes out only for a path the head holds,
-                // never a delete of nothing.
-                if lost && provider.read_file(spec, &head, path).await?.is_none() {
-                    continue;
-                }
+            // What goes: every file of this Reflection the head holds and
+            // this backup does not send. A head this instance did not write
+            // (a new home, a lost state) is listed, since the state says
+            // nothing of it: a page an earlier home pushed and this one holds
+            // back, or a baseline from before baselines stayed local, must
+            // not stay on it. A delete goes out only for a path the head
+            // holds, never a delete of nothing.
+            let gone: Vec<String> = if lost {
+                crate::archive::tarball_paths(&provider.tarball(spec, &head).await?)?
+                    .into_iter()
+                    .filter(|path| is_ours(path, prefix(spec)) && !hashes.contains_key(path))
+                    .collect()
+            } else {
+                state
+                    .files
+                    .keys()
+                    .filter(|p| !hashes.contains_key(*p))
+                    .cloned()
+                    .collect()
+            };
+            for path in gone {
                 writes.push(TreeWrite {
-                    path: path.clone(),
+                    path,
                     blob_sha: None,
                 });
             }
@@ -304,7 +361,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_paths_carry_the_subpath_and_the_hidden_baseline() {
+    fn repo_paths_carry_the_subpath_and_never_the_hidden_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for rel in [
@@ -322,12 +379,8 @@ mod tests {
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
         assert_eq!(
             paths,
-            [
-                "kb/eng/reflections/.reflected/a.md",
-                "kb/eng/reflections/a.md",
-                "kb/eng/reflections/a.threads.md"
-            ],
-            "the layout's backs_up: the baseline yes, a temp file no"
+            ["kb/eng/reflections/a.md", "kb/eng/reflections/a.threads.md"],
+            "the layout's backs_up less the baselines: a temp file no, the hidden baseline no"
         );
         let root_files = collect(root, None).unwrap();
         assert!(
@@ -347,7 +400,7 @@ mod tests {
         std::fs::write(root.join("reflectionsx/b.md"), "# B\n").unwrap();
         let files = collect(root, None).unwrap();
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
-        assert_eq!(paths, ["Reflections/.reflected/a.md", "Reflections/a.md"]);
+        assert_eq!(paths, ["Reflections/a.md"]);
     }
 
     #[test]

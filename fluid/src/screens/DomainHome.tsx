@@ -78,6 +78,9 @@ import { fetchReflectionTree, reflectionTreeKey } from "../api/reflection";
 import type { TreeNode } from "../api/reflection";
 import { DomainLockChip } from "../components/DomainLockChip";
 import { useDomainWritable } from "../domainWritable";
+import { fetchMembers, governanceOf, membersKey } from "../api/members";
+import { GithubLinkHint } from "../components/GithubLinkHint";
+import { useUnlinkedFromGithub } from "../githubLink";
 import type {
   EngramFilters,
   EngramPage,
@@ -264,7 +267,7 @@ function DomainPage({
   manifestPermalink: string | null;
 }) {
   const { capabilities } = useAuth();
-  const { canWrite, domainLocked } = useDomainWritable(domain);
+  const { canWrite, canShare, domainLocked } = useDomainWritable(domain);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   /**
@@ -694,7 +697,7 @@ function DomainPage({
           behind them are gated the same way; each draws nothing on a domain
           with no origin.
         */}
-        {capabilities.canShare && <TeamBanners domain={domain} />}
+        {canShare && <TeamBanners domain={domain} />}
 
         <ManifestProsePanel
           domain={domain}
@@ -1491,7 +1494,23 @@ function EngramsSection({
    */
   manifestPermalink?: string | null;
 }) {
+  const { user } = useAuth();
   const { canWrite } = useDomainWritable(domain);
+  // The same members read the settings and the danger zone make: whether
+  // GitHub decides here, and whether the domain is shared.
+  // Only for a signed-in account, and never retried: the hint is for an
+  // account that could link GitHub, and a missing hint is no failure.
+  const members = useQuery({
+    queryKey: membersKey(domain),
+    queryFn: () => fetchMembers(domain),
+    enabled: user !== null,
+    retry: false,
+  });
+  const sharedGithub =
+    members.data !== undefined &&
+    governanceOf(members.data).github &&
+    members.data.visibility !== "private";
+  const unlinked = useUnlinkedFromGithub(sharedGithub && !canWrite);
   const newEngramReasonId = useId();
   const filterId = useId();
   const newEngramDisabledReason = renaming ? RENAMING_REASON : undefined;
@@ -1575,6 +1594,7 @@ function EngramsSection({
           )}
         </div>
       </div>
+      {!canWrite && unlinked && <GithubLinkHint />}
       {creating && (
         <CreateEngramDialog
           domain={domain}

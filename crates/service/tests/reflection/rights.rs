@@ -873,3 +873,321 @@ async fn a_feedback_item_counts_a_hidden_source() {
         "the same words an update item carries: {item}"
     );
 }
+
+// ---- Per-domain Reflection collaborators (Task 3.4) ----
+
+/// `eng` private to keeper with a curated page; `ann` an instance viewer
+/// who is no member and holds the Reflection `contributor` grant on `eng`.
+async fn collaborator_engine() -> (crate::fixture::Fx, Arc<AuthStore>, Scope) {
+    let fx = crate::docs::reflecting().await;
+    fx.engine
+        .write_reflection(
+            &crate::docs::write(
+                "guides/night.md",
+                "# Night\n\n## Deploys\n\nDeploys run at night.\n",
+            ),
+            &ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    let auth = Arc::new(
+        AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for name in ["keeper", "ann"] {
+        auth.add_user(name, name, None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng", true, "keeper")
+        .await
+        .unwrap();
+    auth.set_reflection_grant("eng", "ann", ReflectionLevel::Contributor, "keeper")
+        .await
+        .unwrap();
+    fx.engine
+        .set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let ann = Scope::User {
+        account: "ann".into(),
+        admin: false,
+    };
+    (fx, auth, ann)
+}
+
+/// A Reflection collaborator with no engram access finds no engram of the
+/// domain anywhere (search, read, browse, graph, the domain list and the
+/// routing) and works on its Reflection.
+#[tokio::test]
+async fn a_reflection_only_collaborator_sees_no_engram_on_any_surface() {
+    let (fx, _auth, ann) = collaborator_engine().await;
+    sees_no_engram(&fx, &ann).await;
+    let read = fx
+        .engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "runbooks/deploy".into(),
+                domain: Some("eng".into()),
+                share_link: None,
+                include_images: false,
+            },
+            &ann,
+        )
+        .await;
+    assert!(read.is_err(), "{read:?}");
+    let browsed = fx
+        .engine
+        .browse_domain(
+            &crystalline_service::params::BrowseParams {
+                domain: "eng".into(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &ann,
+        )
+        .await;
+    assert!(browsed.is_err(), "{browsed:?}");
+    // The graph answers a hidden anchor exactly as one in a domain nobody
+    // registered.
+    let graph = fx
+        .engine
+        .graph_neighborhood("crystalline://eng/runbooks/deploy", 2, 50, &ann)
+        .await
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string());
+    let ghost = fx
+        .engine
+        .graph_neighborhood("crystalline://ghost/runbooks/deploy", 2, 50, &ann)
+        .await
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        graph,
+        ghost
+            .map(|v| v.replace("ghost", "eng"))
+            .map_err(|e| e.replace("ghost", "eng")),
+        "a hidden anchor answers like an unregistered one"
+    );
+    // The control: the machine owner finds the engram there.
+    let owner = fx
+        .engine
+        .graph_neighborhood(
+            "crystalline://eng/runbooks/deploy",
+            2,
+            50,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+        .to_string();
+    assert!(owner.contains("runbooks/deploy"), "{owner}");
+    let listed = fx
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams {
+                include_routing: true,
+            },
+            &ann,
+        )
+        .await
+        .unwrap()
+        .to_string();
+    assert!(!listed.contains("\"eng\""), "{listed}");
+    // The control: the machine owner's list names it.
+    let all = fx
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams {
+                include_routing: true,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+        .to_string();
+    assert!(all.contains("\"eng\""), "{all}");
+    assert!(!listed.contains("eng:"), "{listed}");
+
+    // The Reflection is there: read, listed with its right, writable.
+    assert_eq!(
+        fx.engine.reflection_right(&ann, "eng").await.unwrap(),
+        ReflectionRight::Edit
+    );
+    let caller = ReflectionCaller::person(ann.clone(), "ann");
+    let status = fx.engine.reflection_status("eng", &caller).await.unwrap();
+    assert_eq!(status["right"], "edit", "{status}");
+    assert_eq!(status["engrams_visible"], false, "{status}");
+    fx.engine
+        .read_reflection("eng", "guides/night.md", &caller)
+        .await
+        .unwrap();
+    searches_night(&fx, &caller).await;
+    fx.engine
+        .write_reflection(&crate::docs::write("guides/a.md", "# A\n"), &caller)
+        .await
+        .unwrap();
+}
+
+/// Who manages the grants over REST, on which domains, and who leaves.
+#[tokio::test]
+async fn reflection_collaborators_are_managed_over_rest() {
+    let s = crate::rest::serve().await;
+    s.auth
+        .add_user("boss", "boss", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let keeper = crate::rest::Session::login(s.addr, "keeper").await;
+    let vera = crate::rest::Session::login(s.addr, "vera").await;
+    let path = "/api/v1/domains/eng/reflection-collaborators";
+
+    // A signed-in stranger meets the answer an unregistered name gets.
+    s.auth
+        .add_user("out", "out", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let out = crate::rest::Session::login(s.addr, "out").await;
+    for domain in ["eng", "ghost"] {
+        let base = format!("/api/v1/domains/{domain}/reflection-collaborators");
+        for (method, url, body) in [
+            (reqwest::Method::GET, base.clone(), None),
+            (
+                reqwest::Method::PUT,
+                format!("{base}/vera"),
+                Some(serde_json::json!({ "level": "reader" })),
+            ),
+            (reqwest::Method::DELETE, format!("{base}/vera"), None),
+            (reqwest::Method::DELETE, format!("{base}/out"), None),
+        ] {
+            let (status, body) = out.send(method.clone(), &url, body).await;
+            assert_eq!(status, 404, "{method} {url}: {body}");
+        }
+    }
+
+    // The owner manages; a viewer member does not, neither listing nor
+    // granting.
+    let (status, body) = keeper
+        .send(
+            reqwest::Method::PUT,
+            &format!("{path}/nora"),
+            Some(serde_json::json!({ "level": "reader" })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let (status, body) = keeper.get(path).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["collaborators"][0]["account"], "nora", "{body}");
+    assert_eq!(body["collaborators"][0]["level"], "reader", "{body}");
+    assert_eq!(body["collaborators"][0]["added_by"], "keeper", "{body}");
+    let (status, _) = vera.get(path).await;
+    assert_eq!(status, 403);
+    let (status, _) = vera
+        .send(
+            reqwest::Method::PUT,
+            &format!("{path}/ed"),
+            Some(serde_json::json!({ "level": "reader" })),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    // Refusals: `default`, an unknown account, the reserved owner name.
+    for (who, level) in [
+        ("nora", "default"),
+        ("nobody", "reader"),
+        ("owner", "reader"),
+    ] {
+        let (status, body) = keeper
+            .send(
+                reqwest::Method::PUT,
+                &format!("{path}/{who}"),
+                Some(serde_json::json!({ "level": level })),
+            )
+            .await;
+        assert_eq!(status, 422, "{who} {level}: {body}");
+    }
+
+    // nora reads no engram of eng and reaches its Reflection.
+    let nora = crate::rest::Session::login(s.addr, "nora").await;
+    let (_, status) = nora.get("/api/v1/domains/eng/reflection").await;
+    assert_eq!(status["collaborator"], true, "{status}");
+    assert_eq!(status["member"], false, "{status}");
+    let (_, listing) = nora.get("/api/v1/reflection/domains").await;
+    assert_eq!(listing["domains"][0]["domain"], "eng", "{listing}");
+    assert_eq!(listing["domains"][0]["engrams_visible"], false);
+    // She takes herself off; a second time the grant is gone and the
+    // domain is unknown to her.
+    let (status, body) = nora
+        .send(reqwest::Method::DELETE, &format!("{path}/nora"), None)
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let (status, _) = nora
+        .send(reqwest::Method::DELETE, &format!("{path}/nora"), None)
+        .await;
+    assert_eq!(status, 404);
+    // Removing a name that holds no grant is a 404 for a manager too.
+    let (status, _) = keeper
+        .send(reqwest::Method::DELETE, &format!("{path}/vera"), None)
+        .await;
+    assert_eq!(status, 404);
+    assert!(s.auth.reflection_grants("eng").await.unwrap().is_empty());
+
+    // A grant left on a name nobody registers any more: its holder still
+    // gives it up, and the row goes.
+    s.auth
+        .set_reflection_grant("gone", "nora", ReflectionLevel::Reader, "boss")
+        .await
+        .unwrap();
+    let (status, body) = nora
+        .send(
+            reqwest::Method::DELETE,
+            "/api/v1/domains/gone/reflection-collaborators/nora",
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(s.auth.reflection_grants("gone").await.unwrap().is_empty());
+}
+
+/// A virtual domain has no Reflection kept as files, so it takes no grant.
+#[tokio::test]
+async fn a_virtual_domain_refuses_a_grant() {
+    let fx = crate::fixture::fixture_with(&[], |cfg, _| {
+        cfg.domains.insert(
+            "vd".into(),
+            crystalline_core::config::DomainEntry::virtual_domain(),
+        );
+    })
+    .await;
+    let s = crate::rest::serve_fx(fx, false).await;
+    s.auth
+        .add_user("boss", "boss", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let boss = crate::rest::Session::login(s.addr, "boss").await;
+    for (method, body) in [
+        (
+            reqwest::Method::PUT,
+            Some(serde_json::json!({ "level": "reader" })),
+        ),
+        (reqwest::Method::DELETE, None),
+    ] {
+        let (status, body) = boss
+            .send(
+                method,
+                "/api/v1/domains/vd/reflection-collaborators/ann",
+                body,
+            )
+            .await;
+        assert_eq!(status, 409, "{body}");
+        assert!(
+            body.to_string()
+                .contains("Reflection collaborators are for domains kept as files"),
+            "{body}"
+        );
+    }
+    let (status, _) = boss
+        .get("/api/v1/domains/vd/reflection-collaborators")
+        .await;
+    assert_eq!(status, 409);
+    assert!(s.auth.reflection_grants("vd").await.unwrap().is_empty());
+}

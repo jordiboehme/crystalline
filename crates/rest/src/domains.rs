@@ -67,6 +67,16 @@ use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
                            `domain_name` change and nobody has finished the \
                            rename or kept the links yet, `null` \
                            otherwise).\n\n\
+                           Every domain carries `may_share`: whether this \
+                           session may drive the domain's share surfaces \
+                           (its sync status, the preview, the share, a \
+                           withdrawal and a conflict), answered by the gate \
+                           those routes use. On a domain GitHub governs it \
+                           follows the GitHub role, so it can be true for an \
+                           instance viewer. A row's `read_only`, sent only \
+                           when true, says this session cannot write into \
+                           the domain; on a domain GitHub governs it follows \
+                           the GitHub role too.\n\n\
                            For an instance admin, `mounted` lists the \
                            domains this machine offers from connected \
                            servers (`crystalline connect`): each one's \
@@ -96,6 +106,7 @@ use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
                     "shadowed": false,
                     "renaming": false,
                     "rename_pending": null,
+                    "may_share": false,
                     "when_to_use": ["Route here for eng questions."]
                 }]
             }),
@@ -127,11 +138,20 @@ pub async fn list(
             &identity.scope(),
         )
         .await?;
-    if reads_only(&identity)
-        && let Some(rows) = value.get_mut("domains").and_then(Value::as_array_mut)
-    {
+    if let Some(rows) = value.get_mut("domains").and_then(Value::as_array_mut) {
         for row in rows {
-            row["read_only"] = json!(true);
+            if reads_only(&identity) {
+                row["read_only"] = json!(true);
+            }
+            // The share routes' own gate, asked per domain, so a client
+            // draws the share surfaces exactly where they are served.
+            let may_share = match row.get("name").and_then(Value::as_str) {
+                Some(name) => super::domains_admin::require_share_role_on(&state, &identity, name)
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            row["may_share"] = json!(may_share);
         }
     }
     // The servers this machine is connected to are its owner's business: an

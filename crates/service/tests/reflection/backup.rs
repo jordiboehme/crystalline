@@ -563,7 +563,7 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
             .count()
     };
     // `ops` moved the branch after `eng`'s backup; `eng` changes one page.
-    // An agent's write is reflected, so the page's baseline moves with it.
+    // Its baseline moves too, but baselines stay on this disk.
     let before = blobs(&mock);
     fx.engine
         .write_reflection(&in_domain("eng", "one.md", "# Changed\n"), &agent())
@@ -573,15 +573,11 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
     assert!(
         matches!(
             again[..],
-            [(_, Ok(BackupOutcome::Committed { files: 2, .. }))]
+            [(_, Ok(BackupOutcome::Committed { files: 1, .. }))]
         ),
         "{again:?}"
     );
-    assert_eq!(
-        blobs(&mock),
-        before + 2,
-        "the changed page and its baseline alone"
-    );
+    assert_eq!(blobs(&mock), before + 1, "the changed page alone");
     // And `ops`, whose head `eng` just moved, has nothing to send.
     fx.engine.mark_reflection_dirty("ops", BackupCause::Settled);
     let ops = fx.engine.reflection_backup_tick(Instant::now()).await;
@@ -589,7 +585,7 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
         matches!(ops[..], [(_, Ok(BackupOutcome::NothingToBackUp))]),
         "{ops:?}"
     );
-    assert_eq!(blobs(&mock), before + 2, "no upload for ops");
+    assert_eq!(blobs(&mock), before + 1, "no upload for ops");
     let head = mock.branch_commit(BACKUP_BRANCH).unwrap();
     let paths = mock.commit_paths(&head);
     assert!(
@@ -1414,4 +1410,50 @@ async fn a_run_on_a_github_domain_reads_no_local_domain() {
         .hidden;
     assert!(limit.contains("harbor"), "{limit:?}");
     assert!(!limit.contains("eng"), "{limit:?}");
+}
+
+/// A new home (or one that lost its backup state) knows nothing of what the
+/// branch head holds. It lists the head and removes every file of this
+/// Reflection it does not send: a held page an earlier home pushed, and a
+/// baseline from before baselines stayed local.
+#[tokio::test]
+async fn a_lost_state_removes_held_pages_and_baselines_from_the_head() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    // A page citing a local domain from this GitHub domain: held back.
+    let forged = "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n";
+    std::fs::write(fx.root.join("reflections/forged.md"), forged).unwrap();
+    // What the branch head holds from an earlier home, with no state here.
+    let head = mock.add_commit(BTreeMap::from([
+        (
+            "reflections/forged.md".to_string(),
+            forged.as_bytes().to_vec(),
+        ),
+        (
+            "reflections/.reflected/a.md".to_string(),
+            b"## One\n<!-- r:bbbb2222 -->\n\nOld.\n".to_vec(),
+        ),
+        ("notes/other.md".to_string(), b"not ours".to_vec()),
+    ]));
+    mock.set_branch(BACKUP_BRANCH, &head);
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    let done = fx
+        .engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    assert!(
+        matches!(done[..], [(_, Ok(BackupOutcome::Committed { .. }))]),
+        "{done:?}"
+    );
+    let paths = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("forged")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains(".reflected")), "{paths:?}");
+    // A path outside this Reflection is never touched.
+    assert!(paths.contains(&"notes/other.md".to_string()), "{paths:?}");
 }

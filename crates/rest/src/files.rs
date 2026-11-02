@@ -386,7 +386,9 @@ pub(crate) fn attachment_response(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the CSRF token is \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the CSRF token is \
                            missing or wrong, the instance is read-only, or a \
                            presented `X-Crystalline-Join` names no live join \
                            of this account's.",
@@ -527,7 +529,9 @@ pub async fn write(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the CSRF token is \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the CSRF token is \
                            missing or wrong, the instance is read-only, or a \
                            presented `X-Crystalline-Join` names no live join \
                            of this account's.",

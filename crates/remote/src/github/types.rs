@@ -88,12 +88,25 @@ pub(super) struct TreeEntryRequest {
     pub(super) sha: Option<String>,
 }
 
-/// `POST .../git/commits` request body.
+/// `POST .../git/commits` request body. `author` and `committer` are left
+/// out unless set, so GitHub records the authenticated identity for both.
 #[derive(Debug, Serialize)]
 pub(super) struct CreateCommitRequest {
     pub(super) message: String,
     pub(super) tree: String,
     pub(super) parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) author: Option<GitActor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) committer: Option<GitActor>,
+}
+
+/// The `author` or `committer` of a `POST .../git/commits`. The date is left
+/// out, so GitHub stamps the time of the request.
+#[derive(Debug, Serialize)]
+pub(super) struct GitActor {
+    pub(super) name: String,
+    pub(super) email: String,
 }
 
 /// `POST .../git/refs` request body.

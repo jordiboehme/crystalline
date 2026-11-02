@@ -392,8 +392,12 @@ pub struct OriginDoctor {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GithubDoctor {
     /// Whether a GitHub token is on file for this machine (or supplied by
-    /// `CRYSTALLINE_GITHUB_TOKEN`).
+    /// `CRYSTALLINE_GITHUB_TOKEN`), or a GitHub App that GitHub accepts is
+    /// configured.
     pub connected: bool,
+    /// Connected only through the GitHub App: no instance token is on file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub connected_through_app: bool,
     /// The connected user's login. `None` when not connected, and also for
     /// the environment token store, whose synthesized identity has no login
     /// attached (see `StoredToken::user_display`).
@@ -405,6 +409,107 @@ pub struct GithubDoctor {
     /// Diagnostics for every domain connected to an origin (filtered by
     /// `--domain` like every other section).
     pub origins: Vec<OriginDoctor>,
+    /// The GitHub App checks, when an App is configured (or one is saved in
+    /// a keychain that could not be read). Absent without an App.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<AppDoctor>,
+}
+
+/// What `doctor` found out about this instance's GitHub App. No secret is
+/// ever part of it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AppDoctor {
+    /// Where the App comes from: `environment`, `keyring` or `file`.
+    pub source: Option<String>,
+    /// Whether the credentials make a usable App: the private key parses and
+    /// the App belongs to the host `github.api_url` points at.
+    pub credentials_parse: bool,
+    /// Whether GitHub accepted the App's signed token on `GET /app`. `None`
+    /// when GitHub could not be asked.
+    pub jwt_accepted: Option<bool>,
+    /// Whether the App's installations could be listed. `None` when that was
+    /// not tried, because the token was refused or GitHub was not reached.
+    pub installations_reachable: Option<bool>,
+    /// `service.public_url` is set, so webhooks can reach this instance, but
+    /// the App has no webhook secret to verify them with.
+    pub webhook_secret_missing: bool,
+    /// GitHub's clock minus this machine's, in seconds, from the `Date` of
+    /// GitHub's answer. Above a minute either way GitHub refuses the App's
+    /// signed token.
+    pub clock_skew_secs: Option<i64>,
+    /// Why the keychain could not be read, when it holds the App and could
+    /// not be read.
+    pub keychain_unreadable: Option<String>,
+    /// Since when (RFC 3339) the running daemon has not learned from GitHub
+    /// who may use the domains connected through the App. `None` while it
+    /// learns, and when no daemon answered.
+    pub role_lookup_degraded_since: Option<String>,
+    /// The permissions the App needs and lacks on GitHub, each as
+    /// `name: level` (`contents: write`). Empty when it has them all, or
+    /// when GitHub did not say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_permissions: Vec<String>,
+    /// The domains the running daemon keeps closed because the App is not
+    /// installed on their repository (only instance admins get in).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub closed_domains: Vec<String>,
+    /// What is wrong, in the words a person acts on; `None` when nothing is.
+    pub problem: Option<String>,
+}
+
+/// Records on `app` what the running daemon's `status` says about access
+/// on the domains connected through the App: since when GitHub has not
+/// answered (with what that means, which differs for an outage and for a
+/// repository GitHub does not show at all), and whether
+/// `github.agent_identity` names an instance admin.
+fn note_role_lookup_outage(app: &mut AppDoctor, daemon_status: Option<&serde_json::Value>) {
+    let Some(status) = daemon_status else {
+        return;
+    };
+    let mut found = Vec::new();
+    if let Some(since) = status["github_access_degraded_since"].as_str() {
+        app.role_lookup_degraded_since = Some(since.to_string());
+        if let Some(stale) = status["github_access_stale_since"].as_str() {
+            found.push(format!(
+                "GitHub has not said who may use the domains connected through the App since {stale}; each last answer stands for an hour past its five minutes, then GitHub grants nobody anything there until it answers again, so check the network, GitHub's status and the App's installation"
+            ));
+        }
+        if found.is_empty()
+            && status["github_access_closed"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        {
+            found.push(format!(
+                "GitHub has not said who may use the domains connected through the App since {since}"
+            ));
+        }
+    }
+    // Each closed domain, with what to do about it.
+    for closed in status["github_access_closed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let (Some(domain), Some(reason)) = (closed["domain"].as_str(), closed["reason"].as_str())
+        else {
+            continue;
+        };
+        found.push(format!("{domain}: {reason}"));
+        app.closed_domains.push(domain.to_string());
+    }
+    if status["github_agent_identity_admin"].as_bool() == Some(true) {
+        found.push(
+            "github.agent_identity names an instance admin; the MCP open tier acts as it with no more than its GitHub role, so name an account that is not an admin".to_string(),
+        );
+    }
+    if found.is_empty() {
+        return;
+    }
+    let found = found.join("; ");
+    app.problem = Some(match app.problem.take() {
+        Some(problem) => format!("{problem}; {found}"),
+        None => found,
+    });
 }
 
 /// One connected server, as doctor checks it.
@@ -1657,6 +1762,9 @@ impl DoctorReport {
                 }
                 n += o.base_mismatches.len();
             }
+            if g.app.as_ref().is_some_and(|a| a.problem.is_some()) {
+                n += 1;
+            }
         }
         // A harness that was never installed is not a problem; an
         // unparseable settings/hooks file or MCP file for one that was is,
@@ -1945,8 +2053,8 @@ pub async fn run(
 
     let environment = check_environment(&loaded.overlay);
 
-    let github = if cfg.github_enabled() {
-        Some(check_github(cfg, &loaded.overlay, &targets)?)
+    let mut github = if cfg.github_enabled() {
+        Some(check_github(cfg, &loaded.overlay, &targets).await?)
     } else {
         None
     };
@@ -1981,6 +2089,11 @@ pub async fn run(
     } else {
         None
     };
+    // Who may use a domain connected through the App is learned by the
+    // daemon; it says since when GitHub has not answered.
+    if let Some(app) = github.as_mut().and_then(|g| g.app.as_mut()) {
+        note_role_lookup_outage(app, daemon_status.as_ref());
+    }
     // Claude Desktop's second state, compared with what the daemon serves,
     // when this run reached the daemon.
     if let Some(registered) = daemon_status
@@ -3993,7 +4106,7 @@ fn mirror_present(cfg: &GlobalConfig, name: &str) -> Option<bool> {
 /// `CRYSTALLINE_GITHUB_TOKEN`, that store is used directly instead of probing
 /// the keychain or the token file, so a headless node's diagnostics never
 /// touch a credential store that variable makes irrelevant.
-fn check_github(
+async fn check_github(
     cfg: &GlobalConfig,
     overlay: &EnvOverlay,
     targets: &[(String, DomainEntry)],
@@ -4063,15 +4176,161 @@ fn check_github(
         });
     }
 
+    let app = check_github_app(cfg, overlay).await;
+    // An App GitHub accepts is a connection of its own: reading, pulling and
+    // sharing go through it without an instance token.
+    let app_connected = app
+        .as_ref()
+        .is_some_and(|a| a.problem.is_none() && a.jwt_accepted == Some(true));
     Ok(GithubDoctor {
-        connected: token.is_some(),
+        connected: token.is_some() || app_connected,
+        connected_through_app: token.is_none() && app_connected,
         user: token
             .as_ref()
             .and_then(|t| t.user_display())
             .map(str::to_string),
         token_store: store.kind().to_string(),
         origins,
+        app,
     })
+}
+
+/// What one App store read means for `doctor`: the saved App and its
+/// store, or what to report instead (`None`: no App, and no section). A
+/// keychain that could not be read is reported only when the marker says an
+/// App for this host is saved there; without it the section stays as it was
+/// before the App existed.
+fn saved_app_for_doctor(
+    found: Result<crystalline_remote::AppLookup, crystalline_remote::RemoteError>,
+    api_url: Option<&str>,
+) -> std::result::Result<(crystalline_remote::AppCredentials, &'static str), Option<Box<AppDoctor>>>
+{
+    use crystalline_remote::AppLookup;
+    match found {
+        Ok(AppLookup {
+            credentials: Some(credentials),
+            store,
+            ..
+        }) => Ok((credentials, store.kind())),
+        Ok(AppLookup {
+            keychain_failed: Some(reason),
+            marker: Some(marker),
+            ..
+        }) if crystalline_service::engine::marker_names_host(&marker, api_url) => {
+            Err(Some(Box::new(AppDoctor {
+                source: Some("keyring".to_string()),
+                problem: Some(format!(
+                    "the GitHub App is saved in the keychain, which could not be read ({reason}); origin operations are refused until it answers, so unlock it, or run crystalline github app remove"
+                )),
+                keychain_unreadable: Some(reason),
+                ..AppDoctor::default()
+            })))
+        }
+        Ok(_) => Err(None),
+        Err(e) => Err(Some(Box::new(AppDoctor {
+            problem: Some(format!("the saved GitHub App could not be read: {e}")),
+            ..AppDoctor::default()
+        }))),
+    }
+}
+
+/// How far GitHub's clock may be from this machine's before `doctor` calls
+/// it a problem. The App's signed token is issued a minute in the past, so
+/// a larger gap gets it refused.
+const MAX_CLOCK_SKEW_SECS: i64 = 60;
+
+/// The GitHub App checks: the credentials make an App, GitHub accepts its
+/// signed token (`GET /app`), the App has the four permissions it needs,
+/// the installations can be listed, the clocks
+/// agree within a minute, and a webhook secret is set when
+/// `service.public_url` lets webhooks in. `None` when no App is configured.
+async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<AppDoctor> {
+    use crystalline_remote::{GithubApp, RemoteError};
+
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    let (credentials, source) = match overlay.github_app(api_url.as_deref()) {
+        Some(Ok(credentials)) => (credentials, "environment"),
+        Some(Err(detail)) => {
+            return Some(AppDoctor {
+                source: Some("environment".to_string()),
+                problem: Some(RemoteError::AppCredential(detail).to_string()),
+                ..AppDoctor::default()
+            });
+        }
+        None => {
+            let home = crystalline_service::engine::AppHome::new(
+                api_url.clone(),
+                config::origins_state_dir().ok()?,
+                false,
+            );
+            match saved_app_for_doctor(home.lookup(), api_url.as_deref()) {
+                Ok(found) => found,
+                Err(report) => return report.map(|report| *report),
+            }
+        }
+    };
+    let mut doctor = AppDoctor {
+        source: Some(source.to_string()),
+        webhook_secret_missing: cfg.service_public_url().is_some()
+            && credentials.webhook_secret.is_none(),
+        ..AppDoctor::default()
+    };
+    let mut problems = Vec::new();
+    match GithubApp::new(api_url, credentials) {
+        Err(e) => problems.push(e.to_string()),
+        Ok(app) => {
+            doctor.credentials_parse = true;
+            let probe = app.probe().await;
+            doctor.clock_skew_secs = probe
+                .server_date
+                .map(|date| (date - chrono::Utc::now()).num_seconds());
+            match &probe.info {
+                Ok(info) => {
+                    doctor.jwt_accepted = Some(true);
+                    doctor.missing_permissions = info.missing_permissions().unwrap_or_default();
+                    if !doctor.missing_permissions.is_empty() {
+                        problems.push(format!(
+                            "the GitHub App lacks the permissions {}; change them in the App's settings on GitHub (Permissions & events), then accept the new permissions on each installation",
+                            doctor.missing_permissions.join(", ")
+                        ));
+                    }
+                }
+                Err(e @ RemoteError::AppCredential(_)) => {
+                    doctor.jwt_accepted = Some(false);
+                    problems.push(e.to_string());
+                }
+                Err(e) => problems.push(format!("GitHub could not be asked about the App: {e}")),
+            }
+            if let Some(skew) = doctor.clock_skew_secs
+                && skew.abs() > MAX_CLOCK_SKEW_SECS
+            {
+                let (gap, way) = if skew > 0 {
+                    (skew, "behind")
+                } else {
+                    (-skew, "ahead of")
+                };
+                problems.push(format!(
+                    "this machine's clock is {gap} seconds {way} GitHub's; GitHub refuses the App's signed token when the clocks are more than a minute apart, so set the clock right"
+                ));
+            }
+            if doctor.jwt_accepted == Some(true) {
+                match app.installations().await {
+                    Ok(_) => doctor.installations_reachable = Some(true),
+                    Err(e) => {
+                        doctor.installations_reachable = Some(false);
+                        problems.push(format!("the App's installations could not be listed: {e}"));
+                    }
+                }
+            }
+        }
+    }
+    if doctor.webhook_secret_missing {
+        problems.push(
+            "service.public_url is set but the GitHub App has no webhook secret, so its webhook deliveries cannot be verified; save one with crystalline github app set --webhook-secret-file or CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET".to_string(),
+        );
+    }
+    doctor.problem = (!problems.is_empty()).then(|| problems.join("; "));
+    Some(doctor)
 }
 
 async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serde_json::Value> {
@@ -5108,7 +5367,12 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(g) = &report.github {
         let _ = writeln!(out, "github:");
-        if g.connected && g.token_store == "environment" {
+        if g.connected_through_app {
+            let _ = writeln!(
+                out,
+                "  connected through the GitHub App (no instance sign-in on file)"
+            );
+        } else if g.connected && g.token_store == "environment" {
             let _ = writeln!(
                 out,
                 "  connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)"
@@ -5126,6 +5390,27 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  not connected ({} token store). Run: crystalline connect github",
                 g.token_store
             );
+        }
+        if let Some(app) = &g.app {
+            let source = app.source.as_deref().unwrap_or("?");
+            match &app.problem {
+                Some(problem) => {
+                    let _ = writeln!(out, "  [problem] GitHub App ({source}): {problem}");
+                }
+                None => {
+                    let mut passed = vec!["key parses"];
+                    if app.jwt_accepted == Some(true) {
+                        passed.push("signed token accepted");
+                    }
+                    if app.installations_reachable == Some(true) {
+                        passed.push("installations reachable");
+                    }
+                    if app.clock_skew_secs.is_some() {
+                        passed.push("clock within a minute of GitHub's");
+                    }
+                    let _ = writeln!(out, "  GitHub App ({source}): {}", passed.join(", "));
+                }
+            }
         }
         if g.origins.is_empty() {
             let _ = writeln!(out, "  no team domains connected to an origin");
@@ -5915,6 +6200,128 @@ mod tests {
     use super::*;
     use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
+
+    #[test]
+    fn doctor_names_the_outage_since() {
+        let since = "2026-10-29T08:15:00+00:00";
+        let status = |stale: Option<&str>, closed: &[&str]| {
+            serde_json::json!({
+                "github_access_degraded_since": since,
+                "github_access_stale_since": stale,
+                "github_access_closed": closed.iter().map(|repo| serde_json::json!({
+                    "domain": "kb",
+                    "repo": repo,
+                    "reason": format!("the GitHub App is not installed on {repo}: install it there or disconnect the domain"),
+                })).collect::<Vec<_>>(),
+            })
+        };
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(&mut app, Some(&status(Some(since), &[])));
+        assert_eq!(app.role_lookup_degraded_since.as_deref(), Some(since));
+        let problem = app.problem.expect("a problem");
+        assert!(problem.contains(since), "{problem}");
+        assert!(problem.contains("stands for an hour"), "{problem}");
+
+        // An earlier problem is kept, the outage is added to it.
+        let mut app = AppDoctor {
+            problem: Some("the key does not parse".to_string()),
+            ..AppDoctor::default()
+        };
+        note_role_lookup_outage(&mut app, Some(&status(Some(since), &[])));
+        let problem = app.problem.expect("a problem");
+        assert!(problem.starts_with("the key does not parse; "), "{problem}");
+
+        // A closed domain is named with its sentence, outage or not.
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(&mut app, Some(&status(None, &["acme/kb"])));
+        let problem = app.problem.expect("a problem");
+        assert!(
+            problem.contains(
+                "kb: the GitHub App is not installed on acme/kb: install it there or disconnect the domain"
+            ),
+            "{problem}"
+        );
+        assert!(!problem.contains("stands for an hour"), "{problem}");
+        assert_eq!(app.closed_domains, vec!["kb".to_string()]);
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({
+                "github_access_degraded_since": null,
+                "github_access_closed": [{"domain": "kb", "repo": "acme/kb", "reason": "the GitHub App is not installed on acme/kb: install it there or disconnect the domain"}],
+            })),
+        );
+        assert!(app.problem.expect("a problem").contains("acme/kb"));
+        assert_eq!(app.role_lookup_degraded_since, None);
+
+        // GitHub answers, or no daemon answered: nothing to say.
+        for status in [
+            Some(serde_json::json!({ "github_access_degraded_since": null })),
+            None,
+        ] {
+            let mut app = AppDoctor::default();
+            note_role_lookup_outage(&mut app, status.as_ref());
+            assert_eq!(app.role_lookup_degraded_since, None);
+            assert_eq!(app.problem, None);
+        }
+    }
+
+    #[test]
+    fn doctor_warns_when_the_agent_identity_is_an_admin() {
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_agent_identity_admin": true })),
+        );
+        let problem = app.problem.expect("a problem");
+        assert!(problem.contains("github.agent_identity"), "{problem}");
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_agent_identity_admin": false })),
+        );
+        assert_eq!(app.problem, None);
+    }
+
+    /// A failed keychain read beside the file store, with `marker`.
+    fn unreadable(marker: Option<&str>) -> crystalline_remote::AppLookup {
+        crystalline_remote::AppLookup {
+            store: crystalline_remote::AppStore::file_fallback(Path::new("/nonexistent")),
+            credentials: None,
+            keychain_failed: Some("no keychain daemon".to_string()),
+            marker: marker.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_keychain_is_a_doctor_problem_only_behind_a_marker_for_this_host() {
+        let api = Some("https://ghe.example.com/api/v3");
+        assert!(
+            matches!(saved_app_for_doctor(Ok(unreadable(None)), api), Err(None)),
+            "no marker: no App section at all"
+        );
+        assert!(
+            matches!(
+                saved_app_for_doctor(Ok(unreadable(Some("github.com"))), api),
+                Err(None)
+            ),
+            "a marker for another host is not a problem here"
+        );
+        match saved_app_for_doctor(Ok(unreadable(Some("GHE.example.com"))), api) {
+            Err(Some(doctor)) => {
+                assert_eq!(
+                    doctor.keychain_unreadable.as_deref(),
+                    Some("no keychain daemon")
+                );
+                let problem = doctor.problem.unwrap();
+                assert!(
+                    problem.contains("crystalline github app remove"),
+                    "{problem}"
+                );
+            }
+            other => panic!("expected a problem, got {other:?}"),
+        }
+    }
 
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
         crystalline_service::RenameOwner {

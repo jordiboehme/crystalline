@@ -364,7 +364,7 @@ pub struct MoveParams {
     pub permalink: Option<String>,
     /// Rewrite every reference to the moved engram when its address changes:
     /// `[[old]]` and `[[domain:old]]` links, relations and `crystalline://domain/old`
-    /// URLs (a #fragment is kept), in every domain you can see. A relative
+    /// URLs (a #fragment is kept), in every domain you may write. A relative
     /// Markdown link ([text](../path.md)) follows the file instead: when the
     /// path changes inside the domain, links to it and its own relative links
     /// are rewritten so they land on the same files. Defaults to true; false
@@ -877,6 +877,46 @@ pub struct AddDomainParams {
     /// default branch, asked from GitHub when the domain is added.
     #[serde(default)]
     pub branch: Option<String>,
+    /// Who may read a team domain: `shared` (everyone signed in) or
+    /// `private` (only people with access on GitHub). Required with `repo`
+    /// on an instance with a GitHub App, because access there follows GitHub
+    /// and nobody should open a confidential repository by accident; ignored
+    /// with a note without an App. Only with `repo`.
+    #[serde(default)]
+    pub readers: Option<Readers>,
+}
+
+/// Who may read a domain connected to GitHub on an instance with a GitHub
+/// App, chosen when it is connected. Access to such a domain follows GitHub:
+/// `shared` lets everyone signed in read it, `private` only the people with
+/// access to the repository on GitHub. Without an App it is not asked and
+/// is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Readers {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access to the repository on GitHub read it.
+    Private,
+}
+
+impl Readers {
+    /// The spelling every surface takes and reports: `shared` or `private`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readers::Shared => "shared",
+            Readers::Private => "private",
+        }
+    }
+
+    /// Reads `shared` or `private`, ignoring case and surrounding space.
+    pub fn parse(value: &str) -> Option<Readers> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "shared" => Some(Readers::Shared),
+            "private" => Some(Readers::Private),
+            _ => None,
+        }
+    }
 }
 
 /// Parameters for `remove_domain`.

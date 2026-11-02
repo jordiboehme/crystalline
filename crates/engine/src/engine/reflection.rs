@@ -1035,7 +1035,10 @@ impl Engine {
         let engrams_visible = self.engrams_visible(&caller.scope, domain).await?;
         // The MCP open tier curates every domain it can see; a private
         // domain stays as invisible to it as to every anonymous caller.
-        let right = if caller.open_tier {
+        // Not on a domain GitHub governs: there it is decided like everybody
+        // else, as `github.agent_identity` when that is set
+        // (`Engine::reflection_right` asks through `Engine::scope_on`).
+        let right = if caller.open_tier && !self.github_governs(domain) {
             if engrams_visible {
                 ReflectionRight::Curate
             } else {
@@ -1115,6 +1118,14 @@ pub(super) fn rooms_to_rewrite<'a>(
 /// `reflections` in another letter case (the classifier's rule, so it is the
 /// Reflection's folder), else `reflections`. A write never puts a second
 /// spelling beside the first.
+/// A page's baseline: its file under `.reflected/`, or, when there is none,
+/// what the page itself stands for ([`r::seed_baseline`]): a Reflection
+/// restored from its backup branch has no baselines, and its pages become
+/// the baseline, so a section still as last reflected is no person's change.
+pub(super) fn baseline_or_seed(file: Option<String>, page: Option<&str>) -> String {
+    file.unwrap_or_else(|| page.map(r::seed_baseline).unwrap_or_default())
+}
+
 pub(super) fn reflection_dir(root: &Path) -> PathBuf {
     let name = r::reflection_folders(root)
         .into_iter()
@@ -1802,7 +1813,7 @@ impl Engine {
         // no person's change (`relink`): a section the writer left alone then
         // matches the stored one, so a respelled alias in it records nobody
         // and owes no feedback.
-        let stored_baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let stored_baseline = baseline_or_seed(read_opt(&baseline_abs)?, current.as_deref());
         let funnel = self
             .spelling_funnel(
                 &caller.scope,
@@ -2053,25 +2064,27 @@ impl Engine {
                 needs,
             }));
         }
-        match p.disclosed.as_deref().filter(|_| by.is_some()) {
+        // The readers of the page's repository the person was asked about:
+        // what their confirmation records.
+        let mut asked_repo_readers = None;
+        if by.is_some() && !needs.is_empty() {
+            let shown = super::disclosure::WritePreview {
+                text: final_text.clone(),
+                needs: needs.clone(),
+            };
+            let asked = self.asked_for_preview(&p.domain, &p.path, &shown).await?;
+            // Nothing to record a yes for while the repository's readers are
+            // unknown, whatever the person answered.
+            self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
             // The person said yes to these readers: still them?
-            Some(basis) if !needs.is_empty() => {
-                let shown = super::disclosure::WritePreview {
-                    text: final_text.clone(),
-                    needs: needs.clone(),
-                };
-                if self
-                    .ask_for_preview(&p.domain, &p.path, &shown)
-                    .await?
-                    .basis
-                    != basis
-                {
-                    return Err(EngineError::Conflict(
-                        super::disclosure::DISCLOSURE_CHANGED.into(),
-                    ));
-                }
+            if let Some(basis) = p.disclosed.as_deref()
+                && asked.ask.basis != basis
+            {
+                return Err(EngineError::Conflict(
+                    super::disclosure::DISCLOSURE_CHANGED.into(),
+                ));
             }
-            _ => {}
+            asked_repo_readers = asked.repo_readers;
         }
         let mut confirmed: Vec<String> = if by.is_some() {
             needs.into_iter().map(|(_, source)| source).collect()
@@ -2143,6 +2156,7 @@ impl Engine {
             &final_text,
             &confirmed,
             by.as_deref(),
+            asked_repo_readers,
         )
         .await?;
         self.mark_reflection_dirty(&p.domain, BackupCause::Settled);
@@ -2460,7 +2474,7 @@ impl Engine {
         // already (the session's `normalize_doc`), and the stored page and
         // its baseline get the same respelling as a link rewrite that is no
         // person's change, so a section nobody touched records nobody.
-        let stored_baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let stored_baseline = baseline_or_seed(read_opt(&baseline_abs)?, current.as_deref());
         let funnel = self
             .spelling_funnel(
                 &crate::scope::Scope::Unrestricted,
@@ -2703,9 +2717,10 @@ impl Engine {
         };
         // A section whose only difference from what was last reflected is a
         // task box is not changed: ticking a box is not something to weigh.
-        let reflected = r::parse_baseline(
-            &read_opt(&access.abs(&r::baseline_path(inner)))?.unwrap_or_default(),
-        );
+        let reflected = r::parse_baseline(&baseline_or_seed(
+            read_opt(&access.abs(&r::baseline_path(inner)))?,
+            Some(&text),
+        ));
         // Who shared a section's text on purpose, and when: for curators,
         // who are the ones to settle the page (`super::disclosure`).
         let disclosures = if access.engrams_visible && access.right >= ReflectionRight::Curate {
@@ -3322,7 +3337,7 @@ impl Engine {
         let text = read_opt(&abs)?.ok_or_else(|| {
             EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
         })?;
-        let baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let baseline = baseline_or_seed(read_opt(&baseline_abs)?, Some(&text));
         let sections = r::split_sections(&text);
         // No ids settles the whole page: every section on it, the top
         // included, and every section its baseline holds that the page no

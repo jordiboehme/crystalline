@@ -259,7 +259,7 @@ impl StreamSlots {
     fn acquire(self: &Arc<Self>, scope: &Scope) -> Option<StreamSlot> {
         let account = match scope {
             Scope::User { account, .. } => Some(account.trim().to_lowercase()),
-            Scope::Unrestricted | Scope::Anonymous => None,
+            Scope::Unrestricted | Scope::Anonymous | Scope::Agent { .. } => None,
         };
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
         if open.total >= self.total {
@@ -723,7 +723,7 @@ fn audience_admits(audience: &DomainAudience, scope: &Scope) -> bool {
         (DomainAudience::Accounts(accounts), Scope::User { account, admin }) => {
             *admin || accounts.contains(&account.trim().to_lowercase())
         }
-        (DomainAudience::Accounts(_), Scope::Anonymous) => false,
+        (DomainAudience::Accounts(_), Scope::Anonymous | Scope::Agent { .. }) => false,
     }
 }
 

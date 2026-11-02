@@ -3187,6 +3187,23 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // A Reflection collaborator: `Manage`, which on a shared domain
+        // only an admin holds; the admin gets through to the store, which
+        // refuses a name that is no account (422) or holds no grant (404).
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/reflection-collaborators/quinn",
+            body: Some(serde_json::json!({"level": "reader"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/reflection-collaborators/quinn",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         WriteOp {
             method: Method::PUT,
             path: "/api/v1/domains/eng/owner",
@@ -3445,6 +3462,17 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // The form that creates the instance's GitHub App. Admin only and
+        // refused read-only: the App it leads to is the instance's
+        // credential. Its allowed leg answers past authorization with the
+        // form, or 409 where the fixture has no public url.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/app/manifest",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // The self-service identity surface: the one settings-shaped write
         // group an editor may drive, because the credential it manages is the
         // caller's own rather than the instance's. A viewer is still refused
@@ -3470,6 +3498,33 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/me/github-identity",
             body: None,
             min_role: Role::Editor,
+            read_only_exempt: false,
+        },
+        // The GitHub App link: any signed-in account links or unlinks its own
+        // (a viewer included: the link is who the person is at GitHub), and
+        // an admin unlinks anybody's. Not read-only exempt: a link writes the
+        // person's token as well as the accounts database. The fixture has no
+        // App, so the start's allowed leg answers 422 past authorization and
+        // the two unlinks find nothing to remove.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/github-link/start",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/github-link",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/users/mark/github-link",
+            body: None,
+            min_role: Role::Admin,
             read_only_exempt: false,
         },
         // Starting a single sign-on that links its identity to the caller's
@@ -3978,6 +4033,8 @@ fn canonicalize(path: &str) -> String {
             // The membership rows' target account. Kept apart from the two
             // above because it collapses to a different template.
             "pat" => "{principal}",
+            // A Reflection collaborator's account.
+            "quinn" => "{account}",
             // The share-surface rows: one proposal number and one conflict id.
             "1" => "{number}",
             "abc12345" => "{id}",
@@ -4176,6 +4233,12 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// The revocation endpoint is the same case again: the grant it ends comes off
 /// the token in the body, not off the caller, and it is pinned by
 /// `tests/remote/revoke.rs`.
+/// The GitHub App's webhook, `POST /api/v1/github/webhook`, has neither
+/// dimension: it is called by GitHub, never by a browser, so no role and no
+/// CSRF token count there (the guard hands it to the handler untouched), and
+/// what bounds it is the signature over the body under the App's webhook
+/// secret. Its refusals (no secret, no or a wrong signature, a session in
+/// place of one) are pinned by `tests/origins/github_webhook.rs`.
 /// The rename row's admin leg really renames `eng` (see its own comment in
 /// `write_ops()`), so every row that still addresses `eng` by that name has
 /// to run before it - an invariant a comment alone cannot enforce. A row
@@ -4206,6 +4269,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/oauth/register",
         "POST /api/v1/oauth/token",
         "POST /api/v1/oauth/revoke",
+        "POST /api/v1/github/webhook",
     ];
 
     let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS

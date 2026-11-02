@@ -154,12 +154,13 @@ impl Engine {
     ) -> Result<()> {
         // `read_only` is the owner's on every tier (spec A-1): the open tier
         // keeps the other keys where edit_engram writes, never this one.
-        if key != crystalline_core::READ_ONLY_KEY
-            && matches!(scope, crate::scope::Scope::Anonymous)
-            && !self.auth_mcp()
-        {
+        // Not on a domain GitHub governs, where the open tier is decided as
+        // `github.agent_identity` (or as anonymous without one).
+        if key != crystalline_core::READ_ONLY_KEY && self.open_tier_carve_out(scope, domain) {
             return self.require_domain(domain, scope).await;
         }
+        self.require_domain(domain, scope).await?;
+        let scope = &self.scope_on(scope, domain);
         self.require_domain_owner_refusing(domain, scope, Self::owner_key_refusal(domain, key))
             .await
     }
@@ -788,8 +789,13 @@ impl Engine {
         if self.read_only {
             return false;
         }
+        if self.open_tier_carve_out(scope, domain) {
+            return !self.reviews_changes(domain);
+        }
+        // The open tier on a domain GitHub governs is decided as
+        // `github.agent_identity`, or as anonymous without one.
+        let scope = &self.scope_on(scope, domain);
         match scope {
-            crate::scope::Scope::Anonymous if !self.auth_mcp() => !self.reviews_changes(domain),
             crate::scope::Scope::Anonymous => false,
             _ => matches!(
                 self.domain_right(scope, domain).await,

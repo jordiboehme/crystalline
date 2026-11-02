@@ -25,6 +25,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
+hmac = { workspace = true }
 http = { workspace = true }
 # The OpenID Connect relying party (oidc). Built with no default features
 # (see the workspace pin), so its HTTP calls go through the client below
@@ -42,6 +43,7 @@ thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 utoipa = { workspace = true }
 yrs = { workspace = true }
 zip = { workspace = true }

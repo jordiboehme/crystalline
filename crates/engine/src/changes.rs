@@ -520,7 +520,9 @@ impl ChangeBus {
 pub fn change_label(scope: &crate::scope::Scope) -> Option<String> {
     match scope {
         crate::scope::Scope::User { account, .. } => Some(account.clone()),
-        crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => None,
+        crate::scope::Scope::Unrestricted
+        | crate::scope::Scope::Anonymous
+        | crate::scope::Scope::Agent { .. } => None,
     }
 }
 

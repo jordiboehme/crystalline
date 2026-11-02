@@ -107,6 +107,22 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 // on Windows, its job and package identity. `crystalline
                 // status` prints it as one line, `doctor` in full.
                 "runs_in": crate::runs_in::RunsIn::here(),
+                // Since when GitHub has not said who may use the domains
+                // connected through the GitHub App (RFC 3339), null while it
+                // answers. `doctor` names it.
+                "github_access_degraded_since": shared
+                    .engine
+                    .github_access_degraded()
+                    .map(|since| since.to_rfc3339()),
+                // The part of that outage where the last answers still
+                // serve, and the repositories GitHub does not show to the
+                // App at all (their domains are closed).
+                "github_access_stale_since": shared
+                    .engine
+                    .github_access_stale_since()
+                    .map(|since| since.to_rfc3339()),
+                "github_access_closed": shared.engine.github_access_closed(),
+                "github_agent_identity_admin": shared.engine.github_agent_identity_is_admin().await,
             });
             match shared.engine.status_report().await {
                 Ok(report) => {
@@ -594,9 +610,25 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let path = req.get("path").and_then(Value::as_str);
             let branch = req.get("branch").and_then(Value::as_str);
             let folder = req.get("folder").and_then(Value::as_str);
+            // Absent or null is "not said"; a value nobody knows is refused
+            // rather than read as not said, which would be asked again.
+            let readers = match req.get("readers").and_then(Value::as_str) {
+                None => None,
+                Some(value) => match crate::params::Readers::parse(value) {
+                    Some(readers) => Some(readers),
+                    None => {
+                        return (
+                            envelope_err(format!(
+                                "readers must be shared or private, got '{value}'"
+                            )),
+                            false,
+                        );
+                    }
+                },
+            };
             match shared
                 .engine
-                .origin_add(repo, domain, path, branch, folder)
+                .origin_add(repo, domain, path, branch, folder, readers)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -624,6 +656,37 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 ),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // This daemon's GitHub App, as it runs it: read only, with GitHub
+        // asked for the slug and the installations. No secret is in it.
+        "github_app_status" => (
+            envelope_ok(json!(shared.engine.github_app_status().await)),
+            false,
+        ),
+        // What decides access to one domain on this daemon: whether its
+        // GitHub App does, and the `_READERS` variable that sets the
+        // domain's readers when its environment defines the domain. The
+        // CLI's `domain visibility` and `domain members` ask this rather
+        // than read their own environment, which a daemon started by a
+        // service manager does not share.
+        "github_governs" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            (
+                envelope_ok(json!({
+                    "domain": domain,
+                    "governed": shared.engine.github_app_decides_access(domain).await,
+                    "env_readers_var": shared.engine.env_readers_var(domain),
+                })),
+                false,
+            )
+        }
+        // The CLI just saved or removed the App in this machine's store, so
+        // this daemon drops the App it holds and looks for it again on the
+        // next origin operation. Nothing is sent but the notice: the
+        // credentials never travel over the socket.
+        "github_app_changed" => {
+            shared.engine.reset_github_app();
+            (envelope_ok(json!({ "reset": true })), false)
         }
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {

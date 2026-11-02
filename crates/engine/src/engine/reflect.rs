@@ -223,11 +223,19 @@ impl Engine {
     /// The files under `reflections/assets/` (by path inside
     /// `reflections/`) that only `held` pages of `domain` link: they carry
     /// what those pages show, so the backup holds them back with them. A
-    /// file a page that is not held links too stays.
+    /// file a page that goes out links too stays.
+    ///
+    /// The links are read from `files`, the bytes the backup is about to
+    /// push (by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]), so a
+    /// page known only from its file on disk counts; a held page's links in
+    /// the index count as well.
     pub(crate) async fn held_assets(
         &self,
         domain: &str,
         held: &[String],
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<BTreeSet<String>> {
         if held.is_empty() {
             return Ok(BTreeSet::new());
@@ -240,10 +248,23 @@ impl Engine {
             store.list_reflections(id).await?
         };
         let mut by_held = BTreeSet::new();
-        let mut by_others = BTreeSet::new();
         for row in &rows {
-            let refs = r::reflection_asset_refs(&row.content, &row.path);
             if held.contains(&row.path) {
+                by_held.extend(r::reflection_asset_refs(&row.content, &row.path));
+            }
+        }
+        let mut by_others = BTreeSet::new();
+        for (repo_path, bytes) in files {
+            let Some(inner) =
+                crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            else {
+                continue;
+            };
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            let refs = r::reflection_asset_refs(&String::from_utf8_lossy(bytes), &page);
+            if held.contains(&page) {
                 by_held.extend(refs);
             } else {
                 by_others.extend(refs);
@@ -302,42 +323,46 @@ impl Engine {
             };
             (store.list_reflections(id).await?, id)
         };
-        let disclosures = self.reflection_disclosures(id).await?;
-        let table = self.name_table_now().await;
-        let mut covers: HashMap<String, bool> = HashMap::new();
+        let mut check = TooWide::new(self, domain, id).await?;
         let mut out = Vec::new();
         for row in rows {
-            let mut wide = false;
-            for record in r::read_provenance(&row.content).into_values() {
-                for src in &record.sources {
-                    let Some(name) = src.domain.as_deref() else {
-                        continue;
-                    };
-                    let Some(local) = self.checkable_domain(&table, name) else {
-                        continue;
-                    };
-                    if local == domain {
-                        continue;
-                    }
-                    let covered = match covers.get(&local) {
-                        Some(covered) => *covered,
-                        None => {
-                            let covered = self.readers_cover(domain, &local).await?;
-                            covers.insert(local.clone(), covered);
-                            covered
-                        }
-                    };
-                    // A person shared it on purpose, for the readers and the
-                    // repository the page has now (`source_covered`).
-                    let covered = covered
-                        || self
-                            .source_covered_on_page(domain, &row.path, &local, name, &disclosures)
-                            .await?;
-                    wide |= !covered;
-                }
-            }
-            if wide {
+            if check.text(&row.path, &row.content).await? {
                 out.push(row.path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The pages of `domain` (by path inside `reflections/`, sorted) whose
+    /// bytes among `files` (a backup's collected files, by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]) cite a
+    /// domain fewer people may read, or may and cannot be read: bytes that
+    /// are not UTF-8, or records [`r::provenance_unreadable`] says so of.
+    /// What [`Engine::too_wide_pages`] says of the index, said of what is
+    /// about to go out, so a file edited on disk before the index read it is
+    /// held back too.
+    pub(crate) async fn too_wide_in_files(
+        &self,
+        domain: &str,
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Vec<String>> {
+        let Some(id) = self.store.lock().await.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let mut check = TooWide::new(self, domain, id).await?;
+        let mut out = Vec::new();
+        for (inner, bytes) in reflection_files(spec, files) {
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            let wide = match std::str::from_utf8(bytes) {
+                Ok(text) => check.text(&page, text).await?,
+                Err(_) => true,
+            };
+            if wide {
+                out.push(page);
             }
         }
         out.sort();
@@ -425,7 +450,9 @@ impl Engine {
             // baseline every section would read as a person's change, so the
             // move's one item stands in for that feedback.
             let no_feedback = baseline.is_none() && host_move.is_some();
-            let baseline = baseline.unwrap_or_default();
+            // Without a baseline file (a restore from the backup branch,
+            // which does not carry them) the page stands for its baseline.
+            let baseline = super::reflection::baseline_or_seed(baseline, Some(&row.content));
             let row_age = secs_since_rfc3339(Some(&row.modified)).unwrap_or(0);
             if row.path == r::PACT_FILE {
                 let changes = if no_feedback {
@@ -1433,4 +1460,80 @@ impl Engine {
         }
         Ok(counts)
     }
+}
+
+/// One domain's too-wide check, with what it reads once: the confirmations
+/// on its pages, the name table and each source domain's coverage.
+struct TooWide<'a> {
+    engine: &'a Engine,
+    domain: &'a str,
+    disclosures: super::disclosure::Disclosures,
+    table: Arc<crystalline_core::names::NameTable>,
+    covers: HashMap<String, bool>,
+}
+
+impl<'a> TooWide<'a> {
+    async fn new(engine: &'a Engine, domain: &'a str, id: DomainId) -> Result<TooWide<'a>> {
+        Ok(TooWide {
+            engine,
+            domain,
+            disclosures: engine.reflection_disclosures(id).await?,
+            table: engine.name_table_now().await,
+            covers: HashMap::new(),
+        })
+    }
+
+    /// Whether page `path` with `text` has a section citing a domain fewer
+    /// people may read than the page's own, or records that cannot be read
+    /// in full ([`r::provenance_unreadable`]), which may hide one. A source
+    /// whose domain cannot be checked here is not counted, as in the queue.
+    async fn text(&mut self, path: &str, text: &str) -> Result<bool> {
+        if r::provenance_unreadable(text) {
+            return Ok(true);
+        }
+        let (engine, domain) = (self.engine, self.domain);
+        for record in r::read_provenance(text).into_values() {
+            for src in &record.sources {
+                let Some(name) = src.domain.as_deref() else {
+                    continue;
+                };
+                let Some(local) = engine.checkable_domain(&self.table, name) else {
+                    continue;
+                };
+                if local == domain {
+                    continue;
+                }
+                let covered = match self.covers.get(&local) {
+                    Some(covered) => *covered,
+                    None => {
+                        let covered = engine.readers_cover(domain, &local).await?;
+                        self.covers.insert(local.clone(), covered);
+                        covered
+                    }
+                };
+                // A person shared it on purpose, for the readers and the
+                // repository the page has now (`source_covered`).
+                let covered = covered
+                    || engine
+                        .source_covered_on_page(domain, path, &local, name, &self.disclosures)
+                        .await?;
+                if !covered {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The files of a backup's collected `files` (by repo path) inside the
+/// Reflection folder of `spec`'s domain, by their path inside it.
+fn reflection_files<'a>(
+    spec: &'a crystalline_remote::provider::OriginSpec,
+    files: &'a BTreeMap<String, Vec<u8>>,
+) -> impl Iterator<Item = (&'a str, &'a [u8])> + 'a {
+    files.iter().filter_map(move |(repo_path, bytes)| {
+        crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            .map(|inner| (inner, bytes.as_slice()))
+    })
 }

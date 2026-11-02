@@ -176,6 +176,46 @@ fn the_archive_location_carries_the_archive_cap() {
     );
 }
 
+/// The GitHub App's webhook has its own directive too, inside the location
+/// that matches it, for the archive location's reason: the daemon takes a
+/// larger body on that one route
+/// ([`crystalline_service::rest::github_webhook::WEBHOOK_BODY_BYTES`]), and a
+/// proxy that kept the server-level 10 MiB would drop a delivery the daemon
+/// accepts.
+#[test]
+fn the_webhook_location_carries_the_webhook_cap() {
+    let Some(template) = template() else {
+        return;
+    };
+    let cap = crystalline_service::rest::github_webhook::WEBHOOK_BODY_BYTES;
+    let mut lines = template.lines().map(str::trim);
+    lines
+        .find(|line| line.starts_with("location ") && line.contains("/api/v1/github/webhook"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fluid/nginx.conf.template has no location for the GitHub App's webhook; \
+                 the server-level client_max_body_size would then cap a delivery at \
+                 crystalline_service::rest::MAX_BODY_BYTES while the daemon behind it \
+                 accepts WEBHOOK_BODY_BYTES ({cap} bytes)"
+            )
+        });
+    let directive = lines
+        .take_while(|line| *line != "}")
+        .find(|line| line.starts_with("client_max_body_size"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the webhook location in fluid/nginx.conf.template sets no \
+                 client_max_body_size of its own, so it inherits the server-level one"
+            )
+        });
+    let bytes = directive_bytes(directive);
+    assert!(
+        bytes >= cap,
+        "the webhook location's client_max_body_size ({bytes} bytes) is below \
+         WEBHOOK_BODY_BYTES ({cap} bytes)"
+    );
+}
+
 #[test]
 fn parses_binary_nginx_size_suffixes() {
     assert_eq!(parse_nginx_size("10m"), Some(10 * 1024 * 1024));

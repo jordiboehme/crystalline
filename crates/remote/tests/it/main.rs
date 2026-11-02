@@ -8,6 +8,7 @@ mod common;
 mod mock;
 
 mod discard;
+mod github_app;
 mod github_auth;
 mod github_client;
 mod lifecycle;

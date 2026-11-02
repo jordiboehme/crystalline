@@ -63,6 +63,68 @@ pub struct GithubStatusResponse {
     /// A device flow's failure (expired, denied), reported on exactly one
     /// status read after the flow ends, then cleared.
     pub error: Option<String>,
+    /// The instance's GitHub App, when one is configured; absent otherwise,
+    /// so an instance without an App answers exactly as before. Names the
+    /// App and where to install it, never a secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<GithubAppView>,
+}
+
+/// The instance's GitHub App as the settings screen shows it.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "The instance's GitHub App: which App it is, where it \
+                        comes from and where an owner installs it. No secret, \
+                        ever: only whether the webhook secret is set.")]
+pub struct GithubAppView {
+    /// The numeric App id, when the App could be read.
+    #[schema(example = 123456)]
+    pub app_id: Option<u64>,
+    /// The App's slug, when known.
+    #[schema(example = "crystalline-kb-example-com")]
+    pub slug: Option<String>,
+    /// keyring | file | environment.
+    #[schema(example = "keyring")]
+    pub source: Option<String>,
+    /// Where an owner installs the App on repositories. Null while the App
+    /// cannot be used or its slug is not known yet.
+    #[schema(example = "https://github.com/apps/crystalline-kb-example-com/installations/new")]
+    pub install_url: Option<String>,
+    /// Whether a webhook secret is set, so deliveries can be verified.
+    #[schema(example = true)]
+    pub webhook_secret_set: bool,
+    /// Why the App cannot be used, when it cannot.
+    pub error: Option<String>,
+    /// True while a saved App is still being loaded: the other fields are
+    /// not known yet, but an App is there, so none is to be created.
+    #[schema(example = false)]
+    pub loading: bool,
+}
+
+/// The App part of the status, read locally and without waiting for the
+/// App to load: the screen polls this route, so GitHub is never asked here,
+/// and a saved App still loading reads as loading, never as none.
+fn app_view(state: &RestState) -> Option<GithubAppView> {
+    match state.engine.github_app_settled_status() {
+        crate::engine::SettledApp::None => None,
+        crate::engine::SettledApp::Loading => Some(GithubAppView {
+            app_id: None,
+            slug: None,
+            source: None,
+            install_url: None,
+            webhook_secret_set: false,
+            error: None,
+            loading: true,
+        }),
+        crate::engine::SettledApp::Known(app) => Some(GithubAppView {
+            app_id: app.app_id,
+            slug: app.slug,
+            source: app.source,
+            install_url: state.engine.github_app_install_url(),
+            webhook_secret_set: app.webhook_secret_set,
+            error: app.error,
+            loading: false,
+        }),
+    }
 }
 
 /// The half of a running device flow a browser has to show.
@@ -85,8 +147,9 @@ pub struct GithubPendingView {
     pub expires_in_secs: u64,
 }
 
-fn view(c: crate::engine::GithubConnection) -> GithubStatusResponse {
+fn view(state: &RestState, c: crate::engine::GithubConnection) -> GithubStatusResponse {
     GithubStatusResponse {
+        app: app_view(state),
         enabled: c.enabled,
         connected: c.connected,
         user: c.user,
@@ -160,7 +223,69 @@ pub async fn status(
 ) -> Result<Json<GithubStatusResponse>, ApiError> {
     identity.require_admin()?;
     // A pure read: served under read_only (Group A: GET routes untouched).
-    Ok(Json(view(state.engine.github_connection().await?)))
+    Ok(Json(view(&state, state.engine.github_connection().await?)))
+}
+
+/// What `GET /github/access` answers with.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "How access to the domains connected through the \
+                        GitHub App stands: since when GitHub has not said \
+                        who may use them while the last known roles still \
+                        serve, and which domains are closed.")]
+pub struct GithubAccessResponse {
+    /// RFC 3339: since when GitHub has not answered while the last known
+    /// roles still serve, or `null` while it answers.
+    #[schema(example = "2026-10-29T08:00:00Z")]
+    pub stale_since: Option<String>,
+    /// The closed domains, each with its repository and what to do.
+    #[schema(value_type = Vec<super::schemas::ClosedDomain>)]
+    pub closed: Vec<crate::engine::ClosedDomain>,
+}
+
+/// `GET /github/access` - for the admin banner: whether GitHub can be
+/// asked who may use the connected domains, and which of them are closed.
+///
+/// A pure read of what the GitHub governor already knows: it asks GitHub
+/// nothing, so it is cheap enough to read on every page.
+#[utoipa::path(
+    get,
+    path = "/api/v1/github/access",
+    tag = "settings",
+    operation_id = "get_github_access",
+    summary = "Whether GitHub answers who may use the connected domains.",
+    description = "Admin only. A pure read, served even on a read-only \
+                   instance, that asks GitHub nothing. `stale_since` is set \
+                   while GitHub cannot be reached and access uses the last \
+                   known roles; `closed` lists the domains whose repository \
+                   lacks the GitHub App, each with what to do.",
+    responses(
+        (status = 200, description = "How access stands.", body = GithubAccessResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn access(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<GithubAccessResponse>, ApiError> {
+    identity.require_admin()?;
+    Ok(Json(GithubAccessResponse {
+        stale_since: state
+            .engine
+            .github_access_stale_since()
+            .map(|since| since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        closed: state.engine.github_access_closed(),
+    }))
 }
 
 /// `POST /settings/github/connect` - start a device-code sign-in, answering
@@ -234,7 +359,7 @@ pub async fn connect(
     // where a person's own connect (see `github_identity`) can be started
     // from Fluid and a terminal both.
     state.engine.start_device_connect(None, false).await?;
-    let status = view(state.engine.github_connection().await?);
+    let status = view(&state, state.engine.github_connection().await?);
     Ok((StatusCode::ACCEPTED, Json(status)).into_response())
 }
 
@@ -310,7 +435,7 @@ pub async fn token(
     }
     ensure_enabled(&state).await?;
     state.engine.connect_with_token(token, None).await?;
-    Ok(Json(view(state.engine.github_connection().await?)))
+    Ok(Json(view(&state, state.engine.github_connection().await?)))
 }
 
 /// `DELETE /settings/github` - forget the stored credential, answering with
@@ -369,7 +494,7 @@ pub async fn disconnect(
     identity.require_admin()?;
     refuse_read_only(&state)?;
     state.engine.github_disconnect().await?;
-    Ok(Json(view(state.engine.github_connection().await?)))
+    Ok(Json(view(&state, state.engine.github_connection().await?)))
 }
 
 #[cfg(test)]

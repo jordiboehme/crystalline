@@ -58,6 +58,10 @@ pub struct GithubIdentityResponse {
     /// This account's device flow's failure (expired, denied), reported on
     /// exactly one status read after the flow ends, then cleared.
     pub error: Option<String>,
+    /// Set only by a disconnect that unlinked through the GitHub App and
+    /// could not revoke the token at GitHub: the person should revoke it in
+    /// their GitHub settings.
+    pub warning: Option<String>,
 }
 
 fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
@@ -73,6 +77,7 @@ fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
             expires_in_secs: p.expires_in_secs,
         }),
         error: c.error,
+        warning: c.warning,
     }
 }
 

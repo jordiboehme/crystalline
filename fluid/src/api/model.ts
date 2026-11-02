@@ -60,8 +60,16 @@ export type { SaveManifestBody } from "./gen";
 /** What `GET /settings/github` and every GitHub settings verb answer with. */
 export type { GithubStatusResponse } from "./gen";
 
+/** What `POST /settings/github/app/manifest` answers: the form to post. */
+export type { GithubAppManifestResponse } from "./gen";
+
 /** What `GET /me/github-identity` and every identity verb answer with. */
 export type { GithubIdentityResponse } from "./gen";
+export type {
+  GithubLinkResponse,
+  GithubUnlinkResponse,
+  StartGithubLinkResponse,
+} from "./gen";
 
 /** What an archive preview and an archive import both answer with. */
 export type { ArchiveReport } from "./gen";
@@ -130,6 +138,18 @@ export type { MembersResponse } from "./gen";
 
 /** One membership row: who, at what level, added by whom and when. */
 export type { DomainMember } from "./gen";
+
+/** One person GitHub lists on a governed domain's repository, with the level their role gives and the account linked to them. */
+export type { GithubPerson } from "./gen";
+
+/** One per-domain Reflection collaborator: an account given the Reflection reader or contributor level. */
+export type { ReflectionGrant } from "./gen";
+
+/** What `GET /github/access` answers with: since when GitHub has not answered, and the closed domains. */
+export type { GithubAccessResponse } from "./gen";
+
+/** A domain closed because its repository lacks the GitHub App, with what to do. */
+export type { ClosedDomain } from "./gen";
 
 /** What a member may do on one private domain: `none`, `viewer`, `editor` or `manager`. */
 export type { MemberLevel } from "./gen";

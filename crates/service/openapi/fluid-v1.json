@@ -892,7 +892,7 @@
             }
           },
           "403": {
-            "description": "Viewer role, read-only instance, or a missing/foreign Origin.",
+            "description": "No write right on the domain (a viewer, or on a domain GitHub governs no GitHub write), a read-only instance, or a missing/foreign Origin.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1102,7 +1102,7 @@
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain), `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns) and `rename_pending` (`{from, to, seen_at}` when a sync saw this domain's MANIFEST `domain_name` change and nobody has finished the rename or kept the links yet, `null` otherwise).\n\nFor an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.",
+            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain), `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns) and `rename_pending` (`{from, to, seen_at}` when a sync saw this domain's MANIFEST `domain_name` change and nobody has finished the rename or kept the links yet, `null` otherwise).\n\nEvery domain carries `may_share`: whether this session may drive the domain's share surfaces (its sync status, the preview, the share, a withdrawal and a conflict), answered by the gate those routes use. On a domain GitHub governs it follows the GitHub role, so it can be true for an instance viewer. A row's `read_only`, sent only when true, says this session cannot write into the domain; on a domain GitHub governs it follows the GitHub role too.\n\nFor an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1120,6 +1120,7 @@
                       "engrams": 4,
                       "kind": "file",
                       "last_sync": "2026-08-05T09:14:22Z",
+                      "may_share": false,
                       "name": "eng",
                       "name_origin": "derived",
                       "observations": 12,
@@ -1236,7 +1237,7 @@
             }
           },
           "422": {
-            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.",
+            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, a field that does not belong to the mode asked for, a `readers` that is neither shared nor private or that contradicts `private`, or a team domain without `readers` on an instance with a GitHub App.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1907,7 +1908,7 @@
             }
           },
           "403": {
-            "description": "A viewer, a membership below editor, or a read-only instance.",
+            "description": "No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2499,7 +2500,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2788,7 +2789,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2922,7 +2923,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3393,7 +3394,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3519,7 +3520,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4586,7 +4587,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, or the principal owns it.",
+            "description": "The domain is shared, the principal owns it, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4679,7 +4680,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, or the principal owns it.",
+            "description": "The domain is shared, the principal owns it, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4765,7 +4766,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4881,7 +4882,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, so it has no owner.",
+            "description": "The domain is shared, so it has no owner, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4933,21 +4934,24 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave.",
+            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`). `governance` is `github` when access to the domain follows the GitHub App (then `member` is always false), else `crystalline`; `private` says whether the domain is private.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "collaborator": false,
                   "domain": "eng",
                   "enabled": true,
                   "engrams_visible": true,
+                  "governance": "crystalline",
                   "home": "here",
                   "home_url": null,
                   "host_label": null,
                   "member": false,
                   "pending_engrams": [],
+                  "private": false,
                   "right": "curate",
                   "state": "on"
                 }
@@ -4956,6 +4960,257 @@
           },
           "404": {
             "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection-collaborators": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "The Reflection collaborators of one domain.",
+        "description": "Needs manager access on the domain: its manager, its owner, an instance admin, or on a domain GitHub governs a GitHub maintainer or admin. A caller who may not see the domain is answered 404, exactly as for a domain nobody registered. A domain kept in the database answers 409.",
+        "operationId": "list_reflection_collaborators",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The domain's Reflection collaborators.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReflectionCollaboratorsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not a manager here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection-collaborators/{account}": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Give an account the Reflection of one domain.",
+        "description": "Needs manager access on the domain. Works on any domain kept as files, shared or private, governed by GitHub or not. A grant only raises the Reflection right and opens no engram: an account that reads no engram here reaches the Reflection and nothing else.\n\nAn account that does not exist or is disabled, and the reserved name `owner`, are a 422, and so is a level other than `reader` or `contributor`. A domain kept in the database answers 409.",
+        "operationId": "set_reflection_collaborator",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReflectionCollaboratorBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The account holds that level here."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A level other than reader or contributor, or a name that is no enabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Take an account's Reflection grant on one domain away.",
+        "description": "Needs manager access on the domain, OR that the account is the caller itself: a collaborator may always take itself off, also where it reads no engram. A name that holds no grant here is a 404. A domain kept in the database answers 409.",
+        "operationId": "remove_reflection_collaborator",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "That account holds no grant here now."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is neither a manager here nor the account itself, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, none this caller may see, or an account that holds no grant on it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7086,7 +7341,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7343,7 +7598,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7551,7 +7806,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7643,7 +7898,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7739,7 +7994,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7867,7 +8122,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8003,7 +8258,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8196,7 +8451,7 @@
           "domains"
         ],
         "summary": "Make a domain private, or share it with the instance again.",
-        "description": "Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nMaking a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.\n\nPrivatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.\n\nMaking a domain shared again forgets its membership list.",
+        "description": "Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nMaking a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.\n\nPrivatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.\n\nMaking a domain shared again forgets its membership list.\n\nOn a domain GitHub governs, both directions need manager access: a GitHub admin or maintainer, or an instance admin. Private means only the people with access on GitHub read it; shared means everyone signed in. The membership list is kept there, and a domain whose readers are set in the environment answers 409.",
         "operationId": "set_domain_visibility",
         "parameters": [
           {
@@ -8245,6 +8500,16 @@
           },
           "404": {
             "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Who may read this domain is set in the environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8773,6 +9038,122 @@
         }
       }
     },
+    "/api/v1/github/access": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Whether GitHub answers who may use the connected domains.",
+        "description": "Admin only. A pure read, served even on a read-only instance, that asks GitHub nothing. `stale_since` is set while GitHub cannot be reached and access uses the last known roles; `closed` lists the domains whose repository lacks the GitHub App, each with what to do.",
+        "operationId": "get_github_access",
+        "responses": {
+          "200": {
+            "description": "How access stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAccessResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/app/created": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser back after creating the GitHub App.",
+        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/settings/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
+        "operationId": "finish_github_app_manifest",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The code GitHub converts into the App's credentials, once.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state the form was handed out with.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "The App is stored: to `/settings/github?app=created`."
+          },
+          "401": {
+            "description": "An HTML page: no signed-in session. The state is not spent.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "403": {
+            "description": "An HTML page: the caller is not an admin, this instance is read-only, or the state is missing, unknown, used, expired or another session's.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "409": {
+            "description": "An HTML page: a GitHub App is already configured, and the code was not converted.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "502": {
+            "description": "An HTML page: GitHub did not convert the code, or the App it answered could not be stored. The text says why, with the GitHub Enterprise Server version when the server lacks the endpoint.",
+            "content": {
+              "text/html": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/app/setup": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser after the GitHub App was installed.",
+        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/settings/github?app=installed`.",
+        "operationId": "github_app_installed",
+        "responses": {
+          "303": {
+            "description": "To `/settings/github?app=installed`."
+          }
+        }
+      }
+    },
     "/api/v1/github/domain-name": {
       "get": {
         "tags": [
@@ -8870,6 +9251,212 @@
           },
           "422": {
             "description": "`repo` is present and empty or not owner/name, or `path` is absolute or holds a `..` segment.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/link/callback": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser back to finish a link.",
+        "description": "Needs the session that started the link (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a link this session started in the last ten minutes and is spent by this call. Then the code is exchanged and the account linked, and the browser is sent to `/profile?github=linked`, or to `/profile?github_error=<code>` with `id_taken` (the GitHub account is linked to another account), `denied` (the person cancelled at GitHub), `state` (the state is unknown, used, expired or another session's), `session` (no signed-in session; the app asks for a sign-in and returns to the profile) or `failed` (anything else). It is a browser landing, so it never answers JSON.",
+        "operationId": "finish_github_link",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code, exchanged once for a user token.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state `start` minted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "description": "GitHub's refusal, `access_denied` when the person cancelled.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "To the profile, with `github=linked` or `github_error=<code>`. `state` is no state, or a state this session did not start, already used, or expired, and `session` is no signed-in session; in both cases nothing reached GitHub."
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/link/go": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Open a single-use link an agent session handed out to connect GitHub.",
+        "description": "MCP `configure` with `connect: \"github\"` on an instance with a GitHub App answers this link, bound to the account the agent session is signed in as. Opened in a browser signed in as that same account, the link is spent and the browser goes on to GitHub's authorize url, exactly as `POST /me/github-link/start` would send it, so the callback and its landing on the profile are the same. Without a session the browser is sent to the sign-in page (`/login?github_link=<nonce>`, whose single sign-on button carries the same return) and back, and the link is not spent. Opened by another account it is refused and spent, so a forwarded link never links somebody else's GitHub account. It lives ten minutes, in the server's memory, so a restart ends it. It is a browser landing, so every refusal is an HTML page, never JSON.",
+        "operationId": "open_github_link",
+        "parameters": [
+          {
+            "name": "n",
+            "in": "query",
+            "description": "The nonce `configure` minted for one account.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "To GitHub's authorize url, or to sign in and back."
+          },
+          "403": {
+            "description": "An HTML page: the link was made for another account, or this instance is read-only.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "404": {
+            "description": "An HTML page: the link was never made, was already used or has expired.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "409": {
+            "description": "An HTML page: the link cannot go on to GitHub, for example because `service.public_url` or the App's client secret is not set. The text names the fix.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "422": {
+            "description": "An HTML page: no GitHub App is configured on this instance any more, or it cannot be used.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "503": {
+            "description": "An HTML page: too many links are in flight at once.",
+            "content": {
+              "text/html": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/webhook": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where the GitHub App delivers its webhook events.",
+        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything in the body is read. A delivery id seen in the last day is answered 200 and does nothing; a body sent again under a fresh id is harmless because every event only narrows access. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost, or follow a rename GitHub itself confirms); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
+        "operationId": "receive_github_webhook",
+        "requestBody": {
+          "description": "The event's payload, as GitHub sends it, at most 25 MiB.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handled, a replay, or an event this instance does not act on."
+          },
+          "400": {
+            "description": "Signed, but without `X-GitHub-Delivery` or `X-GitHub-Event`, or a body that is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The App has no webhook secret, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance has no GitHub App. Answered before the body is read, and not logged.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "The body did not arrive within ten seconds.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "A body over 25 MiB, refused before the signature is checked.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled. The answer is one fixed sentence; the server log says why.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many deliveries at once (four are read and handled at a time). Nothing happened.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9263,6 +9850,160 @@
           },
           "422": {
             "description": "The body is JSON but not a token, the token is empty, GitHub refused it, or this account's name cannot address a credential.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/github-link": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own link to a GitHub account through the App.",
+        "description": "Any signed-in account, viewers included: the link says who the person is at GitHub. A pure read, served even on a read-only instance. No token material.",
+        "operationId": "get_my_github_link",
+        "responses": {
+          "200": {
+            "description": "The link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubLinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Unlink the caller's own account from GitHub.",
+        "description": "Any signed-in account, and refused on a read-only instance. Revokes the user token at GitHub, deletes it here and removes the link. When GitHub cannot revoke it, the unlink still happens here and `warning` says so. Idempotent: an account without a link answers `was_linked: false`.",
+        "operationId": "unlink_my_github_link",
+        "responses": {
+          "200": {
+            "description": "Unlinked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubUnlinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/github-link/start": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Start linking the caller's account to GitHub through the App's web flow.",
+        "description": "Any signed-in account, and refused on a read-only instance. Answers GitHub's authorize url; the page sends the browser there, and GitHub sends it back to `GET /github/link/callback`, which links the account of the session that started this and nobody else's. The state lives ten minutes and is good for one callback.",
+        "operationId": "start_my_github_link",
+        "responses": {
+          "200": {
+            "description": "Where to send the browser.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartGithubLinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many links are in flight at once; try again in a moment.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10286,7 +11027,7 @@
           "reflection"
         ],
         "summary": "The domains whose Reflection this caller reaches.",
-        "description": "Every registered domain whose Reflection is not off and where the caller's reflection right is at least `read`, including domains the caller cannot see as engrams (knowledge `none` with a Reflection level): this is how Fluid finds them, since `GET /domains` leaves them out. The anonymous viewer gets the public domains, at `read`. Sorted by name.",
+        "description": "Every registered domain whose Reflection is not off and where the caller's reflection right is at least `read`, including domains the caller cannot see as engrams (knowledge `none` with a Reflection level, and Reflection collaborators, who hold a per-domain Reflection grant): this is how Fluid finds them, since `GET /domains` leaves them out. The anonymous viewer gets the public domains, at `read`. Sorted by name.",
         "operationId": "list_reflection_domains",
         "responses": {
           "200": {
@@ -10587,6 +11328,88 @@
           },
           "422": {
             "description": "The credential comes from `CRYSTALLINE_GITHUB_TOKEN`: only the environment that set it can retire it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings/github/app/manifest": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The manifest form that creates this instance's GitHub App on GitHub.",
+        "description": "Admin only, and refused on a read-only instance. Answers the GitHub App manifest and the url to post it to (as the form field `manifest`): GitHub's new-App page for the admin's account or for `org`, on the Enterprise Server host on GHES. GitHub creates the App there and sends the browser back to `GET /github/app/created` with a code and the state, which is good for one callback, for an hour, from this session only. The manifest asks for Contents and Pull requests write, Metadata and Members read and nothing else, and sets up the webhook only when `service.public_url` is reachable from GitHub.",
+        "operationId": "start_github_app_manifest",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GithubAppManifestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The form to post.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAppManifestResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, the request carries no session to bind the state to, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A GitHub App is already configured (remove it first with `crystalline github app remove`), or `service.public_url` is not set. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`org` is not a GitHub organization name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many forms are in flight at once; try again in a moment.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11136,6 +11959,69 @@
         }
       }
     },
+    "/api/v1/users/{name}/github-link": {
+      "delete": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`DELETE /users/{name}/github-link` - unlink another account from GitHub.",
+        "description": "Admin only: this is how a GitHub account linked to the wrong Crystalline\naccount is freed, so the right one can link it. The user token is revoked\nat GitHub, deleted here and the link removed, exactly as when the person\nunlinks themselves. An admin may unlink its own account here too; nothing\nabout its session depends on the link.",
+        "operationId": "unlink_user_github_link",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unlinked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubUnlinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{name}/password": {
       "post": {
         "tags": [
@@ -11309,7 +12195,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11845,6 +12731,29 @@
           "moved"
         ]
       },
+      "ClosedDomain": {
+        "type": "object",
+        "description": "A domain closed because the GitHub App is not installed on its\nrepository, or GitHub does not show the repository to the App.",
+        "required": [
+          "domain",
+          "repo",
+          "reason"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "reason": {
+            "type": "string",
+            "description": "What to do about it, in one sentence."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Its repository, `owner/name`."
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -11973,6 +12882,17 @@
             "type": "boolean",
             "description": "Register the domain private, owned by the calling account. Applies to\nevery mode; defaults to false, which is a domain the whole instance\nshares.",
             "example": false
+          },
+          "readers": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Readers",
+                "description": "Who may read a team domain on an instance with a GitHub App:\n`shared` (everyone signed in) or `private` (only people with access\non GitHub). github mode only. Required there when an App is\nconfigured, since access then follows GitHub and is never defaulted;\n`private: true` answers `private`. Ignored, with a note in the\nreport, without an App."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "repo": {
             "type": [
@@ -12249,6 +13169,130 @@
           "discard"
         ]
       },
+      "GithubAccessResponse": {
+        "type": "object",
+        "description": "How access to the domains connected through the GitHub App stands: since when GitHub has not said who may use them while the last known roles still serve, and which domains are closed.",
+        "required": [
+          "closed"
+        ],
+        "properties": {
+          "closed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClosedDomain"
+            },
+            "description": "The closed domains, each with its repository and what to do."
+          },
+          "stale_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339: since when GitHub has not answered while the last known\nroles still serve, or `null` while it answers.",
+            "example": "2026-10-29T08:00:00Z"
+          }
+        }
+      },
+      "GithubAppManifestBody": {
+        "type": "object",
+        "description": "What `POST /settings/github/app/manifest` takes.",
+        "properties": {
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GitHub organization the App is created for. Absent: the admin's\nown GitHub account.",
+            "example": "acme-corp"
+          }
+        }
+      },
+      "GithubAppManifestResponse": {
+        "type": "object",
+        "description": "What `POST /settings/github/app/manifest` answers: the form to post.",
+        "required": [
+          "post_url",
+          "manifest",
+          "state"
+        ],
+        "properties": {
+          "manifest": {
+            "type": "object",
+            "description": "The manifest. The page posts it JSON-encoded as the form field\n`manifest`."
+          },
+          "post_url": {
+            "type": "string",
+            "description": "Where to post the form: GitHub's new-App page for the account or the\norganization, on the GitHub Enterprise Server host on GHES. Carries\nthe state.",
+            "example": "https://github.com/settings/apps/new?state=4f2a..."
+          },
+          "state": {
+            "type": "string",
+            "description": "The state GitHub sends back with the code. Good for one callback,\nfor an hour, from this session only.",
+            "example": "4f2a..."
+          }
+        }
+      },
+      "GithubAppView": {
+        "type": "object",
+        "description": "The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.",
+        "required": [
+          "webhook_secret_set",
+          "loading"
+        ],
+        "properties": {
+          "app_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The numeric App id, when the App could be read.",
+            "example": 123456,
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the App cannot be used, when it cannot."
+          },
+          "install_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an owner installs the App on repositories. Null while the App\ncannot be used or its slug is not known yet.",
+            "example": "https://github.com/apps/crystalline-kb-example-com/installations/new"
+          },
+          "loading": {
+            "type": "boolean",
+            "description": "True while a saved App is still being loaded: the other fields are\nnot known yet, but an App is there, so none is to be created.",
+            "example": false
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The App's slug, when known.",
+            "example": "crystalline-kb-example-com"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "keyring | file | environment.",
+            "example": "keyring"
+          },
+          "webhook_secret_set": {
+            "type": "boolean",
+            "description": "Whether a webhook secret is set, so deliveries can be verified.",
+            "example": true
+          }
+        }
+      },
       "GithubIdentityResponse": {
         "type": "object",
         "description": "One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.",
@@ -12308,6 +13352,91 @@
             ],
             "description": "keyring | file; null when disconnected. Never `environment`: the\nenvironment supplies the machine's credential and never a personal one.",
             "example": "keyring"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set only by a disconnect that unlinked through the GitHub App and\ncould not revoke the token at GitHub: the person should revoke it in\ntheir GitHub settings."
+          }
+        }
+      },
+      "GithubLinkResponse": {
+        "type": "object",
+        "description": "One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.",
+        "required": [
+          "linked",
+          "token_live",
+          "app_configured"
+        ],
+        "properties": {
+          "app_configured": {
+            "type": "boolean",
+            "description": "Whether this instance has a GitHub App to link through. Any account\nmay read it, unlike the admin-only settings read, so the profile picks\nits GitHub card by it.",
+            "example": true
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last link device flow's failure, reported on exactly one read."
+          },
+          "github_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "GitHub's numeric user id.",
+            "example": 583231,
+            "minimum": 0
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`github.com` or the Enterprise Server host.",
+            "example": "github.com"
+          },
+          "linked": {
+            "type": "boolean",
+            "description": "Whether the account is linked.",
+            "example": true
+          },
+          "linked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the link was made, RFC 3339.",
+            "example": "2026-10-28T09:12:44Z"
+          },
+          "login": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GitHub login last seen for the linked id.",
+            "example": "octo"
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubPendingView",
+                "description": "This account's link device flow waiting for the browser side, when\none runs (the device flow is started from the CLI)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "token_live": {
+            "type": "boolean",
+            "description": "False once the user token is known to be gone (revoked, or its\nrefresh token expired). The link stays; linking again restores it.",
+            "example": true
           }
         }
       },
@@ -12339,6 +13468,36 @@
           }
         }
       },
+      "GithubPerson": {
+        "type": "object",
+        "description": "One person GitHub lists on a governed domain's repository.",
+        "required": [
+          "login",
+          "github_role",
+          "level"
+        ],
+        "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account linked to that GitHub login here, or `null` when nobody\nhere is linked to it."
+          },
+          "github_role": {
+            "type": "string",
+            "description": "Their role on the repository: `admin`, `maintain`, `write`,\n`triage` or `read`."
+          },
+          "level": {
+            "$ref": "#/components/schemas/MemberLevel",
+            "description": "The level that role gives on this domain."
+          },
+          "login": {
+            "type": "string",
+            "description": "The login GitHub lists."
+          }
+        }
+      },
       "GithubStatusResponse": {
         "type": "object",
         "description": "The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives.",
@@ -12347,6 +13506,17 @@
           "connected"
         ],
         "properties": {
+          "app": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubAppView",
+                "description": "The instance's GitHub App, when one is configured; absent otherwise,\nso an instance without an App answers exactly as before. Names the\nApp and where to install it, never a secret."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "connected": {
             "type": "boolean",
             "description": "Whether a credential is on file for this instance.",
@@ -12392,6 +13562,50 @@
             "example": "octo"
           }
         }
+      },
+      "GithubUnlinkResponse": {
+        "type": "object",
+        "description": "What an unlink answers.",
+        "required": [
+          "linked",
+          "was_linked"
+        ],
+        "properties": {
+          "linked": {
+            "type": "boolean",
+            "description": "Always false: the account is not linked any more.",
+            "example": false
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the link is gone here but GitHub did not revoke the token:\nthe person should revoke it in their GitHub settings.",
+            "example": "unlinked here; GitHub could not be reached to revoke the token, revoke it in your GitHub settings"
+          },
+          "was_linked": {
+            "type": "boolean",
+            "description": "Whether there was a link to remove.",
+            "example": true
+          }
+        }
+      },
+      "Governance": {
+        "type": "string",
+        "description": "Who decides access to a domain.",
+        "enum": [
+          "github",
+          "crystalline"
+        ]
+      },
+      "GrantLevel": {
+        "type": "string",
+        "description": "The level a Reflection collaborator holds. Narrower than\n[`ReflectionLevel`]: `default` would grant nothing, and taking a grant\naway is `DELETE`.",
+        "enum": [
+          "reader",
+          "contributor"
+        ]
       },
       "IdentityLink": {
         "type": "object",
@@ -13113,31 +14327,79 @@
       },
       "MembersResponse": {
         "type": "object",
-        "description": "Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private.",
+        "description": "Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. On a domain GitHub governs (`governance` is `github`), the people on GitHub decide: `github_people` lists them, `owner` is null, `members` is empty, and the membership rows kept from before are listed under `overridden`.",
         "required": [
           "visibility",
-          "members"
+          "members",
+          "governance",
+          "overridden"
         ],
         "properties": {
+          "closed_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this domain is closed (the GitHub App is not installed on its\nrepository), for an instance admin; `null` otherwise."
+          },
+          "github_people": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/GithubPerson"
+            },
+            "description": "The people GitHub lists on the repository, with the level their role\ngives here and the account linked to them, for a caller who writes\nhere (GitHub write, maintain or admin, or an instance admin). `null`\nfor everybody else and on a domain GitHub does not govern; an empty\nlist while GitHub's answer is not known."
+          },
+          "governance": {
+            "$ref": "#/components/schemas/Governance",
+            "description": "`github` when access to this domain follows the GitHub App, else\n`crystalline`."
+          },
           "members": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/DomainMember"
             },
-            "description": "Everyone invited, by name. Empty for a shared domain."
+            "description": "Everyone invited, by name. Empty for a shared domain and for a\ndomain GitHub governs."
+          },
+          "overridden": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DomainMember"
+            },
+            "description": "On a domain GitHub governs, for a caller with manager access: the\nmembership rows set in Crystalline, which GitHub overrides. Empty\neverywhere else."
           },
           "owner": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, and a private one whose owner's account was removed has none\neither.",
+            "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, a private one whose owner's account was removed has none\neither, and on a domain GitHub governs the owner decides nothing.",
             "example": "ada"
+          },
+          "reflection_collaborators": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ReflectionGrant"
+            },
+            "description": "The Reflection collaborators of a domain kept as files, for a caller\nwith manager access; `null` for everybody else and on a domain kept\nin the database."
           },
           "visibility": {
             "type": "string",
             "description": "`private` or `shared`.",
             "example": "private"
+          },
+          "visibility_fixed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a domain GitHub governs whose readers are set in the environment,\nthe sentence that says where; the visibility switch is read-only\nthen. `null` everywhere else.",
+            "example": "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there."
           }
         }
       },
@@ -13704,6 +14966,14 @@
           }
         }
       },
+      "Readers": {
+        "type": "string",
+        "description": "Who may read a team domain on an instance with a GitHub App: `shared`\n(everyone signed in) or `private` (only people with access on GitHub).",
+        "enum": [
+          "shared",
+          "private"
+        ]
+      },
       "ReflectionAssetsResponse": {
         "type": "object",
         "description": "Every file of a domain's Reflection.",
@@ -13764,6 +15034,63 @@
           "path": {
             "type": "string",
             "description": "Inside `reflections/`, after the change; empty for `switched`, and\nfor `changed` when a sync found many paths at once (the whole\nReflection, then)."
+          }
+        }
+      },
+      "ReflectionCollaboratorBody": {
+        "type": "object",
+        "description": "`reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.",
+        "required": [
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/GrantLevel",
+            "description": "reader | contributor"
+          }
+        }
+      },
+      "ReflectionCollaboratorsResponse": {
+        "type": "object",
+        "description": "The accounts given the Reflection reader or contributor level on this one domain, beside what their engram access gives them.",
+        "required": [
+          "collaborators"
+        ],
+        "properties": {
+          "collaborators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReflectionGrant"
+            },
+            "description": "Every collaborator, by account name."
+          }
+        }
+      },
+      "ReflectionGrant": {
+        "type": "object",
+        "description": "One per-domain Reflection collaborator: an account given the Reflection\nreader or contributor level on one domain. A grant only raises the\nReflection right and never opens an engram.",
+        "required": [
+          "account",
+          "level",
+          "added_by",
+          "added_at"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account's login name, folded."
+          },
+          "added_at": {
+            "type": "string",
+            "description": "RFC 3339, when this grant was last written."
+          },
+          "added_by": {
+            "type": "string",
+            "description": "Who added or last changed this grant."
+          },
+          "level": {
+            "$ref": "#/components/schemas/ReflectionLevel",
+            "description": "`reader` or `contributor`."
           }
         }
       },
@@ -14205,6 +15532,20 @@
             ],
             "description": "The pull request title. Defaults to a generated summary.",
             "example": "Refine 2 engrams in kb"
+          }
+        }
+      },
+      "StartGithubLinkResponse": {
+        "type": "object",
+        "description": "What `POST /me/github-link/start` answers: where to send the browser.",
+        "required": [
+          "authorize_url"
+        ],
+        "properties": {
+          "authorize_url": {
+            "type": "string",
+            "description": "GitHub's authorize url for this flow. The page navigates the browser\nthere; GitHub sends it back to the callback.",
+            "example": "https://github.com/login/oauth/authorize?client_id=Iv23.x&redirect_uri=https%3A%2F%2Fkb.example.com%2Fapi%2Fv1%2Fgithub%2Flink%2Fcallback&state=..."
           }
         }
       },

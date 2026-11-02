@@ -150,6 +150,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
+| [Team server with a GitHub App](docs/deployment.md#team-server-with-a-github-app) | An App of your own reads, pulls and shares; access to each domain follows the repository on GitHub |
 | [Reflection on a team server](docs/deployment.md#reflection-on-a-team-server) | People and agents work on a domain's Reflection on one home instance, backed up to its own branch |
 | [Loop runners](docs/deployment.md#loop-runners) | A CronJob, a `watch` process or an n8n workflow runs the reflect and evolve loops when work is due, and shares the changes as a pull request |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |

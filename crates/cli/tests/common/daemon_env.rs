@@ -74,9 +74,23 @@ impl DaemonEnv {
         self.serve_with(false);
     }
 
+    /// [`DaemonEnv::serve`] with `env` set on the daemon alone: what a
+    /// daemon started by a service manager with its own environment file
+    /// has, and a command run in a plain shell does not.
+    pub fn serve_with_env(&mut self, env: &[(&str, &str)]) {
+        self.serve_inner(true, env);
+    }
+
     fn serve_with(&mut self, explicit_config: bool) {
+        self.serve_inner(explicit_config, &[]);
+    }
+
+    fn serve_inner(&mut self, explicit_config: bool, env: &[(&str, &str)]) {
         let mut cmd = crate::common::crystalline_std();
         self.apply(&mut cmd);
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
         cmd.arg("serve");
         if explicit_config {
             cmd.arg("--config").arg(self.config_path());

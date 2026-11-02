@@ -7103,8 +7103,18 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "connect_with_token"),
         ("engine.rs", "disconnect_github_identity"),
         ("engine.rs", "github_disconnect"),
+        // The instance's GitHub App, a credential like the connection, and
+        // the same save when GitHub created it from the manifest.
+        ("engine.rs", "create_github_app"),
+        ("engine.rs", "remove_github_app"),
+        ("engine.rs", "set_github_app"),
         ("engine.rs", "start_device_connect"),
         ("engine.rs", "start_github_identity_device_flow"),
+        // A person's GitHub link: a credential and an accounts row.
+        ("engine.rs", "link_github"),
+        ("engine.rs", "mint_github_link"),
+        ("engine.rs", "start_github_link_device_flow"),
+        ("engine.rs", "unlink_github"),
     ];
     let mut strays: Vec<&(String, String)> = guarded
         .iter()

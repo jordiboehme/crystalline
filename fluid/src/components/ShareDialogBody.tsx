@@ -134,10 +134,13 @@ export default function ShareDialogBody({
    * read-only instance refuses every content write whoever is asking, and a
    * reader who may not write is offered no control that would be refused.
    */
-  const mayDiscard = capabilities.canWrite && !capabilities.readOnly;
   // Sharing is refused on a locked domain (discard is not, decision D5), so
-  // the button says so instead of failing.
-  const { domainLocked } = useDomainWritable(domain);
+  // the button says so instead of failing. Where the listing answers per
+  // domain, a viewer with write access on GitHub may discard on a domain
+  // GitHub governs, as the route serves it.
+  const { canWrite, domainLocked } = useDomainWritable(domain);
+  const mayDiscard =
+    (capabilities.canWrite || canWrite) && !capabilities.readOnly;
   const lockedReasonId = useId();
   const titleField = useId();
   const descriptionField = useId();

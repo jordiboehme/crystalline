@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 11] = [
+const PUBLIC_PATHS: [&str; 16] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -158,6 +158,39 @@ const PUBLIC_PATHS: [&str; 11] = [
     // Where a client ends a grant it holds. Like the token route, the proof is
     // the token in the body, never a session. See `super::oauth::revoke`.
     super::oauth::REVOKE_PATH,
+    // Where GitHub sends the browser back after a link. It is a browser
+    // landing, so a lost session must not answer a raw 401: the handler
+    // calls `require_account` itself and sends a browser without one to the
+    // profile, which asks for a sign-in. Nothing is taken, exchanged or
+    // linked without the session that started the link. See
+    // `super::github_link::callback`.
+    super::github_link::CALLBACK_PATH,
+    // The single-use link an agent session hands its person to connect
+    // GitHub. A browser landing too, opened from a chat where nobody can say
+    // whether the browser is signed in: without a session it is sent to sign
+    // in and back, never a raw 401. The nonce proves nothing on its own; the
+    // handler spends it only for a signed-in session of the very account it
+    // was made for. See `super::github_link::go`.
+    super::github_link::GO_PATH,
+    // Where GitHub delivers the App's webhook events. The proof is the
+    // signature over the body (`X-Hub-Signature-256` under the App's
+    // webhook secret), never a session: GitHub has none, and a browser's
+    // session is worth nothing here. Listed for completeness only: `guard`
+    // hands a POST to this path to the handler before it resolves anybody
+    // or checks CSRF, and the handler refuses every delivery whose
+    // signature does not verify before it reads anything else. See
+    // `super::github_webhook::receive`.
+    super::github_webhook::PATH,
+    // Where GitHub sends the browser back after creating the instance's App
+    // from a manifest. A browser landing like the link callback: a lost
+    // session gets a page, never a raw 401. The handler requires an admin
+    // itself, and stores nothing without the state that admin's own session
+    // was handed with the form. See `super::github_app_create::created`.
+    super::github_app_create::CREATED_PATH,
+    // Where GitHub sends the browser after the App was installed. It only
+    // redirects to the settings page and reads nothing GitHub sent. See
+    // `super::github_app_create::setup`.
+    super::github_app_create::SETUP_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
@@ -508,6 +541,14 @@ pub async fn guard(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // The GitHub App's webhook: no identity is resolved (a header mode
+    // could otherwise provision an account) and no CSRF token is asked for.
+    // GitHub carries neither; the handler's signature check is the gate,
+    // and it extracts no `Identity`. Only the POST: any other method goes
+    // through the guard like every other path.
+    if req.method() == axum::http::Method::POST && req.uri().path() == super::github_webhook::PATH {
+        return Ok(next.run(req).await);
+    }
     // The domain-path step ahead of routing may have resolved the caller
     // already; its answer, success or refusal, is this request's answer.
     let identity = match req

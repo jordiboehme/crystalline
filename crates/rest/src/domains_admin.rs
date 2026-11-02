@@ -22,6 +22,7 @@ use super::{
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
+use crystalline_engine::params::Readers as EngineReaders;
 use crystalline_remote::ops::DiscardTarget;
 
 /// The caller, when they may drive this instance's share surfaces - the status
@@ -36,6 +37,9 @@ use crystalline_remote::ops::DiscardTarget;
 /// layers, who authored them, what is wedged - so an editor who may share and
 /// may not read it would be sharing into a card they cannot see.
 ///
+/// On a domain GitHub governs, the six domain routes go through
+/// [`require_share_role_on`] instead, where the GitHub role decides (R27).
+///
 /// The rule itself lives on [`Identity::may_share`], which the `/auth/me`
 /// probe reads too, so what a client draws and what these routes serve can
 /// never disagree. This wrapper is the local reading of the instance's mode,
@@ -44,6 +48,29 @@ use crystalline_remote::ops::DiscardTarget;
 /// rather than at the next restart.
 fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, ApiError> {
     identity.may_share(state.engine.share_identity_mode())
+}
+
+/// [`require_share_role`] for the share surfaces of one domain. On a domain
+/// GitHub governs the share follows the same right as a save (R27): the
+/// GitHub role and the write list decide through `require_domain_write`,
+/// whatever the instance role and the share mode say, and the engine's own
+/// checks on the share stay as they are. A caller that also fails that gets
+/// the share role's own refusal, so a governed domain it may not see
+/// answers as every other domain does here.
+pub(crate) async fn require_share_role_on(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Caller, ApiError> {
+    match require_share_role(state, identity) {
+        Ok(caller) => Ok(caller),
+        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN && state.access.governs(domain) => {
+            crate::require_domain_write(state, identity, domain)
+                .await
+                .map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The account a request is being served as, or `None` for the anonymous
@@ -112,6 +139,34 @@ pub struct CreateDomainBody {
     #[serde(default)]
     #[schema(example = false)]
     pub private: bool,
+    /// Who may read a team domain on an instance with a GitHub App:
+    /// `shared` (everyone signed in) or `private` (only people with access
+    /// on GitHub). github mode only. Required there when an App is
+    /// configured, since access then follows GitHub and is never defaulted;
+    /// `private: true` answers `private`. Ignored, with a note in the
+    /// report, without an App.
+    #[serde(default)]
+    pub readers: Option<Readers>,
+}
+
+/// Who may read a team domain on an instance with a GitHub App: `shared`
+/// (everyone signed in) or `private` (only people with access on GitHub).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Readers {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access to the repository on GitHub read it.
+    Private,
+}
+
+impl From<Readers> for EngineReaders {
+    fn from(readers: Readers) -> EngineReaders {
+        match readers {
+            Readers::Shared => EngineReaders::Shared,
+            Readers::Private => EngineReaders::Private,
+        }
+    }
 }
 
 /// `POST /domains` - register a domain: a local folder under the server's
@@ -199,8 +254,12 @@ pub struct CreateDomainBody {
                            domain (github alone may omit it), a name that \
                            could escape the domains root, a github `repo` \
                            that is not owner/name or a `path` that is \
-                           absolute or holds a `..` segment, or a field \
-                           that does not belong to the mode asked for.",
+                           absolute or holds a `..` segment, a field \
+                           that does not belong to the mode asked for, a \
+                           `readers` that is neither shared nor private or \
+                           that contradicts `private`, or a team domain \
+                           without `readers` on an instance with a GitHub \
+                           App.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -224,6 +283,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "local")?;
             require_absent(&body.branch, "branch", "local")?;
             require_absent(&body.path, "path", "local")?;
+            require_no_readers(&body, "local")?;
             state
                 .engine
                 .domain_add_local_as(Some(name), None, &identity.scope())
@@ -234,6 +294,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "virtual")?;
             require_absent(&body.branch, "branch", "virtual")?;
             require_absent(&body.path, "path", "virtual")?;
+            require_no_readers(&body, "virtual")?;
             state
                 .engine
                 .domain_add_virtual_as(name, &identity.scope())
@@ -252,6 +313,7 @@ pub async fn create(
             if let Some(path) = body.path.as_deref() {
                 validate_github_path(path)?;
             }
+            let readers = github_readers(&body, || state.engine.github_app_configured())?;
             // The TRIMMED name, and it has to be the one that travels on:
             // `origin_add` uses what it is handed verbatim as the config key
             // and as the folder segment under the domains root, so passing
@@ -277,6 +339,7 @@ pub async fn create(
                     // Never from this surface: a team domain lands under the
                     // domains root like a local one, for the same reason.
                     None,
+                    readers,
                     None,
                     &identity.scope(),
                 )
@@ -290,7 +353,10 @@ pub async fn create(
     };
     match report {
         Ok(report) => {
-            if body.private {
+            // A connect that recorded who may read the domain (its access
+            // follows GitHub) has already made it private when asked; its
+            // owner record is never read, so there is nothing left to close.
+            if body.private && report.get("readers").is_none() {
                 close_new_domain(&state, &report, caller.name()).await?;
             }
             Ok((StatusCode::CREATED, Json(report)).into_response())
@@ -300,6 +366,36 @@ pub async fn create(
         // MCP's classification.
         Err(EngineError::Conflict(detail)) => Err(ApiError::conflict(detail)),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// `readers` on a mode that is not github: a 422 naming the field, the way
+/// [`require_absent`] answers the other github-only fields.
+fn require_no_readers(body: &CreateDomainBody, mode: &str) -> Result<(), ApiError> {
+    match body.readers {
+        Some(_) => Err(ApiError::unprocessable(format!(
+            "readers does not apply to a {mode} domain"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The `readers` a github-mode create passes on: the body's own, else
+/// `private` when the body asked for a private domain on an instance with a
+/// GitHub App (`app_configured`, asked only then), else none. `shared`
+/// beside `private: true` is a 422 naming the field; a value that is
+/// neither is refused by the body's own schema.
+fn github_readers(
+    body: &CreateDomainBody,
+    app_configured: impl FnOnce() -> bool,
+) -> Result<Option<EngineReaders>, ApiError> {
+    match body.readers {
+        Some(Readers::Shared) if body.private => Err(ApiError::unprocessable(
+            "readers shared and private: true contradict each other; send one of them",
+        )),
+        Some(readers) => Ok(Some(readers.into())),
+        None if body.private && app_configured() => Ok(Some(EngineReaders::Private)),
+        None => Ok(None),
     }
 }
 
@@ -893,7 +989,8 @@ fn single_domain(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), or the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
@@ -923,7 +1020,7 @@ pub async fn sync_status(
 ) -> Result<Json<Value>, ApiError> {
     // The share verbs' own gate: whoever may share reads the report they would
     // be sharing into. See the doc comment.
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -1466,7 +1563,8 @@ pub async fn sync_now(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), this \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), this \
                            instance is read-only, or the trusted-header \
                            identity names a disabled account.",
             body = ProblemDetail,
@@ -1493,7 +1591,7 @@ pub async fn share_changes_preview(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The domain gate `sync_status` explains: a domain the caller may not see
     // is refused as one nobody registered.
@@ -1700,7 +1798,8 @@ pub struct ShareBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -1744,7 +1843,7 @@ pub async fn share_now(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -1856,7 +1955,8 @@ pub struct WithdrawBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -1891,7 +1991,7 @@ pub async fn withdraw_proposal(
     ApiPath((domain, number)): ApiPath<(String, u64)>,
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -1966,7 +2066,8 @@ pub async fn withdraw_proposal(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), or the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled \
                            account.",
             body = ProblemDetail,
@@ -1995,7 +2096,7 @@ pub async fn conflict_detail(
     // The same gate the resolve carries, for the same reason: whoever may
     // settle a conflict has to be able to read the three sides they are
     // choosing between first.
-    require_share_role(&state, &identity)?;
+    require_share_role_on(&state, &identity, &domain).await?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
     // The domain gate `sync_status` explains: a domain the caller may not see
@@ -2073,7 +2174,8 @@ pub struct ResolveBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -2115,7 +2217,7 @@ pub async fn resolve_conflict(
     ApiPath((domain, id)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -2329,7 +2431,7 @@ pub struct DiscardBody {
             example = json!({ "domain": "kb", "restored": ["notes/a.md"], "deleted": ["notes/new.md"], "cleared": [], "refused": [{ "path": "notes/b.md", "reason": "changed_since" }], "reindexed": 2 }),
         ),
         (status = 401, description = "No identity, or an anonymous one.", body = ProblemDetail, content_type = "application/problem+json"),
-        (status = 403, description = "A viewer, a membership below editor, or a read-only instance.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 403, description = "No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 404, description = "No such domain, or none this caller may see.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 409, description = "Not a team domain, or GitHub is switched off on this instance.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 422, description = "An empty path list.", body = ProblemDetail, content_type = "application/problem+json"),
@@ -2739,7 +2841,13 @@ pub struct VisibilityBody {
                    invite people and change their levels; deciding who holds \
                    the domain is not one domain's administration to \
                    settle.\n\nMaking a domain shared again forgets its \
-                   membership list.",
+                   membership list.\n\nOn a domain GitHub governs, \
+                   both directions need manager access: a GitHub admin or \
+                   maintainer, or an instance admin. Private means only \
+                   the people with access on GitHub read it; shared means \
+                   everyone signed in. The membership list is kept there, \
+                   and a domain whose readers are set in the environment \
+                   answers 409.",
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = VisibilityBody,
     responses(
@@ -2772,6 +2880,13 @@ pub struct VisibilityBody {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 409,
+            description = "Who may read this domain is set in the \
+                           environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn set_visibility(
@@ -2780,6 +2895,9 @@ pub async fn set_visibility(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<VisibilityBody>,
 ) -> Result<StatusCode, ApiError> {
+    if state.engine.github_governs(&domain) {
+        return set_governed_visibility(&state, &identity, &domain, body.private).await;
+    }
     if body.private {
         let caller = identity.require_admin()?;
         refuse_read_only(&state)?;
@@ -2835,6 +2953,80 @@ pub async fn set_visibility(
         .await
         .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
     crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// [`set_visibility`] on a domain GitHub governs, where "who may read" is
+/// one switch: everyone signed in, or only the people with access on
+/// GitHub.
+///
+/// * The gates run in the order the rest of this surface uses: an account,
+///   the 404 a hidden domain shares with an unregistered name, the
+///   read-only refusal, the right, then the environment. A caller who may
+///   not see the domain and asks to make it private is answered exactly as
+///   for an unregistered name, which for a non-admin is the admin refusal
+///   of the plain path.
+/// * Both directions need [`DomainRight::Manage`]: a GitHub admin or
+///   maintainer, or an instance admin. Nobody holds a domain here, so
+///   neither direction hands it to anybody.
+/// * A domain defined in the environment applies its readers again on every
+///   start, so a change here would not last: it is refused with the
+///   variable's name.
+/// * Private is recorded through `set_governed_private` under the reserved
+///   machine owner's name, never the caller's, and leaves an
+///   already-private domain as it is. Shared drops the acl row only: the
+///   membership rows stay for the day the App is removed.
+async fn set_governed_visibility(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+    private: bool,
+) -> Result<StatusCode, ApiError> {
+    identity.require_account()?;
+    if let Err(hidden) = require_domain_read(state, identity, domain).await {
+        if private {
+            identity.require_admin()?;
+        }
+        return Err(hidden);
+    }
+    refuse_read_only(state)?;
+    let right = state
+        .access
+        .right(&identity.scope(), domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Manage {
+        crate::refuse_off_write_list(state, identity, domain, Some(DomainRight::Manage)).await?;
+        return Err(ApiError::forbidden(format!(
+            "your access to this domain is {}, and only a GitHub admin or \
+             maintainer, or an instance admin, may change who reads it",
+            super::member_level_word(right)
+        )));
+    }
+    if let Some(var) = state.engine.env_readers_var(domain) {
+        return Err(ApiError::conflict(super::members::env_readers_sentence(
+            &var,
+        )));
+    }
+    if private {
+        // The reserved name holds the record, as on the connect and env
+        // paths: nobody owns a governed domain, and a caller's name here
+        // would make it an owner the day the App is removed.
+        state
+            .access
+            .set_governed_private(domain, crate::scope::OWNER_IDENTITY_NAME)
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    } else {
+        state
+            .access
+            .take_back_governed_private(domain)
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    }
+    crate::readers_changed(state);
     Ok(StatusCode::NO_CONTENT)
 }
 

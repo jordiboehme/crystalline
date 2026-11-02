@@ -616,6 +616,14 @@ pub async fn run_serve(
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
     let accounts = crate::client::install_domain_access(&engine).await;
+    // Who may read each env-defined team domain on an instance with a GitHub
+    // App, recorded before anything is served so a private one is closed
+    // from its first request on. A private record that cannot be written
+    // stops the start: serving the domain open is the one thing not to do.
+    engine
+        .apply_env_readers()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {
@@ -2415,7 +2423,9 @@ fn http_base(
     // to anybody who could reach the port. It is a no-op on a second call, so
     // an integration test that builds two routers over one engine keeps the
     // first store.
-    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+    engine.set_domain_access(Arc::new(
+        crate::scope::DomainAccess::new(auth.clone()).with_governor(engine.knowledge_governor()),
+    ));
 
     // And the same rule answers where this instance's pages are, for an HTTP
     // caller from its own headers and for a local one from the address this

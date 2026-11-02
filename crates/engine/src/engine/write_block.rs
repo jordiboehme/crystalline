@@ -104,7 +104,9 @@ impl Engine {
     ///
     /// In order: the open tier (anonymous with `auth.mcp` off), which writes
     /// through the MCP carve-out wherever `edit_engram` writes and so is
-    /// refused only by a reviewing domain; then the capped write right, with
+    /// refused only by a reviewing domain, except on a domain GitHub governs,
+    /// where it is decided as `github.agent_identity` (or as anonymous
+    /// without one, which never writes); then the capped write right, with
     /// the write list named only when it is the reason
     /// ([`crate::scope::DomainAccess::write_list_excludes`]). `None` for
     /// [`Scope::Unrestricted`] and with no resolver installed, never an error.
@@ -113,11 +115,14 @@ impl Engine {
         scope: &Scope,
         domain: &str,
     ) -> Result<Option<WriteBlock>> {
-        if matches!(scope, Scope::Anonymous) && !self.auth_mcp() {
+        if self.open_tier_carve_out(scope, domain) {
             return Ok(self
                 .reviews_changes(domain)
                 .then_some(WriteBlock::Reviewing));
         }
+        // The open tier on a domain GitHub governs is decided as
+        // `github.agent_identity`, or as anonymous without one.
+        let scope = &self.scope_on(scope, domain);
         if self.write_right(scope, domain).await? >= DomainRight::Write {
             return Ok(None);
         }
@@ -214,6 +219,10 @@ impl Engine {
             return true;
         }
         if marks.open_tier {
+            // A domain GitHub governs has no carve-out: decided on its own.
+            if self.github_governs(domain) {
+                return self.read_only_mark(&marks.scope, domain).await;
+            }
             return self.reviews_changes(domain);
         }
         match &marks.rights {

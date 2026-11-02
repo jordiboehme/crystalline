@@ -113,6 +113,11 @@ fn cross_link_reason(
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
+/// The `links_failed` reason for a linking engram in a domain the mover may
+/// see but only read: its link was left as it was.
+const LINKER_READ_ONLY: &str =
+    "you may only read this domain, so its link to the moved engram was left as it was";
+
 /// Name one linking page or engram a move could not rewrite, in the shape
 /// every move receipt's `links_failed` carries: `{ domain, path, reason }`.
 /// Shared by the engram move, the reflection move and the reflection file
@@ -168,7 +173,9 @@ impl Engine {
     /// shown. So the rewrite skips a domain this caller may not see: its link
     /// is left as it was - dangling, which its own members see as an
     /// unresolved-reference finding on the next sweep - rather than silently
-    /// edited by somebody with no access to it, and the receipt's counts
+    /// edited by somebody with no access to it. A domain the caller sees but
+    /// may only read is skipped the same way and named in `links_failed`: a
+    /// move never writes where its mover may not write. The receipt's counts
     /// (`links_rewritten`, the engrams rewritten, and `references_rewritten`,
     /// the references inside them) cover the visible rewrites only, so a
     /// receipt never counts a file its reader may not know exists.
@@ -494,6 +501,26 @@ impl Engine {
         } else {
             Vec::new()
         };
+        // A domain the mover may see but only read is left as it was, like a
+        // hidden one: a move must not write where its mover may not write
+        // (on a domain GitHub governs, that domain is later shared through
+        // the App). Unlike a hidden domain it is named in `links_failed`,
+        // since the mover may know it exists. Both ends passed the write
+        // gate at the edge.
+        let mut read_only_linkers: HashSet<String> = HashSet::new();
+        let mut asked: HashSet<&str> = HashSet::new();
+        for linker in &linkers {
+            let domain = linker.domain.as_str();
+            if domain == p.domain || domain == dest_domain || !asked.insert(domain) {
+                continue;
+            }
+            if matches!(
+                self.write_access_block(scope, domain).await?,
+                Some(WriteBlock::Role | WriteBlock::WriteList { .. })
+            ) {
+                read_only_linkers.insert(domain.to_string());
+            }
+        }
         // Every other domain the rewrite will write into is counted for the
         // rest of the move, as the source and the destination are, so a
         // rename of a linker's domain waits for the move instead of racing
@@ -509,6 +536,7 @@ impl Engine {
             let domain = linker.domain.as_str();
             if domain == p.domain
                 || domain == dest_domain
+                || read_only_linkers.contains(domain)
                 || paused.contains_key(domain)
                 || linker_tickets.iter().any(|(held, _)| held == domain)
             {
@@ -973,6 +1001,14 @@ impl Engine {
         let mut rewritten: Vec<Value> = Vec::new();
         let mut references = 0usize;
         for linker in &linkers {
+            if read_only_linkers.contains(&linker.domain) {
+                failed.push(json!({
+                    "domain": linker.domain,
+                    "path": linker.path,
+                    "reason": LINKER_READ_ONLY,
+                }));
+                continue;
+            }
             if let Some(e) = paused.get(&linker.domain) {
                 tracing::warn!(
                     domain = linker.domain.as_str(),

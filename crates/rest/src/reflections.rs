@@ -124,7 +124,9 @@ pub(crate) fn reflection_error(e: EngineError) -> ApiError {
     description = "Every registered domain whose Reflection is not off and \
                    where the caller's reflection right is at least `read`, \
                    including domains the caller cannot see as engrams \
-                   (knowledge `none` with a Reflection level): this is how \
+                   (knowledge `none` with a Reflection level, and \
+                   Reflection collaborators, who hold a per-domain \
+                   Reflection grant): this is how \
                    Fluid finds them, since `GET /domains` leaves them out. \
                    The anonymous viewer gets the public domains, at `read`. \
                    Sorted by name.",
@@ -218,11 +220,19 @@ pub async fn domains(
                            nobody holds, and it is `null` in every other \
                            state). `member` is true \
                            when the caller holds a membership row it may \
-                           leave.",
+                           leave; `collaborator` is true when it holds a \
+                           per-domain Reflection grant it may give up \
+                           (`DELETE /domains/{domain}/reflection-collaborators/{account}`). \
+                           `governance` is `github` when access to the \
+                           domain follows the GitHub App (then `member` is \
+                           always false), else `crystalline`; `private` says \
+                           whether the domain is private.",
             body = Object,
             example = json!({ "domain": "eng", "enabled": true, "state": "on",
                 "home": "here", "home_url": null, "host_label": null, "right": "curate",
-                "engrams_visible": true, "member": false, "pending_engrams": [] }),
+                "engrams_visible": true, "member": false, "collaborator": false,
+                "governance": "crystalline", "private": false,
+                "pending_engrams": [] }),
         ),
         (
             status = 404,
@@ -245,7 +255,11 @@ pub async fn status(
     // Whether the caller holds a membership row it may leave (Fluid G5). Read
     // here, not in the engine: it is an accounts question, and only this
     // surface offers leaving.
+    // On a domain GitHub governs, a membership row decides nothing and
+    // cannot be removed (the route answers 409), so none is offered.
+    let governed = state.engine.github_governs(&domain);
     let member = match &identity.user {
+        Some(_) if governed => false,
         Some(user) => state
             .auth
             .domain_members(&domain)
@@ -256,6 +270,31 @@ pub async fn status(
         None => false,
     };
     answer["member"] = Value::Bool(member);
+    // Whether the caller holds a Reflection grant here it may give up.
+    let collaborator = match &identity.user {
+        Some(user) => state
+            .auth
+            .reflection_grant(&domain, &user.name)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "reading this domain's Reflection collaborators: {e:#}"
+                ))
+            })?
+            .is_some(),
+        None => false,
+    };
+    answer["collaborator"] = Value::Bool(collaborator);
+    // Whether access follows GitHub here, and whether the domain is private:
+    // Fluid tells an account with no GitHub link how to reach it.
+    answer["governance"] = Value::from(if governed { "github" } else { "crystalline" });
+    let private = state
+        .auth
+        .domain_visibility(&domain)
+        .await
+        .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?
+        .is_some();
+    answer["private"] = Value::Bool(private);
     Ok(Json(answer))
 }
 

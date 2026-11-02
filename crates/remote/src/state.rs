@@ -150,6 +150,24 @@ pub struct OriginState {
     /// written under; no released build wrote it.
     #[serde(rename = "merged_branches", default)]
     pub retire_queue: Vec<QueuedBranch>,
+    /// GitHub's numeric ids of the repository this domain is connected to
+    /// and of its owner, recorded when the domain was connected through the
+    /// GitHub App (or, for a domain connected before, on the App's first
+    /// good lookup). GitHub keeps a repository's id through a rename and a
+    /// transfer and redirects the old name, so the name alone cannot tell a
+    /// transfer or a reused name; these can. `None` until recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_ids: Option<RepositoryIds>,
+}
+
+/// GitHub's numeric ids of a repository and of the account that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryIds {
+    /// The repository's `id`: kept through a rename and a transfer, new for
+    /// a new repository under a reused name.
+    pub repository: u64,
+    /// The owner's `owner.id`: changes when the repository is transferred.
+    pub owner: u64,
 }
 
 /// The recorded shape of a file in the base snapshot: enough to tell, without
@@ -568,6 +586,7 @@ impl OriginState {
             repair_pending: false,
             stack_link_pending: false,
             retire_queue: Vec::new(),
+            repository_ids: None,
         }
     }
 
@@ -1140,6 +1159,29 @@ mod tests {
         assert!(state.direct_refusal_for(Some("alice")).is_some());
         assert!(!state.clear_direct_refusal(None));
         assert!(state.direct_refusal_for(Some("alice")).is_some());
+    }
+
+    #[test]
+    fn repository_ids_round_trip_and_an_older_state_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = OriginState::new("acme/kb", "main");
+        assert_eq!(state.repository_ids, None);
+        state.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(!text.contains("repository_ids"), "{text}");
+        state.repository_ids = Some(RepositoryIds {
+            repository: 55,
+            owner: 7,
+        });
+        state.save(dir.path()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.repository_ids,
+            Some(RepositoryIds {
+                repository: 55,
+                owner: 7
+            })
+        );
     }
 
     fn sample_state() -> OriginState {
