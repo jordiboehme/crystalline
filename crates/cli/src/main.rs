@@ -2156,6 +2156,9 @@ fn main() -> std::process::ExitCode {
     // else can read or write the environment while it is written. The daemon,
     // the MCP bridge and headless runs are this same binary and pass here too.
     unsafe { crystalline_index::keep_xet_telemetry_off() };
+    // Before anything can start a child: on Windows a child would otherwise
+    // hold this process's stdout and stderr open after it exits.
+    crystalline_service::instance::keep_std_handles_from_children();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.is::<PrintedRefusal>() => std::process::ExitCode::from(1),

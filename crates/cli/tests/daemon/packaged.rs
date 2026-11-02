@@ -129,7 +129,6 @@ fn a_packaged_command_without_a_daemon_writes_no_state() {
 #[test]
 fn a_packaged_stop_hook_still_keeps_its_session_file() {
     let home = short_home();
-    let _stops = StopsDaemon(home.path());
     let work = tempfile::tempdir().unwrap();
     let config = config_path(home.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -377,8 +376,10 @@ fn domain_folder(parent: &Path, name: &str) -> PathBuf {
 #[test]
 fn a_packaged_domain_add_registers_through_the_daemon() {
     let home = short_home();
-    let _stops = StopsDaemon(home.path());
+    // Declared before the guard, so the daemon stops before the folder
+    // it serves is removed.
     let work = tempfile::tempdir().unwrap();
+    let _stops = StopsDaemon(home.path());
     domain_folder(work.path(), "kb");
     let file = bounded(
         crystalline(home.path(), true, "serve")
@@ -431,8 +432,10 @@ fn a_packaged_domain_add_registers_through_the_daemon() {
 #[test]
 fn a_packaged_domain_add_still_needs_a_manifest() {
     let home = short_home();
-    let _stops = StopsDaemon(home.path());
+    // Declared before the guard, so the daemon stops before the folder
+    // it serves is removed.
     let work = tempfile::tempdir().unwrap();
+    let _stops = StopsDaemon(home.path());
     std::fs::create_dir_all(work.path().join("bare")).unwrap();
     let out = bounded(
         crystalline(home.path(), true, "serve")
@@ -613,8 +616,10 @@ fn a_packaged_doctor_says_it_reads_the_private_copy() {
 #[test]
 fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
     let home = short_home();
-    let _stops = StopsDaemon(home.path());
+    // Declared before the guard, so the daemon stops before the folder
+    // it serves is removed.
     let work = tempfile::tempdir().unwrap();
+    let _stops = StopsDaemon(home.path());
     domain_folder(work.path(), "kb");
     let config = config_path(home.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();

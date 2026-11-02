@@ -2401,10 +2401,19 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// client's output to its end (a harness, a script, a test's `output()`)
 /// waited for the daemon instead of the client. Clearing the inherit flag
 /// ends that; a later child started with `Stdio::inherit` still gets them,
-/// because std hands it an inheritable duplicate of its own. A no-op on
-/// unix, where std opens everything close-on-exec and a child gets only the
-/// three descriptors it is given.
-pub(crate) fn keep_std_handles_from_children() {
+/// because std hands it an inheritable duplicate of its own.
+///
+/// `main` calls it first thing, so a spawner added later cannot forget it;
+/// the daemon spawns call it again, which costs nothing. It is a no-op on
+/// unix: std opens its own descriptors close-on-exec, and in a child the
+/// three stdio descriptors are replaced by the ones it is given.
+///
+/// What it does not cover: a handle this process inherited from its own
+/// parent beyond its standard handles still passes to every child, because
+/// std always calls `CreateProcessW` with `bInheritHandles` set. Closing that
+/// gap needs `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, which std offers only
+/// through an unstable API.
+pub fn keep_std_handles_from_children() {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
