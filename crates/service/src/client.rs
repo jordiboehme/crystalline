@@ -982,6 +982,11 @@ async fn open_standalone_noting(
     } else {
         "the configured database".to_string()
     };
+    // Inside an app package no local engine is opened, not even for a read
+    // or with an override outside AppData: see `ctl_routed`.
+    if crate::runs_in::PackageContext::here().is_packaged() {
+        anyhow::bail!(packaged_local_engine_refusal());
+    }
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
@@ -1084,7 +1089,7 @@ pub async fn run_tool(
     // call in the session's response format (TOON by default), which neither
     // the `--json` byte contract nor the human renderers can consume.
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "tool", "tool": tool, "args": args.clone(),
         }))
         .await?
@@ -1135,7 +1140,7 @@ pub async fn scaffold_virtual_manifest(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "scaffold_manifest", "domain": domain, "markdown": markdown,
         }))
         .await?
@@ -1164,7 +1169,7 @@ pub async fn domain_import(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_import", "domain": domain,
             "path": src.display().to_string(), "overwrite": overwrite, "dry_run": dry_run,
             "complete": complete,
@@ -1197,7 +1202,7 @@ pub async fn tags_retag(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "retag", "old": old, "new": new,
             "domain": domain, "merge": merge, "dry_run": dry_run, "no_alias": no_alias,
         }))
@@ -1229,7 +1234,7 @@ pub async fn domain_export(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_export", "domain": domain,
             "path": dest.display().to_string(), "force": force, "dry_run": dry_run,
         }))
@@ -1280,7 +1285,7 @@ pub async fn collect_orphaned_domains(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "collect_orphaned_domains", "dry_run": dry_run,
         }))
         .await?
@@ -1313,7 +1318,7 @@ pub async fn name_report(
     use serde_json::json;
     if use_daemon(db, config_path) {
         let renamed = if fix {
-            match ctl_if_running(json!({ "v": 1, "cmd": "finish_rename_questions" })).await {
+            match ctl_routed(json!({ "v": 1, "cmd": "finish_rename_questions" })).await {
                 Ok(answer) => answer.map(Ok),
                 Err(e) => Some(Err(format!("{e:#}"))),
             }
@@ -1321,7 +1326,7 @@ pub async fn name_report(
             None
         };
         let fixed = if fix {
-            match ctl_if_running(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
+            match ctl_routed(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
                 Ok(answer) => {
                     answer.map(|data| Ok(data.get("fixed").and_then(Value::as_u64).unwrap_or(0)))
                 }
@@ -1331,7 +1336,7 @@ pub async fn name_report(
             None
         };
         if (!fix || fixed.is_some())
-            && let Some(mut data) = ctl_if_running(json!({ "v": 1, "cmd": "name_report" })).await?
+            && let Some(mut data) = ctl_routed(json!({ "v": 1, "cmd": "name_report" })).await?
         {
             attach_fix_outcome(&mut data, fixed);
             attach_rename_outcome(&mut data, renamed);
@@ -1477,7 +1482,7 @@ pub async fn domain_remove(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_remove", "domain": name, "purge": purge,
             "end_drafts": end_drafts,
         }))
@@ -1547,7 +1552,7 @@ pub async fn domain_rename(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_rename", "domain": domain, "new": new,
             "local_only": local_only,
         }))
@@ -1782,8 +1787,7 @@ pub async fn domain_review(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     if use_daemon(db, config_path)
-        && let Some(data) =
-            ctl_if_running(review_request(name, overlay_mode, preview, folds)).await?
+        && let Some(data) = ctl_routed(review_request(name, overlay_mode, preview, folds)).await?
     {
         return Ok(data);
     }
@@ -1835,7 +1839,7 @@ pub async fn origin_add(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
             "path": path, "branch": branch, "folder": folder,
         }))
@@ -1910,7 +1914,7 @@ pub async fn origin_update(
     use serde_json::json;
     if use_daemon(db, config_path)
         && let Some(data) =
-            ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
+            ctl_routed(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
     {
         return Ok(data);
     }
@@ -1943,7 +1947,7 @@ pub async fn origin_status(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1,
             "cmd": "origin_status",
             "domain": domain,
@@ -1986,7 +1990,7 @@ pub async fn origin_share(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(origin_share_request(
+        && let Some(data) = ctl_routed(origin_share_request(
             domain,
             title,
             description,
@@ -2045,7 +2049,7 @@ pub async fn origin_withdraw(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_withdraw", "domain": domain,
             "proposal": proposal, "revert": revert,
         }))
@@ -2074,7 +2078,7 @@ pub async fn origin_changes(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_changes", "domain": domain, "path": path, "sides": sides,
         }))
         .await?
@@ -2107,7 +2111,7 @@ pub async fn origin_discard(
         .map(|(path, sha)| json!({ "path": path, "sha": sha }))
         .collect();
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_discard", "domain": domain, "targets": wire,
         }))
         .await?
@@ -2148,7 +2152,7 @@ pub async fn origin_resolve(
     use serde_json::json;
     let content_b64 = content.map(|c| BASE64.encode(c));
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
             "keep": keep, "content_b64": content_b64,
         }))
@@ -2183,7 +2187,7 @@ pub async fn configure(
     // one entirely, so the override always takes the direct path and the
     // daemon is only consulted about the default config it actually serves.
     if config_path.is_none()
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
         }))
         .await?
@@ -2277,7 +2281,7 @@ pub async fn provision(
     // same reasoning `configure` documents: a running daemon serves ITS OWN
     // default config, which may be a different one entirely.
     if config_path.is_none()
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "provision", "action": action, "domain": domain,
         }))
         .await?
@@ -2628,6 +2632,50 @@ pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
         (None, None) => return Ok(None),
     };
     Ok(Some(ctl_exchange(conn, cmd).await?))
+}
+
+/// Send a ctl command the way this process may: outside an app package this
+/// is [`ctl_if_running`], a running daemon's answer or `None`, and the
+/// caller falls back to its local path as before.
+///
+/// Inside an app package (Claude Desktop's MSIX package on Windows) a
+/// daemon is required, because every new file this process writes under
+/// AppData lands in the package's private copy. So it attaches, or runs the
+/// daemon task and waits for the daemon the way a packaged bridge does
+/// ([`crate::instance::ensure_daemon`]), and answers the daemon's reply. It
+/// never answers `None` there: without a daemon it fails with
+/// [`packaged_refusal`], and the caller never opens a local engine.
+pub async fn ctl_routed(cmd: Value) -> anyhow::Result<Option<Value>> {
+    if !crate::runs_in::PackageContext::here().is_packaged() {
+        return ctl_if_running(cmd).await;
+    }
+    let conn = match crate::instance::ensure_daemon(true, None, None, false).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            let bridge = crate::daemon_task::BridgeFailure::of(&e);
+            return Err(anyhow::anyhow!(packaged_refusal(&bridge)));
+        }
+    };
+    Ok(Some(ctl_exchange(conn, cmd).await?))
+}
+
+/// What a command inside an app package says when no daemon answers: why,
+/// the fix and the terminal outside Claude Desktop.
+pub fn packaged_refusal(bridge: &crate::daemon_task::BridgeFailure) -> String {
+    let fix = crate::stub::StubStatus::for_bridge(bridge.to_string(), bridge.clone()).fix();
+    format!(
+        "Crystalline cannot run this command here: {bridge}. A command inside Claude Desktop's app package works only through the Crystalline daemon outside it. {fix} Or run the command in a terminal outside Claude Desktop."
+    )
+}
+
+/// The refusal of a local engine (or a direct index open) inside an app
+/// package: it would create a private index, write-ahead log and ownership
+/// record, and index the same knowledge folders as the daemon outside.
+pub fn packaged_local_engine_refusal() -> String {
+    format!(
+        "Crystalline does not open its index from here: {}.",
+        crate::runs_in::PACKAGED_WRITE_REASON
+    )
 }
 
 /// [`ctl_if_running`] over a passive attach: the answer of a daemon that is

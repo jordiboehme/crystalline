@@ -1871,6 +1871,12 @@ pub async fn run(
     let mut store = None;
     if daemon_stamps.is_some() {
         index = IndexAccess::Daemon;
+    } else if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+        // Inside an app package the index is never opened here: the open
+        // would create a private write-ahead log and ownership record.
+        index = IndexAccess::Unavailable {
+            reason: crystalline_service::client::packaged_local_engine_refusal(),
+        };
     } else if db.is_file() {
         match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
             Ok(opened) => {
@@ -2399,7 +2405,7 @@ fn orphan_check_has_a_route(daemon_may_answer: bool, file_backed: bool, db_exist
 async fn daemon_file_stamps(
     domain: Option<&str>,
 ) -> Option<HashMap<String, HashMap<String, FileStamp>>> {
-    let data = crystalline_service::ctl_if_running(
+    let data = crystalline_service::ctl_routed(
         serde_json::json!({ "v": 1, "cmd": "file_stamps", "domain": domain }),
     )
     .await

@@ -56,7 +56,7 @@ impl AutomationClient {
                 let answer = if settled.load(Ordering::SeqCst) {
                     crystalline_service::ctl_if_running_passive(cmd).await?
                 } else {
-                    crystalline_service::ctl_if_running(cmd).await?
+                    crystalline_service::ctl_routed(cmd).await?
                 };
                 match answer {
                     Some(data) => {

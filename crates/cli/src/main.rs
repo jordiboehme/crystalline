@@ -2242,6 +2242,12 @@ fn run() -> anyhow::Result<()> {
             take_over,
             config,
         }) => {
+            // The daemon never runs with an app package's identity: every
+            // file it wrote under AppData would land in the package's private
+            // copy. Refused before anything else, the scratch folder included.
+            if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+                anyhow::bail!(crystalline_service::runs_in::PACKAGED_SERVE_REFUSAL);
+            }
             // A task-started daemon is recorded as an autostart, like any
             // daemon a client spawned: no new start mode an old reader would
             // fail to parse.
@@ -2508,7 +2514,7 @@ async fn status_dispatch(
     // config names and cannot sensibly do that from a file they cannot read.
     if !bypassed
         && let Some(data) =
-            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+            crystalline_service::ctl_routed(json!({ "v": 1, "cmd": "status" })).await?
     {
         let loaded = cmd::load(config.as_deref());
         let config_error = loaded.as_ref().err().map(|e| e.to_string());
@@ -4860,7 +4866,7 @@ async fn domain_add_dispatch(
     use serde_json::json as j;
     let report: crystalline_index::SyncReport =
         if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-            && let Some(data) = crystalline_service::ctl_if_running(
+            && let Some(data) = crystalline_service::ctl_routed(
                 j!({ "v": 1, "cmd": "sync", "domain": chosen_name, "embed": false }),
             )
             .await?

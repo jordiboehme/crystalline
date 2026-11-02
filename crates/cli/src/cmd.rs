@@ -151,9 +151,15 @@ pub(crate) async fn reach_index(
     let bypassed = !crystalline_service::use_daemon(db_override, config_override);
     if !bypassed
         && let Some(request) = request
-        && let Some(data) = crystalline_service::ctl_if_running(request).await?
+        && let Some(data) = crystalline_service::ctl_routed(request).await?
     {
         return Ok(IndexRoute::Daemon(data));
+    }
+    // Inside an app package the index is never opened here, not even for a
+    // read or with an override outside AppData: the open would create a
+    // private index and ownership record (see `ctl_routed`).
+    if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+        bail!(crystalline_service::client::packaged_local_engine_refusal());
     }
     let db = db_path(db_override)?;
     let turso = backend_is_turso(cfg);

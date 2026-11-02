@@ -161,3 +161,122 @@ fn a_packaged_stop_hook_still_keeps_its_session_file() {
         text(&out)
     );
 }
+
+/// Stop the daemon a `serve` seam started under `home`, if one answers.
+fn stop_daemon(home: &Path) {
+    let _ = crystalline(home, false, "missing")
+        .args(["ctl", "shutdown"])
+        .output();
+}
+
+/// Whether a daemon answers under `home`.
+fn daemon_answers(home: &Path) -> bool {
+    crystalline(home, false, "missing")
+        .args(["ctl", "status", "--json"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// With no daemon and a task that does not start one, every packaged
+/// command refuses, data verbs and reads included: a local engine would
+/// create a private index and ownership record. The refusal names why and a
+/// terminal outside Claude Desktop, and nothing is written.
+#[test]
+fn a_packaged_command_refuses_when_the_task_brings_no_daemon() {
+    for (task, says) in [("missing", "is missing"), ("fail", "did not start")] {
+        for args in [
+            &["config", "set", "github.poll_secs", "120"][..],
+            &["provision", "allow", "harbor"][..],
+            &["search", "anything"][..],
+        ] {
+            let home = short_home();
+            let before = snapshot_state(home.path());
+            let out = crystalline(home.path(), true, task)
+                .args(args)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains(says), "{args:?}: {}", text(&out));
+            assert!(
+                stderr.contains("outside Claude Desktop"),
+                "{args:?}: {}",
+                text(&out)
+            );
+            assert_eq!(
+                before,
+                snapshot_state(home.path()),
+                "{args:?} wrote nothing in the state or config folder"
+            );
+        }
+    }
+}
+
+/// With the task that starts a daemon, a packaged command reaches it: the
+/// setting lands in the config file the daemon writes, while the client
+/// itself runs fenced and could not have written it.
+#[test]
+fn a_packaged_command_runs_the_task_and_writes_through_the_daemon() {
+    let home = short_home();
+    let out = crystalline(home.path(), true, "serve")
+        .args(["config", "set", "github.poll_secs", "120"])
+        .output()
+        .unwrap();
+    let answered = daemon_answers(home.path());
+    let search = crystalline(home.path(), true, "serve")
+        .args(["search", "anything", "--json"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(answered, "the task seam started a daemon");
+    let config = std::fs::read_to_string(config_path(home.path())).unwrap();
+    assert!(config.contains("poll_secs: 120"), "{config}");
+    assert!(search.status.success(), "{}", text(&search));
+}
+
+/// `serve` inside a package is refused before anything starts: the daemon
+/// must never run with the package identity.
+#[test]
+fn serve_inside_a_package_is_refused_and_starts_nothing() {
+    for args in [&["serve"][..], &["serve", "--daemon"][..]] {
+        let home = short_home();
+        let before = snapshot_state(home.path());
+        let out = crystalline(home.path(), true, "missing")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("outside Claude Desktop"),
+            "{args:?}: {}",
+            text(&out)
+        );
+        assert!(!daemon_answers(home.path()), "{args:?} started no daemon");
+        assert_eq!(before, snapshot_state(home.path()), "{args:?}");
+    }
+}
+
+/// An explicit `--db` outside AppData is not enough to open an index inside
+/// a package: the local engine still takes its ownership record in the
+/// state folder. So the command refuses rather than opening one.
+#[test]
+fn a_packaged_command_with_a_db_override_opens_no_local_engine() {
+    let home = short_home();
+    let outside = tempfile::tempdir().unwrap();
+    let db = outside.path().join("index.db");
+    let before = snapshot_state(home.path());
+    let out = crystalline(home.path(), true, "missing")
+        .arg("--db")
+        .arg(&db)
+        .args(["search", "anything"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("outside Claude Desktop"), "{}", text(&out));
+    assert!(!db.exists(), "no index was created");
+    assert_eq!(before, snapshot_state(home.path()));
+}
