@@ -414,7 +414,7 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
                 identifier: "alpha".to_string(),
                 domain: Some("brand-knowledge".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -789,7 +789,7 @@ async fn origin_add_heals_a_pending_link_that_names_the_new_domain() {
                     identifier: "src".to_string(),
                     domain: Some("home".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )

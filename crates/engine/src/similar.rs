@@ -91,7 +91,7 @@ impl<'a> SimilarProbe<'a> {
         SimilarProbe::Write {
             title: &p.title,
             description: metadata_description(p.metadata.as_ref()),
-            body: &p.content,
+            body: p.body(),
         }
     }
 

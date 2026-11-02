@@ -665,6 +665,19 @@ impl RestState {
 /// [`ARCHIVE_BODY_BYTES`].
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// The largest request body a tool call may carry, 15 MiB: MCP over HTTP and
+/// the remote `ctl` route, the two doors an agent's `write_engram` or
+/// `write_reflection` reaches this server through.
+///
+/// A file an agent uploads travels as base64 inside the JSON body. The file
+/// cap stays `crystalline_core::MAX_ATTACHMENT_BYTES` (10 MiB), and 10 MiB as
+/// base64 is `4 * ceil(10 MiB / 3)` = 13,981,016 bytes (13.33 MiB), which with
+/// the JSON-RPC or ctl envelope does not fit under [`MAX_BODY_BYTES`]. 15 MiB
+/// leaves 1.6 MiB for the envelope and the other arguments. REST keeps
+/// [`MAX_BODY_BYTES`]: its upload routes take the file as raw bytes, and
+/// `fluid/nginx.conf.template` is guarded against that number only.
+pub const MAX_TOOL_BODY_BYTES: usize = 15 * 1024 * 1024;
+
 /// The largest request body the archive preview and import accept, 64 MiB.
 ///
 /// A separate number because those two routes carry a different kind of body:

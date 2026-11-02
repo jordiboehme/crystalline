@@ -170,8 +170,13 @@ pub enum Play {
     /// Pass everything through.
     #[default]
     Honest,
-    /// A 0.26 server: no `file` command, no `files` in a read answer.
+    /// A 0.26 server: no `file` command, no `files` in a read answer, no
+    /// capability list in its status.
     As026,
+    /// A server of 0.27 to 0.30: it has the `file` command and `files`, but
+    /// its status names no `agent_files` capability, so it cannot take a file
+    /// from an agent.
+    BeforeAgentFiles,
     /// A hostile server: every mime it names is `text/html`, and a read
     /// answer lists files with paths no domain may hold.
     BadFiles,
@@ -184,6 +189,11 @@ pub enum Play {
     /// A server that finds the argument of a `file` request invalid: it
     /// answers [`INVALID_FILE`] with `kind: invalid`, as 0.27.0 does.
     InvalidFile,
+    /// An honest server that takes this long before it handles a `tool`
+    /// command: a large file over a slow link.
+    SlowTool(std::time::Duration),
+    /// An honest server that takes this long before it answers `status`.
+    SlowStatus(std::time::Duration),
 }
 
 /// The argument error [`Play::InvalidFile`] answers.
@@ -218,7 +228,10 @@ async fn record_ctl(
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, 1 << 20)
+    // Room for a full-size upload (a 10 MiB file as base64 is about 13.3
+    // MiB); a body past the daemon's own cap still reaches the daemon whole,
+    // so that its refusal is the one a test reads.
+    let bytes = axum::body::to_bytes(body, 32 << 20)
         .await
         .unwrap_or_default();
     let parsed = serde_json::from_slice::<Value>(&bytes).ok();
@@ -245,6 +258,9 @@ async fn record_ctl(
             )
             .into_response();
         }
+        (Play::SlowTool(delay), "tool") | (Play::SlowStatus(delay), "status") => {
+            tokio::time::sleep(delay).await;
+        }
         _ => {}
     }
     let response = next
@@ -255,7 +271,11 @@ async fn record_ctl(
         .await;
     if matches!(
         play,
-        Play::Honest | Play::HostedElsewhere | Play::InvalidFile
+        Play::Honest
+            | Play::HostedElsewhere
+            | Play::InvalidFile
+            | Play::SlowTool(_)
+            | Play::SlowStatus(_)
     ) {
         return response;
     }
@@ -269,6 +289,10 @@ async fn record_ctl(
             // 0.26 knew no `files` in a read answer.
             (Play::As026, _) => {
                 data.remove("files");
+                data.remove("capabilities");
+            }
+            (Play::BeforeAgentFiles, _) => {
+                data.remove("capabilities");
             }
             (Play::BadFiles, "file") => {
                 data.insert("mime".into(), json!("text/html"));

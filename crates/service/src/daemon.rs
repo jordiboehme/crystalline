@@ -3640,11 +3640,13 @@ fn describe_hosts(hosts: &[String]) -> String {
 /// (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`), which would start
 /// refusing engram writes that succeed today: bodies of 2.5 MB and 8.8 MB are
 /// documented in this project's own corpus. So we pick the number, and we pick
-/// the one the REST API already enforces - [`crate::rest::MAX_BODY_BYTES`],
-/// read from that constant rather than spelled again here, so an MCP write and
-/// a `/api/v1` write of the same engram always get the same answer. A body
-/// past it is refused with `413 Payload Too Large: request body exceeds
-/// {max} bytes` before any handler runs.
+/// [`crate::rest::MAX_TOOL_BODY_BYTES`] (15 MiB), read from that constant
+/// rather than spelled again here: the REST API's 10 MiB plus room for a
+/// 10 MiB file an agent uploads as base64 (13,981,016 bytes) and the
+/// JSON-RPC envelope. A text write between 10 and 15 MiB is served here and
+/// refused by REST, a deliberate difference. A body past it is refused with
+/// `413 Payload Too Large: request body exceeds {max} bytes` before any
+/// handler runs.
 fn http_config(
     allowed_hosts: &[String],
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
@@ -3652,7 +3654,7 @@ fn http_config(
     let base = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
         .with_legacy_session_mode(true)
-        .with_max_request_body_bytes(crate::rest::MAX_BODY_BYTES);
+        .with_max_request_body_bytes(crate::rest::MAX_TOOL_BODY_BYTES);
     if allowed_hosts.iter().any(|h| h == "*") {
         return base.disable_allowed_hosts();
     }
@@ -4819,10 +4821,12 @@ mod tests {
     /// 8.8 MB are documented in this project's own corpus
     /// (`research/2026-07-28-turso-sorter-spill.md`).
     ///
-    /// Asserting equality with `crate::rest::MAX_BODY_BYTES` rather than with
+    /// Asserting equality with `crate::rest::MAX_TOOL_BODY_BYTES` rather than with
     /// a literal is the whole divergence guard: it fails the moment someone
-    /// spells the number a second time, which is the only way the MCP and
-    /// REST surfaces can drift apart.
+    /// spells the number a second time. The MCP and REST surfaces differ on
+    /// purpose (15 MiB against 10 MiB, room for a base64 file upload), so the
+    /// guard is against a second spelling of this number, not against that
+    /// difference.
     #[test]
     fn http_config_pins_the_session_mode_and_the_body_limit() {
         let cfg = http_config(&[]);
@@ -4832,8 +4836,8 @@ mod tests {
         );
         assert_eq!(
             cfg.max_request_body_bytes,
-            crate::rest::MAX_BODY_BYTES,
-            "the MCP transport and the REST API refuse the same body size"
+            crate::rest::MAX_TOOL_BODY_BYTES,
+            "the MCP transport takes the tool body size, room for a full-size file"
         );
     }
 

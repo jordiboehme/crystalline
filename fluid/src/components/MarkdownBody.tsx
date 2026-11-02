@@ -58,7 +58,6 @@ import type { AssetResolver } from "../api/files";
 import { documentHref } from "../base";
 import {
   decodeTarget,
-  engramAssetHome,
   imageStyle,
   parseImageFragment,
 } from "../editor/imageFormat";
@@ -95,6 +94,7 @@ import { lazyPart } from "./lazyPart";
 import { Chip, FOCUS_RING } from "./primitives";
 import StatusLabel from "./StatusLabel";
 import { NotApplicableBox, TaskBox } from "./TaskBox";
+import { useEngramAssetHome } from "./useEngramAssetHome";
 import { useSaid } from "./useSaid";
 
 const MermaidDiagram = lazyPart(() => import("./MermaidDiagram"));
@@ -1806,11 +1806,14 @@ export default function MarkdownBody({
   const { hash, pathname } = useLocation();
   // Memoized on its inputs so the component map below is too: a new map
   // every render would remount every image and close an open full window.
-  const resolver = useMemo(
-    () =>
-      assets ?? (domain === undefined ? undefined : engramAssetHome(domain)),
-    [assets, domain],
+  // The domain's own files, each addressed by its current bytes: a listing
+  // that reports new bytes for a file redraws its picture (a given `assets`
+  // resolver brings its own and asks nothing here).
+  const engramHome = useEngramAssetHome(
+    assets === undefined ? domain : undefined,
+    source,
   );
+  const resolver = useMemo(() => assets ?? engramHome, [assets, engramHome]);
   // react-markdown drops a `crystalline:` address as an unknown protocol, and
   // with it the target the resolver would refuse. Keep exactly those, and only
   // when the address really is `crystalline://`: the refusal test reads a

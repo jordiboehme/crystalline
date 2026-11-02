@@ -63,7 +63,7 @@ async fn checksum_of(engine: &Engine, domain: &str, identifier: &str) -> (String
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -141,9 +141,11 @@ async fn a_permalink_collision_names_the_permalink_and_the_overwrite_hint() {
     // `alpha.md` is in the fixture, so a second Alpha collides with it.
     let err = engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "eng".to_string(),
             title: "Alpha".to_string(),
-            content: "A second rule about alpha.".to_string(),
+            content: Some("A second rule about alpha.".to_string()),
             folder: None,
             engram_type: None,
             tags: vec![],
@@ -196,9 +198,11 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
     // Virtual: seed an engram, then save with a stale token.
     engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "scratch".to_string(),
             title: "Note".to_string(),
-            content: "A note.".to_string(),
+            content: Some("A note.".to_string()),
             folder: None,
             engram_type: None,
             tags: vec![],
@@ -274,9 +278,11 @@ async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
     // Virtual domain: the seam already held; pin it beside the file case.
     engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "scratch".to_string(),
             title: "Note".to_string(),
-            content: "A note.".to_string(),
+            content: Some("A note.".to_string()),
             folder: None,
             engram_type: None,
             tags: vec![],
@@ -551,7 +557,7 @@ async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_brea
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -597,7 +603,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
                 identifier: "reader".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -631,7 +637,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
                 identifier: "log-weekly".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -651,9 +657,11 @@ fn write_params(
     content: &str,
 ) -> crystalline_service::params::WriteParams {
     crystalline_service::params::WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec![],
@@ -947,7 +955,7 @@ async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() 
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1479,7 +1487,7 @@ async fn observation_lines(engine: &Engine, identifier: &str, needles: &[&str]) 
                 identifier: identifier.to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1565,7 +1573,7 @@ async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1630,7 +1638,7 @@ async fn split_moves_every_line_of_a_wrapped_bullet() {
                 identifier: "coolant-bundle".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1772,10 +1780,10 @@ async fn split_refuses_an_empty_selection() {
 async fn split_works_on_a_virtual_domain_too() {
     let (_tmp, engine, _) = bundle_fixture().await;
     engine
-        .write_engram(&crystalline_service::params::WriteParams {
+        .write_engram(&crystalline_service::params::WriteParams { path: None, base64: None,
             domain: "scratch".to_string(),
             title: "Scratch Bundle".to_string(),
-            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            content: Some("# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["ops".to_string()],
@@ -1793,7 +1801,7 @@ async fn split_works_on_a_virtual_domain_too() {
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -2019,10 +2027,10 @@ async fn the_reindex_seam_fires_once() {
 async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_orphan() {
     let (_tmp, engine) = engine_fixture().await;
     engine
-        .write_engram(&crystalline_service::params::WriteParams {
+        .write_engram(&crystalline_service::params::WriteParams { path: None, base64: None,
             domain: "scratch".to_string(),
             title: "Scratch Bundle".to_string(),
-            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            content: Some("# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["ops".to_string()],
@@ -2044,7 +2052,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -2130,10 +2138,10 @@ async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value
         "write",
         engine
             .write_engram_as(
-                &crystalline_service::params::WriteParams {
+                &crystalline_service::params::WriteParams { path: None, base64: None,
                     domain: "eng".to_string(),
                     title: "Gamma".to_string(),
-                    content: "# Gamma\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n".to_string(),
+                    content: Some("# Gamma\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n".to_string()),
                     folder: None,
                     engram_type: None,
                     tags: vec!["eng".to_string()],
@@ -2821,9 +2829,11 @@ async fn the_sync_after_a_parser_change_reparses_file_and_virtual_domains_once()
     engine.sync(None).await.unwrap();
     engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "scratch".to_string(),
             title: "Purge Notes".to_string(),
-            content: wrapped_body.to_string(),
+            content: Some(wrapped_body.to_string()),
             folder: None,
             engram_type: None,
             tags: vec![],
@@ -2895,9 +2905,11 @@ async fn a_failing_virtual_reparse_does_not_stop_the_sync() {
     ] {
         engine
             .write_engram(&crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "scratch".to_string(),
                 title: title.to_string(),
-                content: content.to_string(),
+                content: Some(content.to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec![],

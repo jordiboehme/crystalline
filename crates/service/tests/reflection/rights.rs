@@ -929,7 +929,7 @@ async fn a_reflection_only_collaborator_sees_no_engram_on_any_surface() {
                 identifier: "runbooks/deploy".into(),
                 domain: Some("eng".into()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &ann,
         )

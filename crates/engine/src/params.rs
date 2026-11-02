@@ -61,10 +61,31 @@ pub struct WriteParams {
     /// The target domain. Required; there is no default domain for writes.
     pub domain: String,
     /// The engram title. Used for the filename slug and for `[[Title]]` linking.
+    /// Required for an engram; leave it out with `path`, which writes a file.
+    #[serde(default)]
     pub title: String,
     /// The markdown body. Observations `- [category] text` and relations
-    /// `- rel_type [[Target]]` in the body are parsed and indexed.
-    pub content: String,
+    /// `- rel_type [[Target]]` in the body are parsed and indexed. Required
+    /// for an engram. With `path`: the file's text, for a text file (svg,
+    /// txt, csv, json, yaml, toml, xml); send any other file as `base64`
+    /// instead.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Upload a file instead of writing an engram: its path under `assets/`,
+    /// for example `assets/diagrams/flow.svg`, ending in an allowed extension
+    /// (png, jpg, gif, webp, svg, pdf, pptx, docx, xlsx, odp, odt, ods, txt,
+    /// log, csv, json, yaml, toml, xml). Pass exactly one of `content` (text)
+    /// or `base64` (bytes), at most 10 MiB. `title`, `folder`, `type`,
+    /// `tags`, `status` and `metadata` do not apply to a file. A file already
+    /// at the path is refused unless `overwrite` is true, which replaces it.
+    /// Reference it from an engram as `![alt](assets/...)`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// With `path`: the file's bytes, base64 encoded (standard alphabet).
+    /// Use it for a picture, a PDF or an office file; a text file may come
+    /// as `content` or as `base64`.
+    #[serde(default)]
+    pub base64: Option<String>,
     /// A domain-relative subfolder to place the engram in. Defaults to the
     /// root. The folder becomes the engram's permalink prefix, so a topic
     /// filed under one is reachable as the `build_context` glob
@@ -99,7 +120,8 @@ pub struct WriteParams {
     /// Replace the engram that already answers to this permalink instead of
     /// erroring. It is replaced in its own file, whatever that file is
     /// called; an engram that lives in another folder is refused (move it
-    /// with move_engram first).
+    /// with move_engram first). With `path`: replace the file already at
+    /// that path; without it a file there is refused.
     #[serde(default)]
     pub overwrite: bool,
     /// Your model id, for example claude-opus-5; recorded beside who wrote it
@@ -126,9 +148,12 @@ pub struct ReadParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
     /// A file path is not an identifier: a miss names the permalink it
-    /// probably meant.
+    /// probably meant. The one exception is an attachment: a path under
+    /// `assets/` (with `domain`) returns that file itself, its mime, size
+    /// and sha256 with `text` for a text file and `base64` otherwise.
     pub identifier: String,
-    /// Restrict resolution to this domain.
+    /// Restrict resolution to this domain. Required for a file under
+    /// `assets/`.
     #[serde(default)]
     pub domain: Option<String>,
     /// A draft share-link somebody handed you (`dl_...`), to read the draft it
@@ -147,9 +172,15 @@ pub struct ReadParams {
     /// Also return the pictures the engram links to (png, jpeg, gif, webp) as
     /// image content, so you can look at them. At most 8 pictures and 5 MiB
     /// in all; the rest stay resource links. Pass it when a picture is marked
-    /// as needing vision. Only for a domain on this machine.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub include_images: bool,
+    /// as needing vision. Pictures an engram links to come back only for a
+    /// domain on this machine. For an
+    /// identifier under assets/ it decides how a picture comes back: left
+    /// out or true, as an image block with no base64; false, as base64 in
+    /// the JSON with no image block. To copy a picture, read it with false,
+    /// then write_reflection write_asset (or write_engram path) with that
+    /// base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_images: Option<bool>,
 }
 
 /// Parameters for `edit_engram`.
@@ -596,7 +627,10 @@ pub struct ReadReflectionParams {
     pub domain: String,
     /// A reflection's path inside reflections/, for example guides/deploying.md
     /// or PACT.md. Omit for the tree of every reflection with titles and open
-    /// thread counts.
+    /// thread counts. A file's path inside reflections/ (assets/flow.png)
+    /// returns that file itself: its mime, size and sha256 with `text` for a
+    /// text file, an image block for a picture (see include_images) and
+    /// `base64` otherwise.
     #[serde(default)]
     pub path: Option<String>,
     /// Words to search the Reflection for, instead of reading one page or the
@@ -614,6 +648,12 @@ pub struct ReadReflectionParams {
     /// With query: one-based page, default 1.
     #[serde(default)]
     pub page: Option<usize>,
+    /// For a file path under assets/: how a picture (png, jpeg, gif, webp up
+    /// to 5 MiB) comes back. Left out or true, as an image block you can look
+    /// at, with no base64; false, as base64 in the JSON with no image block.
+    /// Pass false to copy a picture: write_asset takes that base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_images: Option<bool>,
 }
 
 /// Parameters for `write_reflection`.
@@ -623,14 +663,16 @@ pub struct WriteReflectionParams {
     pub domain: String,
     /// write (the default: create or replace a reflection or PACT.md, or
     /// change one section of it with operation), move, delete, settle (mark
-    /// people's changes to sections as taken in or kept), move_asset or
-    /// delete_asset (move or remove a file under reflections/assets/; both
+    /// people's changes to sections as taken in or kept), write_asset
+    /// (upload a file under reflections/assets/: path, and content or
+    /// base64; replacing one with overwrite needs curate access), move_asset
+    /// or delete_asset (move or remove a file under reflections/assets/; both
     /// need curate access).
     #[serde(default)]
     pub action: Option<String>,
     /// The reflection's path inside reflections/, ending in .md; for
-    /// move_asset and delete_asset the file's path inside reflections/, for
-    /// example assets/flow.png.
+    /// write_asset, move_asset and delete_asset the file's path inside
+    /// reflections/, for example assets/flow.png.
     pub path: String,
     /// write: the whole markdown of the reflection. Keep the <!-- r:... -->
     /// id lines a read returned as they are; Crystalline gives a new ##
@@ -652,9 +694,18 @@ pub struct WriteReflectionParams {
     pub section: Option<String>,
     /// write with operation: the section body (never repeat the heading; a
     /// repeat is dropped), or for insert_before_section the text to put above
-    /// the heading.
+    /// the heading. write_asset: the file's text, for a text file (svg, txt,
+    /// csv, json, yaml, toml, xml).
     #[serde(default)]
     pub content: Option<String>,
+    /// write_asset: the file's bytes, base64 encoded (standard alphabet), at
+    /// most 10 MiB. Pass exactly one of content or base64.
+    #[serde(default)]
+    pub base64: Option<String>,
+    /// write_asset: replace a file already at path (needs curate access).
+    /// Without it a file there is refused and nothing is written.
+    #[serde(default)]
+    pub overwrite: bool,
     /// write with replace_section: replace deeper subsections too.
     #[serde(default)]
     pub include_subsections: bool,
@@ -1192,8 +1243,14 @@ fn lf_opt(text: &mut Option<String>) {
 impl WriteParams {
     /// These parameters with every text in them as LF.
     pub(crate) fn lf_only(mut self) -> Self {
-        lf(&mut self.content);
+        lf_opt(&mut self.content);
         self
+    }
+
+    /// The engram body: `content`, or empty when it was left out (an
+    /// engram write refuses that before it reads the body).
+    pub fn body(&self) -> &str {
+        self.content.as_deref().unwrap_or_default()
     }
 }
 

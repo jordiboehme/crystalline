@@ -46,9 +46,11 @@ async fn engine_with(root: &Path, mut cfg: GlobalConfig, read_only: bool) -> Eng
 
 fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: "the body".to_string(),
+        content: Some("the body".to_string()),
         folder: folder.map(str::to_string),
         engram_type: None,
         tags: Vec::new(),
@@ -366,9 +368,11 @@ async fn a_virtual_domain_generates_no_files() {
 
     engine
         .write_engram(&WriteParams {
+            path: None,
+            base64: None,
             domain: "ideas".to_string(),
             title: "An Idea".to_string(),
-            content: "the body".to_string(),
+            content: Some("the body".to_string()),
             folder: None,
             engram_type: None,
             tags: Vec::new(),

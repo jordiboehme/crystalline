@@ -1230,9 +1230,11 @@ impl Review {
             .engine
             .write_engram_as(
                 &crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "team".to_string(),
                     title: title.to_string(),
-                    content: body.to_string(),
+                    content: Some(body.to_string()),
                     folder: None,
                     engram_type: None,
                     tags: vec!["team".to_string()],
@@ -1769,7 +1771,7 @@ async fn a_link_opens_the_draft_it_was_minted_on_and_no_other() {
                 identifier: "aaa".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::User {
                 account: "alice".to_string(),
@@ -1959,7 +1961,7 @@ async fn a_discarding_leave_closes_the_room_without_publishing_its_text() {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::User {
                 account: "alice".to_string(),

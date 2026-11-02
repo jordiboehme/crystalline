@@ -58,6 +58,7 @@
  * VALIDATOR would never let be stored.
  */
 
+import { versionedUrl } from "../api/assetVersions";
 import type { AssetHome } from "../api/files";
 import {
   ASSETS_PREFIX,
@@ -173,13 +174,20 @@ export function assetPath(target: string): string | null {
  * cycle. `editor/attachments.ts` is no home either: it carries CodeMirror,
  * which the reading view must not load.
  */
-export function engramAssetHome(domain: string): AssetHome {
+export function engramAssetHome(
+  domain: string,
+  versions?: ReadonlyMap<string, string>,
+): AssetHome {
   return {
     key: attachmentsKey(domain),
     list: () => listAttachments(domain),
     upload: (path, file) => uploadAttachment(domain, path, file),
     remove: (path) => deleteAttachment(domain, path),
-    url: (path) => attachmentUrl(domain, path),
+    // Read at call time, so a map the caller updates in place is honoured.
+    // The version is an address for the browser only: `linkTo` and `resolve`
+    // never carry it.
+    url: (path) =>
+      versionedUrl(attachmentUrl(domain, path), versions?.get(path)),
     resolve: assetPath,
     refused: () => null,
     linkTo: (path) => path,

@@ -1361,7 +1361,7 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
                 identifier: "alpha".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::Unrestricted,
         )
@@ -1869,9 +1869,11 @@ async fn a_full_rename_that_stops_does_not_tell_its_rooms_a_new_name() {
         tokio::spawn(async move {
             engine
                 .write_engram(&crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "eng".into(),
                     title: "Beta".into(),
-                    content: "written while the rename waits".into(),
+                    content: Some("written while the rename waits".into()),
                     folder: None,
                     engram_type: None,
                     tags: Vec::new(),
@@ -1923,9 +1925,11 @@ async fn a_refused_rename_does_not_tell_its_rooms_a_new_name() {
         tokio::spawn(async move {
             engine
                 .write_engram(&crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "eng".into(),
                     title: "Beta".into(),
-                    content: "written while the rename waits".into(),
+                    content: Some("written while the rename waits".into()),
                     folder: None,
                     engram_type: None,
                     tags: Vec::new(),

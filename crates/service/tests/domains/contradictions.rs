@@ -220,9 +220,11 @@ async fn a_retired_checkpoint_is_pruned_when_the_config_still_names_its_profile(
 
 fn write(title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec!["t".to_string()],
@@ -3651,7 +3653,7 @@ async fn a_wrapped_bullet_is_embedded_and_scored_as_its_whole_text() {
                 identifier: "eighteen".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

@@ -1294,3 +1294,121 @@ async fn an_export_carries_the_baseline_and_no_import_reads_reflections_as_engra
         "{out}"
     );
 }
+
+/// `write_asset` params for `path` with `base64` of `bytes`.
+fn upload(path: &str, bytes: &[u8], overwrite: bool) -> WriteReflectionParams {
+    use base64::Engine as _;
+    WriteReflectionParams {
+        domain: "eng".into(),
+        action: Some("write_asset".into()),
+        path: path.into(),
+        base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        overwrite,
+        ..Default::default()
+    }
+}
+
+/// An agent working for `caller`'s account, as the MCP server names one.
+fn agent_of(caller: &ReflectionCaller) -> ReflectionCaller {
+    ReflectionCaller::agent(caller.scope.clone(), "claude-code", false)
+}
+
+/// An agent's upload is a person's upload: a reader adds nothing, a
+/// contributor (Edit) creates and is refused a replace, a curator replaces.
+#[tokio::test]
+async fn an_agent_uploads_through_write_reflection_under_the_reflection_rights() {
+    use crystalline_service::EngineError;
+    use crystalline_service::engine::ASSET_EXISTS;
+    let (fx, vera, nora, ed) = three_people().await;
+    let (vera, nora, ed) = (agent_of(&vera), agent_of(&nora), agent_of(&ed));
+    let err = fx
+        .engine
+        .write_reflection(&upload("assets/flow.png", PNG, false), &vera)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Forbidden(_)), "{err}");
+    assert!(!fx.root.join("reflections/assets/flow.png").exists());
+
+    let created = fx
+        .engine
+        .write_reflection(&upload("assets/flow.png", PNG, false), &nora)
+        .await
+        .unwrap();
+    assert_eq!(created["created"], true, "{created}");
+    assert_eq!(created["path"], "assets/flow.png", "{created}");
+    assert_eq!(created["domain"], "eng", "{created}");
+    assert_eq!(created["mime"], "image/png", "{created}");
+    assert_eq!(created["size"], PNG.len(), "{created}");
+    assert!(created["sha256"].as_str().is_some_and(|s| s.len() == 64));
+
+    let err = fx
+        .engine
+        .write_reflection(&upload("assets/flow.png", b"other", false), &nora)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Conflict(t) if t.ends_with(ASSET_EXISTS)),
+        "{err}"
+    );
+    let err = fx
+        .engine
+        .write_reflection(&upload("assets/flow.png", b"other", true), &nora)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("curate"), "replacing needs curate: {err}");
+    assert_eq!(
+        std::fs::read(fx.root.join("reflections/assets/flow.png")).unwrap(),
+        PNG
+    );
+
+    let replaced = fx
+        .engine
+        .write_reflection(&upload("assets/flow.png", b"other", true), &ed)
+        .await
+        .unwrap();
+    assert_eq!(replaced["created"], false, "{replaced}");
+    assert_eq!(
+        std::fs::read(fx.root.join("reflections/assets/flow.png")).unwrap(),
+        b"other"
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_domain_refuses_an_agents_upload() {
+    let fx = reflecting().await;
+    std::fs::write(
+        fx.root.join("MANIFEST.md"),
+        manifest("reflection: on\nread_only: on\n"),
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let err = fx
+        .engine
+        .write_reflection(&upload("assets/n.png", PNG, false), &agent())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::EngineError::DomainReadOnly(_)),
+        "{err}"
+    );
+    assert!(!fx.root.join("reflections/assets/n.png").exists());
+}
+
+#[tokio::test]
+async fn an_unknown_action_names_write_asset() {
+    let fx = reflecting().await;
+    let p = WriteReflectionParams {
+        domain: "eng".into(),
+        action: Some("upload".into()),
+        path: "assets/a.png".into(),
+        ..Default::default()
+    };
+    let err = fx
+        .engine
+        .write_reflection(&p, &agent())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("write_asset"), "{err}");
+}

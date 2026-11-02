@@ -312,7 +312,9 @@ fn init_body_of_exactly(total_len: usize) -> String {
 /// (`DEFAULT_MAX_REQUEST_BODY_BYTES`, `tower.rs:55`), which would start
 /// refusing engram writes this project's own corpus contains. We therefore
 /// choose the number, and we choose the one the REST API already enforces:
-/// `crystalline_service::rest::MAX_BODY_BYTES`, 10 MiB.
+/// `crystalline_service::rest::MAX_TOOL_BODY_BYTES`, 15 MiB: room for a
+/// 10 MiB file as base64 (13,981,016 bytes) and the JSON-RPC envelope, which
+/// REST's 10 MiB `MAX_BODY_BYTES` would refuse.
 ///
 /// The boundary is inclusive at both ends by rmcp's own arithmetic: the check
 /// is `data.remaining() > max_bytes.saturating_sub(collected.len())`, so a
@@ -321,7 +323,9 @@ fn init_body_of_exactly(total_len: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_body_at_the_limit_is_served_and_one_byte_over_is_refused() {
     let addr = spawn_router().await;
-    let limit = crystalline_service::rest::MAX_BODY_BYTES;
+    let limit = crystalline_service::rest::MAX_TOOL_BODY_BYTES;
+    assert!(limit > crystalline_service::rest::MAX_BODY_BYTES);
+    assert!(limit >= 4 * (crystalline_core::MAX_ATTACHMENT_BYTES as usize).div_ceil(3) + 4096);
 
     let at_the_limit = post(addr, &init_body_of_exactly(limit), None).await;
     assert!(
@@ -740,7 +744,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // guards; the both-directions proof is its own test above.
     let over = post(
         addr,
-        &init_body_of_exactly(crystalline_service::rest::MAX_BODY_BYTES + 1),
+        &init_body_of_exactly(crystalline_service::rest::MAX_TOOL_BODY_BYTES + 1),
         None,
     )
     .await;

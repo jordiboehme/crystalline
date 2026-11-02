@@ -59,7 +59,7 @@ async fn read(engine: &Engine, domain: &str, identifier: &str) -> serde_json::Va
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -175,9 +175,11 @@ async fn write_engram_content_with_crlf_is_stored_lf() {
     for domain in ["eng", "scratch"] {
         engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: domain.to_string(),
                 title: "Captured".to_string(),
-                content: "line one\r\nline two\r\n\r\n- [fact] a fact\r\n".to_string(),
+                content: Some("line one\r\nline two\r\n\r\n- [fact] a fact\r\n".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec!["eng".to_string()],
@@ -346,7 +348,7 @@ async fn a_read_of_a_file_that_is_not_utf8_is_refused_not_answered_from_the_row(
                 identifier: "windows".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

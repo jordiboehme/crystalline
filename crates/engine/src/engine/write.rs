@@ -492,7 +492,7 @@ impl Engine {
             model.as_deref(),
             now,
             p.metadata.as_ref(),
-            &p.content,
+            p.body(),
         )?;
         // The single point this capture's text funnels through before it is
         // stored, whichever of the three exits below takes it: a cross-domain
@@ -2405,9 +2405,11 @@ mod landing_race_tests {
             tokio::spawn(async move {
                 engine
                     .write_engram(&WriteParams {
+                        path: None,
+                        base64: None,
                         domain: "notes".to_string(),
                         title: "Code Review Standards".to_string(),
-                        content: "The new rule.".to_string(),
+                        content: Some("The new rule.".to_string()),
                         folder: Some("conventions".to_string()),
                         engram_type: None,
                         tags: Vec::new(),
@@ -2474,9 +2476,11 @@ mod landing_race_tests {
         );
         engine.sync(None).await.unwrap();
         let params = |content: &str| WriteParams {
+            path: None,
+            base64: None,
             domain: "notes".to_string(),
             title: "Code Review Standards".to_string(),
-            content: content.to_string(),
+            content: Some(content.to_string()),
             folder: Some("conventions".to_string()),
             engram_type: None,
             tags: Vec::new(),
@@ -2580,9 +2584,11 @@ mod landing_race_tests {
             tokio::spawn(async move {
                 engine
                     .write_engram(&WriteParams {
+                        path: None,
+                        base64: None,
                         domain: "notes".to_string(),
                         title: "Code Review Standards".to_string(),
-                        content: "The new rule.".to_string(),
+                        content: Some("The new rule.".to_string()),
                         folder: Some("conventions".to_string()),
                         engram_type: None,
                         tags: Vec::new(),
@@ -2677,9 +2683,11 @@ mod on_disk_name_tests {
 
     fn create(title: &str, folder: &str) -> WriteParams {
         WriteParams {
+            path: None,
+            base64: None,
             domain: "kb".to_string(),
             title: title.to_string(),
-            content: "Mine.".to_string(),
+            content: Some("Mine.".to_string()),
             folder: Some(folder.to_string()),
             engram_type: None,
             tags: Vec::new(),
