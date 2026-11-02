@@ -45,10 +45,14 @@ import type { SyntaxNode } from "@lezer/common";
 import type { Align, SpanChange, TableModel } from "./tableModel";
 import {
   addColumnAfter,
+  addColumnBefore,
+  addRowAbove,
   addRowBelow,
   columnAt,
   deleteColumn,
   deleteRow,
+  moveColumn,
+  moveRow,
   parseTable,
   prettify,
   setAlignment,
@@ -135,11 +139,17 @@ function quoteMarked(state: EditorState, node: SyntaxNode): boolean {
   return found;
 }
 
-/** The context and the model behind it, parsed once for both readers. */
+/**
+ * The context and the model behind it, parsed once for both readers. `at` names
+ * the document position to read the cell from; omitted, it is the main caret.
+ * Callers other than the caret (the table grid) pass the position of the cell
+ * they mean, and every verb below takes it through unchanged.
+ */
 function analyze(
   state: EditorState,
+  at?: number,
 ): { context: TableContext; model: TableModel } | null {
-  const head = state.selection.main.head;
+  const head = at ?? state.selection.main.head;
   const node = tableNodeAt(state, head);
   if (node === null || quoteMarked(state, node)) {
     return null;
@@ -255,11 +265,12 @@ function absolute(from: number, changes: SpanChange[]): ChangeSpec[] {
  */
 function target(
   view: EditorView,
+  at?: number,
 ): { context: TableContext; model: TableModel } | null {
   if (!clearOfFoldedFrontmatter(view)) {
     return null;
   }
-  return analyze(view.state);
+  return analyze(view.state, at);
 }
 
 /**
@@ -312,8 +323,8 @@ function indentWidth(text: string): number {
  * land the caret AT the second line's `|` - the last position still inside
  * the first cell, so typing there gives `|  X|` - on every added row.
  */
-export function tableAddRowBelow(view: EditorView): boolean {
-  const found = target(view);
+export function tableAddRowBelow(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -324,11 +335,11 @@ export function tableAddRowBelow(view: EditorView): boolean {
     return false;
   }
   const spec = absolute(found.context.from, changes);
-  const at = found.context.from + change.from;
+  const inserted = found.context.from + change.from;
   const made = ChangeSet.of(spec, state.doc.length, state.lineBreak).apply(
     state.doc,
   );
-  const line = made.lineAt(at + 1);
+  const line = made.lineAt(inserted + 1);
   view.dispatch({
     changes: spec,
     selection: EditorSelection.cursor(line.from + indentWidth(line.text) + 2),
@@ -339,8 +350,8 @@ export function tableAddRowBelow(view: EditorView): boolean {
 }
 
 /** A new column after the caret's, one insertion per line of the table. */
-export function tableAddColumnAfter(view: EditorView): boolean {
-  const found = target(view);
+export function tableAddColumnAfter(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -352,8 +363,8 @@ export function tableAddColumnAfter(view: EditorView): boolean {
 }
 
 /** The caret's row. The header and the rule refuse: a GFM table needs both. */
-export function tableDeleteRow(view: EditorView): boolean {
-  const found = target(view);
+export function tableDeleteRow(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -365,8 +376,8 @@ export function tableDeleteRow(view: EditorView): boolean {
 }
 
 /** The caret's column. The last column refuses: a table needs one. */
-export function tableDeleteColumn(view: EditorView): boolean {
-  const found = target(view);
+export function tableDeleteColumn(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -378,8 +389,12 @@ export function tableDeleteColumn(view: EditorView): boolean {
 }
 
 /** The caret's column, aligned - one delimiter cell, nothing else moves. */
-export function tableAlignColumn(view: EditorView, align: Align): boolean {
-  const found = target(view);
+export function tableAlignColumn(
+  view: EditorView,
+  align: Align,
+  at?: number,
+): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -391,8 +406,8 @@ export function tableAlignColumn(view: EditorView, align: Align): boolean {
 }
 
 /** Every pipe lined up. The one verb that rewrites lines, by request. */
-export function tablePrettify(view: EditorView): boolean {
-  const found = target(view);
+export function tablePrettify(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
   if (found === null) {
     return false;
   }
@@ -400,5 +415,128 @@ export function tablePrettify(view: EditorView): boolean {
     view,
     found.context.from,
     prettify(found.model, view.state.lineBreak),
+  );
+}
+
+/**
+ * Dispatch a change list as ONE transaction and put the caret inside a named
+ * cell of the table AS IT READS AFTERWARDS.
+ *
+ * The cell is found by applying the changes to a scratch `Text`, mapping the
+ * table's end through them, and parsing that span again with the sanctioned
+ * read: no cell offset is computed by hand, so the caret is right for every
+ * shape the model edits (edge pipes, ragged rows, an indent) and for a CRLF
+ * document, where a break is one position whatever it spells. The caret goes
+ * one past the cell's opening blank when it has one, which is the interior of
+ * an empty `|  |` cell. Should the table not parse afterwards the selection is
+ * left to the transaction's own mapping rather than guessed.
+ */
+function dispatchInCell(
+  view: EditorView,
+  found: { context: TableContext },
+  changes: SpanChange[] | null,
+  row: number,
+  column: number,
+): boolean {
+  if (changes === null || changes.length === 0) {
+    return false;
+  }
+  const { state } = view;
+  const { from, to } = found.context;
+  const spec = absolute(from, changes);
+  const set = ChangeSet.of(spec, state.doc.length, state.lineBreak);
+  const made = set.apply(state.doc);
+  const model = parseTable(made.sliceString(from, set.mapPos(to, 1)));
+  const line = model?.lines[row];
+  const cell = line?.cells[column];
+  if (line === undefined || cell === undefined) {
+    view.dispatch({ changes: spec, userEvent: "input" });
+  } else {
+    const blank = cell.raw.startsWith(" ") ? 1 : 0;
+    view.dispatch({
+      changes: spec,
+      selection: EditorSelection.cursor(
+        from + line.start + Math.min(cell.from + blank, cell.to),
+      ),
+      userEvent: "input",
+    });
+  }
+  view.focus();
+  return true;
+}
+
+/**
+ * A new empty row above the caret's, with the caret in its first cell. The
+ * header and the delimiter refuse: nothing goes above either.
+ */
+export function tableAddRowAbove(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
+  if (found === null) {
+    return false;
+  }
+  return dispatchInCell(
+    view,
+    found,
+    addRowAbove(found.model, found.context.row, view.state.lineBreak),
+    found.context.row,
+    0,
+  );
+}
+
+/** A new column before the caret's, the caret in the new cell of its row. */
+export function tableAddColumnBefore(view: EditorView, at?: number): boolean {
+  const found = target(view, at);
+  if (found === null) {
+    return false;
+  }
+  return dispatchInCell(
+    view,
+    found,
+    addColumnBefore(found.model, found.context.column),
+    found.context.row,
+    found.context.column,
+  );
+}
+
+/**
+ * The caret's data row, one step up (-1) or down (1); the caret follows it.
+ * The header and the delimiter neither move nor are passed.
+ */
+export function tableMoveRow(
+  view: EditorView,
+  delta: -1 | 1,
+  at?: number,
+): boolean {
+  const found = target(view, at);
+  if (found === null) {
+    return false;
+  }
+  const { row, column } = found.context;
+  return dispatchInCell(
+    view,
+    found,
+    moveRow(found.model, row, row + delta, view.state.lineBreak),
+    row + delta,
+    column,
+  );
+}
+
+/** The caret's column, one step left (-1) or right (1); the caret follows it. */
+export function tableMoveColumn(
+  view: EditorView,
+  delta: -1 | 1,
+  at?: number,
+): boolean {
+  const found = target(view, at);
+  if (found === null) {
+    return false;
+  }
+  const { row, column } = found.context;
+  return dispatchInCell(
+    view,
+    found,
+    moveColumn(found.model, column, column + delta),
+    row,
+    column + delta,
   );
 }

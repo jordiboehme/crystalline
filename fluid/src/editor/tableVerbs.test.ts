@@ -21,12 +21,16 @@ import { parsedState } from "../test/parse";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   tableAddColumnAfter,
+  tableAddColumnBefore,
+  tableAddRowAbove,
   tableAddRowBelow,
   tableAlignColumn,
   tableContextAt,
   tableContextListener,
   tableDeleteColumn,
   tableDeleteRow,
+  tableMoveColumn,
+  tableMoveRow,
   tablePrettify,
 } from "./tableVerbs";
 
@@ -298,4 +302,193 @@ describe("in a room", () => {
     expect(shared.split("| a | Column | b |").length - 1).toBe(1);
     expect(shared).toBe(docText(view.state));
   });
+});
+
+describe("insert-before and move verbs, and the `at` position", () => {
+  const TWO =
+    "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n\nmiddle\n\n| x | y |\n| --- | --- |\n| 5 | 6 |\n";
+  const FIRST = TWO.indexOf("4"); // inside the "4" cell, second column
+  const SECOND = TWO.indexOf("6"); // inside the "6" cell, second column
+
+  const verbs: [string, (v: EditorView) => boolean, string][] = [
+    [
+      "add row above",
+      (v) => tableAddRowAbove(v),
+      TWO.replace("| 3 | 4 |", "|  |  |\n| 3 | 4 |"),
+    ],
+    [
+      "add column before",
+      (v) => tableAddColumnBefore(v),
+      TWO.replace(
+        "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |",
+        "| a | Column | b |\n| --- | --- | --- |\n| 1 |  | 2 |\n| 3 |  | 4 |",
+      ),
+    ],
+    [
+      "move row up",
+      (v) => tableMoveRow(v, -1),
+      TWO.replace("| 1 | 2 |\n| 3 | 4 |", "| 3 | 4 |\n| 1 | 2 |"),
+    ],
+    [
+      "move column left",
+      (v) => tableMoveColumn(v, -1),
+      TWO.replace(
+        "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |",
+        "| b | a |\n| --- | --- |\n| 2 | 1 |\n| 4 | 3 |",
+      ),
+    ],
+  ];
+
+  for (const [name, run, expected] of verbs) {
+    test(`${name} is one transaction, one undo step, exact bytes back`, () => {
+      let transactions = 0;
+      const v = editor(TWO, FIRST, [
+        EditorView.updateListener.of((u) => {
+          if (u.docChanged) transactions += 1;
+        }),
+      ]);
+      expect(run(v)).toBe(true);
+      expect(transactions).toBe(1);
+      expect(docText(v.state)).toBe(expected);
+      undo(v);
+      expect(docText(v.state)).toBe(TWO);
+    });
+  }
+
+  test("the caret lands in the new or moved cell", () => {
+    const v = editor(TWO, FIRST);
+    expect(tableAddRowAbove(v)).toBe(true);
+    let line = v.state.doc.lineAt(v.state.selection.main.head);
+    expect(line.text).toBe("|  |  |");
+    expect(v.state.selection.main.head).toBe(line.from + 2);
+
+    const w = editor(TWO, FIRST);
+    expect(tableMoveRow(w, -1)).toBe(true);
+    line = w.state.doc.lineAt(w.state.selection.main.head);
+    expect(line.text).toBe("| 3 | 4 |");
+    expect(w.state.selection.main.head).toBe(line.from + 6);
+
+    const c = editor(TWO, FIRST);
+    expect(tableMoveColumn(c, -1)).toBe(true);
+    line = c.state.doc.lineAt(c.state.selection.main.head);
+    expect(line.text).toBe("| 4 | 3 |");
+    expect(c.state.selection.main.head).toBe(line.from + 2);
+
+    const b = editor(TWO, FIRST);
+    expect(tableAddColumnBefore(b)).toBe(true);
+    line = b.state.doc.lineAt(b.state.selection.main.head);
+    expect(line.text).toBe("| 3 |  | 4 |");
+    expect(b.state.selection.main.head).toBe(line.from + 6);
+  });
+
+  test("refusals leave the document alone", () => {
+    const header = TWO.indexOf("| a") + 2;
+    const v = editor(TWO, header);
+    expect(tableAddRowAbove(v)).toBe(false);
+    expect(tableMoveRow(v, 1)).toBe(false);
+    const first = editor(TWO, TWO.indexOf("| 1") + 2);
+    expect(tableMoveRow(first, -1)).toBe(false);
+    expect(tableMoveColumn(first, -1)).toBe(false);
+    expect(docText(first.state)).toBe(TWO);
+  });
+
+  test("a CRLF buffer is edited at the right places", () => {
+    const doc =
+      "x\r\n\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n| 3 | 4 |\r\n";
+    const v = editor(doc, 0);
+    v.dispatch({
+      selection: EditorSelection.cursor(v.state.doc.line(6).from + 2),
+    });
+    expect(tableMoveRow(v, -1)).toBe(true);
+    expect(docText(v.state)).toBe(
+      "x\r\n\r\n| a | b |\r\n| --- | --- |\r\n| 3 | 4 |\r\n| 1 | 2 |\r\n",
+    );
+    expect(tableAddRowAbove(v)).toBe(true);
+    expect(v.state.doc.lineAt(v.state.selection.main.head).text).toBe(
+      "|  |  |",
+    );
+    expect(tableMoveColumn(v, 1)).toBe(true);
+  });
+
+  test("`at` names the cell, so a verb can edit a table the caret is not in", () => {
+    const v = editor(TWO, FIRST);
+    expect(tableAddRowBelow(v, SECOND)).toBe(true);
+    expect(docText(v.state)).toBe(
+      TWO.replace("| 5 | 6 |", "| 5 | 6 |\n|  |  |"),
+    );
+    undo(v);
+    expect(tableDeleteColumn(v, SECOND)).toBe(true);
+    expect(docText(v.state)).toBe(
+      TWO.replace(
+        "| x | y |\n| --- | --- |\n| 5 | 6 |",
+        "| x |\n| --- |\n| 5 |",
+      ),
+    );
+    undo(v);
+    expect(tableAlignColumn(v, "right", SECOND)).toBe(true);
+    expect(docText(v.state)).toContain("| --- | ---: |");
+    undo(v);
+    expect(tableMoveColumn(v, 1, SECOND)).toBe(false); // already the last column
+    expect(tableAddColumnAfter(v, 2)).toBe(true);
+    expect(docText(v.state)).toContain("| a | Column | b |");
+    undo(v);
+    expect(tableAddRowAbove(v, SECOND)).toBe(true);
+    expect(tablePrettify(v, 2)).toBe(true);
+    undo(v);
+    undo(v);
+    expect(tableDeleteRow(v, SECOND)).toBe(true);
+    expect(docText(v.state)).toBe(TWO.replace("\n| 5 | 6 |", ""));
+  });
+});
+
+describe("insert-before and move verbs in a room", () => {
+  const ROOM = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+
+  function room(): {
+    v: EditorView;
+    ytext: Y.Text;
+    undoManager: Y.UndoManager;
+  } {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("content");
+    ytext.insert(0, ROOM);
+    const undoManager = new Y.UndoManager(ytext);
+    const awareness = new Awareness(ydoc);
+    view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: ytext.toJSON(),
+          selection: EditorSelection.cursor(ROOM.indexOf("4")),
+          extensions: [
+            EditorState.lineSeparator.of("\n"),
+            ...baseExtensions(false),
+            yCollab(ytext, awareness, { undoManager }),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    return { v: view, ytext, undoManager };
+  }
+
+  const verbs: [string, (v: EditorView) => boolean][] = [
+    ["add row above", (v) => tableAddRowAbove(v)],
+    ["add column before", (v) => tableAddColumnBefore(v)],
+    ["move row up", (v) => tableMoveRow(v, -1)],
+    ["move column left", (v) => tableMoveColumn(v, -1)],
+  ];
+
+  for (const [name, run] of verbs) {
+    test(`${name} reaches the shared text once and one undo restores it`, () => {
+      const { v, ytext, undoManager } = room();
+      expect(run(v)).toBe(true);
+      expect(ytext.toJSON()).toBe(docText(v.state));
+      expect(ytext.toJSON()).not.toBe(ROOM);
+      // The verb is a single shared transaction, so one undo takes it all back.
+      undoManager.stopCapturing();
+      undoManager.undo();
+      expect(ytext.toJSON()).toBe(ROOM);
+      expect(docText(v.state)).toBe(ROOM);
+    });
+  }
 });

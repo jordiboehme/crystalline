@@ -316,6 +316,190 @@ export function addColumnAfter(
 }
 
 /**
+ * Insert a new row above `row`: one insertion at the START of the target line,
+ * of `indent + "|" + "  |".repeat(columns) + separator`, so the new row takes
+ * the target's place and the target moves down. Nothing goes above the header
+ * or between the header and the delimiter, so `row <= 1` is refused; `row ===
+ * 2` therefore inserts the new row directly after the delimiter line, which is
+ * the first data position.
+ *
+ * Like `addRowBelow` the break is insertion TEXT only and no position is
+ * derived from its length. The new row begins at `change.from` itself (the
+ * insertion sits at a line start), so after the dispatch the line at the
+ * mapped `change.from` is the new row.
+ */
+export function addRowAbove(
+  model: TableModel,
+  row: number,
+  separator: string,
+): SpanChange[] | null {
+  if (row <= 1 || row >= model.lines.length) return null;
+  const target = model.lines[row];
+  if (!target) return null;
+  const cells = "  |".repeat(model.columns);
+  return [
+    {
+      from: target.start,
+      insert: `${target.indent}|${cells}${separator}`,
+    },
+  ];
+}
+
+/**
+ * Add a column before `column`: one insertion per line, at the boundary that
+ * OPENS the target cell, so the new column takes index `column` and the old one
+ * shifts right. The spelling of the new cells matches `addColumnAfter` (the
+ * `Column` header, a three-dash rule cell, empty data cells).
+ *
+ * A line whose first cell has no leading pipe cannot take a cell in front of
+ * it by inserting `| x ` at the start, because the text would read `| x a | b`.
+ * A non-empty new cell is written as `x | ` in front of the old text, which
+ * gains no pipe it did not need; an EMPTY one cannot be expressed without an
+ * edge pipe (a blank cell at the start of a pipeless line is nothing), so that
+ * line gains a leading pipe, the minimum for the cell to exist.
+ *
+ * A row too short to have `column` is extended at its end with empty cells,
+ * inside the same single insertion, so every row ends up with the same number
+ * of columns.
+ */
+export function addColumnBefore(
+  model: TableModel,
+  column: number,
+): SpanChange[] | null {
+  if (column < 0 || column >= model.columns) return null;
+
+  const changes: SpanChange[] = [];
+  for (let index = 0; index < model.lines.length; index += 1) {
+    const line = model.lines[index];
+    if (!line) continue;
+
+    const filler = index === 1 ? "-".repeat(MIN_DASHES) : "";
+    const added = index === 0 ? NEW_HEADER_CELL : filler;
+    const anchor = line.cells[column];
+
+    if (anchor) {
+      if (column > 0 || line.leadingPipe) {
+        changes.push({
+          from: line.start + anchor.from - 1,
+          insert: field(added),
+        });
+      } else if (added !== "") {
+        changes.push({
+          from: line.start + anchor.from,
+          insert: `${added} | `,
+        });
+      } else {
+        changes.push({ from: line.start + anchor.from, insert: "|  | " });
+      }
+      continue;
+    }
+
+    // Too short: extend at the end, as `addColumnAfter` does for its target.
+    const last = line.cells[line.cells.length - 1];
+    if (!last) continue;
+    const fields: string[] = [];
+    for (let missing = line.cells.length; missing < column; missing += 1)
+      fields.push(field(filler));
+    fields.push(field(added));
+    changes.push({
+      from: line.start + last.to,
+      insert: line.trailingPipe ? fields.join("") : ` ${fields.join("")}|`,
+    });
+  }
+  return changes;
+}
+
+/**
+ * Move the data row `row` so it ends up at index `to`, as ONE deletion plus
+ * ONE insertion. The moved line's text travels byte-identical, and so does
+ * every other line: nothing is rebuilt. Both indices must be data rows (`>=
+ * 2`), so the header and the delimiter can neither move nor be moved past, and
+ * `row === to` is refused as a move that moves nothing.
+ *
+ * The deletion is `deleteRow`'s own range (the line plus exactly one break,
+ * read off the model's line spans); the insertion is the line text plus the
+ * separator at the start of the line it displaces when moving up, or the
+ * separator plus the line text at the end of the line it passes when moving
+ * down. The separator is insertion text only, never a length.
+ */
+export function moveRow(
+  model: TableModel,
+  row: number,
+  to: number,
+  separator: string,
+): SpanChange[] | null {
+  const last = model.lines.length;
+  if (row < 2 || to < 2 || row >= last || to >= last || row === to) return null;
+  const line = model.lines[row];
+  const destination = model.lines[to];
+  const removal = deleteRow(model, row, separator);
+  if (!line || !destination || !removal) return null;
+
+  const insertion: SpanChange =
+    to < row
+      ? { from: destination.start, insert: `${line.text}${separator}` }
+      : {
+          from: destination.start + destination.text.length,
+          insert: `${separator}${line.text}`,
+        };
+  return [...removal, insertion];
+}
+
+/**
+ * Move a column so it ends up at index `to`. Per line, the cells between the
+ * two columns are re-laid in their new order with the pipes staying exactly
+ * where they were, as ONE replacement that spans only the cells involved; a
+ * line whose affected cells already read the same emits nothing. Every cell
+ * travels with its own raw text (padding included), the delimiter cell too, so
+ * alignment moves with its column.
+ *
+ * A ragged row too short for either column is left as it is: moving a cell it
+ * does not have would mean inventing one.
+ *
+ * One whitespace rule keeps an edge line parseable: where the first cell of a
+ * line without a leading pipe receives a cell, that cell's leading blanks are
+ * dropped, because they would otherwise read as the line's indent (four of
+ * them turn a table row into a code block).
+ */
+export function moveColumn(
+  model: TableModel,
+  column: number,
+  to: number,
+): SpanChange[] | null {
+  if (column < 0 || to < 0 || column >= model.columns || to >= model.columns)
+    return null;
+  if (column === to) return null;
+
+  const low = Math.min(column, to);
+  const high = Math.max(column, to);
+  const changes: SpanChange[] = [];
+  for (const line of model.lines) {
+    if (line.cells.length <= high) continue;
+    const slots = line.cells.slice(low, high + 1);
+    const order = slots.map((_, i) => i);
+    const [moved] = order.splice(column - low, 1);
+    if (moved === undefined) continue;
+    order.splice(to - low, 0, moved);
+
+    const raws = order.map((from, slot) => {
+      const raw = slots[from]?.raw ?? "";
+      return low + slot === 0 && !line.leadingPipe ? raw.trimStart() : raw;
+    });
+    const first = slots[0];
+    const lastSlot = slots[slots.length - 1];
+    if (!first || !lastSlot) continue;
+    const text = raws.join("|");
+    if (text === line.text.slice(first.from, lastSlot.to)) continue;
+    changes.push({
+      from: line.start + first.from,
+      to: line.start + lastSlot.to,
+      insert: text,
+    });
+  }
+  return changes;
+}
+
+/**
  * Delete a data row: the line plus exactly one break. The header and the
  * delimiter are refused - a GFM table needs both.
  *
