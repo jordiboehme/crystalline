@@ -13225,7 +13225,8 @@
         "type": "object",
         "description": "The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.",
         "required": [
-          "webhook_secret_set"
+          "webhook_secret_set",
+          "loading"
         ],
         "properties": {
           "app_id": {
@@ -13252,6 +13253,11 @@
             ],
             "description": "Where an owner installs the App on repositories. Null while the App\ncannot be used or its slug is not known yet.",
             "example": "https://github.com/apps/crystalline-kb-example-com/installations/new"
+          },
+          "loading": {
+            "type": "boolean",
+            "description": "True while a saved App is still being loaded: the other fields are\nnot known yet, but an App is there, so none is to be created.",
+            "example": false
           },
           "slug": {
             "type": [
@@ -13493,7 +13499,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/GithubAppView",
-                "description": "The instance's GitHub App, when one is configured; null otherwise.\nNames the App and where to install it, never a secret."
+                "description": "The instance's GitHub App, when one is configured; absent otherwise,\nso an instance without an App answers exactly as before. Names the\nApp and where to install it, never a secret."
               },
               {
                 "type": "null"

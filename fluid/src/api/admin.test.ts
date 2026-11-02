@@ -145,6 +145,7 @@ describe("the admin client layer", () => {
       installUrl:
         "https://github.example/apps/crystalline-kb/installations/new",
       error: null,
+      loading: false,
     });
   });
 

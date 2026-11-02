@@ -456,6 +456,47 @@ async fn while_a_saved_app_loads_its_domains_are_closed() {
     release.send(()).unwrap();
 }
 
+/// The settings screen never waits for the App to load, and never shows
+/// "no App" (which offers Create) while a saved one is loading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settings_view_of_a_loading_app_is_loading_not_absent() {
+    use crystalline_service::engine::SettledApp;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("tokens")).unwrap();
+    let crystalline_remote::AppStore::File { path } =
+        crystalline_remote::AppStore::file_fallback(&tmp.path().join("tokens"))
+    else {
+        unreachable!()
+    };
+    std::fs::write(path, "{}").unwrap();
+    let (eng, release) = blocked_app_engine(tmp.path()).await;
+    eng.preload_github_app();
+    assert!(matches!(
+        eng.github_app_settled_status(),
+        SettledApp::Loading
+    ));
+    release.send(()).unwrap();
+    for _ in 0..500 {
+        if let SettledApp::Known(status) = eng.github_app_settled_status() {
+            assert!(status.configured);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the App never loaded");
+}
+
+/// Without anything saved, a loading App reads as none: Create is offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_settings_view_of_nothing_saved_is_no_app_while_loading() {
+    use crystalline_service::engine::SettledApp;
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, release) = blocked_app_engine(tmp.path()).await;
+    eng.preload_github_app();
+    assert!(matches!(eng.github_app_settled_status(), SettledApp::None));
+    release.send(()).unwrap();
+}
+
 /// An instance admin named as `github.agent_identity` gives the open tier
 /// its GitHub role on a governed domain and nothing more.
 #[tokio::test]

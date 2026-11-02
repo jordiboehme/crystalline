@@ -185,7 +185,10 @@ function GithubPanel() {
         </p>
       )}
 
-      <AppSection app={connection?.app ?? null} loading={status.isPending} />
+      <AppSection
+        app={connection?.app ?? null}
+        loading={status.isPending || connection?.app?.loading === true}
+      />
 
       {status.error && (
         <p
@@ -463,6 +466,7 @@ function AppSection({
   app: GithubApp | null;
   loading: boolean;
 }) {
+  const { capabilities } = useAuth();
   const orgField = useId();
   const [org, setOrg] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
@@ -557,6 +561,10 @@ function AppSection({
             <code className="font-mono">crystalline github app remove</code>.
           </p>
         </div>
+      ) : capabilities.readOnly ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          This instance is read-only, so no GitHub App can be created here.
+        </p>
       ) : (
         <form
           className="flex flex-wrap items-end gap-3"

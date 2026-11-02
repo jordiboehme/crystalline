@@ -63,8 +63,10 @@ pub struct GithubStatusResponse {
     /// A device flow's failure (expired, denied), reported on exactly one
     /// status read after the flow ends, then cleared.
     pub error: Option<String>,
-    /// The instance's GitHub App, when one is configured; null otherwise.
-    /// Names the App and where to install it, never a secret.
+    /// The instance's GitHub App, when one is configured; absent otherwise,
+    /// so an instance without an App answers exactly as before. Names the
+    /// App and where to install it, never a secret.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<GithubAppView>,
 }
 
@@ -92,20 +94,37 @@ pub struct GithubAppView {
     pub webhook_secret_set: bool,
     /// Why the App cannot be used, when it cannot.
     pub error: Option<String>,
+    /// True while a saved App is still being loaded: the other fields are
+    /// not known yet, but an App is there, so none is to be created.
+    #[schema(example = false)]
+    pub loading: bool,
 }
 
-/// The App part of the status, read locally: the screen polls this route,
-/// so GitHub is never asked here.
+/// The App part of the status, read locally and without waiting for the
+/// App to load: the screen polls this route, so GitHub is never asked here,
+/// and a saved App still loading reads as loading, never as none.
 fn app_view(state: &RestState) -> Option<GithubAppView> {
-    let app = state.engine.github_app_local_status();
-    app.configured.then(|| GithubAppView {
-        app_id: app.app_id,
-        slug: app.slug,
-        source: app.source,
-        install_url: state.engine.github_app_install_url(),
-        webhook_secret_set: app.webhook_secret_set,
-        error: app.error,
-    })
+    match state.engine.github_app_settled_status() {
+        crate::engine::SettledApp::None => None,
+        crate::engine::SettledApp::Loading => Some(GithubAppView {
+            app_id: None,
+            slug: None,
+            source: None,
+            install_url: None,
+            webhook_secret_set: false,
+            error: None,
+            loading: true,
+        }),
+        crate::engine::SettledApp::Known(app) => Some(GithubAppView {
+            app_id: app.app_id,
+            slug: app.slug,
+            source: app.source,
+            install_url: state.engine.github_app_install_url(),
+            webhook_secret_set: app.webhook_secret_set,
+            error: app.error,
+            loading: false,
+        }),
+    }
 }
 
 /// The half of a running device flow a browser has to show.

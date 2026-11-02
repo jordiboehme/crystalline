@@ -661,8 +661,28 @@ async fn ghes_manifest_posts_to_the_ghes_web_host() {
 
 #[tokio::test]
 async fn a_ghes_without_the_conversion_endpoint_names_its_version() {
+    for (version, endpoint_missing) in [("2.14.0", true), ("3.9.0", false)] {
+        let page = ghes_conversion_refused(version).await;
+        assert!(page.contains(version), "{page}");
+        assert_eq!(
+            page.contains("does not offer"),
+            endpoint_missing,
+            "{version}: {page}"
+        );
+        // From 3.0 the endpoint is there: the code was used or is too old.
+        assert_eq!(page.contains("an hour old"), !endpoint_missing, "{page}");
+        // GitHub created the App either way; the page says what to do.
+        assert!(
+            page.contains("delete it in your GitHub developer settings"),
+            "{page}"
+        );
+    }
+}
+
+/// The page a GHES of `version` that answers the conversion 404 leads to.
+async fn ghes_conversion_refused(version: &'static str) -> String {
     let github = FakeGithub::start().await;
-    *github.state.ghes_version.lock().unwrap() = Some("3.9.0");
+    *github.state.ghes_version.lock().unwrap() = Some(version);
     github.state.no_conversions.store(true, Ordering::SeqCst);
     let ctx = Ctx::with(
         &github,
@@ -677,9 +697,43 @@ async fn a_ghes_without_the_conversion_endpoint_names_its_version() {
     let response = ctx.created(&root, "secretcode", &state).await;
     assert_eq!(response.status(), 502);
     let page = response.text().await.unwrap();
-    assert!(page.contains("3.9.0"), "{page}");
     assert!(!page.contains("secretcode"), "the code is never echoed");
     assert!(ctx.saved().is_none());
+    page
+}
+
+#[tokio::test]
+async fn a_callback_without_a_code_says_to_delete_the_app() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let root = ctx.login("root").await;
+    let state = state_of(&ctx.manifest(&root).await);
+    let response = ctx
+        .get(&format!("/github/app/created?state={state}"), &root)
+        .await;
+    assert_eq!(response.status(), 502);
+    let page = response.text().await.unwrap();
+    assert!(
+        page.contains("delete it in your GitHub developer settings"),
+        "{page}"
+    );
+}
+
+#[tokio::test]
+async fn an_instance_without_an_app_answers_its_status_as_before() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let root = ctx.login("root").await;
+    let status: serde_json::Value = ctx
+        .get("/settings/github", &root)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        status.get("app").is_none(),
+        "no App, no key: the answer is what it was before: {status}"
+    );
 }
 
 #[tokio::test]

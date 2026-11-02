@@ -1365,8 +1365,53 @@ fn no_hook_attributes_without_a_public_url() {
         manifest.get("hook_attributes").is_none(),
         "GitHub cannot reach this instance, so no webhook: {manifest}"
     );
-    // The events stay: they are what the App would get once a webhook is set.
-    assert!(manifest["default_events"].as_array().is_some());
+    // Events without a webhook reach nobody, and GitHub may refuse a
+    // manifest that lists them with no hook.
+    assert!(manifest.get("default_events").is_none(), "{manifest}");
+}
+
+#[test]
+fn a_long_name_is_cut_to_githubs_limit() {
+    // A 40-character host: "Crystalline " plus it is far past 34.
+    let host = format!("{}.example.com", "k".repeat(28));
+    assert_eq!(host.len(), 40);
+    let manifest = app_manifest(&ManifestParams {
+        instance_label: host,
+        ..manifest_params(true)
+    });
+    let name = manifest["name"].as_str().unwrap();
+    assert!(name.chars().count() <= 34, "{name}");
+    assert_eq!(name, format!("Crystalline {}", "k".repeat(22)));
+
+    // A cut that lands after a dot, a hyphen or a space drops it.
+    for (label, cut) in [
+        (
+            format!("{}.{}", "a".repeat(21), "b".repeat(10)),
+            "a".repeat(21),
+        ),
+        (
+            format!("{}-{}", "a".repeat(21), "b".repeat(10)),
+            "a".repeat(21),
+        ),
+        (
+            format!("{} .{}", "a".repeat(20), "b".repeat(10)),
+            "a".repeat(20),
+        ),
+    ] {
+        let manifest = app_manifest(&ManifestParams {
+            instance_label: label.clone(),
+            ..manifest_params(true)
+        });
+        assert_eq!(manifest["name"], format!("Crystalline {cut}"), "{label}");
+    }
+
+    // On a character boundary: a multi-byte label is never split.
+    let manifest = app_manifest(&ManifestParams {
+        instance_label: "\u{e9}".repeat(30),
+        ..manifest_params(true)
+    });
+    let name = manifest["name"].as_str().unwrap();
+    assert_eq!(name.chars().count(), 34, "{name}");
 }
 
 #[test]
@@ -1446,17 +1491,7 @@ async fn the_conversion_answers_every_credential() {
 
 #[tokio::test]
 async fn a_ghes_without_the_conversion_endpoint_names_its_version() {
-    let routes = Router::new().route(
-        "/api/v3/app-manifests/{code}/conversions",
-        post(|| async {
-            (
-                StatusCode::NOT_FOUND,
-                [("X-GitHub-Enterprise-Version", "3.9.0")],
-                Json(not_found()),
-            )
-        }),
-    );
-    let base = spawn(routes).await;
+    let base = ghes_answering_404("2.14.0").await;
 
     let err = convert_manifest(Some(&format!("{base}/api/v3")), "secretcode")
         .await
@@ -1467,16 +1502,50 @@ async fn a_ghes_without_the_conversion_endpoint_names_its_version() {
             ghes_version,
         } => {
             assert_eq!(endpoint, "POST /app-manifests/{code}/conversions");
-            assert_eq!(ghes_version.as_deref(), Some("3.9.0"));
+            assert_eq!(ghes_version.as_deref(), Some("2.14.0"));
         }
         other => panic!("expected EndpointMissing, got {other:?}"),
     }
     let text = err.to_string();
-    assert!(text.contains("3.9.0"), "{text}");
+    assert!(text.contains("2.14.0"), "{text}");
     assert!(
         !text.contains("secretcode"),
         "the code is never echoed: {text}"
     );
+}
+
+/// GHES 3.x and later has the endpoint: a 404 there is a code that was
+/// used or is too old, said with the version.
+#[tokio::test]
+async fn a_404_from_a_ghes_that_has_the_endpoint_is_a_used_or_expired_code() {
+    let base = ghes_answering_404("3.9.0").await;
+    let err = convert_manifest(Some(&format!("{base}/api/v3")), "secretcode")
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(err, RemoteError::EndpointMissing { .. }),
+        "3.9.0 has the endpoint: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("an hour"), "{text}");
+    assert!(text.contains("3.9.0"), "{text}");
+    assert!(!text.contains("secretcode"), "{text}");
+}
+
+/// A GHES whose conversion endpoint answers 404 with `version` as its
+/// `X-GitHub-Enterprise-Version`.
+async fn ghes_answering_404(version: &'static str) -> String {
+    let routes = Router::new().route(
+        "/api/v3/app-manifests/{code}/conversions",
+        post(move || async move {
+            (
+                StatusCode::NOT_FOUND,
+                [("X-GitHub-Enterprise-Version", version)],
+                Json(not_found()),
+            )
+        }),
+    );
+    spawn(routes).await
 }
 
 #[tokio::test]

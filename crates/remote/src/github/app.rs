@@ -1223,6 +1223,17 @@ const MANIFEST_PERMISSIONS: [(&str, &str); 4] = [
 /// App without being asked for, so they are not (and cannot be) listed.
 const MANIFEST_EVENTS: [&str; 5] = ["member", "membership", "organization", "repository", "team"];
 
+/// The longest name GitHub takes for an App.
+const MAX_APP_NAME: usize = 34;
+
+/// The App's name, `Crystalline <label>`, cut to GitHub's limit on a
+/// character boundary, without a trailing hyphen, dot or space.
+fn app_name(label: &str) -> String {
+    let full = format!("Crystalline {}", label.trim());
+    let cut: String = full.chars().take(MAX_APP_NAME).collect();
+    cut.trim_end_matches(['-', '.', ' ']).to_string()
+}
+
 /// What the App created from a manifest is made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestParams {
@@ -1233,7 +1244,8 @@ pub struct ManifestParams {
     /// `service.public_url`: every url in the manifest is built under it.
     pub public_url: String,
     /// Whether GitHub can reach `public_url`. Only then does the manifest
-    /// set up a webhook; without one the role cache's five minutes apply.
+    /// set up a webhook and subscribe to events; without one the role
+    /// cache's five minutes apply.
     pub webhook_public: bool,
     /// The organization the App is created for, or `None` for the admin's
     /// own account. Only decides where the form is posted
@@ -1255,7 +1267,7 @@ pub fn app_manifest(p: &ManifestParams) -> serde_json::Value {
         .map(|(name, access)| (name.to_string(), serde_json::Value::from(*access)))
         .collect();
     let mut manifest = serde_json::json!({
-        "name": format!("Crystalline {}", p.instance_label.trim()),
+        "name": app_name(&p.instance_label),
         "url": base,
         "redirect_url": at(MANIFEST_CREATED_PATH),
         "callback_urls": [at(LINK_CALLBACK_PATH)],
@@ -1263,13 +1275,15 @@ pub fn app_manifest(p: &ManifestParams) -> serde_json::Value {
         "public": false,
         "request_oauth_on_install": false,
         "default_permissions": permissions,
-        "default_events": MANIFEST_EVENTS,
     });
+    // Events without a webhook reach nobody, and GitHub may refuse a
+    // manifest that lists them with no hook: both or neither.
     if p.webhook_public {
         manifest["hook_attributes"] = serde_json::json!({
             "url": at(WEBHOOK_PATH),
             "active": true,
         });
+        manifest["default_events"] = serde_json::json!(MANIFEST_EVENTS);
     }
     manifest
 }
@@ -1301,6 +1315,18 @@ pub fn valid_org_login(name: &str) -> bool {
         && !name.contains("--")
 }
 
+/// Whether an `X-GitHub-Enterprise-Version` names a release before 3.0,
+/// which may lack the manifest conversion. A version that does not parse
+/// counts as a later one: the 404 is then read as a used or expired code.
+fn before_ghes_3(version: &str) -> bool {
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < 3)
+}
+
 /// What `POST /app-manifests/{code}/conversions` answers: the App and its
 /// secrets. No `Debug`: it holds the private key.
 #[derive(Deserialize)]
@@ -1321,10 +1347,11 @@ struct ConversionResponse {
 /// `github.api_url`). The code is the only proof, so the request carries no
 /// credential. It works once, within an hour of the App's creation.
 ///
-/// A 404 from an Enterprise Server (it sends `X-GitHub-Enterprise-Version`)
-/// is [`RemoteError::EndpointMissing`] naming its version; a 404 from
-/// github.com means the code is unknown, used or too old. The code is never
-/// part of an error.
+/// A 404 from an Enterprise Server older than 3.0 (it sends
+/// `X-GitHub-Enterprise-Version`) is [`RemoteError::EndpointMissing`] naming
+/// its version. Any other 404, from github.com or a later Enterprise Server,
+/// means the code is unknown, used or too old, and says so with the
+/// version when there is one. The code is never part of an error.
 pub async fn convert_manifest(
     api_url: Option<&str>,
     code: &str,
@@ -1348,15 +1375,21 @@ pub async fn convert_manifest(
         .header("User-Agent", "crystalline");
     let response = send(request).await?;
     if response.status() == StatusCode::NOT_FOUND {
-        if let Some(version) = header(&response, "x-github-enterprise-version") {
+        let version = header(&response, "x-github-enterprise-version");
+        if let Some(version) = version.as_deref().filter(|v| before_ghes_3(v)) {
             return Err(RemoteError::EndpointMissing {
                 endpoint: "POST /app-manifests/{code}/conversions".to_string(),
-                ghes_version: Some(version),
+                ghes_version: Some(version.to_string()),
             });
         }
+        let server = version
+            .map(|v| format!("GitHub Enterprise Server {v}"))
+            .unwrap_or_else(|| "GitHub".to_string());
         return Err(RemoteError::Api {
             status: 404,
-            message: "GitHub does not know the code it sent back: it was already used or is more than an hour old. Delete the new App in GitHub's developer settings and create it again".to_string(),
+            message: format!(
+                "{server} does not know the code it sent back: it was already used or is more than an hour old"
+            ),
         });
     }
     let response = check_response(response, None, false, api_url).await?;

@@ -89,3 +89,21 @@ fn the_document_covers_every_mounted_path() {
 fn regenerate_openapi() {
     std::fs::write(SNAPSHOT, generated()).expect("the snapshot directory exists and is writable");
 }
+
+/// Two schemas of one name replace each other in the document without a
+/// word: the GitHub App manifest form was once called `ManifestResponse` and
+/// took the domain MANIFEST's place. The domain's keeps its five properties.
+#[test]
+fn the_domain_manifest_schema_keeps_its_own_properties() {
+    let doc = serde_json::to_value(crystalline_service::rest::openapi_document()).unwrap();
+    let properties: BTreeSet<&str> = doc["components"]["schemas"]["ManifestResponse"]["properties"]
+        .as_object()
+        .expect("ManifestResponse has properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        properties,
+        BTreeSet::from(["checksum", "domain", "markdown", "missing", "sections"])
+    );
+}

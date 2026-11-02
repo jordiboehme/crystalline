@@ -46,6 +46,17 @@ pub(crate) const KEYCHAIN_REFUSAL: &str = "the GitHub App is saved in the keycha
 /// the App.
 pub const APP_FROM_ENV: &str = "the GitHub App comes from the CRYSTALLINE_GITHUB_APP_* environment variables, which win over a saved App; unset them to set or remove a saved one";
 
+/// The App as [`Engine::github_app_settled_status`] sees it.
+#[derive(Debug)]
+pub enum SettledApp {
+    /// No App is configured.
+    None,
+    /// An App may be saved and is being loaded.
+    Loading,
+    /// The App, loaded.
+    Known(GithubAppStatus),
+}
+
 /// Why an App is not created from the browser: one is configured already,
 /// and creating another would overwrite it.
 pub const APP_ALREADY_CONFIGURED: &str = "a GitHub App is already configured on this instance; remove it first with crystalline github app remove, then create a new one";
@@ -322,21 +333,80 @@ impl AppHome {
     pub async fn save(
         &self,
         overlay: &EnvOverlay,
-        mut credentials: AppCredentials,
+        credentials: AppCredentials,
     ) -> Result<GithubAppStatus> {
+        self.save_as(overlay, credentials, false).await
+    }
+
+    /// [`AppHome::save`] for an App GitHub just created: refused with
+    /// [`APP_ALREADY_CONFIGURED`] while any App is configured here, saved,
+    /// from the environment, or in a keychain that cannot be read. The
+    /// store is looked up again under the store lock after GitHub validated
+    /// the App, so an App another process saved meanwhile is never
+    /// overwritten.
+    pub async fn save_new(
+        &self,
+        overlay: &EnvOverlay,
+        credentials: AppCredentials,
+    ) -> Result<GithubAppStatus> {
+        self.save_as(overlay, credentials, true).await
+    }
+
+    /// Why a save is refused before it writes, if it is: the environment
+    /// supplies the App, the keychain holding one cannot be read, or (for a
+    /// create) an App is saved already.
+    fn refuse_save(
+        &self,
+        overlay: &EnvOverlay,
+        found: &AppLookup,
+        create_only: bool,
+    ) -> Result<()> {
+        let already = || EngineError::Conflict(APP_ALREADY_CONFIGURED.to_string());
         if overlay.github_app(self.api_url.as_deref()).is_some() {
-            return Err(EngineError::Conflict(APP_FROM_ENV.to_string()));
+            return Err(if create_only {
+                already()
+            } else {
+                EngineError::Conflict(APP_FROM_ENV.to_string())
+            });
         }
-        let found = self.lookup()?;
         // A save to the file would be shadowed by the keychain's App once
         // the keychain answers again.
         if let (Some(reason), Some(marker)) = (&found.keychain_failed, &found.marker)
             && marker_names_host(marker, self.api_url.as_deref())
         {
-            return Err(EngineError::Conflict(format!(
-                "the keychain could not be read ({reason}), and a GitHub App is saved there; unlock it and run the set again, or run crystalline github app remove first"
-            )));
+            return Err(if create_only {
+                already()
+            } else {
+                EngineError::Conflict(format!(
+                    "the keychain could not be read ({reason}), and a GitHub App is saved there; unlock it and run the set again, or run crystalline github app remove first"
+                ))
+            });
         }
+        if create_only && found.credentials.is_some() {
+            return Err(already());
+        }
+        Ok(())
+    }
+
+    /// The save both ways share: refuse early, validate with GitHub, then
+    /// under the store lock look again and write.
+    async fn save_as(
+        &self,
+        overlay: &EnvOverlay,
+        mut credentials: AppCredentials,
+        create_only: bool,
+    ) -> Result<GithubAppStatus> {
+        if overlay.github_app(self.api_url.as_deref()).is_some() {
+            return Err(EngineError::Conflict(
+                if create_only {
+                    APP_ALREADY_CONFIGURED
+                } else {
+                    APP_FROM_ENV
+                }
+                .to_string(),
+            ));
+        }
+        self.refuse_save(overlay, &self.lookup()?, create_only)?;
         credentials.host = self.host();
         credentials.slug = None;
         let app = GithubApp::new(self.api_url.clone(), credentials.clone())?;
@@ -348,11 +418,20 @@ impl AppHome {
             )));
         }
         credentials.slug = Some(info.slug);
-        found.store.save_marked(&credentials, &self.dir)?;
-        if matches!(found.store, AppStore::Keyring { .. }) {
-            AppStore::file_fallback(&self.dir).delete()?;
-        }
-        let status = GithubAppStatus::of(&credentials, found.store.kind());
+        // GitHub was asked outside the lock; the look that decides and the
+        // write happen inside it, so nothing saved meanwhile is overwritten
+        // by a create, and two saves do not interleave.
+        let kind = {
+            let _lock = crystalline_remote::AppStoreLock::acquire(&self.dir)?;
+            let found = self.lookup()?;
+            self.refuse_save(overlay, &found, create_only)?;
+            found.store.save_marked(&credentials, &self.dir)?;
+            if matches!(found.store, AppStore::Keyring { .. }) {
+                AppStore::file_fallback(&self.dir).delete()?;
+            }
+            found.store.kind()
+        };
+        let status = GithubAppStatus::of(&credentials, kind);
         Ok(match app.installations().await {
             Ok(accounts) => GithubAppStatus {
                 installations: Some(accounts),
@@ -1187,15 +1266,36 @@ impl Engine {
         if self.github_app_local_status().configured {
             return Err(EngineError::Conflict(APP_ALREADY_CONFIGURED.to_string()));
         }
-        self.set_github_app(credentials).await
+        let saved = self.app_home()?.save_new(&self.overlay, credentials).await;
+        self.reset_github_app();
+        saved
     }
 
-    /// Where an owner installs the App, when it is usable and its slug is
-    /// known, without asking GitHub: the settings screen polls it.
+    /// Where an owner installs the App, when it is loaded, usable and its
+    /// slug is known, without asking GitHub or waiting for a load: the
+    /// settings screen polls it.
     pub fn github_app_install_url(&self) -> Option<String> {
-        match self.github_app_slot() {
-            AppSlot::Ready(router) => router.app().known_install_url(),
+        match self.github_app_slot_settled() {
+            Some(AppSlot::Ready(router)) => router.app().known_install_url(),
             _ => None,
+        }
+    }
+
+    /// The App as the settings screen shows it, without waiting for a load:
+    /// [`SettledApp::Loading`] while one runs and something cheap says an
+    /// App may be saved, so the screen never offers to create a second one.
+    pub fn github_app_settled_status(&self) -> SettledApp {
+        match self.github_app_slot_settled() {
+            Some(_) => {
+                let status = self.github_app_local_status();
+                if status.configured {
+                    SettledApp::Known(status)
+                } else {
+                    SettledApp::None
+                }
+            }
+            None if self.github_app_maybe_saved() => SettledApp::Loading,
+            None => SettledApp::None,
         }
     }
 

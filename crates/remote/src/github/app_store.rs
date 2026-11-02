@@ -35,6 +35,40 @@ const MARKER_FILE_NAME: &str = "github-app.present";
 /// it: the variables are the source of truth until they are unset.
 const ENV_READ_ONLY: &str = "the GitHub App credentials come from the CRYSTALLINE_GITHUB_APP_* environment variables and are read-only; unset them to manage saved credentials";
 
+/// The lock file beside the file store that every save of an App takes, so
+/// a create that must not overwrite and a set from another process do not
+/// interleave between their look and their write.
+const LOCK_FILE_NAME: &str = "github-app.lock";
+
+/// An exclusive lock on a state directory's App store, held until dropped.
+/// It holds no secret; the file it locks stays empty.
+#[derive(Debug)]
+pub struct AppStoreLock {
+    file: std::fs::File,
+}
+
+impl AppStoreLock {
+    /// Waits for and takes the lock of the App store in `dir`. Blocking: the
+    /// holders are short (a store read and a write).
+    pub fn acquire(dir: &Path) -> Result<AppStoreLock, RemoteError> {
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(LOCK_FILE_NAME))?;
+        fs4::FileExt::lock(&file)?;
+        Ok(AppStoreLock { file })
+    }
+}
+
+impl Drop for AppStoreLock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
 /// A GitHub App's identity and secrets, as GitHub shows them on the App's
 /// settings page (and returns from the manifest flow).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

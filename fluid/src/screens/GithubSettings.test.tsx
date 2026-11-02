@@ -82,6 +82,7 @@ const APP = {
   install_url: "https://github.example/apps/crystalline-kb/installations/new",
   webhook_secret_set: true,
   error: null,
+  loading: false,
 };
 
 /** A device flow waiting for its browser half. */
@@ -498,6 +499,54 @@ describe("the GitHub settings screen", () => {
     expect(
       screen.getByText(/crystalline github app remove/i),
     ).toBeInTheDocument();
+  });
+
+  it("offers no Create while a saved App is still loading", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          app: {
+            app_id: null,
+            slug: null,
+            source: null,
+            install_url: null,
+            webhook_secret_set: false,
+            error: null,
+            loading: true,
+          },
+        }),
+    });
+    renderApp("/settings/github");
+
+    // The status has arrived: the connection line says so.
+    expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
+    expect(screen.getByText("Reading the App")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create GitHub App" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers no Create on a read-only instance", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () =>
+          meResponse({
+            user: userFixture({ name: "root", role: "admin" }),
+            read_only: true,
+          }),
+        "/domains": domainsResponse,
+        "/settings/github": () => statusPayload(),
+      }),
+    );
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByRole("heading", { name: "GitHub App" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/read-only/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create GitHub App" }),
+    ).not.toBeInTheDocument();
   });
 
   it("is reachable from the command palette", async () => {

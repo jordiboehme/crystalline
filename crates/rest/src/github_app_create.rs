@@ -102,20 +102,24 @@ fn new_state() -> String {
 }
 
 /// Whether GitHub can reach `public_url`: its host is neither a loopback
-/// nor a private, link-local or otherwise local address. Only then does the
-/// manifest set up a webhook. A host name is taken as reachable unless it is
-/// `localhost` or a `.localhost` or `.local` name; what DNS makes of the
-/// others is not this check's to know.
+/// nor a private, link-local, multicast, reserved or otherwise local
+/// address. Only then does the manifest set up a webhook. A host name is
+/// taken as reachable unless it is a single label (`kb`), `localhost`, or
+/// under `.localhost`, `.local`, `.internal`, `.lan` or `.home.arpa`; what
+/// DNS makes of the others is not this check's to know.
 pub(crate) fn webhook_public(public_url: &str) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     fn v4_public(ip: Ipv4Addr) -> bool {
         let [a, b, ..] = ip.octets();
         let shared = a == 100 && (64..128).contains(&b);
+        // 240.0.0.0/4 is reserved, and holds the broadcast address too.
+        let reserved = a >= 240;
         !(ip.is_loopback()
             || ip.is_private()
             || ip.is_link_local()
             || ip.is_unspecified()
-            || ip.is_broadcast()
+            || ip.is_multicast()
+            || reserved
             || shared)
     }
     let Ok(url) = url::Url::parse(public_url.trim()) else {
@@ -124,7 +128,8 @@ pub(crate) fn webhook_public(public_url: &str) -> bool {
     match url.host() {
         Some(url::Host::Domain(name)) => {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
-            !(name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local"))
+            const LOCAL: [&str; 5] = [".localhost", ".local", ".internal", ".lan", ".home.arpa"];
+            name.contains('.') && !LOCAL.iter().any(|suffix| name.ends_with(suffix))
         }
         Some(url::Host::Ipv4(ip)) => v4_public(ip),
         Some(url::Host::Ipv6(ip)) => {
@@ -134,7 +139,11 @@ pub(crate) fn webhook_public(public_url: &str) -> bool {
             let first = ip.segments()[0];
             let unique_local = first & 0xfe00 == 0xfc00;
             let link_local = first & 0xffc0 == 0xfe80;
-            !(IpAddr::V6(ip).is_loopback() || ip.is_unspecified() || unique_local || link_local)
+            !(IpAddr::V6(ip).is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || unique_local
+                || link_local)
         }
         None => false,
     }
@@ -502,11 +511,9 @@ pub async fn created(
             "the GitHub App creation by {} could not finish: GitHub sent no code",
             user.name
         );
-        return page(
+        return orphan_page(
             &state,
-            StatusCode::BAD_GATEWAY,
-            "GitHub sent no code back, so the App's credentials cannot be fetched. Create the \
-             App again from the GitHub settings page.",
+            "GitHub sent no code back, so the App's credentials cannot be fetched",
         );
     };
     let api_url = state.engine.config().github.and_then(|g| g.api_url);
@@ -517,7 +524,7 @@ pub async fn created(
                 "GitHub did not convert the code of the GitHub App created by {}: {e}",
                 user.name
             );
-            return page(&state, StatusCode::BAD_GATEWAY, &e.to_string());
+            return orphan_page(&state, &e.to_string());
         }
     };
     match state.engine.create_github_app(credentials).await {
@@ -535,12 +542,10 @@ pub async fn created(
                 user.name
             );
             let e = ApiError::from(e);
-            let status = if e.status == StatusCode::FORBIDDEN {
-                e.status
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            return page(&state, status, &e.detail);
+            if e.status == StatusCode::FORBIDDEN {
+                return page(&state, e.status, &e.detail);
+            }
+            return orphan_page(&state, &e.detail);
         }
     }
     tracing::info!("{} created this instance's GitHub App", user.name);
@@ -557,6 +562,17 @@ pub async fn created(
         tracing::warn!("github.enabled could not be switched on after the App was created: {e}");
     }
     to_settings(&state, "app=created")
+}
+
+/// What every page after GitHub created the App and nothing was stored ends
+/// with.
+const ORPHAN: &str = "GitHub has created the App already: delete it in your GitHub developer \
+     settings, then create it again from the GitHub settings page here.";
+
+/// A 502 page: `text`, then what to do with the App GitHub created.
+fn orphan_page(state: &RestState, text: &str) -> Response {
+    let text = text.trim_end_matches('.');
+    page(state, StatusCode::BAD_GATEWAY, &format!("{text}. {ORPHAN}"))
 }
 
 /// The sentence a creation refused over an App already configured says.
@@ -595,6 +611,9 @@ mod tests {
 
     #[test]
     fn only_an_address_github_can_reach_gets_a_webhook() {
+        // 203.0.113.0/24 and 2001:db8::/32 are documentation ranges: they
+        // stand in for public addresses here, which is what the check reads
+        // them as, since it only knows the local and private ranges.
         for public in [
             "https://kb.example.com",
             "https://kb.example.com/fluid",
@@ -621,6 +640,15 @@ mod tests {
             "http://[fd00::1]",
             "http://[fe80::1]",
             "http://[::ffff:192.168.1.1]",
+            "http://kb",
+            "http://kb.internal",
+            "http://kb.lan",
+            "http://kb.home.arpa",
+            "http://224.0.0.1",
+            "http://239.1.2.3",
+            "http://240.0.0.1",
+            "http://255.255.255.255",
+            "http://[ff02::1]",
             "not a url",
         ] {
             assert!(!webhook_public(local), "{local}");

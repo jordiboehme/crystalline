@@ -92,6 +92,8 @@ export interface GithubApp {
   installUrl: string | null;
   /** Why the App cannot be used, in the server's words. */
   error: string | null;
+  /** A saved App is still being loaded; nothing else is known yet. */
+  loading: boolean;
 }
 
 /** The cache key of the GitHub connection. */
@@ -130,6 +132,7 @@ function readApp(value: unknown): GithubApp | null {
     source: asString(record.source),
     installUrl: asString(record.install_url),
     error: asString(record.error),
+    loading: record.loading === true,
   };
 }
 

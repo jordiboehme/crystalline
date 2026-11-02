@@ -1786,6 +1786,88 @@ async fn set_github_app_validates_saves_and_swaps_the_app_and_remove_drops_it() 
     );
 }
 
+/// A created App never overwrites one saved meanwhile, by another process
+/// this engine has not heard from: the store is looked up again under the
+/// lock, after GitHub validated the new App. Here the other process saves
+/// while GitHub is being asked, past the first look.
+#[tokio::test]
+async fn creating_an_app_refuses_one_saved_meanwhile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = AppStore::file_fallback(&tmp.path().join("tokens"));
+    let host: Arc<StdMutex<String>> = Arc::default();
+    let router = {
+        let file = file.clone();
+        let host = host.clone();
+        Router::new().route(
+            "/app",
+            axum::routing::get(move || {
+                let file = file.clone();
+                let host = host.clone();
+                async move {
+                    // The CLI of another process saves an App now.
+                    let mut other = app_to_set();
+                    other.client_id = "Iv23.other".to_string();
+                    other.host = host.lock().unwrap().clone();
+                    file.save(&other).unwrap();
+                    axum::Json(
+                        json!({"id": 7, "slug": SLUG, "owner": {"login": "acme"}, "html_url": "x"}),
+                    )
+                }
+            }),
+        )
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let url = format!("http://{addr}");
+    *host.lock().unwrap() = addr.to_string();
+    let eng = engine(tmp.path(), &url, &[]).await;
+
+    let err = eng.create_github_app(app_to_set()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(crystalline_service::engine::APP_ALREADY_CONFIGURED),
+        "{err}"
+    );
+    assert_eq!(
+        file.load().unwrap().unwrap().client_id,
+        "Iv23.other",
+        "the App saved meanwhile is kept"
+    );
+}
+
+/// `github app set` saves under the same lock a create takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setting_an_app_waits_for_the_store_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(&[], &[], &[]).await;
+    let eng = Arc::new(engine(tmp.path(), &url, &[]).await);
+    let held = crystalline_remote::AppStoreLock::acquire(&tmp.path().join("tokens")).unwrap();
+
+    let setting = {
+        let eng = eng.clone();
+        tokio::spawn(async move { eng.set_github_app(app_to_set()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !setting.is_finished(),
+        "the save waits while the lock is held"
+    );
+    assert_eq!(
+        AppStore::file_fallback(&tmp.path().join("tokens"))
+            .load()
+            .unwrap(),
+        None
+    );
+    drop(held);
+    let status = tokio::time::timeout(Duration::from_secs(5), setting)
+        .await
+        .expect("the save goes on once the lock is free")
+        .unwrap()
+        .unwrap();
+    assert!(status.configured);
+}
+
 #[tokio::test]
 async fn set_github_app_refuses_an_app_github_does_not_know_by_that_id() {
     let tmp = tempfile::tempdir().unwrap();

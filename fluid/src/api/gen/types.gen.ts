@@ -665,6 +665,11 @@ export type GithubAppView = {
      */
     install_url?: string | null;
     /**
+     * True while a saved App is still being loaded: the other fields are
+     * not known yet, but an App is there, so none is to be created.
+     */
+    loading: boolean;
+    /**
      * The App's slug, when known.
      */
     slug?: string | null;
