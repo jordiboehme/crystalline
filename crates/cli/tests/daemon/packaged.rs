@@ -534,3 +534,27 @@ fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
         "{served_text}"
     );
 }
+
+/// The trigger is the process's own package identity, never the launcher's
+/// variables: the extension's launcher sets them on the process it starts,
+/// also on macOS, where nothing is redirected. With only them set and no
+/// package, `domain add` takes the ordinary local path and `serve` is not
+/// refused.
+#[test]
+fn the_launcher_variables_alone_do_not_make_a_process_packaged() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    let dir = domain_folder(work.path(), "kb");
+    let out = crystalline(home.path(), false, "missing")
+        .env("CRYSTALLINE_CHANNEL", "desktop")
+        .env("CRYSTALLINE_LAUNCHER_VERSION", "0.30.0")
+        .args(["domain", "add", "kb", "--path"])
+        .arg(&dir)
+        .arg("--no-sync")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let config = std::fs::read_to_string(config_path(home.path())).unwrap();
+    assert!(config.contains("kb:"), "registered locally: {config}");
+    assert!(!daemon_answers(home.path()), "no daemon was asked to start");
+}
