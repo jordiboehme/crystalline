@@ -29,9 +29,11 @@ import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { changedVersions } from "../api/assetVersions";
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { heldJoin } from "../api/draftLinks";
+import { ASSETS_PREFIX, attachmentsKey, listAttachments } from "../api/files";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramDetail, SimilarEngram } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
@@ -64,7 +66,11 @@ import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
-import { imagePreviews } from "../editor/imagePreviews";
+import {
+  imagePreviews,
+  refreshPreviews,
+  setPreviewVersions,
+} from "../editor/imagePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
@@ -426,6 +432,29 @@ function Surface({
    * schedules no re-render of its own.
    */
   const [view, setView] = useState<EditorView | null>(null);
+  // A file rewritten elsewhere (another tab, an agent) is announced by a
+  // `files` event that refetches this listing; the previews then name the
+  // file's current bytes (`changedVersions`, shared with the reading page).
+  // Read once the text names a file; the upload flow fills the same entry.
+  const listing = useQuery({
+    queryKey: attachmentsKey(engram.domain),
+    queryFn: () => listAttachments(engram.domain),
+    enabled: mountText.includes(ASSETS_PREFIX),
+  });
+  const fileVersions = useMemo(
+    () => changedVersions(queryClient, `engram:${engram.domain}`, listing.data),
+    [queryClient, engram.domain, listing.data],
+  );
+  useEffect(() => {
+    setPreviewVersions(engram.domain, fileVersions);
+    view?.dispatch({ effects: refreshPreviews.of(null) });
+  }, [view, engram.domain, fileVersions]);
+  useEffect(
+    () => () => {
+      setPreviewVersions(engram.domain, new Map());
+    },
+    [engram.domain],
+  );
   /**
    * The decoration layer's on/off switch. Raw mode is not a second buffer or
    * a different document, it is this compartment reconfigured to hold nothing

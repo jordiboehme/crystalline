@@ -1,7 +1,7 @@
 //! **The MCP read surface for attachments, over both transports.**
 //!
-//! An attachment is a file a human added to a domain - a screenshot, a slide
-//! deck, a data file - and the surface an agent reaches it through is three
+//! An attachment is a file a person or an agent added to a domain - a
+//! screenshot, a slide deck, a data file - and the surface an agent reaches it through is three
 //! things: one resource template that says how attachments are addressed, a
 //! `resources/read` that hands back the bytes in the shape the mime asks for,
 //! and the resource links `read_engram` appends for the attachments an engram

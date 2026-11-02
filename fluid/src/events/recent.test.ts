@@ -26,6 +26,26 @@ describe("the recent changes store", () => {
     vi.useRealTimers();
   });
 
+  it("a file write or delete is no change of the engram it is filed under", () => {
+    const recent = new RecentChanges();
+    recent.note(
+      change({
+        kind: "files",
+        permalink: "assets/a.png",
+        path: "assets/a.png",
+      }),
+    );
+    recent.note(
+      change({
+        kind: "files",
+        permalink: "assets/a.png",
+        path: "assets/a.png",
+        checksum: null,
+      }),
+    );
+    expect(recent.size).toBe(0);
+  });
+
   it("an add or a modify is an update, with the actor and the time it arrived", () => {
     const recent = new RecentChanges();
     recent.note(change());

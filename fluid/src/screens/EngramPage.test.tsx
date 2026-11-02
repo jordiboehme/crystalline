@@ -2255,6 +2255,58 @@ describe("the reading page follows the stream", () => {
     });
   });
 
+  it("redraws an attachment image when a files event brings new bytes, and leaves the others", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let a = "1".repeat(64);
+    const b = "b".repeat(64);
+    const row = (path: string, sha256: string) => ({
+      path,
+      mime: "image/png",
+      size: 10,
+      modified: "2026-01-01T00:00:00Z",
+      sha256,
+    });
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: `${BODY}\n![First](assets/a.png)\n\n![Second](assets/b.png)\n`,
+        }),
+      "/domains/eng/attachments": () => ({
+        attachments: [row("assets/a.png", a), row("assets/b.png", b)],
+      }),
+    });
+    renderApp(engramRoute("eng", "alpha"));
+    const article = await screen.findByRole("article");
+    const src = (name: string) =>
+      within(article).getByRole("img", { name }).getAttribute("src");
+    await waitFor(() => {
+      expect(src("First")).toMatch(/assets\/a\.png$/);
+    });
+    // Let the first listing land: it sets the baseline, no version yet.
+    await act(async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    expect(src("First")).toMatch(/assets\/a\.png$/);
+    a = "2".repeat(64);
+    await connected();
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({
+          kind: "files",
+          permalink: "assets/a.png",
+          path: "assets/a.png",
+          checksum: a,
+        }),
+        "1:1",
+      );
+    });
+    await waitFor(() => {
+      expect(src("First")).toMatch(/assets\/a\.png\?v=222222222222$/);
+    });
+    expect(src("Second")).toMatch(/assets\/b\.png$/);
+  });
+
   it("names the actor the way the details panel does", async () => {
     serve();
     renderApp(engramRoute("eng", "alpha"));

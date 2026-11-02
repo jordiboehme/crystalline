@@ -9,10 +9,11 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { useMemo } from "react";
 
-import type { AttachmentRow } from "../api/files";
+import type { AssetHome, AttachmentRow } from "../api/files";
 import { inboundTitlesQuery } from "../api/inboundTitles";
-import { assetRefsIn, engramAssetHome } from "../editor/imageFormat";
+import { assetRefsIn } from "../editor/imageFormat";
 import { formatBytes, plural } from "../format";
+import { useEngramAssetHome } from "./useEngramAssetHome";
 
 /** A printed list's small heading. */
 const LIST_LABEL =
@@ -40,7 +41,7 @@ export function PrintRelated({
   const inbound = useInfiniteQuery(
     inboundTitlesQuery(domain, permalink, "", inboundCount > 0),
   );
-  const home = useMemo(() => engramAssetHome(domain), [domain]);
+  const home = useEngramAssetHome(domain, body) as AssetHome;
   const referenced = useMemo(
     () => assetRefsIn(body, home.resolve),
     [body, home],

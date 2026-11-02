@@ -30,6 +30,7 @@ import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
 import type { AssetResolver } from "../api/files";
+import { changedVersions } from "../api/assetVersions";
 import type {
   Disclosed,
   ReflectionDoc,
@@ -37,7 +38,6 @@ import type {
   SourceView,
 } from "../api/reflection";
 import {
-  changedVersions,
   deleteReflection,
   fetchReflection,
   fetchReflectionAssets,
