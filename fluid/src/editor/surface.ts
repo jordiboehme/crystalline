@@ -18,6 +18,8 @@ import { elementContextListener } from "./elementContext";
 import { elementPreviews } from "./elementPreviews";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
+import { cellPreviewLayers } from "./grid/draws";
+import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
@@ -96,6 +98,13 @@ export function previewConfig(
   images: Extension,
   adapter: DocumentAdapter,
 ): Extension {
+  // The prose layers the main view gets. The cell editor of the table grid
+  // draws with the same ones, read through `cellPreviewLayers`.
+  const proseLayers = [
+    elementPreviews({ sections: adapter.kind === "reflection" }),
+    livePreview(),
+    ...adapter.previewLayers,
+  ];
   return off
     ? // Raw is deliberately the source view, so the whole buffer goes back to
       // mono: the shared theme sets prose proportional, and this is the one
@@ -104,9 +113,11 @@ export function previewConfig(
     : [
         // Before the mark folding, so a callout head, a label or a formula
         // replaces its whole span over the marks folded inside it.
-        elementPreviews({ sections: adapter.kind === "reflection" }),
-        livePreview(),
-        ...adapter.previewLayers,
+        ...proseLayers,
+        cellPreviewLayers.of(proseLayers),
+        // Before the read-only previews: the grid takes over the tables it
+        // draws once its chunk is in.
+        tableGrid(),
         fencePreviews(dark),
         // A pasted screenshot is a path in the buffer and a picture on the
         // page, so the picture is drawn here too: an author placing an image

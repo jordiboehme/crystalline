@@ -32,6 +32,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
 import { mermaidConfig } from "../theme/mermaid";
+import { gridDraws, gridLoaded } from "./grid/draws";
 import { parseAdvanced } from "./parseProgress";
 
 let mermaidSequence = 0;
@@ -415,6 +416,7 @@ class TablePreviewWidget extends WidgetType {
 function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
   const widgets: Range<Decoration>[] = [];
   const doc = state.doc;
+  const grid = state.facet(gridLoaded);
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name === "FencedCode") {
@@ -438,7 +440,10 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
           );
         }
       }
-      if (node.name === "Table") {
+      // Once the lazy grid is in, it draws (and edits) the tables it accepts;
+      // the read-only preview stays for the rest, and for every table while
+      // the chunk loads or when its import failed.
+      if (node.name === "Table" && !(grid && gridDraws(node, doc))) {
         widgets.push(
           Decoration.widget({
             widget: new TablePreviewWidget(doc.sliceString(node.from, node.to)),
@@ -492,7 +497,9 @@ export function fencePreviews(dark: boolean): Extension {
   const field = StateField.define<DecorationSet>({
     create: (state) => buildPreviews(state, dark),
     update: (value, tr) =>
-      tr.docChanged || parseAdvanced(tr)
+      tr.docChanged ||
+      parseAdvanced(tr) ||
+      tr.startState.facet(gridLoaded) !== tr.state.facet(gridLoaded)
         ? buildPreviews(tr.state, dark)
         : value,
     provide: (f) => EditorView.decorations.from(f),
