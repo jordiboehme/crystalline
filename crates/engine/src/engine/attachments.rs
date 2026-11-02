@@ -170,6 +170,7 @@ impl Engine {
         path: &str,
         bytes: Vec<u8>,
         create_only: bool,
+        actor_label: Option<String>,
     ) -> Result<WrittenAttachment> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -208,6 +209,12 @@ impl Engine {
         let row = self
             .attachment_write_ruled(view.domain(), path, bytes, replace)
             .await?;
+        self.announce_attachment(
+            view.domain(),
+            &row.path,
+            Some(row.sha256.clone()),
+            actor_label,
+        );
         Ok(WrittenAttachment { row, draft: false })
     }
 
@@ -275,7 +282,7 @@ impl Engine {
             }
             _ => self.screen_granted_path(domain, path, scope, None).await?,
         }
-        self.attachment_write_in(&view, path, bytes, create_only)
+        self.attachment_write_in(&view, path, bytes, create_only, change_label(scope))
             .await
     }
 
@@ -292,6 +299,7 @@ impl Engine {
         &self,
         view: &DomainView<'_>,
         path: &str,
+        actor_label: Option<String>,
     ) -> Result<bool> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -309,6 +317,7 @@ impl Engine {
             return Ok(true);
         }
         self.attachment_delete(view.domain(), path).await?;
+        self.announce_attachment(view.domain(), path, None, actor_label);
         Ok(false)
     }
 
@@ -352,7 +361,38 @@ impl Engine {
             }
             _ => self.screen_granted_path(domain, path, scope, None).await?,
         }
-        self.attachment_delete_in(&view, path).await
+        self.attachment_delete_in(&view, path, change_label(scope))
+            .await
+    }
+
+    /// Tell every tab that may read this domain that an attachment landed,
+    /// was replaced or went: an `engram` event of kind `files` whose `path`
+    /// and `permalink` are both the attachment path (a reader rejects an
+    /// empty permalink). A write carries the file's SHA-256 as `checksum` (a
+    /// replace with other bytes is then never taken for an echo by the bus's
+    /// duplicate window; identical bytes inside it are, and nothing changed);
+    /// a delete carries none. Called for a landed write or delete only; a draft in a review-mode overlay never reaches it, as a draft page
+    /// announces nothing to the folder's readers. The sync walker stays
+    /// silent about attachments (`FileRows::announced_as`), so this is the
+    /// one announcement a file gets.
+    fn announce_attachment(
+        &self,
+        domain: &str,
+        path: &str,
+        checksum: Option<String>,
+        actor: Option<String>,
+    ) {
+        self.announce(Change::Engram(EngramChanged {
+            domain: domain.to_string(),
+            permalink: path.to_string(),
+            path: path.to_string(),
+            kind: ChangeKind::Files,
+            from: None,
+            checksum,
+            actor,
+            draft_of: None,
+            audience: None,
+        }));
     }
 
     // --- attachments a cross-domain move carries ------------------------------

@@ -12723,12 +12723,13 @@
       },
       "ChangeKind": {
         "type": "string",
-        "description": "What happened to the engram: the four things the sync engine counts.",
+        "description": "What happened to the engram: the four things the sync engine counts, and\n`files` for an attachment.",
         "enum": [
           "added",
           "modified",
           "deleted",
-          "moved"
+          "moved",
+          "files"
         ]
       },
       "ClosedDomain": {

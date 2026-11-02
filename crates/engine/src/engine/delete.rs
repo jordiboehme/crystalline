@@ -54,7 +54,9 @@ impl Engine {
             // Through the view this verb already built, so an attachment
             // delete lands where an engram delete lands: in review mode as
             // this actor's own deletion, with the folder untouched.
-            let draft = self.attachment_delete_in(&view, &path).await?;
+            let draft = self
+                .attachment_delete_in(&view, &path, crate::changes::change_label(scope))
+                .await?;
             let mut receipt = json!({
                 "domain": p.domain,
                 "path": path,

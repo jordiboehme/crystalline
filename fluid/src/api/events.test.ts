@@ -34,6 +34,32 @@ describe("the change frames", () => {
     ).toMatchObject({ from: null, checksum: null, actor: null, draftOf: null });
   });
 
+  it("reads an engram files frame for an attachment path", () => {
+    expect(
+      parseFrame(
+        "engram",
+        JSON.stringify({
+          domain: "eng",
+          permalink: "assets/a.png",
+          path: "assets/a.png",
+          kind: "files",
+          from: null,
+          checksum: null,
+          actor: "ada",
+          draft_of: null,
+        }),
+      ),
+    ).toMatchObject({
+      event: "engram",
+      change: {
+        kind: "files",
+        path: "assets/a.png",
+        permalink: "assets/a.png",
+        actor: "ada",
+      },
+    });
+  });
+
   it("drops a frame that does not parse, with a warning and no throw", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     expect(parseFrame("engram", "{not json")).toBeNull();
