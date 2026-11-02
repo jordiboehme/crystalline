@@ -1792,6 +1792,109 @@ async fn a_link_that_never_resolved_stays_and_is_named_in_links_dead() {
     assert!(receipt.get("links_failed").is_none(), "{receipt}");
 }
 
+/// A wikilink to a heading of a missing engram is named whole, with its
+/// heading, in `links_dead`.
+#[tokio::test]
+async fn a_dead_heading_link_is_named_with_its_heading() {
+    let f = Fixture::new().await;
+    seed(f.notes(), "a.md", &engram("Ay", "a", "See [[ghost#x]]."));
+    f.sync().await;
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    assert_eq!(
+        dead(&receipt),
+        vec![("[[ghost#x]]".to_string(), "unresolved_before".to_string())],
+        "{receipt}"
+    );
+    assert!(read(f.ops(), "a.md").contains("See [[ghost#x]]."));
+}
+
+/// A permalink rename rewrites `[[b#setup|t]]` in a linking engram to the new
+/// permalink and keeps the heading and the text; the receipt counts it.
+#[tokio::test]
+async fn a_renamed_permalink_rewrites_a_heading_link() {
+    let f = Fixture::new().await;
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    seed(
+        f.notes(),
+        "linker.md",
+        &engram("Linker", "linker", "See [[b#setup|t]]."),
+    );
+    f.sync().await;
+
+    let receipt = f
+        .mv("b", "notes", "b.md", None, Some("newb"))
+        .await
+        .unwrap();
+    assert_eq!(receipt["links_rewritten"], 1, "{receipt}");
+    assert_eq!(receipt["references_rewritten"], 1, "{receipt}");
+    let linker = read(f.notes(), "linker.md");
+    assert!(linker.contains("See [[newb#setup|t]]."), "{linker}");
+    assert!(
+        edges(&read_receipt(&f, "notes", "linker").await)
+            .iter()
+            .all(|(_, resolved, _)| *resolved)
+    );
+}
+
+/// A relative link with an anchor becomes a wikilink with the domain and keeps
+/// the anchor when its target moves to another domain, with nothing failed.
+#[tokio::test]
+async fn a_cross_domain_move_keeps_the_anchor_of_a_relative_link() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [p](p.md#setup)."),
+    );
+    seed(f.notes(), "p.md", &engram("Pee", "p", "P."));
+    f.sync().await;
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    assert!(receipt.get("links_failed").is_none(), "{receipt}");
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[notes:p#setup|p]]."), "{a}");
+}
+
+/// A link by a title that holds a `#`, in an engram beside one titled `C`,
+/// is prefixed to the permalink of the `C# Basics` engram on a cross-domain
+/// move: the whole text is the title, not `C` with a heading.
+#[tokio::test]
+async fn a_cross_domain_move_resolves_a_hash_title_whole() {
+    let f = Fixture::new().await;
+    seed(f.notes(), "a.md", &engram("Ay", "a", "See [[C# Basics]]."));
+    seed(f.notes(), "c.md", &engram("C", "c", "C."));
+    seed(
+        f.notes(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "Basics."),
+    );
+    f.sync().await;
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[notes:c-basics|C# Basics]]."), "{a}");
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+}
+
+/// `read_engram` reports a heading link with its fragment, resolved.
+#[tokio::test]
+async fn read_engram_reports_the_fragment_of_a_heading_link() {
+    let f = Fixture::new().await;
+    seed(f.notes(), "a.md", &engram("Ay", "a", "See [[b#setup]]."));
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    f.sync().await;
+
+    let a = read_receipt(&f, "notes", "a").await;
+    let link = &a["links"].as_array().unwrap()[0];
+    assert_eq!(
+        link["target"],
+        serde_json::json!({"target": "b", "fragment": "setup", "domain": null}),
+        "{a}"
+    );
+    assert_eq!(link["resolved"], true, "{a}");
+}
+
 /// A title link keeps its words and its fragment when a move names the
 /// permalink, and a title that holds a `#` is read whole, so it is not split
 /// into a target and a heading.
