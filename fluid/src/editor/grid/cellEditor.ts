@@ -159,10 +159,10 @@ const LINE_BREAK_TAG = /<br\s*\/?>/gi;
 
 /**
  * One unit of the cell's text the caret and a deletion never split, in
- * document positions. A backslash run right before a pipe (an inner `\|`, or
- * the cell's closing pipe) is read in pairs, `\\` being one escaped
- * backslash, and an odd last backslash belongs to the pipe it escapes. `hide`
- * is the escaping backslash the cell view hides, if any.
+ * document positions. Every backslash run is read in pairs, `\\` being one
+ * escaped backslash (R11), and an odd last backslash belongs to the `|` it
+ * escapes, or stands alone before any other character. `hide` is the
+ * escaping backslash the cell view hides, if any.
  */
 interface Unit {
   from: number;
@@ -172,7 +172,6 @@ interface Unit {
 
 function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
   const text = doc.sliceString(range.from, range.to);
-  const closing = doc.sliceString(range.to, range.to + 1) === "|";
   const base = range.from;
   const units: Unit[] = [];
   const single = (at: number) =>
@@ -186,23 +185,25 @@ function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
     }
     let j = i;
     while (j < text.length && text[j] === "\\") j += 1;
-    const piped = j < text.length ? text[j] === "|" : closing;
-    if (!piped) {
-      for (let k = i; k < j; k += 1) single(k);
-      i = j;
-      continue;
-    }
-    const length = j - i;
+    // Read in pairs anywhere: Markdown shows `\\` as one `\`.
     for (let k = i; k + 1 < j; k += 2) {
       units.push({ from: base + k, to: base + k + 2, hide: base + k });
     }
-    if (length % 2 === 1 && j < text.length) {
-      // The last backslash escapes the inner pipe after it.
-      units.push({ from: base + j - 1, to: base + j + 1, hide: base + j - 1 });
-      i = j + 1;
-      continue;
+    if ((j - i) % 2 === 1) {
+      if (j < text.length && text[j] === "|") {
+        // The last backslash escapes the inner pipe after it.
+        units.push({
+          from: base + j - 1,
+          to: base + j + 1,
+          hide: base + j - 1,
+        });
+        i = j + 1;
+        continue;
+      }
+      // A literal backslash before anything else, shown as it is. Before the
+      // closing pipe only an edit in flight is odd here.
+      single(j - 1);
     }
-    if (length % 2 === 1) single(j - 1); // only an edit in flight is odd here
     i = j;
   }
   return units;
@@ -210,7 +211,8 @@ function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
 
 /**
  * Inside the cell: every escaping backslash hidden (an escaped `\|` shows
- * `|`, a `\\` before a pipe shows `\`), each `<br>` drawn as a line break.
+ * `|`, any `\\` shows `\`), each `<br>` drawn as a line break. The bytes are
+ * never rewritten for it.
  * Both atomic.
  */
 const cellMarks = atomicField((state) => {

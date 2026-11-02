@@ -210,6 +210,32 @@ describe("cell editor under co-editing", () => {
     expect(rtext.toJSON()).toBe("a | b\n--|--\n0 | 9\n1 | 3q");
   });
 
+  test("a peer emptying a pipeless last cell closes it as gone (R10)", async () => {
+    const { main, rtext } = roomMain("a | b\n--|--\n0 | 9\n1 | 23");
+    openAt(main, cellOf(main, 2, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(cellOf(main, 2, 1).content.from, 2);
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("a peer deleting only the line break after a pipeless last cell keeps it open", async () => {
+    // Pinned on purpose: the content stays, the next line joins the row, and
+    // the parsed table still has the cell.
+    const { main, rtext } = roomMain("a | b\n--|--\n1 | 23\n | 4\n");
+    const cell = openAt(main, cellOf(main, 1, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(rtext.toJSON().indexOf("23\n") + 2, 1);
+    await Promise.resolve();
+    expect(rtext.toJSON()).toBe("a | b\n--|--\n1 | 23 | 4\n");
+    expect(heard).not.toHaveBeenCalled();
+    expect(activeCell(main)).toBe(cell);
+    expect(openText(main)).toBe("23");
+  });
+
   test("a peer clearing a compact cell leaves it open", async () => {
     const { main, rtext } = roomMain("|A|B|\n|-|-|\n|1|2|\n");
     const cell = openAt(main, cellOf(main, 1, 0).content.to);

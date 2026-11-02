@@ -188,6 +188,46 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(cell.view.contentDOM.textContent).toBe("a\\|b");
   });
 
+  test("Backspace on an escaped pipe after a literal backslash shows the backslash once", () => {
+    const { main } = open("| a | b |\n| - | - |\n| x\\\\\\|y | 2 |\n");
+    const content = cellOf(main, 1, 0).content;
+    const cell = openAt(main, content.from + 5);
+    expect(cell.view.contentDOM.textContent).toBe("x\\|y");
+    expect(press(cell.view, "Backspace")).toBe(true);
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| x\\\\y | 2 |\n");
+    expect(cell.view.contentDOM.textContent).toBe("x\\y");
+  });
+
+  test("a letter typed between a visible backslash and a pipe keeps the backslash single", () => {
+    const { main } = open("| a | b |\n| - | - |\n| x\\\\\\|y | 2 |\n");
+    const content = cellOf(main, 1, 0).content;
+    const cell = openAt(main, content.from + 3);
+    typeIn(cell, "Z");
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| x\\\\Z\\|y | 2 |\n",
+    );
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("x\\Z|y");
+  });
+
+  test("a backslash and a letter typed into a compact cell show as typed", () => {
+    const { main, cell } = open("|A|B|\n|-|-|\n|C:|2|\n");
+    typeIn(cell, "\\");
+    typeIn(cell, "U");
+    expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|C:\\\\U|2|\n");
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("C:\\U");
+  });
+
+  test("a hand-written backslash pair shows once and Backspace takes the pair", () => {
+    const { main } = open("| a | b |\n| - | - |\n| a\\\\b | 2 |\n");
+    const content = cellOf(main, 1, 0).content;
+    const cell = openAt(main, content.from + 3);
+    expect(cell.view.contentDOM.textContent).toBe("a\\b");
+    expect(press(cell.view, "Backspace")).toBe(true);
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| ab | 2 |\n");
+  });
+
   test("a second mount destroys the first", () => {
     const { main, cell } = open();
     expect(activeCell(main)).toBe(cell);
