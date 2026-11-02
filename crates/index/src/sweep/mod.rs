@@ -922,6 +922,29 @@ pub struct SpelledRef {
     pub raw: String,
     /// The display text of a `[[target|text]]` reference, `None` without one.
     pub alias: Option<String>,
+    /// The target with its `#heading` as the parse read it before the
+    /// fragment split, `None` when nothing was split off.
+    pub whole: Option<String>,
+}
+
+impl SpelledRef {
+    /// The bracket text before any `|`, as the file holds it: [`SpelledRef::raw`]
+    /// with its `#heading` put back.
+    pub fn written(&self) -> String {
+        let target = self.raw.split_once(':').map_or("", |(_, rest)| rest.trim());
+        with_fragment(&self.raw, target, self.whole.as_deref())
+    }
+}
+
+/// `raw`, which ends in the split `target`, with the `#heading` of `whole`
+/// (the target as it read before the split) put back after it: the target
+/// part of the bracket text as the file holds it, trimmed. `raw` unchanged
+/// when nothing was split off.
+fn with_fragment(raw: &str, target: &str, whole: Option<&str>) -> String {
+    match whole.and_then(|whole| whole.strip_prefix(target)) {
+        Some(tail) if raw.ends_with(target) => format!("{raw}{tail}"),
+        _ => raw.to_string(),
+    }
 }
 
 /// A reference that names a target the index could not resolve: the `V102`
@@ -948,8 +971,32 @@ pub struct UnresolvedRef {
     /// A repair quotes it on both sides, so its left side is the text the file
     /// holds and following it keeps the author's words.
     pub alias: Option<String>,
+    /// The target with its `#heading` as the parse read it before the
+    /// fragment split, `None` when nothing was split off. A finding quotes the
+    /// link with it.
+    pub whole: Option<String>,
     /// The one-based line the reference sits on, when known.
     pub line: Option<usize>,
+}
+
+impl UnresolvedRef {
+    /// The bracket text before any `|`, as the file holds it: [`UnresolvedRef::raw`]
+    /// with its `#heading` put back, or the split target with it for a row
+    /// written before `to_raw` existed.
+    pub fn written(&self) -> String {
+        let raw = if self.raw.is_empty() {
+            self.target.as_str()
+        } else {
+            self.raw.as_str()
+        };
+        with_fragment(raw, &self.target, self.whole.as_deref())
+    }
+
+    /// The target with its `#heading`, without a domain prefix: what a
+    /// finding names the link by.
+    pub fn named(&self) -> &str {
+        self.whole.as_deref().unwrap_or(&self.target)
+    }
 }
 
 /// Every threshold the sweep uses, so a caller can tune a run without editing
@@ -1866,7 +1913,7 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
                 Some(u) => (
                     format!(
                         "status=superseded; superseded_by [[{}]] does not resolve",
-                        u.target
+                        u.named()
                     ),
                     u.line,
                 ),
@@ -2500,11 +2547,11 @@ fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut Sw
         .map(|(spelling, canonical)| (spelling.as_str(), canonical.as_str()))
         .collect();
 
-    let mut same: HashMap<(i64, &str, Option<&str>), Vec<usize>> = HashMap::new();
+    let mut same: HashMap<(i64, String, Option<&str>), Vec<usize>> = HashMap::new();
     for reference in &input.spelled_refs {
         same.entry((
             reference.from.0,
-            reference.raw.as_str(),
+            reference.written(),
             reference.alias.as_deref(),
         ))
         .or_default()
@@ -2528,9 +2575,16 @@ fn detect_local_spellings(input: &SweepInput, graph: &Graph<'_>, report: &mut Sw
         let new_raw = format!("{canonical}:{rest}");
         let alias = reference.alias.as_deref();
         let ordinal = same
-            .get(&(reference.from.0, reference.raw.as_str(), alias))
+            .get(&(reference.from.0, reference.written(), alias))
             .map_or(0, |lines| ordinal_of(lines, reference.line));
-        let (written, respelled) = as_written(&fact.body, &reference.raw, alias, &new_raw, ordinal);
+        let (written, respelled) = as_written(
+            &fact.body,
+            &reference.raw,
+            reference.whole.as_deref(),
+            alias,
+            &new_raw,
+            ordinal,
+        );
         let spelling = &reference.spelling;
         let finding = if input.renames_asked.contains(spelling) {
             Finding::about("V110", fact).with(
@@ -2608,17 +2662,11 @@ fn detect_unsourced_ingest(input: &SweepInput, graph: &Graph<'_>, report: &mut S
             .collect();
         records.sort_by_key(|id| id.0);
         records.dedup();
-        let dangling: Vec<&str> = input
+        let dangling: Vec<String> = input
             .unresolved
             .iter()
             .filter(|r| r.from == fact.id && r.rel_type == "ingested_from")
-            .map(|r| {
-                if r.raw.is_empty() {
-                    r.target.as_str()
-                } else {
-                    r.raw.as_str()
-                }
-            })
+            .map(UnresolvedRef::written)
             .collect();
         if records.is_empty() && dangling.is_empty() {
             continue;
@@ -2761,7 +2809,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
     let mut targets: HashMap<i64, Vec<String>> = HashMap::new();
     // The lines of each engram's references by raw text and display text,
     // so a repair quotes the occurrence on its own line.
-    let mut same: HashMap<(i64, &str, Option<&str>), Vec<usize>> = HashMap::new();
+    let mut same: HashMap<(i64, String, Option<&str>), Vec<usize>> = HashMap::new();
     for reference in &input.unresolved {
         targets
             .entry(reference.from.0)
@@ -2769,7 +2817,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
             .push(reference.target.clone());
         same.entry((
             reference.from.0,
-            reference.raw.as_str(),
+            reference.written(),
             reference.alias.as_deref(),
         ))
         .or_default()
@@ -2783,7 +2831,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
         let ordinal = same
             .get(&(
                 reference.from.0,
-                reference.raw.as_str(),
+                reference.written(),
                 reference.alias.as_deref(),
             ))
             .map_or(0, |lines| ordinal_of(lines, reference.line.unwrap_or(0)));
@@ -2804,11 +2852,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
         if reference.target_domain.is_none()
             && reference.target.to_ascii_lowercase().ends_with(".md")
         {
-            let written = if reference.raw.is_empty() {
-                reference.target.as_str()
-            } else {
-                reference.raw.as_str()
-            };
+            let written = reference.written();
             report.findings.push(
                 Finding::about("V102", fact)
                     .with(
@@ -2855,6 +2899,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                         let (left, right) = as_written(
                             &fact.body,
                             &reference.raw,
+                            reference.whole.as_deref(),
                             reference.alias.as_deref(),
                             &candidate,
                             ordinal,
@@ -2868,7 +2913,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                         reference.rel_type
                     ),
                     Class::Judgment,
-                    format!("[[{}]]", reference.target),
+                    format!("[[{}]]", reference.named()),
                 ),
             },
             None => {
@@ -2919,6 +2964,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                             let (left, right) = as_written(
                                 &fact.body,
                                 written,
+                                reference.whole.as_deref(),
                                 reference.alias.as_deref(),
                                 &prefixed(reference.target_domain.as_deref(), &candidate),
                                 ordinal,
@@ -2932,7 +2978,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                             reference.rel_type, reference.target
                         ),
                         Class::Judgment,
-                        format!("[[{}]]", reference.target),
+                        format!("[[{}]]", reference.named()),
                     ),
                 }
             }
@@ -2942,7 +2988,7 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
             Finding::about("V102", fact)
                 .with(
                     class,
-                    format!("unresolved reference [[{}]]", reference.target),
+                    format!("unresolved reference [[{}]]", reference.named()),
                     evidence,
                     fix,
                 )
@@ -2976,8 +3022,9 @@ fn bracketed(text: &str, alias: Option<&str>) -> String {
     }
 }
 
-/// A repair's two sides for the reference `raw` (with display text `alias`)
-/// in `body`, the left side quoted exactly as the file holds it, spaces and
+/// A repair's two sides for the reference `raw` (with display text `alias`,
+/// and `whole` the target as it read before a `#heading` was split off) in
+/// `body`, the left side quoted exactly as the file holds it, spaces and
 /// an empty display text included, and the right side the same text with
 /// `raw` replaced by `new_raw`. The index keeps a reference trimmed (`[[ a |
 /// b ]]` is `a` with `b`), so a quote rebuilt from it would name text a find
@@ -2992,6 +3039,7 @@ fn bracketed(text: &str, alias: Option<&str>) -> String {
 fn as_written(
     body: &str,
     raw: &str,
+    whole: Option<&str>,
     alias: Option<&str>,
     new_raw: &str,
     ordinal: usize,
@@ -3000,13 +3048,24 @@ fn as_written(
         .into_iter()
         .filter_map(|inners| {
             inners.into_iter().find(|inner| {
-                crystalline_core::LinkTarget::wikilink(inner)
-                    .is_some_and(|target| target.raw == raw && target.alias.as_deref() == alias)
+                crystalline_core::LinkTarget::wikilink(inner).is_some_and(|target| {
+                    target.raw == raw
+                        && target.whole.as_deref() == whole
+                        && target.alias.as_deref() == alias
+                })
             })
         })
         .collect();
     let Some(inner) = matching.get(ordinal).or_else(|| matching.first()) else {
-        return (bracketed(raw, alias), bracketed(new_raw, alias));
+        // The `#heading` the file holds after `raw`, kept on both sides.
+        let target = crystalline_core::LinkTarget::parse(raw).target;
+        let tail = whole
+            .and_then(|whole| whole.strip_prefix(target.as_str()))
+            .unwrap_or("");
+        return (
+            bracketed(&format!("{raw}{tail}"), alias),
+            bracketed(&format!("{new_raw}{tail}"), alias),
+        );
     };
     let (left, rest) = match inner.split_once('|') {
         Some((left, rest)) => (left, Some(rest)),

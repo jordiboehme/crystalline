@@ -1759,10 +1759,9 @@ async fn an_already_prefixed_link_is_untouched() {
 }
 
 /// A link that resolved nowhere before the move stays as written, and the
-/// receipt names it in `links_dead` so the caller sees it at once. The
-/// resolver never splits a `#fragment` off a wikilink target, so
-/// `[[b#setup]]` is one of them; `[[b]]` beside it resolves and gains its
-/// prefix.
+/// receipt names it in `links_dead` so the caller sees it at once. A
+/// `#heading` after a target is a fragment, so `[[b#setup]]` resolves to `b`
+/// like `[[b]]` beside it, and both gain their prefix, the fragment kept.
 #[tokio::test]
 async fn a_link_that_never_resolved_stays_and_is_named_in_links_dead() {
     let f = Fixture::new().await;
@@ -1775,27 +1774,101 @@ async fn a_link_that_never_resolved_stays_and_is_named_in_links_dead() {
     f.sync().await;
     let before = edges(&read_receipt(&f, "notes", "a").await);
     assert!(
-        before.contains(&("b#setup".to_string(), false, None)),
-        "the resolver reads the fragment as part of the target: {before:?}"
+        before.contains(&("b".to_string(), true, None)),
+        "the fragment is not part of the target: {before:?}"
     );
 
     let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
     let a = read(f.ops(), "a.md");
     assert!(
-        a.contains("See [[ghost]], [[b#setup]] and [[notes:b]]."),
+        a.contains("See [[ghost]], [[notes:b#setup]] and [[notes:b]]."),
         "{a}"
     );
-    let mut dead = dead(&receipt);
-    dead.sort();
     assert_eq!(
-        dead,
-        vec![
-            ("[[b#setup]]".to_string(), "unresolved_before".to_string()),
-            ("[[ghost]]".to_string(), "unresolved_before".to_string()),
-        ],
+        dead(&receipt),
+        vec![("[[ghost]]".to_string(), "unresolved_before".to_string())],
         "{receipt}"
     );
     assert!(receipt.get("links_failed").is_none(), "{receipt}");
+}
+
+/// A title link keeps its words and its fragment when a move names the
+/// permalink, and a title that holds a `#` is read whole, so it is not split
+/// into a target and a heading.
+#[tokio::test]
+async fn a_title_link_with_a_fragment_or_a_hash_follows_a_move() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram(
+            "Ay",
+            "a",
+            "See [[Bee#setup]], [[C# Basics]] and [[c#intro]].",
+        ),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    seed(f.notes(), "c.md", &engram("C", "c", "C."));
+    seed(
+        f.notes(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "Basics."),
+    );
+    f.sync().await;
+    assert!(
+        edges(&read_receipt(&f, "notes", "a").await)
+            .iter()
+            .all(|(_, resolved, _)| *resolved)
+    );
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(
+        a.contains(
+            "See [[notes:b#setup|Bee]], [[notes:c-basics|C# Basics]] and [[notes:c#intro]]."
+        ),
+        "{a}"
+    );
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+}
+
+/// A title that holds a `#` names the engram that carries it, never the one
+/// its split target names. Moving `c` (title `C`) leaves a linker's
+/// `[[C# Basics]]` alone while `[[C]]` beside it follows; moving `c-basics`
+/// leaves its own `[[C# Basics]]` a self-reference rather than a link to `c`.
+#[tokio::test]
+async fn a_title_holding_a_hash_is_never_read_as_its_split_target_by_a_move() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "linker.md",
+        &engram("Linker", "linker", "See [[C]] and [[C# Basics]]."),
+    );
+    seed(f.notes(), "c.md", &engram("C", "c", "C."));
+    seed(
+        f.notes(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "Itself: [[C# Basics]]."),
+    );
+    f.sync().await;
+
+    f.mv("c", "notes", "c.md", Some("ops"), None).await.unwrap();
+    let linker = read(f.notes(), "linker.md");
+    assert!(
+        linker.contains("See [[ops:C]] and [[C# Basics]]."),
+        "{linker}"
+    );
+
+    f.mv("c-basics", "notes", "c-basics.md", Some("ops"), None)
+        .await
+        .unwrap();
+    let moved = read(f.ops(), "c-basics.md");
+    assert!(moved.contains("Itself: [[C# Basics]]."), "{moved}");
+    let linker = read(f.notes(), "linker.md");
+    assert!(
+        linker.contains("See [[ops:C]] and [[ops:C# Basics]]."),
+        "{linker}"
+    );
 }
 
 /// A move inside one domain leaves bare links bare and carries no

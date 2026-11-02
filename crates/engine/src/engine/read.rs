@@ -498,6 +498,7 @@ impl Engine {
                 o.kind == kind
                     && o.line == line
                     && o.to_target == stored
+                    && o.to_whole == target.whole
                     && super::names::same_domain(
                         &names,
                         o.to_domain.as_deref(),

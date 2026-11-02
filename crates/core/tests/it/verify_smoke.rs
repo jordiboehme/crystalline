@@ -1919,3 +1919,43 @@ fn l007_follows_the_domains_severity_override() {
     );
     assert!(error[0].starts_with("Error "), "{error:?}");
 }
+
+#[test]
+fn a_heading_fragment_is_checked_by_its_target_and_quoted_with_it() {
+    let dir = tempdir().unwrap();
+    let manifest = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Scope text here for the domain\n\n## When to Use\n\n- When testing\n";
+    let notes = dir.path().join("notes");
+    write(&notes, "MANIFEST.md", manifest);
+    write(
+        &notes,
+        "b.md",
+        "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# B\n\n## Setup\n\nSteps for the on-call engineer when the pager goes off at night.\n\nA second paragraph of prose, so the body clears the minimum line count.\n",
+    );
+    write(
+        &notes,
+        "linker.md",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[b#setup]] and [[ghost#x]] for the details here.\n\nAlso crystalline://notes/b#setup and crystalline://notes/ghost#x for more.\n",
+    );
+
+    let report = verify::verify_paths([notes.as_path()], &VerifyOptions::default()).unwrap();
+    let messages = |rule: &str| -> Vec<String> {
+        report
+            .issues
+            .iter()
+            .filter(|i| i.rule == rule)
+            .map(|i| i.message.clone())
+            .collect()
+    };
+    assert_eq!(
+        messages("L001"),
+        vec!["broken wikilink to `ghost#x`".to_string()],
+        "{:#?}",
+        report.issues
+    );
+    assert_eq!(
+        messages("L005"),
+        vec!["broken crystalline:// URL: `crystalline://notes/ghost#x`".to_string()],
+        "{:#?}",
+        report.issues
+    );
+}

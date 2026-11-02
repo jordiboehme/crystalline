@@ -92,11 +92,15 @@ pub struct ObservationRecord {
 /// byte for byte what they were; the other two read one actor's view, with
 /// that actor's own row preferred at an address the base also answers.
 ///
-/// Four readings. The first two and the last are the order
-/// [`crystalline_core::address::resolve`] tries them: the target as a permalink
-/// in the target domain, the target as a title there, and - only when the row
-/// names a domain nobody registered - the whole bracket text as a permalink and
-/// then a title in the row's OWN domain. The third is the target as the path
+/// Five readings. The first three and the last are the order
+/// [`crystalline_core::address::resolve`] tries them: the whole target text
+/// with its `#heading` (`to_whole`, set only when the parse split a fragment
+/// off) as a title in the target domain, so an engram titled `C# Basics` is
+/// still found by `[[C# Basics]]`; then the split target as a permalink in the
+/// target domain, the target as a title there, and - only when the row names a
+/// domain nobody registered - the whole bracket text before the fragment as a
+/// permalink and then a title in the row's OWN domain. The fourth is the target
+/// as the path
 /// of an engram in the target domain: a relative Markdown link
 /// (`[p](../pumps/p-12.md)`) is stored as the domain-relative path it lands on
 /// ([`crystalline_core::LinkTarget::stored_target`]), and only the path can
@@ -111,7 +115,7 @@ pub struct ObservationRecord {
 /// domain of a prefixed one is the domain its prefix spells and nothing else:
 /// an explicit `[[domain:Target]]` resolves only within the named domain, as
 /// core's rule says. A prefix that spells no domain has no target domain, so
-/// the first two readings find nothing and the bare target is never looked up
+/// the first three readings find nothing and the bare target is never looked up
 /// at home; only the whole bracket text is. `[[ops:Runbook]]` written where
 /// `ops` is not registered stays unresolved even when the home domain holds a
 /// Runbook. It heals on the next resolve pass over home after `ops` is
@@ -126,7 +130,7 @@ pub struct ObservationRecord {
 /// consulted `domain.name` directly; the lookup is a primary-key seek either
 /// way.
 ///
-/// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
+/// That last reading is what makes an engram titled `Log: Weekly Garden Notes`
 /// reachable. The parser splits that into a domain and a target exactly as it
 /// splits `ops:Runbook`, because nothing inside the brackets says which it is,
 /// and only the spelling table can settle it. It stays a second question rather than
@@ -176,6 +180,9 @@ pub(crate) fn reference_match(table: &str, candidates: ReferenceCandidates<'_>) 
     };
     format!(
         "COALESCE(\
+         (SELECT e.id FROM engram e WHERE {actor_screen} AND {table}.to_whole IS NOT NULL \
+          AND lower(e.title) = lower({table}.to_whole) \
+          AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
          (SELECT e.id FROM engram e WHERE {actor_screen} AND e.permalink = {table}.to_target \
           AND e.domain_id = {target_domain}{prefer} LIMIT 1), \
          (SELECT e.id FROM engram e WHERE {actor_screen} AND lower(e.title) = lower({table}.to_target) \
@@ -228,7 +235,7 @@ pub(crate) enum ReferenceCandidates<'a> {
 /// plan guards - `the_reference_resolve_pass_seeks_the_title_index` in
 /// `turso/mod.rs` and the registry in `tests/it/plans.rs` - explain the statement
 /// the stores actually issue. The pass runs on every sync of every domain and
-/// is O(dangling references), so each of its five arms has to be an index seek;
+/// is O(dangling references), so each of its six arms has to be an index seek;
 /// a hand-copied literal in a test is what let the title arm lose its index
 /// once already.
 #[doc(hidden)]
@@ -332,7 +339,8 @@ pub fn resolve_spelled_references_sql(table: &str, list: &str) -> String {
 /// The rows [`Store::resolve_references_to`] binds, as a `WHERE` clause over one
 /// reference table: pending rows in every domain but `domain` (the caller's
 /// placeholder), spelled with one of `spellings` and naming one of `targets`
-/// (placeholder lists; each target placeholder comes wrapped in `lower()`),
+/// by the split target or by the whole text with its `#` (placeholder lists;
+/// each target placeholder comes wrapped in `lower()`),
 /// that the base candidates now answer. The `to_domain IS NOT NULL` term
 /// repeats the partial index's own condition, as in
 /// [`reset_spelled_references_sql`].
@@ -340,7 +348,7 @@ fn references_to_where(table: &str, domain: &str, spellings: &str, targets: &str
     format!(
         "{table}.to_domain IS NOT NULL AND {table}.to_domain IN ({spellings}) \
          AND {table}.to_id IS NULL AND {table}.domain_id <> {domain} \
-         AND lower({table}.to_target) IN ({targets}) \
+         AND (lower({table}.to_target) IN ({targets}) OR lower({table}.to_whole) IN ({targets})) \
          AND {resolved} IS NOT NULL",
         resolved = reference_match(table, ReferenceCandidates::Base)
     )
@@ -417,11 +425,11 @@ pub fn referencing_domains_sql(list: &str) -> String {
 #[doc(hidden)]
 pub fn spelled_references_sql(domain: &str, list: &str) -> String {
     format!(
-        "SELECT r.engram_id, r.line, r.to_domain, r.to_raw, e.path, r.to_alias \
+        "SELECT r.engram_id, r.line, r.to_domain, r.to_raw, e.path, r.to_alias, r.to_whole \
          FROM relation r JOIN engram e ON e.id=r.engram_id \
          WHERE r.to_domain IS NOT NULL AND r.to_domain IN ({list}) AND r.domain_id={domain} AND e.actor = '' \
          UNION ALL \
-         SELECT l.engram_id, l.line, l.to_domain, l.to_raw, e.path, l.to_alias \
+         SELECT l.engram_id, l.line, l.to_domain, l.to_raw, e.path, l.to_alias, l.to_whole \
          FROM link l JOIN engram e ON e.id=l.engram_id \
          WHERE l.to_domain IS NOT NULL AND l.to_domain IN ({list}) AND l.domain_id={domain} AND e.actor = ''"
     )
@@ -696,6 +704,12 @@ pub struct RelationRecord {
     /// The display text of a `[[target|text]]` reference, `None` without one.
     /// Only read to quote the bracket text as the file holds it.
     pub to_alias: Option<String>,
+    /// The target with its `#heading`, as the parse read it before the
+    /// fragment split ([`crystalline_core::LinkTarget::whole`]); `None` when
+    /// nothing was split off. Resolution tries it as a title first, so a title
+    /// that holds a `#` stays reachable, and a quote rebuilds the fragment
+    /// from it.
+    pub to_whole: Option<String>,
 }
 
 /// One prose wikilink, treated as a direct link edge.
@@ -719,6 +733,12 @@ pub struct LinkRecord {
     /// The display text of a `[[target|text]]` reference, `None` without one.
     /// Only read to quote the bracket text as the file holds it.
     pub to_alias: Option<String>,
+    /// The target with its `#heading`, as the parse read it before the
+    /// fragment split ([`crystalline_core::LinkTarget::whole`]); `None` when
+    /// nothing was split off. Resolution tries it as a title first, so a title
+    /// that holds a `#` stays reachable, and a quote rebuilds the fragment
+    /// from it.
+    pub to_whole: Option<String>,
 }
 
 /// A fully prepared engram row plus its child rows and file stamp. Built from a
@@ -819,6 +839,7 @@ impl EngramRecord {
                 to_domain: r.target.domain.clone(),
                 to_raw: r.target.raw.clone(),
                 to_alias: r.target.alias.clone(),
+                to_whole: r.target.whole.clone(),
             })
             .collect();
         let links = engram
@@ -830,6 +851,7 @@ impl EngramRecord {
                 to_domain: l.target.domain.clone(),
                 to_raw: l.target.raw.clone(),
                 to_alias: l.target.alias.clone(),
+                to_whole: l.target.whole.clone(),
             })
             .collect();
 
@@ -1746,6 +1768,10 @@ pub struct OutboundRef {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The target with its `#heading` as written, `None` when the parse split
+    /// no fragment off: what a message quotes the link with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_whole: Option<String>,
     /// Whether the reference currently resolves to a target in the index.
     pub resolved: bool,
 }

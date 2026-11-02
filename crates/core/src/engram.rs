@@ -363,16 +363,32 @@ pub struct WikiLink {
     pub target: LinkTarget,
 }
 
-/// A link target, optionally carrying an explicit cross-domain prefix.
+/// A link target, optionally carrying an explicit cross-domain prefix and a
+/// `#heading` fragment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct LinkTarget {
     /// The domain named by a `[[domain:Target]]` prefix, if any.
     pub domain: Option<String>,
-    /// The target title or permalink.
+    /// The target title or permalink: the part before the first `#`, trimmed.
     pub target: String,
+    /// The `#heading` of a `[[target#heading]]` wikilink: the text after the
+    /// first `#` of the target part, trimmed. `None` when there is no `#`, or
+    /// nothing after it. It names a place inside the target and never changes
+    /// which engram the link lands on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
+    /// The target as 0.30.0 read it, the `#` and all, trimmed: `C# Basics`
+    /// for `[[C# Basics]]`, whose target reads `C`. Set whenever a `#` was
+    /// split off a non-empty target and the reading without the split names
+    /// the same domain. The resolver tries it as a title first, so an engram
+    /// whose own title holds a `#` stays reachable by it. Not part of the
+    /// serialized shape.
+    #[serde(skip)]
+    pub whole: Option<String>,
     /// The target part of the bracket text as it was written: everything
-    /// before the first `|` (the display text is [`LinkTarget::alias`]),
-    /// trimmed at the ends and nothing else.
+    /// before the first `|` (the display text is [`LinkTarget::alias`]) and
+    /// before the `#` of a fragment ([`LinkTarget::fragment`]), trimmed at the
+    /// ends and nothing else.
     ///
     /// The parse below is domain-agnostic: it cannot know whether the segment
     /// before a colon names a real domain, so a title whose own first word ends
@@ -426,6 +442,8 @@ impl LinkTarget {
         LinkTarget {
             domain: None,
             target: path.to_string(),
+            fragment: None,
+            whole: None,
             raw: path.to_string(),
             form: LinkForm::Relative,
             alias: None,
@@ -448,34 +466,47 @@ impl LinkTarget {
     }
 
     /// Parse the inside of a `[[...]]` into a target. The text after the
-    /// first `|` is the display text ([`LinkTarget::alias`]); everything below
-    /// reads the part before it. A single leading colon group is treated as a
+    /// first `|` is the display text ([`LinkTarget::alias`]); the text after
+    /// the first `#` of the part before it is the fragment
+    /// ([`LinkTarget::fragment`]), split off only when something stands
+    /// before the `#` (`[[#setup]]` stays the target `#setup`). On the part
+    /// before the `#`, a single leading colon group is treated as a
     /// cross-domain prefix; further colons stay in the target text.
     pub fn parse(inner: &str) -> LinkTarget {
-        let (inner, alias) = split_alias(inner);
+        let (part, alias) = split_alias(inner);
         let alias = alias.map(str::to_string);
-        if let Some((domain, rest)) = inner.split_once(':') {
-            let domain = domain.trim();
-            let rest = rest.trim();
-            // Only treat it as a domain prefix when both sides look like a
-            // plausible domain and target (no spaces in the domain segment).
-            if !domain.is_empty() && !rest.is_empty() && !domain.contains(char::is_whitespace) {
-                return LinkTarget {
-                    domain: Some(domain.to_string()),
-                    target: rest.to_string(),
-                    raw: inner.to_string(),
-                    form: LinkForm::Wiki,
-                    alias,
-                };
-            }
+        let (before, fragment) = split_fragment(part);
+        let Some(fragment) = fragment else {
+            return read_prefix(part, alias);
+        };
+        let mut link = read_prefix(before.trim(), alias);
+        // The reading 0.30.0 took, with the `#` left in the target. Kept as
+        // the whole text only when it names the same domain, so a title
+        // holding a `#` is looked up where the link points.
+        let unsplit = read_prefix(part, None);
+        if unsplit.domain == link.domain {
+            link.whole = Some(unsplit.target);
         }
-        LinkTarget {
-            domain: None,
-            target: inner.to_string(),
-            raw: inner.to_string(),
-            form: LinkForm::Wiki,
-            alias,
+        let fragment = fragment.trim();
+        link.fragment = (!fragment.is_empty()).then(|| fragment.to_string());
+        link
+    }
+
+    /// The target part written back: `[domain:]target[#fragment]`, never the
+    /// display text. What a rewrite or a message that rebuilds bracket text
+    /// writes.
+    pub fn written(&self) -> String {
+        let mut out = String::new();
+        if let Some(domain) = &self.domain {
+            out.push_str(domain);
+            out.push(':');
         }
+        out.push_str(&self.target);
+        if let Some(fragment) = &self.fragment {
+            out.push('#');
+            out.push_str(fragment);
+        }
+        out
     }
 
     /// Whether two targets point at the same place: equal in everything but
@@ -483,6 +514,7 @@ impl LinkTarget {
     pub fn same_place(&self, other: &LinkTarget) -> bool {
         self.domain == other.domain
             && self.target == other.target
+            && self.fragment == other.fragment
             && self.raw == other.raw
             && self.form == other.form
     }
@@ -495,6 +527,51 @@ impl LinkTarget {
             return None;
         }
         Some(LinkTarget::parse(inner))
+    }
+}
+
+/// The domain prefix of a trimmed target part, read the one way every
+/// wikilink is read: a single leading colon group is a prefix when both sides
+/// are non-empty and the domain segment holds no whitespace.
+fn read_prefix(part: &str, alias: Option<String>) -> LinkTarget {
+    if let Some((domain, rest)) = part.split_once(':') {
+        let domain = domain.trim();
+        let rest = rest.trim();
+        // Only treat it as a domain prefix when both sides look like a
+        // plausible domain and target (no spaces in the domain segment).
+        if !domain.is_empty() && !rest.is_empty() && !domain.contains(char::is_whitespace) {
+            return LinkTarget {
+                domain: Some(domain.to_string()),
+                target: rest.to_string(),
+                fragment: None,
+                whole: None,
+                raw: part.to_string(),
+                form: LinkForm::Wiki,
+                alias,
+            };
+        }
+    }
+    LinkTarget {
+        domain: None,
+        target: part.to_string(),
+        fragment: None,
+        whole: None,
+        raw: part.to_string(),
+        form: LinkForm::Wiki,
+        alias,
+    }
+}
+
+/// Split the target part of a wikilink (the text before its `|`) at its
+/// first `#` into the part before it and the fragment text after it, both as
+/// written, untrimmed. No split, and `None` for the fragment, when there is
+/// no `#` or nothing but whitespace stands before it (`[[#setup]]`). The one
+/// place the split is spelled, so the parser and every rewrite that keeps the
+/// fragment agree on where the target ends.
+pub fn split_fragment(part: &str) -> (&str, Option<&str>) {
+    match part.split_once('#') {
+        Some((before, after)) if !before.trim().is_empty() => (before, Some(after)),
+        _ => (part, None),
     }
 }
 
@@ -754,5 +831,87 @@ mod link_target_tests {
         assert!(LinkTarget::wikilink(" | b").is_none());
         assert!(LinkTarget::wikilink("a|b").is_some());
         assert_eq!(LinkTarget::parse("plain").alias, None);
+    }
+
+    #[test]
+    fn a_heading_after_the_target_is_a_fragment() {
+        let link = LinkTarget::parse("b#setup");
+        assert_eq!(link.domain, None);
+        assert_eq!(link.target, "b");
+        assert_eq!(link.fragment.as_deref(), Some("setup"));
+        assert_eq!(link.whole.as_deref(), Some("b#setup"));
+        assert_eq!(link.raw, "b");
+        assert_eq!(link.written(), "b#setup");
+
+        let link = LinkTarget::parse("b#Setup Guide|see");
+        assert_eq!(link.target, "b");
+        assert_eq!(link.fragment.as_deref(), Some("Setup Guide"));
+        assert_eq!(link.whole.as_deref(), Some("b#Setup Guide"));
+        assert_eq!(link.alias.as_deref(), Some("see"));
+        assert_eq!(link.raw, "b");
+        assert_eq!(link.written(), "b#Setup Guide", "never the alias");
+    }
+
+    #[test]
+    fn the_prefix_is_read_on_the_part_before_the_fragment() {
+        let link = LinkTarget::parse("ops:b#x:y");
+        assert_eq!(link.domain.as_deref(), Some("ops"));
+        assert_eq!(link.target, "b");
+        assert_eq!(link.fragment.as_deref(), Some("x:y"));
+        assert_eq!(link.whole.as_deref(), Some("b#x:y"));
+        assert_eq!(link.raw, "ops:b");
+        assert_eq!(link.written(), "ops:b#x:y");
+
+        // The unregistered-prefix fallback reads `raw`, which holds no
+        // fragment.
+        let link = LinkTarget::parse("Log: Weekly#x");
+        assert_eq!(link.domain.as_deref(), Some("Log"));
+        assert_eq!(link.target, "Weekly");
+        assert_eq!(link.fragment.as_deref(), Some("x"));
+        assert_eq!(link.whole.as_deref(), Some("Weekly#x"));
+        assert_eq!(link.raw, "Log: Weekly");
+    }
+
+    #[test]
+    fn an_empty_fragment_or_an_empty_target_is_no_split() {
+        let link = LinkTarget::parse("b#");
+        assert_eq!(link.target, "b");
+        assert_eq!(link.fragment, None);
+        assert_eq!(link.whole.as_deref(), Some("b#"));
+        assert_eq!(link.raw, "b");
+
+        let link = LinkTarget::parse("#setup");
+        assert_eq!(link.target, "#setup");
+        assert_eq!(link.fragment, None);
+        assert_eq!(link.whole, None);
+        assert_eq!(link.raw, "#setup");
+
+        let link = LinkTarget::parse("plain");
+        assert_eq!(link.fragment, None);
+        assert_eq!(link.whole, None);
+        assert_eq!(link.written(), "plain");
+    }
+
+    #[test]
+    fn a_split_that_moves_the_prefix_keeps_no_whole_text() {
+        // Read whole, `a#b` would be the prefix; split, there is none.
+        let link = LinkTarget::parse("a#b:c");
+        assert_eq!(link.domain, None);
+        assert_eq!(link.target, "a");
+        assert_eq!(link.fragment.as_deref(), Some("b:c"));
+        assert_eq!(link.whole, None);
+    }
+
+    #[test]
+    fn the_fragment_is_part_of_the_place_and_is_serialized() {
+        let a = LinkTarget::parse("b#setup");
+        let b = LinkTarget::parse("b#setup|text");
+        let c = LinkTarget::parse("b");
+        assert!(a.same_place(&b));
+        assert!(!a.same_place(&c));
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["fragment"], "setup");
+        assert!(json.get("whole").is_none());
+        assert!(serde_json::to_value(&c).unwrap().get("fragment").is_none());
     }
 }

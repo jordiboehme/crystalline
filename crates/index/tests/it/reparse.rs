@@ -335,6 +335,84 @@ async fn an_interrupted_virtual_reparse_repeats(store: Arc<Mutex<dyn Store>>) {
     assert_eq!(generation(&*store, domain).await, PARSE_GENERATION);
 }
 
+// --- generation 10: heading fragments ---------------------------------------------
+
+const LINKER: &str = "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Linker\n\nSee [[b#setup]] and [[C# Basics]] for the details here.\n";
+
+const BEE: &str = "---\ntype: engram\ntitle: B\npermalink: b\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# B\n\n## Setup\n\nThe steps.\n";
+
+const C_BASICS: &str = "---\ntype: engram\ntitle: C# Basics\npermalink: c-basics\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# C# Basics\n\nThe language.\n";
+
+/// The engrams `linker` links to, by id, the way the graph reads them.
+async fn linked_ids(store: &dyn Store, linker: crystalline_index::EngramId) -> Vec<i64> {
+    let slice = store.neighbors(&[linker], 1, None).await.unwrap();
+    let mut ids: Vec<i64> = slice
+        .edges
+        .iter()
+        .filter(|e| e.from == linker)
+        .map(|e| e.to.0)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// An index built by generation 9 read `[[b#setup]]` as the target `b#setup`,
+/// which nothing answers, and `[[C# Basics]]` as the title it is. The next
+/// sync reparses: the fragment link binds to `b`, and the title link still
+/// binds to the same engram.
+async fn a_heading_fragment_link_resolves_after_the_reparse(store: Arc<Mutex<dyn Store>>) {
+    let store = store.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("d");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("linker.md"), LINKER).unwrap();
+    std::fs::write(root.join("b.md"), BEE).unwrap();
+    std::fs::write(root.join("c-basics.md"), C_BASICS).unwrap();
+    sync_domain_with(&*store, "d", &root, &params())
+        .await
+        .unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let linker = store.lookup_id("d", "linker").await.unwrap().unwrap();
+    let b = store.lookup_id("d", "b").await.unwrap().unwrap();
+    let c_basics = store.lookup_id("d", "c-basics").await.unwrap().unwrap();
+
+    // Staged as generation 9 wrote it: the `#` and all in the target.
+    let stamp = store.file_stamps(domain).await.unwrap()["linker.md"].clone();
+    let mut record = EngramRecord::from_engram(&parse_engram(LINKER).unwrap(), "linker.md", stamp);
+    assert_eq!(record.links.len(), 2, "{:?}", record.links);
+    for link in &mut record.links {
+        let whole = link.to_whole.take().unwrap();
+        link.to_target = whole.clone();
+        link.to_raw = whole;
+    }
+    store.upsert_engram(domain, &record).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+    store.set_parse_generation(domain, 9).await.unwrap();
+    let refs = store.outbound_refs(linker, None).await.unwrap();
+    let resolved: Vec<(&str, bool)> = refs
+        .iter()
+        .map(|r| (r.to_target.as_str(), r.resolved))
+        .collect();
+    assert_eq!(resolved, vec![("b#setup", false), ("C# Basics", true)]);
+    assert_eq!(linked_ids(&*store, linker).await, vec![c_basics.0]);
+
+    let report = sync_domain_with(&*store, "d", &root, &params())
+        .await
+        .unwrap();
+    assert_eq!(report.updated, 3, "every file was reparsed: {report:?}");
+    assert_eq!(generation(&*store, domain).await, PARSE_GENERATION);
+    let linker = store.lookup_id("d", "linker").await.unwrap().unwrap();
+    let refs = store.outbound_refs(linker, None).await.unwrap();
+    assert!(refs.iter().all(|r| r.resolved), "{refs:?}");
+    let mut want = vec![b.0, c_basics.0];
+    want.sort_unstable();
+    assert_eq!(linked_ids(&*store, linker).await, want);
+}
+
 // --- backend runner ------------------------------------------------------------
 
 macro_rules! parity {
@@ -382,6 +460,10 @@ parity!(
 parity!(
     interrupted_virtual_reparse_repeats,
     an_interrupted_virtual_reparse_repeats
+);
+parity!(
+    heading_fragment_link_resolves_after_the_reparse,
+    a_heading_fragment_link_resolves_after_the_reparse
 );
 
 // --- fix round 1 -------------------------------------------------------------------

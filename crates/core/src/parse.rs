@@ -53,7 +53,9 @@ use crate::yaml::YamlValue;
 ///   (0.29.1).
 /// - 9: a `[[...]]` inside an inline link's destination is part of that
 ///   path, not a wikilink (0.29.1).
-pub const PARSE_GENERATION: u32 = 9;
+/// - 10: a `#heading` after a wikilink target is a fragment, not part of the
+///   target (0.31.0).
+pub const PARSE_GENERATION: u32 = 10;
 
 /// An error encountered while parsing an Engram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1391,7 +1393,7 @@ mod tests {
 
     #[test]
     fn the_parse_generation_moved_for_relative_links() {
-        assert_eq!(PARSE_GENERATION, 9);
+        assert_eq!(PARSE_GENERATION, 10);
     }
 
     /// `index.md` and `log.md` are the files Crystalline keeps in every

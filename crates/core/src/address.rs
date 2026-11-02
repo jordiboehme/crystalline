@@ -280,11 +280,23 @@ pub trait LinkResolver {
 /// domain keeps its meaning whatever the current domain happens to hold: the
 /// registry decides, and a title that merely looks like a prefix never wins
 /// against a real one.
+///
+/// **A title may hold a `#`.** `[[C# Basics]]` parses as the target `C` with
+/// the fragment ` Basics`, so when the parse split a fragment off
+/// ([`LinkTarget::whole`]), the whole text is tried as a title in the target
+/// domain first, and only then the chain above on the split target. The
+/// unregistered-prefix fallback reads [`LinkTarget::raw`] only.
 pub fn resolve<R: LinkResolver + ?Sized>(
     target: &LinkTarget,
     current_domain: &str,
     lookup: &R,
 ) -> Resolution {
+    if let Some(whole) = &target.whole {
+        let domain = target.domain.as_deref().unwrap_or(current_domain);
+        if let Some(found) = lookup.by_title(domain, whole) {
+            return Resolution::Resolved(found);
+        }
+    }
     match &target.domain {
         Some(domain) => lookup
             .by_permalink(domain, &target.target)

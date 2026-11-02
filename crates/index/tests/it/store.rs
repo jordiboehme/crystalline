@@ -1762,6 +1762,119 @@ parity!(
     resolve_references_to_binds_only_other_domains_and_counts_per_domain
 );
 
+/// A `#heading` after a target is a fragment: `[[b#setup]]` binds to `b` at
+/// home and in a named domain, a path spelled with one binds by the path, and
+/// a title that holds a `#` is found by its whole text first. An unresolved
+/// one answers its whole text, so a message can quote it as written.
+async fn a_heading_fragment_binds_to_its_target(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for (dir, title, permalink) in [
+        (&home, "B", "b"),
+        (&home, "C", "c"),
+        (&home, "C# Basics", "c-basics"),
+        (&ops, "B", "b"),
+    ] {
+        write(
+            dir.path(),
+            &format!("{permalink}.md"),
+            &engram(title, permalink, "engram", "", "body\n"),
+        );
+    }
+    write(
+        home.path(),
+        "pumps/p.md",
+        &engram("Pump", "pumps/p", "engram", "", "body\n"),
+    );
+    let cases = [
+        ("s1", "b#setup", Some(("home", "b"))),
+        ("s2", "ops:b#setup", Some(("ops", "b"))),
+        ("s3", "pumps/p.md#x", Some(("home", "pumps/p"))),
+        ("s4", "C# Basics", Some(("home", "c-basics"))),
+        ("s5", "c#intro", Some(("home", "c"))),
+        ("s6", "ghost#x", None),
+    ];
+    for (permalink, inner, _) in &cases {
+        write(
+            home.path(),
+            &format!("{permalink}.md"),
+            &source_engram(permalink, permalink, inner),
+        );
+    }
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    sync_domain(store, "home", home.path()).await.unwrap();
+    for (permalink, inner, want) in &cases {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            want.map(|(d, p)| (d.to_string(), p.to_string())),
+            "[[{inner}]]"
+        );
+    }
+    let ghost = store.lookup_id("home", "s6").await.unwrap().unwrap();
+    let refs = store.outbound_refs(ghost, None).await.unwrap();
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    for r in &refs {
+        assert_eq!(r.to_target, "ghost");
+        assert_eq!(r.to_whole.as_deref(), Some("ghost#x"));
+        assert!(!r.resolved);
+    }
+    let unresolved = store
+        .unresolved_refs(store.domain_id("home").await.unwrap().unwrap(), None)
+        .await
+        .unwrap();
+    let ghost_rows: Vec<_> = unresolved.iter().filter(|u| u.from == ghost).collect();
+    assert_eq!(ghost_rows.len(), 2, "{unresolved:?}");
+    assert!(
+        ghost_rows.iter().all(|u| u.written() == "ghost#x"),
+        "{ghost_rows:?}"
+    );
+}
+parity!(
+    a_heading_fragment_binds_to_its_target_on_both_backends,
+    a_heading_fragment_binds_to_its_target
+);
+
+/// A pending `[[ops:C# Basics]]` stores the split target `C`, so the pass a
+/// later write in `ops` runs reads the whole text too, and binds it to the
+/// engram whose title holds the `#`.
+async fn resolve_references_to_binds_a_whole_title_with_a_hash(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "a.md",
+        &source_engram("A", "a", "ops:C# Basics"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("c-basics.md", "c-basics", "C# Basics"),
+        )
+        .await
+        .unwrap();
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["c-basics".to_string(), "C# Basics".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 2)]);
+    let a = store.lookup_id("home", "a").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, a).await,
+        Some(("ops".to_string(), "c-basics".to_string()))
+    );
+}
+parity!(
+    resolve_references_to_binds_a_whole_title_with_a_hash_on_both_backends,
+    resolve_references_to_binds_a_whole_title_with_a_hash
+);
+
 /// The title arm binds too, in any letter case (Review Focus 4).
 async fn resolve_references_to_binds_by_title_too(store: &dyn Store) {
     let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -1948,6 +2061,11 @@ async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store)
         ("platform", "runbook", "Runbook"),
         ("ops2", "runbook", "Runbook"),
         ("ops2", "guide", "Guide"),
+        // Review Focus 1: a title that holds a `#` beside the one before it.
+        ("home", "c", "C"),
+        ("home", "c-basics", "C# Basics"),
+        ("eng-knowledge", "c", "C"),
+        ("eng-knowledge", "c-basics", "C# Basics"),
     ];
     for (domain, permalink, title) in &base {
         write(
@@ -1981,6 +2099,16 @@ async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store)
         "platform:Runbook",
         "platform:Guide",
         "ops2:Guide",
+        // A `#heading` is a fragment, unless the whole text is a title.
+        "C# Basics",
+        "c#intro",
+        "Foo#setup",
+        "eng:C# Basics",
+        "eng:c#intro",
+        "eng:Foo#x:y",
+        "Missing#x",
+        "typo:Foo#x",
+        "#setup",
     ];
     for (i, inner) in cases.iter().enumerate() {
         write(
@@ -2540,6 +2668,7 @@ async fn spelled_references_lists_one_domains_references(store: &dyn Store) {
                 spelling: "eng-knowledge".to_string(),
                 raw: "eng-knowledge:runbook".to_string(),
                 alias: None,
+                whole: None,
             },
             crystalline_index::SpelledRef {
                 from: a,
@@ -2547,6 +2676,7 @@ async fn spelled_references_lists_one_domains_references(store: &dyn Store) {
                 spelling: "eng-knowledge".to_string(),
                 raw: "eng-knowledge:guide".to_string(),
                 alias: Some("the guide".to_string()),
+                whole: None,
             },
         ]
     );
@@ -12518,7 +12648,7 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 189,
+        census.sites, 190,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
          78 per backend in mod.rs (`BASE_PATH_SQL`, the folder counts' existence probe of one path, is the newest, on the base rows; before it `CITED_ENGRAM_SQL`, one cited engram by permalink, on the base rows; before it `ENGRAM_COVERAGE_SQL`, the coverage of one domain's engram chunks, waived below; before it the Reflection gate's two probes, \
          `ENGRAM_ROWS_UNDER_REFLECTIONS_SQL` and `HAS_ENGRAM_ROWS_SQL`, are the newest, \
@@ -12533,9 +12663,10 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
          of `engrams_referencing_domains`, the move's `readdress_engram` and \
-         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 15 in the shared \
-         statement builders in store.rs: the reference-resolution expression's five \
-         arms (the path arm for a relative note link is the newest), the three engram hops of each of the two graph frontiers, the two \
+         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 16 in the shared \
+         statement builders in store.rs: the reference-resolution expression's six \
+         arms (the whole-title arm for a link whose title holds a `#` is the newest, \
+         before it the path arm for a relative note link), the three engram hops of each of the two graph frontiers, the two \
          arms of the edge half of `engrams_referencing_domains` and the two arms of \
          `spelled_references`, all four on the base rows. Those \
          six used to be six per backend in search.rs: one copy of each frontier \

@@ -606,7 +606,7 @@ impl TursoStore {
         }
 
         for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 8);
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 9);
             for rel in batch {
                 params.push(Value::Integer(engram_id));
                 params.push(Value::Integer(domain.0));
@@ -616,16 +616,17 @@ impl TursoStore {
                 params.push(opt_text(&rel.to_domain));
                 params.push(Value::Text(rel.to_raw.clone()));
                 params.push(opt_text(&rel.to_alias));
+                params.push(opt_text(&rel.to_whole));
             }
             let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_alias, to_id) VALUES {}",
-                value_rows(8, batch.len(), Some("NULL"))
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_alias, to_whole, to_id) VALUES {}",
+                value_rows(9, batch.len(), Some("NULL"))
             );
             self.conn.execute(&sql, params).await?;
         }
 
         for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 8);
             for link in batch {
                 params.push(Value::Integer(engram_id));
                 params.push(Value::Integer(domain.0));
@@ -634,10 +635,11 @@ impl TursoStore {
                 params.push(opt_text(&link.to_domain));
                 params.push(Value::Text(link.to_raw.clone()));
                 params.push(opt_text(&link.to_alias));
+                params.push(opt_text(&link.to_whole));
             }
             let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_alias, to_id) VALUES {}",
-                value_rows(7, batch.len(), Some("NULL"))
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_alias, to_whole, to_id) VALUES {}",
+                value_rows(8, batch.len(), Some("NULL"))
             );
             self.conn.execute(&sql, params).await?;
         }
@@ -978,8 +980,9 @@ fn pending_predicates(
 }
 
 /// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
-/// link), rel_type (NULL for a link), target text, target domain and resolved
-/// flag. The column layout is identical across both backends.
+/// link), rel_type (NULL for a link), target text, target domain, resolved
+/// flag and the whole target text with its `#heading`. The column layout is
+/// identical across both backends.
 fn outbound_ref_from_row(r: &Row) -> OutboundRef {
     OutboundRef {
         line: cell_i64(r, 0).unwrap_or(0) as usize,
@@ -991,13 +994,15 @@ fn outbound_ref_from_row(r: &Row) -> OutboundRef {
         rel_type: cell_text(r, 2),
         to_target: cell_text(r, 3).unwrap_or_default(),
         to_domain: cell_text(r, 4),
+        to_whole: cell_text(r, 6),
         resolved: cell_i64(r, 5).unwrap_or(0) != 0,
     }
 }
 
 /// Decode one row of the unresolved-reference query. Column 6 is the source
 /// path, selected only to order by, so it is not read back; column 7 is the
-/// bracket text as written, which the repair scores against.
+/// bracket text as written, which the repair scores against, and column 9 the
+/// whole target text with its `#heading`, which a quote rebuilds it from.
 fn unresolved_ref_from_row(r: &Row) -> UnresolvedRef {
     UnresolvedRef {
         from: EngramId(cell_i64(r, 0).unwrap_or(0)),
@@ -1013,6 +1018,7 @@ fn unresolved_ref_from_row(r: &Row) -> UnresolvedRef {
         // the repair treats as "nothing extra to score" rather than as a match.
         raw: cell_text(r, 7).unwrap_or_default(),
         alias: cell_text(r, 8),
+        whole: cell_text(r, 9),
         // The parser writes 0 when it has no line to report, which the sweep
         // reads as "no line" rather than as line zero.
         line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
@@ -1188,8 +1194,8 @@ fn opt_text(o: &Option<String>) -> Value {
 
 /// The maximum number of value tuples in one multi-row INSERT. Chunking keeps the
 /// bind-parameter count under SQLite's 999-parameter ceiling for every child
-/// table (the widest is chunk at 7 params per row; `reflection_chunk` binds 11
-/// and has its own size below).
+/// table (the widest is relation at 9 params per row; `reflection_chunk` binds
+/// 11 and has its own size below).
 const INSERT_CHUNK: usize = 100;
 
 /// [`INSERT_CHUNK`] for `reflection_chunk`, whose rows bind 11 parameters
@@ -1655,11 +1661,11 @@ pub fn folder_level_sql(rel: &str, under: &str) -> String {
 #[doc(hidden)]
 pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &str) -> String {
     format!(
-        "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path, r.to_raw, r.to_alias \
+        "SELECT r.engram_id, 0 AS kind, r.rel_type, r.to_domain, r.to_target, r.line, e.path, r.to_raw, r.to_alias, r.to_whole \
          FROM relation r JOIN engram e ON e.id=r.engram_id \
          WHERE {src_screen} AND {rel_pending} AND r.domain_id=?1 \
          UNION ALL \
-         SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path, l.to_raw, l.to_alias \
+         SELECT l.engram_id, 1, 'links_to', l.to_domain, l.to_target, l.line, e.path, l.to_raw, l.to_alias, l.to_whole \
          FROM link l JOIN engram e ON e.id=l.engram_id \
          WHERE {src_screen} AND {link_pending} AND l.domain_id=?1 \
          ORDER BY 7, 6, 2, 5"
@@ -2126,6 +2132,7 @@ impl Store for TursoStore {
                         spelling: cell_text(r, 2).unwrap_or_default(),
                         raw: cell_text(r, 3).unwrap_or_default(),
                         alias: cell_text(r, 5),
+                        whole: cell_text(r, 6),
                     },
                 )
             })
@@ -3065,11 +3072,11 @@ impl Store for TursoStore {
             &self.conn,
             &format!(
                 "SELECT r.line AS line, 0 AS kind, r.rel_type, r.to_target, r.to_domain, \
-                    {rel_resolved} AS resolved \
+                    {rel_resolved} AS resolved, r.to_whole \
              FROM relation r WHERE r.engram_id=?1 \
              UNION ALL \
              SELECT l.line, 1, NULL, l.to_target, l.to_domain, \
-                    {link_resolved} \
+                    {link_resolved}, l.to_whole \
              FROM link l WHERE l.engram_id=?1 \
              ORDER BY line"
             ),

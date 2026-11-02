@@ -167,6 +167,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "reflection disclosures",
         sql: SCHEMA_V29,
     },
+    Migration {
+        version: 30,
+        label: "wikilink whole target text",
+        sql: SCHEMA_V30,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -942,6 +947,18 @@ CREATE TABLE reflection_disclosure (
     records TEXT NOT NULL,
     PRIMARY KEY(domain_id, path)
 );
+"#;
+
+// The target of a `[[target#heading]]` reference as 0.30.0 read it, the `#`
+// and all, beside the split `to_target`, so an engram whose own title holds a
+// `#` (`C# Basics`) is still found by its whole title before the text after
+// the `#` is read as a heading. NULL when nothing was split off. Nullable, no
+// default, no backfill: the parse generation moved in the same release, so
+// every engram is parsed again and its rows are written with the column
+// filled.
+const SCHEMA_V30: &str = r#"
+ALTER TABLE relation ADD COLUMN to_whole TEXT;
+ALTER TABLE link ADD COLUMN to_whole TEXT;
 "#;
 
 const SCHEMA_V9: &str = r#"
