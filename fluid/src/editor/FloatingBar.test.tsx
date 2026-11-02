@@ -258,6 +258,26 @@ describe("the floating bar on a text selection", () => {
     expect(bar()).toBeInTheDocument();
   });
 
+  test("a touch scroll that ends in a cancel shows the bar again", async () => {
+    const h = harness();
+    h.main.focus();
+    h.main.dispatch({ selection: { anchor: 0, head: 5 } });
+    await vi.waitFor(() => {
+      expect(h.context()?.kind).toBe("text");
+    });
+    h.show();
+    fireEvent.pointerDown(h.main.dom, {
+      isPrimary: true,
+      pointerType: "touch",
+    });
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+    fireEvent.pointerCancel(document, {
+      isPrimary: true,
+      pointerType: "touch",
+    });
+    expect(bar()).toBeInTheDocument();
+  });
+
   test("a selection that spans a table offers no bar", async () => {
     const h = harness();
     h.main.dispatch({

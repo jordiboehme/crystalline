@@ -233,6 +233,13 @@ export default function FloatingBar({
       setPointerDown(false);
       setDismissed(null);
     };
+    // A touch scroll or a drag the browser takes over ends in a cancel, not
+    // an up: the press is over, but nothing was picked, so an Escape holds.
+    const onCancel = (event: PointerEvent) => {
+      if (!pressed || !event.isPrimary) return;
+      pressed = false;
+      setPointerDown(false);
+    };
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") dismiss();
     };
@@ -240,12 +247,14 @@ export default function FloatingBar({
     document.addEventListener("focusout", onFocusOut);
     main.dom.addEventListener("pointerdown", onDown);
     document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onCancel);
     main.dom.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("focusin", onFocusIn);
       document.removeEventListener("focusout", onFocusOut);
       main.dom.removeEventListener("pointerdown", onDown);
       document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onCancel);
       main.dom.removeEventListener("keydown", onKey);
     };
   }, [main, dismiss]);
