@@ -7,15 +7,15 @@ Three checks ask three questions: does the format hold, is the machinery healthy
 `crystalline verify` statically checks one or more domains against the full rule catalog (malformed frontmatter, broken links, missing MANIFEST sections, schema drift) with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
 
 ```yaml
-- uses: jordiboehme/crystalline/action@v0.29.1
+- uses: jordiboehme/crystalline/action@v0.30.0
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
     team-repository: 'false' # also run the team repository rules (0.30.0 and newer)
-    version: v0.29.1        # crystalline binary tag to download, or 'latest'
+    version: v0.30.0        # crystalline binary tag to download, or 'latest'
 ```
 
-The action ref (`@v0.29.1`) pins the action's own code. `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+The action ref (`@v0.30.0`) pins the action's own code. `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
 
 In the repository of a team domain, set `team-repository: 'true'`. It runs `crystalline verify --team-repository`, which fails on a Reflection switched on without a home (`M011`) and on files under `reflections/` while Reflection is on (`M012`), and warns when the MANIFEST lacks `team: github` (`M109`). See [Keep a team repository's Reflection safe](teams.md#keep-a-team-repositorys-reflection-safe).
 
