@@ -144,9 +144,10 @@ pub struct CtlState {
     pub origin_rule: OriginRule,
 }
 
-/// The route. The tool body ceiling ([`crate::rest::MAX_TOOL_BODY_BYTES`], room
-/// for a 10 MiB file as base64) is applied by `handle` itself, after the bearer check, rather than by a
-/// body-limit layer in front of an extractor that would read the body first.
+/// The route. The tool body ceiling ([`crate::rest::MAX_TOOL_BODY_BYTES`],
+/// room for a 10 MiB file as base64) is applied by `handle` itself, after the
+/// bearer check, rather than by a body-limit layer in front of an extractor
+/// that would read the body first.
 pub fn route(state: CtlState) -> axum::Router {
     axum::Router::new()
         .route(CTL_PATH, axum::routing::post(handle))

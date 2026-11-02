@@ -3644,8 +3644,9 @@ fn describe_hosts(hosts: &[String]) -> String {
 /// rather than spelled again here: the REST API's 10 MiB plus room for a
 /// 10 MiB file an agent uploads as base64 (13,981,016 bytes) and the
 /// JSON-RPC envelope. A text write between 10 and 15 MiB is served here and
-/// refused by REST, a deliberate difference. A body past it is refused with `413 Payload Too Large: request body exceeds
-/// {max} bytes` before any handler runs.
+/// refused by REST, a deliberate difference. A body past it is refused with
+/// `413 Payload Too Large: request body exceeds {max} bytes` before any
+/// handler runs.
 fn http_config(
     allowed_hosts: &[String],
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
@@ -4822,8 +4823,10 @@ mod tests {
     ///
     /// Asserting equality with `crate::rest::MAX_TOOL_BODY_BYTES` rather than with
     /// a literal is the whole divergence guard: it fails the moment someone
-    /// spells the number a second time, which is the only way the MCP and
-    /// REST surfaces can drift apart.
+    /// spells the number a second time. The MCP and REST surfaces differ on
+    /// purpose (15 MiB against 10 MiB, room for a base64 file upload), so the
+    /// guard is against a second spelling of this number, not against that
+    /// difference.
     #[test]
     fn http_config_pins_the_session_mode_and_the_body_limit() {
         let cfg = http_config(&[]);

@@ -910,15 +910,17 @@ impl SourceSet {
     }
 
     /// Whether `source`'s server takes files from agents
-    /// ([`crate::Connection::takes_agent_files`]), within `deadline`.
+    /// ([`crate::Connection::takes_agent_files`]), within `deadline` overall
+    /// and as `budget`: a caller's shorter cut never opens the down window.
     pub async fn takes_agent_files(
         &self,
         source: &str,
         deadline: Duration,
+        budget: Budget,
     ) -> Result<bool, RemoteFailure> {
         self.connection(source, deadline)
             .await?
-            .takes_agent_files()
+            .takes_agent_files(deadline, budget)
             .await
     }
 

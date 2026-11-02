@@ -411,13 +411,27 @@ pub async fn routed(
                 return Some(Err(RouteError::Local(EngineError::ReadOnly.into())));
             }
             let forwarded = forwarded_args(args, &names, false);
+            let limit = if tool == crate::EVOLVE_TOOL_NAME {
+                CTL_TIMEOUT
+            } else {
+                ONE_DOMAIN_LIMIT
+            };
+            let own = limit;
+            let limit = deadline.map_or(own, |d| d.min(own));
+            let budget = crystalline_remote::Budget::of(limit, own);
+            let started = std::time::Instant::now();
             if let Some(transfer) = file_transfer(tool, args) {
                 // An older server ignores the fields that make this a file;
                 // with a title beside them it would write an engram instead.
-                match sources.takes_agent_files(&source, ONE_DOMAIN_LIMIT).await {
+                // The status question is part of the caller's limit and
+                // budget, so a short budget never opens the down window.
+                match sources.takes_agent_files(&source, limit, budget).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        let url = sources.source_url(&source).unwrap_or_default();
+                        let url = sources
+                            .source_url(&source)
+                            .filter(|url| !url.is_empty())
+                            .unwrap_or_else(|| source.clone());
                         return Some(Err(RouteError::Refused(older_server_sentence(
                             &url, transfer,
                         ))));
@@ -426,29 +440,16 @@ pub async fn routed(
                         return Some(Err(RouteError::Source {
                             source,
                             domain,
-                            failure: within(failure, ONE_DOMAIN_LIMIT),
+                            failure: within(failure, limit),
                         }));
                     }
                 }
             }
-            let limit = if tool == crate::EVOLVE_TOOL_NAME {
-                CTL_TIMEOUT
-            } else {
-                ONE_DOMAIN_LIMIT
-            };
-            let own = limit;
-            let limit = deadline.map_or(own, |d| d.min(own));
+            let left = limit.saturating_sub(started.elapsed());
             // A caller's shorter budget running out says nothing about the
             // source, so it never opens the down window (Budget::Cut).
             let answer = sources
-                .forward_as(
-                    &source,
-                    tool,
-                    forwarded,
-                    agent,
-                    limit,
-                    crystalline_remote::Budget::of(limit, own),
-                )
+                .forward_as(&source, tool, forwarded, agent, left, budget)
                 .await;
             Some(match answer {
                 Ok(mut value) => {

@@ -1005,8 +1005,14 @@ impl Connection {
     /// Whether the server lists [`AGENT_FILES_CAPABILITY`] in its `status`
     /// answer. A server that answers no capability list, which every release
     /// before [`AGENT_FILES_RELEASE`] does, does not.
-    pub async fn takes_agent_files(&self) -> Result<bool, RemoteFailure> {
-        let status = self.ctl_data(json!({ "v": 1, "cmd": "status" })).await?;
+    pub async fn takes_agent_files(
+        &self,
+        limit: Duration,
+        budget: Budget,
+    ) -> Result<bool, RemoteFailure> {
+        let status = self
+            .ctl_data_within(json!({ "v": 1, "cmd": "status" }), limit, budget)
+            .await?;
         Ok(status["capabilities"]
             .as_array()
             .is_some_and(|all| all.iter().any(|c| c == AGENT_FILES_CAPABILITY)))
