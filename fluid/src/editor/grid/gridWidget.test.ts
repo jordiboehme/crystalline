@@ -22,6 +22,7 @@ import {
 import { parsedState } from "../../test/parse";
 import { fencePreviews } from "../fencePreviews";
 import { baseExtensions } from "../setup";
+import { wikilinkResolverFacet } from "../wikilinkChips";
 import { activeCell } from "./cellEditor";
 import { GridWidget, gridField } from "./gridWidget";
 import { gridExtension } from "./index";
@@ -201,6 +202,31 @@ describe("drawing", () => {
   });
 });
 
+describe("wikilinks in static cells (R12)", () => {
+  const LINKED = "| a | b |\n| - | - |\n| [[Harbor Map\\|map]] | 2 |\n";
+
+  test("with the engram editor's resolver a wikilink is a chip", () => {
+    const main = soloMain(LINKED, [
+      wikilinkResolverFacet.of(() => ({
+        kind: "resolved",
+        href: "/x",
+        label: "Harbor Map",
+      })),
+      ...layers(),
+    ]);
+    const chip = cellEl(main, 1, 0).querySelector(".cm-wikilink");
+    expect(chip?.className).toBe("cm-wikilink cm-wikilink-resolved");
+    expect(chip?.textContent).toBe("map");
+  });
+
+  test("without a resolver (a Reflection) it is its plain label", () => {
+    const main = soloMain(LINKED, layers());
+    const el = cellEl(main, 1, 0);
+    expect(el.querySelector(".cm-wikilink")).toBeNull();
+    expect(el.textContent).toBe("map");
+  });
+});
+
 describe("opening a cell with the mouse", () => {
   test("a mousedown opens the cell under it, focused, in that cell", () => {
     const main = soloMain(DOC, layers());
@@ -310,6 +336,22 @@ describe("in-place patching and remounting", () => {
     expect(hasFocus(cell.view)).toBe(true);
   });
 
+  test("a same-shape patch writes nothing on the host cell", () => {
+    const { main, rtext } = roomMain(
+      "| a | b |\n| :-: | - |\n| 1 | 2 |\n",
+      layers(),
+    );
+    openByMouse(main, 1, 0);
+    const host = cellEl(main, 1, 0);
+    const observer = new MutationObserver(() => {});
+    observer.observe(host, { attributes: true, childList: true });
+    rtext.insert(rtext.toJSON().indexOf("2") + 1, "x");
+    expect(cellEl(main, 1, 1).textContent).toBe("2x");
+    expect(observer.takeRecords()).toEqual([]);
+    observer.disconnect();
+    expect(host.style.textAlign).toBe("center");
+  });
+
   test("a remote added column remounts the editor in the same cell with focus and caret", async () => {
     const { main, rtext, remote } = roomMain(DOC, layers());
     const first = openByMouse(main, 1, 0);
@@ -367,6 +409,29 @@ describe("in-place patching and remounting", () => {
     await flush();
     expect(hasFocus(second.view)).toBe(true);
     again.remove();
+  });
+
+  test("a table scrolled back after focus moved elsewhere leaves that focus alone", async () => {
+    const main = soloMain(DOC, layers());
+    openByMouse(main, 1, 1);
+    const widget = widgetOf(main);
+    const dom = grid(main).closest<HTMLElement>(".cm-grid");
+    if (!dom) throw new Error("no grid root");
+    widget.destroy(dom);
+    // The teardown sent no focus change, so the field still says focused.
+    expect(main.state.field(openCellField)?.focused).toBe(true);
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+    const again = widget.toDOM(main);
+    document.body.appendChild(again);
+    await flush();
+    const cell = hosted(main);
+    expect(again.contains(cell.view.dom)).toBe(true);
+    expect(hasFocus(cell.view)).toBe(false);
+    expect(document.activeElement).toBe(input);
+    again.remove();
+    input.remove();
   });
 
   test("a table scrolled back without focus remounts without taking focus", async () => {

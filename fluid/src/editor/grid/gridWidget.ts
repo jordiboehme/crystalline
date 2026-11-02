@@ -24,7 +24,7 @@
  */
 
 import type { Extension, Range } from "@codemirror/state";
-import { StateField } from "@codemirror/state";
+import { EditorState, StateField } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
@@ -56,7 +56,7 @@ const mainOf = new WeakMap<HTMLElement, EditorView>();
 /** The table a grid root shows, or will once a waiting patch lands. */
 const shownOf = new WeakMap<HTMLElement, GridTable>();
 /** The resolver a grid root's chips were drawn with. */
-const resolverOf = new WeakMap<HTMLElement, WikilinkResolver>();
+const resolverOf = new WeakMap<HTMLElement, WikilinkResolver | undefined>();
 /** The text each static cell element was drawn from. */
 const drawnOf = new WeakMap<HTMLElement, string>();
 /** The cell element hosting the cell editor, per main view. */
@@ -114,16 +114,32 @@ function cellElement(
 
 function setAlign(el: HTMLElement, table: GridTable, column: number): void {
   const align = table.aligns[column];
-  el.style.textAlign = align === undefined || align === "none" ? "" : align;
+  const value = align === undefined || align === "none" ? "" : align;
+  if (el.style.textAlign !== value) el.style.textAlign = value;
+}
+
+/** The facet's value in a state nobody gave a resolver: no chips there. */
+let noResolver: WikilinkResolver | null = null;
+
+/**
+ * The resolver static cells draw chips with, or undefined when the main view
+ * draws none (R12): the engram editor provides `wikilinkResolverFacet`, a
+ * Reflection does not. Told apart by the facet's value in an empty state,
+ * which is its default.
+ */
+function chipResolver(state: EditorState): WikilinkResolver | undefined {
+  noResolver ??= EditorState.create().facet(wikilinkResolverFacet);
+  const resolve = state.facet(wikilinkResolverFacet);
+  return resolve === noResolver ? undefined : resolve;
 }
 
 function drawStatic(
   el: HTMLElement,
   text: string,
-  resolve: WikilinkResolver,
+  resolve: WikilinkResolver | undefined,
 ): void {
   el.classList.remove(HOSTING);
-  renderCellContent(text, el, { resolve });
+  renderCellContent(text, el, resolve ? { resolve } : {});
   drawnOf.set(el, text);
 }
 
@@ -138,14 +154,14 @@ function hosts(main: EditorView, el: HTMLElement): boolean {
 function patch(root: HTMLElement, main: EditorView): void {
   waiting.delete(root);
   const table = shownOf.get(root);
-  const resolve = main.state.facet(wikilinkResolverFacet);
+  const resolve = chipResolver(main.state);
   if (!table) return;
-  const redrawAll = resolverOf.get(root) !== resolve;
+  const redrawAll = resolverOf.has(root) && resolverOf.get(root) !== resolve;
   resolverOf.set(root, resolve);
   for (const el of cellElements(root)) {
     const [row, column] = placeOf(el);
-    setAlign(el, table, column);
     if (hosts(main, el)) continue;
+    setAlign(el, table, column);
     const text = table.rows[row]?.[column]?.text ?? "";
     if (redrawAll || drawnOf.get(el) !== text || el.classList.contains(HOSTING))
       drawStatic(el, text, resolve);
@@ -168,7 +184,7 @@ function restore(main: EditorView, el: HTMLElement): void {
   drawStatic(
     el,
     table.rows[row]?.[column]?.text ?? "",
-    main.state.facet(wikilinkResolverFacet),
+    chipResolver(main.state),
   );
 }
 
@@ -206,7 +222,17 @@ function host(
   if (focus === "now") editor.view.focus();
   else if (focus === "later") {
     queueMicrotask(() => {
-      if (mountedCell(main)?.view === editor.view && el.isConnected) {
+      if (mountedCell(main)?.view !== editor.view || !el.isConnected) return;
+      // The field's `focused` outlives a teardown that sent no focus change
+      // (virtualisation): take focus only when nothing else holds it, or
+      // when it is inside this grid (a shape change just rebuilt it).
+      const active = document.activeElement;
+      const root = el.closest(".cm-grid");
+      if (
+        active === null ||
+        active === document.body ||
+        (root !== null && root.contains(active))
+      ) {
         editor.view.focus();
       }
     });
@@ -293,9 +319,9 @@ function openFromMouse(
 
 export class GridWidget extends WidgetType {
   readonly table: GridTable;
-  readonly resolve: WikilinkResolver;
+  readonly resolve: WikilinkResolver | undefined;
 
-  constructor(table: GridTable, resolve: WikilinkResolver) {
+  constructor(table: GridTable, resolve: WikilinkResolver | undefined) {
     super();
     this.table = table;
     this.resolve = resolve;
@@ -417,7 +443,7 @@ export class GridWidget extends WidgetType {
 
 function build(state: EditorView["state"]): DecorationSet {
   const doc = state.doc;
-  const resolve = state.facet(wikilinkResolverFacet);
+  const resolve = chipResolver(state);
   const ranges: Range<Decoration>[] = gridTables(state).map((table) =>
     Decoration.replace({
       block: true,

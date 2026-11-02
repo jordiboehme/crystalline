@@ -23,7 +23,10 @@ import { referenceState, wikilinkWords } from "../../wikilinks";
 import { dialectGrammar } from "../dialectHighlight";
 
 export interface CellRenderOptions {
-  /** What a wikilink chip asks about its target; none draws it pending. */
+  /**
+   * What a wikilink chip asks about its target. Without one (a Reflection,
+   * whose main view draws no chips) a wikilink is its plain label text.
+   */
   resolve?: WikilinkResolver;
 }
 
@@ -349,6 +352,8 @@ class Drawer {
     anchor.href = href;
     anchor.rel = "noopener noreferrer";
     anchor.target = "_blank";
+    // Not a Tab stop: the grid's roving tabindex is the only one.
+    anchor.tabIndex = -1;
     anchor.addEventListener("click", holdNavigation);
     this.range(words, from, to, anchor);
     into.appendChild(anchor);
@@ -357,10 +362,16 @@ class Drawer {
   /** The chip `wikilinkChips` draws, in the same classes. */
   wikilink(source: string, into: Node): void {
     const inner = unescapePipes(source.slice(2, -2));
-    const resolution = this.options.resolve?.(inner) ?? null;
+    const words = wikilinkWords(inner) ?? inner;
+    const resolve = this.options.resolve;
+    if (!resolve) {
+      into.appendChild(document.createTextNode(words));
+      return;
+    }
+    const resolution = resolve(inner);
     const chip = document.createElement("span");
     chip.className = `cm-wikilink cm-wikilink-${referenceState(resolution, null)}`;
-    chip.textContent = wikilinkWords(inner) ?? inner;
+    chip.textContent = words;
     chip.title = `[[${inner}]]`;
     into.appendChild(chip);
   }

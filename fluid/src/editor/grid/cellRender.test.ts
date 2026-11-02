@@ -63,6 +63,8 @@ describe("renderCellContent", () => {
     const anchor = cell.querySelector("a");
     expect(anchor?.getAttribute("href")).toBe("https://example.com/a");
     expect(anchor?.getAttribute("rel")).toContain("noopener");
+    // Not a Tab stop of its own: the grid's roving tabindex is the only one.
+    expect(anchor?.tabIndex).toBe(-1);
     expect(anchor?.textContent).toBe("the docs");
     expect(cell.textContent).toBe("see the docs here");
   });
@@ -112,12 +114,19 @@ describe("renderCellContent", () => {
   });
 
   test("a wikilink draws as the reference chip", () => {
-    const cell = draw("go to [[Harbor Map]] now");
+    const cell = draw("go to [[Harbor Map]] now", { resolve: () => null });
     const chip = cell.querySelector(".cm-wikilink");
     expect(chip?.className).toBe("cm-wikilink cm-wikilink-pending");
     expect(chip?.textContent).toBe("Harbor Map");
     expect(chip?.getAttribute("title")).toBe("[[Harbor Map]]");
     expect(cell.textContent).toBe("go to Harbor Map now");
+  });
+
+  test("without a resolver a wikilink is its plain label text (R12)", () => {
+    const cell = draw("go to [[Harbor Map]] or [[Tide Tables\\|the tides]]");
+    expect(cell.querySelector(".cm-wikilink")).toBeNull();
+    expect(cell.children.length).toBe(0);
+    expect(cell.textContent).toBe("go to Harbor Map or the tides");
   });
 
   test("a wikilink with an alias shows the alias, resolved by the resolver", () => {
