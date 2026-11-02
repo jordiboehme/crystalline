@@ -149,7 +149,8 @@ export default function EngramPage() {
   // A permalink is a path of its own, so it arrives through the splat.
   const permalink = params["*"] ?? "";
   const { capabilities } = useAuth();
-  const { canWrite, domainLocked, lockKnown } = useDomainWritable(domain);
+  const { canWrite, canShare, domainLocked, lockKnown } =
+    useDomainWritable(domain);
   const { fullWidth } = useFullWidth();
   // The two panels under the prose, switched from the Explore rows.
   const [graphOpen, toggleGraph] = useRememberedDisclosure(GRAPH_SECTION_KEY);
@@ -749,7 +750,7 @@ export default function EngramPage() {
                   >
                     What changed
                   </DropdownMenu.Item>
-                  {capabilities.canShare && (
+                  {canShare && (
                     <DropdownMenu.Item
                       className={ITEM_CLASSES}
                       onSelect={() => {

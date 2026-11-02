@@ -267,7 +267,7 @@ function DomainPage({
   manifestPermalink: string | null;
 }) {
   const { capabilities } = useAuth();
-  const { canWrite, domainLocked } = useDomainWritable(domain);
+  const { canWrite, canShare, domainLocked } = useDomainWritable(domain);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   /**
@@ -697,7 +697,7 @@ function DomainPage({
           behind them are gated the same way; each draws nothing on a domain
           with no origin.
         */}
-        {capabilities.canShare && <TeamBanners domain={domain} />}
+        {canShare && <TeamBanners domain={domain} />}
 
         <ManifestProsePanel
           domain={domain}

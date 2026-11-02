@@ -319,6 +319,54 @@ describe("the top bar's share action", () => {
     expect(requested()).not.toContain("/sync");
   });
 
+  describe("on a domain GitHub governs", () => {
+    /** A viewer's session, with `row` folded into the listing's one domain. */
+    function serveViewer(row: Record<string, unknown>) {
+      apiMock.mockImplementation(
+        answersFor({
+          "/auth/me": () =>
+            meResponse({ user: userFixture({ role: "viewer" }) }),
+          "/domains": () => ({
+            ...domainsResponse(),
+            domains: [{ ...domainsResponse().domains[0], ...row }],
+          }),
+          "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+          "/domains/eng/sync": () => syncResponse(),
+          "/sync": () => summaryResponse([summaryEntry("eng", 2)]),
+          ...domainScreenRoutes("eng"),
+        }),
+      );
+    }
+
+    it("offers a viewer with GitHub write the action on that domain only", async () => {
+      serveViewer({ may_share: true });
+      renderApp("/d/eng");
+      const action = await shareAction();
+      await waitFor(() => {
+        expect(action).toHaveAttribute("aria-disabled", "false");
+      });
+      // The domain's own team sync card is drawn for them too.
+      expect(
+        await screen.findByRole("region", { name: "Team sync" }),
+      ).toBeInTheDocument();
+      // Nowhere else: the instance-wide summary is the role's alone.
+      expect(requested()).not.toContain("/sync");
+    });
+
+    it("offers a GitHub reader nothing", async () => {
+      serveViewer({ may_share: false, read_only: true });
+      renderApp("/d/eng");
+      await screen.findByRole("heading", { level: 1 });
+      expect(
+        within(await topBar()).queryByRole("button", {
+          name: "Share changes",
+        }),
+      ).toBeNull();
+      expect(screen.queryByRole("region", { name: "Team sync" })).toBeNull();
+      expect(requested()).not.toContain("/domains/eng/sync");
+    });
+  });
+
   it("says which domain has nothing to share, by name", async () => {
     serve({
       "/settings/github": () => githubStatus(),

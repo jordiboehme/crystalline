@@ -390,6 +390,41 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("the engram editor on a domain GitHub governs", () => {
+  /** A viewer's session, with `row` folded into the listing's one domain. */
+  function serveViewer(row: Record<string, unknown>) {
+    serveEditor({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "viewer" }) }),
+      "/domains": () => ({
+        ...domainsResponse(),
+        domains: [{ ...domainsResponse().domains[0], ...row }],
+      }),
+    });
+  }
+
+  it("lets an instance viewer with GitHub write edit and save", async () => {
+    serveViewer({ may_share: true });
+    renderApp("/d/eng/edit/alpha");
+    const editor = await openBuffer();
+    typeAtEnd(editor, "x");
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+
+  it("opens no editor for a GitHub reader", async () => {
+    serveViewer({ may_share: false, read_only: true });
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText(/not found/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Engram source")).toBeNull();
+  });
+
+  it("keeps the role rule for a server that sends no per-domain answer", async () => {
+    serveViewer({});
+    renderApp("/d/eng/edit/alpha");
+    expect(await screen.findByText(/not found/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText("Engram source")).toBeNull();
+  });
+});
+
 describe("the engram editor", () => {
   it("loads the exact file text into the buffer", async () => {
     serveEditor();

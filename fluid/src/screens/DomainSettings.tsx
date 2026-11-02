@@ -72,7 +72,7 @@ function Settings({
   treeAnswered: boolean;
 }) {
   const { user, capabilities } = useAuth();
-  const { canWrite } = useDomainWritable(domain);
+  const { canWrite, canShare } = useDomainWritable(domain);
   const navigate = useNavigate();
   const location = useLocation();
   const { summary, listing, members, own, isRenaming } =
@@ -106,7 +106,7 @@ function Settings({
     queryKey: syncStatusKey(domain),
     queryFn: () => fetchSyncStatus(domain),
     retry: false,
-    enabled: capabilities.canShare,
+    enabled: canShare,
   });
   // The texts the server kept for this domain. A refusal (no right, signed
   // out) is not an error here: the section is simply not drawn.
@@ -133,7 +133,7 @@ function Settings({
     !listing.isPending &&
     !members.isPending &&
     !manifest.isPending &&
-    !(capabilities.canShare && syncStatus.isPending) &&
+    !(canShare && syncStatus.isPending) &&
     !(user !== null && kept.isPending);
   const [settled, setSettled] = useState(answered);
   if (answered && !settled) {
