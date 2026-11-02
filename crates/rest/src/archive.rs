@@ -514,6 +514,57 @@ fn asset_name_verdict(path: &str) -> Option<Screened> {
     })
 }
 
+/// Why an entry is not imported when its name is one this OS cannot hold as
+/// a file. Only Windows has such names today (zip 9.1 and later says so):
+/// a component over 255 UTF-16 units, a device name like `CON`, a trailing
+/// dot or space, or one of `<>"|?*`.
+const NOT_A_FILE_NAME_HERE_REASON: &str = "the name is not a valid file name on this system";
+
+/// Whether an archive entry's name leaves the extraction root: a leading
+/// `/` (which covers `//server`), an empty, `.` or `..` component, a `:`
+/// anywhere (a drive letter or an alternate data stream), a `\` anywhere
+/// (a Windows separator, a UNC prefix) or a NUL. The same rules as the
+/// remote crate's `to_platform_path`, judged on the name alone, so the
+/// answer is the same on every OS.
+fn escapes_the_root(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.contains('\0')
+        || raw
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == ".." || c.contains(':') || c.contains('\\'))
+}
+
+/// What an archive entry's name alone decides, before anything reads it.
+///
+/// An escape refuses the whole archive. `enclosed` is zip's own
+/// `enclosed_name` check, kept as a second line behind
+/// [`escapes_the_root`]: since zip 9.1 it also refuses, on Windows only, a
+/// name that is not a valid Windows file name, which is not an escape. Such
+/// a name is screened per entry instead: an `assets/` entry by the
+/// attachment gate when that gate has a reason of its own (a component that
+/// long is always over the attachment path limit), any other with
+/// [`NOT_A_FILE_NAME_HERE_REASON`]. So a too-long attachment name gets the
+/// same answer on every OS.
+fn entry_name_verdict(raw: &str, enclosed: bool) -> Result<Option<Screened>, ApiError> {
+    if escapes_the_root(raw) {
+        return Err(ApiError::unprocessable(format!(
+            "archive entry '{raw}' escapes the extraction root; refusing the archive"
+        )));
+    }
+    if enclosed {
+        return Ok(None);
+    }
+    if crystalline_core::is_under_assets(raw)
+        && let Some(decided) = asset_name_verdict(raw)
+    {
+        return Ok(Some(decided));
+    }
+    Ok(Some(Screened::Invalid {
+        path: raw.to_string(),
+        reason: NOT_A_FILE_NAME_HERE_REASON.to_string(),
+    }))
+}
+
 /// Whether the archive's root `MANIFEST.md` declares `reflection: on`.
 /// Read under the per-entry ceiling the screen applies to markdown; a
 /// missing, oversized or unparseable MANIFEST declares nothing.
@@ -626,18 +677,9 @@ fn read_archive(bytes: &[u8]) -> Result<(Vec<Screened>, LooseFiles), ApiError> {
                 )
             })?
             .into_owned();
-        // Zip-slip and Windows-hostile shapes: zip's own containment check
-        // plus the component rules the remote crate's to_platform_path
-        // enforces (no empty/'.'/'..' components, no ':' or '\\' anywhere).
-        let contained = entry.enclosed_name().is_some();
-        let clean_components = !raw.starts_with('/')
-            && raw.split('/').all(|c| {
-                !c.is_empty() && c != "." && c != ".." && !c.contains(':') && !c.contains('\\')
-            });
-        if !contained || !clean_components {
-            return Err(ApiError::unprocessable(format!(
-                "archive entry '{raw}' escapes the extraction root; refusing the archive"
-            )));
+        if let Some(decided) = entry_name_verdict(&raw, entry.enclosed_name().is_some())? {
+            out.push(decided);
+            continue;
         }
         // A Reflection's pages and files are never engrams or attachments:
         // answered before both screens below, so a `reflections/assets/`
@@ -1603,6 +1645,72 @@ mod tests {
         std::io::Read::read_to_end(&mut archive.by_name("assets/shot.png").unwrap(), &mut png)
             .unwrap();
         assert_eq!(png, PNG, "the binary survives the archive byte for byte");
+    }
+
+    /// The name screen gives the same answers on every OS: a name zip says
+    /// this OS cannot hold (on Windows since zip 9.1: a component over 255
+    /// UTF-16 units, a device name, a trailing dot) is not an escape. An
+    /// `assets/` name is answered by the attachment gate with its own reason,
+    /// any other by a reason of its own. A real escape refuses the archive
+    /// whatever zip said.
+    #[test]
+    fn a_name_this_os_cannot_hold_is_not_an_escape() {
+        let named = |raw: &str, enclosed: bool| {
+            entry_name_verdict(raw, enclosed).unwrap().map(|v| {
+                let (status, reason) = verdict(&v);
+                (status, reason.map(str::to_string))
+            })
+        };
+        // Where zip takes the long name (every OS but Windows) the assets arm
+        // answers it later, through the same gate:
+        // `asset_entries_are_screened_by_the_attachment_gates` pins that.
+        let long_asset = format!("assets/{}.png", "n".repeat(300));
+        assert_eq!(named(&long_asset, true), None);
+        assert_eq!(
+            named(&long_asset, false),
+            Some(("invalid", Some(ASSET_PATH_REASON.to_string()))),
+            "the attachment gate names the long asset zip refused"
+        );
+        assert_eq!(named("assets/shot.png", true), None);
+        assert_eq!(
+            named("assets/shot.png", false),
+            Some(("invalid", Some(NOT_A_FILE_NAME_HERE_REASON.to_string()))),
+            "a good asset name zip refuses still gets a verdict, never an escape"
+        );
+        let long_note = format!("notes/{}.md", "n".repeat(300));
+        assert_eq!(named(&long_note, true), None);
+        assert_eq!(
+            named(&long_note, false),
+            Some(("invalid", Some(NOT_A_FILE_NAME_HERE_REASON.to_string())))
+        );
+
+        for escape in [
+            "../x.md",
+            "a/../../x.md",
+            "a/./x.md",
+            "a//x.md",
+            "/etc/x.md",
+            "//server/share/x.md",
+            "C:/x.md",
+            "C:x.md",
+            "a/file.md:stream",
+            r"\\server\share\x.md",
+            r"a\..\..\x.md",
+            r"assets\x.png",
+            "a/x\0.md",
+        ] {
+            for enclosed in [true, false] {
+                let Err(err) = entry_name_verdict(escape, enclosed) else {
+                    panic!("{escape:?} (enclosed {enclosed}) is an escape");
+                };
+                assert_eq!(err.status.as_u16(), 422, "{escape:?}");
+                assert!(
+                    err.detail.contains("escapes the extraction root"),
+                    "{escape:?}: {}",
+                    err.detail
+                );
+            }
+        }
     }
 
     /// An `assets/` entry is screened by the upload gates rather than by the
