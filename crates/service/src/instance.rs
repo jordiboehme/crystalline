@@ -2389,6 +2389,45 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
     daemon_log_file().map(Into::into)
 }
 
+/// Keep this process's own stdin, stdout and stderr out of every child it
+/// starts from now on, apart from a child given them on purpose.
+///
+/// On Windows std starts every child with handle inheritance on, so the
+/// child gets every inheritable handle of this process, not only the three
+/// it is handed as its stdio. The standard handles this process was started
+/// with are inheritable here whenever its parent passed them in, which is
+/// how a pipe is passed in. So a daemon started by a client whose output is
+/// a pipe held that pipe open for as long as it ran, and whoever read the
+/// client's output to its end (a harness, a script, a test's `output()`)
+/// waited for the daemon instead of the client. Clearing the inherit flag
+/// ends that; a later child started with `Stdio::inherit` still gets them,
+/// because std hands it an inheritable duplicate of its own. A no-op on
+/// unix, where std opens everything close-on-exec and a child gets only the
+/// three descriptors it is given.
+pub(crate) fn keep_std_handles_from_children() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle only reads this process's standard handle
+            // table, and SetHandleInformation changes one flag of a handle
+            // this process owns. A missing or console handle is skipped or
+            // its refusal ignored: either way it holds no pipe.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Spawn `current_exe serve --daemon`, forwarding `--read-only` when this
 /// instance was asked to serve read-only.
 ///
@@ -2458,6 +2497,9 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(daemon_log_sink().unwrap_or_else(std::process::Stdio::null));
+    // The daemon outlives this client: it must not hold the client's own
+    // stdout or stderr, or whoever reads them waits for the daemon.
+    keep_std_handles_from_children();
     #[cfg(unix)]
     if !extension {
         use std::os::unix::process::CommandExt;

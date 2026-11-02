@@ -8,9 +8,11 @@
 //! process writes nothing.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::SystemTime;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime};
 
 /// A package full name for the seam.
 const PACKAGE: &str = "Claude_1.0.0.0_x64__pzs8sxrjxfjjc";
@@ -127,6 +129,7 @@ fn a_packaged_command_without_a_daemon_writes_no_state() {
 #[test]
 fn a_packaged_stop_hook_still_keeps_its_session_file() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     let work = tempfile::tempdir().unwrap();
     let config = config_path(home.path());
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -178,6 +181,79 @@ fn daemon_answers(home: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How long a packaged command may run: the task wait (15 s) and the
+/// command's own work, with room to spare on a slow CI machine.
+const COMMAND_LIMIT: Duration = Duration::from_secs(90);
+
+/// How long the command's stdout and stderr may stay open after it exited.
+const PIPE_LIMIT: Duration = Duration::from_secs(10);
+
+/// Run `cmd` as `output()` does, but bounded, so a hang fails the test with
+/// its cause instead of running into the harness timeout. The two hangs it
+/// tells apart: the command itself did not finish, or it finished and a
+/// process it started (the daemon the `serve` seam starts) still holds its
+/// output pipes, which on Windows is what an inherited handle does. Either
+/// way the daemon under `home` is stopped first, which also lets the readers
+/// end.
+fn bounded(cmd: &mut Command, home: &Path) -> Output {
+    fn reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = send.send(bytes);
+        });
+        receive
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = reader(child.stdout.take().unwrap());
+    let stderr = reader(child.stderr.take().unwrap());
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > COMMAND_LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            stop_daemon(home);
+            panic!("the packaged command did not finish within {COMMAND_LIMIT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let collect = |pipe: mpsc::Receiver<Vec<u8>>, name: &str| {
+        pipe.recv_timeout(PIPE_LIMIT).unwrap_or_else(|_| {
+            stop_daemon(home);
+            panic!(
+                "the packaged command exited ({status}), but its {name} stayed open for \
+                 {PIPE_LIMIT:?}: a process it started holds the pipe"
+            )
+        })
+    };
+    let stdout = collect(stdout, "stdout");
+    let stderr = collect(stderr, "stderr");
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// Stops the daemon under a home when a test ends, failed or not, so a
+/// failing test leaves no daemon running.
+struct StopsDaemon<'a>(&'a Path);
+
+impl Drop for StopsDaemon<'_> {
+    fn drop(&mut self) {
+        stop_daemon(self.0);
+    }
+}
+
 /// With no daemon and a task that does not start one, every packaged
 /// command refuses, data verbs and reads included: a local engine would
 /// create a private index and ownership record. The refusal names why and a
@@ -219,15 +295,16 @@ fn a_packaged_command_refuses_when_the_task_brings_no_daemon() {
 #[test]
 fn a_packaged_command_runs_the_task_and_writes_through_the_daemon() {
     let home = short_home();
-    let out = crystalline(home.path(), true, "serve")
-        .args(["config", "set", "github.poll_secs", "120"])
-        .output()
-        .unwrap();
+    let _stops = StopsDaemon(home.path());
+    let out = bounded(
+        crystalline(home.path(), true, "serve").args(["config", "set", "github.poll_secs", "120"]),
+        home.path(),
+    );
     let answered = daemon_answers(home.path());
-    let search = crystalline(home.path(), true, "serve")
-        .args(["search", "anything", "--json"])
-        .output()
-        .unwrap();
+    let search = bounded(
+        crystalline(home.path(), true, "serve").args(["search", "anything", "--json"]),
+        home.path(),
+    );
     stop_daemon(home.path());
     assert!(out.status.success(), "{}", text(&out));
     assert!(answered, "the task seam started a daemon");
@@ -300,23 +377,31 @@ fn domain_folder(parent: &Path, name: &str) -> PathBuf {
 #[test]
 fn a_packaged_domain_add_registers_through_the_daemon() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     let work = tempfile::tempdir().unwrap();
     domain_folder(work.path(), "kb");
-    let file = crystalline(home.path(), true, "serve")
-        .current_dir(work.path())
-        .args(["domain", "add", "kb", "--path", "kb", "--json"])
-        .output()
-        .unwrap();
-    let virtual_add = crystalline(home.path(), true, "serve")
-        .args(["domain", "add", "notes", "--virtual", "--json"])
-        .output()
-        .unwrap();
+    let file = bounded(
+        crystalline(home.path(), true, "serve")
+            .current_dir(work.path())
+            .args(["domain", "add", "kb", "--path", "kb", "--json"]),
+        home.path(),
+    );
+    let virtual_add = bounded(
+        crystalline(home.path(), true, "serve").args([
+            "domain",
+            "add",
+            "notes",
+            "--virtual",
+            "--json",
+        ]),
+        home.path(),
+    );
     // A later setting through the daemon keeps the registration: the
     // daemon writes the file it reads again, never a copy from its start.
-    let setting = crystalline(home.path(), true, "serve")
-        .args(["config", "set", "github.poll_secs", "120"])
-        .output()
-        .unwrap();
+    let setting = bounded(
+        crystalline(home.path(), true, "serve").args(["config", "set", "github.poll_secs", "120"]),
+        home.path(),
+    );
     let status = crystalline(home.path(), false, "missing")
         .args(["ctl", "status", "--json"])
         .output()
@@ -346,13 +431,15 @@ fn a_packaged_domain_add_registers_through_the_daemon() {
 #[test]
 fn a_packaged_domain_add_still_needs_a_manifest() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     let work = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(work.path().join("bare")).unwrap();
-    let out = crystalline(home.path(), true, "serve")
-        .current_dir(work.path())
-        .args(["domain", "add", "bare", "--path", "bare"])
-        .output()
-        .unwrap();
+    let out = bounded(
+        crystalline(home.path(), true, "serve")
+            .current_dir(work.path())
+            .args(["domain", "add", "bare", "--path", "bare"]),
+        home.path(),
+    );
     stop_daemon(home.path());
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(
@@ -466,15 +553,16 @@ fn plant_private_state(home: &Path, domains: &[&str]) -> PathBuf {
 #[test]
 fn a_packaged_status_names_what_the_daemon_does_not_serve() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     plant_private_state(home.path(), &["notes", "work"]);
-    let out = crystalline(home.path(), true, "serve")
-        .args(["status"])
-        .output()
-        .unwrap();
-    let json = crystalline(home.path(), true, "serve")
-        .args(["status", "--json"])
-        .output()
-        .unwrap();
+    let out = bounded(
+        crystalline(home.path(), true, "serve").args(["status"]),
+        home.path(),
+    );
+    let json = bounded(
+        crystalline(home.path(), true, "serve").args(["status", "--json"]),
+        home.path(),
+    );
     stop_daemon(home.path());
     assert!(out.status.success(), "{}", text(&out));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -500,11 +588,12 @@ fn a_packaged_status_names_what_the_daemon_does_not_serve() {
 #[test]
 fn a_packaged_doctor_says_it_reads_the_private_copy() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     plant_private_state(home.path(), &["notes"]);
-    let out = crystalline(home.path(), true, "serve")
-        .args(["doctor"])
-        .output()
-        .unwrap();
+    let out = bounded(
+        crystalline(home.path(), true, "serve").args(["doctor"]),
+        home.path(),
+    );
     stop_daemon(home.path());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -524,6 +613,7 @@ fn a_packaged_doctor_says_it_reads_the_private_copy() {
 #[test]
 fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
     let home = short_home();
+    let _stops = StopsDaemon(home.path());
     let work = tempfile::tempdir().unwrap();
     domain_folder(work.path(), "kb");
     let config = config_path(home.path());
@@ -544,10 +634,10 @@ fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
         .args(["prompt", "system"])
         .output()
         .unwrap();
-    let served = crystalline(home.path(), true, "serve")
-        .args(["prompt", "system"])
-        .output()
-        .unwrap();
+    let served = bounded(
+        crystalline(home.path(), true, "serve").args(["prompt", "system"]),
+        home.path(),
+    );
     stop_daemon(home.path());
     assert!(alone.status.success(), "{}", text(&alone));
     let alone_text = String::from_utf8_lossy(&alone.stdout);
