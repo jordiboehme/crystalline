@@ -709,6 +709,14 @@ describe("the engram editor", () => {
     // Inserting a table leaves the caret in the header row of what it wrote,
     // which is the shortest honest way into a table from this screen.
     await insertTable(bar);
+    // The grid chunk draws this table and takes the verbs into its own menu;
+    // Raw gives the pipe source (and the bar's verbs) back.
+    await waitFor(() => {
+      expect(
+        within(bar).queryByRole("button", { name: "Add column after" }),
+      ).toBeNull();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Raw" }));
     await within(bar).findByRole("button", { name: "Add column after" });
 
     // And leaving it takes them away again.

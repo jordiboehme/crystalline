@@ -82,6 +82,7 @@ import { SaveState } from "../editor/SaveState";
 import type { ElementFace } from "../editor/elementContext";
 import { roomUndo } from "../editor/roomUndo";
 import { surfaceExtensions } from "../editor/surface";
+import type { TableUiContext } from "../editor/tableVerbs";
 import {
   UploadScreenContext,
   useAttachmentUploads,
@@ -606,7 +607,10 @@ function Surface({
   const adapter = useMemo(() => reflectionAdapter(), []);
   const preview = useMemo(() => new Compartment(), []);
   /** Whether the caret is in a table or on an image: the bar's context verbs. */
-  const [tableActive, setTableActive] = useState(false);
+  const [tableContext, setTableContext] = useState<TableUiContext>({
+    inTable: false,
+    drawn: false,
+  });
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
@@ -632,7 +636,7 @@ function Surface({
         raw: false,
         images: previews.of(imagePreviews(home)),
         uploads: uploads.extension,
-        onTableContext: setTableActive,
+        onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
       }),
@@ -1055,7 +1059,9 @@ function Surface({
         <EditorToolbar
           bare
           view={view}
-          tableActive={tableActive}
+          tableActive={tableContext.inTable}
+          tableDrawn={tableContext.drawn}
+          raw={false}
           imageActive={imageActive}
           calloutActive={element?.kind === "callout" ? element : null}
           statusActive={element?.kind === "status" ? element.colour : null}

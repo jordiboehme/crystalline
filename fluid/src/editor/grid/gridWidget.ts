@@ -39,6 +39,7 @@ import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
+import { disposeChrome, mountChrome } from "./gridChrome";
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import {
   gridWritable,
@@ -391,6 +392,7 @@ export class GridWidget extends WidgetType {
     mainOf.set(root, view);
     shownOf.set(root, this.table);
     patch(root, view);
+    mountChrome(root, view);
 
     root.addEventListener("mousedown", (event) => {
       if (event.button !== 0) return;
@@ -451,6 +453,7 @@ export class GridWidget extends WidgetType {
   }
 
   override destroy(dom: HTMLElement): void {
+    disposeChrome(dom);
     const main = mainOf.get(dom);
     if (!main) return;
     const mounted = mountedCell(main);
@@ -520,7 +523,58 @@ const hostWatch = ViewPlugin.fromClass(
  * view's own padding is taken away so its text sits where the static text did.
  */
 const gridTheme = EditorView.baseTheme({
-  ".cm-grid": { padding: "0.25rem 0.75rem" },
+  ".cm-grid": { padding: "0.25rem 0.75rem", position: "relative" },
+  ".cm-grid-chrome[hidden]": { display: "none" },
+  ".cm-grid-plus, .cm-grid-cell-menu": {
+    position: "absolute",
+    width: "18px",
+    height: "18px",
+    padding: "0",
+    lineHeight: "16px",
+    textAlign: "center",
+    fontSize: "0.8rem",
+    cursor: "pointer",
+    border: "1px solid var(--color-slate-300)",
+    borderRadius: "9999px",
+    background: "var(--color-white)",
+    color: "var(--color-slate-700)",
+    zIndex: "5",
+  },
+  ".cm-grid-cell-menu": { borderRadius: "4px", width: "20px" },
+  ".cm-grid-menu": {
+    position: "absolute",
+    zIndex: "20",
+    minWidth: "11rem",
+    padding: "0.25rem",
+    border: "1px solid var(--color-slate-300)",
+    borderRadius: "6px",
+    background: "var(--color-white)",
+    color: "var(--color-slate-900)",
+    boxShadow: "0 4px 12px rgb(0 0 0 / 0.15)",
+    fontSize: "0.875rem",
+  },
+  ".cm-grid-menu-item": {
+    padding: "0.25rem 0.5rem",
+    borderRadius: "4px",
+    cursor: "pointer",
+  },
+  ".cm-grid-menu-item:focus, .cm-grid-menu-item:hover": {
+    outline: "none",
+    background: "var(--color-slate-100)",
+  },
+  ".cm-grid-menu-item[aria-disabled='true']": {
+    opacity: "0.45",
+    cursor: "default",
+  },
+  ".cm-grid-menu-item[aria-checked='true']::after": { content: '" \u2713"' },
+  "&dark .cm-grid-plus, &dark .cm-grid-cell-menu, &dark .cm-grid-menu": {
+    background: "var(--color-slate-800)",
+    borderColor: "var(--color-slate-600)",
+    color: "var(--color-slate-100)",
+  },
+  "&dark .cm-grid-menu-item:focus, &dark .cm-grid-menu-item:hover": {
+    background: "var(--color-slate-700)",
+  },
   ".cm-grid table": { borderCollapse: "collapse" },
   ".cm-grid table:focus": { outline: "none" },
   ".cm-grid th, .cm-grid td": {

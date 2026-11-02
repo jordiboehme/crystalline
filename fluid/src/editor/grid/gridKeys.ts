@@ -113,7 +113,10 @@ function neighbour(
  * Closes the undo group on both stacks: CodeMirror's history solo, the
  * room's `Y.UndoManager` capture window in a room.
  */
-function closeUndoGroup(main: EditorView, side: "before" | "after"): void {
+export function closeUndoGroup(
+  main: EditorView,
+  side: "before" | "after",
+): void {
   main.state.facet(roomUndo)?.stopCapturing();
   main.dispatch({ annotations: isolateHistory.of(side) });
 }

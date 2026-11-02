@@ -10,7 +10,7 @@
  */
 
 import { undo } from "@codemirror/commands";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, test } from "vitest";
 import { yCollab } from "y-codemirror.next";
@@ -18,6 +18,7 @@ import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { parsedState } from "../test/parse";
+import { gridLoaded } from "./grid/draws";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   tableAddColumnAfter,
@@ -267,12 +268,59 @@ describe("tableContextListener", () => {
   test("fires only on transitions", () => {
     const seen: boolean[] = [];
     const v = editor(DOC, 2, [
-      tableContextListener((inTable) => seen.push(inTable)),
+      tableContextListener((context) => seen.push(context.inTable)),
     ]);
     v.dispatch({ selection: EditorSelection.cursor(IN_TABLE) });
     v.dispatch({ selection: EditorSelection.cursor(IN_TABLE + 1) }); // still inside: no event
     v.dispatch({ selection: EditorSelection.cursor(2) });
     expect(seen).toEqual([true, false]);
+  });
+});
+
+describe("tableContextListener and the grid", () => {
+  const QUOTED = "- item\n\n  | a | b |\n  | - | - |\n  | 1 | 2 |\n\nAfter\n";
+
+  function seenBy(doc: string, at: number, grid: boolean) {
+    const seen: { inTable: boolean; drawn: boolean }[] = [];
+    const v = editor(doc, 2, [
+      ...(grid ? [gridLoaded.of(true)] : []),
+      tableContextListener((context) => seen.push(context)),
+    ]);
+    v.dispatch({ selection: EditorSelection.cursor(at) });
+    return seen;
+  }
+
+  test("a table the loaded grid draws reports drawn", () => {
+    expect(seenBy(DOC, IN_TABLE, true).at(-1)).toEqual({
+      inTable: true,
+      drawn: true,
+    });
+  });
+
+  test("without the grid loaded (Raw, a MANIFEST) nothing is drawn", () => {
+    expect(seenBy(DOC, IN_TABLE, false).at(-1)).toEqual({
+      inTable: true,
+      drawn: false,
+    });
+  });
+
+  test("a table in a list item is in a table the grid does not draw", () => {
+    expect(seenBy(QUOTED, QUOTED.indexOf("1 |"), true).at(-1)).toEqual({
+      inTable: true,
+      drawn: false,
+    });
+  });
+
+  test("the grid loading while the caret rests in a table reports again", () => {
+    const seen: { inTable: boolean; drawn: boolean }[] = [];
+    const slot = new Compartment();
+    const v = editor(DOC, IN_TABLE, [
+      slot.of([]),
+      tableContextListener((context) => seen.push(context)),
+    ]);
+    v.dispatch({ selection: EditorSelection.cursor(IN_TABLE + 1) });
+    v.dispatch({ effects: slot.reconfigure(gridLoaded.of(true)) });
+    expect(seen.at(-1)).toEqual({ inTable: true, drawn: true });
   });
 });
 

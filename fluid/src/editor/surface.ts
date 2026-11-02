@@ -26,6 +26,7 @@ import { readingTheme } from "./readingTheme";
 import { richPaste } from "./richPaste";
 import { RAW_MONO, baseExtensions } from "./setup";
 import { slashCompletions } from "./slashMenu";
+import type { TableUiContext } from "./tableVerbs";
 import { tableContextListener } from "./tableVerbs";
 import { formattingKeymap } from "./toolbar";
 
@@ -69,7 +70,7 @@ export interface SurfaceOptions {
    * function and a listener added at only one site would go silent the first
    * time a session rebuilt the buffer.
    */
-  onTableContext: (inTable: boolean) => void;
+  onTableContext: (context: TableUiContext) => void;
   /**
    * Told when the caret enters or leaves an attachment image, so the format
    * bar can draw its image menu. It travels with the table listener above and

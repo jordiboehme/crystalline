@@ -42,6 +42,7 @@ import { ChangeSet, EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
+import { gridDraws, gridLoaded } from "./grid/draws";
 import type { Align, SpanChange, TableModel } from "./tableModel";
 import {
   addColumnAfter,
@@ -196,6 +197,24 @@ export function tableContextAt(state: EditorState): TableContext | null {
 }
 
 /**
+ * What the format bar needs to know about the caret's table: whether it is in
+ * one, and whether the table grid draws that table (the grid is loaded, not
+ * in Raw, and `gridDraws` accepts the table). A drawn table's verbs live in
+ * the grid's own menu; the bar keeps them for every other table.
+ */
+export interface TableUiContext {
+  inTable: boolean;
+  drawn: boolean;
+}
+
+function tableUiContext(state: EditorState): TableUiContext {
+  const inTable = tableContextAt(state) !== null;
+  if (!inTable || !state.facet(gridLoaded)) return { inTable, drawn: false };
+  const node = tableNodeAt(state, state.selection.main.head);
+  return { inTable, drawn: node !== null && gridDraws(node, state.doc) };
+}
+
+/**
  * Tell a screen when the caret enters or leaves a table.
  *
  * Only transitions are reported, so a toolbar's `useState` is written once per
@@ -208,23 +227,30 @@ export function tableContextAt(state: EditorState): TableContext | null {
  * reports, and a `false` that React already holds costs a bailed-out setState.
  */
 export function tableContextListener(
-  onChange: (inTable: boolean) => void,
+  onChange: (context: TableUiContext) => void,
 ): Extension {
-  let last: boolean | null = null;
+  let last: TableUiContext | null = null;
   return EditorView.updateListener.of((update) => {
     // A parse pass is the third reason to re-derive, beside a moved caret and
     // an edited document: on a document big enough for the language plugin to
     // parse in the background, the tree that first says "this is a table"
-    // arrives in an update that changed neither of the other two.
+    // arrives in an update that changed neither of the other two. The grid
+    // loading (or Raw taking it away) is the fourth: it changes `drawn`
+    // under a caret that stayed where it was.
     if (
       !update.selectionSet &&
       !update.docChanged &&
-      syntaxTree(update.startState) === syntaxTree(update.state)
+      syntaxTree(update.startState) === syntaxTree(update.state) &&
+      update.startState.facet(gridLoaded) === update.state.facet(gridLoaded)
     ) {
       return;
     }
-    const now = tableContextAt(update.state) !== null;
-    if (now === last) {
+    const now = tableUiContext(update.state);
+    if (
+      last !== null &&
+      now.inTable === last.inTable &&
+      now.drawn === last.drawn
+    ) {
       return;
     }
     last = now;

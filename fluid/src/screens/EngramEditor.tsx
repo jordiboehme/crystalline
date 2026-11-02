@@ -72,6 +72,7 @@ import { roomUndo } from "../editor/roomUndo";
 import { docText, lineSeparatorFor } from "../editor/setup";
 import type { ElementFace } from "../editor/elementContext";
 import { previewConfig, surfaceExtensions } from "../editor/surface";
+import type { TableUiContext } from "../editor/tableVerbs";
 import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import {
@@ -220,7 +221,7 @@ interface EngramSurfaceOptions {
   /** Paste and drop uploads; see `SurfaceOptions`. */
   uploads: Extension;
   /** Told when the caret enters or leaves a table; see `SurfaceOptions`. */
-  onTableContext: (inTable: boolean) => void;
+  onTableContext: (context: TableUiContext) => void;
   /** Told when the caret enters or leaves an image; see `SurfaceOptions`. */
   onImageContext: (onImage: boolean) => void;
   /** Told what callout or label the caret is in; see `SurfaceOptions`. */
@@ -466,7 +467,10 @@ function Surface({
    * only, and the setter is React's own stable one, so this costs a render
    * per crossing rather than one per keystroke.
    */
-  const [tableActive, setTableActive] = useState(false);
+  const [tableContext, setTableContext] = useState<TableUiContext>({
+    inTable: false,
+    drawn: false,
+  });
   /** The same, for the caret sitting on an attachment image. */
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
@@ -598,7 +602,7 @@ function Surface({
       resolver,
       room,
       uploads: uploads.extension,
-      onTableContext: setTableActive,
+      onTableContext: setTableContext,
       onImageContext: setImageActive,
       onElementContext: setElement,
     });
@@ -886,7 +890,7 @@ function Surface({
         resolver: NO_RESOLUTION,
         room,
         uploads: uploads.extension,
-        onTableContext: setTableActive,
+        onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
       }),
@@ -1330,7 +1334,9 @@ function Surface({
           <EditorToolbar
             bare
             view={view}
-            tableActive={tableActive}
+            tableActive={tableContext.inTable}
+            tableDrawn={tableContext.drawn}
+            raw={raw}
             imageActive={imageActive}
             calloutActive={element?.kind === "callout" ? element : null}
             statusActive={element?.kind === "status" ? element.colour : null}

@@ -52,6 +52,7 @@ import {
   lineSeparatorFor,
   replaceBuffer,
 } from "../editor/setup";
+import type { TableUiContext } from "../editor/tableVerbs";
 import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
@@ -90,7 +91,7 @@ const ARIA_LABEL = "MANIFEST source";
 function extensionsFor(
   content: string,
   dark: boolean,
-  onTableContext: (inTable: boolean) => void,
+  onTableContext: (context: TableUiContext) => void,
 ): Extension[] {
   return [
     ...lineSeparatorFor(content),
@@ -219,7 +220,10 @@ function EditorSurface({
    * Whether the caret is in a table - the format bar's context segment, fed by
    * the listener inside the buffer, which reports crossings only.
    */
-  const [tableActive, setTableActive] = useState(false);
+  const [tableContext, setTableContext] = useState<TableUiContext>({
+    inTable: false,
+    drawn: false,
+  });
   /**
    * The section the domain page asked for, if the reader arrived by pressing
    * one of its Add buttons rather than by opening the editor.
@@ -377,7 +381,7 @@ function EditorSurface({
       }
       return receipt;
     },
-    extensionsFor: (content) => extensionsFor(content, dark, setTableActive),
+    extensionsFor: (content) => extensionsFor(content, dark, setTableContext),
     ariaLabel: ARIA_LABEL,
   });
 
@@ -405,7 +409,7 @@ function EditorSurface({
       replaceBuffer(
         view,
         withDomainName(docText(view.state), asked.from),
-        (content) => extensionsFor(content, dark, setTableActive),
+        (content) => extensionsFor(content, dark, setTableContext),
         ARIA_LABEL,
         session.setBuffer,
       );
@@ -576,10 +580,14 @@ function EditorSurface({
         <div className="rounded border border-slate-200 dark:border-slate-800">
           {/* The same bar the engram editor carries, over the same kind of
               text: this buffer is markdown too. */}
-          <EditorToolbar view={view} tableActive={tableActive} />
+          <EditorToolbar
+            view={view}
+            tableActive={tableContext.inTable}
+            tableDrawn={tableContext.drawn}
+          />
           <CmEditor
             initialDoc={manifest.markdown}
-            extensions={extensionsFor(manifest.markdown, dark, setTableActive)}
+            extensions={extensionsFor(manifest.markdown, dark, setTableContext)}
             ariaLabel={ARIA_LABEL}
             onReady={(ready) => {
               session.onReady(ready);

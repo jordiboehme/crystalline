@@ -393,6 +393,8 @@ function ConfirmHeadingDialog({
 export function EditorToolbar({
   view: buffer,
   tableActive = false,
+  tableDrawn = false,
+  raw = false,
   imageActive = false,
   calloutActive = null,
   statusActive = null,
@@ -406,6 +408,17 @@ export function EditorToolbar({
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
   tableActive?: boolean;
+  /**
+   * Whether the table grid draws the table the caret is in. A drawn table's
+   * add, delete, align and prettify verbs live in the grid's cell menu and
+   * floating actions, so the bar's table segment steps aside for it.
+   */
+  tableDrawn?: boolean;
+  /**
+   * Raw mode: the table is pipe source again and the grid is gone, so the
+   * segment is drawn whatever `tableDrawn` says.
+   */
+  raw?: boolean;
   /**
    * Whether the caret is on an attachment image right now. Drawn rather than
    * disabled, like the table segment beside it: a menu that has nothing to act
@@ -709,7 +722,7 @@ export function EditorToolbar({
             </DropdownMenu.Root>
           </>
         )}
-        {tableActive && (
+        {tableActive && (raw || !tableDrawn) && (
           <>
             {/*
             The same hairline again, in front of the verbs that act on the
