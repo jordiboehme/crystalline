@@ -22,28 +22,60 @@ import {
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
+import { relationType } from "./relationLines";
 
 // The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
-// or a second space after the dash is a line the server's parser never reads
-// as a bullet at all, so marking it as one would be a UI claim the engine
-// does not honor.
-//
-// The relation type mirrors `parse_relation` (parse.rs): a quoted string
-// (any run of non-quote characters between a literal pair of `"`) or a bare
-// token of any non-whitespace characters, letter case included - the server
-// neither requires a lowercase start nor forbids one, so requiring it here
-// understated what a line can mean. `[` is excluded from the bare token only
-// to keep this regex's own greediness from eating into the `[[` delimiter;
-// the server's `content.find("[[")` has no such need because it searches
-// rather than matching greedily.
+// after the dash is no bullet to the server's parser, and a category must
+// follow the dash directly. A relation's type is read by `relationLines.ts`,
+// a port of `parse_relation`, which trims the words before the target.
 //
 // A task box is never a category: `[x]`, `[X]` and `[~]` (and `[ ]`, which
 // the first character class already refuses) are a task line, as the core
 // reads them. A bracket that opens with `^` is a footnote reference
 // (`- [^1] text`), never a category, as `split_category` (parse.rs) reads it.
 export const OBSERVATION_LINE = /^- \[(?![ xX~]\])([^\]\s^][^\]]*)\]\s/;
-export const RELATION_LINE = /^- ("[^"]*"|[^\s"[]+)\s*\[\[/;
 const TRAILING_TAG = /#[\w-]+/g;
+
+/** `is_hashtag` (parse.rs): `#` and then one or more of A-Z a-z 0-9 `_` `-` `/`. */
+const HASHTAG = /^#[A-Za-z0-9_/-]+$/;
+
+/**
+ * The tags of an observation line as `split_observation` (parse.rs) reads
+ * them: from the text after the category, a trailing parenthesized group is
+ * the context and is set aside, then whitespace-separated hashtag tokens are
+ * taken from the end until one is not a tag. Offsets are in the line.
+ */
+function serverTags(
+  text: string,
+  bodyFrom: number,
+): { from: number; to: number }[] {
+  let end = text.length;
+  while (end > bodyFrom && /\s/.test(text[end - 1] ?? "")) {
+    end -= 1;
+  }
+  if (text[end - 1] === ")") {
+    const open = text.lastIndexOf("(", end - 1);
+    if (open >= bodyFrom) {
+      end = open;
+    }
+  }
+  const found: { from: number; to: number }[] = [];
+  for (;;) {
+    while (end > bodyFrom && /\s/.test(text[end - 1] ?? "")) {
+      end -= 1;
+    }
+    let start = end;
+    while (start > bodyFrom && !/\s/.test(text[start - 1] ?? "")) {
+      start -= 1;
+    }
+    if (start >= end || !HASHTAG.test(text.slice(start, end))) {
+      break;
+    }
+    found.unshift({ from: start, to: end });
+    end = start;
+  }
+  return found;
+}
 
 /**
  * Where a bullet is code rather than an observation or relation line.
@@ -103,25 +135,37 @@ function buildMarks(view: EditorView): DecorationSet {
                   start + category.length + 2,
                 ),
           );
-          for (const tag of line.text.matchAll(TRAILING_TAG)) {
+          const tags: { from: number; to: number }[] = chips
+            ? serverTags(line.text, observation[0].length)
+            : [...line.text.matchAll(TRAILING_TAG)].map((tag) => ({
+                from: tag.index,
+                to: tag.index + tag[0].length,
+              }));
+          for (const tag of tags) {
             marks.push(
               Decoration.mark({
                 class: chips ? "cm-tag-chip" : "cm-line-tag",
-              }).range(
-                line.from + tag.index,
-                line.from + tag.index + tag[0].length,
-              ),
+              }).range(line.from + tag.from, line.from + tag.to),
             );
           }
         } else {
-          const relation = RELATION_LINE.exec(line.text);
-          if (relation) {
-            const relType = relation[1] ?? "";
-            const start = line.from + line.text.indexOf(relType);
+          const span = relationType((offset) => {
+            const number = line.number + offset;
+            if (number > doc.lines) {
+              return undefined;
+            }
+            const next = doc.line(number);
+            return code.some(
+              (range) => next.from >= range.from && next.from < range.to,
+            )
+              ? undefined
+              : next.text;
+          });
+          if (span) {
             marks.push(
               Decoration.mark({
                 class: chips ? "cm-relation-chip" : "cm-rel-type",
-              }).range(start, start + relType.length),
+              }).range(line.from + span.from, line.from + span.to),
             );
           }
         }

@@ -18,7 +18,7 @@ import {
   setCaret,
   undoOnce,
 } from "../test/markKit";
-import { footnoteScans } from "./footnotes";
+import { footnoteModel, footnoteScans } from "./footnotes";
 import { markSegment } from "./marks/caret";
 
 afterEach(cleanupMarkViews);
@@ -295,19 +295,29 @@ describe("the cost", () => {
     return lines.join("\n");
   })();
 
-  it("numbers 200 footnotes in a long document within a generous bound", () => {
+  it("does not parse a long document while mounting, and numbers 200 footnotes after", async () => {
+    const before = footnoteScans();
     const started = performance.now();
     const view = markView(long);
     const elapsed = performance.now() - started;
     expect(long.split("\n").length).toBeGreaterThanOrEqual(2000);
+    // Mounting reads nothing: the references show as their text for now.
+    expect(footnoteScans()).toBe(before);
+    expect(refs(view)).toEqual([]);
+    expect(view.dom.textContent).toContain("[^0]");
     expect(elapsed).toBeLessThan(5000);
+    await vi.waitFor(() => {
+      expect(refs(view).length).toBeGreaterThan(0);
+    });
+    expect(footnoteScans()).toBe(before + 1);
     expect(bytes(view.state)).toBe(long);
-    expect(refs(view).length).toBeGreaterThan(0);
-    expect(footnoteScans()).toBeGreaterThan(0);
   });
 
-  it("does not scan again for a keystroke that cannot change a note", () => {
+  it("does not scan again for a keystroke that cannot change a note", async () => {
     const view = markView(long);
+    await vi.waitFor(() => {
+      expect(refs(view).length).toBeGreaterThan(0);
+    });
     const at = long.indexOf("Plain line 1000") + 5;
     setCaret(view, at);
     const before = footnoteScans();
@@ -322,13 +332,78 @@ describe("the cost", () => {
     expect(view.state.doc.sliceString(at, at + 3)).toBe("abc");
   });
 
-  it("scans again when a keystroke touches a reference", () => {
+  it("reads a long document again after a pause, keeping the drawing meanwhile", async () => {
     const view = markView(long);
+    await vi.waitFor(() => {
+      expect(refs(view).length).toBeGreaterThan(0);
+    });
+    setCaret(view, 0);
     const before = footnoteScans();
+    const drawn = refs(view).length;
     view.dispatch({
       changes: { from: 0, insert: "[^1]" },
       userEvent: "input.type",
     });
+    // Not read inside the keystroke; the references carried by the edit stay.
+    expect(footnoteScans()).toBe(before);
+    expect(refs(view).length).toBeGreaterThan(0);
+    expect(refs(view).length).toBeLessThanOrEqual(drawn + 1);
+    await vi.waitFor(() => {
+      expect(footnoteScans()).toBeGreaterThan(before);
+    });
+  });
+
+  it("reads a short document inside the keystroke", () => {
+    const view = markView(DOC);
+    setCaret(view, 0);
+    const before = footnoteScans();
+    view.dispatch({
+      changes: { from: 0, insert: "[^m]" },
+      userEvent: "input.type",
+    });
     expect(footnoteScans()).toBeGreaterThan(before);
+  });
+
+  it("reads again when a typed < opens a tag over a later line, where no indent rule can fire", () => {
+    // `<` in the middle of a line that holds nothing else the check looks
+    // for: the tag now runs on into the next line, and the reference in its
+    // attribute is no reference.
+    const text = 'a span\ntitle="b[^1]">\n\n[^1]: one\n';
+    const view = markView(text);
+    setCaret(view, 2);
+    view.dispatch({
+      changes: { from: 2, insert: "<" },
+      userEvent: "input.type",
+    });
+    const fresh = markView(view.state.doc.toString());
+    expect(footnoteModel(fresh.state).refs).toEqual([]);
+    expect(footnoteModel(view.state)).toEqual(footnoteModel(fresh.state));
+    view.dispatch({
+      changes: { from: 2, to: 3 },
+      userEvent: "delete.backward",
+    });
+    const plain = markView(view.state.doc.toString());
+    expect(footnoteModel(view.state)).toEqual(footnoteModel(plain.state));
+  });
+
+  it("reads again for an HTML block that starts or ends, a fence, display math and an indent", () => {
+    const cases: [string, number, string][] = [
+      ["div>\nb[^1]\n\n[^1]: one\n", 0, "<"],
+      ["<div>\nb[^1]\n\n[^1]: one\n", 0, "x"],
+      ["a\nb[^1]\n\n[^1]: one\n", 2, "```\n"],
+      ["a\n\nb[^1]\n\n[^1]: one\n", 1, "$$"],
+      ["x\n\n  b[^1]\n\n[^1]: one\n", 3, "  "],
+      ["x\n\nb[^1]\n\n[^1]: one\n", 3, "    "],
+    ];
+    for (const [text, at, insert] of cases) {
+      const view = markView(text);
+      setCaret(view, at);
+      view.dispatch({
+        changes: { from: at, insert },
+        userEvent: "input.type",
+      });
+      const fresh = markView(view.state.doc.toString());
+      expect(footnoteModel(view.state)).toEqual(footnoteModel(fresh.state));
+    }
   });
 });

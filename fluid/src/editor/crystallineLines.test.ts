@@ -99,12 +99,18 @@ describe("grammar fidelity", () => {
     view.destroy();
   });
 
-  it("does not draw for a bullet the server's literal '- ' prefix would reject", () => {
+  it("draws no category for a bullet the server's literal '- ' prefix would reject, but reads a spaced relation", () => {
     const doc =
       "---\nt: x\n---\n\n-  [decision] two spaces\n-\t[decision] a tab\n-  relates_to [[Beta]]\n";
     const view = mount(doc);
     expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
-    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+    // `parse_relation` trims the words before the target, so the second
+    // space is no obstacle to a relation, as it is to a category.
+    expect(
+      [...view.dom.querySelectorAll(".cm-rel-type")].map(
+        (el) => el.textContent,
+      ),
+    ).toEqual(["relates_to"]);
     view.destroy();
   });
 
@@ -285,5 +291,73 @@ describe("chips in hidden mode", () => {
     const view = markView(doc, { mode: "show" });
     setCaret(view, 1);
     expect(view.dom.textContent).toContain("<!-- c -->");
+  });
+});
+
+describe("tag chips follow the tags the server reads", () => {
+  afterEach(cleanupMarkViews);
+
+  const tagsOf = (doc: string): string[] => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return [...view.dom.querySelectorAll(".cm-tag-chip")].map(
+      (el) => el.textContent ?? "",
+    );
+  };
+
+  it.each([
+    ["- [fact] use #include here", []],
+    ["- [fact] see issue#12", []],
+    ["- [fact] a #x then text", []],
+    ["- [fact] text #area/sub", ["#area/sub"]],
+    ["- [fact] text #a #b", ["#a", "#b"]],
+    ["- [fact] text #tag (the context)", ["#tag"]],
+    ["- [fact] text (the context) #tag", ["#tag"]],
+    ["- [fact] text #tag.", []],
+    ["- [fact] text #tag-1_x ", ["#tag-1_x"]],
+    ["- [fact] #only", ["#only"]],
+  ])("%s", (doc, expected) => {
+    expect(tagsOf(doc)).toEqual(expected);
+  });
+});
+
+describe("relation chips follow the relations the server reads", () => {
+  afterEach(cleanupMarkViews);
+
+  const chipOf = (doc: string): string | null => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return view.dom.querySelector(".cm-relation-chip")?.textContent ?? null;
+  };
+
+  it.each([
+    ["- relates_to [[T]]", "relates_to"],
+    ["- rel[[T]]", "rel"],
+    ['- "part of" [[T]]', '"part of"'],
+    ["- See [[T]]", "See"],
+    ["- part_of [Doc](doc.md)", "part_of"],
+    ["- part_of [Doc](sub/Doc.MD#top)", "part_of"],
+    ['- "part of" [Doc](doc.md)', '"part of"'],
+    ["- rel [Doc](a[[x]]b.md)", "rel"],
+    ["- relates_to\n  [[T]]", "relates_to"],
+    ["- part_of\n  [Doc](doc.md)", "part_of"],
+    // Not relations to the server.
+    ["- See [Three](chapter-3.md)", null],
+    ["- uses [x](page.html)", null],
+    ["- uses ![x](a.md)", null],
+    ["- uses [x](http://a.org/b.md)", null],
+    ["- uses [x](index.md)", null],
+    ["- uses [x](sub/log.md)", null],
+    ["- uses [[index.md]]", null],
+    ["- two words [[T]]", null],
+    ["- :x [[T]]", null],
+    ["- [x] done [[T]]", null],
+    ["- uses [[|alias]]", null],
+    ["- [fact] see [[T]]", null],
+    ["- uses `[x](a.md)`", null],
+    ["- relates_to [[T]\n", null],
+    ["  - relates_to [[T]]", null],
+  ])("%j", (doc, expected) => {
+    expect(chipOf(doc)).toBe(expected);
   });
 });

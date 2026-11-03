@@ -6,25 +6,25 @@
  * Markdown: every widget is a view over bytes that never change, and a copy
  * over a drawn reference gives the source.
  *
- * The numbers are the reading page's, which comes from remark-gfm and
- * mdast-util-to-hast: a footnote is numbered by the order of its first
- * reference in the body, then the references inside the notes in the order
- * the notes are numbered; labels match without regard to case or the
- * whitespace around them; a reference with no definition is plain text; a
- * definition nobody refers to is not on the page, so it draws as its text;
- * and of two definitions for one label the first is the note.
- *
- * What is a reference and what is code comes from the syntax tree (fences,
- * inline code, math and HTML comments hold no footnotes); the labels follow
- * the footnote grammar. The model is kept in a state field and is scanned
- * again only for an edit that can change it: a keystroke in a line with no
- * `[^`, no code or comment character and no line break leaves it as it is
- * and only moves the positions.
+ * What is a reference, a definition or code, and the numbers, come from the
+ * reading page's own parser (`footnoteSyntax.ts`), so the two cannot differ
+ * by construction. That parse costs far more than a keystroke may (tens of
+ * milliseconds for a long page), so the model is a state field that is read
+ * again only for an edit that can change footnotes, at once for a short
+ * document and, for a long one, in a worker after a short pause (the first
+ * read at mount too, with references shown as text until it arrives); until
+ * a read arrives the drawn references and notes stay where the edits carry
+ * them.
  */
 
-import { syntaxTree } from "@codemirror/language";
-import type { ChangeSet, EditorState, Extension } from "@codemirror/state";
-import { EditorSelection, StateField } from "@codemirror/state";
+import type { EditorState, Extension } from "@codemirror/state";
+import {
+  ChangeSet,
+  EditorSelection,
+  Facet,
+  StateEffect,
+  StateField,
+} from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
@@ -33,7 +33,8 @@ import {
   WidgetType,
 } from "@codemirror/view";
 
-import { frontmatterRegion } from "./frontmatterRegion";
+import type { Notes } from "./footnoteSyntax";
+import { readNotes } from "./footnoteSyntax";
 import { markSegment } from "./marks/caret";
 import {
   markModeChanged,
@@ -41,252 +42,77 @@ import {
   marksOnEditLine,
 } from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
-import { parseAdvanced } from "./parseProgress";
-import { CODE_CONTEXTS } from "./prose";
-
-/** A reference that gets a number. */
-interface Ref {
-  from: number;
-  to: number;
-  key: string;
-}
-
-/** The note a label names: the span of `[^label]:` and its space. */
-interface Note {
-  key: string;
-  from: number;
-  /** Where the note's text starts, after the colon and one space. */
-  textFrom: number;
-}
-
-interface Model {
-  refs: readonly Ref[];
-  notes: readonly Note[];
-  numbers: ReadonlyMap<string, number>;
-  /** The length of the syntax tree the model was read from. */
-  parsed: number;
-}
 
 let scans = 0;
 
-/** How many whole-document scans have run, for the cost tests. */
+/** How many whole-document reads have run, for the cost tests. */
 export function footnoteScans(): number {
   return scans;
 }
 
-/** Subtrees whose text holds no footnote. */
-const NO_NOTES = new Set([
-  ...CODE_CONTEXTS,
-  "InlineMath",
-  "Comment",
-  "CommentBlock",
-  "HTMLBlock",
-  "ProcessingInstruction",
-]);
-
-/** A label as the footnote grammar matches it to a definition. */
-function labelKey(label: string): string {
-  return label
-    .replace(/[\t\n\r ]+/g, " ")
-    .replace(/^ | $/g, "")
-    .toLowerCase()
-    .toUpperCase();
-}
-
-/** Where the line before a definition's `[` may stand: quote marks, up to three spaces. */
-const DEFINITION_LEAD = /^ {0,3}(?:> ?)* {0,3}$/;
-
-/** The ranges of `state` that hold no footnote, sorted and apart. */
-function excludedRanges(state: EditorState): [number, number][] {
-  const out: [number, number][] = [];
-  const region = frontmatterRegion(state.doc);
-  if (region) {
-    out.push([0, region.to]);
-  }
-  syntaxTree(state).iterate({
-    enter: (node) => {
-      if (NO_NOTES.has(node.name)) {
-        out.push([node.from, node.to]);
-        return false;
-      }
-      return undefined;
-    },
-  });
-  return out.sort((a, b) => a[0] - b[0]);
-}
-
-function excluded(ranges: readonly [number, number][], pos: number): boolean {
-  let low = 0;
-  let high = ranges.length - 1;
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    const range = ranges[mid];
-    if (!range) {
-      return false;
-    }
-    if (pos < range[0]) {
-      high = mid - 1;
-    } else if (pos >= range[1]) {
-      low = mid + 1;
-    } else {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** The label starting at `at` (just after `[^`) and the index of its `]`. */
-function labelAt(
-  text: string,
-  at: number,
-): { label: string; end: number } | null {
-  let index = at;
-  while (index < text.length && index - at <= 999) {
-    const char = text[index];
-    if (char === "]") {
-      return index > at ? { label: text.slice(at, index), end: index } : null;
-    }
-    if (char === undefined || char === "[" || /\s/.test(char)) {
-      return null;
-    }
-    // A backslash may escape a bracket or another backslash.
-    index += char === "\\" && /[[\\\]]/.test(text[index + 1] ?? "") ? 2 : 1;
-  }
-  return null;
-}
-
-function scan(state: EditorState): Model {
+function read(doc: EditorState["doc"]): Notes {
   scans += 1;
-  const doc = state.doc;
-  const text = doc.toString();
-  const none = excludedRanges(state);
-  interface Found {
-    from: number;
-    to: number;
-    key: string;
-    /** For a definition: where its text starts. */
-    textFrom?: number;
-  }
-  const refs: Found[] = [];
-  const defs: Found[] = [];
-  let at = text.indexOf("[^");
-  while (at !== -1) {
-    const next = text.indexOf("[^", at + 2);
-    if (!excluded(none, at)) {
-      let slashes = 0;
-      while (text[at - slashes - 1] === "\\") {
-        slashes += 1;
-      }
-      const found = slashes % 2 === 0 ? labelAt(text, at + 2) : null;
-      if (found) {
-        const to = found.end + 1;
-        const key = labelKey(found.label);
-        const lineStart = text.lastIndexOf("\n", at - 1) + 1;
-        if (
-          text[to] === ":" &&
-          DEFINITION_LEAD.test(text.slice(lineStart, at))
-        ) {
-          const textFrom = text[to + 1] === " " ? to + 2 : to + 1;
-          defs.push({ from: at, to: textFrom, key, textFrom });
-        } else {
-          refs.push({ from: at, to, key });
-        }
-      }
-    }
-    at = next;
-  }
-
-  // Of two definitions of a label the first is the note.
-  const noted = new Map<string, Found>();
-  for (const def of defs) {
-    if (!noted.has(def.key)) {
-      noted.set(def.key, def);
-    }
-  }
-
-  // A definition's span: its line, the lazy lines under it up to a blank,
-  // and what is indented four after a blank, until the next definition.
-  const starts = new Set(defs.map((def) => def.from));
-  const spanEnd = (def: Found): number => {
-    let number = doc.lineAt(def.from).number;
-    let end = doc.line(number).to;
-    let blank = false;
-    for (number += 1; number <= doc.lines; number += 1) {
-      const line = doc.line(number);
-      if (/^\s*$/.test(line.text)) {
-        blank = true;
-        continue;
-      }
-      const lead = /^ {0,3}(?:> ?)* {0,3}/.exec(line.text)?.[0].length ?? 0;
-      if (
-        starts.has(line.from + lead) ||
-        (blank && !/^( {4}|\t)/.test(line.text))
-      ) {
-        break;
-      }
-      blank = false;
-      end = line.to;
-    }
-    return end;
-  };
-  const spans = defs.map((def) => ({ def, end: spanEnd(def) }));
-  const insideNote = (pos: number) =>
-    spans.find((span) => span.def.from < pos && pos < span.end) ?? null;
-
-  const numbers = new Map<string, number>();
-  const counted = new Set<Found>();
-  const queue: string[] = [];
-  const visit = (ref: Found) => {
-    if (!noted.has(ref.key)) {
-      return;
-    }
-    counted.add(ref);
-    if (!numbers.has(ref.key)) {
-      numbers.set(ref.key, numbers.size + 1);
-      queue.push(ref.key);
-    }
-  };
-  for (const ref of refs) {
-    if (!insideNote(ref.from)) {
-      visit(ref);
-    }
-  }
-  // The notes are rendered in number order, and a reference inside one
-  // numbers a note that comes after.
-  for (let index = 0; index < queue.length; index += 1) {
-    const def = noted.get(queue[index] ?? "");
-    const span = spans.find((candidate) => candidate.def === def);
-    if (!span) {
-      continue;
-    }
-    for (const ref of refs) {
-      if (ref.from > span.def.from && ref.from < span.end) {
-        visit(ref);
-      }
-    }
-  }
-
-  return {
-    refs: refs
-      .filter((ref) => counted.has(ref))
-      .map(({ from, to, key }) => ({ from, to, key })),
-    notes: [...noted.values()]
-      .filter((def) => numbers.has(def.key))
-      .map(({ from, key, textFrom }) => ({
-        from,
-        key,
-        textFrom: textFrom ?? from,
-      }))
-      .sort((a, b) => a.from - b.from),
-    numbers,
-    parsed: syntaxTree(state).length,
-  };
+  return readNotes(doc);
 }
 
-/** What in a touched line can change which footnotes there are. */
-const TRIGGER = /\[\^|[`~]|<!--|-->|\$|^\s*$|^[ \t>]/;
+/** Documents up to this many characters are read inside the keystroke. */
+const SYNC_LIMIT = 6000;
 
-/** Whether the edit can change a reference, a definition or what is code. */
+/** How long a long document waits after the last edit before it is read. */
+const PAUSE_MS = 120;
+
+/** What a footnote read is handed to, in or out of the page's thread. */
+export interface NotesWorker {
+  postMessage(message: { id: number; text: string }): void;
+  terminate(): void;
+  onmessage: ((event: { data: { id: number; notes: Notes } }) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+}
+
+export interface FootnoteOptions {
+  /**
+   * Starts the worker a long document is read in, or answers null where there
+   * is none (jsdom, an old browser): the read then runs in the page's thread
+   * after a tick. Called at most once per view, on its first long read.
+   */
+  worker?: () => NotesWorker | null;
+}
+
+function startWorker(): NotesWorker | null {
+  if (typeof Worker === "undefined") {
+    return null;
+  }
+  return new Worker(new URL("./footnoteWorker.ts", import.meta.url), {
+    type: "module",
+  }) as unknown as NotesWorker;
+}
+
+const workerFactory = Facet.define<
+  () => NotesWorker | null,
+  () => NotesWorker | null
+>({ combine: (values) => values[0] ?? startWorker });
+
+interface Model extends Notes {
+  /** Whether an edit that can change footnotes is not read yet. */
+  stale: boolean;
+  /** Counts the edits that can change footnotes, to tell a reply is current. */
+  revision: number;
+}
+
+const settled = StateEffect.define<{ revision: number; notes: Notes }>();
+
+const TRIGGER = /[[\]^`~<>$\\:|]/;
+const BLOCKISH = /^[ \t]*([#>*+=-]|\d+[.)])/;
+const BLANK = /^\s*$/;
+
+/**
+ * Whether the edit can change a reference, a definition, or what is code, a
+ * link address, math or HTML around them. When in doubt it says yes: a line
+ * that holds a bracket, a caret, a backtick, a tilde, an angle, a dollar or a
+ * backslash is read again whatever the edit was, and so is a change in
+ * the indentation or the first characters of a line, a blank line made or
+ * lost and a change over a line break.
+ */
 function affects(tr: {
   startState: EditorState;
   state: EditorState;
@@ -306,41 +132,209 @@ function affects(tr: {
       return;
     }
     const now = after.lineAt(fromB);
-    hit = TRIGGER.test(first.text) || TRIGGER.test(now.text);
+    const indent = /^[ \t]*/.exec(first.text)?.[0].length ?? 0;
+    hit =
+      fromA - first.from <= indent ||
+      TRIGGER.test(first.text) ||
+      TRIGGER.test(now.text) ||
+      BLOCKISH.test(first.text) ||
+      BLOCKISH.test(now.text) ||
+      BLANK.test(first.text) ||
+      BLANK.test(now.text);
   });
   return hit;
 }
 
+function carry<T extends Notes>(value: T, changes: ChangeSet): T {
+  const map = (pos: number) => changes.mapPos(pos, 1);
+  return {
+    ...value,
+    refs: value.refs
+      .map((ref) => ({ ...ref, from: map(ref.from), to: map(ref.to) }))
+      .filter((ref) => ref.from < ref.to),
+    notes: value.notes
+      .map((note) => ({
+        ...note,
+        from: map(note.from),
+        textFrom: map(note.textFrom),
+      }))
+      .filter((note) => note.from < note.textFrom),
+  };
+}
+
+const EMPTY: Notes = { refs: [], notes: [], numbers: new Map() };
+
 const model = StateField.define<Model>({
-  create: (state) => scan(state),
+  create: (state) =>
+    state.doc.length <= SYNC_LIMIT
+      ? { ...read(state.doc), stale: false, revision: 0 }
+      : // A long document is read off the keystroke, mount included; until
+        // the answer comes its references and notes show as text.
+        { ...EMPTY, stale: true, revision: 0 },
   update(value, tr) {
-    if (tr.docChanged) {
-      if (affects(tr)) {
-        return scan(tr.state);
+    for (const effect of tr.effects) {
+      if (effect.is(settled) && effect.value.revision === value.revision) {
+        return {
+          ...effect.value.notes,
+          stale: false,
+          revision: value.revision,
+        };
       }
-      const map = (pos: number) => tr.changes.mapPos(pos, 1);
-      return {
-        ...value,
-        refs: value.refs.map((ref) => ({
-          ...ref,
-          from: map(ref.from),
-          to: map(ref.to),
-        })),
-        notes: value.notes.map((note) => ({
-          ...note,
-          from: map(note.from),
-          textFrom: map(note.textFrom),
-        })),
-        parsed: syntaxTree(tr.state).length,
-      };
     }
-    // The parse reaching further without an edit: code may have appeared.
-    if (syntaxTree(tr.state).length !== value.parsed) {
-      return scan(tr.state);
+    if (!tr.docChanged) {
+      return value;
     }
-    return value;
+    if (!affects(tr)) {
+      return carry(value, tr.changes);
+    }
+    const revision = value.revision + 1;
+    if (tr.state.doc.length <= SYNC_LIMIT) {
+      return { ...read(tr.state.doc), stale: false, revision };
+    }
+    return { ...carry(value, tr.changes), stale: true, revision };
   },
 });
+
+/** The references and notes a state draws, with their numbers (for tests). */
+export function footnoteModel(state: EditorState): {
+  refs: { label: string; number: number }[];
+  notes: { number: number; text: string }[];
+} {
+  const { refs, notes, numbers } = state.field(model);
+  return {
+    refs: refs.map((ref) => ({
+      label: state.sliceDoc(ref.from, ref.to),
+      number: numbers.get(ref.key) ?? 0,
+    })),
+    notes: notes.map((note) => ({
+      number: numbers.get(note.key) ?? 0,
+      text: state.sliceDoc(note.textFrom, state.doc.lineAt(note.textFrom).to),
+    })),
+  };
+}
+
+interface Flight {
+  id: number;
+  revision: number;
+  /** Everything that changed the document since the text was handed over. */
+  since: ChangeSet;
+}
+
+/**
+ * Reads a long document off the page's thread: in a worker where there is
+ * one, else in a later tick. One read is in flight per view. A reply is
+ * applied only if no edit that can change footnotes came after the text it
+ * read; edits that cannot are mapped over its offsets; otherwise it is
+ * dropped and the pause starts again.
+ */
+const settling = ViewPlugin.fromClass(
+  class {
+    timer: ReturnType<typeof setTimeout> | undefined;
+    worker: NotesWorker | null = null;
+    broken = false;
+    destroyed = false;
+    flight: Flight | null = null;
+    counter = 0;
+    readonly view: EditorView;
+
+    constructor(view: EditorView) {
+      this.view = view;
+      if (view.state.field(model).stale) {
+        this.request();
+      }
+    }
+
+    update(update: ViewUpdate) {
+      if (this.flight && update.docChanged) {
+        this.flight.since = this.flight.since.compose(update.changes);
+      }
+      if (update.state.field(model).stale && !this.flight) {
+        this.later();
+      }
+    }
+
+    later() {
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.request(), PAUSE_MS);
+    }
+
+    request() {
+      if (this.destroyed || this.flight) {
+        return;
+      }
+      const { doc } = this.view.state;
+      const flight: Flight = {
+        id: (this.counter += 1),
+        revision: this.view.state.field(model).revision,
+        since: ChangeSet.empty(doc.length),
+      };
+      this.flight = flight;
+      if (!this.broken && !this.worker) {
+        try {
+          this.worker = this.view.state.facet(workerFactory)();
+        } catch {
+          this.worker = null;
+        }
+        if (this.worker) {
+          this.worker.onmessage = (event) => {
+            if (event.data.id === this.flight?.id) {
+              this.deliver(event.data.notes);
+            }
+          };
+          this.worker.onerror = () => {
+            this.worker?.terminate();
+            this.worker = null;
+            this.broken = true;
+            const lost = this.flight;
+            this.flight = null;
+            if (lost && !this.destroyed) {
+              this.request();
+            }
+          };
+        } else {
+          this.broken = true;
+        }
+      }
+      if (this.worker) {
+        this.worker.postMessage({ id: flight.id, text: doc.toString() });
+        return;
+      }
+      // No worker: the read happens a tick later, not inside this update.
+      this.timer = setTimeout(() => {
+        if (this.flight?.id === flight.id) {
+          this.deliver(read(doc));
+        }
+      }, 0);
+    }
+
+    deliver(notes: Notes) {
+      const flight = this.flight;
+      this.flight = null;
+      if (!flight || this.destroyed) {
+        return;
+      }
+      const current = this.view.state.field(model);
+      if (flight.revision !== current.revision) {
+        // An edit that can change footnotes came in; read again after a pause.
+        this.later();
+        return;
+      }
+      this.view.dispatch({
+        effects: settled.of({
+          revision: flight.revision,
+          notes: flight.since.empty ? notes : carry(notes, flight.since),
+        }),
+      });
+    }
+
+    destroy() {
+      this.destroyed = true;
+      clearTimeout(this.timer);
+      this.worker?.terminate();
+      this.worker = null;
+    }
+  },
+);
 
 /** Moves the caret to the text of the note `key` names, if this view may. */
 function jump(view: EditorView, from: number, key: string): void {
@@ -470,7 +464,6 @@ const drawing = ViewPlugin.fromClass(
         update.viewportChanged ||
         (update.selectionSet && update.state.facet(marksOnEditLine)) ||
         update.startState.field(model) !== update.state.field(model) ||
-        parseAdvanced(update) ||
         parkingChanged(update) ||
         markModeChanged(update)
       ) {
@@ -512,6 +505,12 @@ const theme = EditorView.baseTheme({
 });
 
 /** Footnotes as numbers; belongs in the preview layers of a document kind. */
-export function footnotes(): Extension {
-  return [model, drawing, theme];
+export function footnotes(options: FootnoteOptions = {}): Extension {
+  return [
+    options.worker ? workerFactory.of(options.worker) : [],
+    model,
+    settling,
+    drawing,
+    theme,
+  ];
 }
