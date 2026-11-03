@@ -21,6 +21,7 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
+import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
 import type { CellEditor } from "./cellEditor";
 import {
   activeCell,
@@ -94,6 +95,38 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(press(cell.view, "Backspace")).toBe(true);
     expect(press(cell.view, "Backspace")).toBe(true);
     expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| a | 2 |\n");
+  });
+
+  // R23: every cell of a table without outer pipes edits in place, a typed
+  // pipe stored escaped, and nothing outside the cell changes.
+  describe.each(PIPELESS_FIXTURES)("without outer pipes: $name", (f) => {
+    const places = f.cells.flatMap((row, r) => row.map((_, c) => [r, c]));
+    test.each(places)(
+      "typing a pipe into cell %i/%i changes only that cell",
+      async (row, column) => {
+        const main = make(f.text);
+        const at = cellOf(main, row ?? 0, column ?? 0).content.to;
+        const cell = openAt(main, at);
+        typeIn(cell, "x|y");
+        expect(bytes(main.state)).toBe(
+          `${f.text.slice(0, at)}x\\|y${f.text.slice(at)}`,
+        );
+        expect(cell.view.contentDOM.textContent).toBe(
+          `${f.cells[row ?? 0]?.[column ?? 0] ?? ""}x|y`,
+        );
+        const table = gridTables(main.state)[0];
+        expect(table?.rows.map((r) => r.length)).toEqual([2, 2, 2]);
+        expect(table?.rows[row ?? 0]?.[column ?? 0]?.text).toBe(
+          `${f.cells[row ?? 0]?.[column ?? 0] ?? ""}x\\|y`,
+        );
+        closeCell(main, "user", "none");
+        await Promise.resolve();
+        expect(activeCell(main)).toBeNull();
+        expect(bytes(main.state)).toBe(
+          `${f.text.slice(0, at)}x\\|y${f.text.slice(at)}`,
+        );
+      },
+    );
   });
 
   test("Delete in front of an escaped pipe removes the pair", () => {

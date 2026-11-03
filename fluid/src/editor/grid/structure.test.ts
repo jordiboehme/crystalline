@@ -8,6 +8,10 @@ import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
 import { parsedState } from "../../test/parse";
+import {
+  LIST_ITEM_NOT_A_TABLE,
+  PIPELESS_FIXTURES,
+} from "../../test/pipelessTables";
 import { baseExtensions } from "../setup";
 import { cellAt, gridTableAt, gridTables } from "./structure";
 
@@ -91,6 +95,20 @@ describe("gridTables", () => {
       ["1 ", "1"],
       [" 2", "2"],
     ]);
+  });
+
+  it.each(PIPELESS_FIXTURES)("reads every cell of $name (R23)", (f) => {
+    const table = only(f.text);
+    expect(table.rows.map((row) => row.map((cell) => cell.text))).toEqual(
+      f.cells,
+    );
+    expect(table.aligns).toEqual(
+      f.aligns.map((align) => (align === "" ? "none" : align)),
+    );
+  });
+
+  it("reads `- | -` under a header as no table at all", () => {
+    expect(gridTables(stateOf(LIST_ITEM_NOT_A_TABLE))).toEqual([]);
   });
 
   it("leaves a ragged row's missing cells out of its array", () => {

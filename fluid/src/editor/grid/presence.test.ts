@@ -13,10 +13,11 @@ import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { cleanupCells, press, roomMain, typeIn } from "../../test/cellKit";
+import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { activeCell } from "./cellEditor";
 import { gridExtension } from "./index";
-import { cellAt, gridTableAt } from "./structure";
+import { cellAt, gridTableAt, gridTables } from "./structure";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n\nafter\n";
 
@@ -194,6 +195,56 @@ describe("peers' carets in static cells", () => {
     const back = markers(cellEl(main, 1, 1));
     expect(back).toHaveLength(1);
     expect(cell.view.dom.isConnected).toBe(false);
+  });
+});
+
+// R23: carets in a table without outer pipes land in the right cell, at
+// both ends of each cell's text, the bare line edges included.
+describe.each(PIPELESS_FIXTURES)("presence without outer pipes: $name", (f) => {
+  test("a peer's caret at either end of each cell is drawn in that cell", () => {
+    const { main, rtext, remoteAwareness } = roomMain(f.text, layers());
+    const table = gridTables(main.state)[0];
+    if (!table) throw new Error("no table");
+    for (const row of table.rows) {
+      for (const cell of row) {
+        for (const pos of [cell.content.from, cell.content.to]) {
+          peerCursor(remoteAwareness, rtext, pos);
+          const holding = table.rows.flatMap((r, ri) =>
+            r
+              .map((_, ci) => [ri, ci])
+              .filter(
+                ([ri, ci]) =>
+                  markers(cellEl(main, ri ?? 0, ci ?? 0)).length > 0,
+              ),
+          );
+          expect(
+            holding,
+            `${String(cell.row)}/${String(cell.column)} at ${String(pos)}`,
+          ).toEqual([[cell.row, cell.column]]);
+        }
+      }
+    }
+    peerCursor(remoteAwareness, rtext, null);
+  });
+
+  test("the local caret in an open edge cell is published in that cell", async () => {
+    const { main, remoteAwareness, local, remote } = roomMain(f.text, layers());
+    for (const [row, column] of [
+      [2, 0],
+      [2, 1],
+    ]) {
+      mouseDown(cellEl(main, row ?? 0, column ?? 0));
+      const cell = hosted(main);
+      await flush();
+      expect(cellName(main, seenHead(remoteAwareness, local, remote))).toBe(
+        `${String(row)}/${String(column)}`,
+      );
+      typeIn(cell, "x");
+      await flush();
+      expect(cellName(main, seenHead(remoteAwareness, local, remote))).toBe(
+        `${String(row)}/${String(column)}`,
+      );
+    }
   });
 });
 

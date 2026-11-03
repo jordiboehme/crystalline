@@ -384,12 +384,14 @@ describe("tolerances the verbs inherit from the parse", () => {
     );
   });
 
-  test("a column appended past an edge-pipeless row closes it with a pipe", () => {
+  test("a column appended past an edge-pipeless row closes it only where the new cell is empty", () => {
     const span = "a | b\n--- | ---\n1 | 2";
     const model = parseTable(span);
     if (!model) throw new Error("no model");
+    // R23: the header's `Column` and the rule's dashes exist without a
+    // closing pipe; the data row's empty cell does not, so only it gains one.
     expect(apply(span, addColumnAfter(model, 1) ?? [])).toBe(
-      ["a | b | Column |", "--- | --- | --- |", "1 | 2 |  |"].join("\n"),
+      ["a | b | Column", "--- | --- | ---", "1 | 2 |  |"].join("\n"),
     );
   });
 
@@ -630,5 +632,135 @@ describe("insert-before and move verbs", () => {
     expect(apply(span, moveRow(m, 2, 3, "\n") ?? [])).toBe(
       "a | b\n- | -\n3 | 4\n1 | 2",
     );
+  });
+});
+
+/**
+ * R23: a table keeps its own spelling when it grows or shrinks. A row keeps
+ * the edge pipes it has and gains one only where a cell needs it to exist: an
+ * empty first cell needs a leading pipe and an empty last cell a trailing one
+ * (GFM reads `1 | ` as a trailing pipe and ` | 2` as a leading one). Every
+ * result is checked against the parse as well as against its bytes.
+ */
+describe("the table's own spelling (R23)", () => {
+  const PIPELESS = "a | b\n--|--\n1 | 2\n3 | 4";
+  const MIXED = "| a | b |\n|:--|--:|\n1 | 2\n| 3 | 4 |";
+
+  function modelOf(span: string) {
+    const model = parseTable(span);
+    if (!model) throw new Error("no model");
+    return model;
+  }
+
+  /** Every line of `span` holds `columns` cells. */
+  function cellCounts(span: string): number[] {
+    return modelOf(span).lines.map((line) => line.cells.length);
+  }
+
+  test("a new empty row needs both edge pipes, in a pipeless table too", () => {
+    // The exception the ruling names: every cell of a new row is empty, so its
+    // first cell needs a leading pipe and its last a trailing one. ` | ` would
+    // be one cell to this parse and none to Lezer's.
+    const m = modelOf(PIPELESS);
+    const below = apply(PIPELESS, addRowBelow(m, 3, "\n") ?? []);
+    expect(below).toBe("a | b\n--|--\n1 | 2\n3 | 4\n|  |  |");
+    expect(cellCounts(below)).toEqual([2, 2, 2, 2, 2]);
+    const above = apply(PIPELESS, addRowAbove(m, 2, "\n") ?? []);
+    expect(above).toBe("a | b\n--|--\n|  |  |\n1 | 2\n3 | 4");
+    expect(cellCounts(above)).toEqual([2, 2, 2, 2, 2]);
+  });
+
+  test("a new empty row in a mixed table is the same, next to either spelling", () => {
+    const m = modelOf(MIXED);
+    expect(apply(MIXED, addRowBelow(m, 2, "\n") ?? [])).toBe(
+      "| a | b |\n|:--|--:|\n1 | 2\n|  |  |\n| 3 | 4 |",
+    );
+    expect(apply(MIXED, addRowAbove(m, 2, "\n") ?? [])).toBe(
+      "| a | b |\n|:--|--:|\n|  |  |\n1 | 2\n| 3 | 4 |",
+    );
+  });
+
+  test("a new last column keeps each row's own edge spelling", () => {
+    const pipeless = apply(
+      PIPELESS,
+      addColumnAfter(modelOf(PIPELESS), 1) ?? [],
+    );
+    expect(pipeless).toBe(
+      "a | b | Column\n--|-- | ---\n1 | 2 |  |\n3 | 4 |  |",
+    );
+    expect(cellCounts(pipeless)).toEqual([3, 3, 3, 3]);
+    const mixed = apply(MIXED, addColumnAfter(modelOf(MIXED), 1) ?? []);
+    expect(mixed).toBe(
+      "| a | b | Column |\n|:--|--:| --- |\n1 | 2 |  |\n| 3 | 4 |  |",
+    );
+    expect(cellCounts(mixed)).toEqual([3, 3, 3, 3]);
+  });
+
+  test("a new first column keeps each row's own edge spelling", () => {
+    const pipeless = apply(
+      PIPELESS,
+      addColumnBefore(modelOf(PIPELESS), 0) ?? [],
+    );
+    expect(pipeless).toBe(
+      "Column | a | b\n--- | --|--\n|  | 1 | 2\n|  | 3 | 4",
+    );
+    expect(cellCounts(pipeless)).toEqual([3, 3, 3, 3]);
+    const mixed = apply(MIXED, addColumnBefore(modelOf(MIXED), 0) ?? []);
+    expect(mixed).toBe(
+      "| Column | a | b |\n| --- |:--|--:|\n|  | 1 | 2\n|  | 3 | 4 |",
+    );
+    expect(cellCounts(mixed)).toEqual([3, 3, 3, 3]);
+  });
+
+  test("deleting down to one column writes every row with outer pipes", () => {
+    // A one-column table without pipes is no table: `a` over `--` is a
+    // paragraph and a setext heading. Every row keeps or gains both edges.
+    const first = apply(PIPELESS, deleteColumn(modelOf(PIPELESS), 0) ?? []);
+    expect(first).toBe("| b |\n|-- |\n| 2 |\n| 4 |");
+    expect(cellCounts(first)).toEqual([1, 1, 1, 1]);
+    const last = apply(PIPELESS, deleteColumn(modelOf(PIPELESS), 1) ?? []);
+    expect(last).toBe("| a |\n| --|\n| 1 |\n| 3 |");
+    expect(cellCounts(last)).toEqual([1, 1, 1, 1]);
+    const mixed = apply(MIXED, deleteColumn(modelOf(MIXED), 0) ?? []);
+    expect(mixed).toBe("| b |\n|--:|\n| 2 |\n| 4 |");
+    expect(modelOf(mixed).aligns).toEqual(["right"]);
+  });
+
+  test("deleting a column keeps a pipe that a blank new edge cell needs", () => {
+    const span = "a | b | c\n--|--|--\n1 |  | 3\n4 | 5 | 6";
+    const m = modelOf(span);
+    // Column 0 goes: the empty middle cell becomes the first, so the pipe
+    // after the deleted cell stays as that row's leading pipe.
+    const first = apply(span, deleteColumn(m, 0) ?? []);
+    expect(first).toBe(" b | c\n--|--\n|  | 3\n 5 | 6");
+    expect(cellCounts(first)).toEqual([2, 2, 2, 2]);
+    // Column 2 goes: the empty middle cell becomes the last and keeps the
+    // pipe before the deleted cell as its trailing pipe.
+    const last = apply(span, deleteColumn(m, 2) ?? []);
+    expect(last).toBe("a | b \n--|--\n1 |  |\n4 | 5 ");
+    expect(cellCounts(last)).toEqual([2, 2, 2, 2]);
+  });
+
+  test("moving an empty cell into the last slot of a pipeless row keeps it", () => {
+    const span = "x | y | z\n--|--|--\nx |  | z";
+    const out = apply(span, moveColumn(modelOf(span), 1, 2) ?? []);
+    expect(out).toBe("x | z| y \n--|--|--\nx | z|  |");
+    expect(cellCounts(out)).toEqual([3, 3, 3]);
+    expect(modelOf(out).lines[2]?.cells.map((c) => c.raw)).toEqual([
+      "x ",
+      " z",
+      "  ",
+    ]);
+  });
+
+  test("aligning the first cell of a pipeless rule adds no blank before it", () => {
+    // Three blanks of indent plus one more would make the rule indented code.
+    const span = "   a | b\n   --|--\n   1 | 2";
+    const out = apply(span, setAlignment(modelOf(span), 0, "center") ?? []);
+    expect(out).toBe("   a | b\n   :---: |--\n   1 | 2");
+    expect(modelOf(out).aligns).toEqual(["center", "none"]);
+    const last = apply(span, setAlignment(modelOf(span), 1, "right") ?? []);
+    expect(last).toBe("   a | b\n   --| ---:\n   1 | 2");
+    expect(modelOf(last).aligns).toEqual(["none", "right"]);
   });
 });

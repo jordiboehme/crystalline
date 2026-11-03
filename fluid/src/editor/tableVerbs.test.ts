@@ -10,6 +10,7 @@
  */
 
 import { undo } from "@codemirror/commands";
+import { syntaxTree } from "@codemirror/language";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, test } from "vitest";
@@ -18,7 +19,10 @@ import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { parsedState } from "../test/parse";
+import { PIPELESS_FIXTURES, tableStart } from "../test/pipelessTables";
 import { gridLoaded } from "./grid/draws";
+import type { Align } from "./tableModel";
+import { parseTable } from "./tableModel";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   tableAddColumnAfter,
@@ -595,4 +599,112 @@ describe("focus option", () => {
       outside.remove();
     },
   );
+});
+
+/**
+ * R23: every verb on a table without outer pipes (and on a mixed one) leaves
+ * a table that every reader still takes for the same table: Lezer finds ONE
+ * `Table` covering every row, the model reads each row with the table's
+ * column count, and every row is a row to the server's merge too (it holds an
+ * unescaped pipe and does not start another block). The page around the
+ * table keeps its bytes.
+ */
+describe("every verb on tables without outer pipes (R23)", () => {
+  type Run = (v: EditorView, at: number) => boolean;
+  const off = { focus: false };
+  const aligns: Align[] = ["left", "center", "right", "none"];
+  const verbs: [string, Run][] = [
+    ["add row below", (v, at) => tableAddRowBelow(v, at, off)],
+    ["add row above", (v, at) => tableAddRowAbove(v, at, off)],
+    ["add column after", (v, at) => tableAddColumnAfter(v, at, off)],
+    ["add column before", (v, at) => tableAddColumnBefore(v, at, off)],
+    ["delete row", (v, at) => tableDeleteRow(v, at, off)],
+    ["delete column", (v, at) => tableDeleteColumn(v, at, off)],
+    ["move row up", (v, at) => tableMoveRow(v, -1, at, off)],
+    ["move row down", (v, at) => tableMoveRow(v, 1, at, off)],
+    ["move column left", (v, at) => tableMoveColumn(v, -1, at, off)],
+    ["move column right", (v, at) => tableMoveColumn(v, 1, at, off)],
+    ...aligns.map((align): [string, Run] => [
+      `align ${align}`,
+      (v, at) => tableAlignColumn(v, align, at, off),
+    ]),
+  ];
+
+  /** A merge row: an unescaped pipe, and no block start (merge.rs). */
+  function mergeRow(text: string): boolean {
+    const trimmed = text.trim();
+    const pipe = /(^|[^\\])(\\\\)*\|/.test(trimmed);
+    const block =
+      /^[><]/.test(trimmed) ||
+      /^#{1,6}(\s|$)/.test(trimmed) ||
+      /^[-*+](\s|$)/.test(trimmed) ||
+      /^\d{1,9}[.)](\s|$)/.test(trimmed);
+    return pipe && !block && !/^( {4}|\t)/.test(text);
+  }
+
+  for (const fixture of PIPELESS_FIXTURES) {
+    const start = tableStart(fixture);
+    const end = start + fixture.lines.join("\n").length;
+    const before = fixture.text.slice(0, start);
+    const after = fixture.text.slice(end);
+    // A position inside each cell: the first character of its text.
+    const positions: [string, number][] = [];
+    fixture.cells.forEach((row, r) => {
+      const lineIndex = r === 0 ? 0 : r + 1;
+      const lineFrom =
+        start +
+        fixture.lines.slice(0, lineIndex).join("\n").length +
+        (lineIndex === 0 ? 0 : 1);
+      const line = fixture.lines[lineIndex] ?? "";
+      let from = 0;
+      row.forEach((text, c) => {
+        const at = line.indexOf(text, from);
+        from = at + text.length;
+        positions.push([`${String(r)}/${String(c)}`, lineFrom + at]);
+      });
+    });
+
+    describe(fixture.name, () => {
+      for (const [name, run] of verbs) {
+        test(`${name} in every cell keeps one table every reader agrees on`, () => {
+          for (const [cell, at] of positions) {
+            const v = editor(fixture.text, 0);
+            if (!run(v, at)) {
+              expect(docText(v.state), `${name} at ${cell}`).toBe(fixture.text);
+              v.destroy();
+              continue;
+            }
+            const text = docText(v.state);
+            expect(text.startsWith(before), `${name} at ${cell}`).toBe(true);
+            expect(text.endsWith(after), `${name} at ${cell}`).toBe(true);
+            const span = text.slice(before.length, text.length - after.length);
+            const model = parseTable(span);
+            expect(model, `${name} at ${cell}`).not.toBeNull();
+            if (!model) continue;
+            expect(
+              model.lines.map((l) => l.cells.length),
+              `${name} at ${cell}: ${span}`,
+            ).toEqual(model.lines.map(() => model.columns));
+            expect(
+              model.lines.every((l) => mergeRow(l.text)),
+              `${name} at ${cell}: ${span}`,
+            ).toBe(true);
+            const tables: [number, number][] = [];
+            let rows = 0;
+            syntaxTree(v.state).iterate({
+              enter: (node) => {
+                if (node.name === "Table") tables.push([node.from, node.to]);
+                if (node.name === "TableRow") rows += 1;
+              },
+            });
+            expect(tables, `${name} at ${cell}: ${span}`).toEqual([
+              [before.length, before.length + span.length],
+            ]);
+            expect(rows, `${name} at ${cell}`).toBe(model.lines.length - 2);
+            v.destroy();
+          }
+        });
+      }
+    });
+  }
 });

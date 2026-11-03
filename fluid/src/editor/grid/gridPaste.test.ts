@@ -10,6 +10,7 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { bytes, cleanupCells, roomMain, soloMain } from "../../test/cellKit";
+import { PIPELESS_FIXTURES, withTable } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { activeCell } from "./cellEditor";
 import { hostOpenCell } from "./gridWidget";
@@ -206,6 +207,77 @@ describe("paste of a block", () => {
     });
     expect(paste(view, { plain: "x\ty\nz\tw" })).toBe(true);
     expect(bytes(main.state)).toBe(DOC);
+  });
+});
+
+/**
+ * R23: a block pasted into a table without outer pipes fills its cells in
+ * place, and the rows and columns it adds are written in the table's own
+ * spelling: a row keeps the edge pipes it had, a new row copies the row above
+ * it, and an edge pipe is added only where its cell is empty.
+ */
+describe.each(PIPELESS_FIXTURES)("paste without outer pipes: $name", (f) => {
+  const GROWN: Record<string, string[]> = {
+    "pipeless.md": [
+      "a | b | Column",
+      "--|-- | ---",
+      "p | q | r",
+      "s | t | u",
+      "v | w | x",
+    ],
+    "mixed.md": [
+      "| a | b | Column |",
+      "|:--|--:| --- |",
+      "p | q | r",
+      "| s | t | u |",
+      "| v | w | x |",
+    ],
+  };
+
+  test("a block inside the table replaces the cells and nothing else", () => {
+    const main = soloMain(f.text, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "p\tq\ns\tt" });
+    const lines = [...f.lines];
+    lines[2] = lines[2]?.replace("1", "p").replace("2", "q") ?? "";
+    lines[3] = lines[3]?.replace("3", "s").replace("4", "t") ?? "";
+    expect(bytes(main.state)).toBe(withTable(f, lines));
+    expect(where(main)).toEqual([1, 0]);
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test("a block that grows the table writes its spelling, one undo", () => {
+    const main = soloMain(f.text, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "p\tq\tr\ns\tt\tu\nv\tw\tx" });
+    expect(bytes(main.state)).toBe(withTable(f, GROWN[f.name] ?? []));
+    const table = gridTables(main.state)[0];
+    expect(table?.rows.map((row) => row.map((c) => c.text))).toEqual([
+      ["a", "b", "Column"],
+      ["p", "q", "r"],
+      ["s", "t", "u"],
+      ["v", "w", "x"],
+    ]);
+    expect(where(main)).toEqual([1, 0]);
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test("an empty value at a bare edge keeps its cell with the pipe it needs", () => {
+    const main = soloMain(f.text, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "\tq\ns\t" });
+    const table = gridTables(main.state)[0];
+    expect(table?.rows.map((row) => row.map((c) => c.text))).toEqual([
+      ["a", "b"],
+      ["", "q"],
+      ["s", ""],
+    ]);
+    const lines = [...f.lines];
+    lines[2] = "| | q";
+    lines[3] = f.name === "mixed.md" ? "| s |  |" : "s | |";
+    expect(bytes(main.state)).toBe(withTable(f, lines));
   });
 });
 

@@ -402,10 +402,19 @@ function navigate(
       if (mod || event.altKey || !writable) return false;
       const { from, to } = cell.content;
       if (from < to) {
+        // R23: an edge cell without its edge pipe exists only while it has
+        // text (` | 2` is a leading pipe and one cell, `1 | ` a trailing
+        // pipe), so clearing it leaves the one pipe it needs, as a paste of
+        // an empty value does.
+        const line = table.model.lines[row === 0 ? 0 : row + 1];
+        const bare =
+          line !== undefined &&
+          ((column === 0 && !line.leadingPipe) ||
+            (column === line.cells.length - 1 && !line.trailingPipe));
         // Its own undo step, never joined to typing just before or after.
         closeUndoGroup(main, "before");
         main.dispatch({
-          changes: { from, to },
+          changes: bare ? { from, to, insert: "|" } : { from, to },
           userEvent:
             event.key === "Delete" ? "delete.forward" : "delete.backward",
         });

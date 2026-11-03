@@ -370,15 +370,18 @@ class TablePreviewWidget extends WidgetType {
   override toDOM(): HTMLElement {
     const box = document.createElement("div");
     box.className = "cm-table-preview";
+    // Every line of the span is a row, with or without outer pipes (R23); a
+    // quoted table's later lines carry their quote marks inside the span.
     const rows = this.source
       .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("|"))
+      .map((line) => line.replace(/^\s*(?:>\s?)*/, "").trim())
+      .filter((line) => line !== "")
       .map((line) =>
         line
-          .replace(/^\||\|$/g, "")
-          .split("|")
-          .map((cell) => cell.trim()),
+          .replace(/^\|/, "")
+          .replace(/(?<!\\)\|$/, "")
+          .split(/(?<!\\)\|/)
+          .map((cell) => cell.trim().replaceAll("\\|", "|")),
       );
     const table = document.createElement("table");
     rows.forEach((cells, index) => {

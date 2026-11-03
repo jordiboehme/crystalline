@@ -19,6 +19,7 @@ import {
   roomMain,
   typeIn,
 } from "../../test/cellKit";
+import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
 import { activeCell } from "./cellEditor";
 import { gridTables } from "./structure";
 import { closeCell, onCellClosed, openCellField } from "./openCell";
@@ -234,6 +235,70 @@ describe("cell editor under co-editing", () => {
     expect(heard).not.toHaveBeenCalled();
     expect(activeCell(main)).toBe(cell);
     expect(openText(main)).toBe("23");
+  });
+
+  // R23 with R7 and R10 on the two fixtures: a peer's row delete closes an
+  // open cell of that row as gone, emptying a last cell without a trailing
+  // pipe closes it too (the parse no longer has it), and a partial delete or
+  // a last cell with its trailing pipe stays open.
+  describe.each(PIPELESS_FIXTURES)("without outer pipes: $name", (f) => {
+    test.each([
+      [1, 0],
+      [1, 1],
+      [2, 0],
+      [2, 1],
+    ])(
+      "a peer deleting the row closes cell %i/%i as gone (R7)",
+      async (row, column) => {
+        const { main, rtext } = roomMain(f.text);
+        openAt(main, cellOf(main, row, column).content.to);
+        const heard = vi.fn();
+        onCellClosed(main, heard);
+        const line = `${f.lines[row + 1] ?? ""}\n`;
+        rtext.delete(rtext.toJSON().indexOf(line), line.length);
+        await Promise.resolve();
+        expect(heard).toHaveBeenCalledTimes(1);
+        expect(heard).toHaveBeenCalledWith("gone");
+        expect(activeCell(main)).toBeNull();
+        expect(main.state.field(openCellField)).toBeNull();
+      },
+    );
+
+    test.each([1, 2])(
+      "a peer emptying the last cell of row %i follows R10",
+      async (row) => {
+        const { main, rtext } = roomMain(f.text);
+        const cell = openAt(main, cellOf(main, row, 1).content.to);
+        const heard = vi.fn();
+        onCellClosed(main, heard);
+        const { content } = cellOf(main, row, 1);
+        rtext.delete(content.from, content.to - content.from);
+        await Promise.resolve();
+        if ((f.lines[row + 1] ?? "").endsWith("|")) {
+          // The trailing pipe keeps an empty last cell a cell.
+          expect(heard).not.toHaveBeenCalled();
+          expect(activeCell(main)).toBe(cell);
+          expect(openText(main)).toBe("");
+        } else {
+          expect(heard).toHaveBeenCalledWith("gone");
+          expect(activeCell(main)).toBeNull();
+        }
+      },
+    );
+
+    test("a peer deleting part of a bare last cell leaves it open", async () => {
+      const { main, rtext } = roomMain(f.text);
+      const cell = openAt(main, cellOf(main, 1, 1).content.to);
+      typeIn(cell, "x");
+      const heard = vi.fn();
+      onCellClosed(main, heard);
+      rtext.delete(cellOf(main, 1, 1).content.from, 1);
+      await Promise.resolve();
+      expect(heard).not.toHaveBeenCalled();
+      expect(activeCell(main)).toBe(cell);
+      expect(openText(main)).toBe("x");
+      expect(cell.view.state.doc.eq(main.state.doc)).toBe(true);
+    });
   });
 
   test("a peer clearing a compact cell leaves it open", async () => {

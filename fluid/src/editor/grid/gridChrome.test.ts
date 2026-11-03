@@ -19,6 +19,8 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
+import type { PipelessFixture } from "../../test/pipelessTables";
+import { PIPELESS_FIXTURES, withTable } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import {
   tableAddColumnAfter,
@@ -376,6 +378,116 @@ describe("the Cell actions menu", () => {
     expect(main.hasFocus).toBe(false);
   });
 });
+
+/**
+ * R23: every menu item on a table without outer pipes, with the bytes it
+ * writes. Each row keeps its own edge spelling; an edge pipe appears only
+ * where a cell needs it (an empty edge cell, a one-column table, a cell
+ * that would open a line with a blank).
+ */
+const SPELLED: Record<string, Record<string, string[]>> = {
+  "pipeless.md": {
+    "Insert row above": ["a | b", "--|--", "1 | 2", "|  |  |", "3 | 4"],
+    "Insert row below": ["a | b", "--|--", "1 | 2", "|  |  |", "3 | 4"],
+    "Move row up": ["a | b", "--|--", "3 | 4", "1 | 2"],
+    "Move row down": ["a | b", "--|--", "3 | 4", "1 | 2"],
+    "Delete row": ["a | b", "--|--", "3 | 4"],
+    "Insert column left": [
+      "a | Column | b",
+      "--| --- |--",
+      "1 |  | 2",
+      "3 |  | 4",
+    ],
+    "Insert column right": [
+      "a | Column | b",
+      "--| --- |--",
+      "1 |  | 2",
+      "3 |  | 4",
+    ],
+    "Move column left": ["| b|a ", "--|--", "| 2|1 ", "| 4|3 "],
+    "Move column right": ["| b|a ", "--|--", "| 2|1 ", "| 4|3 "],
+    "Delete column": ["| a |", "| --|", "| 1 |", "| 3 |"],
+    "Align left": ["a | b", ":--- |--", "1 | 2", "3 | 4"],
+    "Align center": ["a | b", ":---: |--", "1 | 2", "3 | 4"],
+    "Align right": ["a | b", "---: |--", "1 | 2", "3 | 4"],
+  },
+  "mixed.md": {
+    "Insert row above": [
+      "| a | b |",
+      "|:--|--:|",
+      "1 | 2",
+      "|  |  |",
+      "| 3 | 4 |",
+    ],
+    "Insert row below": [
+      "| a | b |",
+      "|:--|--:|",
+      "1 | 2",
+      "|  |  |",
+      "| 3 | 4 |",
+    ],
+    "Move row up": ["| a | b |", "|:--|--:|", "| 3 | 4 |", "1 | 2"],
+    "Move row down": ["| a | b |", "|:--|--:|", "| 3 | 4 |", "1 | 2"],
+    "Delete row": ["| a | b |", "|:--|--:|", "| 3 | 4 |"],
+    "Insert column left": [
+      "| a | Column | b |",
+      "|:--| --- |--:|",
+      "1 |  | 2",
+      "| 3 |  | 4 |",
+    ],
+    "Insert column right": [
+      "| a | Column | b |",
+      "|:--| --- |--:|",
+      "1 |  | 2",
+      "| 3 |  | 4 |",
+    ],
+    "Move column left": ["| b | a |", "|--:|:--|", "| 2|1 ", "| 4 | 3 |"],
+    "Move column right": ["| b | a |", "|--:|:--|", "| 2|1 ", "| 4 | 3 |"],
+    "Delete column": ["| a |", "|:--|", "| 1 |", "| 3 |"],
+    "Align left": ["| a | b |", "| :--- |--:|", "1 | 2", "| 3 | 4 |"],
+    "Align center": ["| a | b |", "| :---: |--:|", "1 | 2", "| 3 | 4 |"],
+    "Align right": ["| a | b |", "| ---: |--:|", "1 | 2", "| 3 | 4 |"],
+  },
+};
+
+describe.each(PIPELESS_FIXTURES)(
+  "the Cell actions menu without outer pipes: $name",
+  (f: PipelessFixture) => {
+    for (const [label, row, column] of CASES) {
+      test(`${label} writes the table's own spelling, one undo step`, () => {
+        const main = soloMain(f.text, layers());
+        contextMenu(cellEl(main, row, column));
+        item(label).click();
+        const lines = SPELLED[f.name]?.[label];
+        if (!lines) throw new Error(`no spelling for ${label}`);
+        expect(bytes(main.state)).toBe(withTable(f, lines));
+        expect(menu()).toBeNull();
+        undo(main);
+        expect(bytes(main.state)).toBe(f.text);
+      });
+    }
+
+    test("the plus buttons insert a column and a row in its spelling", () => {
+      const main = soloMain(f.text, layers());
+      layout(main);
+      move(cellEl(main, 0, 1), 102, 15);
+      button("Insert column here")?.click();
+      expect(bytes(main.state)).toBe(
+        withTable(f, SPELLED[f.name]?.["Insert column left"] ?? []),
+      );
+      expect(where(main)).toEqual([0, 1]);
+      undo(main);
+      expect(bytes(main.state)).toBe(f.text);
+      layout(main);
+      move(cellEl(main, 2, 0), 5, 61);
+      button("Insert row here")?.click();
+      expect(bytes(main.state)).toBe(
+        withTable(f, SPELLED[f.name]?.["Insert row above"] ?? []),
+      );
+      expect(where(main)).toEqual([2, 0]);
+    });
+  },
+);
 
 describe("deleting under an open cell", () => {
   test("Delete row on the open cell's row leaves focus off the main view", async () => {

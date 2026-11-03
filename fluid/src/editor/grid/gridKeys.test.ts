@@ -20,6 +20,11 @@ import {
 } from "../../test/cellKit";
 import * as Y from "yjs";
 
+import {
+  PIPELESS_FIXTURES,
+  tableStart,
+  withTable,
+} from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { activeCell } from "./cellEditor";
 import { hostOpenCell } from "./gridWidget";
@@ -466,6 +471,99 @@ function focused(main: EditorView): [number, number] | null {
 
 const WIDE = "| a | b | c |\n| - | - | - |\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |\n";
 
+// R23: the cell keys work the same in a table without outer pipes.
+describe.each(PIPELESS_FIXTURES)("keys without outer pipes: $name", (f) => {
+  test("Tab walks every cell, Shift+Tab walks back, the bytes stay", () => {
+    const main = solo(f.text);
+    open(main, 0, 0);
+    const order = [
+      [0, 1],
+      [1, 0],
+      [1, 1],
+      [2, 0],
+      [2, 1],
+    ];
+    for (const [row, column] of order) {
+      expect(press(cellView(main), "Tab")).toBe(true);
+      expectOpen(main, row ?? 0, column ?? 0);
+    }
+    for (const [row, column] of order.reverse().slice(1)) {
+      expect(press(cellView(main), "Tab", { shift: true })).toBe(true);
+      expectOpen(main, row ?? 0, column ?? 0);
+    }
+    press(cellView(main), "Tab", { shift: true });
+    expectOpen(main, 0, 0);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test("Tab in the last cell adds a row, Mod-z takes it back", () => {
+    const main = solo(f.text);
+    open(main, 2, 1);
+    expect(press(cellView(main), "Tab")).toBe(true);
+    expectOpen(main, 3, 0);
+    // A new row's cells are empty, and an empty edge cell needs its edge
+    // pipe to exist: the one place R23 adds pipes a table did not have.
+    expect(bytes(main.state)).toBe(withTable(f, [...f.lines, "|  |  |"]));
+    expect(gridTables(main.state)[0]?.rows.map((r) => r.length)).toEqual([
+      2, 2, 2, 2,
+    ]);
+    const editor = activeCell(main);
+    if (!editor) throw new Error("no cell editor mounted");
+    typeIn(editor, "5");
+    expect(bytes(main.state)).toBe(withTable(f, [...f.lines, "| 5 |  |"]));
+    press(cellView(main), "z", { mod: true });
+    press(cellView(main), "z", { mod: true });
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test("Enter moves down, and in the last row adds a row in the same column", () => {
+    const main = solo(f.text);
+    open(main, 0, 1);
+    expect(press(cellView(main), "Enter")).toBe(true);
+    expectOpen(main, 1, 1);
+    press(cellView(main), "Enter");
+    expectOpen(main, 2, 1);
+    expect(bytes(main.state)).toBe(f.text);
+    press(cellView(main), "Enter");
+    expectOpen(main, 3, 1);
+    expect(bytes(main.state)).toBe(withTable(f, [...f.lines, "|  |  |"]));
+  });
+
+  test("arrows cross the cell edges and the rows", () => {
+    const main = solo(f.text);
+    open(main, 1, 0);
+    expect(press(cellView(main), "ArrowRight")).toBe(true);
+    expectOpen(main, 1, 1);
+    expect(head(main)).toBe(cellAt(main, 1, 1).content.from);
+    expect(press(cellView(main), "ArrowLeft")).toBe(true);
+    expectOpen(main, 1, 0);
+    expect(head(main)).toBe(cellAt(main, 1, 0).content.to);
+    expect(press(cellView(main), "ArrowDown")).toBe(true);
+    expectOpen(main, 2, 0);
+    expect(press(cellView(main), "ArrowUp")).toBe(true);
+    expectOpen(main, 1, 0);
+    press(cellView(main), "ArrowUp");
+    expectOpen(main, 0, 0);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test("Escape closes the cell onto its element, and Escape again leaves the table", async () => {
+    const main = solo(f.text);
+    open(main, 2, 1);
+    expect(press(cellView(main), "Escape")).toBe(true);
+    expect(main.state.field(openCellField)).toBeNull();
+    const el = cellEl(main, 2, 1);
+    expect(document.activeElement).toBe(el);
+    expect(el.textContent).toBe("4");
+    await flush();
+    keyOn(el, "Escape");
+    const end = tableStart(f) + f.lines.join("\n").length;
+    expect(main.state.selection.main.head).toBe(end + 1);
+    expect(main.hasFocus).toBe(true);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+});
+
 describe("grid navigation", () => {
   test("arrows move between cells and stop at the edges", () => {
     const main = solo(WIDE);
@@ -575,6 +673,39 @@ describe("grid navigation", () => {
     expect(again.defaultPrevented).toBe(true);
     expect(bytes(main.state)).toBe(cleared);
   });
+
+  // R23: clearing a bare edge cell must not take the cell with it (` | 2` is
+  // a leading pipe and one cell, `1 | ` a trailing pipe and one cell), so
+  // the cleared cell keeps the one pipe it needs, as an empty pasted value.
+  describe.each(PIPELESS_FIXTURES)(
+    "clearing without outer pipes: $name",
+    (f) => {
+      test.each([
+        ["Delete", 0, "| | 2"],
+        ["Backspace", 0, "| | 2"],
+        ["Delete", 1, "1 | |"],
+        ["Backspace", 1, "1 | |"],
+      ])("%s on cell 1/%i keeps the row's two cells", (key, column, line) => {
+        const main = solo(f.text);
+        const el = navOn(main, 1, column);
+        keyOn(el, key);
+        const lines = [...f.lines];
+        lines[2] = line;
+        expect(bytes(main.state)).toBe(withTable(f, lines));
+        expect(
+          gridTables(main.state)[0]?.rows.map((row) => row.map((c) => c.text)),
+        ).toEqual([
+          ["a", "b"],
+          column === 0 ? ["", "2"] : ["1", ""],
+          ["3", "4"],
+        ]);
+        expect(focused(main)).toEqual([1, column]);
+        expect(main.state.field(openCellField)).toBeNull();
+        keyOn(cellEl(main, 1, column), "z", { ...modKey, keyCode: 90 });
+        expect(bytes(main.state)).toBe(f.text);
+      });
+    },
+  );
 
   test("Escape leaves the table with the caret on the line after it", () => {
     const main = solo();

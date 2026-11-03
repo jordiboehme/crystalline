@@ -33,6 +33,7 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
+import { PIPELESS_FIXTURES, withTable } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { baseExtensions } from "../setup";
 import { activeCell } from "./cellEditor";
@@ -293,6 +294,39 @@ describe("replacing inside cells (R20)", () => {
     const table = gridTables(main.state)[0];
     expect(table?.rows.map((row) => row.length)).toEqual([1, 1]);
     expect(table?.rows[1]?.[0]?.text).toBe("x\\\\");
+  });
+});
+
+// R23: find and replace reach the cells of a table without outer pipes, and
+// a replace inside one of its edge cells never splits it.
+describe.each(PIPELESS_FIXTURES)("search without outer pipes: $name", (f) => {
+  test.each([
+    ["3", 2, 0],
+    ["4", 2, 1],
+  ])("a hit on %s opens its cell with the hit selected", (hit, row, column) => {
+    const main = soloMain(f.text, layers());
+    query(main, hit);
+    openPanel(main);
+    findNext(main);
+    expect(openPlace(main)).toEqual([row, column]);
+    expect(selected(main)).toBe(hit);
+    expect(bytes(main.state)).toBe(f.text);
+  });
+
+  test.each([
+    ["3", 0],
+    ["4", 1],
+  ])("replacing %s with a|b stays inside the cell", (hit, column) => {
+    const main = soloMain(f.text, layers());
+    query(main, hit, "a|b");
+    openSearchPanel(main);
+    findNext(main);
+    replaceNext(main);
+    const lines = [...f.lines];
+    lines[3] = lines[3]?.replace(hit, "a\\|b") ?? "";
+    expect(bytes(main.state)).toBe(withTable(f, lines));
+    expect(shape(main.state)).toEqual([2, 2, 2]);
+    expect(gridTables(main.state)[0]?.rows[2]?.[column]?.text).toBe("a\\|b");
   });
 });
 

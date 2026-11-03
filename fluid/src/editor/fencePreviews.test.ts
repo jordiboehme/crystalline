@@ -182,6 +182,23 @@ describe("fence previews", () => {
     view.destroy();
   });
 
+  it.each([
+    ["no outer pipes", "a | b\n--|--\n1 | 2\n3 | 4\n"],
+    ["some outer pipes", "| a | b |\n|:--|--:|\n1 | 2\n| 3 | 4 |\n"],
+  ])("previews a table with %s, every row and cell (R23)", (_name, doc) => {
+    const view = editor(doc);
+    const table = view.dom.querySelector(".cm-table-preview table");
+    const rows = [...(table?.querySelectorAll("tr") ?? [])].map((tr) =>
+      [...tr.querySelectorAll("th, td")].map((el) => el.textContent),
+    );
+    expect(rows).toEqual([
+      ["a", "b"],
+      ["1", "2"],
+      ["3", "4"],
+    ]);
+    view.destroy();
+  });
+
   it("shows nothing for a fence of another language", () => {
     const view = editor("```rust\nfn main() {}\n```\n");
     expect(view.dom.querySelector(".cm-mermaid-preview")).toBeNull();

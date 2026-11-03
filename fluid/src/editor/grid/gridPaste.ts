@@ -19,7 +19,7 @@ import { ChangeSet, Prec } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
 import { transferFiles } from "../attachments";
-import type { SpanChange } from "../tableModel";
+import type { SpanChange, TableLine } from "../tableModel";
 import { addColumnAfter, addRowBelow, parseTable } from "../tableModel";
 import { noteUndoLanding } from "./cellEditor";
 import { closeUndoGroup } from "./gridKeys";
@@ -59,6 +59,51 @@ function stored(text: string, closing: boolean): string {
   }
   if (closing && run % 2 === 1) out += "\\";
   return out;
+}
+
+/**
+ * Whether a cell's text can open a line without a leading pipe: it must start
+ * with a letter or a digit, and not as a list number (`1.` or `1)` followed
+ * by a blank starts a list). Anything else (`-`, `#`, `>`, `<`, a fence) could
+ * start another block and end the table, so such a row keeps its pipe.
+ */
+function opensBare(text: string): boolean {
+  return /^[\p{L}\p{N}]/u.test(text) && !/^\d{1,9}[.)](\s|$)/.test(text);
+}
+
+/**
+ * R23: the edge pipes a pasted row no longer needs. The verbs that grow the
+ * table add a row or a column with empty cells, and an empty edge cell needs
+ * its edge pipe; once the paste has filled it, a row that the table spells
+ * without that pipe (`want`) gets its own spelling back. A row the paste did
+ * not reach keeps every byte, and so does an edge cell left empty.
+ */
+function spare(from: number, line: TableLine, want: TableLine): ChangeSpec[] {
+  const trims: ChangeSpec[] = [];
+  const first = line.cells[0];
+  const last = line.cells.at(-1);
+  if (!first || !last) return trims;
+  if (line.leadingPipe && !want.leadingPipe && opensBare(first.raw.trim())) {
+    const blank = first.raw.length - first.raw.trimStart().length;
+    trims.push({
+      from: from + line.start + line.indent.length,
+      to: from + line.start + first.from + blank,
+    });
+  }
+  const text = last.raw.trim();
+  if (
+    line.trailingPipe &&
+    !want.trailingPipe &&
+    text !== "" &&
+    !text.endsWith("\\") &&
+    (line.cells.length > 1 || trims.length === 0)
+  ) {
+    trims.push({
+      from: from + line.start + last.from + last.raw.trimEnd().length,
+      to: from + line.start + last.to + 1,
+    });
+  }
+  return trims;
 }
 
 function absolute(from: number, changes: SpanChange[]): ChangeSpec[] {
@@ -149,18 +194,41 @@ function fill(main: EditorView, rows: string[][]): boolean {
   const grown = tableIn(doc, from, to);
   const fills: ChangeSpec[] = [];
   rows.forEach((values, r) => {
+    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+    const line = grown.model.lines[index];
     values.forEach((value, c) => {
       const target = grown.rows[cell.row + r]?.[cell.column + c];
-      if (!target) return;
+      if (!target || !line) return;
       const closing = doc.sliceString(target.content.to, target.content.to + 1);
+      // An empty value at an edge without a pipe would take the cell with it
+      // (` | 2` is a leading pipe, `1 | ` a trailing one): the one pipe it
+      // needs to exist goes in its place (R23).
+      const column = cell.column + c;
+      const bare =
+        (column === 0 && !line.leadingPipe) ||
+        (column === line.cells.length - 1 && !line.trailingPipe);
       fills.push({
         from: target.content.from,
         to: target.content.to,
-        insert: stored(value, closing === "|"),
+        insert: value === "" && bare ? "|" : stored(value, closing === "|"),
       });
     });
   });
   apply(fills);
+
+  // The rows the paste reached get the table's own spelling back where a
+  // grown row or column added an edge pipe they no longer need. A new row
+  // copies the spelling of the last row the table had.
+  const filled = model();
+  const trims: ChangeSpec[] = [];
+  const lastOld = table.model.lines.at(-1);
+  rows.forEach((_values, r) => {
+    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+    const line = filled.lines[index];
+    const want = table.model.lines[index] ?? lastOld;
+    if (line && want) trims.push(...spare(from, line, want));
+  });
+  if (trims.length > 0) apply(trims);
 
   const final = tableIn(doc, from, to);
   const home = final.rows[cell.row]?.[cell.column];

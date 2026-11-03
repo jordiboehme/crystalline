@@ -221,6 +221,18 @@ function field(text: string): string {
   return `| ${text} `;
 }
 
+/**
+ * Fields appended past the last cell of a line that has no trailing pipe
+ * (R23: the line keeps its own spelling). The new cells need a closing pipe
+ * only when the last of them is empty, because GFM reads `1 | ` as a trailing
+ * pipe and the empty cell would not exist; `Column` and a rule cell exist
+ * without one, so those lines stay without it.
+ */
+function openEnded(fields: string[], last: string): string {
+  const joined = fields.join("");
+  return last === "" ? ` ${joined}|` : ` ${joined.slice(0, -1)}`;
+}
+
 /** How many of a rule cell's characters are colons rather than dashes. */
 function colons(align: Align): number {
   if (align === "center") return 2;
@@ -285,8 +297,10 @@ export function addRowBelow(
  * Add a column after `column`: one insertion per line, at the boundary that
  * closes the target cell. A row too short to have that column is extended with
  * empty cells inside the same insertion, so every row grows by the same number
- * of columns. A row without a trailing pipe that gains a cell at its END gains
- * a closing pipe with it - the minimum needed for the new cell to exist.
+ * of columns. A row without a trailing pipe that gains a cell at its END keeps
+ * that spelling when the new cell has text (the header's `Column`, the rule's
+ * dashes) and gains a closing pipe when it is empty - the minimum needed for
+ * the new cell to exist (R23).
  */
 export function addColumnAfter(
   model: TableModel,
@@ -313,7 +327,7 @@ export function addColumnAfter(
     const atEnd = target === line.cells.length - 1 && !line.trailingPipe;
     changes.push({
       from: line.start + anchor.to,
-      insert: atEnd ? ` ${fields.join("")}|` : fields.join(""),
+      insert: atEnd ? openEnded(fields, added) : fields.join(""),
     });
   }
   return changes;
@@ -407,7 +421,7 @@ export function addColumnBefore(
     fields.push(field(added));
     changes.push({
       from: line.start + last.to,
-      insert: line.trailingPipe ? fields.join("") : ` ${fields.join("")}|`,
+      insert: line.trailingPipe ? fields.join("") : openEnded(fields, added),
     });
   }
   return changes;
@@ -464,8 +478,11 @@ export function moveRow(
  * parseable: when the cell that lands in its first slot is empty or opens with
  * a blank, the bare text would read as nothing or as the line's indent (four
  * blanks turn a row into a code block), so that line gains an explicit leading
- * pipe, the minimum for the cell to exist, as `addColumnBefore` does. A line
- * with pipes on both edges is always byte-identical apart from the order.
+ * pipe, the minimum for the cell to exist, as `addColumnBefore` does. The
+ * mirror rule holds at the other end: a line without a trailing pipe whose
+ * last slot receives an empty cell gains a closing pipe, since `x | ` reads
+ * as a trailing pipe and the cell would be gone (R23). A line with pipes on
+ * both edges is always byte-identical apart from the order.
  */
 export function moveColumn(
   model: TableModel,
@@ -494,7 +511,10 @@ export function moveColumn(
     const bare = low === 0 && !line.leadingPipe;
     const opening = raws[0] ?? "";
     const needsPipe = bare && (opening === "" || /^\s/.test(opening));
-    const text = `${needsPipe ? "|" : ""}${raws.join("|")}`;
+    const openEnd = high === line.cells.length - 1 && !line.trailingPipe;
+    const closing = raws[raws.length - 1] ?? "";
+    const needsClose = openEnd && closing.trim() === "";
+    const text = `${needsPipe ? "|" : ""}${raws.join("|")}${needsClose ? "|" : ""}`;
     if (text === line.text.slice(first.from, lastSlot.to)) continue;
     changes.push({
       from: line.start + first.from,
@@ -542,6 +562,16 @@ export function deleteRow(
  * its line. A row too short to have the column is left untouched. The last
  * column of a table is refused; a table needs one.
  *
+ * Two spellings need the adjoining pipe to stay (R23). On a line without a
+ * pipe at that edge, deleting an edge cell exposes its neighbour as the new
+ * edge cell; when that neighbour is blank it exists only with a pipe at that
+ * edge (` | 3` is a leading pipe and one cell, `1 | ` a trailing pipe and
+ * one cell), so only the cell's span goes and the pipe becomes the edge pipe.
+ * And a table left with ONE column needs a pipe on every line, because a
+ * pipeless one-column table is not a table at all (`a` over `--` is a setext
+ * heading): every line is written with outer pipes, keeping the ones it has
+ * and gaining the ones it lacks.
+ *
  * The whole verb is also refused when any one line would be left blank by it,
  * which a line without edge pipes that is ragged down to the target column is:
  * its only cell IS the column, so the deletion takes the line down to nothing.
@@ -556,21 +586,62 @@ export function deleteColumn(
 ): SpanChange[] | null {
   if (model.columns <= 1) return null;
   if (column < 0 || column >= model.columns) return null;
+  const single = model.columns === 2;
 
   const changes: SpanChange[] = [];
   for (const line of model.lines) {
     const cell = line.cells[column];
-    if (!cell) continue;
+    if (!cell) {
+      if (single) changes.push(...outerPipes(line, line.text, 0, 0));
+      continue;
+    }
+    const lastCell = column === line.cells.length - 1;
+    const neighbour = line.cells[lastCell ? column - 1 : column + 1];
+    const blank = neighbour !== undefined && neighbour.raw.trim() === "";
     let from = cell.from;
     let to = cell.to;
-    if (column < line.cells.length - 1) {
-      to = cell.to + 1;
+    if (!lastCell) {
+      // The first cell of a line without a leading pipe: its closing pipe
+      // stays as the new leading pipe when the next cell needs one.
+      const keep = column === 0 && !line.leadingPipe && (blank || single);
+      if (!keep) to = cell.to + 1;
     } else if (cell.from > line.indent.length) {
-      from = cell.from - 1;
+      const keep = !line.trailingPipe && (blank || single);
+      if (!keep) from = cell.from - 1;
     }
-    if (`${line.text.slice(0, from)}${line.text.slice(to)}`.trim() === "")
-      return null;
+    const rest = `${line.text.slice(0, from)}${line.text.slice(to)}`;
+    if (rest.trim() === "") return null;
     changes.push({ from: line.start + from, to: line.start + to });
+    if (single) changes.push(...outerPipes(line, rest, from, to - from));
+  }
+  return changes;
+}
+
+/**
+ * The insertions that give `rest` - a line's text after one deletion at
+ * `at` of `removed` characters - a leading and a trailing pipe it lacks, in
+ * offsets of the ORIGINAL line, so they sit beside the deletion in one
+ * change list. A lone cell needs a pipe to be a row at all.
+ */
+function outerPipes(
+  line: TableLine,
+  rest: string,
+  at: number,
+  removed: number,
+): SpanChange[] {
+  const shape = parseLine(rest, 0);
+  const changes: SpanChange[] = [];
+  if (!shape.leadingPipe) {
+    const open = shape.indent.length;
+    const original = open < at ? open : open + removed;
+    const spaced = /\s/.test(rest[open] ?? "") ? "|" : "| ";
+    changes.push({ from: line.start + original, insert: spaced });
+  }
+  if (!shape.trailingPipe) {
+    const close = trimmedEnd(rest, shape.indent.length);
+    const original = close <= at ? close : close + removed;
+    const spaced = /\s/.test(rest[close - 1] ?? "") ? "|" : " |";
+    changes.push({ from: line.start + original, insert: spaced });
   }
   return changes;
 }
@@ -597,11 +668,17 @@ export function setAlignment(
   if (!cell) return null;
 
   const dashes = (cell.raw.match(/-/g) ?? []).length;
+  // A bare edge of the rule takes no blank (R23): before the first cell it
+  // would be indent (three plus one is indented code), after the last it
+  // would only be trailing whitespace.
+  const open = column === 0 && !delimiter.leadingPipe ? "" : " ";
+  const lastCell = column === delimiter.cells.length - 1;
+  const close = lastCell && !delimiter.trailingPipe ? "" : " ";
   return [
     {
       from: delimiter.start + cell.from,
       to: delimiter.start + cell.to,
-      insert: ` ${ruleWithDashes(align, dashes)} `,
+      insert: `${open}${ruleWithDashes(align, dashes)}${close}`,
     },
   ];
 }

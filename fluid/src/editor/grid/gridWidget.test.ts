@@ -20,8 +20,13 @@ import {
   typeIn,
 } from "../../test/cellKit";
 import { parsedState } from "../../test/parse";
+import {
+  LIST_ITEM_NOT_A_TABLE,
+  PIPELESS_FIXTURES,
+} from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { baseExtensions } from "../setup";
+import { tableAlignColumn } from "../tableVerbs";
 import { wikilinkResolverFacet } from "../wikilinkChips";
 import { activeCell } from "./cellEditor";
 import { GridWidget, gridField } from "./gridWidget";
@@ -199,6 +204,49 @@ describe("drawing", () => {
     const three = soloMain(DOC.replace("2", "3"), layers());
     expect(widgetOf(one).eq(widgetOf(two))).toBe(true);
     expect(widgetOf(one).eq(widgetOf(three))).toBe(false);
+  });
+
+  // R23: a table without outer pipes on some or all rows is drawn like any.
+  describe.each(PIPELESS_FIXTURES)(
+    "a table without outer pipes: $name",
+    (f) => {
+      test("draws as a grid with the right cell texts and alignments", () => {
+        const main = soloMain(f.text, layers());
+        const table = grid(main);
+        const texts = [...table.querySelectorAll("tr")].map((tr) =>
+          [...tr.querySelectorAll("th, td")].map((el) => el.textContent),
+        );
+        expect(texts).toEqual(f.cells);
+        expect([0, 1].map((c) => cellEl(main, 1, c).style.textAlign)).toEqual(
+          f.aligns,
+        );
+        expect([0, 1].map((c) => cellEl(main, 0, c).style.textAlign)).toEqual(
+          f.aligns,
+        );
+        for (const line of f.lines) {
+          expect(main.contentDOM.textContent).not.toContain(line);
+        }
+        expect(main.dom.querySelector(".cm-table-preview")).toBeNull();
+      });
+
+      test("an alignment written into its rule is drawn", () => {
+        const main = soloMain(f.text, layers());
+        const at = f.text.indexOf(f.lines[2] ?? "");
+        expect(tableAlignColumn(main, "center", at, { focus: false })).toBe(
+          true,
+        );
+        expect(cellEl(main, 1, 0).style.textAlign).toBe("center");
+        expect(cellEl(main, 2, 0).style.textAlign).toBe("center");
+        expect(cellEl(main, 1, 1).style.textAlign).toBe(f.aligns[1]);
+      });
+    },
+  );
+
+  test("`- | -` under a header is a list item, so the lines stay text", () => {
+    const main = soloMain(LIST_ITEM_NOT_A_TABLE, layers());
+    expect(main.dom.querySelector('[role="grid"]')).toBeNull();
+    expect(main.dom.querySelector(".cm-table-preview")).toBeNull();
+    expect(main.contentDOM.textContent).toContain("a | b");
   });
 });
 
