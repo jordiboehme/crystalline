@@ -1,3 +1,7 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { describe, expect, it } from "vitest";
 
 import { cleanClipboardHtml } from "./clipboardHtml";
@@ -260,6 +264,65 @@ describe("htmlToMarkdown", () => {
       '<p><span data-macro-name="status" class="lozenge">[x] done</span></p>',
     );
     expect(md.trim()).toBe(":status[x done]{grey}");
+  });
+});
+
+/**
+ * The cells of the first body row of `markdown`'s table, as a GFM reader draws
+ * them: text, with `code` around a code span. `null` when no table is drawn.
+ */
+function readBackCells(markdown: string): string[] | null {
+  const html = renderToStaticMarkup(
+    createElement(ReactMarkdown, { remarkPlugins: [remarkGfm] }, markdown),
+  );
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const row = doc.querySelector("tbody tr");
+  if (row === null) {
+    return null;
+  }
+  return Array.from(row.querySelectorAll("td"), (td) =>
+    Array.from(td.childNodes, (node) =>
+      node.nodeName === "CODE"
+        ? `code(${node.textContent})`
+        : (node.textContent ?? ""),
+    ).join(""),
+  );
+}
+
+describe("htmlToMarkdown table cells", () => {
+  function table(cell: string): string {
+    return `<table><tr><th>h</th><th>i</th></tr><tr><td>${cell}</td><td>z</td></tr></table>`;
+  }
+
+  it.each([
+    ["ends in a backslash", "a\\", "a\\"],
+    ["ends in a backslash before a pipe", "a\\|", "a\\|"],
+    ["holds a backslash and a pipe", "a\\|b", "a\\|b"],
+    ["holds two backslashes", "a\\\\b", "a\\\\b"],
+    ["holds a pipe", "x | y", "x | y"],
+    ["holds a pipe in code", "<code>a|b</code>", "code(a|b)"],
+    [
+      "holds code that ends in a backslash",
+      "<code>a\\</code>|x",
+      "code(a\\)|x",
+    ],
+    [
+      "holds two backslashes and a pipe in code",
+      "<code>a\\\\|b</code>",
+      "code(a\\\\|b)",
+    ],
+  ])("reads back as pasted when it %s", (_name, cell, shown) => {
+    const md = htmlToMarkdown(table(cell));
+    expect(readBackCells(md)).toEqual([shown, "z"]);
+  });
+
+  it("keeps the row whole when code holds a backslash before a pipe", () => {
+    // GFM cannot keep this one exactly: in a cell, `\|` in code reads as a
+    // pipe and `\\` as two backslashes. The pipe stays escaped and the
+    // backslash stays, doubled, rather than the row breaking apart.
+    const md = htmlToMarkdown(table("<code>a\\|b</code>"));
+    expect(md).toContain("| `a\\\\\\|b` | z   |");
+    expect(readBackCells(md)).toEqual(["code(a\\\\|b)", "z"]);
   });
 });
 

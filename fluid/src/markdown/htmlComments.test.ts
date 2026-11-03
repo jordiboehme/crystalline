@@ -15,6 +15,14 @@ describe("HTML comments", () => {
     expect(withoutHtmlComments("<div>x</div>")).toBe("<div>x</div>");
   });
 
+  it("takes out a comment that taking out another one made", () => {
+    expect(withoutHtmlComments("<!-<!-- x -->- y -->")).toBe("");
+    expect(withoutHtmlComments("a <!-<!-<!-- x -->- y -->- z --> b")).toBe(
+      "a  b",
+    );
+    expect(stripHtmlComments("<!-<!-- x -->- y")).toBe("");
+  });
+
   it("cleans a snippet the window cut inside a comment, and keeps an arrow", () => {
     expect(stripHtmlComments("night <!-- sources: the har")).toBe("night ");
     expect(stripHtmlComments("A --> B <!-- x --> C")).toBe("A --> B  C");
