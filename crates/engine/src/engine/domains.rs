@@ -795,7 +795,7 @@ impl Engine {
         // regenerated after a pull would be an unshared change that can never
         // be shared. A file domain, so this is a MANIFEST read and never the
         // store lock.
-        if self.domain_is_read_only(domain).await {
+        if self.writes_refused(domain).await {
             return;
         }
         // The switch in effect, so the listings follow what the index holds:

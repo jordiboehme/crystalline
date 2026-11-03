@@ -4415,7 +4415,7 @@ impl Engine {
                 home: crystalline_core::reflection::ReflectionHome::Here
                     | crystalline_core::reflection::ReflectionHome::Local
             })
-        ) && !self.domain_is_read_only(domain).await
+        ) && !self.writes_refused(domain).await
             // A takeover stops the old host's backup at once, not at its
             // next heartbeat.
             && matches!(self.confirm_reflection_host(domain).await, Ok(None))
@@ -5540,8 +5540,11 @@ impl Engine {
             return Err(EngineError::DomainReadOnly(read_only_sentence(name)));
         }
         // An archived GitHub repository takes no push, so its domain takes
-        // no write either, from anybody. Read from what the governor last
-        // learned; this never asks GitHub.
+        // no write either, from anybody: read-only for everyone, instance
+        // admins and the machine owner included, on a domain GitHub governs.
+        // A daemon with no resolver installed governs nothing and skips
+        // this; GitHub refuses the push to an archived repository anyway.
+        // Read from what the governor last learned; this never asks GitHub.
         if let Some(repo) = self.github_archived_repo(name) {
             self.require_domain(name, scope).await?;
             return Err(EngineError::DomainReadOnly(archived_sentence(name, &repo)));
@@ -5681,6 +5684,16 @@ impl Engine {
     /// session, which keep theirs.
     pub async fn release_command_locks(&self) {
         self.release_taken_hosts().await;
+    }
+
+    /// Whether nothing may be written into `name` by anybody right now: its
+    /// MANIFEST says `read_only: on`, or GitHub governs it and its
+    /// repository is archived ([`Engine::github_archived_repo`]). The filter
+    /// every sweep and loop that writes into other domains on its own (link
+    /// rewrites, retags, listings after a pull, the automation loops) leaves
+    /// a domain out by.
+    pub(crate) async fn writes_refused(&self, name: &str) -> bool {
+        self.domain_is_read_only(name).await || self.github_archived_repo(name).is_some()
     }
 
     /// Every registered domain that is read-only right now.

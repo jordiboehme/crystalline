@@ -1781,8 +1781,8 @@ impl Engine {
             if hidden.contains(&domain)
                 || (domain_id == src.domain_id && path == src.path)
                 // A read-only domain's link is left as it was, like a hidden
-                // domain's (decision D7).
-                || self.domain_is_read_only(&domain).await
+                // domain's (decision D7); so is an archived repository's.
+                || self.writes_refused(&domain).await
             {
                 continue;
             }
@@ -2305,7 +2305,7 @@ impl Engine {
                 let is_locked = match locked.get(&d.domain) {
                     Some(known) => *known,
                     None => {
-                        let known = self.domain_is_read_only(&d.domain).await;
+                        let known = self.writes_refused(&d.domain).await;
                         locked.insert(d.domain.clone(), known);
                         known
                     }

@@ -800,6 +800,27 @@ impl GithubGovernor {
             .then_some(repo)
     }
 
+    /// Carry the archived mark of `old` over to `new` after the engine
+    /// followed a rename GitHub confirmed, so the renamed domain stays
+    /// read-only until a lookup of the new name decides. The old name keeps
+    /// its mark only while a domain is still connected to it.
+    pub fn follow_archived_rename(&self, old: &str, new: &str) {
+        let (old_key, new_key) = (repo_key(old), repo_key(new));
+        let still_connected = self
+            .env
+            .origins()
+            .iter()
+            .any(|(_, repo)| repo_key(repo) == old_key);
+        let mut state = lock(&self.state);
+        if !state.archived.contains(&old_key) {
+            return;
+        }
+        state.archived.insert(new_key);
+        if !still_connected {
+            state.archived.remove(&old_key);
+        }
+    }
+
     /// Mark `repo` archived at once, because a webhook said so (a payload
     /// may narrow on its own word). The generation is bumped under the same
     /// lock, so a lookup that started before this cannot clear the mark
@@ -2394,6 +2415,9 @@ impl super::Engine {
                     );
                 }
                 let moved = self.move_origin_repo(&old_key, &live, &skip)?;
+                if !moved.is_empty() {
+                    governor.follow_archived_rename(old, &live);
+                }
                 for domain in connected
                     .iter()
                     .filter(|d| !moved.contains(d) && !skip.contains(*d))
@@ -3878,5 +3902,21 @@ mod tests {
         assert_eq!(rig.governor.archived(DOMAIN), None);
         assert_eq!(rig.governor.archived("elsewhere"), None);
         assert_eq!(rig.github.listings(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_rename_carries_the_archived_mark_to_the_new_name() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        // The engine moved the domain to the new name.
+        *lock(&rig.env.origins) = vec![(DOMAIN.to_string(), "acme/guide".to_string())];
+        assert_eq!(rig.governor.archived(DOMAIN), None, "not carried yet");
+        rig.governor.follow_archived_rename(REPO, "acme/guide");
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some("acme/guide"));
+        assert!(
+            !lock(&rig.governor.state).archived.contains(&repo_key(REPO)),
+            "no domain is on the old name any more"
+        );
     }
 }

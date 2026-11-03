@@ -217,7 +217,7 @@ impl Engine {
         let mut read_only_left_out: Vec<String> = Vec::new();
         let mut swept_scope = Vec::with_capacity(named.len());
         for name in named {
-            if self.domain_is_read_only(&name).await {
+            if self.writes_refused(&name).await {
                 read_only_left_out.push(name);
             } else {
                 swept_scope.push(name);

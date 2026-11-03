@@ -656,7 +656,7 @@ impl Engine {
         state_dir: &Path,
         files: Option<&[String]>,
     ) -> Result<Option<TeamMarker>> {
-        if self.read_only || self.domain_is_read_only(domain).await {
+        if self.read_only || self.writes_refused(domain).await {
             return Ok(None);
         }
         let Ok(current) = std::fs::read_to_string(tree.join(MANIFEST_PATH)) else {

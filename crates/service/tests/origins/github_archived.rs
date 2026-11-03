@@ -43,6 +43,8 @@ struct Fixture {
     eng: Arc<Engine>,
     auth: Arc<AuthStore>,
     forge: Arc<Forge>,
+    /// `acme/kb` as the forge serves it.
+    kb: Arc<MockProvider>,
     _tmp: tempfile::TempDir,
 }
 
@@ -50,7 +52,15 @@ struct Fixture {
 /// engram whose body says `quokka` and the engram `row-gwrite`.
 fn seeded_repo(domain: &str) -> Arc<MockProvider> {
     let mock = Arc::new(MockProvider::new());
-    let head = mock.add_commit(files(&[
+    let head = mock.add_commit(seed_files(domain));
+    mock.set_branch("main", &head);
+    mock
+}
+
+/// The files of [`seeded_repo`]. Each repository also holds `linker.md`,
+/// which links to `vault`'s `mover`.
+fn seed_files(domain: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
+    files(&[
         (
             "MANIFEST.md",
             manifest("reflection: on\nreflection_home: https://kb.example.com\n"),
@@ -67,9 +77,11 @@ fn seeded_repo(domain: &str) -> Arc<MockProvider> {
             "mover.md",
             engram("Mover", "mover", "An engram that moves."),
         ),
-    ]));
-    mock.set_branch("main", &head);
-    mock
+        (
+            "linker.md",
+            engram("Linker", "linker", "See [[vault:mover]]."),
+        ),
+    ])
 }
 
 /// An instance with the App, `kb` on `acme/kb` and `vault` on
@@ -82,7 +94,7 @@ async fn instance() -> Fixture {
     let root = tmp.path();
     let (kb, vault) = (seeded_repo(KB), seeded_repo(VAULT));
     let (forge, url) = spawn_forge(
-        &[(KB_REPO, kb), ("acme/vault", vault)],
+        &[(KB_REPO, kb.clone()), ("acme/vault", vault)],
         &[(KB_REPO, 1), ("acme/vault", 1)],
         &[(1, "ghs_test")],
     )
@@ -199,6 +211,7 @@ async fn instance() -> Fixture {
         eng,
         auth,
         forge,
+        kb,
         _tmp: tmp,
     }
 }
@@ -600,17 +613,29 @@ async fn after_unarchived_writes_work_again_once_github_says_so() {
 }
 
 /// A signed `archived` body can be sent again with a fresh delivery id
-/// long after the repository was unarchived. It narrows at once, and the
-/// lookup it starts clears the mark without anybody asking.
+/// long after the repository was unarchived. The lookup it starts clears
+/// the mark without anybody asking. That it narrows at once is pinned by
+/// the governor's unit tests: here the warm-up lookup may already have
+/// answered before a check could run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replayed_archived_body_for_a_live_repository_is_cleared_by_the_warm_up_lookup() {
     let fx = instance().await;
+    let facts = || {
+        fx.forge
+            .hits()
+            .iter()
+            .filter(|h| h.path == format!("/repos/{KB_REPO}"))
+            .count()
+    };
+    let before = facts();
     fx.eng
         .apply_github_event("repository", &repository_event("archived", KB_REPO))
         .await
         .unwrap();
-    let marked = fx.eng.github_archived_repo(KB);
-    assert_eq!(marked.as_deref(), Some(KB_REPO), "it narrows at once");
+    assert!(
+        eventually(|| facts() > before).await,
+        "the delivery starts a lookup of its own"
+    );
     assert!(
         eventually(|| fx.eng.github_archived_repo(KB).is_none()).await,
         "the warm-up lookup clears the mark"
@@ -671,4 +696,156 @@ async fn without_an_app_an_archived_repository_writes_as_today_and_is_never_look
         "the domain is not marked read-only"
     );
     assert_eq!(lookups(), before, "{:?}", forge.hits());
+}
+
+/// A move in another domain leaves the links inside the archived domain as
+/// they are, as it leaves a locked domain's: they could never be shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_elsewhere_leaves_the_links_in_an_archived_domain_alone() {
+    let fx = instance().await;
+    archive(&fx).await;
+    let file = |d: &str| std::fs::read_to_string(fx._tmp.path().join(d).join("linker.md")).unwrap();
+    let before = file(KB);
+    let writer = mcp_as(&fx, "gwrite").await;
+    let receipt = writer
+        .call(
+            "move_engram",
+            json!({
+                "identifier": "mover",
+                "domain": VAULT,
+                "destination": "moved/mover",
+                "permalink": "path",
+            }),
+        )
+        .await
+        .unwrap();
+    // The receipt is a JSON object, and guidance lines may follow it.
+    let receipt: Value = serde_json::Deserializer::from_str(&receipt)
+        .into_iter::<Value>()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rewritten: Vec<String> = receipt["rewritten"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r["domain"].as_str().unwrap(),
+                r["permalink"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(rewritten, vec!["vault:linker"], "{receipt}");
+    assert_eq!(file(KB), before, "the archived domain's file is untouched");
+    assert!(file(VAULT).contains("moved/mover"), "{}", file(VAULT));
+}
+
+/// The evolve sweep leaves an archived domain out and names it, as it does
+/// a locked one: nobody could act on its findings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_evolve_sweep_leaves_an_archived_domain_out_and_names_it() {
+    let fx = instance().await;
+    archive(&fx).await;
+    let writer = mcp_as(&fx, "gwrite").await;
+    let answer = writer
+        .call("evolve_engrams", json!({"domains": [KB, VAULT]}))
+        .await
+        .unwrap();
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(
+        answer["scope"]["read_only_left_out"],
+        json!([KB]),
+        "{answer}"
+    );
+}
+
+/// The unnamed reflect queue and the reflect loop leave an archived domain
+/// out: the Reflection's home takes no write there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reflect_loop_leaves_an_archived_domain_out() {
+    let fx = instance().await;
+    archive(&fx).await;
+    let writer = mcp_as(&fx, "gwrite").await;
+    let answer = writer.call("reflect", json!({})).await.unwrap();
+    assert!(!answer.contains("\"kb\""), "{answer}");
+    assert!(answer.contains("\"vault\""), "{answer}");
+}
+
+/// A pull into an archived domain does not regenerate its listings: that
+/// would be a change in the folder that can never be shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_into_an_archived_domain_writes_no_listing() {
+    let fx = instance().await;
+    archive(&fx).await;
+    let mut tree = seed_files(KB);
+    tree.insert(
+        "guides/setup.md".to_string(),
+        engram("Setup", "guides/setup", "How to set up."),
+    );
+    let parent = fx.kb.branch_commit("main").unwrap();
+    let head = fx.kb.add_commit_on(tree, Some(&parent));
+    fx.kb.set_branch("main", &head);
+    fx.eng
+        .origin_update(Some(KB), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let guides = fx._tmp.path().join(KB).join("guides");
+    assert!(guides.join("setup.md").exists(), "the pull landed");
+    assert!(
+        !guides.join("index.md").exists(),
+        "no listing was written into the archived domain"
+    );
+}
+
+/// The share status and a conflict's sides are reads, so they stay open on
+/// an archived domain; the share surfaces that change something refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_share_reads_stay_open_on_an_archived_domain() {
+    let fx = instance().await;
+    archive(&fx).await;
+    let session = login(fx.addr, "gwrite").await.unwrap();
+    let (status, body) = send(
+        &fx,
+        &session,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{KB}/sync"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "the status reads: {body}");
+    let (status, body) = send(
+        &fx,
+        &session,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{KB}/sync/conflicts/nope"),
+        None,
+    )
+    .await;
+    assert!(
+        ![401, 403].contains(&status),
+        "a conflict's sides read: {status} {body}"
+    );
+    for (method, path, body) in [
+        (
+            reqwest::Method::GET,
+            format!("/api/v1/domains/{KB}/sync/changes"),
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/api/v1/domains/{KB}/sync/proposals/999/withdraw"),
+            Some(json!({})),
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/api/v1/domains/{KB}/sync/conflicts/nope/resolve"),
+            Some(json!({ "resolution": "theirs" })),
+        ),
+    ] {
+        let (status, answer) = send(&fx, &session, method, &path, body).await;
+        assert_eq!(status, 403, "{path}: {answer}");
+        assert_eq!(answer["detail"], SENTENCE, "{path}: {answer}");
+    }
 }
