@@ -20,7 +20,7 @@ import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { isIdLine } from "../../reflectionText";
 import { OBSERVATION_LINE } from "../crystallineLines";
 import { frontmatterRegion } from "../frontmatterRegion";
-import { hidesIdLines } from "../hiddenIdLines";
+import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { marksHiddenOnLine } from "./mode";
 
 export type MarkKind =
@@ -178,8 +178,9 @@ export function marksOnLine(
     return [];
   }
   const hidden = options.always === true || marksHiddenOnLine(state, line);
-  // A Reflection never shows a comment, in either mode.
-  const comments = hidden || hidesIdLines(state);
+  // A Reflection never shows a comment, in either mode, in a table cell too.
+  const comments =
+    hidden || hidesIdLines(state) || state.facet(pageHidesComments);
   if (!comments) {
     return [];
   }

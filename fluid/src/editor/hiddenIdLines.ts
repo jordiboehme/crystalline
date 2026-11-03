@@ -34,6 +34,7 @@ import {
   ChangeSet,
   EditorSelection,
   EditorState,
+  Facet,
   Prec,
   RangeSetBuilder,
   StateField,
@@ -87,6 +88,16 @@ export function isIdLineAt(state: EditorState, lineNo: number): boolean {
 export function hidesIdLines(state: EditorState): boolean {
   return state.field(field, false) !== undefined;
 }
+
+/**
+ * Whether the page this buffer edits a part of is a Reflection, which never
+ * shows an HTML comment. The table cell editor holds no id line field of its
+ * own (it hides everything outside the cell), so it is told this by its main
+ * view's `hidesIdLines`.
+ */
+export const pageHidesComments = Facet.define<boolean, boolean>({
+  combine: (values) => values.some(Boolean),
+});
 
 /**
  * The annotations a filter that rebuilds `tr` carries over: its user event

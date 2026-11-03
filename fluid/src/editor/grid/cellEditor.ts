@@ -29,6 +29,7 @@ import {
   defaultKeymap,
   historyField,
   redo as historyRedo,
+  isolateHistory,
   undo as historyUndo,
 } from "@codemirror/commands";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
@@ -36,6 +37,7 @@ import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
   Annotation,
   ChangeSet,
+  Compartment,
   EditorSelection,
   EditorState,
   Facet,
@@ -54,9 +56,14 @@ import {
 } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
+import { copyAsHtml } from "../copyHtml";
+import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
+import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
 import { keptWhole } from "../marks/deleting";
 import { documentLanguage } from "../setup";
 import { formatKeymap } from "../marks/formatting";
+import { marksOnEditLine } from "../marks/mode";
+import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
 import type { MountedCell, OpenCell } from "./openCell";
@@ -261,10 +268,23 @@ function clampSelection(
   );
 }
 
-/** Carries a transaction's user event over to a rebuilt spec. */
-function userEventOf(tr: Transaction): { userEvent?: string } {
+/**
+ * Carries a transaction's user event over to a rebuilt spec, and its history
+ * isolation: a gesture (a format, a popover commit, a mark-aware delete) is
+ * one undo step of its own on main's stack too.
+ */
+function userEventOf(tr: Transaction): {
+  userEvent?: string;
+  annotations?: Annotation<unknown>[];
+} {
   const event = tr.annotation(Transaction.userEvent);
-  return event === undefined ? {} : { userEvent: event };
+  const isolate = tr.annotation(isolateHistory);
+  return {
+    ...(event === undefined ? {} : { userEvent: event }),
+    ...(isolate === undefined
+      ? {}
+      : { annotations: [isolateHistory.of(isolate)] }),
+  };
 }
 
 /**
@@ -656,9 +676,10 @@ export { cellMain };
 
 /**
  * Whether the cell view's caret is empty and at the visible start (`side`
- * -1) or end (1) of the cell's content: only hidden escapes lie between it
- * and the edge. A leading `\|` hides its `\`, so the caret after it still
- * looks like the start.
+ * -1) or end (1) of the cell's content: only hidden escapes or hidden marks
+ * lie between it and the edge (C3). A leading `\|` hides its `\`, so the
+ * caret after it still looks like the start; a canonical caret before the
+ * closing `**` of a bold cell is at its end.
  */
 export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
   const { selection } = view.state;
@@ -666,8 +687,10 @@ export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
   const head = selection.main.head;
   const range = view.state.field(rangeField, false);
   if (!range) return false;
-  if (side === 1) return head >= range.to;
-  if (head <= range.from) return true;
+  if (side === 1 ? head >= range.to : head <= range.from) return true;
+  if (stepVisible(view.state, head, side === 1, viewAtoms(view)) === null)
+    return true;
+  if (side === 1) return false;
   const first = cellUnits(view.state.doc, range)[0];
   return first?.hide === range.from && head === range.from + 1;
 }
@@ -761,6 +784,13 @@ const forwardingOn = Facet.define<boolean, boolean>({
   combine: (values) => values.some(Boolean),
 });
 
+/**
+ * The marks setting inside a cell view, read from main at mount and
+ * reconfigured by `Forwarding` when main's flips, so the open cell switches
+ * in place. One compartment serves every cell view: it is only a key.
+ */
+const cellMarksMode = new Compartment();
+
 /** Feeds main changes into the mounted cell and runs the gone check. */
 class Forwarding {
   readonly main: EditorView;
@@ -797,6 +827,14 @@ class Forwarding {
     const cell = mountedCell(main);
     if (!cell || !now) return;
     const view = cell.view;
+    // The setting flipped: the open cell follows in place, with its caret.
+    const show = update.state.facet(marksOnEditLine);
+    if (view.state.facet(marksOnEditLine) !== show) {
+      view.dispatch({
+        effects: cellMarksMode.reconfigure(marksOnEditLine.of(show)),
+        annotations: [fromMain.of(true)],
+      });
+    }
     let touched = false;
     for (const tr of update.transactions) {
       if (tr.annotation(fromCell)) continue;
@@ -915,12 +953,13 @@ export function mountCellEditor(
     for (const tr of local) {
       if (!tr.docChanged) continue;
       sent = true;
+      const { userEvent, annotations = [] } = userEventOf(tr);
       tellMain(
         {
           changes: tr.changes,
           effects: setOpenCell.of(own(tr.state)),
-          annotations: [fromCell.of(true)],
-          ...userEventOf(tr),
+          annotations: [fromCell.of(true), ...annotations],
+          ...(userEvent === undefined ? {} : { userEvent }),
         },
         tr.startState.doc,
       );
@@ -939,54 +978,77 @@ export function mountCellEditor(
     }
   });
 
-  const view = new EditorView({
-    state: EditorState.create({
-      doc: main.state.doc,
-      selection: selectionFor(open, range),
-      extensions: [
-        ...(separator ? [EditorState.lineSeparator.of(separator)] : []),
-        cellMain.of(main),
-        rangeField.init(() => range),
-        Prec.highest([hideOutside, cellMarks]),
-        clampToCell,
-        // Backspace and Delete over hidden marks leave every hidden escape to
-        // `cellChange`, which takes such a unit whole.
-        keptWhole.of(keepsEscape),
-        composeEdges,
-        forward,
-        Prec.high([
-          keymap.of([
-            {
-              key: "Mod-z",
-              run: () => runMainUndo(main, "undo"),
-              preventDefault: true,
-            },
-            {
-              key: "Mod-Shift-z",
-              run: () => runMainUndo(main, "redo"),
-              preventDefault: true,
-            },
-            {
-              key: "Mod-y",
-              run: () => runMainUndo(main, "redo"),
-              preventDefault: true,
-            },
-          ]),
-          cellSearchKeys,
-        ]),
-        cellPresence,
-        documentLanguage,
-        ...main.state.facet(cellPreviewLayers),
-        formatKeymap,
-        ...extensions,
+  const created = EditorState.create({
+    doc: main.state.doc,
+    selection: selectionFor(open, range),
+    extensions: [
+      ...(separator ? [EditorState.lineSeparator.of(separator)] : []),
+      cellMain.of(main),
+      rangeField.init(() => range),
+      Prec.highest([hideOutside, cellMarks]),
+      clampToCell,
+      // Backspace and Delete over hidden marks leave every hidden escape to
+      // `cellChange`, which takes such a unit whole.
+      keptWhole.of(keepsEscape),
+      composeEdges,
+      forward,
+      Prec.high([
         keymap.of([
-          { key: "Shift-Enter", run: insertLineBreakTag },
-          // Never text; a caller's Enter (navigation) comes first.
-          { key: "Enter", run: () => true },
+          {
+            key: "Mod-z",
+            run: () => runMainUndo(main, "undo"),
+            preventDefault: true,
+          },
+          {
+            key: "Mod-Shift-z",
+            run: () => runMainUndo(main, "redo"),
+            preventDefault: true,
+          },
+          {
+            key: "Mod-y",
+            run: () => runMainUndo(main, "redo"),
+            preventDefault: true,
+          },
         ]),
-        keymap.of(defaultKeymap),
-      ],
-    }),
+        cellSearchKeys,
+      ]),
+      cellPresence,
+      documentLanguage,
+      // The cell's content is the segment the hidden-mark layer's caret,
+      // delete and format rules stay inside; outside it, the line.
+      markSegment.of((state, pos) => {
+        const cell = state.field(rangeField, false);
+        return cell && pos >= cell.from && pos <= cell.to ? cell : null;
+      }),
+      cellMarksMode.of(marksOnEditLine.of(main.state.facet(marksOnEditLine))),
+      // A Reflection never shows a comment, in a cell too.
+      pageHidesComments.of(hidesIdLines(main.state)),
+      // The room's undo manager, so a gesture in the cell closes its
+      // capture window (`stopCapturing`) as it does in main.
+      roomUndo.of(main.state.facet(roomUndo)),
+      ...main.state.facet(cellPreviewLayers),
+      // Copy and cut carry HTML beside the Markdown, as in main.
+      copyAsHtml(),
+      formatKeymap,
+      ...extensions,
+      keymap.of([
+        { key: "Shift-Enter", run: insertLineBreakTag },
+        // Never text; a caller's Enter (navigation) comes first.
+        { key: "Enter", run: () => true },
+      ]),
+      keymap.of(defaultKeymap),
+    ],
+  });
+  // The caret the cell opens with rests on its drawn place, as every caret a
+  // transaction sets does: "start" in a bold cell is inside the `**`. Main
+  // keeps the raw head it asked for, which is the same drawn place.
+  const opened = created.selection.main;
+  const settled = canonical(created, opened.head);
+  const view = new EditorView({
+    state:
+      opened.empty && settled !== opened.head
+        ? created.update({ selection: { anchor: settled } }).state
+        : created,
     parent,
   });
 

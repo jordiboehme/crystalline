@@ -149,6 +149,10 @@ export function previewConfig(
     livePreview(),
     ...adapter.previewLayers,
   ];
+  const marks = hiddenMarkLayer({
+    confirmHeadingChange: (state, line, level) =>
+      adapter.confirmHeadingChange(state, line, level),
+  });
   return off
     ? // Raw is deliberately the source view, so the whole buffer goes back to
       // mono: the shared theme sets prose proportional, and this is the one
@@ -158,14 +162,12 @@ export function previewConfig(
         // Before the mark folding, so a callout head, a label or a formula
         // replaces its whole span over the marks folded inside it.
         ...proseLayers,
-        cellPreviewLayers.of(proseLayers),
-        // After the prose layers and outside `livePreview()`, so the cell
-        // editor, which reads `proseLayers`, does not get it until it is
-        // given the layer on purpose.
-        hiddenMarkLayer({
-          confirmHeadingChange: (state, line, level) =>
-            adapter.confirmHeadingChange(state, line, level),
-        }),
+        // The cell editor draws with the prose layers and the hidden-mark
+        // layer after them, in the order main has them; the cell adds its own
+        // segment and the marks setting (`mountCellEditor`).
+        cellPreviewLayers.of([...proseLayers, marks]),
+        // After the prose layers and outside `livePreview()`.
+        marks,
         // Before the read-only previews: the grid takes over the tables it
         // draws once its chunk is in.
         tableGrid(),

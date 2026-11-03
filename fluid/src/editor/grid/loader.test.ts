@@ -13,6 +13,7 @@ import { reflectionAdapter } from "../adapter";
 import { previewConfig } from "../surface";
 import { baseExtensions, RAW_MONO } from "../setup";
 import { fencePreviews } from "../fencePreviews";
+import { hiddenMarkLayerOn } from "../marks/mode";
 import { cellPreviewLayers, gridLoaded, gridUnavailable } from "./draws";
 import { tableGridWith } from "./loader";
 
@@ -192,7 +193,7 @@ describe("tableGridWith", () => {
 });
 
 describe("previewConfig", () => {
-  it("hands the cell editor the same prose layers the main view gets", () => {
+  it("hands the cell editor the same prose layers the main view gets, and the hidden-mark layer", () => {
     const adapter = reflectionAdapter();
     const state = EditorState.create({
       doc: "x",
@@ -201,10 +202,12 @@ describe("previewConfig", () => {
         previewConfig(false, false, [], adapter),
       ],
     });
-    // elementPreviews, livePreview and the adapter's own layers
-    expect(state.facet(cellPreviewLayers).length).toBe(
-      2 + adapter.previewLayers.length,
-    );
+    // elementPreviews, livePreview, the adapter's own layers and, last, the
+    // hidden-mark layer (Task 12, C2)
+    const layers = state.facet(cellPreviewLayers);
+    expect(layers.length).toBe(3 + adapter.previewLayers.length);
+    const cell = EditorState.create({ doc: "x", extensions: layers });
+    expect(cell.facet(hiddenMarkLayerOn)).toBe(true);
   });
 
   it("provides no layers in Raw", () => {

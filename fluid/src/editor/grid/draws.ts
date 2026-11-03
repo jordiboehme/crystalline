@@ -36,8 +36,9 @@ export const gridUnavailable = Facet.define<boolean, boolean>({
 });
 
 /**
- * The prose layers a cell editor draws with: the same ones the main view
- * gets, provided by `previewConfig` so the two never drift apart.
+ * The prose layers a cell editor draws with, and the hidden-mark layer after
+ * them: the same ones the main view gets, provided by `previewConfig` so the
+ * two never drift apart.
  */
 export const cellPreviewLayers = Facet.define<Extension[], Extension[]>({
   combine: (values) => values.flat(),

@@ -5,8 +5,8 @@
  * separates the preview from Raw for `marksHiddenOnLine`.
  *
  * It sits in the preview compartment after the prose layers, not inside
- * `livePreview()`, so the table cell editor, which reads the prose layers,
- * gets it only once it is given it on purpose.
+ * `livePreview()`; the table cell editor gets it after its prose layers
+ * through `cellPreviewLayers`, with the cell's content as its segment.
  */
 
 import type { EditorState, Extension } from "@codemirror/state";

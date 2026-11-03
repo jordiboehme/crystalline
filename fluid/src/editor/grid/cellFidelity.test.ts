@@ -1,8 +1,9 @@
 /**
  * Byte fidelity of the cell editor: opening a cell and typing one character
- * changes exactly that one character of the file, in LF and CRLF files, with
- * the main view's prose layers drawn in the cell; undo gives back the file
- * byte for byte. And the one teardown path: Raw and a buffer swap both close a
+ * changes exactly that one character of the file, inside the cell, in LF and
+ * CRLF files, with the main view's prose layers and the hidden-mark layer
+ * drawn in the cell, with marks hidden and with marks shown on the edited
+ * line; undo gives back the file byte for byte. And the one teardown path: Raw and a buffer swap both close a
  * focused cell without losing what was typed.
  */
 
@@ -21,9 +22,11 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
+import { typeText } from "../../test/markKit";
 import { parsedState } from "../../test/parse";
 import { engramAdapter } from "../adapter";
 import { baseExtensions, lineSeparatorFor } from "../setup";
+import { hiddenMarkLayerOn, marksOnEditLine } from "../marks/mode";
 import { previewConfig } from "../surface";
 import { activeCell, cellForwarding } from "./cellEditor";
 import { cellPreviewLayers } from "./draws";
@@ -89,7 +92,16 @@ test("the fixtures hold tables", () => {
   expect(counted.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(4);
 });
 
-describe.each(FIXTURES)("cell fidelity: %s", (_, text) => {
+const MODES = [
+  { mode: "hidden", show: false },
+  { mode: "show", show: true },
+];
+
+describe.each(
+  FIXTURES.flatMap(([name, text]) =>
+    MODES.map(({ mode, show }) => ({ name, text, mode, show })),
+  ),
+)("cell fidelity: $name, $mode mode", ({ text, show }) => {
   const probe = parsedState(
     EditorState.create({
       doc: text,
@@ -103,21 +115,34 @@ describe.each(FIXTURES)("cell fidelity: %s", (_, text) => {
   test.each(cells)(
     "table %i cell %i/%i takes one character and undoes to the bytes",
     (t, row, column) => {
-      const main = soloMain(text, [layers(false), cellForwarding]);
+      const main = soloMain(text, [
+        layers(false),
+        marksOnEditLine.of(show),
+        cellForwarding,
+      ]);
       expect(main.state.facet(cellPreviewLayers).length).toBeGreaterThan(0);
       const before = main.state;
       const cell = gridTables(before)[t]?.rows[row]?.[column];
       if (!cell) throw new Error("cell vanished");
       const at = cell.content.to;
       const editor = openAt(main, at, false);
-      typeIn(editor, "Z");
+      expect(editor.view.state.facet(hiddenMarkLayerOn)).toBe(true);
+      expect(editor.view.state.facet(marksOnEditLine)).toBe(show);
+      // Typed as the DOM types (C22): the format rules may put the letter
+      // before the cell's closing marks, never outside its content.
+      typeText(editor.view, "Z");
       const lb = before.lineBreak;
-      const len = before.doc.length;
-      const want =
-        before.doc.sliceString(0, at, lb) +
-        "Z" +
-        before.doc.sliceString(at, len, lb);
-      expect(bytes(main.state)).toBe(want);
+      const was = bytes(before);
+      const now = bytes(main.state);
+      expect(now.length).toBe(was.length + 1);
+      let i = 0;
+      while (i < was.length && was[i] === now[i]) i += 1;
+      expect(now[i]).toBe("Z");
+      expect(now.slice(0, i) + now.slice(i + 1)).toBe(was);
+      const from = before.doc.sliceString(0, cell.content.from, lb).length;
+      const to = before.doc.sliceString(0, cell.content.to, lb).length;
+      expect(i).toBeGreaterThanOrEqual(from);
+      expect(i).toBeLessThanOrEqual(to);
       expect(editor.view.state.doc.eq(main.state.doc)).toBe(true);
       closeCell(main, "user", "none");
       expect(activeCell(main)).toBeNull();
