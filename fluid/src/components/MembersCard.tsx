@@ -296,6 +296,7 @@ export function MembersCard({ domain }: { domain: string }) {
           mayChoose={governedManager}
           fixedBy={governance.visibilityFixedBy}
           closedReason={governance.closedReason}
+          archivedReason={governance.archivedReason}
           disabledReason={disabledReason}
         />
       ) : isPrivate ? (
