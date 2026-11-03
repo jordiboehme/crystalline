@@ -1,12 +1,13 @@
 /**
  * `[[Target]]` as an atom: drawn as a reference chip in the same three states
- * every other surface draws a reference in, and handed back as plain text the
- * moment a selection touches it. The resolver arrives through a facet because
+ * every other surface draws a reference in, and, with the setting to show
+ * marks on the edited line, handed back as plain text the moment a selection
+ * touches it. The resolver arrives through a facet because
  * it is built from two requests that land after the editor mounts.
  *
  * Nothing here rewrites the document. A chip is a decoration over the bytes
- * that are already there, and the brackets come back the instant the cursor
- * reaches them, so what an author edits is always the literal text.
+ * that are already there; with the setting to show marks on the edited line,
+ * the brackets come back the instant the cursor reaches them.
  *
  * The completion feeds on title search across every registered domain - the
  * palette's own lookup - and inserts the `domain:Title` prefixed form when the
@@ -33,6 +34,7 @@ import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, referenceState, wikilinkWords } from "../wikilinks";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { markModeChanged, marksHiddenOnLine } from "./marks/mode";
 import { parkingChanged, revealRanges } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
@@ -136,10 +138,16 @@ function buildChips(view: EditorView): DecorationSet {
       if (code.some((range) => start >= range.from && start < range.to)) {
         continue;
       }
-      // An atom a selection touches is text being edited, not a chip.
-      const touched = revealRanges(view.state).some(
-        (range) => range.from <= end && range.to >= start,
-      );
+      // With the setting on, an atom a selection touches is text being
+      // edited, not a chip; with marks hidden on its line it stays a chip.
+      const hidden =
+        marksHiddenOnLine(view.state, doc.lineAt(start).number) &&
+        marksHiddenOnLine(view.state, doc.lineAt(end).number);
+      const touched =
+        !hidden &&
+        revealRanges(view.state).some(
+          (range) => range.from <= end && range.to >= start,
+        );
       if (touched) {
         continue;
       }
@@ -184,6 +192,7 @@ const chipsPlugin = ViewPlugin.fromClass(
         update.viewportChanged ||
         parseAdvanced(update) ||
         parkingChanged(update) ||
+        markModeChanged(update) ||
         // The resolver lands after the buffer does; the chips it was drawn
         // without have to be redrawn when it arrives.
         update.startState.facet(wikilinkResolverFacet) !==

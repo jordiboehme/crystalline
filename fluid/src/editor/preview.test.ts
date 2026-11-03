@@ -10,10 +10,18 @@
 
 import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import {
+  cleanupMarkViews,
+  markView,
+  setCaret,
+  setShowMarks,
+} from "../test/markKit";
 import { parsedState } from "../test/parse";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 
@@ -33,6 +41,9 @@ function editor(doc: string, at?: number): EditorView {
           ...lineSeparatorFor(doc),
           ...baseExtensions(false),
           livePreview(),
+          hiddenMarkLayer(),
+          // Show mode: these tests pin the marks a touched line reveals.
+          marksOnEditLine.of(true),
         ],
       }),
     ),
@@ -46,6 +57,37 @@ function editor(doc: string, at?: number): EditorView {
   });
   return view;
 }
+
+afterEach(cleanupMarkViews);
+
+describe("hidden marks", () => {
+  it("draws no star on the caret line in hidden mode and the stars in show mode", () => {
+    const hidden = markView("a **bold** c", { mode: "hidden" });
+    setCaret(hidden, 6);
+    expect(hidden.contentDOM.textContent).toBe("a bold c");
+    expect(hidden.contentDOM.textContent).not.toContain("*");
+    const show = markView("a **bold** c", { mode: "show" });
+    setCaret(show, 6);
+    expect(show.contentDOM.textContent).toContain("**bold**");
+  });
+
+  it("shows every mark in the source view", () => {
+    const raw = markView("a **bold** c", { raw: true });
+    setCaret(raw, 6);
+    expect(raw.contentDOM.textContent).toContain("**bold**");
+  });
+
+  it("redraws the caret line when the setting flips, with no selection change", () => {
+    const view = markView("a **bold** c", { mode: "hidden" });
+    setCaret(view, 6);
+    expect(view.contentDOM.textContent).not.toContain("*");
+    setShowMarks(view, true);
+    expect(view.state.selection.main.head).toBe(6);
+    expect(view.contentDOM.textContent).toContain("**bold**");
+    setShowMarks(view, false);
+    expect(view.contentDOM.textContent).not.toContain("*");
+  });
+});
 
 describe("frontmatterRegion", () => {
   it("finds the opening block and only the opening block", () => {

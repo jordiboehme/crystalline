@@ -39,3 +39,18 @@ export function marksHiddenOnLine(state: EditorState, line: number): boolean {
     (range) => range.from <= at.to && range.to >= at.from,
   );
 }
+
+/**
+ * Whether a transaction flipped the setting or put the layer in or out, so a
+ * layer that asks `marksHiddenOnLine` draws again even with no selection
+ * change in it.
+ */
+export function markModeChanged(tr: {
+  startState: EditorState;
+  state: EditorState;
+}): boolean {
+  return (
+    tr.startState.facet(marksOnEditLine) !== tr.state.facet(marksOnEditLine) ||
+    tr.startState.facet(hiddenMarkLayerOn) !== tr.state.facet(hiddenMarkLayerOn)
+  );
+}

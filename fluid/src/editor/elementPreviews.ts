@@ -1,12 +1,14 @@
 /**
- * The live preview of the dialect's elements: off the lines a selection
- * touches, a callout, a status label, a colour code and math draw the way
- * the reading page draws them; on those lines the text shows as written. The
- * rule `preview.ts` keeps for headings and emphasis, applied to the elements
- * it does not know.
+ * The live preview of the dialect's elements: wherever a line hides its marks
+ * (`marksHiddenOnLine`: every line by default, with the setting on every line
+ * a selection does not touch), a callout, a status label, a colour code and
+ * math draw the way the reading page draws them; elsewhere the text shows as
+ * written. The rule `preview.ts` keeps for headings and emphasis, applied to
+ * the elements it does not know.
  *
- * - A callout's lines wear the page's `.callout` rule and tint, its `> `
- *   marks fold away, and its head marker becomes the head the page draws:
+ * - A callout's lines wear the page's `.callout` rule and tint (its `> `
+ *   marks fold away with every quote's, in the hidden-mark layer), and its
+ *   head marker becomes the head the page draws:
  *   the fold chevron, the kind's icon, and the kind word when no title is
  *   written (a title stays as text, set in the head's weight).
  * - A status label becomes the page's pill.
@@ -51,7 +53,8 @@ import { labelPlainWords } from "../markdown/statusText";
 import { SWATCH_CLASSES, colourOf } from "../markdown/swatch";
 import { calloutAt, calloutOf, statusOf } from "./elementContext";
 import { frontmatterRegion } from "./frontmatterRegion";
-import { parkingChanged, revealRanges } from "./parkedSelection";
+import { markModeChanged, marksHiddenOnLine } from "./marks/mode";
+import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS } from "./prose";
 
@@ -286,28 +289,16 @@ class MathWidget extends WidgetType {
 }
 
 /**
- * The line numbers any selection range touches; none while main's selection
- * is parked behind an open table cell.
+ * Whether line `number` shows its source rather than its elements: never with
+ * marks hidden on it (`marksHiddenOnLine`), else while a selection touches it.
  */
-function activeLines(state: EditorState): Set<number> {
-  const lines = new Set<number>();
-  for (const range of revealRanges(state)) {
-    const from = state.doc.lineAt(range.from).number;
-    const to = state.doc.lineAt(range.to).number;
-    for (let line = from; line <= to; line += 1) {
-      lines.add(line);
-    }
-  }
-  return lines;
+function showsSource(state: EditorState, number: number): boolean {
+  return !marksHiddenOnLine(state, number);
 }
-
-/** A quote's `> ` at the start of a line: the mark and one space after it. */
-const QUOTE_PREFIX = /^>[ \t]?/;
 
 function calloutDecorations(
   state: EditorState,
   quote: SyntaxNode,
-  active: Set<number>,
   out: Range<Decoration>[],
 ): void {
   const callout = calloutOf(state, quote);
@@ -320,9 +311,6 @@ function calloutDecorations(
   // A details callout folds without a sign, as on the page.
   const fold =
     callout.fold ?? (callout.callout === "details" ? "closed" : null);
-  // Only a callout that is not itself inside a quote loses its marks: an
-  // inner one's line starts with its outer quote's mark.
-  const outermost = quote.parent?.name === "Document";
   for (let number = first; number <= last; number += 1) {
     const line = doc.line(number);
     // The first and last lines carry the page's head and foot padding.
@@ -330,23 +318,15 @@ function calloutDecorations(
       number === first ? "cm-callout-first" : "",
       number === last ? "cm-callout-last" : "",
     ].join(" ");
+    // The `> ` marks are the hidden-mark layer's, as on any quote.
     out.push(
       Decoration.line({
         class: `callout ${edge}`.trim(),
         attributes: { "data-callout": callout.callout },
       }).range(line.from),
     );
-    if (!outermost || active.has(number)) {
-      continue;
-    }
-    const prefix = QUOTE_PREFIX.exec(line.text);
-    if (prefix !== null) {
-      out.push(
-        Decoration.replace({}).range(line.from, line.from + prefix[0].length),
-      );
-    }
   }
-  if (active.has(callout.line)) {
+  if (showsSource(state, callout.line)) {
     return;
   }
   const head = doc.lineAt(callout.markFrom);
@@ -389,7 +369,6 @@ interface Inline {
 function buildInline(view: EditorView): Inline {
   const { state } = view;
   const doc = state.doc;
-  const active = activeLines(state);
   const fmEnd = frontmatterRegion(doc)?.to ?? -1;
   const out: Range<Decoration>[] = [];
   // A node two visible ranges both reach is decorated once.
@@ -416,11 +395,11 @@ function buildInline(view: EditorView): Inline {
         const node = ref.node;
         if (ref.name === "Blockquote") {
           if (once(node)) {
-            calloutDecorations(state, node, active, out);
+            calloutDecorations(state, node, out);
           }
           return;
         }
-        const lineActive = active.has(doc.lineAt(ref.from).number);
+        const lineActive = showsSource(state, doc.lineAt(ref.from).number);
         if (ref.name === "StatusLabel") {
           const status = statusOf(state, node);
           if (status !== null && !lineActive && once(node)) {
@@ -510,7 +489,8 @@ const inlinePreviews = ViewPlugin.fromClass(
         update.selectionSet ||
         update.viewportChanged ||
         parseAdvanced(update) ||
-        parkingChanged(update)
+        parkingChanged(update) ||
+        markModeChanged(update)
       ) {
         this.built = buildInline(update.view);
       }
@@ -685,16 +665,22 @@ function scanBlocks(state: EditorState, sections: boolean): Scanned[] {
     });
 }
 
-/** Which scanned formulas a selection range touches, as one comparable word. */
+/** Whether any line of a formula shows its source. */
+function blockShowsSource(state: EditorState, block: Scanned): boolean {
+  const first = state.doc.lineAt(block.from).number;
+  const last = state.doc.lineAt(block.to).number;
+  for (let number = first; number <= last; number += 1) {
+    if (showsSource(state, number)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Which scanned formulas show their source, as one comparable word. */
 function touchedKey(state: EditorState, blocks: Scanned[]): string {
   return blocks
-    .map((block, index) =>
-      revealRanges(state).some(
-        (range) => range.from <= block.to && range.to >= block.from,
-      )
-        ? index
-        : -1,
-    )
+    .map((block, index) => (blockShowsSource(state, block) ? index : -1))
     .filter((index) => index !== -1)
     .join(",");
 }
@@ -742,7 +728,9 @@ function blockPreviews(sections: boolean): Extension {
         return previewsOf(tr.state, scanBlocks(tr.state, sections));
       }
       if (
-        (tr.selection === undefined && !parkingChanged(tr)) ||
+        (tr.selection === undefined &&
+          !parkingChanged(tr) &&
+          !markModeChanged(tr)) ||
         touchedKey(tr.state, value.blocks) === value.touched
       ) {
         return value;

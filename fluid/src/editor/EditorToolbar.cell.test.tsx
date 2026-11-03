@@ -25,7 +25,12 @@ import { hostOpenCell } from "./grid/gridWidget";
 import { gridExtension } from "./grid/index";
 import { mountedCell, setOpenCell } from "./grid/openCell";
 import { gridTables } from "./grid/structure";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
+
+/** The hidden-mark layer in show mode: these tests pin a touched line's marks. */
+const showModeMarks = [hiddenMarkLayer(), marksOnEditLine.of(true)];
 
 const DOC = "## Crew\n\n| a | b |\n| - | - |\n| Ada | x |\n\nAfter\n";
 
@@ -39,6 +44,7 @@ function mainWithOpenCell(): { main: EditorView; cell: EditorView } {
     gridExtension(),
     fencePreviews(false),
     livePreview(),
+    ...showModeMarks,
     floatingContextListener(() => undefined),
   ]);
   main.dispatch({ selection: { anchor: 4 } }); // inside "## Crew"
@@ -165,6 +171,7 @@ describe("a torn-down cell's parked selection (round 2 A and B)", () => {
       gridExtension(),
       fencePreviews(false),
       livePreview(),
+      ...showModeMarks,
       floatingContextListener((context) => {
         seen.push(context);
       }),

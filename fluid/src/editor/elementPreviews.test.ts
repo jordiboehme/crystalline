@@ -16,6 +16,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parsedState } from "../test/parse";
 import CmEditor from "./CmEditor";
 import { elementPreviews } from "./elementPreviews";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { baseExtensions, lineSeparatorFor } from "./setup";
 
@@ -26,11 +28,14 @@ afterEach(() => {
   view = null;
 });
 
-/** A buffer with both preview layers, in the order the surface mounts them. */
+/**
+ * A buffer with the preview layers, in the order the surface mounts them.
+ * Show mode unless asked: most tests here pin what a touched line reveals.
+ */
 function editor(
   doc: string,
   at: number,
-  options: { sections?: boolean } = {},
+  options: { sections?: boolean; mode?: "hidden" | "show" } = {},
 ): EditorView {
   view = new EditorView({
     state: parsedState(
@@ -42,6 +47,8 @@ function editor(
           ...baseExtensions(false),
           elementPreviews(options),
           livePreview(),
+          hiddenMarkLayer(),
+          marksOnEditLine.of((options.mode ?? "show") === "show"),
         ],
       }),
     ),
@@ -156,6 +163,46 @@ describe("a status label", () => {
   });
 });
 
+describe("with marks hidden on the caret line", () => {
+  const DOC = "Build :status[Done]{green} at $`x^2`$ now\n\nEnd\n";
+  const afterPill = DOC.indexOf(" at");
+  const afterMath = DOC.indexOf(" now");
+
+  it("keeps a status pill and inline math drawn with the caret right after them", async () => {
+    for (const at of [afterPill, afterMath]) {
+      const v = editor(DOC, at, { mode: "hidden" });
+      expect(v.dom.querySelector(".status-label")?.textContent).toBe("Done");
+      await waitFor(() => {
+        expect(v.dom.querySelector(".cm-math-inline .katex")).not.toBeNull();
+      });
+      expect(lineText(v, 1)).not.toContain(":status[");
+      expect(lineText(v, 1)).not.toContain("$`");
+      v.destroy();
+    }
+    view = null;
+  });
+
+  it("hands them back as text in show mode", () => {
+    for (const at of [afterPill, afterMath]) {
+      const v = editor(DOC, at, { mode: "show" });
+      expect(v.dom.querySelector(".status-label")).toBeNull();
+      expect(v.dom.querySelector(".cm-math-inline")).toBeNull();
+      expect(lineText(v, 1)).toBe("Build :status[Done]{green} at $`x^2`$ now");
+      v.destroy();
+    }
+    view = null;
+  });
+
+  it("keeps a callout head and a display formula drawn with the caret on them", () => {
+    const doc = "> [!NOTE]\n> body\n\n$$\na^2\n$$\n\nEnd\n";
+    const v = editor(doc, doc.indexOf("a^2"), { mode: "hidden" });
+    expect(v.dom.querySelector(".cm-math-block")).not.toBeNull();
+    v.dispatch({ selection: EditorSelection.cursor(3) });
+    expect(v.dom.querySelector(".cm-callout-head")).not.toBeNull();
+    expect(lineText(v, 1)).not.toContain("[!NOTE]");
+  });
+});
+
 describe("a colour code", () => {
   const DOC = "Accent `#0969DA` here and `#define` there\n\nEnd\n";
 
@@ -230,7 +277,11 @@ describe("inside the React screen that mounts the buffer", () => {
       const { container, unmount } = render(
         createElement(CmEditor, {
           initialDoc: "Top\n\n> [!NOTE]\n> body\n",
-          extensions: [...baseExtensions(false), elementPreviews()],
+          extensions: [
+            ...baseExtensions(false),
+            elementPreviews(),
+            hiddenMarkLayer(),
+          ],
           ariaLabel: "Source",
           onReady: () => {},
           onDocChanged: () => {},

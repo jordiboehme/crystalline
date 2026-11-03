@@ -34,6 +34,7 @@ export interface MarkViewOptions {
 
 const views = new Set<EditorView>();
 const undoManagers = new WeakMap<EditorView, Y.UndoManager>();
+const markCompartments = new WeakMap<EditorView, Compartment>();
 
 /** Destroys every view `markView` built; call in `afterEach`. */
 export function cleanupMarkViews(): void {
@@ -58,6 +59,7 @@ export function markView(
         });
   let screen: ReturnType<typeof yCollab>[] = [];
   let undoManager: Y.UndoManager | null = null;
+  const marks = new Compartment();
   let doc = text;
   if (options.room) {
     const ydoc = new Y.Doc();
@@ -89,7 +91,7 @@ export function markView(
           onImageContext: () => {},
           onElementContext: () => {},
           onFloatingContext: () => {},
-          marks: new Compartment(),
+          marks,
           showMarks: options.mode === "show",
         }),
       ],
@@ -97,6 +99,7 @@ export function markView(
     parent: document.body,
   });
   views.add(view);
+  markCompartments.set(view, marks);
   if (undoManager) {
     undoManagers.set(view, undoManager);
   }
@@ -106,6 +109,18 @@ export function markView(
 /** Whether the setting says to show marks on the edited line. */
 export function showsMarks(view: EditorView): boolean {
   return view.state.facet(marksOnEditLine);
+}
+
+/**
+ * Flips the setting the way a screen does: a reconfigure of the marks
+ * compartment, with no selection in the transaction.
+ */
+export function setShowMarks(view: EditorView, show: boolean): void {
+  const marks = markCompartments.get(view);
+  if (!marks) {
+    throw new Error("setShowMarks takes a view built by markView");
+  }
+  view.dispatch({ effects: marks.reconfigure(marksOnEditLine.of(show)) });
 }
 
 /** The caret (the main selection's head). */
