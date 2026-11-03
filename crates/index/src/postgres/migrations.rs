@@ -1283,6 +1283,9 @@ mod tests {
             "relations are unbound too"
         );
 
+        // Today's resolve pass names `to_whole`, which v30 adds: give this
+        // v16 schema that column so the pass runs as it does after an upgrade.
+        sqlx::raw_sql(SCHEMA_V30).execute(&mut conn).await.unwrap();
         for table in ["relation", "link"] {
             sqlx::raw_sql(sqlx::AssertSqlSafe(crate::store::resolve_pending_sql(
                 table, "1",
