@@ -1,9 +1,18 @@
 import { CompletionContext } from "@codemirror/autocomplete";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { Vocabulary } from "../api/vocabulary";
+import {
+  bytes,
+  caret,
+  cleanupMarkViews,
+  keys,
+  markView,
+  setCaret,
+  typeText,
+} from "../test/markKit";
 import { parsedState } from "../test/parse";
 import {
   OBSERVATION_LINE,
@@ -188,5 +197,93 @@ describe("task lines", () => {
     expect(OBSERVATION_LINE.test("- [^1] the source")).toBe(false);
     expect(OBSERVATION_LINE.test("- [^note] more")).toBe(false);
     expect(OBSERVATION_LINE.exec("- [a^b] x")?.[1]).toBe("a^b");
+  });
+});
+
+describe("chips in hidden mode", () => {
+  const LINE = "- [decision] text #tag";
+
+  afterEach(cleanupMarkViews);
+
+  it("draws the category word as a chip, with no bracket", () => {
+    const view = markView(LINE);
+    setCaret(view, LINE.length);
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "decision",
+    );
+    expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
+    expect(view.dom.textContent).not.toContain("[");
+    expect(view.dom.querySelector(".cm-tag-chip")?.textContent).toBe("#tag");
+    expect(view.dom.querySelector(".cm-line-tag")).toBeNull();
+    expect(bytes(view.state)).toBe(LINE);
+  });
+
+  it("types after the drawn category word into the word", () => {
+    const view = markView(LINE);
+    setCaret(view, 11);
+    expect(caret(view)).toBe(11);
+    typeText(view, "s");
+    expect(bytes(view.state)).toBe("- [decisions] text #tag");
+    expect(view.dom.textContent).not.toContain("[");
+  });
+
+  it("puts Home inside the category and types there", () => {
+    const view = markView(LINE);
+    setCaret(view, 14);
+    keys(view, "Home");
+    expect(caret(view)).toBe(3);
+    typeText(view, "x");
+    expect(bytes(view.state)).toBe("- [xdecision] text #tag");
+    expect(view.dom.textContent).not.toContain("[");
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "xdecision",
+    );
+  });
+
+  it("draws the relation type as a chip", () => {
+    const view = markView("- relates_to [[T]]");
+    setCaret(view, 0);
+    expect(view.dom.querySelector(".cm-relation-chip")?.textContent).toBe(
+      "relates_to",
+    );
+    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+  });
+
+  it("keeps the line's bytes", () => {
+    const doc = "- [decision] text #a #b\n- relates_to [[T]]\n";
+    const view = markView(doc);
+    expect(bytes(view.state)).toBe(doc);
+    expect(
+      [...view.dom.querySelectorAll(".cm-tag-chip")].map((e) => e.textContent),
+    ).toEqual(["#a", "#b"]);
+  });
+
+  it("keeps today's marking in show mode on the line the caret touches", () => {
+    const view = markView(LINE, { mode: "show" });
+    setCaret(view, 5);
+    expect(view.dom.querySelector(".cm-obs-category")?.textContent).toBe(
+      "[decision]",
+    );
+    expect(view.dom.querySelector(".cm-category-chip")).toBeNull();
+    expect(view.dom.querySelector(".cm-line-tag")?.textContent).toBe("#tag");
+  });
+
+  it("draws the chips in show mode on a line the caret is not on", () => {
+    const doc = `${LINE}\nother`;
+    const view = markView(doc, { mode: "show" });
+    setCaret(view, doc.length);
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "decision",
+    );
+    setCaret(view, 3);
+    expect(view.dom.querySelector(".cm-category-chip")).toBeNull();
+    expect(view.dom.querySelector(".cm-obs-category")).not.toBeNull();
+  });
+
+  it("shows a comment in an engram in show mode with the caret on the line", () => {
+    const doc = "x <!-- c --> y";
+    const view = markView(doc, { mode: "show" });
+    setCaret(view, 1);
+    expect(view.dom.textContent).toContain("<!-- c -->");
   });
 });

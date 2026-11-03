@@ -16,6 +16,7 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { crystallineCompletions, crystallineLines } from "./crystallineLines";
+import { footnotes } from "./footnotes";
 import { frontmatterFold } from "./frontmatterFold";
 import { hiddenIdLines, isIdLineAt } from "./hiddenIdLines";
 import { wikilinkChips, wikilinkCompletions } from "./wikilinkChips";
@@ -82,6 +83,7 @@ export function engramAdapter(opts: {
     previewLayers: [
       wikilinkChips(),
       crystallineLines(),
+      footnotes(),
       // The Details rail is the metadata surface, so the block itself is
       // hidden from the text here rather than being shown twice; Raw shows
       // it. The MANIFEST editor deliberately does not get this: it has no
@@ -101,7 +103,7 @@ export function reflectionAdapter(): DocumentAdapter {
     kind: "reflection",
     wikilinks: false,
     extensions: [hiddenIdLines()],
-    previewLayers: [],
+    previewLayers: [footnotes()],
     // No wikilink completions: a Reflection page links no engrams.
     completions: [],
     confirmHeadingChange: (state, line, nextLevel) =>

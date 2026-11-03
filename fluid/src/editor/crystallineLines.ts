@@ -14,6 +14,12 @@ import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { frontmatterRegion } from "./frontmatterRegion";
+import {
+  marksHiddenOnLine,
+  markModeChanged,
+  marksOnEditLine,
+} from "./marks/mode";
+import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
@@ -79,19 +85,29 @@ function buildMarks(view: EditorView): DecorationSet {
         (range) => line.from >= range.from && line.from < range.to,
       );
       if (line.from > fmEnd && !inCode) {
+        // Hidden marks draw chips on the words; a line whose marks show (the
+        // caret line in show mode, Raw) keeps the bracketed marking.
+        const chips = marksHiddenOnLine(view.state, line.number);
         const observation = OBSERVATION_LINE.exec(line.text);
         if (observation) {
           const category = observation[1] ?? "";
           const start = line.from + line.text.indexOf("[");
           marks.push(
-            Decoration.mark({ class: "cm-obs-category" }).range(
-              start,
-              start + category.length + 2,
-            ),
+            chips
+              ? Decoration.mark({ class: "cm-category-chip" }).range(
+                  start + 1,
+                  start + 1 + category.length,
+                )
+              : Decoration.mark({ class: "cm-obs-category" }).range(
+                  start,
+                  start + category.length + 2,
+                ),
           );
           for (const tag of line.text.matchAll(TRAILING_TAG)) {
             marks.push(
-              Decoration.mark({ class: "cm-line-tag" }).range(
+              Decoration.mark({
+                class: chips ? "cm-tag-chip" : "cm-line-tag",
+              }).range(
                 line.from + tag.index,
                 line.from + tag.index + tag[0].length,
               ),
@@ -103,10 +119,9 @@ function buildMarks(view: EditorView): DecorationSet {
             const relType = relation[1] ?? "";
             const start = line.from + line.text.indexOf(relType);
             marks.push(
-              Decoration.mark({ class: "cm-rel-type" }).range(
-                start,
-                start + relType.length,
-              ),
+              Decoration.mark({
+                class: chips ? "cm-relation-chip" : "cm-rel-type",
+              }).range(start, start + relType.length),
             );
           }
         }
@@ -129,7 +144,13 @@ const linesPlugin = ViewPlugin.fromClass(
       if (
         update.docChanged ||
         update.viewportChanged ||
-        parseAdvanced(update)
+        parseAdvanced(update) ||
+        // The chips replace the bracketed marking where marks are hidden, so
+        // a selection that reveals a line (show mode), a flip of the setting
+        // or of the layer, and a parked selection draw it again.
+        (update.selectionSet && update.state.facet(marksOnEditLine)) ||
+        markModeChanged(update) ||
+        parkingChanged(update)
       ) {
         this.decorations = buildMarks(update.view);
       }
@@ -152,6 +173,27 @@ const linesTheme = EditorView.baseTheme({
     color: "var(--link)",
   },
   ".cm-line-tag": { color: "var(--color-slate-500)" },
+  ".cm-category-chip": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    fontSize: "0.85em",
+    color: "var(--color-slate-600)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+    padding: "0 0.3em",
+  },
+  ".cm-relation-chip": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    fontSize: "0.85em",
+    color: "var(--link)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+    padding: "0 0.3em",
+  },
+  ".cm-tag-chip": {
+    color: "var(--color-slate-500)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+  },
 });
 
 /** The recognition layer; belongs inside the caller's preview compartment. */
