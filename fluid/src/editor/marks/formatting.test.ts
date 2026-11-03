@@ -228,6 +228,20 @@ describe.each([
       expect(formatsOf(v, 6)).toEqual([]);
     });
 
+    it("a Markdown character typed with bold waiting is written as typed", () => {
+      const v = view("a *b c");
+      setCaret(v, 6);
+      keys(v, "Mod-b");
+      typeText(v, "*");
+      expect(bytes(v.state)).toBe("a *b c*");
+      // The bold no longer waits; the `*` just closed the italic, so the
+      // next letter is plain (rule 3).
+      expect(v.state.field(pendingFormat)?.on ?? []).toEqual([]);
+      typeText(v, "x");
+      expect(bytes(v.state)).toBe("a *b c*x");
+      expect(formatsOf(v, 7)).toEqual([]);
+    });
+
     it("a space with bold waiting is written plain and bold still waits", () => {
       const v = view("ab");
       setCaret(v, 2);
@@ -414,5 +428,36 @@ describe("the format state", () => {
     expect([...(seen.at(-1) ?? [])]).toEqual(["strong"]);
     select(v, 5, 6);
     expect([...(seen.at(-1) ?? [])].sort()).toEqual(["em", "strong"]);
+  });
+});
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])("a Reflection's hidden id lines, $name", ({ room }) => {
+  it("a selection across an id line formats the text and keeps the id", () => {
+    const page = "## A\n<!-- r:abcd -->\nalpha";
+    const v = markView(page, { adapter: "reflection", room });
+    const said = announcements(v);
+    select(v, 3, page.length);
+    toggleFormat(v, "strong");
+    expect(said).toEqual([]);
+    expect(bytes(v.state)).toBe("## **A**\n<!-- r:abcd -->\n**alpha**");
+    expect(v.state.doc.line(2).text).toBe("<!-- r:abcd -->");
+  });
+
+  it("select-all over two sections formats both and keeps both ids", () => {
+    const page =
+      "## A\n<!-- r:aaaa0001 -->\none\n\n## B\n<!-- r:bbbb0002 -->\ntwo";
+    const v = markView(page, { adapter: "reflection", room });
+    const said = announcements(v);
+    select(v, 0, page.length);
+    toggleFormat(v, "strong");
+    expect(said).toEqual([]);
+    const text = bytes(v.state);
+    expect(text).toContain("\n<!-- r:aaaa0001 -->\n");
+    expect(text).toContain("\n<!-- r:bbbb0002 -->\n");
+    expect(text).toContain("**one**");
+    expect(text).toContain("**two**");
   });
 });

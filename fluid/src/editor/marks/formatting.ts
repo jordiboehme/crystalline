@@ -40,6 +40,7 @@ import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { verbTarget } from "../floatingContext";
+import { isIdLineAt } from "../hiddenIdLines";
 import { mainSelectionParked, parkingChanged } from "../parkedSelection";
 import { roomUndo } from "../roomUndo";
 import { clearOfFoldedFrontmatter, toggleInline } from "../toolbar";
@@ -579,6 +580,10 @@ function formatSelection(view: EditorView, format: Format): void {
   const first = state.doc.lineAt(range.from).number;
   const last = state.doc.lineAt(range.to).number;
   for (let number = first; number <= last; number++) {
+    // A Reflection's hidden id line is no text to format: it stays as it is.
+    if (isIdLineAt(state, number)) {
+      continue;
+    }
     const model = lineModel(state, number);
     const [from, to] = trimmed(
       state,
@@ -1002,7 +1007,11 @@ function typed(
 
   let plan: Plan | null = null;
   if (pending && pending.pos === place) {
-    plan = pendingPlan(model, place, text, pending, space);
+    // A Markdown character is typed where it is written: the waiting format
+    // goes, and no markers are written around it.
+    plan = MARK_CHARS.test(text)
+      ? plain(place, text, false)
+      : pendingPlan(model, place, text, pending, space);
   }
   if (!plan && hidden) {
     plan = continuePlan(model, place, text, space);

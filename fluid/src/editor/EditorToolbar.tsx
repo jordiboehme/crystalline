@@ -513,29 +513,25 @@ export function EditorToolbar({
    */
   const askingNow = useRef(false);
   /**
-   * The view a verb acts on, read when it runs: the open cell's editor, or
-   * main, or nothing. Nothing while main's selection is parked behind an
-   * open cell whose editor is not mounted (its table scrolled away): that
-   * selection is stale, and the cell is not there to take the verb. Main
-   * holding the focus itself always means main. The floating bar's rule
-   * too, so it lives in one place (`verbTarget`).
+   * Whether a verb on main's line or caret may run now. The view a verb acts
+   * on is `verbTarget`'s, read when it runs: the open cell's editor, else
+   * main, or nothing while main's selection is parked behind a cell whose
+   * editor is not mounted. The floating bar uses the same rule.
    */
-  const targetOf = verbTarget;
-  /** Whether a verb on main's line or caret may run now. */
-  const mainTurn = (v: EditorView): boolean => targetOf(v) === v;
+  const mainTurn = (v: EditorView): boolean => verbTarget(v) === v;
   /**
    * A verb on main's line or main's caret. Refused unless main is the
    * target, so a click that beats the render that turned the button off
    * still changes nothing.
    */
   const act = (run: (view: EditorView) => boolean) => () => {
-    if (view && targetOf(view) === view) {
+    if (view && verbTarget(view) === view) {
       run(view);
     }
   };
   /** An inline verb: in the open cell when there is one, else on main. */
   const actInline = (run: (view: EditorView) => boolean) => () => {
-    const target = view ? targetOf(view) : null;
+    const target = view ? verbTarget(view) : null;
     if (target) {
       run(target);
     }
@@ -655,7 +651,7 @@ export function EditorToolbar({
                   key={level}
                   className={ITEM_CLASSES}
                   onSelect={() => {
-                    if (view && targetOf(view) === view) {
+                    if (view && verbTarget(view) === view) {
                       pickHeading(view, level);
                     }
                   }}
