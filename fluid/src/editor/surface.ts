@@ -16,6 +16,7 @@ import type { EditorView } from "@codemirror/view";
 import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
 import { codeBlocks } from "./codeBlocks";
+import { copyAsHtml } from "./copyHtml";
 import { elementContextListener } from "./elementContext";
 import type { ElementEdit } from "./elementEdit";
 import { elementEditListener } from "./elementEdit";
@@ -236,6 +237,9 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // processor's picture of the copy) is converted and nothing is uploaded;
     // any other file, or images with no text, goes to the uploads.
     richPaste(),
+    // Copy and cut carry HTML beside the Markdown, in Raw mode too: the
+    // buffer is Markdown either way.
+    copyAsHtml(),
     // The toolbar's own shortcuts. Outside the preview compartment: Mod-b and
     // Mod-i are typing help like the completions below, and raw mode is
     // still markdown being written (`toggleFormat` wraps there as the source

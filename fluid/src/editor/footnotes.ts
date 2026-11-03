@@ -213,6 +213,24 @@ export function footnoteModel(state: EditorState): {
   };
 }
 
+/**
+ * The number the page shows for the reference at exactly [from, to), or null
+ * when there is none, the state has no footnote model or a long document has
+ * not been read yet (its references show as text until then).
+ */
+export function footnoteNumberAt(
+  state: EditorState,
+  from: number,
+  to: number,
+): number | null {
+  const value = state.field(model, false);
+  if (!value || value.stale) {
+    return null;
+  }
+  const ref = value.refs.find((r) => r.from === from && r.to === to);
+  return (ref && value.numbers.get(ref.key)) || null;
+}
+
 interface Flight {
   id: number;
   revision: number;
