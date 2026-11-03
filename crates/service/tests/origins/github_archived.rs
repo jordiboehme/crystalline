@@ -18,6 +18,7 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_service::daemon::http_router;
+use crystalline_service::engine::PolicyEdit;
 use crystalline_service::params::{WriteParams, WriteReflectionParams};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, EnvOverlay, ReflectionCaller, Scope};
@@ -570,6 +571,49 @@ async fn the_listing_and_the_members_answer_say_an_archived_domain_is_read_only(
         .unwrap()
         .unwrap();
     assert_eq!(block.sentence(KB), SENTENCE);
+}
+
+/// The owner's switch-off of `read_only` is a MANIFEST write too, so an
+/// archived domain refuses it with the archived sentence and keeps the flag,
+/// whether the switch-off sets `off` or removes the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_archived_domain_refuses_the_owners_read_only_switch_off() {
+    let fx = instance().await;
+    fx.eng
+        .set_manifest_policies(
+            KB,
+            &[("read_only".to_string(), "on".to_string())],
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(fx.eng.domain_is_read_only(KB).await);
+    archive(&fx).await;
+    let manifest = fx._tmp.path().join(KB).join("MANIFEST.md");
+    let before = std::fs::read_to_string(&manifest).unwrap();
+
+    let switch_offs = [
+        PolicyEdit::Set {
+            key: "read_only".to_string(),
+            value: "off".to_string(),
+        },
+        PolicyEdit::Unset {
+            key: "read_only".to_string(),
+        },
+    ];
+    for edit in switch_offs {
+        let answer = fx
+            .eng
+            .edit_manifest_policies(KB, std::slice::from_ref(&edit), &Scope::Unrestricted)
+            .await;
+        assert_eq!(
+            answer.map(|_| ()).unwrap_err().to_string(),
+            SENTENCE,
+            "the switch-off is refused: {edit:?}"
+        );
+    }
+    assert!(fx.eng.domain_is_read_only(KB).await, "the flag stays on");
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

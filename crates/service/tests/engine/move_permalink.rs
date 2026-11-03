@@ -1899,6 +1899,39 @@ async fn read_engram_reports_the_fragment_of_a_heading_link() {
     assert_eq!(link["resolved"], true, "{a}");
 }
 
+/// `read_engram` sends the target as written beside the split one when the
+/// split loses it: `[[C# Basics]]` reads target `C` with heading `Basics`, and
+/// `whole` keeps the space a reader needs to find the title again. A link the
+/// split writes back unchanged (`[[b#setup]]`) carries no `whole`.
+#[tokio::test]
+async fn read_engram_sends_the_whole_text_of_a_hash_title_link() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram(
+            "Ay",
+            "a",
+            "- relates_to [[C# Basics]]\n\nSee [[C# Basics]] and [[b#setup]].",
+        ),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    seed(
+        f.notes(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "Basics."),
+    );
+    f.sync().await;
+
+    let a = read_receipt(&f, "notes", "a").await;
+    let relation = &a["relations"].as_array().unwrap()[0];
+    assert_eq!(relation["whole"], "C# Basics", "{a}");
+    assert_eq!(relation["resolved"], true, "{a}");
+    let links = a["links"].as_array().unwrap();
+    assert_eq!(links[0]["whole"], "C# Basics", "{a}");
+    assert!(links[1].get("whole").is_none(), "{a}");
+}
+
 /// A title link keeps its words and its fragment when a move names the
 /// permalink, and a title that holds a `#` is read whole, so it is not split
 /// into a target and a heading.

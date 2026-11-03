@@ -1307,5 +1307,6 @@ describe("the members card on a domain GitHub governs", () => {
     renderApp("/d/eng/settings");
     const card = await membersCard();
     expect(within(card).queryByText(/is read-only because/)).toBeNull();
+    expect(within(card).queryByRole("status")).toBeNull();
   });
 });

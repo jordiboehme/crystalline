@@ -158,7 +158,30 @@ describe("the page address a detail payload carries", () => {
     ).toBeNull();
   });
 
-  it("keeps the fragment of a link target and never reads whole", () => {
+  it("reads the whole text a reference sends beside its target", () => {
+    const read = readEngramDetail(
+      {
+        relations: [
+          {
+            rel_type: "relates_to",
+            resolved: true,
+            target: { domain: null, target: "C", fragment: "Basics" },
+            whole: "C# Basics",
+          },
+        ],
+      },
+      "eng",
+      "alpha",
+    );
+    expect(read.relations[0]?.target).toEqual({
+      domain: null,
+      target: "C",
+      fragment: "Basics",
+      whole: "C# Basics",
+    });
+  });
+
+  it("keeps the fragment of a link target and never reads whole inside it", () => {
     const read = readEngramDetail(
       {
         links: [

@@ -1445,6 +1445,36 @@ async fn repository_facts_by_id_renew_the_token_once_after_a_401() {
     );
 }
 
+/// A 401 on the fresh token too is an error: the request is retried once,
+/// never more.
+#[tokio::test]
+async fn repository_facts_by_id_fail_after_a_second_401() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let routes = Router::new().route(
+        "/repositories/{id}",
+        get(move |headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                recorded.lock().unwrap().push(auth);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"message": "Bad credentials"})),
+                )
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let answer = app.repository_facts_by_id(11, 55).await;
+    assert!(answer.is_err(), "{answer:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["Bearer ghs_11_1".to_string(), "Bearer ghs_11_2".to_string()],
+        "exactly one retry"
+    );
+}
+
 // --- the manifest flow --------------------------------------------------------
 
 fn manifest_params(webhook_public: bool) -> ManifestParams {

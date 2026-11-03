@@ -261,6 +261,11 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
 /// Seeks the partial `lower(to_whole)` index of the table. A row bound to an
 /// engram that carries the title already, in any dimension, is left as it is,
 /// so writing the same engram again changes nothing.
+///
+/// Draft rows are unbound too, on purpose: the base pass after the write binds
+/// them again, so a draft's `[[C# Basics]]` follows the new title instead of
+/// staying on `C` until its author saves it again
+/// (`a_draft_link_follows_a_later_base_hash_title` in the store suite).
 #[doc(hidden)]
 pub fn unbind_shadowed_by_title_sql(table: &str, domain: &str, title: &str) -> String {
     // -- actor: all - the bound engram already carrying the title settles the

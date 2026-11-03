@@ -50,8 +50,10 @@ export interface LinkTarget {
    */
   fragment?: string;
   /**
-   * Fluid side only, never read from the payload: the target text with its
-   * `#` kept, tried as a whole title before the heading split.
+   * The target text with its `#` kept, tried as a whole title before the
+   * heading split. The parser sets it; the payload sends it beside the target
+   * (as the reference's `whole`) only when the split target and heading do not
+   * write it back as it was, as for `[[C# Basics]]`.
    */
   whole?: string;
 }
@@ -279,10 +281,12 @@ function readTarget(value: unknown): LinkTarget | null {
 /** Read one reference, or null when it names nothing to point at. */
 function readReference(value: unknown): EngramReference | null {
   const record = asObject(value);
-  const target = readTarget(record?.target);
-  if (target === null) {
+  const read = readTarget(record?.target);
+  if (read === null) {
     return null;
   }
+  const whole = asString(record?.whole);
+  const target = whole === null || whole === "" ? read : { ...read, whole };
   const permalink = asString(record?.permalink);
   return {
     line: asNumber(record?.line),

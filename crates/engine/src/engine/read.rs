@@ -512,6 +512,12 @@ impl Engine {
         // its text cannot say: the path it names may carry any permalink. A
         // reader (Fluid's engram page) routes the link through it. Left out for
         // a wikilink, whose text already is a permalink or a title.
+        //
+        // `whole` is the target text with its `#` kept ([`LinkTarget::whole`]),
+        // sent only when the split target and heading do not write it back as
+        // it was: `[[C# Basics]]` reads target `C` and heading `Basics`, and a
+        // reader that asks for the title again needs the space. Left out for
+        // every other link, so their shape does not change.
         #[derive(serde::Serialize)]
         struct RelationOut<'a> {
             line: usize,
@@ -520,6 +526,8 @@ impl Engine {
             resolved: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             permalink: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            whole: Option<&'a str>,
         }
         #[derive(serde::Serialize)]
         struct LinkOut<'a> {
@@ -528,6 +536,16 @@ impl Engine {
             resolved: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             permalink: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            whole: Option<&'a str>,
+        }
+        fn lost_whole(target: &LinkTarget) -> Option<&str> {
+            let whole = target.whole.as_deref()?;
+            let rebuilt = match &target.fragment {
+                Some(fragment) => format!("{}#{fragment}", target.target),
+                None => target.target.clone(),
+            };
+            (whole != rebuilt).then_some(whole)
         }
 
         // A reference that bound by path: a relative link, or a bare wikilink
@@ -554,6 +572,7 @@ impl Engine {
                     target: &r.target,
                     resolved,
                     permalink: landed(resolved, &r.target),
+                    whole: lost_whole(&r.target),
                 }
             })
             .collect();
@@ -567,6 +586,7 @@ impl Engine {
                     target: &l.target,
                     resolved,
                     permalink: landed(resolved, &l.target),
+                    whole: lost_whole(&l.target),
                 }
             })
             .collect();

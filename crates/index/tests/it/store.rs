@@ -1907,6 +1907,99 @@ parity!(
     a_later_hash_title_takes_over_the_link
 );
 
+/// A row bound to an engram titled `C# Basics` stays bound to it when a
+/// second engram with that title is written: the unbind leaves a row alone
+/// whose engram carries the title already.
+async fn a_second_hash_title_leaves_a_bound_row_alone(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "engram", "", "body\n"),
+    );
+    write(home.path(), "a.md", &source_engram("A", "a", "C# Basics"));
+    sync_domain(store, "home", home.path()).await.unwrap();
+    let a = store.lookup_id("home", "a").await.unwrap().unwrap();
+    let pair = |d: &str, p: &str| Some((d.to_string(), p.to_string()));
+    assert_eq!(bound_target(store, a).await, pair("home", "c-basics"));
+
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    store
+        .upsert_engram(
+            home_id,
+            &titled_record("c-basics-2.md", "c-basics-2", "C# Basics"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        bound_target(store, a).await,
+        pair("home", "c-basics"),
+        "the row keeps the engram it was bound to"
+    );
+}
+parity!(
+    a_second_hash_title_leaves_a_bound_row_alone_on_both_backends,
+    a_second_hash_title_leaves_a_bound_row_alone
+);
+
+/// A `[[C# Basics]]` in alice's draft, bound to the base `C`, follows a later
+/// base engram titled `C# Basics` as her view says it should. The base write
+/// unbinds draft rows too, and the base pass after it binds them again, so the
+/// draft does not keep pointing at `C` until alice saves it again.
+async fn a_draft_link_follows_a_later_base_hash_title(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "body\n"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    let text = source_engram("D", "d", "C# Basics");
+    let draft = crystalline_index::EngramRecord::from_engram(
+        &crystalline_core::parse_engram(&text).unwrap(),
+        "d.md",
+        FileStamp {
+            mtime: 0,
+            size: text.len() as u64,
+            sha256: "0".repeat(64),
+        },
+    );
+    let d = store
+        .upsert_overlay(home_id, "alice", &draft)
+        .await
+        .unwrap();
+    store
+        .reresolve_actor_references(home_id, "alice")
+        .await
+        .unwrap();
+    let pair = |d: &str, p: &str| Some((d.to_string(), p.to_string()));
+    assert_eq!(
+        bound_target_as(store, d, Some("alice")).await,
+        pair("home", "c")
+    );
+
+    write(
+        home.path(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "engram", "", "body\n"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    store
+        .reresolve_actor_references(home_id, "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        bound_target_as(store, d, Some("alice")).await,
+        pair("home", "c-basics"),
+        "alice's view names the engram titled C# Basics"
+    );
+}
+parity!(
+    a_draft_link_follows_a_later_base_hash_title_on_both_backends,
+    a_draft_link_follows_a_later_base_hash_title
+);
+
 /// A pending `[[ops:C# Basics]]` stores the split target `C`, so the pass a
 /// later write in `ops` runs reads the whole text too, and binds it to the
 /// engram whose title holds the `#`.

@@ -812,7 +812,8 @@ pub struct GitHubConfig {
     /// The Crystalline account whose connected GitHub identity agent shares
     /// over HTTP MCP run under in personal mode. Absent means those shares are
     /// refused. With a GitHub App it is also the account the MCP open tier
-    /// acts as on a domain GitHub governs. Read through [`GlobalConfig::github_agent_identity`].
+    /// acts as on a domain GitHub governs. Read through
+    /// [`GlobalConfig::github_agent_identity`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     /// The GitHub API base URL, for a GitHub Enterprise Server instance.

@@ -115,50 +115,80 @@ function splitAlias(inner: string): { target: string; alias?: string } {
 }
 
 /**
- * Split the inside of a `[[...]]` into a domain, a target and a display text,
- * the way the server's own parser does. The display text is what follows the
- * first `|`; the rest reads the part before it. One leading colon group is a
- * cross-domain prefix when both sides are non-empty and the domain side has no
- * whitespace, and every further colon stays in the target text. `[[|b]]` names
- * no target and is no link: its target comes back empty.
+ * Split a target part (the text before its `|`) at its first `#` into the
+ * part before it and the heading after it, both as written. No split, and no
+ * heading, when there is no `#` or nothing but whitespace stands before it
+ * (`[[#setup]]`). The server splits the same way (`split_fragment` in
+ * `core/src/engram.rs`).
+ */
+function splitFragment(part: string): { before: string; fragment?: string } {
+  const hash = part.indexOf("#");
+  if (hash < 0 || part.slice(0, hash).trim() === "") {
+    return { before: part };
+  }
+  return { before: part.slice(0, hash), fragment: part.slice(hash + 1) };
+}
+
+/**
+ * The domain prefix of a trimmed target part: one leading colon group is a
+ * prefix when both sides are non-empty and the domain side has no whitespace,
+ * and every further colon stays in the target text. The server reads it the
+ * same way (`read_prefix` in `core/src/engram.rs`).
+ */
+function readPrefix(part: string): { domain: string | null; target: string } {
+  const colon = part.indexOf(":");
+  if (colon >= 0) {
+    const prefix = part.slice(0, colon).trim();
+    const after = part.slice(colon + 1).trim();
+    if (prefix !== "" && after !== "" && !/\s/.test(prefix)) {
+      return { domain: prefix, target: after };
+    }
+  }
+  return { domain: null, target: part };
+}
+
+/**
+ * Split the inside of a `[[...]]` into a domain, a target, a heading and a
+ * display text, in the order the server's own parser takes
+ * (`LinkTarget::parse` in `core/src/engram.rs`): the display text is what
+ * follows the first `|`; the heading is what follows the first `#` of the part
+ * before it, when something stands before that `#`; the domain prefix is read
+ * on the part before the `#` only, so a heading may hold a colon
+ * (`[[b#FAQ: General]]`). An empty heading is no heading. `whole` is the part
+ * with its `#` kept, set when a `#` was split off and the reading without the
+ * split names the same domain. `[[|b]]` names no target and is no link: its
+ * target comes back empty.
  */
 export function parseWikiTarget(inner: string): LinkTarget {
-  const { target: text, alias } = splitAlias(inner);
+  const { target: part, alias } = splitAlias(inner);
   const withAlias = alias === undefined ? {} : { alias };
-  let domain: string | null = null;
-  let rest = text;
-  const colon = text.indexOf(":");
-  if (colon > 0) {
-    const prefix = text.slice(0, colon).trim();
-    const after = text.slice(colon + 1).trim();
-    if (prefix !== "" && after !== "" && !/\s/.test(prefix)) {
-      domain = prefix;
-      rest = after;
-    }
+  const { before, fragment } = splitFragment(part);
+  if (fragment === undefined) {
+    return { ...readPrefix(part), ...withAlias };
   }
-  // A `#` splits off a heading only when something precedes it, so `[[#setup]]`
-  // keeps its text whole, as the server's parser does.
-  const hash = rest.indexOf("#");
-  if (hash > 0) {
-    const target = rest.slice(0, hash).trim();
-    const fragment = rest.slice(hash + 1).trim();
-    if (target !== "" && fragment !== "") {
-      return { domain, target, fragment, whole: rest, ...withAlias };
-    }
-  }
-  return { domain, target: rest, ...withAlias };
+  const link = readPrefix(before.trim());
+  const unsplit = readPrefix(part);
+  const heading = fragment.trim();
+  return {
+    ...link,
+    ...(heading === "" ? {} : { fragment: heading }),
+    ...(unsplit.domain === link.domain ? { whole: unsplit.target } : {}),
+    ...withAlias,
+  };
 }
 
 /**
  * A parsed target written back the way it appeared inside the brackets, so a
  * relation and a prose wikilink pointing at the same place ask the resolver the
- * same question.
+ * same question. A target that kept its `#` (`whole`) is written with it, so
+ * `[[C# Basics]]` comes back with its space.
  */
 export function innerOf(target: LinkTarget): string {
   const base =
-    target.fragment === undefined
+    target.whole ??
+    (target.fragment === undefined
       ? target.target
-      : `${target.target}#${target.fragment}`;
+      : `${target.target}#${target.fragment}`);
   const written = target.domain === null ? base : `${target.domain}:${base}`;
   return target.alias === undefined ? written : `${written}|${target.alias}`;
 }
@@ -175,6 +205,7 @@ export function wikilinkWords(inner: string): string | null {
   }
   return (
     parsed.alias ??
+    parsed.whole ??
     (parsed.fragment === undefined
       ? parsed.target
       : `${parsed.target}#${parsed.fragment}`)
@@ -227,7 +258,14 @@ function readings(
   ) {
     return [...first, parsed];
   }
-  return [...first, parsed, { domain: null, target: splitAlias(inner).target }];
+  // The fallback reads the text before the `#`, as the server's does
+  // (`LinkTarget::raw`), and keeps the heading.
+  const { before } = splitFragment(splitAlias(inner).target);
+  const fallback: LinkTarget = { domain: null, target: before.trim() };
+  if (parsed.fragment !== undefined) {
+    fallback.fragment = parsed.fragment;
+  }
+  return [...first, parsed, fallback];
 }
 
 /**
@@ -307,7 +345,6 @@ export function buildWikilinkResolver(
 
   return (inner: string) => {
     const candidates = readings(inner, known);
-    const split = candidates.find((c) => c.fragment !== undefined);
     const { alias, target: written } = parseWikiTarget(inner);
     if (written === "") {
       // `[[|b]]` names no target, so it is no link.
@@ -336,9 +373,9 @@ export function buildWikilinkResolver(
     for (const target of candidates) {
       const where = located.get(keyOf(target, home, known));
       if (where !== undefined) {
-        // Only the split reading carries a heading; a link located by its
+        // Only a split reading carries a heading; a link located by its
         // whole text opens the engram itself.
-        const fragment = target === split ? split.fragment : undefined;
+        const fragment = target.fragment;
         const base = engramRoute(where.domain, where.permalink);
         const shown = where.title === "" ? target.target : where.title;
         return {
