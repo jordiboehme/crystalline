@@ -1631,3 +1631,64 @@ async fn an_organization_event_for_an_owner_no_domain_is_connected_to_does_nothi
     assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
     assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
 }
+
+/// GitHub answers the recorded repository id, but under another owner id
+/// (the repository was transferred to an account now called `acme-labs`):
+/// that is no rename of the recorded organization, so nothing moves.
+#[tokio::test]
+async fn an_organization_rename_github_answers_under_another_owner_id_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let kb = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.transfer("acme/kb", "acme-labs/kb");
+    assert_ne!(fx.forge.owner_id_of("acme-labs"), owner_id("acme"));
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-other-owner",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        fx.forge
+            .hits()
+            .iter()
+            .any(|h| h.path == format!("/repositories/{kb}")),
+        "GitHub was asked"
+    );
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+}
+
+/// Two domains on one repository: the one GitHub confirmed (recorded ids)
+/// moves, the one with no recorded ids stays on the old name.
+#[tokio::test]
+async fn an_organization_rename_moves_only_the_confirmed_domain_of_a_repository() {
+    let fx = setup(Some(SECRET)).await;
+    connect(&fx.eng, "acme/kb", "kb2", &fx.tmp.path().join("kb2")).await;
+    settle_both(&fx).await;
+    fx.eng.github_people("kb2").await;
+    let dir = fx.tmp.path().join("origins").join("kb2");
+    let mut state = crystalline_remote::state::OriginState::load(&dir)
+        .unwrap()
+        .unwrap();
+    state.repository_ids = None;
+    state.save(&dir).unwrap();
+    fx.forge.rename_owner("acme", "acme-labs");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-two-domains",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme-labs/kb");
+    assert_eq!(origin_repo(&fx.eng, "kb2"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme-labs/vault");
+}

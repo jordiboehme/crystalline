@@ -2532,6 +2532,9 @@ impl super::Engine {
     /// domain recorded the repository's id and `org_id` as its owner's id,
     /// and GitHub, asked by that repository id with `installation`'s token,
     /// answers the same two ids under a name whose owner is `new_login`.
+    /// The domain moves to wherever GitHub says that repository id lives
+    /// now, even when the repository was also renamed: this is intended,
+    /// because GitHub confirms both the repository id and the owner id.
     /// A domain with no ids recorded, or recorded for another owner, keeps
     /// its origin (GitHub redirects the old name), and so does every domain
     /// when no installation or no App is known, or the instance is
@@ -2617,10 +2620,25 @@ impl super::Engine {
                     if !moved.is_empty() {
                         governor.follow_archived_rename(old, &live);
                     }
-                    for domain in group.iter().filter(|d| !moved.contains(d)) {
-                        tracing::warn!(
-                            "GitHub says {old} is now {live}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
-                        );
+                    if moved.len() < group.len() {
+                        // A lookup may have followed the rename already.
+                        let live_key = repo_key(&live);
+                        let now: HashMap<String, String> =
+                            self.github_origins().into_iter().collect();
+                        for domain in group.iter().filter(|d| !moved.contains(d)) {
+                            if now
+                                .get(domain)
+                                .is_some_and(|repo| repo_key(repo) == live_key)
+                            {
+                                tracing::debug!(
+                                    "the domain {domain} is connected to {live} already"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "GitHub says {old} is now {live}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
+                                );
+                            }
+                        }
                     }
                 }
             } else {
@@ -3509,6 +3527,22 @@ mod tests {
             *lock(&rig.env.renames),
             vec![(REPO.to_string(), "acme-labs/handbook".to_string())]
         );
+        // The same login change with a new owner id is a transfer: closed,
+        // and not reported as a rename.
+        rig.github.with(REPO, |r| {
+            r.ids = Some(RepositoryIds {
+                repository: IDS.repository,
+                owner: IDS.owner + 1,
+            });
+        });
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(
+            rig.governor.closed()[0].reason,
+            "the repository moved to acme-labs/handbook on GitHub; disconnect the domain and connect it again"
+        );
+        assert_eq!(lock(&rig.env.renames).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
