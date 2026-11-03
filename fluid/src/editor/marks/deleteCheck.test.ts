@@ -215,6 +215,28 @@ describe.each([false, true])("a new pair, room %s", (room) => {
     expect(text()).toBe("a` and `b`");
     expect(heard.outcome).toBeNull();
   });
+
+  it("is refused in show mode when the new pair reaches a line whose marks are hidden (D23)", () => {
+    // `*a r\nb*` would pair: the opener shows, the closer does not, and the
+    // `b` below would turn italic with no mark on screen.
+    const { view, heard, text } = page("q * a r\nb* c", "show", room);
+    setCaret(view, 6);
+    keys(view, "Backspace");
+    expect(text()).toBe("q * a r\nb* c");
+    expect(heard.outcome).toBe("refused");
+    expect(heard.said).toEqual([CANNOT_JOIN]);
+  });
+
+  it("is left to today's keys in show mode when a shown mark goes, though its partner's line hides its marks (D25)", () => {
+    // The opener of a bold that wraps: the person edits the Markdown they
+    // see, and `b` below loses its bold, as typed (D9).
+    const { view, heard, text } = page("**a\nb** c", "show", room);
+    setCaret(view, 4);
+    keys(view, "Backspace");
+    expect(text()).toBe("*a\nb** c");
+    expect(heard.outcome).toBeNull();
+    expect(heard.said).toEqual([]);
+  });
 });
 
 /** A cut as the browser sends it; what reached the clipboard comes back. */

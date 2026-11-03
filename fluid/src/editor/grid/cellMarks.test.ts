@@ -921,6 +921,35 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     );
     expect(said).toEqual([CELL_NOT_READ, CELL_NOT_READ]);
   });
+
+  it("says it is loading before the deletion check reads its short row", () => {
+    // Without its space `q * a* r` reads italic, so the deletion check
+    // would refuse with its own sentence (D10). The guard runs first.
+    const loose = `${above}\n\n| a | b |\n| - | - |\n| label | q * a* r |\n`;
+    const main = page(loose, { room });
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
+    });
+    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    if (!cell) throw new Error("no cell");
+    const view = openAt(main, cell.content.from + 4, false).view;
+    expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
+    const said: string[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) said.push(effect.value);
+            }
+          }
+        }),
+      ),
+    });
+    keys(view, "Backspace");
+    expect(bytes(main.state)).toBe(loose);
+    expect(said).toEqual([CELL_NOT_READ]);
+  });
 });
 
 describe.each(ROOMS)("a shown mark deleted in a cell, $name", ({ room }) => {

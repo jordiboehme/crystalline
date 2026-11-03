@@ -1,9 +1,11 @@
 /**
- * What the deletion check costs in a hard-wrapped paragraph. The check reads
- * the whole paragraph (a pair can wrap onto the next line), so its cost must
- * stay a small multiple of what a plain delete already pays there: the
- * parse of that paragraph again. Measured as a ratio of medians over
- * interleaved presses, so a loaded machine slows both sides alike.
+ * What the deletion check costs in a hard-wrapped paragraph (D24). The check
+ * reads the whole paragraph (a pair can wrap onto the next line), so its
+ * work may grow with the paragraph, but no faster than the paragraph: a
+ * paragraph five times longer may cost about five times as much, never
+ * twenty-five. The test counts work (the syntax nodes the tree walks stand
+ * on, the characters the sweeps read, the results parsed and read) instead of
+ * timing it, so it gives the same answer on a quiet and on a busy machine.
  */
 
 import { ensureSyntaxTree } from "@codemirror/language";
@@ -11,91 +13,111 @@ import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
 import { documentLanguage } from "../setup";
-import { checkedDeletion, deletionOutcome } from "./deleteCheck";
+import { checkWork, checkedDeletion, deletionOutcome } from "./deleteCheck";
 import type { DeleteOutcome } from "./deleteCheck";
+import { treeWalkWork } from "./hiddenMarks";
 import { hiddenMarkLayerOn } from "./mode";
 
 /** About 52 characters with one pair of each kind. */
 const LINE = "word **bold** and *em* with `code` and [link](u) end";
 /** A line with a closer after punctuation: its space cannot go (c). */
 const STUCK = "word **bold.** and *em* with `code` and [link](u) end";
+/** A bold that wraps onto the next line, and the line it closes on. */
+const WRAP_OPEN = "word and *em* with `code` and **a bold that";
+const WRAP_CLOSE = "wraps** with [link](u) and more words end";
 
-/** The ratio a checked press may cost over a plain one. */
-const MAX_RATIO = 10;
-const ROUNDS = 15;
+/** 2.1 kB, 10.6 kB and 42 kB in one paragraph. */
+const SIZES = [40, 200, 800];
 
-function median(values: readonly number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)] ?? 0;
-}
+/** How much faster than the paragraph the work may grow: a little slack. */
+const SLACK = 1.25;
 
-/** A parsed state on `lines` lines in one paragraph, middle line `middle`. */
-function paragraph(lines: number, middle: string) {
-  const all = Array.from({ length: lines }, (_, i) =>
-    i === Math.floor(lines / 2) ? middle : LINE,
+/** A parsed state on `lines` lines in one paragraph, `middle` in the middle. */
+function paragraph(lines: number, middle: string, fill: readonly string[]) {
+  const half = Math.floor(lines / 2);
+  const all = Array.from(
+    { length: lines },
+    (_, i) => fill[i % fill.length] ?? "",
   );
+  all[half] = middle;
   const doc = all.join("\n");
   const raw = EditorState.create({
     doc,
     extensions: [documentLanguage, hiddenMarkLayerOn.of(true), checkedDeletion],
   });
-  ensureSyntaxTree(raw, doc.length, 10_000);
+  ensureSyntaxTree(raw, doc.length, 30_000);
   const state = raw.update({}).state;
   const lineStart = all
-    .slice(0, Math.floor(lines / 2))
+    .slice(0, half)
     .reduce((sum, line) => sum + line.length + 1, 0);
   return { state, lineStart };
 }
 
-/** The time of one delete of `from..to` as `userEvent`, parse included. */
-function press(
-  state: EditorState,
-  from: number,
-  userEvent: string,
-): { ms: number; outcome: DeleteOutcome | null } {
-  const begin = performance.now();
-  const tr = state.update({ changes: { from, to: from + 1 }, userEvent });
-  ensureSyntaxTree(tr.state, tr.state.doc.length, 10_000);
-  const ms = performance.now() - begin;
+interface Work {
+  /** Nodes stood on and characters read, in all. */
+  total: number;
+  reads: number;
+  outcome: DeleteOutcome | null;
+}
+
+/** The work one Backspace on `pos` costs the check. */
+function work(state: EditorState, pos: number): Work {
+  treeWalkWork.steps = 0;
+  checkWork.positions = 0;
+  checkWork.reads = 0;
+  const tr = state.update({
+    changes: { from: pos - 1, to: pos },
+    userEvent: "delete.backward",
+  });
   const effect = tr.effects.find((e) => e.is(deletionOutcome));
-  return { ms, outcome: effect ? effect.value : null };
+  return {
+    total: treeWalkWork.steps + checkWork.positions,
+    reads: checkWork.reads,
+    outcome: effect ? effect.value : null,
+  };
 }
 
-/** Checked over plain, as a ratio of medians of interleaved presses. */
-function ratio(state: EditorState, from: number) {
-  const checked: number[] = [];
-  const plain: number[] = [];
-  let outcome: DeleteOutcome | null = null;
-  for (let i = 0; i < ROUNDS; i += 1) {
-    const one = press(state, from, "delete.backward");
-    outcome = one.outcome;
-    checked.push(one.ms);
-    // Not a key the check judges: the same change, parsed the same way.
-    plain.push(press(state, from, "input.plain").ms);
+/** The work at each size, and the check that it grows at most linearly. */
+function grows(at: (lines: number) => Work, outcome: DeleteOutcome | null) {
+  const works = SIZES.map((lines) => at(lines));
+  for (const one of works) expect(one.outcome).toBe(outcome);
+  // As many results read at every size: no parse per line.
+  expect(new Set(works.map((one) => one.reads)).size).toBe(1);
+  for (let i = 1; i < SIZES.length; i += 1) {
+    const size = (SIZES[i] ?? 0) / (SIZES[i - 1] ?? 1);
+    const cost = (works[i]?.total ?? 0) / (works[i - 1]?.total ?? 1);
+    expect(
+      cost,
+      `${String(SIZES[i - 1])} to ${String(SIZES[i])} lines: work x${cost.toFixed(1)} for size x${size.toFixed(1)} (${works.map((one) => String(one.total)).join(", ")})`,
+    ).toBeLessThanOrEqual(size * SLACK);
   }
-  const c = median(checked);
-  const p = median(plain);
-  return { ratio: c / Math.max(p, 0.05), checked: c, plain: p, outcome };
 }
 
-describe("the deletion check's cost in a hard-wrapped paragraph", () => {
-  it.each([40, 200])(
-    "stays a small multiple of a plain delete, %i lines",
-    (lines) => {
+describe("the deletion check's work in a hard-wrapped paragraph (D24)", () => {
+  it("grows at most linearly for an exact deletion", () => {
+    grows((lines) => {
       // A letter of "word": the exact deletion.
-      const exact = paragraph(lines, LINE);
-      const letter = ratio(exact.state, exact.lineStart + 1);
-      expect(letter.outcome).toBeNull();
+      const { state, lineStart } = paragraph(lines, LINE, [LINE]);
+      return work(state, lineStart + 2);
+    }, null);
+  });
+
+  it("grows at most linearly for a refused deletion", () => {
+    grows((lines) => {
       // The space after "**bold.**": every repair is tried, then refused.
-      const stuck = paragraph(lines, STUCK);
-      const space = ratio(stuck.state, stuck.lineStart + STUCK.indexOf(" and"));
-      expect(space.outcome).toBe("refused");
-      console.info(
-        `${String(lines)} lines (${String(exact.state.doc.length)} B): exact ${letter.checked.toFixed(2)} ms vs ${letter.plain.toFixed(2)} ms (x${letter.ratio.toFixed(1)}), refused ${space.checked.toFixed(2)} ms vs ${space.plain.toFixed(2)} ms (x${space.ratio.toFixed(1)})`,
-      );
-      expect(letter.ratio).toBeLessThan(MAX_RATIO);
-      expect(space.ratio).toBeLessThan(MAX_RATIO);
-    },
-    60_000,
-  );
+      const { state, lineStart } = paragraph(lines, STUCK, [LINE]);
+      return work(state, lineStart + STUCK.indexOf(" and") + 1);
+    }, "refused");
+  });
+
+  it("grows at most linearly where every other line ends in a wrapped bold", () => {
+    grows((lines) => {
+      // A letter of "word" on a line between two wrapped pairs.
+      const { state, lineStart } = paragraph(lines, LINE, [
+        WRAP_OPEN,
+        WRAP_CLOSE,
+      ]);
+      return work(state, lineStart + 2);
+    }, null);
+  });
 });

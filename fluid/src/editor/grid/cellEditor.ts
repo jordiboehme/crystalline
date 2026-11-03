@@ -62,7 +62,7 @@ import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
 import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage } from "../setup";
-import { formatKeymap, pendingFormat } from "../marks/formatting";
+import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
 import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
@@ -974,6 +974,12 @@ export const cellParseBudget = Facet.define<number, number>({
 export const CELL_NOT_READ =
   "This cell is still loading. Try again in a moment.";
 
+/** Whether the cell's row is not read yet: the parse stops above it. */
+function rowUnread(state: EditorState): boolean {
+  const cell = state.field(rangeField, false);
+  return cell !== undefined && syntaxTree(state).length < cell.to;
+}
+
 /**
  * When the watchdog fired before the parse reached the row, the cell opens
  * with no marks hidden and no atoms drawn: a delete then could split a
@@ -981,13 +987,13 @@ export const CELL_NOT_READ =
  * Every delete and every command edit (a bare `input`: the format keys and
  * bar, links, popover commits) is refused, and so is a format waiting for
  * typing, with one sentence each, until the background parse has read the
- * row (D13). Typing or a paste over a selection deletes that selection, so
+ * row (D13). The format commands ask first (`formatGate`), so they say it
+ * before they read the short tree themselves. Typing or a paste over a selection deletes that selection, so
  * it is refused like a delete (D17). Typing at a caret stays, and so does a
  * composition, which is the browser's to finish.
  */
 const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
-  const cell = tr.startState.field(rangeField, false);
-  if (!cell || syntaxTree(tr.startState).length >= cell.to) return tr;
+  if (!rowUnread(tr.startState)) return tr;
   const overSelection =
     tr.isUserEvent("input") &&
     !tr.isUserEvent("input.type.compose") &&
@@ -1141,6 +1147,7 @@ export function mountCellEditor(
       // Copy and cut carry HTML beside the Markdown, as in main.
       copyAsHtml(),
       formatKeymap,
+      formatGate.of((state) => (rowUnread(state) ? CELL_NOT_READ : null)),
       ...extensions,
       keymap.of([
         { key: "Shift-Enter", run: insertLineBreakTag },

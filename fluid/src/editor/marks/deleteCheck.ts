@@ -25,7 +25,11 @@
  * decide, not the paragraph read: a key that takes a shown mark is left as
  * it is (D9), and so is a key on shown lines that no pair reaches, even when
  * it makes a new pair (D11). The person is editing the Markdown there, and
- * the plan keeps today's keys. A deletion during an IME composition and an
+ * the plan keeps today's keys. A key on such lines that takes no mark is
+ * left alone for the lines that show their marks only: a pair it makes or
+ * breaks that changes a character on a line whose marks are hidden is
+ * refused (D23). A key that takes a shown mark stays unchecked even then
+ * (D25). A deletion during an IME composition and an
  * edit a table cell has judged already (`judgedElsewhere`) are left alone.
  */
 
@@ -48,9 +52,9 @@ import { isolateHistory } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 
 import type { Mark, MarkKind } from "./hiddenMarks";
-import { marksOnLine } from "./hiddenMarks";
+import { scanMarks, walkTree } from "./hiddenMarks";
 import { composing } from "./caret";
-import { judgedElsewhere, partnerAcrossLines } from "./deleting";
+import { judgedElsewhere } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
@@ -69,6 +73,14 @@ const CHECKED = new Set([
   // A cut removes a selection too (D12).
   "delete.cut",
 ]);
+
+/**
+ * A test hook: the work the check has done, in all, beside the tree walks
+ * `treeWalkWork` counts. `positions` are the characters its sweeps read and
+ * `reads` the results it parsed and read. A cost test counts these instead
+ * of timing a press, so it gives the same answer at any load.
+ */
+export const checkWork = { positions: 0, reads: 0 };
 
 /** The formats a character can have that a deletion must keep. */
 const KINDS = new Set<MarkKind>(["strong", "em", "strike", "code", "link"]);
@@ -92,9 +104,9 @@ interface Lines {
 }
 
 /**
- * The marks and pairs of lines `first` to `last`, shown or hidden alike. A
- * pair across a soft line break (its marks on two lines) is paired through
- * the syntax node the two belong to.
+ * The marks and pairs of lines `first` to `last`, shown or hidden alike, in
+ * one walk over the tree. A pair across a soft line break (its marks on two
+ * lines) is paired through the syntax node the two belong to.
  */
 function linesOf(state: EditorState, first: number, last: number): Lines {
   const marks: Mark[] = [];
@@ -109,8 +121,8 @@ function linesOf(state: EditorState, first: number, last: number): Lines {
     });
   };
   const across: Mark[] = [];
-  for (let n = first; n <= last; n += 1) {
-    const line = marksOnLine(state, n, { always: true });
+  const scan = scanMarks(state, first, last, { always: true });
+  for (const line of scan.lines) {
     marks.push(...line);
     for (const mark of line) {
       if (mark.side !== "open" || !KINDS.has(mark.kind)) continue;
@@ -122,12 +134,18 @@ function linesOf(state: EditorState, first: number, last: number): Lines {
       if (close) add(mark, close, mark.kind);
     }
   }
-  for (const open of across) {
-    const far = partnerAcrossLines(state, open);
-    const close = far
-      ? marks.find((mark) => mark.from === far.from && mark.side === "close")
-      : undefined;
-    if (close) add(open, close, open.kind);
+  if (across.length > 0) {
+    const closes = new Map<number, Mark>();
+    for (const mark of marks) {
+      if (mark.side === "close" && !closes.has(mark.from)) {
+        closes.set(mark.from, mark);
+      }
+    }
+    for (const open of across) {
+      const far = scan.closers.get(open.from);
+      const close = far ? closes.get(far.from) : undefined;
+      if (close) add(open, close, open.kind);
+    }
   }
   return { marks, pairs };
 }
@@ -144,17 +162,13 @@ function blockLines(
 ): { first: number; last: number } {
   let lo = from;
   let hi = to;
-  syntaxTree(state).iterate({
-    from,
-    to,
-    enter: (node) => {
-      if (node.name === "Paragraph" || node.name.startsWith("SetextHeading")) {
-        lo = Math.min(lo, node.from);
-        hi = Math.max(hi, node.to);
-        return false;
-      }
-      return undefined;
-    },
+  walkTree(syntaxTree(state), from, to, (node) => {
+    if (node.name === "Paragraph" || node.name.startsWith("SetextHeading")) {
+      lo = Math.min(lo, node.from);
+      hi = Math.max(hi, node.to);
+      return false;
+    }
+    return undefined;
   });
   return {
     first: state.doc.lineAt(lo).number,
@@ -245,6 +259,7 @@ function withEmptied(lines: Lines, deleted: readonly Range[]): Range[] {
     let seen = false;
     let all = true;
     for (let p = pair.open.to; all && p < pair.close.from; p += 1) {
+      checkWork.positions += 1;
       if (isMark(p)) continue;
       seen = true;
       if (!isDeleted(p)) all = false;
@@ -268,6 +283,11 @@ function parsedTo(state: EditorState, upto: number): EditorState | null {
  * the deletion targeted (it took one of its marks, or a letter of a link
  * whose words are its label) frees the characters inside it. Null when
  * `after` could not be parsed far enough to tell.
+ *
+ * With `shown` (the lines that show their marks), only the characters on
+ * the other lines are judged, and no pair frees them: where the marks show
+ * the person edits the Markdown (D9, D11), but a line whose marks are
+ * hidden keeps its formats (D23).
  */
 function readsSame(
   start: EditorState,
@@ -277,11 +297,13 @@ function readsSame(
   changes: ChangeSet,
   deleted: readonly Range[],
   after: EditorState,
+  shown?: readonly Range[],
 ): boolean | null {
   const from = start.doc.line(first).from;
   const to = start.doc.line(last).to;
   const aFrom = changes.mapPos(from, -1);
   const aTo = changes.mapPos(to, 1);
+  checkWork.reads += 1;
   const parsed = parsedTo(after, aTo);
   // Not parsed far enough to tell: the caller refuses rather than writes
   // the deletion unchecked.
@@ -305,13 +327,17 @@ function readsSame(
   const isDeleted = cover(deleted);
   const isMark = cover(lines.marks);
   const isFreed = cover(
-    targeted.map((pair) => ({ from: pair.open.to, to: pair.close.from })),
+    shown
+      ? []
+      : targeted.map((pair) => ({ from: pair.open.to, to: pair.close.from })),
   );
+  const isShown = cover(shown ?? []);
   const isMarkAfter = cover(next.marks);
   const was = formats(lines.pairs);
   const now = formats(next.pairs);
   for (let p = from; p < to; p += 1) {
-    if (isDeleted(p) || isMark(p)) continue;
+    checkWork.positions += 1;
+    if (isDeleted(p) || isMark(p) || isShown(p)) continue;
     if (isBlank(text[p - from] ?? "")) continue;
     if (isFreed(p)) continue;
     const q = changes.mapPos(p, 1);
@@ -524,15 +550,17 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   const onTouched = lines.pairs.some(
     (pair) => pair.open.from <= touchedTo && pair.close.to >= touchedFrom,
   );
+  let shownTouched = false;
   if (!onTouched) {
     const lo = start.doc.lineAt(firstPos).number;
     const hi = start.doc.lineAt(lastPos).number;
-    for (let n = lo; n <= hi; n += 1) {
-      if (!marksHiddenOnLine(start, n)) return tr;
+    for (let n = lo; n <= hi && !shownTouched; n += 1) {
+      if (!marksHiddenOnLine(start, n)) shownTouched = true;
     }
   }
   // Where a line shows its marks, a key that takes one is the person editing
-  // the Markdown itself (today's keys): the pairs after it may pair anew.
+  // the Markdown itself (today's keys): the pairs after it may pair anew,
+  // also where a partner is on a line whose marks are hidden (D9, D25).
   if (
     lines.marks.some(
       (mark) =>
@@ -541,6 +569,30 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
     )
   ) {
     return tr;
+  }
+  if (shownTouched) {
+    // Today's keys, for the formats of the lines that show their marks. A
+    // pair a key that takes no mark makes or breaks must leave every line
+    // whose marks are hidden as it read (D23): the person sees no mark
+    // there.
+    const shown: Range[] = [];
+    for (let n = first; n <= last; n += 1) {
+      if (marksHiddenOnLine(start, n)) continue;
+      const line = start.doc.line(n);
+      shown.push({ from: line.from, to: line.to + 1 });
+    }
+    if (shown.length === last - first + 1) return tr;
+    const unseen = readsSame(
+      start,
+      lines,
+      first,
+      last,
+      tr.changes,
+      merged(deleted),
+      tr.state,
+      shown,
+    );
+    return unseen === true ? tr : refusal(start);
   }
   const asked = merged(deleted);
   const ranges = withEmptied(lines, asked);
@@ -590,6 +642,11 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   if (exactIsSame()) {
     return grown ? rebuilt(tr, exact, null) : tr;
   }
+  return refusal(start);
+});
+
+/** A refused deletion: the bytes stay and the page says so. */
+function refusal(start: EditorState): TransactionSpec {
   return {
     selection: start.selection,
     effects: [
@@ -597,4 +654,4 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       deletionOutcome.of("refused"),
     ],
   };
-});
+}

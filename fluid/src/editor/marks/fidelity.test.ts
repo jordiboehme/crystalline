@@ -1056,6 +1056,33 @@ describe.each(MODES)("property 3 pins, %s mode", (mode) => {
     }
   });
 
+  it("refuses a new pair that reaches a line whose marks are hidden, in both modes (D23)", () => {
+    // `*a r\nb*` would pair. In show mode the caret's line shows the
+    // opener, but the closer's line hides its marks.
+    const { outcome, bytes: after } = press(
+      "wraps: q * a r\nb* c",
+      "q * ",
+      "Backspace",
+    );
+    expect(outcome).toBe("refused");
+    expect(after).toBe(EVERYTHING);
+  });
+
+  it("lets a shown mark go in show mode, though its partner's line hides its marks (D25)", () => {
+    if (mode === "hidden") return;
+    // The caret's line shows the opener of a bold that wraps: Backspace
+    // takes one star of it, as typed (D9).
+    const { outcome, bytes: after } = press(
+      "Wrapped: **a lead-in",
+      "Wrapped: **",
+      "Backspace",
+    );
+    expect(outcome).toBeNull();
+    expect(after).toBe(
+      EVERYTHING.replace("Wrapped: **a lead-in", "Wrapped: *a lead-in"),
+    );
+  });
+
   it("(c) refuses across a line break too", () => {
     const { outcome, bytes: after } = press(
       "wraps\nhere.** text",

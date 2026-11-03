@@ -31,6 +31,7 @@ import type { EditorState, Extension } from "@codemirror/state";
 import {
   ChangeSet,
   EditorSelection,
+  Facet,
   Prec,
   StateEffect,
   StateField,
@@ -71,6 +72,13 @@ const CONTINUING = new Set<Format>(["strong", "em", "strike"]);
 
 /** What a refused format says. */
 export const CANNOT_FORMAT = "This text cannot be formatted here.";
+
+/**
+ * Asked first by every format command: a sentence the buffer says instead,
+ * when it cannot take a format yet, or null. A table cell whose row is not
+ * read gives its own (D13), before the command reads that short tree.
+ */
+export const formatGate = Facet.define<(state: EditorState) => string | null>();
 
 function isFormat(kind: string): kind is Format {
   return (FORMATS as readonly string[]).includes(kind);
@@ -666,6 +674,13 @@ function formatSelection(view: EditorView, format: Format): void {
 export function toggleFormat(view: EditorView, format: Format): boolean {
   if (!writable(view.state)) {
     return true;
+  }
+  for (const gate of view.state.facet(formatGate)) {
+    const said = gate(view.state);
+    if (said !== null) {
+      view.dispatch({ effects: EditorView.announce.of(said) });
+      return true;
+    }
   }
   const marker = FORMAT_MARKER[format];
   if (!view.state.facet(hiddenMarkLayerOn)) {

@@ -13,8 +13,9 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Text } from "@codemirror/state";
-import type { SyntaxNode, Tree } from "@lezer/common";
+import type { EditorState, Line, Text } from "@codemirror/state";
+import type { SyntaxNode, SyntaxNodeRef, Tree } from "@lezer/common";
+import { IterMode } from "@lezer/common";
 
 import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { isIdLine } from "../../reflectionText";
@@ -50,6 +51,45 @@ export interface MarkRun {
   from: number;
   to: number;
   marks: Mark[];
+}
+
+/**
+ * A test hook: how many syntax nodes `walkTree` has stood on, in all, the
+ * ones it stepped over included. A cost test reads it to count work instead
+ * of timing it.
+ */
+export const treeWalkWork = { steps: 0 };
+
+/**
+ * `tree.iterate({ from, to, enter, leave })`, step for step (named nodes
+ * only), counting every node the cursor stands on in `treeWalkWork`.
+ */
+export function walkTree(
+  tree: Tree,
+  from: number,
+  to: number,
+  enter: (node: SyntaxNodeRef) => boolean | undefined,
+  leave?: (node: SyntaxNodeRef) => void,
+): void {
+  const cursor = tree.cursor(IterMode.IncludeAnonymous);
+  for (;;) {
+    treeWalkWork.steps += 1;
+    let entered = false;
+    if (
+      cursor.from <= to &&
+      cursor.to >= from &&
+      (cursor.type.isAnonymous || enter(cursor) !== false)
+    ) {
+      if (cursor.firstChild()) continue;
+      entered = true;
+    }
+    for (;;) {
+      if (entered && leave && !cursor.type.isAnonymous) leave(cursor);
+      if (cursor.nextSibling()) break;
+      if (!cursor.parent()) return;
+      entered = true;
+    }
+  }
 }
 
 /** The subtrees that hold no marks at all. */
@@ -161,6 +201,73 @@ function isSpace(char: string): boolean {
   return char === " " || char === "\t";
 }
 
+/** One line of a scan: what the walk found on it so far. */
+interface LineScan {
+  at: Line;
+  /** Whether the line's marks are read; else only its comments. */
+  hidden: boolean;
+  drafts: Draft[];
+  /** Whether a code block covers the line's start. */
+  inCode: boolean;
+  /**
+   * Where an observation's category or a task box already took a `[`, so
+   * the parser's link over the same brackets is not read twice.
+   */
+  taken: Set<number>;
+  category: RegExpExecArray | null;
+  /** The depth of a node whose inside this line does not read, or -1. */
+  skip: number;
+  /** The walk step that last found the node in hand on this line. */
+  seen: number;
+}
+
+/** What one walk over a range of lines found. */
+export interface MarkScan {
+  /** The marks of each line, as `marksOnLine` gives them: first line first. */
+  lines: Mark[][];
+  /**
+   * The closing child of each pair whose marks are its node's first and last
+   * child (an inline pair, a link), by the start of its first child: how an
+   * opening mark finds its partner on another line, as `partnerAcrossLines`
+   * does from the tree.
+   */
+  closers: Map<number, { from: number; to: number }>;
+}
+
+function addTo(
+  scan: LineScan,
+  from: number,
+  to: number,
+  kind: MarkKind,
+  side: Mark["side"],
+): Draft | null {
+  if (from < scan.at.from || to > scan.at.to || from >= to) {
+    return null;
+  }
+  const draft: Draft = { from, to, kind, side, pair: null };
+  scan.drafts.push(draft);
+  return draft;
+}
+
+function pair(open: Draft | null, close: Draft | null): void {
+  if (open && close) {
+    open.pair = close;
+    close.pair = open;
+  }
+}
+
+/** The first of `lines` (sorted, touching) whose end is at or after `pos`. */
+function firstReaching(lines: readonly Line[], pos: number): number {
+  let lo = 0;
+  let hi = lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((lines[mid]?.to ?? 0) < pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 /**
  * The marks of line `line` (1-based), sorted by position. Empty when the
  * line's marks show, apart from a Reflection's comments. With `always`, the
@@ -172,61 +279,92 @@ export function marksOnLine(
   line: number,
   options: { always?: boolean } = {},
 ): Mark[] {
+  return scanMarks(state, line, line, options).lines[0] ?? [];
+}
+
+/**
+ * The marks of lines `first` to `last` (1-based), each line exactly as
+ * `marksOnLine` gives it, read in one walk over the syntax tree. Asking line
+ * by line walks a paragraph's nodes from its start once per line, which a
+ * long hard-wrapped paragraph pays for quadratically; this walks them once.
+ */
+export function scanMarks(
+  state: EditorState,
+  first: number,
+  last: number,
+  options: { always?: boolean } = {},
+): MarkScan {
   const doc = state.doc;
-  const at = doc.line(line);
-  if (at.from <= frontmatterEnd(doc)) {
-    return [];
-  }
-  const hidden = options.always === true || marksHiddenOnLine(state, line);
+  const fence = frontmatterEnd(doc);
   // A Reflection never shows a comment, in either mode, in a table cell too.
-  const comments =
-    hidden || hidesIdLines(state) || state.facet(pageHidesComments);
-  if (!comments) {
-    return [];
+  const comments = hidesIdLines(state) || state.facet(pageHidesComments);
+  const lines: Line[] = [];
+  const scans: (LineScan | null)[] = [];
+  for (let number = first; number <= last; number++) {
+    const at = doc.line(number);
+    lines.push(at);
+    const hidden =
+      at.from > fence &&
+      (options.always === true || marksHiddenOnLine(state, number));
+    scans.push(
+      at.from <= fence || (!hidden && !comments)
+        ? null
+        : {
+            at,
+            hidden,
+            drafts: [],
+            inCode: false,
+            taken: new Set(),
+            category: hidden ? OBSERVATION_LINE.exec(at.text) : null,
+            skip: -1,
+            seen: -1,
+          },
+    );
   }
-  const drafts: Draft[] = [];
-  const onLine = (from: number, to: number) =>
-    from >= at.from && to <= at.to && from < to;
-  const add = (
-    from: number,
-    to: number,
-    kind: MarkKind,
-    side: Mark["side"],
-  ): Draft | null => {
-    if (!onLine(from, to)) {
-      return null;
-    }
-    const draft: Draft = { from, to, kind, side, pair: null };
-    drafts.push(draft);
-    return draft;
+  const closers = new Map<number, { from: number; to: number }>();
+  const live = scans.filter((scan) => scan !== null);
+  const head = live[0];
+  const tail = live.at(-1);
+  if (head && tail) {
+    walkMarks(state, lines, scans, closers, head.at.from, tail.at.to);
+  }
+  return {
+    lines: scans.map((scan) => (scan ? finished(scan) : [])),
+    closers,
   };
-  const pair = (open: Draft | null, close: Draft | null) => {
-    if (open && close) {
-      open.pair = close;
-      close.pair = open;
-    }
-  };
+}
+
+function walkMarks(
+  state: EditorState,
+  lines: readonly Line[],
+  scans: readonly (LineScan | null)[],
+  closers: Map<number, { from: number; to: number }>,
+  from: number,
+  to: number,
+): void {
+  const doc = state.doc;
   const char = (pos: number) => doc.sliceString(pos, pos + 1);
   // A `>` with the one optional space after it.
-  const quote = (from: number, to: number) => {
-    add(from, isSpace(char(to)) ? to + 1 : to, "quote", "prefix");
+  const quote = (scan: LineScan, from: number, to: number) => {
+    addTo(scan, from, isSpace(char(to)) ? to + 1 : to, "quote", "prefix");
   };
-  let inCode = false;
-  // Where an observation's category or a task box already took a `[`, so the
-  // parser's link over the same brackets is not read twice.
-  const taken = new Set<number>();
   let defined: Map<string, unknown> | null = null;
   const isDefined = (label: string) => {
     defined ??= definitions(state);
     return defined.has(labelKey(label));
   };
+  // The line holding `pos`, if it was found on the node in hand.
+  let step = 0;
+  const found = (pos: number): LineScan | null => {
+    const scan = scans[firstReaching(lines, pos)];
+    return scan && scan.seen === step && scan.at.from <= pos ? scan : null;
+  };
 
-  const category = hidden ? OBSERVATION_LINE.exec(at.text) : null;
-
-  const link = (node: SyntaxNode) => {
+  /** A link's opening mark, and where its closing mark starts and ends. */
+  const linkPlan = (node: SyntaxNode) => {
     const open = node.firstChild;
-    if (!open || open.name !== "LinkMark" || taken.has(open.from)) {
-      return;
+    if (!open || open.name !== "LinkMark") {
+      return null;
     }
     const image = node.name === "Image";
     let close: SyntaxNode | null = open.nextSibling;
@@ -234,16 +372,16 @@ export function marksOnLine(
       close = close.nextSibling;
     }
     if (!close) {
-      return;
+      return null;
     }
     const text = doc.sliceString(open.to, close.from);
     // A footnote reference is Task 10's, never a link.
     if (!image && text.startsWith("^")) {
-      return;
+      return null;
     }
     // `[[Target]]`: the wikilink chip's, never a link.
     if (char(node.from - 1) === "[" && char(node.to) === "]") {
-      return;
+      return null;
     }
     const after = close.nextSibling;
     let end = close.to;
@@ -260,92 +398,104 @@ export function marksOnLine(
         }
       }
       if (!isDefined(label)) {
-        return;
+        return null;
       }
     }
-    pair(
-      add(open.from, open.to, "link", "open"),
-      add(close.from, end, "link", "close"),
-    );
+    return { open, close: close.from, end };
   };
 
-  syntaxTree(state).iterate({
-    from: at.from,
-    to: at.to,
-    enter: (ref) => {
-      const name = ref.name;
-      if (name === "Comment" || name === "CommentBlock") {
-        if (!isIdLine(at.text)) {
-          const text = doc.sliceString(ref.from, ref.to);
-          for (const comment of htmlCommentRanges(text)) {
-            add(
-              Math.max(ref.from + comment.from, at.from),
-              Math.min(ref.from + comment.to, at.to),
-              "comment",
-              "whole",
+  /** Whether a pair node's last child is its first child's partner. */
+  const closer = (node: SyntaxNode) => {
+    const open = node.firstChild;
+    const close = node.lastChild;
+    if (open && close && close.from !== open.from && close.name === open.name) {
+      closers.set(open.from, { from: close.from, to: close.to });
+    }
+  };
+
+  /**
+   * The marks node `ref` gives the lines in `hidden` (all of whose marks are
+   * read). True when those lines do not read its inside.
+   */
+  const marksOf = (ref: SyntaxNodeRef, hidden: readonly LineScan[]) => {
+    const name = ref.name;
+    if (NO_MARKS.has(name)) {
+      if (name === "FencedCode" || name === "CodeBlock") {
+        for (const scan of hidden) {
+          if (ref.from <= scan.at.from && ref.to >= scan.at.from) {
+            scan.inCode = true;
+          }
+        }
+        // In a quote or a callout the parser hangs each code line's `>`
+        // under the block: those are the quote's marks, not code.
+        for (const mark of ref.node.getChildren("QuoteMark")) {
+          const scan = found(mark.from);
+          if (scan?.hidden) quote(scan, mark.from, mark.to);
+        }
+      }
+      return true;
+    }
+    const node = ref.node;
+    const pairKind = PAIRS.get(name);
+    if (pairKind !== undefined) {
+      // `$`...`$` is inline math, drawn by `elementPreviews.ts`.
+      const math =
+        name === "InlineCode" &&
+        char(ref.from - 1) === "$" &&
+        doc.sliceString(ref.from - 2, ref.from - 1) !== "\\" &&
+        char(ref.to) === "$";
+      const first = node.firstChild;
+      const last = node.lastChild;
+      if (!math && first && last && first.from !== last.from) {
+        for (const scan of hidden) {
+          pair(
+            addTo(scan, first.from, first.to, pairKind, "open"),
+            addTo(scan, last.from, last.to, pairKind, "close"),
+          );
+        }
+        closer(node);
+      }
+      // Inside code nothing is a mark; inside emphasis, more may be.
+      return name === "InlineCode";
+    }
+    if (name === "Link" || name === "Image") {
+      const plan = linkPlan(node);
+      if (plan) {
+        for (const scan of hidden) {
+          if (!scan.taken.has(plan.open.from)) {
+            pair(
+              addTo(scan, plan.open.from, plan.open.to, "link", "open"),
+              addTo(scan, plan.close, plan.end, "link", "close"),
             );
           }
         }
-        return false;
+        closer(node);
       }
-      if (!hidden) {
-        return;
-      }
-      if (NO_MARKS.has(name)) {
-        if (name === "FencedCode" || name === "CodeBlock") {
-          if (ref.from <= at.from && ref.to >= at.from) {
-            inCode = true;
-          }
-          // In a quote or a callout the parser hangs each code line's `>`
-          // under the block: those are the quote's marks, not code.
-          for (const mark of ref.node.getChildren("QuoteMark")) {
-            quote(mark.from, mark.to);
-          }
-        }
-        return false;
-      }
-      const node = ref.node;
-      const pairKind = PAIRS.get(name);
-      if (pairKind !== undefined) {
-        // `$`...`$` is inline math, drawn by `elementPreviews.ts`.
-        const math =
-          name === "InlineCode" &&
-          char(ref.from - 1) === "$" &&
-          doc.sliceString(ref.from - 2, ref.from - 1) !== "\\" &&
-          char(ref.to) === "$";
-        const first = node.firstChild;
-        const last = node.lastChild;
-        if (!math && first && last && first.from !== last.from) {
+      return false;
+    }
+    if (name === "Autolink") {
+      const first = node.firstChild;
+      const last = node.lastChild;
+      if (first?.name === "LinkMark" && last?.name === "LinkMark") {
+        for (const scan of hidden) {
           pair(
-            add(first.from, first.to, pairKind, "open"),
-            add(last.from, last.to, pairKind, "close"),
+            addTo(scan, first.from, first.to, "link", "open"),
+            addTo(scan, last.from, last.to, "link", "close"),
           );
         }
-        // Inside code nothing is a mark; inside emphasis, more may be.
-        return name === "InlineCode" ? false : undefined;
+        closer(node);
       }
-      if (name === "Link" || name === "Image") {
-        link(node);
-        return;
-      }
-      if (name === "Autolink") {
-        const first = node.firstChild;
-        const last = node.lastChild;
-        if (first?.name === "LinkMark" && last?.name === "LinkMark") {
-          pair(
-            add(first.from, first.to, "link", "open"),
-            add(last.from, last.to, "link", "close"),
-          );
-        }
-        return false;
-      }
-      if (name.startsWith("ATXHeading")) {
-        const open = node.firstChild;
-        const close = node.lastChild;
-        // Only with the space after it: a `#` run alone is a heading being typed.
+      return true;
+    }
+    if (name.startsWith("ATXHeading")) {
+      const open = node.firstChild;
+      const close = node.lastChild;
+      for (const scan of hidden) {
+        // Only with the space after it: a `#` run alone is a heading being
+        // typed.
         const prefix =
           open?.name === "HeaderMark" && isSpace(char(open.to))
-            ? add(open.from, open.to + 1, "heading", "prefix")
+            ? addTo(scan, open.from, open.to + 1, "heading", "prefix")
             : null;
         if (
           prefix &&
@@ -353,17 +503,23 @@ export function marksOnLine(
           close.from !== prefix.from &&
           close.name === "HeaderMark"
         ) {
-          pair(prefix, add(close.from, close.to, "heading", "close"));
+          pair(prefix, addTo(scan, close.from, close.to, "heading", "close"));
         }
-        return;
       }
-      if (name === "ListMark") {
-        if (isSpace(char(ref.to))) {
-          add(ref.from, ref.to + 1, "list", "prefix");
-          const box = ref.to + 1;
-          if (NOT_APPLICABLE.test(doc.sliceString(box, box + 4))) {
-            taken.add(box);
-            add(
+      return false;
+    }
+    if (name === "ListMark") {
+      if (isSpace(char(ref.to))) {
+        const box = ref.to + 1;
+        const notApplicable = NOT_APPLICABLE.test(
+          doc.sliceString(box, box + 4),
+        );
+        for (const scan of hidden) {
+          addTo(scan, ref.from, ref.to + 1, "list", "prefix");
+          if (notApplicable) {
+            scan.taken.add(box);
+            addTo(
+              scan,
               box,
               isSpace(char(box + 3)) ? box + 4 : box + 3,
               "task",
@@ -371,26 +527,111 @@ export function marksOnLine(
             );
           }
         }
-        return;
       }
-      if (name === "TaskMarker") {
-        taken.add(ref.from);
-        add(
+      return false;
+    }
+    if (name === "TaskMarker") {
+      for (const scan of hidden) {
+        scan.taken.add(ref.from);
+        addTo(
+          scan,
           ref.from,
           isSpace(char(ref.to)) ? ref.to + 1 : ref.to,
           "task",
           "prefix",
         );
-        return;
       }
-      if (name === "QuoteMark") {
-        quote(ref.from, ref.to);
-        return;
+      return false;
+    }
+    if (name === "QuoteMark") {
+      for (const scan of hidden) {
+        quote(scan, ref.from, ref.to);
       }
-    },
-  });
+      return false;
+    }
+    return false;
+  };
 
-  if (category && !inCode) {
+  // The depth of the node in hand: a line that does not read a node's
+  // inside skips every node below it, until the walk is back at its depth.
+  let depth = 0;
+  const hidden: LineScan[] = [];
+  walkTree(
+    syntaxTree(state),
+    from,
+    to,
+    (ref) => {
+      step += 1;
+      const at = depth;
+      hidden.length = 0;
+      let any = false;
+      // A line that reads only comments reads every inside.
+      let inside = false;
+      for (
+        let index = firstReaching(lines, ref.from);
+        index < lines.length && (lines[index]?.from ?? 0) <= ref.to;
+        index++
+      ) {
+        const scan = scans[index];
+        if (!scan) continue;
+        if (scan.skip !== -1) {
+          if (at > scan.skip) continue;
+          scan.skip = -1;
+        }
+        scan.seen = step;
+        any = true;
+        if (scan.hidden) hidden.push(scan);
+        else inside = true;
+      }
+      if (!any) {
+        return false;
+      }
+      if (ref.name === "Comment" || ref.name === "CommentBlock") {
+        const text = doc.sliceString(ref.from, ref.to);
+        for (const comment of htmlCommentRanges(text)) {
+          const start = ref.from + comment.from;
+          const end = ref.from + comment.to;
+          for (
+            let index = firstReaching(lines, start);
+            index < lines.length && (lines[index]?.from ?? 0) <= end;
+            index++
+          ) {
+            const scan = scans[index];
+            if (!scan || scan.seen !== step || isIdLine(scan.at.text)) continue;
+            addTo(
+              scan,
+              Math.max(start, scan.at.from),
+              Math.min(end, scan.at.to),
+              "comment",
+              "whole",
+            );
+          }
+        }
+        return false;
+      }
+      if (hidden.length > 0) {
+        if (marksOf(ref, hidden)) {
+          for (const scan of hidden) scan.skip = at;
+        } else {
+          inside = true;
+        }
+      }
+      if (!inside) {
+        return false;
+      }
+      depth += 1;
+      return undefined;
+    },
+    () => {
+      depth -= 1;
+    },
+  );
+}
+
+/** A line's drafts as its sorted marks, its category read last. */
+function finished(scan: LineScan): Mark[] {
+  const { at, drafts, taken, category } = scan;
+  if (category && !scan.inCode) {
     const open = at.from + at.text.indexOf("[");
     const close = open + (category[1] ?? "").length + 1;
     taken.add(open);
@@ -405,11 +646,10 @@ export function marksOnLine(
       }
     }
     pair(
-      add(open, open + 1, "category", "open"),
-      add(close, close + 1, "category", "close"),
+      addTo(scan, open, open + 1, "category", "open"),
+      addTo(scan, close, close + 1, "category", "close"),
     );
   }
-
   drafts.sort((a, b) => a.from - b.from || a.to - b.to);
   return drafts.map((draft) => ({
     from: draft.from,

@@ -55,7 +55,7 @@ import {
   viewAtoms,
 } from "./caret";
 import type { Mark } from "./hiddenMarks";
-import { marksOnLine, runAt } from "./hiddenMarks";
+import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
 
 type HeadingQuestion = (
@@ -657,9 +657,32 @@ export function partnerAcrossLines(
 function marksBetween(state: EditorState, from: number, to: number): Mark[] {
   const first = state.doc.lineAt(from).number;
   const last = state.doc.lineAt(to).number;
-  const out: Mark[] = [];
-  for (let n = first; n <= last; n += 1) {
-    out.push(...marksOnLine(state, n));
+  return scanMarks(state, first, last).lines.flat();
+}
+
+/**
+ * The hidden marks of each of `numbers`, read in one walk per run of
+ * consecutive lines rather than one per line.
+ */
+function marksOfLines(
+  state: EditorState,
+  numbers: Iterable<number>,
+): Map<number, Mark[]> {
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const out = new Map<number, Mark[]>();
+  let start = 0;
+  while (start < sorted.length) {
+    let end = start;
+    while (
+      end + 1 < sorted.length &&
+      (sorted[end + 1] ?? 0) === (sorted[end] ?? 0) + 1
+    ) {
+      end += 1;
+    }
+    const first = sorted[start] ?? 1;
+    const scan = scanMarks(state, first, sorted[end] ?? first);
+    scan.lines.forEach((marks, i) => out.set(first + i, marks));
+    start = end + 1;
   }
   return out;
 }
@@ -691,11 +714,15 @@ function markFate(
       lines.add(n);
     }
   }
+  const read = marksOfLines(
+    state,
+    [...lines].filter((n) => marksHiddenOnLine(state, n)),
+  );
   for (const n of lines) {
-    if (!marksHiddenOnLine(state, n)) {
+    const marks = read.get(n);
+    if (!marks) {
       continue;
     }
-    const marks = marksOnLine(state, n);
     for (const mark of marks) {
       if (cut(mark)) {
         kept.push(mark);
