@@ -522,3 +522,261 @@ describe("a relative note link", () => {
     });
   });
 });
+
+describe("a wikilink to a heading", () => {
+  const headingDetail = (links: unknown[]) =>
+    readEngramDetail(
+      { domain: "notes", permalink: "a", title: "A", content: "", links },
+      "notes",
+      "a",
+    );
+  const headingGraph = (titles: [string, string][]) =>
+    readGraph({
+      nodes: titles.map(([permalink, title], i) => ({
+        id: i + 1,
+        domain: "notes",
+        permalink,
+        title,
+        status: "stable",
+        type: "engram",
+      })),
+      edges: [],
+      truncated: false,
+    });
+
+  it("splits the heading off a target and keeps the alias", () => {
+    expect(parseWikiTarget("b#Setup Guide|x")).toEqual({
+      domain: null,
+      target: "b",
+      fragment: "Setup Guide",
+      whole: "b#Setup Guide",
+      alias: "x",
+    });
+  });
+
+  it("keeps a leading hash as part of the target", () => {
+    expect(parseWikiTarget("#setup")).toEqual({
+      domain: null,
+      target: "#setup",
+    });
+  });
+
+  it("writes the heading back and shows it as written", () => {
+    expect(innerOf(parseWikiTarget("ops:b#Setup|x"))).toBe("ops:b#Setup|x");
+    expect(wikilinkWords("b#setup")).toBe("b#setup");
+    expect(wikilinkWords("b#setup|see")).toBe("see");
+  });
+
+  it("opens the engram at the heading slug, labelled with title and heading", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        {
+          resolved: true,
+          target: { domain: null, target: "b", fragment: "setup" },
+        },
+        {
+          resolved: true,
+          target: { domain: null, target: "b", fragment: "Setup Guide" },
+        },
+      ]),
+      headingGraph([["b", "Bee"]]),
+    );
+    expect(resolve("b#setup")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b#setup",
+      label: "Bee \u203a setup",
+    });
+    expect(resolve("b#Setup Guide|see")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b#setup-guide",
+      label: "see",
+    });
+  });
+
+  it("opens a title holding a hash as a whole, without a fragment", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        { resolved: true, target: { domain: null, target: "C# Basics" } },
+      ]),
+      headingGraph([
+        ["c", "C"],
+        ["c-basics", "C# Basics"],
+      ]),
+    );
+    expect(resolve("C# Basics")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/c-basics",
+      label: "C# Basics",
+    });
+  });
+
+  // The order core's parser takes (`LinkTarget::parse`): the alias at the
+  // first `|`, then the fragment at the first `#`, then the prefix on the part
+  // before the `#` only.
+  it("reads the prefix only on the part before the hash", () => {
+    expect(parseWikiTarget("b#FAQ: General")).toEqual({
+      domain: null,
+      target: "b",
+      fragment: "FAQ: General",
+    });
+    expect(parseWikiTarget("a#b:c")).toEqual({
+      domain: null,
+      target: "a",
+      fragment: "b:c",
+    });
+    expect(parseWikiTarget("ops:b#x")).toEqual({
+      domain: "ops",
+      target: "b",
+      fragment: "x",
+      whole: "b#x",
+    });
+    expect(parseWikiTarget("Log: Weekly#x")).toEqual({
+      domain: "Log",
+      target: "Weekly",
+      fragment: "x",
+      whole: "Weekly#x",
+    });
+  });
+
+  it("reads an empty heading as no heading, as the server does", () => {
+    expect(parseWikiTarget("b#")).toEqual({
+      domain: null,
+      target: "b",
+      whole: "b#",
+    });
+    expect(parseWikiTarget("b# |see")).toEqual({
+      domain: null,
+      target: "b",
+      whole: "b#",
+      alias: "see",
+    });
+    expect(wikilinkWords("b#")).toBe("b#");
+    expect(innerOf(parseWikiTarget("b#"))).toBe("b#");
+  });
+
+  it("resolves a relation to a title holding a hash as written", () => {
+    // The payload's shape for `- relates_to [[C# Basics]]`: the split target
+    // and heading, and the whole text beside them.
+    const page = readEngramDetail(
+      {
+        domain: "notes",
+        permalink: "a",
+        title: "A",
+        content: "",
+        relations: [
+          {
+            line: 1,
+            rel_type: "relates_to",
+            resolved: true,
+            target: { domain: null, target: "C", fragment: "Basics" },
+            whole: "C# Basics",
+          },
+        ],
+      },
+      "notes",
+      "a",
+    );
+    const resolve = buildWikilinkResolver(
+      page,
+      headingGraph([
+        ["c", "C"],
+        ["c-basics", "C# Basics"],
+      ]),
+    );
+    const relation = page.relations[0];
+    expect(relation).toBeDefined();
+    expect(resolve(innerOf(relation!.target))).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/c-basics",
+      label: "C# Basics",
+    });
+  });
+
+  it("writes a title holding a hash back as it was written", () => {
+    expect(innerOf(parseWikiTarget("C# Basics"))).toBe("C# Basics");
+    expect(wikilinkWords("C# Basics")).toBe("C# Basics");
+    expect(wikilinkWords("b#FAQ: General")).toBe("b#FAQ: General");
+    expect(innerOf(parseWikiTarget("ops:C# Basics|x"))).toBe("ops:C# Basics|x");
+  });
+
+  it("resolves a heading whose text holds a colon", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        {
+          resolved: true,
+          target: { domain: null, target: "b", fragment: "FAQ: General" },
+        },
+      ]),
+      headingGraph([["b", "Bee"]]),
+    );
+    expect(resolve("b#FAQ: General")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b#faq-general",
+      label: "Bee › FAQ: General",
+    });
+  });
+
+  it("resolves a heading after a domain prefix", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        {
+          resolved: true,
+          target: { domain: "ops", target: "b", fragment: "x" },
+        },
+      ]),
+      readGraph({
+        nodes: [
+          {
+            id: 1,
+            domain: "ops",
+            permalink: "b",
+            title: "Bee",
+            status: "stable",
+            type: "engram",
+          },
+        ],
+        edges: [],
+        truncated: false,
+      }),
+    );
+    expect(resolve("ops:b#x")).toEqual({
+      kind: "resolved",
+      href: "/d/ops/e/b#x",
+      label: "Bee › x",
+    });
+  });
+
+  it("resolves an empty heading to the engram itself", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        { resolved: true, target: { domain: null, target: "b" } },
+      ]),
+      headingGraph([["b", "Bee"]]),
+    );
+    expect(resolve("b#")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b",
+      label: "Bee",
+    });
+  });
+
+  it("falls back to the text before the hash when the prefix names no domain", () => {
+    // `Log` is no domain, so the server reads `Log: Weekly` as a title at
+    // home and keeps the heading.
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        {
+          resolved: true,
+          target: { domain: "Log", target: "Weekly", fragment: "x" },
+        },
+      ]),
+      headingGraph([["log-weekly", "Log: Weekly"]]),
+      domainSpellings([{ name: "notes", canonicalName: "notes", aliases: [] }]),
+    );
+    expect(resolve("Log: Weekly#x")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/log-weekly#x",
+      label: "Log: Weekly › x",
+    });
+  });
+});

@@ -25,7 +25,8 @@ use crystalline_service::{DomainAccess, Engine, ReflectionCaller, Scope};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 
-use super::github_app::{Forge, app_env, connect, engram, files, manifest, spawn_forge};
+use super::github_app::{Forge, app_env, connect, engram, files, manifest, owner_id, spawn_forge};
+use super::github_identity::{MOVED, closed_reason, eventually, restart_engine};
 use crate::support::MockProvider;
 
 pub(crate) const SECRET: &str = "a webhook secret only the tests know";
@@ -1124,4 +1125,570 @@ async fn a_rename_skips_a_domain_recorded_for_another_repository() {
     .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+}
+
+/// A `repository` event with `action` for `acme/kb`.
+fn kb_repository_event(action: &str) -> Value {
+    json!({
+        "action": action,
+        "repository": {"full_name": "acme/kb", "name": "kb", "archived": action == "archived"},
+        "installation": {"id": 1},
+    })
+}
+
+/// What the archived domain answers a write with.
+const KB_ARCHIVED: &str = "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub";
+
+#[tokio::test]
+async fn a_signed_archived_delivery_makes_the_domain_read_only() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.forge.archive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-archived", &kb_repository_event("archived")),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        fx.eng.github_archived_repo("kb").as_deref(),
+        Some("acme/kb")
+    );
+    assert_eq!(fx.eng.github_archived_repo("vault"), None);
+    let page = WriteReflectionParams {
+        domain: "kb".into(),
+        path: "overview.md".into(),
+        markdown: Some(OVERVIEW.into()),
+        ..Default::default()
+    };
+    let refused = fx.eng.write_reflection(&page, &owner()).await.unwrap_err();
+    assert_eq!(refused.to_string(), KB_ARCHIVED);
+
+    // Unarchived on GitHub: the delivery asks again, and the answer opens it.
+    fx.forge.unarchive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-unarchived",
+            &kb_repository_event("unarchived"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    for _ in 0..250 {
+        if fx.eng.github_archived_repo("kb").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fx.eng.github_archived_repo("kb"), None);
+    fx.eng.write_reflection(&page, &owner()).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_backup_tick_makes_no_push_for_an_archived_domain() {
+    let fx = setup(Some(SECRET)).await;
+    let later = || Instant::now() + Duration::from_secs(120);
+    let page = |path: &str| WriteReflectionParams {
+        domain: "kb".into(),
+        path: path.into(),
+        markdown: Some(OVERVIEW.into()),
+        ..Default::default()
+    };
+    fx.eng
+        .write_reflection(&page("overview.md"), &owner())
+        .await
+        .unwrap();
+    fx.eng.reflection_backup_tick(later()).await;
+    let head = || fx.kb.branch_commit(BACKUP_BRANCH);
+    let before = head();
+    assert!(before.is_some(), "the first backup went out");
+    // A change waits to be backed up when the repository is archived.
+    fx.eng
+        .write_reflection(&page("second.md"), &owner())
+        .await
+        .unwrap();
+    fx.forge.archive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-archived", &kb_repository_event("archived")),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let commits = fx.forge.commits().len();
+    let outcomes = fx.eng.reflection_backup_tick(later()).await;
+    assert!(
+        outcomes.iter().all(|(domain, _)| domain != "kb"),
+        "{outcomes:?}"
+    );
+    assert_eq!(head(), before, "nothing was pushed for kb");
+    assert_eq!(fx.forge.commits().len(), commits);
+    // Unarchived: the change goes out on the next tick.
+    fx.forge.unarchive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-unarchived",
+            &kb_repository_event("unarchived"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    for _ in 0..250 {
+        if fx.eng.github_archived_repo("kb").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fx.eng.reflection_backup_tick(later()).await;
+    assert_ne!(head(), before, "the change goes out once unarchived");
+}
+
+/// An `organization` `renamed` body: the account `from` is now `to`, with
+/// the id the payload claims.
+fn org_renamed(from: &str, to: &str, id: u64) -> Value {
+    json!({
+        "action": "renamed",
+        "changes": {"login": {"from": from}},
+        "organization": {"login": to, "id": id},
+        "installation": {"id": 1},
+    })
+}
+
+/// An `organization` `deleted` body for `login`, with the id it claims.
+fn org_deleted(login: &str, id: u64) -> Value {
+    json!({
+        "action": "deleted",
+        "organization": {"login": login, "id": id},
+        "installation": {"id": 1},
+    })
+}
+
+/// The repository `domain`'s origin state names.
+fn state_repo(fx: &Fx, domain: &str) -> String {
+    crystalline_remote::state::OriginState::load(&fx.tmp.path().join("origins").join(domain))
+        .unwrap()
+        .unwrap()
+        .repo
+}
+
+/// How many `GET /repositories/{id}` the forge answered.
+fn by_id_hits(fx: &Fx) -> usize {
+    fx.forge
+        .hits()
+        .iter()
+        .filter(|h| h.path.starts_with("/repositories/"))
+        .count()
+}
+
+fn invalidate(fx: &Fx, repo: &str) {
+    fx.eng
+        .invalidate_github_access(crystalline_service::engine::Invalidate::Repo(
+            repo.to_string(),
+        ));
+}
+
+/// Asks the governor about `kb` and `vault`, so both hold a fresh snapshot
+/// and no lookup runs for the next five minutes: a lookup after the forge
+/// renamed the owner would follow the rename on its own (the passive path).
+async fn settle_both(fx: &Fx) {
+    ask(fx).await;
+    fx.eng.github_people("vault").await.unwrap();
+}
+
+#[tokio::test]
+async fn an_organization_rename_github_confirms_moves_the_origin() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let (kb, vault) = (
+        fx.forge.id_of("acme/kb").unwrap(),
+        fx.forge.id_of("acme/vault").unwrap(),
+    );
+    fx.forge.rename_owner("acme", "acme-labs");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-rename",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme-labs/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme-labs/vault");
+    let saved = std::fs::read_to_string(fx.tmp.path().join("config.yaml")).unwrap();
+    assert!(saved.contains("acme-labs/kb"), "{saved}");
+    assert!(saved.contains("acme-labs/vault"), "{saved}");
+    assert!(!saved.contains("acme/"), "{saved}");
+    for domain in ["kb", "vault"] {
+        let want = format!("acme-labs/{domain}");
+        assert!(
+            eventually(|| state_repo(&fx, domain) == want).await,
+            "{domain}: {}",
+            state_repo(&fx, domain)
+        );
+    }
+    // GitHub was asked about each recorded repository by its id.
+    let hits = fx.forge.hits();
+    for id in [kb, vault] {
+        assert!(hits.iter().any(|h| h.path == format!("/repositories/{id}")));
+    }
+    // And the domain stays open under its new name.
+    assert!(fx.eng.github_people("kb").await.is_some());
+    assert!(fx.eng.github_access_closed().is_empty());
+}
+
+/// Review Focus 3: a rename GitHub does not confirm, or one the payload
+/// cannot prove, moves nothing.
+#[tokio::test]
+async fn an_organization_rename_github_does_not_confirm_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let acme = owner_id("acme");
+    // The organization was never renamed: GitHub answers the old name.
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-not-renamed",
+            &org_renamed("acme", "acme-labs", acme),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(by_id_hits(&fx) > 0, "GitHub was asked");
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+
+    // Renamed now, but the body names another organization id, or carries
+    // no installation or no id: nothing is asked and nothing moves.
+    fx.forge.rename_owner("acme", "acme-labs");
+    let before = by_id_hits(&fx);
+    let mut no_installation = org_renamed("acme", "acme-labs", acme);
+    no_installation
+        .as_object_mut()
+        .unwrap()
+        .remove("installation");
+    let mut no_id = org_renamed("acme", "acme-labs", acme);
+    no_id["organization"].as_object_mut().unwrap().remove("id");
+    for (delivery, payload) in [
+        ("d-org-other-id", org_renamed("acme", "acme-labs", 4242)),
+        ("d-org-no-installation", no_installation),
+        ("d-org-no-id", no_id),
+    ] {
+        let resp = deliver(&fx, Delivery::signed("organization", delivery, &payload)).await;
+        assert_eq!(resp.status(), 200, "{delivery}");
+        assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb", "{delivery}");
+        assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault", "{delivery}");
+    }
+    assert_eq!(by_id_hits(&fx), before);
+    let saved = std::fs::read_to_string(fx.tmp.path().join("config.yaml")).unwrap();
+    assert!(!saved.contains("acme-labs"), "{saved}");
+}
+
+/// Review Focus 3: a domain with no recorded ids proves nothing, so it
+/// keeps its origin while a domain with matching ids moves.
+#[tokio::test]
+async fn an_organization_rename_leaves_a_domain_without_recorded_ids_alone() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let dir = fx.tmp.path().join("origins").join("kb");
+    let mut state = crystalline_remote::state::OriginState::load(&dir)
+        .unwrap()
+        .unwrap();
+    state.repository_ids = None;
+    state.save(&dir).unwrap();
+    let kb = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.rename_owner("acme", "acme-labs");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-unrecorded",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme-labs/vault");
+    assert!(
+        !fx.forge
+            .hits()
+            .iter()
+            .any(|h| h.path == format!("/repositories/{kb}")),
+        "nothing recorded, nothing to ask about"
+    );
+}
+
+/// Review Focus 3: a signed body sent again under a fresh id after the
+/// organization was renamed back moves nothing.
+#[tokio::test]
+async fn a_stale_organization_renamed_body_sent_again_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let acme = owner_id("acme");
+    let forward = org_renamed("acme", "acme-labs", acme);
+    fx.forge.rename_owner("acme", "acme-labs");
+    deliver(
+        &fx,
+        Delivery::signed("organization", "d-org-forward", &forward),
+    )
+    .await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme-labs/kb");
+    // And back again.
+    fx.forge.rename_owner("acme-labs", "acme");
+    deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-back",
+            &org_renamed("acme-labs", "acme", acme),
+        ),
+    )
+    .await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+    // The first body once more, under a new id.
+    let resp = deliver(
+        &fx,
+        Delivery::signed("organization", "d-org-forward-again", &forward),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+}
+
+#[tokio::test]
+async fn a_read_only_instance_logs_an_organization_rename_and_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let config = fx.tmp.path().join("config.yaml");
+    let before = std::fs::read_to_string(&config).unwrap();
+    fx.forge.rename_owner("acme", "acme-labs");
+    let eng = restart_engine(&fx, true).await;
+    let (logs, _guard) = crate::support::capture_logs();
+    let outcome = eng
+        .apply_github_event(
+            "organization",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.readers_changed);
+    assert_eq!(origin_repo(&eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&eng, "vault"), "acme/vault");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(state_repo(&fx, "kb"), "acme/kb");
+    assert_eq!(state_repo(&fx, "vault"), "acme/vault");
+    assert!(
+        logs.any_contains("this instance is read-only"),
+        "{:?}",
+        logs.lines()
+    );
+}
+
+/// An organization rename that moves a domain carries its repository's
+/// archived mark to the new name, so the domain stays read-only.
+#[tokio::test]
+async fn an_organization_rename_carries_the_archived_mark() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    fx.forge.archive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-archived", &kb_repository_event("archived")),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    // The lookups the delivery started have answered.
+    settle_both(&fx).await;
+    assert_eq!(
+        fx.eng.github_archived_repo("kb").as_deref(),
+        Some("acme/kb")
+    );
+    fx.forge.rename_owner("acme", "acme-labs");
+    let outcome = fx
+        .eng
+        .apply_github_event(
+            "organization",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        )
+        .await
+        .unwrap();
+    assert!(!outcome.readers_changed);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme-labs/kb");
+    assert_eq!(
+        fx.eng.github_archived_repo("kb").as_deref(),
+        Some("acme-labs/kb")
+    );
+    assert_eq!(fx.eng.github_archived_repo("vault"), None);
+}
+
+#[tokio::test]
+async fn a_deleted_organization_closes_its_domains() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.eng.github_people("vault").await.unwrap();
+    // A body naming another organization of that login closes nothing.
+    let resp = deliver(
+        &fx,
+        Delivery::signed("organization", "d-org-other", &org_deleted("acme", 4242)),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(fx.eng.github_access_closed().is_empty());
+
+    const REASON: &str = "the GitHub organization acme was deleted: disconnect the domain or connect it to another repository";
+    let delete = org_deleted("acme", owner_id("acme"));
+    for delivery in ["d-org-deleted", "d-org-deleted-again"] {
+        let resp = deliver(&fx, Delivery::signed("organization", delivery, &delete)).await;
+        assert_eq!(resp.status(), 200);
+        let mut closed = fx.eng.github_access_closed();
+        closed.sort_by(|a, b| a.domain.cmp(&b.domain));
+        assert_eq!(closed.len(), 2, "{delivery}: {closed:?}");
+        assert_eq!(closed[0].domain, "kb");
+        assert_eq!(closed[1].domain, "vault");
+        assert!(closed.iter().all(|c| c.reason == REASON), "{closed:?}");
+        assert!(fx.eng.github_people("kb").await.is_none());
+        // GitHub still shows the App both repositories: the recheck after
+        // the grace (asked at once here by naming them) opens them again,
+        // so a replayed delete does not keep them shut.
+        invalidate(&fx, "acme/kb");
+        invalidate(&fx, "acme/vault");
+        assert!(
+            eventually(|| fx.eng.github_access_closed().is_empty()).await,
+            "{delivery}: {:?}",
+            fx.eng.github_access_closed()
+        );
+        assert!(fx.eng.github_people("kb").await.is_some());
+    }
+}
+
+/// The passive path: with the webhook not delivered, the next lookup sees
+/// the same repository and owner ids under the new login and follows it.
+#[tokio::test]
+async fn an_organization_rename_without_a_webhook_moves_the_origin_on_a_lookup() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.forge.rename_owner("acme", "acme-labs");
+    invalidate(&fx, "acme/kb");
+    assert!(fx.eng.github_people("kb").await.is_some());
+    assert!(closed_reason(&fx.eng, "kb").is_none());
+    assert!(eventually(|| origin_repo(&fx.eng, "kb") == "acme-labs/kb").await);
+    let saved = std::fs::read_to_string(fx.tmp.path().join("config.yaml")).unwrap();
+    assert!(saved.contains("acme-labs/kb"), "{saved}");
+}
+
+/// The passive path never follows a transfer: another owner id closes the
+/// domain.
+#[tokio::test]
+async fn a_transfer_to_another_organization_without_a_webhook_still_closes_the_domain() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.forge.transfer("acme/kb", "newco/kb");
+    invalidate(&fx, "acme/kb");
+    assert!(fx.eng.github_people("kb").await.is_none());
+    assert_eq!(closed_reason(&fx.eng, "kb").as_deref(), Some(MOVED));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+}
+
+#[tokio::test]
+async fn an_organization_event_for_an_owner_no_domain_is_connected_to_does_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.eng.github_people("vault").await.unwrap();
+    let before = fx.forge.hits().len();
+    let mut no_id = org_renamed("otherco", "otherco-labs", owner_id("otherco"));
+    no_id["organization"].as_object_mut().unwrap().remove("id");
+    for (id, payload) in [
+        (
+            "d-o1",
+            org_renamed("otherco", "otherco-labs", owner_id("otherco")),
+        ),
+        ("d-o2", org_deleted("otherco", owner_id("otherco"))),
+        ("d-o3", no_id),
+    ] {
+        let resp = deliver(&fx, Delivery::signed("organization", id, &payload)).await;
+        assert_eq!(resp.status(), 200, "{id}");
+    }
+    ask(&fx).await;
+    fx.eng.github_people("vault").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fx.forge.hits().len(),
+        before,
+        "{:?}",
+        &fx.forge.hits()[before..]
+    );
+    assert!(fx.eng.github_access_closed().is_empty());
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+}
+
+/// GitHub answers the recorded repository id, but under another owner id
+/// (the repository was transferred to an account now called `acme-labs`):
+/// that is no rename of the recorded organization, so nothing moves.
+#[tokio::test]
+async fn an_organization_rename_github_answers_under_another_owner_id_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    settle_both(&fx).await;
+    let kb = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.transfer("acme/kb", "acme-labs/kb");
+    assert_ne!(fx.forge.owner_id_of("acme-labs"), owner_id("acme"));
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-other-owner",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        fx.forge
+            .hits()
+            .iter()
+            .any(|h| h.path == format!("/repositories/{kb}")),
+        "GitHub was asked"
+    );
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
+}
+
+/// Two domains on one repository: the one GitHub confirmed (recorded ids)
+/// moves, the one with no recorded ids stays on the old name.
+#[tokio::test]
+async fn an_organization_rename_moves_only_the_confirmed_domain_of_a_repository() {
+    let fx = setup(Some(SECRET)).await;
+    connect(&fx.eng, "acme/kb", "kb2", &fx.tmp.path().join("kb2")).await;
+    settle_both(&fx).await;
+    fx.eng.github_people("kb2").await;
+    let dir = fx.tmp.path().join("origins").join("kb2");
+    let mut state = crystalline_remote::state::OriginState::load(&dir)
+        .unwrap()
+        .unwrap();
+    state.repository_ids = None;
+    state.save(&dir).unwrap();
+    fx.forge.rename_owner("acme", "acme-labs");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "organization",
+            "d-org-two-domains",
+            &org_renamed("acme", "acme-labs", owner_id("acme")),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme-labs/kb");
+    assert_eq!(origin_repo(&fx.eng, "kb2"), "acme/kb");
+    assert_eq!(origin_repo(&fx.eng, "vault"), "acme-labs/vault");
 }

@@ -11,6 +11,7 @@ mod support;
 
 mod github_access;
 mod github_app;
+mod github_archived;
 mod github_governed;
 mod github_identity;
 mod github_link;

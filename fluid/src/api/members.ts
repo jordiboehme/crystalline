@@ -58,6 +58,8 @@ export interface Governance {
   visibilityFixedBy: string | null;
   /** Why a closed domain is closed, for an instance admin; else null. */
   closedReason: string | null;
+  /** The sentence that says the repository is archived, or null. */
+  archivedReason: string | null;
 }
 
 /** The governance half of one members read, defaulted where a field is absent. */
@@ -72,6 +74,7 @@ export function governanceOf(data: MembersResponse): Governance {
     reflectionCollaborators: wire.reflection_collaborators ?? null,
     visibilityFixedBy: wire.visibility_fixed_by ?? null,
     closedReason: wire.closed_reason ?? null,
+    archivedReason: wire.archived_reason ?? null,
   };
 }
 

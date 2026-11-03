@@ -54,10 +54,23 @@ struct CrossLinks {
     /// The links left as written that would land on an engram in the
     /// destination, as they were written.
     stranded: Vec<String>,
-    /// The target text of every reference of the moved engram the index
-    /// could not resolve before the move, which tells a link that was dead
-    /// already from one the move broke (see [`Engine::dead_links`]).
+    /// The target text, with its `#heading`, of every reference of the moved
+    /// engram the index could not resolve before the move, which tells a link
+    /// that was dead already from one the move broke (see
+    /// [`Engine::dead_links`]).
     unresolved: HashSet<String>,
+}
+
+/// What the whole text of a wikilink whose title holds a `#` reached as a
+/// title in the domain an engram leaves.
+#[derive(Debug)]
+enum TitleHit {
+    /// Another engram, and the address it is written with from now on.
+    Other(CrossTarget),
+    /// The moving engram itself.
+    Itself,
+    /// Nothing: the text is read split, as a target and a heading.
+    Nothing,
 }
 
 /// What one wikilink of an engram moving into another domain is written as.
@@ -555,6 +568,7 @@ impl Engine {
             title: &src.title,
             to_domain: &dest_domain,
             to_permalink: &new_permalink,
+            shadowed: &[],
         };
 
         // The source's and the destination's write locks, from the read of
@@ -665,7 +679,7 @@ impl Engine {
                 .await?
                 .into_iter()
                 .filter(|r| !r.resolved)
-                .map(|r| r.to_target)
+                .map(|r| r.to_whole.unwrap_or(r.to_target))
                 .collect();
             Some(links)
         } else {
@@ -674,11 +688,16 @@ impl Engine {
         // The text the engram lands with, when the move has to change it: the
         // permalink line, and its own references to itself. `None` is the
         // plain rename, which carries the bytes across untouched.
+        let own_shadowed = self.shadowed_titles(&original, &p.domain, &spec).await?;
+        let own_spec = Relink {
+            shadowed: &own_shadowed,
+            ..spec
+        };
         let (moved_text, own_notes) = Self::readdressed_text(
             &original,
             &dest_rel,
             &new_permalink,
-            (readdressed && update_links).then_some(&spec),
+            (readdressed && update_links).then_some(&own_spec),
             relocation
                 .as_ref()
                 .filter(|moved| !defer_rebase && moved.across.is_none()),
@@ -1399,9 +1418,21 @@ impl Engine {
                 }
                 LinkForm::Wiki => {
                     let key = (target.domain.clone(), target.target.clone());
-                    if out.readdressed.contains_key(&key) {
+                    let whole_key = target
+                        .whole
+                        .as_ref()
+                        .map(|whole| (target.domain.clone(), whole.clone()));
+                    if out.readdressed.contains_key(&key)
+                        || whole_key
+                            .as_ref()
+                            .is_some_and(|k| out.readdressed.contains_key(k))
+                    {
                         continue;
                     }
+                    // A title that holds a `#` (`[[C# Basics]]`) is read whole
+                    // first, as the resolver reads it, and keyed by the whole
+                    // text so the rewrite replaces it fragment and all.
+                    let mut key = key;
                     let to = match &target.domain {
                         None if target.target.to_ascii_lowercase().ends_with(".md") => {
                             // Its own path follows it, and is read in the
@@ -1434,8 +1465,27 @@ impl Engine {
                         // itself is left to the self-references, and one
                         // that reached nothing stays as written.
                         None => {
-                            self.cross_target(src_domain, src_path, &target.target)
-                                .await?
+                            let whole = match &target.whole {
+                                Some(whole) => {
+                                    self.cross_title(src_domain, src_path, whole).await?
+                                }
+                                None => TitleHit::Nothing,
+                            };
+                            match whole {
+                                TitleHit::Other(to) => {
+                                    if let Some(whole_key) = whole_key {
+                                        key = whole_key;
+                                    }
+                                    Some(to)
+                                }
+                                // The engram's own title: left to the
+                                // self-references, never read split.
+                                TitleHit::Itself => None,
+                                TitleHit::Nothing => {
+                                    self.cross_target(src_domain, src_path, &target.target)
+                                        .await?
+                                }
+                            }
                         }
                         Some(prefix) => match names.resolve(prefix) {
                             // A prefix that names the destination: written
@@ -1459,6 +1509,79 @@ impl Engine {
                         out.readdressed.insert(key, to);
                     }
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// What the whole text of a bare wikilink whose title holds a `#`
+    /// ([`LinkTarget::whole`]) reached in `src_domain` as a title, written as
+    /// [`Engine::cross_target`] writes it.
+    async fn cross_title(&self, src_domain: &str, src_path: &str, whole: &str) -> Result<TitleHit> {
+        let found = {
+            let store = self.store.lock().await;
+            store.find_engram(src_domain, whole).await?
+        };
+        let Some(found) = found.filter(|f| f.title.to_lowercase() == whole.to_lowercase()) else {
+            return Ok(TitleHit::Nothing);
+        };
+        if found.path == src_path {
+            return Ok(TitleHit::Itself);
+        }
+        Ok(TitleHit::Other(CrossTarget {
+            to: format!("{src_domain}:{}", found.permalink),
+            words: Some(whole.to_string()),
+        }))
+    }
+
+    /// The whole texts with a `#` of the wikilinks in `text`, read in
+    /// `read_in`, that the domain the moved engram left holds as the title of
+    /// another engram (`[[C# Basics]]` beside a moved `C`), for
+    /// [`Relink::shadowed`]: the resolver reads them whole, so they point
+    /// there and a relink must leave them alone.
+    async fn shadowed_titles(
+        &self,
+        text: &str,
+        read_in: &str,
+        spec: &Relink<'_>,
+    ) -> Result<Vec<String>> {
+        let Ok(engram) = parse_engram(text) else {
+            return Ok(Vec::new());
+        };
+        let moved_title = spec.title.trim().to_lowercase();
+        let mut asked: Vec<&String> = Vec::new();
+        for target in engram
+            .links
+            .iter()
+            .map(|l| &l.target)
+            .chain(engram.relations.iter().map(|r| &r.target))
+        {
+            let Some(whole) = &target.whole else {
+                continue;
+            };
+            let read_there = match &target.domain {
+                Some(domain) => domain == spec.from_domain,
+                None => read_in == spec.from_domain,
+            };
+            let lower = whole.to_lowercase();
+            if read_there
+                && lower != moved_title
+                && !asked.iter().any(|a| a.to_lowercase() == lower)
+            {
+                asked.push(whole);
+            }
+        }
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every text asked under one store lock.
+        let store = self.store.lock().await;
+        let mut out: Vec<String> = Vec::new();
+        for whole in asked {
+            let lower = whole.to_lowercase();
+            let found = store.find_engram(spec.from_domain, whole).await?;
+            if found.is_some_and(|f| f.title.to_lowercase() == lower) {
+                out.push(whole.clone());
             }
         }
         Ok(out)
@@ -1523,11 +1646,13 @@ impl Engine {
         refs.into_iter()
             .filter(|r| !r.resolved)
             .filter_map(|r| {
+                // Named with its `#heading`, as it is written.
+                let named = r.to_whole.as_deref().unwrap_or(&r.to_target);
                 let link = match &r.to_domain {
-                    Some(prefix) => format!("[[{prefix}:{}]]", r.to_target),
-                    None => format!("[[{}]]", r.to_target),
+                    Some(prefix) => format!("[[{prefix}:{named}]]"),
+                    None => format!("[[{named}]]"),
                 };
-                let reason = if unresolved_before.contains(&r.to_target) {
+                let reason = if unresolved_before.contains(named) {
                     "unresolved_before"
                 } else {
                     "unresolved_after"
@@ -1656,8 +1781,8 @@ impl Engine {
             if hidden.contains(&domain)
                 || (domain_id == src.domain_id && path == src.path)
                 // A read-only domain's link is left as it was, like a hidden
-                // domain's (decision D7).
-                || self.domain_is_read_only(&domain).await
+                // domain's (decision D7); so is an archived repository's.
+                || self.writes_refused(&domain).await
             {
                 continue;
             }
@@ -1923,6 +2048,15 @@ impl Engine {
     ) -> Option<(String, usize)> {
         // Rewritten as LF, the whole file, like every write.
         let text = crystalline_core::to_lf(text);
+        // A lookup that fails shadows nothing, as before this rule existed.
+        let shadowed = self
+            .shadowed_titles(&text, &linker.domain, spec)
+            .await
+            .unwrap_or_default();
+        let spec = &Relink {
+            shadowed: &shadowed,
+            ..*spec
+        };
         let (mut relinked, mut count) =
             crystalline_core::relink::relink(&text, &linker.domain, &linker.domain, spec);
         let moved_here = relocation.filter(|moved| moved.domain_id == linker.domain_id);
@@ -2171,7 +2305,7 @@ impl Engine {
                 let is_locked = match locked.get(&d.domain) {
                     Some(known) => *known,
                     None => {
-                        let known = self.domain_is_read_only(&d.domain).await;
+                        let known = self.writes_refused(&d.domain).await;
                         locked.insert(d.domain.clone(), known);
                         known
                     }

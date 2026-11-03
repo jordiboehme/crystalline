@@ -44,6 +44,18 @@ export interface LinkTarget {
    * where a link points.
    */
   alias?: string;
+  /**
+   * The heading a `[[target#heading]]` link names, without the `#`. Absent
+   * when the link has none.
+   */
+  fragment?: string;
+  /**
+   * The target text with its `#` kept, tried as a whole title before the
+   * heading split. The parser sets it; the payload sends it beside the target
+   * (as the reference's `whole`) only when the split target and heading do not
+   * write it back as it was, as for `[[C# Basics]]`.
+   */
+  whole?: string;
 }
 
 /** One parsed reference out of the body: a prose wikilink or a relation. */
@@ -258,18 +270,23 @@ function readTarget(value: unknown): LinkTarget | null {
     return null;
   }
   const domain = asString(record?.domain);
-  return record?.form === "relative"
-    ? { domain, target, form: "relative" }
-    : { domain, target };
+  const fragment = asString(record?.fragment);
+  const base: LinkTarget =
+    record?.form === "relative"
+      ? { domain, target, form: "relative" }
+      : { domain, target };
+  return fragment === null || fragment === "" ? base : { ...base, fragment };
 }
 
 /** Read one reference, or null when it names nothing to point at. */
 function readReference(value: unknown): EngramReference | null {
   const record = asObject(value);
-  const target = readTarget(record?.target);
-  if (target === null) {
+  const read = readTarget(record?.target);
+  if (read === null) {
     return null;
   }
+  const whole = asString(record?.whole);
+  const target = whole === null || whole === "" ? read : { ...read, whole };
   const permalink = asString(record?.permalink);
   return {
     line: asNumber(record?.line),

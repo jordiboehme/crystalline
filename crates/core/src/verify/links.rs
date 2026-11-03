@@ -266,7 +266,12 @@ fn check_target(
     own_title: &str,
     sink: &mut Sink,
 ) {
-    if target.domain.is_none() {
+    // A link to a heading of the engram itself (`[[own#section]]`) is how a
+    // page points into its own text, never a self-link to warn about. A
+    // title that holds a `#` and is the engram's own is still one.
+    let own_heading = target.fragment.is_some()
+        && target.whole.as_deref().map(str::to_lowercase).as_deref() != Some(own_title);
+    if target.domain.is_none() && !own_heading {
         let text = target.target.to_lowercase();
         if text == own_permalink.to_lowercase() || text == own_title {
             sink.emit(
@@ -283,7 +288,10 @@ fn check_target(
 
     match address::resolve(target, &domain.name, lookup) {
         Resolution::Resolved(r) => {
-            if r.domain == domain.name && r.permalink.eq_ignore_ascii_case(own_permalink) {
+            if r.domain == domain.name
+                && r.permalink.eq_ignore_ascii_case(own_permalink)
+                && !own_heading
+            {
                 sink.emit(
                     &file.path,
                     line,
@@ -297,13 +305,22 @@ fn check_target(
         Resolution::Unresolved => {
             // A bare target resolves only in its own domain. When the scan set
             // holds it elsewhere, the fix is one prefix away, so name it.
-            let found = found_elsewhere(&target.target, &domain.name, domain_names, lookup);
+            let mut found = found_elsewhere(&target.target, &domain.name, domain_names, lookup);
+            if let Some(whole) = &target.whole {
+                for elsewhere in found_elsewhere(whole, &domain.name, domain_names, lookup) {
+                    if !found.contains(&elsewhere) {
+                        found.push(elsewhere);
+                    }
+                }
+                found.sort_unstable();
+            }
+            // Quoted with its fragment, as it is written.
             sink.emit(
                 &file.path,
                 line,
                 "L001",
                 Severity::Warning,
-                broken_bare_message(&target.target, &found),
+                broken_bare_message(&target.written(), &found),
                 None,
             );
         }
@@ -316,7 +333,7 @@ fn check_target(
                     line,
                     "L001",
                     Severity::Warning,
-                    format!("broken wikilink to `{target_domain}:{}`", target.target),
+                    format!("broken wikilink to `{}`", target.written()),
                     None,
                 );
             } else {
@@ -400,7 +417,11 @@ fn check_crystalline_urls(
             Cow::Borrowed(bl.text)
         };
         for url in find_urls(&masked) {
-            let Some(parsed) = CrystallineUrl::parse(&url) else {
+            // A `#fragment` names a place inside the engram, never which
+            // engram: `crystalline://d/b#setup` is checked as
+            // `crystalline://d/b`, and quoted as written.
+            let address = url.split_once('#').map_or(url.as_str(), |(a, _)| a);
+            let Some(parsed) = CrystallineUrl::parse(address) else {
                 continue;
             };
             if parsed.glob {

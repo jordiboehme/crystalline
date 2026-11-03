@@ -760,8 +760,8 @@ impl Engine {
             }
             Loop::Evolve => {
                 self.require_domain(domain, scope).await?;
-                if self.domain_is_read_only(domain).await {
-                    return Err(EngineError::DomainReadOnly(domain.to_string()));
+                if let Some(e) = self.loop_write_refusal(domain).await {
+                    return Err(e);
                 }
                 if !self
                     .writable_domains(scope)
@@ -798,7 +798,7 @@ impl Engine {
                 let mut out = Vec::new();
                 for name in names {
                     if self.reflection_switch(&name) == crystalline_core::ReflectionSwitch::Off
-                        || self.domain_is_read_only(&name).await
+                        || self.writes_refused(&name).await
                     {
                         continue;
                     }
@@ -817,6 +817,17 @@ impl Engine {
     /// Where `lp` on `domain` runs. Reflect runs on the Reflection's home
     /// ([`Engine::reflection_home_here`]); evolve on the instance that holds
     /// the domain's host lock, which off a shared database is this one.
+    /// Why a loop may not run on `domain` because nothing may be written
+    /// there ([`Engine::writes_refused`]), or `None`. A locked domain is
+    /// answered as before; an archived repository with its own sentence.
+    async fn loop_write_refusal(&self, domain: &str) -> Option<EngineError> {
+        if self.domain_is_read_only(domain).await {
+            return Some(EngineError::DomainReadOnly(domain.to_string()));
+        }
+        self.github_archived_repo(domain)
+            .map(|repo| EngineError::DomainReadOnly(super::archived_sentence(domain, &repo)))
+    }
+
     async fn loop_runs(&self, lp: Loop, domain: &str, scope: &Scope) -> Runs {
         // An instance started read-only writes nothing, so a run there
         // could do nothing.
@@ -845,19 +856,19 @@ impl Engine {
                             .await
                         {
                             Err(e) => e,
-                            Ok(_) if self.domain_is_read_only(domain).await => {
-                                EngineError::DomainReadOnly(domain.to_string())
-                            }
-                            Ok(_) => EngineError::Refused(format!(
-                                "the Reflection of '{domain}' cannot run here right now; try again later"
-                            )),
+                            Ok(_) => match self.loop_write_refusal(domain).await {
+                                Some(e) => e,
+                                None => EngineError::Refused(format!(
+                                    "the Reflection of '{domain}' cannot run here right now; try again later"
+                                )),
+                            },
                         },
                     ),
                 }
             }
             Loop::Evolve => {
-                if self.domain_is_read_only(domain).await {
-                    return Runs::Nowhere(EngineError::DomainReadOnly(domain.to_string()));
+                if let Some(e) = self.loop_write_refusal(domain).await {
+                    return Runs::Nowhere(e);
                 }
                 // The home first, then the host lock among the instances that
                 // are the home: instances of one shared database usually

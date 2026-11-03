@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use super::{Engine, OVERLAY_NEEDS_IDENTITY, Result, read_only_sentence};
+use super::{Engine, OVERLAY_NEEDS_IDENTITY, Result, archived_sentence, read_only_sentence};
 use crate::scope::{DomainRight, Scope, WriteRights};
 
 /// Why a write into one domain is refused for one caller.
@@ -17,6 +17,12 @@ use crate::scope::{DomainRight, Scope, WriteRights};
 pub enum WriteBlock {
     /// The domain's MANIFEST says `read_only: on`.
     DomainLocked,
+    /// The domain's GitHub repository is archived, which refuses everybody
+    /// as the lock does.
+    RepositoryArchived {
+        /// The repository, as `owner/name`.
+        repo: String,
+    },
     /// The caller's role or membership allows reading only.
     Role,
     /// The caller's write list does not name the domain, and nothing else
@@ -35,6 +41,7 @@ impl WriteBlock {
     pub fn sentence(&self, domain: &str) -> String {
         match self {
             WriteBlock::DomainLocked => read_only_sentence(domain),
+            WriteBlock::RepositoryArchived { repo } => archived_sentence(domain, repo),
             // Visible and not writable means Read: the resolver never answers
             // None for a domain the caller can see, so the level word is
             // always "viewer". Byte for byte the MCP gate's old sentence.
@@ -54,17 +61,21 @@ impl Engine {
     /// Why `scope` cannot write `domain`, or `None` when it can.
     ///
     /// Asked of a domain the caller may see; the surface's `require_domain`
-    /// runs first. The domain lock comes first, then
-    /// [`Engine::write_access_block`]. A domain listing marks a row
+    /// runs first. The domain lock comes first, then an archived GitHub
+    /// repository, then [`Engine::write_access_block`]. A domain listing marks a row
     /// `read_only: true` exactly when this is `Some`; when it errors, a read
     /// leaves the mark out ([`Engine::read_only_mark`]).
     ///
     /// The machine owner ([`Scope::Unrestricted`]) and an engine with no
-    /// resolver installed are answered `None` or [`WriteBlock::DomainLocked`],
-    /// never an error: both resolve to Own on every domain.
+    /// resolver installed are answered `None`, [`WriteBlock::DomainLocked`]
+    /// or [`WriteBlock::RepositoryArchived`], never an error: both resolve to
+    /// Own on every domain.
     pub async fn write_block(&self, scope: &Scope, domain: &str) -> Result<Option<WriteBlock>> {
         if self.domain_is_read_only(domain).await {
             return Ok(Some(WriteBlock::DomainLocked));
+        }
+        if let Some(repo) = self.github_archived_repo(domain) {
+            return Ok(Some(WriteBlock::RepositoryArchived { repo }));
         }
         self.write_access_block(scope, domain).await
     }
@@ -93,7 +104,9 @@ impl Engine {
 
     /// Why `scope` may not write `domain` whatever the domain lock says:
     /// [`WriteBlock::Role`], [`WriteBlock::WriteList`] or
-    /// [`WriteBlock::Reviewing`], never [`WriteBlock::DomainLocked`].
+    /// [`WriteBlock::Reviewing`], never [`WriteBlock::DomainLocked`] or
+    /// [`WriteBlock::RepositoryArchived`] (the engine's write path gives
+    /// that sentence, as it gives the lock's).
     ///
     /// The MCP write gate asks this rather than [`Engine::write_block`]. The
     /// lock's own sentence is left to the engine's write view and to the MCP
@@ -215,7 +228,7 @@ impl Engine {
                 locked
             }
         };
-        if locked {
+        if locked || self.github_archived_repo(domain).is_some() {
             return true;
         }
         if marks.open_tier {

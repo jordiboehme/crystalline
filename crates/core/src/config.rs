@@ -278,6 +278,8 @@ impl GlobalConfig {
     /// `github.agent_identity`. Absent or empty means None: that transport has
     /// no acting user of its own, so without a configured account its write
     /// verbs are refused rather than falling back to the instance token.
+    /// With a GitHub App it is also the account the MCP open tier acts as on
+    /// a domain GitHub governs, never with more than the editor role.
     pub fn github_agent_identity(&self) -> Option<&str> {
         self.github
             .as_ref()
@@ -809,7 +811,9 @@ pub struct GitHubConfig {
     pub share_identity: Option<String>,
     /// The Crystalline account whose connected GitHub identity agent shares
     /// over HTTP MCP run under in personal mode. Absent means those shares are
-    /// refused. Read through [`GlobalConfig::github_agent_identity`].
+    /// refused. With a GitHub App it is also the account the MCP open tier
+    /// acts as on a domain GitHub governs. Read through
+    /// [`GlobalConfig::github_agent_identity`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<String>,
     /// The GitHub API base URL, for a GitHub Enterprise Server instance.

@@ -54,6 +54,12 @@ pub struct Relink<'a> {
     pub to_domain: &'a str,
     /// The permalink it answers to now.
     pub to_permalink: &'a str,
+    /// Whole link texts with a `#` ([`LinkTarget::whole`]) that the caller
+    /// found as the title of another engram where the link is read
+    /// (`[[C# Basics]]` beside a moved `C`). Such a link points there, not
+    /// at the moved engram, so it is left as written. Compared in any letter
+    /// case. Empty when the caller looked nothing up.
+    pub shadowed: &'a [String],
 }
 
 impl Relink<'_> {
@@ -246,7 +252,8 @@ fn relink_line(line: &str, read_in: &str, written_in: &str, spec: &Relink<'_>) -
             if let Some(new_inner) = relink_wikilink(&inner, read_in, written_in, spec) {
                 out.push_str("[[");
                 out.push_str(&new_inner);
-                out.extend(&original[end..close]);
+                // The `#fragment` and the `|display text`, as written.
+                out.extend(&original[fragment_start(&inner, i + 2, end)..close]);
                 out.push_str("]]");
                 count += 1;
             } else {
@@ -297,6 +304,18 @@ fn find_close(chars: &[char], from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&k| chars[k] == ']' && chars[k + 1] == ']')
 }
 
+/// Where the `#fragment` of the wikilink whose target part `inner` runs from
+/// `from` to `end` starts, as a char index: at the whitespace before its first
+/// `#`, the split [`crate::engram::split_fragment`] makes, or at `end` when it
+/// has none. A rewrite replaces only the trimmed target before it and keeps
+/// the fragment, and the spacing before its `#`, exactly as written.
+fn fragment_start(inner: &str, from: usize, end: usize) -> usize {
+    match crate::engram::split_fragment(inner) {
+        (before, Some(_)) => from + before.trim_end().chars().count(),
+        _ => end,
+    }
+}
+
 /// Where the target part of the wikilink whose text runs from `from` to
 /// `close` ends: at its first `|`, the split [`crate::engram::split_alias`]
 /// makes, or at `close` when it has no display text. A rewrite replaces only
@@ -309,8 +328,11 @@ fn starts_with(chars: &[char], at: usize, needle: &[char]) -> bool {
     chars.len() >= at + needle.len() && chars[at..at + needle.len()] == *needle
 }
 
-/// The new bracket text for one wikilink, or `None` when it does not name the
-/// moved engram or already reads right.
+/// The new target part for one wikilink, before its `#fragment`, or `None`
+/// when it does not name the moved engram or already reads right. The whole
+/// text of a link whose title holds a `#` ([`LinkTarget::whole`]) is tried as
+/// the title first, as the resolver tries it; written back with the fragment
+/// as the caller keeps it, it reads exactly as before.
 fn relink_wikilink(
     inner: &str,
     read_in: &str,
@@ -318,8 +340,22 @@ fn relink_wikilink(
     spec: &Relink<'_>,
 ) -> Option<String> {
     let target = LinkTarget::parse(inner);
+    if let Some(whole) = &target.whole
+        && spec
+            .shadowed
+            .iter()
+            .any(|other| other.to_lowercase() == whole.to_lowercase())
+    {
+        return None;
+    }
     let named = |text: &str| -> Option<Named> {
         let title = spec.title.trim();
+        if let Some(whole) = &target.whole
+            && !title.is_empty()
+            && whole.to_lowercase() == title.to_lowercase()
+        {
+            return Some(Named::Title);
+        }
         if text == spec.from_permalink {
             Some(Named::Permalink)
         } else if !title.is_empty() && text.to_lowercase() == title.to_lowercase() {
@@ -603,9 +639,31 @@ fn path_wikilink_line(line: &str, map: &WikilinkMap<'_>) -> (String, usize) {
             let end = target_end(&masked, i + 2, close);
             let inner: String = masked[i + 2..end].iter().collect();
             let target = LinkTarget::parse(&inner);
-            if let Some(to) = map(target.domain.as_deref(), &target.target, end < close) {
+            let domain = target.domain.as_deref();
+            let shown = end < close;
+            // The whole text first, as the resolver reads it: a title that
+            // holds a `#` is replaced as a whole, fragment and all.
+            let whole = target
+                .whole
+                .as_deref()
+                .and_then(|whole| map(domain, whole, shown));
+            if let Some(to) = whole {
                 out.push_str("[[");
                 out.push_str(&to);
+                out.extend(&original[end..close]);
+                out.push_str("]]");
+                count += 1;
+            } else if let Some(to) = map(domain, &target.target, shown) {
+                // The answer replaces the text before the `#fragment`, which
+                // stays as written, before any display text the answer adds.
+                let (to_target, to_alias) = match to.find('|') {
+                    Some(bar) => to.split_at(bar),
+                    None => (to.as_str(), ""),
+                };
+                out.push_str("[[");
+                out.push_str(to_target);
+                out.extend(&original[fragment_start(&inner, i + 2, end)..end]);
+                out.push_str(to_alias);
                 out.extend(&original[end..close]);
                 out.push_str("]]");
                 count += 1;
@@ -685,6 +743,7 @@ mod tests {
             title: "Pump Twelve",
             to_domain: "eng",
             to_permalink: "pumps/p-13",
+            shadowed: &[],
         };
         let source = doc("See [[pumps/p-12|the pump]] and [[eng:pumps/p-12|it]].\n\
              - part_of [[pumps/p-12|the pump]]\n\
@@ -827,22 +886,51 @@ mod tests {
         );
         assert!(
             out.text.contains(
-                "See [[dom:guides/b|B]], [me](x.md#top), [[dom:guides/b|frag]], \
+                "See [[dom:guides/b|B]], [me](x.md#top), [[dom:guides/b#part|frag]], \
                  [[dom:guides/b|titled]], [[dom:guides/b]], ![pic](b.md), `[B](b.md)`, \
                  [odd [[x]]](b.md) and [left](c.md)."
             ),
             "{}",
             out.text
         );
+        assert_eq!(out.dropped, vec!["[titled](b.md \"T\")".to_string()]);
+        assert_eq!(out.unwritable, vec!["[odd [[x]]](b.md)".to_string()]);
+        assert!(out.text.starts_with(ENGRAM_HEAD));
+    }
+
+    #[test]
+    fn map_note_links_whole_carries_a_fragment_a_wikilink_can_hold() {
+        let source = format!(
+            "{ENGRAM_HEAD}See [p](p.md#setup), [q](p.md#a%20b \"t\") and [r](p.md#a%7Cb).\n"
+        );
+        let out = readdress_relative_links(&source, &|target| {
+            (target == "p.md").then(|| NoteLinkTo::Wikilink("notes:p".to_string()))
+        });
+        assert_eq!(out.changed, 3, "{}", out.text);
+        assert!(
+            out.text
+                .contains("See [[notes:p#setup|p]], [[notes:p#a b|q]] and [[notes:p|r]]."),
+            "{}",
+            out.text
+        );
         assert_eq!(
             out.dropped,
             vec![
-                "[frag](b.md#part)".to_string(),
-                "[titled](b.md \"T\")".to_string()
+                "[q](p.md#a%20b \"t\")".to_string(),
+                "[r](p.md#a%7Cb)".to_string()
             ]
         );
-        assert_eq!(out.unwritable, vec!["[odd [[x]]](b.md)".to_string()]);
-        assert!(out.text.starts_with(ENGRAM_HEAD));
+
+        let only =
+            readdress_relative_links(&format!("{ENGRAM_HEAD}See [p](p.md#setup).\n"), &|_| {
+                Some(NoteLinkTo::Wikilink("notes:p".to_string()))
+            });
+        assert!(
+            only.text.contains("See [[notes:p#setup|p]]."),
+            "{}",
+            only.text
+        );
+        assert!(only.dropped.is_empty(), "{:?}", only.dropped);
     }
 
     #[test]
@@ -879,6 +967,7 @@ mod tests {
         title: "Alpha Notes",
         to_domain: "eng",
         to_permalink: "projects/velog/alpha",
+        shadowed: &[],
     };
 
     const CROSS: Relink<'static> = Relink {
@@ -887,6 +976,7 @@ mod tests {
         title: "Alpha Notes",
         to_domain: "ops",
         to_permalink: "alpha",
+        shadowed: &[],
     };
 
     fn doc(body: &str) -> String {
@@ -1175,5 +1265,136 @@ mod tests {
         assert!(LinkDialect::Addressed.may_hold("see [[a]]"));
         assert!(LinkDialect::Addressed.may_hold("see crystalline://eng/a"));
         assert!(!LinkDialect::Addressed.may_hold("see [a](b.md)"));
+    }
+
+    #[test]
+    fn a_relink_keeps_the_fragment_as_written() {
+        let renamed = Relink {
+            from_domain: "eng",
+            from_permalink: "b",
+            title: "B",
+            to_domain: "eng",
+            to_permalink: "newb",
+            shadowed: &[],
+        };
+        let source = doc("See [[b#setup|t]], [[b # Setup Guide ]] and [[eng:b#x:y]].\n");
+        let (out, n) = relink(&source, "eng", "eng", &renamed);
+        assert_eq!(n, 3, "{out}");
+        assert!(
+            out.contains("See [[newb#setup|t]], [[newb # Setup Guide ]] and [[eng:newb#x:y]]."),
+            "{out}"
+        );
+
+        let across = Relink {
+            from_domain: "eng",
+            from_permalink: "b",
+            title: "B",
+            to_domain: "notes",
+            to_permalink: "b",
+            shadowed: &[],
+        };
+        let (out, n) = relink(&doc("See [[b#setup|t]].\n"), "eng", "eng", &across);
+        assert_eq!(n, 1, "{out}");
+        assert!(out.contains("See [[notes:b#setup|t]]."), "{out}");
+
+        // The spacing before the `#` stays as written.
+        let spaced = Relink {
+            from_permalink: "c",
+            title: "C",
+            to_permalink: "c",
+            ..across
+        };
+        let (out, n) = relink(
+            &doc("See [[C # Basics]] and [[c #intro|i]].\n"),
+            "eng",
+            "eng",
+            &spaced,
+        );
+        assert_eq!(n, 2, "{out}");
+        assert!(
+            out.contains("See [[notes:C # Basics]] and [[notes:c #intro|i]]."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_title_holding_a_hash_still_follows_a_move() {
+        let across = Relink {
+            from_domain: "eng",
+            from_permalink: "c-basics",
+            title: "C# Basics",
+            to_domain: "notes",
+            to_permalink: "c-basics",
+            shadowed: &[],
+        };
+        let (out, n) = relink(
+            &doc("See [[C# Basics]] and [[c#intro]].\n"),
+            "eng",
+            "eng",
+            &across,
+        );
+        assert_eq!(n, 1, "{out}");
+        assert!(
+            out.contains("See [[notes:C# Basics]] and [[c#intro]]."),
+            "{out}"
+        );
+
+        // Moving `c` (title `C`): a `[[C# Basics]]` the caller found as the
+        // title of another engram points there and is left alone.
+        let shadowed = vec!["C# Basics".to_string()];
+        let moved_c = Relink {
+            from_domain: "eng",
+            from_permalink: "c",
+            title: "C",
+            to_domain: "eng",
+            to_permalink: "newc",
+            shadowed: &shadowed,
+        };
+        let (out, n) = relink(
+            &doc("See [[C]], [[c#intro]], [[C# Basics]] and [[c# basics]].\n"),
+            "eng",
+            "eng",
+            &moved_c,
+        );
+        assert_eq!(n, 1, "{out}");
+        assert!(
+            out.contains("See [[C]], [[newc#intro]], [[C# Basics]] and [[c# basics]]."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_domain_respell_and_a_path_respell_keep_the_fragment() {
+        let (out, n) = respell_domains(&spell_doc("See [[old:b#x]].\n"), &old_to_new);
+        assert_eq!(n, 1, "{out}");
+        assert!(out.ends_with("See [[new:b#x]].\n"), "{out}");
+
+        let source = format!("{ENGRAM_HEAD}See [[pumps/p.md#x]] and [[pumps/p.md#x|the pump]].\n");
+        let (out, n) = respell_path_wikilinks(&source, "pumps/p.md", "archive/p.md");
+        assert_eq!(n, 2, "{out}");
+        assert!(
+            out.contains("See [[archive/p.md#x]] and [[archive/p.md#x|the pump]]."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_readdress_puts_the_fragment_before_the_display_text_it_adds() {
+        let source = format!("{ENGRAM_HEAD}See [[B#setup]], [[C# Basics]] and [[C#intro|c]].\n");
+        let (out, n) = readdress_wikilinks(&source, &|domain, target, shown| match (
+            domain, target, shown,
+        ) {
+            (None, "B", false) => Some("notes:b|B".to_string()),
+            (None, "C# Basics", false) => Some("notes:c-basics|C# Basics".to_string()),
+            (None, "C", true) => Some("notes:c".to_string()),
+            _ => None,
+        });
+        assert_eq!(n, 3, "{out}");
+        assert!(
+            out.contains(
+                "See [[notes:b#setup|B]], [[notes:c-basics|C# Basics]] and [[notes:c#intro|c]]."
+            ),
+            "{out}"
+        );
     }
 }

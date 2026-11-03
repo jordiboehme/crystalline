@@ -515,6 +515,34 @@ describe("the engram page", () => {
     });
   });
 
+  it("opens a wikilink to a heading at that heading", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: BODY.replace(
+            "Body prose linking",
+            "See [[Beta#Setup]]. Body prose linking",
+          ),
+          links: [
+            {
+              line: 7,
+              resolved: true,
+              target: { domain: null, target: "Beta", fragment: "Setup" },
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const body = await screen.findByRole("article");
+    await waitFor(() => {
+      expect(
+        within(body).getByRole("link", { name: "Beta \u203a Setup" }),
+      ).toHaveAttribute("href", "/d/eng/e/notes/beta#setup");
+    });
+  });
+
   it("marks a wikilink the index could not resolve rather than linking it", async () => {
     serve();
 

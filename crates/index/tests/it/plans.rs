@@ -827,7 +827,7 @@ pub fn registry() -> Vec<HotStatement> {
             scan_expected_pg: None,
             // The driving index only: this pins that the pass itself stays
             // bounded by the partial unresolved index. Which index each of the
-            // five COALESCE arms seeks is asked by name in
+            // six COALESCE arms seeks is asked by name in
             // `the_reference_resolve_pass_seeks_the_title_index`
             // (`src/turso/mod.rs`), which reads this same builder: a statement
             // can lose the title index to a rewrite that still has it seeking

@@ -59,8 +59,8 @@ async fn store_info_reports_turso_schema_version() {
     // v23 reflection chunks by domain, v24 engram rows under the Reflection folder,
     // v25 domain host move, v26 wikilink display text, v27 automation lease and runs,
     // v28 automation lease pull request and written paths,
-    // v29 reflection disclosures.
-    assert_eq!(info.schema_version, 29);
+    // v29 reflection disclosures, v30 wikilink whole target text.
+    assert_eq!(info.schema_version, 30);
 }
 
 #[tokio::test]

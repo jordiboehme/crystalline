@@ -199,7 +199,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "github.share_identity",
-            doc: "Whose GitHub identity shares run under: instance (default) uses the one connected token for everything; personal requires each person to connect their own GitHub identity for sharing, while pulling stays on the instance token",
+            doc: "Whose GitHub identity shares run under: instance (default) shares with the instance credential, which with a GitHub App is the App, named as committer, with the person as commit author; personal requires each person to link their own GitHub identity for sharing, while pulling stays on the instance credential or the App",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
@@ -210,7 +210,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "github.agent_identity",
-            doc: "The crystalline account whose connected GitHub identity agent shares over HTTP MCP run under when share_identity is personal; unset means those shares are refused",
+            doc: "The crystalline account agent shares over HTTP MCP run under when share_identity is personal (unset refuses them); with a GitHub App, also the account the MCP open tier acts as on domains GitHub governs, with that account's GitHub role and never more than editor",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
