@@ -12,7 +12,13 @@
  * The threads decide when it is drawn (`ReflectionThreads`): they read the
  * selection, and the bar only stands where they say. It is mounted only
  * while it is shown, so Alt+F10 does nothing without it. Placed absolutely
- * in the page's flow, it moves with the text as the page scrolls.
+ * in the page's flow, it moves with the text as the page scrolls, and it is
+ * placed again when the window or the page changes size. It stays inside
+ * the page column (`frame`), so it never covers the threads beside it.
+ *
+ * A press on it tells the threads (`onPressStart`, `onPressEnd`): a touch
+ * can collapse the selection before the click lands, and the threads keep
+ * the bar and its passage until then.
  */
 
 import { MessageSquarePlus } from "lucide-react";
@@ -20,33 +26,40 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent,
   ReactElement,
+  RefObject,
 } from "react";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import { FOCUS_RING } from "./primitives";
-import type { SelectionBox } from "./selectionBox";
-import { SELECTION_BAR_ATTR } from "./selectionBox";
+import { SELECTION_BAR_ATTR } from "./selectionBarMark";
 
 /** The gap between the bar and the selection it stands by, in pixels. */
 const GAP = 6;
 
 /** The bottom of the app's sticky header, which the bar must not go under. */
 function ceiling(): number {
-  for (const header of document.querySelectorAll("header")) {
-    const position = getComputedStyle(header).position;
-    if (position === "sticky" || position === "fixed") {
-      return Math.max(0, header.getBoundingClientRect().bottom);
-    }
-  }
-  return 0;
+  const header = document.querySelector("[data-app-header]");
+  return header === null
+    ? 0
+    : Math.max(0, header.getBoundingClientRect().bottom);
 }
 
 export function SelectionBar({
-  box,
+  range,
+  frame,
+  onPressStart,
+  onPressEnd,
   onComment,
   onDismiss,
 }: {
-  box: SelectionBox;
+  /** The passage it stands by, measured whenever the bar is placed. */
+  range: Range;
+  /** The page column it stays inside. */
+  frame: RefObject<HTMLElement | null>;
+  /** A pointer went down on the bar. */
+  onPressStart: () => void;
+  /** That press ended without a click on the bar. */
+  onPressEnd: () => void;
   onComment: () => void;
   /** Escape: the bar goes until the selection changes. */
   onDismiss: () => void;
@@ -58,9 +71,53 @@ export function SelectionBar({
     null,
   );
   const dismissNow = useRef(onDismiss);
+  const pressEndNow = useRef(onPressEnd);
   useEffect(() => {
     dismissNow.current = onDismiss;
+    pressEndNow.current = onPressEnd;
   });
+  /** Bumped when the window or the page column changes size: place again. */
+  const [, replace] = useReducer((n: number) => n + 1, 0);
+
+  useEffect(() => {
+    window.addEventListener("resize", replace);
+    const column = frame.current;
+    const observer =
+      column !== null && typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => {
+            replace();
+          })
+        : null;
+    if (column !== null) {
+      observer?.observe(column);
+    }
+    return () => {
+      window.removeEventListener("resize", replace);
+      observer?.disconnect();
+    };
+  }, [frame]);
+
+  // A press that comes up off the bar, or that the browser takes over, ends
+  // without a click.
+  useEffect(() => {
+    const onUp = (event: PointerEvent) => {
+      if (
+        !(event.target instanceof Node) ||
+        bar.current?.contains(event.target) !== true
+      ) {
+        pressEndNow.current();
+      }
+    };
+    const onCancel = () => {
+      pressEndNow.current();
+    };
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onCancel);
+    return () => {
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onCancel);
+    };
+  }, []);
 
   // Alt+F10 from anywhere on the page moves focus here; Escape outside the
   // bar sends it away.
@@ -92,25 +149,33 @@ export function SelectionBar({
   }, []);
 
   // Above the selection, or below it with no room above (the sticky header
-  // counts as no room); never over it, and never past its frame's edges.
+  // counts as no room); with no room on either side, at the top of the
+  // window, over the passage rather than off screen. Never past the page
+  // column's edges. Measured in the window, written against the element the
+  // bar is placed in.
   useLayoutEffect(() => {
     const el = bar.current;
-    const parent = el?.offsetParent;
-    if (!el || !(parent instanceof HTMLElement)) return;
-    const frame = parent.getBoundingClientRect();
-    const top = box.top - window.scrollY;
-    const bottom = box.bottom - window.scrollY;
-    const left = box.left - window.scrollX;
+    const origin = el?.offsetParent;
+    if (!el || !(origin instanceof HTMLElement)) return;
+    const from = origin.getBoundingClientRect();
+    const column = (frame.current ?? origin).getBoundingClientRect();
+    const all = range.getBoundingClientRect();
+    // Where the passage starts, not the left edge of every line it spans.
+    const first = range.getClientRects()[0] ?? all;
     const height = el.offsetHeight;
     const width = el.offsetWidth;
+    const top = ceiling();
+    const above = all.top - height - GAP;
+    const below = all.bottom + GAP;
     const y =
-      top - height - GAP >= ceiling() ? top - height - GAP : bottom + GAP;
-    const x = Math.max(
-      frame.left,
-      Math.min(left, frame.left + frame.width - width),
-    );
-    el.style.top = `${String(y - frame.top)}px`;
-    el.style.left = `${String(x - frame.left)}px`;
+      above >= top
+        ? above
+        : below + height <= window.innerHeight
+          ? below
+          : top + GAP;
+    const x = Math.max(column.left, Math.min(first.left, column.right - width));
+    el.style.top = `${String(y - from.top)}px`;
+    el.style.left = `${String(x - from.left)}px`;
   });
 
   // Focus back where Alt+F10 found it (nowhere in particular: the page
@@ -182,6 +247,11 @@ export function SelectionBar({
       aria-orientation="horizontal"
       {...{ [SELECTION_BAR_ATTR]: "" }}
       onMouseDown={keepSelection}
+      onPointerDown={(event) => {
+        if (event.isPrimary && event.button === 0) {
+          onPressStart();
+        }
+      }}
       onKeyDown={onKeyDown}
       className="absolute z-20 flex items-center rounded-md border border-hair bg-raised p-0.5 shadow-pop print:hidden"
     >

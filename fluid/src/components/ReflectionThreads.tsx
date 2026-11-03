@@ -95,8 +95,7 @@ import {
 } from "../reflectionQuotes";
 import { PageOutline } from "./PageOutline";
 import { SelectionBar } from "./SelectionBar";
-import type { SelectionBox } from "./selectionBox";
-import { SELECTION_BAR_ATTR, boxOf } from "./selectionBox";
+import { SELECTION_BAR_ATTR } from "./selectionBarMark";
 import type { SectionText } from "../reflectionText";
 import { TOP_SECTION, locateQuote } from "../reflectionText";
 import {
@@ -689,10 +688,18 @@ export function ReflectionThreads({
   const [showResolved, setShowResolved] = useState(false);
   const [blockingOnly, setBlockingOnly] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
-  // Where the page's selection stands while it is live in the page (not
-  // collapsed, not gone elsewhere): the bar at the selection stands there.
-  // Unlike `captured`, a caret outside the page takes it away.
-  const [selectedAt, setSelectedAt] = useState<SelectionBox | null>(null);
+  // The page's selection while it is live in the page (not collapsed, not
+  // gone elsewhere), as a range of its own: the bar at the selection stands
+  // by it and measures it again when the text moves. Unlike `captured`, a
+  // caret outside the page takes it away.
+  const [selectedAt, setSelectedAt] = useState<Range | null>(null);
+  // A press on the bar in progress, with the passage it stood by: a touch
+  // can collapse the selection in the page before the click lands, and the
+  // click must still comment on that passage.
+  const [barPress, setBarPress] = useState<{
+    anchor: SelectionAnchor;
+    range: Range;
+  } | null>(null);
   // Whether the pointer button went down on the page and is still down: a
   // drag selection, which the bar must not stand in the way of.
   const [pointerDown, setPointerDown] = useState(false);
@@ -707,9 +714,9 @@ export function ReflectionThreads({
   const commentKey = `${kept.page}\n${COMMENT_KEY}`;
   const commentLabelKey = `${kept.page}\n${COMMENT_LABEL_KEY}`;
   const [said, say] = useSaid(4000);
-  // Whether a selection was captured a moment ago, so the Comment button is
+  // Whether the bar was announced for the passage captured now, so it is
   // announced once per selection, not at every change of it.
-  const hadCapture = useRef(false);
+  const announced = useRef(false);
   // The thread a comment just opened, focused once the page lists it.
   const focusNew = useRef<string | null>(null);
   const commentButton = useRef<HTMLButtonElement | null>(null);
@@ -796,7 +803,6 @@ export function ReflectionThreads({
           document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement;
         if (!range.collapsed && !typing) {
-          hadCapture.current = false;
           setCaptured(null);
         }
         return;
@@ -804,22 +810,8 @@ export function ReflectionThreads({
       const next = range.collapsed
         ? null
         : selectionAnchor(root, range, sections);
-      if (next !== null && !hadCapture.current) {
-        // Below `xl` the button is in the sheet, not beside the page; the
-        // bar at the selection is there for whoever may comment.
-        say(
-          column
-            ? mayComment
-              ? "Comment on the selection with Alt+F10"
-              : "Comment on the selection"
-            : mayComment
-              ? "Comment on the selection with Alt+F10 or from the threads"
-              : "Comment on the selection from the threads",
-        );
-      }
-      hadCapture.current = next !== null;
       setCaptured(next);
-      setSelectedAt(next === null ? null : boxOf(range));
+      setSelectedAt(next === null ? null : range.cloneRange());
     };
     // A keyboard or pointer selection is read again when the key or the
     // button comes up: Chrome can leave the last steps of a fast Shift+Arrow
@@ -833,7 +825,7 @@ export function ReflectionThreads({
       document.removeEventListener("keyup", read);
       document.removeEventListener("pointerup", read);
     };
-  }, [articleRef, sections, say, column, mayComment]);
+  }, [articleRef, sections]);
 
   // The pointer button on the page: while it is down the reader is
   // selecting, and the bar waits. A press that comes up ends an Escape held
@@ -1162,7 +1154,6 @@ export function ReflectionThreads({
       // The new thread must be listed to take the keyboard.
       setBlockingOnly(false);
       say("Comment posted.");
-      hadCapture.current = false;
       backToComment.current = true;
       setDrafting(null);
       setCaptured(null);
@@ -1173,34 +1164,67 @@ export function ReflectionThreads({
 
   // The column's Comment button and the bar at the selection: a comment on
   // what is selected now, or on what was when the selection was last heard.
-  const startComment = () => {
+  const startComment = (pressed: SelectionAnchor | null = null) => {
     comment.reset();
-    setDrafting(selectionNow() ?? captured);
+    setDrafting(selectionNow() ?? captured ?? pressed);
   };
 
-  const barShown =
-    mayComment &&
-    captured !== null &&
-    selectedAt !== null &&
-    drafting === null &&
-    !pointerDown &&
-    dismissed === null &&
-    !sheetOpen;
-  const bar = barShown ? (
-    <SelectionBar
-      box={selectedAt}
-      onComment={() => {
-        startComment();
-        // Below `xl` the form is in the sheet.
-        if (!column) {
-          setSheetOpen(true);
-        }
-      }}
-      onDismiss={() => {
-        setDismissed(capturedKey);
-      }}
-    />
-  ) : null;
+  // The bar stands by a live selection in the page, for whoever may
+  // comment, while no comment is written, the pointer is not selecting,
+  // Escape did not send it away and the sheet does not cover it. A press
+  // on it keeps it there until the click, whatever the selection does.
+  const barAt =
+    !mayComment || drafting !== null || sheetOpen
+      ? null
+      : barPress !== null
+        ? barPress.range
+        : captured !== null && !pointerDown && dismissed === null
+          ? selectedAt
+          : null;
+  const bar =
+    barAt === null ? null : (
+      <SelectionBar
+        range={barAt}
+        frame={articleRef}
+        onPressStart={() => {
+          if (captured !== null && selectedAt !== null) {
+            setBarPress({ anchor: captured, range: selectedAt });
+          }
+        }}
+        onPressEnd={() => {
+          setBarPress(null);
+        }}
+        onComment={() => {
+          startComment(barPress?.anchor ?? null);
+          setBarPress(null);
+          // Below `xl` the form is in the sheet.
+          if (!column) {
+            setSheetOpen(true);
+          }
+        }}
+        onDismiss={() => {
+          setDismissed(capturedKey);
+        }}
+      />
+    );
+  const barShown = barAt !== null;
+  // Said once per selection, and only while the bar is there to be used:
+  // not to a reader who may not comment, not while a comment is written.
+  useEffect(() => {
+    if (captured === null) {
+      announced.current = false;
+      return;
+    }
+    if (barShown && !announced.current) {
+      announced.current = true;
+      // Below `xl` the column's button is in the sheet.
+      say(
+        column
+          ? "Comment on the selection with Alt+F10"
+          : "Comment on the selection with Alt+F10 or from the threads",
+      );
+    }
+  }, [barShown, captured, column, say]);
 
   // A thread a resolve or reopen moves is drawn elsewhere: focus waits on
   // the column's heading rather than on a control that is gone.
@@ -1323,7 +1347,9 @@ export function ReflectionThreads({
             onMouseDown={(event) => {
               event.preventDefault();
             }}
-            onClick={startComment}
+            onClick={() => {
+              startComment();
+            }}
             className={`flex items-center gap-2.5 rounded-[10px] border border-accent-300 bg-accent-50 px-3 py-2.5 text-left text-[13px] font-medium text-accent-800 hover:bg-accent-100 dark:border-accent-700 dark:bg-accent-400/10 dark:text-accent-200 dark:hover:bg-accent-400/20 ${FOCUS_RING}`}
           >
             <MessageSquarePlus aria-hidden size={16} className="shrink-0" />

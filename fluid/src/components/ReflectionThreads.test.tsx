@@ -1737,8 +1737,11 @@ describe("the bar at the selection", () => {
     });
     renderApp("/d/eng/reflection/guides/deploying.md");
     await screen.findByText("at");
+    const status = screen.getByRole("status", { hidden: true });
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(bar()).toBeNull();
+    // Nor is the reader told to comment.
+    expect(status).toHaveTextContent("");
   });
 
   it("goes while a comment is written", async () => {
@@ -1820,8 +1823,8 @@ describe("the bar at the selection", () => {
       cancelable: true,
     });
     barButton().dispatchEvent(down);
+    // jsdom never moves the selection on a press: the cancel is the proof.
     expect(down.defaultPrevented).toBe(true);
-    expect(window.getSelection()?.toString()).toBe("Deploys run at night");
   });
 
   it("goes on Escape until the selection changes", async () => {
@@ -1858,18 +1861,199 @@ describe("the bar at the selection", () => {
     serve([]);
     renderApp("/d/eng/reflection/guides/deploying.md");
     await screen.findByText("at");
-    const before = document.activeElement;
+    // The reader was on a control outside the page (a button, not a field).
+    const before = screen.getByRole("switch", {
+      name: "Show resolved threads",
+    });
+    before.focus();
     // Without a bar, Alt+F10 does nothing.
-    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
-    expect(document.activeElement).toBe(before);
+    fireEvent.keyDown(before, { key: "F10", altKey: true });
+    expect(before).toHaveFocus();
     select(textNode("Deploys run "), textNode(" night."), 6);
-    expect(document.activeElement).toBe(before);
-    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
+    expect(before).toHaveFocus();
+    fireEvent.keyDown(before, { key: "F10", altKey: true });
     expect(barButton()).toHaveFocus();
+    // A browser may collapse the selection as the bar takes the focus.
+    window.getSelection()?.collapse(document.body, 0);
+    act(() => {
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(bar()).toBeVisible();
     fireEvent.keyDown(barButton(), { key: "Escape" });
     expect(bar()).toBeNull();
-    expect(document.activeElement).toBe(before);
+    expect(before).toHaveFocus();
     expect(window.getSelection()?.toString()).toBe("Deploys run at night");
+  });
+
+  it("keeps the passage for a tap whose touch collapsed the selection first", async () => {
+    const opened = vi.fn((_path: string, _init?: RequestInit) =>
+      thread("t-00000001"),
+    );
+    serve([], {
+      "/domains/eng/reflection/threads": (path, init) => opened(path, init),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const button = barButton();
+    fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+    // The touch lands as a caret in the page before the click does.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+    fireEvent.click(button);
+    const form = screen.getByRole("form", { name: "New comment" });
+    expect(within(form).getByText("Deploys run **at** night")).toBeVisible();
+  });
+
+  it("says nothing of the bar while a comment is written", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const status = screen.getByRole("status", { hidden: true });
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(barButton());
+    // The first word goes as it always does, after a few seconds.
+    await waitFor(
+      () => {
+        expect(status).toHaveTextContent("");
+      },
+      { timeout: 6000 },
+    );
+    // Another passage while the form is open: the bar is not there.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    select(textNode("Deploys run "), textNode("Deploys run "), 7);
+    expect(bar()).toBeNull();
+    expect(status).toHaveTextContent("");
+  });
+
+  describe("where it stands", () => {
+    // jsdom lays nothing out: the boxes the bar measures are lent here.
+    const sel = { top: 300, bottom: 320, left: 900 };
+    const box = (b: {
+      top?: number;
+      bottom?: number;
+      left?: number;
+      right?: number;
+      width?: number;
+    }) =>
+      ({
+        top: b.top ?? 0,
+        bottom: b.bottom ?? 0,
+        left: b.left ?? 0,
+        right: b.right ?? (b.left ?? 0) + (b.width ?? 0),
+        width: b.width ?? (b.right ?? 0) - (b.left ?? 0),
+        height: (b.bottom ?? 0) - (b.top ?? 0),
+        x: b.left ?? 0,
+        y: b.top ?? 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    const lent: [string, PropertyDescriptor | undefined][] = [];
+    const lend = (name: string, get: (this: HTMLElement) => unknown) => {
+      lent.push([
+        name,
+        Object.getOwnPropertyDescriptor(HTMLElement.prototype, name),
+      ]);
+      Object.defineProperty(HTMLElement.prototype, name, {
+        configurable: true,
+        get,
+      });
+    };
+    let observed: (() => void) | null = null;
+    const savedObserver = globalThis.ResizeObserver;
+    beforeEach(() => {
+      Object.assign(sel, { top: 300, bottom: 320, left: 900 });
+      vi.spyOn(Range.prototype, "getBoundingClientRect").mockImplementation(
+        () => box(sel),
+      );
+      vi.spyOn(Range.prototype, "getClientRects").mockImplementation(
+        () => [box(sel)] as unknown as DOMRectList,
+      );
+      vi.spyOn(
+        HTMLElement.prototype,
+        "getBoundingClientRect",
+      ).mockImplementation(function (this: HTMLElement) {
+        // The shell's frame is the window; the page column ends at 960,
+        // where the gap and the threads beside it begin.
+        if (this.tagName === "MAIN") return box({ left: 0, right: 1440 });
+        if (this.tagName === "ARTICLE") return box({ left: 40, right: 960 });
+        return box({});
+      });
+      lend("offsetParent", function () {
+        return this.parentElement?.closest("main") ?? null;
+      });
+      lend("offsetWidth", function () {
+        return this.getAttribute("role") === "toolbar" ? 105 : 0;
+      });
+      lend("offsetHeight", function () {
+        return this.getAttribute("role") === "toolbar" ? 40 : 0;
+      });
+      observed = null;
+      globalThis.ResizeObserver = class {
+        constructor(callback: () => void) {
+          observed = callback;
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {
+          observed = null;
+        }
+      } as unknown as typeof ResizeObserver;
+    });
+    afterEach(() => {
+      for (const [name, descriptor] of lent.splice(0).reverse()) {
+        if (descriptor) {
+          Object.defineProperty(HTMLElement.prototype, name, descriptor);
+        } else {
+          Reflect.deleteProperty(HTMLElement.prototype, name);
+        }
+      }
+      globalThis.ResizeObserver = savedObserver;
+    });
+
+    it("stays inside the page column, never over the threads beside it", async () => {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const toolbar = bar() as HTMLElement;
+      // Above the passage, by the gap.
+      expect(toolbar.style.top).toBe("254px");
+      // Its right edge on the column's: 960 - 105.
+      expect(toolbar.style.left).toBe("855px");
+    });
+
+    it("goes below a passage with no room above it", async () => {
+      Object.assign(sel, { top: 10, bottom: 30, left: 100 });
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect((bar() as HTMLElement).style.top).toBe("36px");
+    });
+
+    it("follows the text when the window or the page changes size", async () => {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const toolbar = bar() as HTMLElement;
+      Object.assign(sel, { top: 500, bottom: 520, left: 100 });
+      act(() => {
+        window.dispatchEvent(new Event("resize"));
+      });
+      expect(toolbar.style.top).toBe("454px");
+      expect(toolbar.style.left).toBe("100px");
+      // A picture above the passage loads: the page grows, the text moves.
+      Object.assign(sel, { top: 700, bottom: 720, left: 120 });
+      expect(observed).not.toBeNull();
+      act(() => {
+        observed?.();
+      });
+      expect(toolbar.style.top).toBe("654px");
+      expect(toolbar.style.left).toBe("120px");
+    });
   });
 
   it("says the bar is there, with its key", async () => {
@@ -2178,6 +2362,27 @@ describe("threads on a narrow screen", () => {
     });
     expect(
       screen.queryByRole("toolbar", { name: "Selection actions" }),
+    ).toBeNull();
+  });
+
+  it("is not at the selection while the sheet is open", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(
+      screen.getByRole("toolbar", { name: "Selection actions" }),
+    ).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Show threads" }));
+    await screen.findByRole("dialog", { name: "Threads" });
+    // The passage is still selected behind the sheet (jsdom drops it as the
+    // sheet takes the focus; a browser keeps it).
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(
+      screen.queryByRole("toolbar", {
+        name: "Selection actions",
+        hidden: true,
+      }),
     ).toBeNull();
   });
 

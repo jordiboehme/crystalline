@@ -572,6 +572,19 @@ test.describe.serial("the Reflection journeys", () => {
     expect((barBox?.y ?? 0) + (barBox?.height ?? 0)).toBeLessThanOrEqual(
       textBox?.y ?? 0,
     );
+    // Inside the page column: never over the threads beside it.
+    const columnBox = await page
+      .locator("article", { has: passage })
+      .boundingBox();
+    const threadsBox = await page
+      .getByRole("complementary", { name: "Threads" })
+      .boundingBox();
+    expect((barBox?.x ?? 0) + (barBox?.width ?? 0)).toBeLessThanOrEqual(
+      (columnBox?.x ?? 0) + (columnBox?.width ?? 0),
+    );
+    expect((barBox?.x ?? 0) + (barBox?.width ?? 0)).toBeLessThan(
+      threadsBox?.x ?? 0,
+    );
     await bar
       .getByRole("button", { name: "Comment on selection", exact: true })
       .click();
