@@ -19,6 +19,7 @@ import { ChangeSet, Prec } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
 import { transferFiles } from "../attachments";
+import { isOwnCopy } from "../clipboardHtml";
 import type { SpanChange, TableLine } from "../tableModel";
 import { addColumnAfter, addRowBelow, parseTable } from "../tableModel";
 import { noteUndoLanding } from "./cellEditor";
@@ -356,7 +357,10 @@ export const cellPaste: Extension = Prec.highest(
         );
         return true;
       }
-      const rows = blockOf(plain, data.getData("text/html"));
+      // Our own copy is read by its plain text alone, as a copy before it
+      // carried HTML was.
+      const clipHtml = data.getData("text/html");
+      const rows = blockOf(plain, isOwnCopy(clipHtml) ? "" : clipHtml);
       if (rows === null || (rows.length === 1 && rows[0]?.length === 1)) {
         typed(view, rows?.[0]?.[0] ?? plain);
         return true;

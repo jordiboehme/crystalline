@@ -46,7 +46,7 @@ export interface Root extends MdNode {
 const TICKABLE = /^\[[ xX]\]$/;
 
 /** `[~]` and the whitespace after it, at the start of an item's words. */
-const NOT_APPLICABLE = /^\[~\][ \t]+/;
+export const NOT_APPLICABLE = /^\[~\][ \t]+/;
 
 /** The offset of the item's box in `source`, or null when it is not on the item's first line. */
 function boxOffset(item: MdNode, source: string): number | null {

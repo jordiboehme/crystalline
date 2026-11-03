@@ -15,14 +15,19 @@ import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension, SelectionRange } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
+import { decodeNamedCharacterReference } from "decode-named-character-reference";
 
 import { parseCalloutHead } from "../markdown/callouts";
 import { statusLabelWords } from "../markdown/statusText";
+import { NOT_APPLICABLE } from "../markdown/taskState";
 import { isIdLine } from "../reflectionText";
 import { WIKILINK, wikilinkWords } from "../wikilinks";
 import { footnoteNumberAt } from "./footnotes";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { mathBlocks } from "./mathBlocks";
+
+/** The attribute on the root of the HTML a copy writes (see `isOwnCopy`). */
+const COPY_MARKER = 'data-crystalline-copy="1"';
 
 const ESCAPES: Record<string, string> = {
   "&": "&amp;",
@@ -35,20 +40,19 @@ const ESCAPES: Record<string, string> = {
 const esc = (text: string): string =>
   text.replace(/[&<>"']/g, (c) => ESCAPES[c] ?? c);
 
-const NAMED: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-};
-
-/** The character references the parser reads, with an unknown one left as it is. */
+/**
+ * The backslash escapes and character references the parser reads in an
+ * address or a text, with an unknown or out-of-range one left as it is.
+ */
 function decode(text: string): string {
   return text.replace(
-    /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(\w+));/g,
-    (whole, dec?: string, hex?: string, name?: string) => {
+    /\\([!-/:-@[-`{-~])|&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(\w+));/g,
+    (whole, punct?: string, dec?: string, hex?: string, name?: string) => {
+      if (punct !== undefined) {
+        return punct;
+      }
       if (name !== undefined) {
-        return NAMED[name] ?? whole;
+        return decodeNamedCharacterReference(name) || whole;
       }
       const code = dec !== undefined ? Number(dec) : parseInt(hex ?? "", 16);
       return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
@@ -81,7 +85,7 @@ interface Item {
   inner: string;
 }
 
-const SKIPPED = /Mark|Delim|Title|Label|Comment|Instr/;
+const SKIPPED = /Mark|Delim|Title|Label|Comment|Instr|Reference/;
 const CODEISH = /^(?:InlineCode|InlineMath|HTMLTag|URL)$/;
 
 const kids = (node: SyntaxNode): SyntaxNode[] => {
@@ -98,7 +102,9 @@ export function copyHtmlOf(
   ranges: readonly SelectionRange[],
 ): string {
   const end = ranges.reduce((to, r) => Math.max(to, r.to), 0);
-  const tree = ensureSyntaxTree(state, end, 200) ?? syntaxTree(state);
+  void end;
+  const tree =
+    ensureSyntaxTree(state, state.doc.length, 200) ?? syntaxTree(state);
   const maths = mathBlocks(state).filter((m) => m.form === "dollars");
   const front = frontmatterRegion(state.doc);
 
@@ -106,6 +112,33 @@ export function copyHtmlOf(
     from < to ? esc(state.sliceDoc(from, to)) : "";
   const whole = (c: { from: number; to: number }, lo: number, hi: number) =>
     c.from >= lo && c.to <= hi;
+
+  const norm = (key: string) => key.trim().replace(/\s+/g, " ").toLowerCase();
+  let defs: Map<string, string> | undefined;
+  /** The address a reference label stands for, as the document defines it. */
+  function defined(key: string): string | undefined {
+    if (!defs) {
+      const found = new Map<string, string>();
+      tree.iterate({
+        enter(n) {
+          if (n.name !== "LinkReference") {
+            return;
+          }
+          const label = n.node.getChild("LinkLabel");
+          const url = n.node.getChild("URL");
+          const name = label
+            ? norm(state.sliceDoc(label.from + 1, label.to - 1))
+            : null;
+          if (name !== null && url && !found.has(name)) {
+            found.set(name, state.sliceDoc(url.from, url.to));
+          }
+          return false;
+        },
+      });
+      defs = found;
+    }
+    return defs.get(norm(key));
+  }
 
   function items(n: SyntaxNode): Item[] {
     const real = kids(n).map((c): Item => ({
@@ -216,12 +249,25 @@ export function copyHtmlOf(
             : raw();
         }
         const [open, close] = marks;
-        if (!url || !open || !close) {
-          // No address: the reader shows brackets, so they stay.
+        if (!open || !close) {
           return raw();
         }
-        const words = inl(c, Math.max(lo, open.to), Math.min(hi, close.from));
-        return link(safeHref(state.sliceDoc(url.from, url.to)), words);
+        const label = kids(c).find((k) => k.name === "LinkLabel");
+        let key = label ? state.sliceDoc(label.from + 1, label.to - 1) : "";
+        if (key.trim() === "") {
+          key = state.sliceDoc(open.to, close.from);
+        }
+        const address = url ? state.sliceDoc(url.from, url.to) : defined(key);
+        const inner = inl(c, Math.max(lo, open.to), Math.min(hi, close.from));
+        if (address === undefined) {
+          // No address anywhere: the reader shows the brackets, so they stay.
+          return (
+            txt(Math.max(open.from, lo), Math.min(open.to, hi)) +
+            inner +
+            txt(Math.max(close.from, lo), Math.min(c.to, hi))
+          );
+        }
+        return link(safeHref(address), inner);
       }
       case "Task":
         return box(c, lo, hi) + inl(c, lo, hi);
@@ -238,11 +284,16 @@ export function copyHtmlOf(
     return /\[[xX]\]/.test(state.sliceDoc(marker.from, marker.to)) ? "☑" : "☐";
   }
 
-  /** A paragraph's words, with the `[~]` box of a list item. */
-  function words(p: SyntaxNode, lo: number, hi: number, inItem: boolean) {
-    if (inItem && state.sliceDoc(p.from, p.from + 4) === "[~] ") {
+  /** A paragraph's words, with the `[~]` box of a list item's first paragraph. */
+  function words(p: SyntaxNode, lo: number, hi: number, first: boolean) {
+    const na = first
+      ? NOT_APPLICABLE.exec(state.sliceDoc(p.from, p.from + 12))
+      : null;
+    if (na) {
       const shown = p.from >= lo && p.from < hi;
-      return (shown ? "☒ " : "") + inl(p, Math.max(lo, p.from + 4), hi);
+      return (
+        (shown ? "☒ " : "") + inl(p, Math.max(lo, p.from + na[0].length), hi)
+      );
     }
     return inl(p, lo, hi);
   }
@@ -300,7 +351,7 @@ export function copyHtmlOf(
         const text = tidy(
           c.name === "Task"
             ? box(c, lo, hi) + inl(c, lo, hi)
-            : words(c, lo, hi, true),
+            : words(c, lo, hi, first),
         );
         out += first ? text : wrap("p", text);
         first = false;
@@ -328,7 +379,8 @@ export function copyHtmlOf(
     const text = kids(c)
       .filter((k) => k.name === "CodeText" && k.to > lo && k.from < hi)
       .map((k) => state.sliceDoc(Math.max(k.from, lo), Math.min(k.to, hi)))
-      .join("\n");
+      .join("")
+      .replace(/\n$/, "");
     return wrap("pre", wrap("code", esc(text)));
   }
 
@@ -341,7 +393,16 @@ export function copyHtmlOf(
       case "Paragraph": {
         const tex = maths.find((m) => m.from <= c.from && c.to <= m.to);
         if (tex) {
-          return wrap("pre", wrap("code", esc(tex.tex)));
+          const part = state
+            .sliceDoc(Math.max(lo, c.from), Math.min(hi, c.to))
+            .split("\n")
+            .map((l) => l.replace(/^[\s>]*/, ""))
+            .filter((l) => l.trim() !== "$$")
+            .join("\n");
+          return wrap(
+            "pre",
+            wrap("code", esc(lo <= c.from && hi >= c.to ? tex.tex : part)),
+          );
         }
         const mark = kids(c).find((k) => k.name === "CalloutMark");
         return mark
@@ -385,13 +446,25 @@ export function copyHtmlOf(
     .join("");
 }
 
+/** Whether the page's selection sits in the view, as CodeMirror asks first. */
+function selectionIn(view: EditorView): boolean {
+  const sel = view.dom.ownerDocument.defaultView?.getSelection() ?? null;
+  const inside = (node: Node | null) =>
+    node !== null && view.contentDOM.contains(node);
+  return sel !== null && inside(sel.anchorNode) && inside(sel.focusNode);
+}
+
 /**
- * Copy and cut for the main view: the text exactly as CodeMirror would put it
- * on the clipboard (the selected ranges joined with the line break, then the
- * output filters, which strip the id lines), and the HTML beside it. A cut
- * deletes as one undo step, `delete.cut`, through the same guards as any
- * deletion, and only where the view can be edited. An empty selection is left
- * to CodeMirror's line-wise copy.
+ * Copy and cut for the main view. Where CodeMirror's own copy can run, it
+ * does, so its line-wise copy bookkeeping, its selection guard and its cut
+ * (`delete.cut`, one undo step, through the same guards as any deletion) stay
+ * its own: this handler only slips the HTML beside the text it writes. The
+ * HTML root carries `COPY_MARKER`, so a paste in Fluid takes the Markdown.
+ * Where it cannot (a view that is not editable must copy and never delete,
+ * or the clipboard object is not replaceable), it writes both flavours
+ * itself, with the text exactly as CodeMirror would put it: the selected
+ * ranges joined with the line break, then the output filters. An empty
+ * selection is left to CodeMirror's line-wise copy.
  */
 export function copyAsHtml(): Extension {
   const handle =
@@ -402,20 +475,41 @@ export function copyAsHtml(): Extension {
       if (ranges.length === 0 || data === null) {
         return false;
       }
+      const html = `<div ${COPY_MARKER}>${copyHtmlOf(state, ranges)}</div>`;
+      const deletes = cut && !state.readOnly;
+      if (!deletes || state.facet(EditorView.editable)) {
+        try {
+          Object.defineProperty(event, "clipboardData", {
+            configurable: true,
+            value: {
+              clearData: () => data.clearData(),
+              setData: (type: string, value: string) => {
+                data.setData(type, value);
+                if (type === "text/plain") {
+                  data.setData("text/html", html);
+                }
+              },
+            },
+          });
+          return false;
+        } catch {
+          // Not replaceable: written here.
+        }
+      }
+      if (!selectionIn(view)) {
+        return false;
+      }
       let text = ranges
         .map((r) => state.sliceDoc(r.from, r.to))
         .join(state.lineBreak);
       for (const filter of state.facet(EditorView.clipboardOutputFilter)) {
         text = filter(text, state);
       }
-      const html = copyHtmlOf(state, ranges);
       event.preventDefault();
       data.clearData();
       data.setData("text/plain", text);
-      if (html !== "") {
-        data.setData("text/html", html);
-      }
-      if (cut && !state.readOnly && state.facet(EditorView.editable)) {
+      data.setData("text/html", html);
+      if (deletes && state.facet(EditorView.editable)) {
         view.dispatch({
           changes: ranges.map((r) => ({ from: r.from, to: r.to })),
           scrollIntoView: true,

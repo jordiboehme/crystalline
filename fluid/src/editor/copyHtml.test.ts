@@ -8,6 +8,8 @@ import { copyHtmlOf } from "./copyHtml";
 
 afterEach(cleanupMarkViews);
 
+const OWN = '<div data-crystalline-copy="1">';
+
 /** The HTML of the whole of `text`, or of `[from, to)`. */
 function html(text: string, from = 0, to = text.length): string {
   const view = markView(text);
@@ -26,6 +28,7 @@ function send(view: EditorView, type: "copy" | "cut"): Copied {
   const copied: Copied = { data, setCalls: 0, prevented: false };
   const event = new Event(type, { bubbles: true, cancelable: true });
   Object.defineProperty(event, "clipboardData", {
+    configurable: true,
     value: {
       clearData: () => {
         data.clear();
@@ -212,7 +215,9 @@ describe("the copy and cut handlers", () => {
     select(view, 0, view.state.doc.length);
     const copied = send(view, "copy");
     expect(copied.data.get("text/plain")).toBe("## Night\n\nText.\n");
-    expect(copied.data.get("text/html")).toBe("<h2>Night</h2><p>Text.</p>");
+    expect(copied.data.get("text/html")).toBe(
+      `${OWN}<h2>Night</h2><p>Text.</p></div>`,
+    );
     const joined = [...copied.data.values()].join("");
     expect(joined).not.toContain("r:");
     expect(joined).not.toContain("<!--");
@@ -225,7 +230,9 @@ describe("the copy and cut handlers", () => {
     select(view, 1, 6);
     const copied = send(view, "copy");
     expect(copied.data.get("text/plain")).toBe("b **c");
-    expect(copied.data.get("text/html")).toBe("<p>b <strong>c</strong></p>");
+    expect(copied.data.get("text/html")).toBe(
+      `${OWN}<p>b <strong>c</strong></p></div>`,
+    );
   });
 
   it.each([
@@ -237,7 +244,9 @@ describe("the copy and cut handlers", () => {
     select(view, 1, 6);
     const copied = send(view, "cut");
     expect(copied.data.get("text/plain")).toBe("b **c");
-    expect(copied.data.get("text/html")).toBe("<p>b <strong>c</strong></p>");
+    expect(copied.data.get("text/html")).toBe(
+      `${OWN}<p>b <strong>c</strong></p></div>`,
+    );
     expect(bytes(view.state)).toBe("a**d** ef");
     undoOnce(view);
     expect(bytes(view.state)).toBe("ab **cd** ef");
@@ -255,7 +264,9 @@ describe("the copy and cut handlers", () => {
       select(view, 1, 6);
       const copied = send(view, "cut");
       expect(copied.data.get("text/plain")).toBe("b **c");
-      expect(copied.data.get("text/html")).toBe("<p>b <strong>c</strong></p>");
+      expect(copied.data.get("text/html")).toBe(
+        `${OWN}<p>b <strong>c</strong></p></div>`,
+      );
       expect(bytes(view.state)).toBe("ab **cd** ef");
     },
   );
@@ -278,7 +289,124 @@ describe("the copy and cut handlers", () => {
     const copied = send(view, "copy");
     expect(copied.data.get("text/plain")).toBe("one");
     expect(copied.data.get("text/html")).toBe(
-      "<table><tbody><tr><td>one</td></tr></tbody></table>",
+      `${OWN}<table><tbody><tr><td>one</td></tr></tbody></table></div>`,
     );
+  });
+});
+
+/** A paste as the browser sends it, with the flavours `copied` holds. */
+function pasteInto(view: EditorView, copied: Copied): void {
+  const event = new Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      getData: (kind: string) => copied.data.get(kind) ?? "",
+      types: [...copied.data.keys()],
+      files: [],
+      items: [],
+    },
+  });
+  view.contentDOM.dispatchEvent(event);
+}
+
+describe("round trip inside Fluid", () => {
+  const DOC =
+    "See [[Other Page]] and ![diagram](att/x.png) :status[Done]{green} a[^1]\n\n> [!WARNING]\n> careful\n\n```rust\nlet x = 1;\n```\n\n[^1]: note\n";
+
+  it("pastes a copy back byte for byte", () => {
+    const from = markView(DOC);
+    from.focus();
+    select(from, 0, DOC.length);
+    const copied = send(from, "copy");
+    expect(copied.data.get("text/html")?.startsWith(OWN)).toBe(true);
+    const to = markView("");
+    to.focus();
+    pasteInto(to, copied);
+    expect(bytes(to.state)).toBe(DOC);
+  });
+
+  it("pastes a cut back byte for byte", () => {
+    const from = markView(DOC);
+    from.focus();
+    select(from, 0, DOC.length);
+    const copied = send(from, "cut");
+    expect(bytes(from.state)).toBe("");
+    const to = markView("");
+    to.focus();
+    pasteInto(to, copied);
+    expect(bytes(to.state)).toBe(DOC);
+  });
+});
+
+describe("what CodeMirror remembers of a line copy", () => {
+  it("does not make a paste after our copy a line paste", () => {
+    const view = markView("foo\nbar foo baz");
+    view.focus();
+    view.dispatch({ selection: { anchor: 1 } });
+    const line = send(view, "copy");
+    expect(line.data.get("text/plain")).toBe("foo");
+    select(view, 8, 11);
+    const word = send(view, "copy");
+    expect(word.data.get("text/plain")).toBe("foo");
+    view.dispatch({ selection: { anchor: 5 }, userEvent: "select.pointer" });
+    pasteInto(view, word);
+    expect(bytes(view.state)).toBe("foo\nbfooar foo baz");
+  });
+});
+
+describe("copyHtmlOf, fix round 1", () => {
+  it.each([
+    ["    a\n    b\n\n    c", "<pre><code>a\nb\n\nc</code></pre>"],
+    [
+      "> ```\n> a\n> b\n> ```",
+      "<blockquote><pre><code>a\nb</code></pre></blockquote>",
+    ],
+    [
+      "- x\n\n  ```\n  a\n  b\n  ```",
+      "<ul><li>x<pre><code>a\nb</code></pre></li></ul>",
+    ],
+  ])("keeps the lines of a code block in a container (%#)", (doc, out) => {
+    expect(html(doc)).toBe(out);
+  });
+
+  it("writes reference links as links and leaves the definitions out", () => {
+    expect(
+      html(
+        '[**a**][r] [b] [c][]\n\n[r]: https://x "t"\n[b]: <https://y>\n[c]: javascript:x',
+      ),
+    ).toBe(
+      '<p><a href="https://x"><strong>a</strong></a> <a href="https://y">b</a> c</p>',
+    );
+    expect(html("[r]\n\n[r]: https://x")).toBe(
+      '<p><a href="https://x">r</a></p>',
+    );
+    expect(html("a[^1]\n\n[^1]: note")).toBe("<p>a<sup>1</sup></p>");
+  });
+
+  it("keeps the inner formatting of bracket text with no address", () => {
+    expect(html("[**b** c]")).toBe("<p>[<strong>b</strong> c]</p>");
+  });
+
+  it("reads the not-applicable box the way the reader does", () => {
+    expect(html("- [~]\tb")).toBe("<ul><li>\u2612 b</li></ul>");
+    expect(html("- a\n\n  [~] b")).toBe("<ul><li>a<p>[~] b</p></li></ul>");
+  });
+
+  it("decodes every named entity the page decodes", () => {
+    expect(html("a&nbsp;b &copy; &amp; &bogus;")).toBe(
+      "<p>a\u00a0b \u00a9 &amp; &amp;bogus;</p>",
+    );
+  });
+
+  it("copies only the selected part of a display formula", () => {
+    const doc = "$$\nE=mc^2\n$$";
+    expect(html(doc, 4, 7)).toBe("<pre><code>=mc</code></pre>");
+    expect(html(doc)).toBe("<pre><code>E=mc^2</code></pre>");
+  });
+
+  it("resolves a backslash escape in an address", () => {
+    expect(html("[l](https://x/\\_y)")).toBe(
+      '<p><a href="https://x/_y">l</a></p>',
+    );
+    expect(html("[l](\\javascript:x)")).toBe("<p>l</p>");
   });
 });

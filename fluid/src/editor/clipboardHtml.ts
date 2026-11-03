@@ -82,3 +82,16 @@ export function decodeEntities(text: string): string {
   }
   return current;
 }
+
+/**
+ * Whether the HTML is the copy Fluid wrote itself: its root element carries
+ * the marker, after whatever a browser wraps around a fragment. Its
+ * `text/plain` is the Markdown the person copied and a paste takes that as it
+ * is. The marker earns no trust beyond that: the plain text is the same text
+ * the person sees, whoever wrote the HTML.
+ */
+export function isOwnCopy(html: string): boolean {
+  return /^(?:\s|<meta[^>]*>|<!--[\s\S]*?-->|<\/?(?:html|body)[^>]*>)*<div data-crystalline-copy="1">/.test(
+    html,
+  );
+}

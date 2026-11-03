@@ -92,6 +92,38 @@ function undo(main: EditorView, view: EditorView): void {
   expect(main.state.doc.length).toBeGreaterThan(0);
 }
 
+describe("HTML Fluid wrote itself", () => {
+  const OWN = '<div data-crystalline-copy="1">';
+
+  test("its two-column table does not make the plain lines a block", () => {
+    const table =
+      "<table><tbody><tr><td>x</td><td>z</td></tr><tr><td>y</td><td>w</td></tr></tbody></table>";
+    const plainOnly = soloMain(DOC, layers());
+    paste(open(plainOnly, 0, 1), { plain: "x\ny" });
+    const own = soloMain(DOC, layers());
+    paste(open(own, 0, 1), { plain: "x\ny", html: `${OWN}${table}</div>` });
+    expect(bytes(own.state)).toBe(bytes(plainOnly.state));
+  });
+
+  test("the plain text with tabs still fills cells", () => {
+    const main = soloMain(DOC, layers());
+    paste(open(main, 0, 0), {
+      plain: "x\tz\ny\tw",
+      html: `${OWN}<table><tr><td>x</td><td>z</td></tr></table></div>`,
+    });
+    expect(bytes(main.state)).toContain("| x | z |");
+  });
+
+  test("another site's HTML with the marker deeper in is converted as before", () => {
+    const main = soloMain(DOC, layers());
+    paste(open(main, 0, 1), {
+      plain: "x\ny",
+      html: '<table><tr><td>x</td><td>z</td></tr><tr><td>y</td><td>w</td></tr></table><div data-crystalline-copy="1"></div>',
+    });
+    expect(bytes(main.state)).toBe("| a | x |\n| - | - |\n| 1 | y |\n");
+  });
+});
+
 describe("multi-line text without a tab (finding 8)", () => {
   test("two lines of prose are one value, typed at the caret", () => {
     const main = soloMain(DOC, layers());
