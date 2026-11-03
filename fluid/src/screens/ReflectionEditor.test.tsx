@@ -225,7 +225,7 @@ describe("the reflection editor", () => {
       "Italic",
       "Strikethrough",
       "Inline code",
-      "Heading",
+      "Text style",
       "Bulleted list",
       "Numbered list",
       "Task list",
@@ -251,9 +251,9 @@ describe("the reflection editor", () => {
       view.dispatch({ selection: { anchor: PAGE.indexOf("## One") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog).toHaveTextContent(
@@ -282,9 +282,9 @@ describe("the reflection editor", () => {
       view.dispatch({ selection: { anchor: PAGE.indexOf("## One") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     await user.click(
       within(await screen.findByRole("alertdialog")).getByRole("button", {
@@ -1681,7 +1681,7 @@ describe("the reflection editor takes files", () => {
     ).toBeDisabled();
     // The whole bar is off with it: the text can take no edit now.
     expect(screen.getByRole("button", { name: "Bold" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Heading" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Text style" })).toBeDisabled();
     editor.dispatchEvent(carrying("paste", [png()]));
     const drop = carrying("drop", [png()]);
     editor.dispatchEvent(drop);

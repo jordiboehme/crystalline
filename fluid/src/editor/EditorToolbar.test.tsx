@@ -903,17 +903,15 @@ describe("a heading change the document asks about first", () => {
     return view;
   }
 
-  async function pickHeading(level: number): Promise<void> {
+  async function pickHeading(name: string): Promise<void> {
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
-    await user.click(
-      await screen.findByRole("menuitem", { name: `Heading ${String(level)}` }),
-    );
+    await user.click(screen.getByRole("button", { name: "Text style" }));
+    await user.click(await screen.findByRole("menuitemradio", { name }));
   }
 
   test("says what joining does and changes nothing until it is confirmed", async () => {
     const v = mountPage();
-    await pickHeading(3);
+    await pickHeading("Heading 2");
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog).toHaveTextContent(JOIN_SECTIONS);
     expect(docText(v.state)).toBe(PAGE);
@@ -934,7 +932,7 @@ describe("a heading change the document asks about first", () => {
 
   test("Cancel leaves the text as it was and the caret in the buffer", async () => {
     const v = mountPage();
-    await pickHeading(2);
+    await pickHeading("Body");
     await screen.findByRole("alertdialog");
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(docText(v.state)).toBe(PAGE);
@@ -949,7 +947,7 @@ describe("a heading change the document asks about first", () => {
     act(() => {
       v.dispatch({ selection: { anchor: PAGE.indexOf("one") } });
     });
-    await pickHeading(2);
+    await pickHeading("Heading 1");
     expect(docText(v.state)).toContain("\n## one\n");
     expect(screen.queryByRole("alertdialog")).toBeNull();
   });

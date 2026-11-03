@@ -7,6 +7,7 @@
  * change that makes a section vanish asks first.
  */
 
+import { history, undo } from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -20,6 +21,7 @@ import {
   headingLevelAfter,
   insertBlock,
   insertMarkdownLink,
+  setHeadingLevel,
   toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
@@ -134,6 +136,30 @@ describe("the reflection adapter", () => {
     ).toBeNull();
     cycleHeading(v, 2);
     // No id line: the server mints the new section's id on save.
+    expect(v.state.doc.toString()).toBe(DOC.replace("\none\n", "\n## one\n"));
+  });
+
+  it("setHeadingLevel joins a section with its id line in one transaction, one undo restores both", () => {
+    const v = mount(
+      DOC,
+      [...adapter.extensions, history()],
+      DOC.indexOf("## B") + 3,
+    );
+    expect(adapter.confirmHeadingChange(v.state, caretLine(v), 3)).toBe(
+      JOIN_SECTIONS,
+    );
+    setHeadingLevel(v, 3, { joinSections: true });
+    expect(v.state.doc.toString()).toBe(
+      "# P\n\n## A\n<!-- r:aaaa0001 -->\n\none\n\n### B\n\ntwo\n",
+    );
+    undo(v);
+    expect(v.state.doc.toString()).toBe(DOC);
+  });
+
+  it("setHeadingLevel on a non-section line asks nothing and writes ##", () => {
+    const v = mount(DOC, adapter.extensions, DOC.indexOf("one"));
+    expect(adapter.confirmHeadingChange(v.state, caretLine(v), 2)).toBeNull();
+    setHeadingLevel(v, 2);
     expect(v.state.doc.toString()).toBe(DOC.replace("\none\n", "\n## one\n"));
   });
 

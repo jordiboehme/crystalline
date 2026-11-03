@@ -31,7 +31,6 @@ import {
   ChevronDown,
   Code,
   Columns3,
-  Heading,
   Italic,
   Link,
   List,
@@ -67,6 +66,8 @@ import { toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
+import type { StyleLevel } from "./TextStyleMenu";
+import { TextStyleMenu } from "./TextStyleMenu";
 import { TableSizePicker } from "./TableSizePicker";
 import type { ImageAlign } from "./imageFormat";
 import {
@@ -91,8 +92,7 @@ import {
 import type { Align } from "./tableModel";
 import {
   ORDERED_ITEM,
-  cycleHeading,
-  headingLevelAfter,
+  setHeadingLevel,
   insertMarkdownLink,
   insertWikilink,
   toggleLinePrefix,
@@ -105,9 +105,6 @@ import {
   tableDeleteRow,
   tablePrettify,
 } from "./tableVerbs";
-
-/** The heading levels the menu offers - deeper marks stay a typed thing. */
-const HEADING_LEVELS = [1, 2, 3];
 
 /**
  * The alignments a column can be given, in the order they read, each with the
@@ -503,7 +500,7 @@ export function EditorToolbar({
   const lineOff = off || cellNow;
   /** The heading change waiting for the person's answer, if any. */
   const [asking, setAsking] = useState<{
-    level: number;
+    level: StyleLevel;
     sentence: string;
   } | null>(null);
   /**
@@ -543,23 +540,17 @@ export function EditorToolbar({
   const pressed = (format: Format) =>
     formats ? { "aria-pressed": formats.has(format) } : {};
   /** The question a heading change on the caret's line asks, or null. */
-  const questionFor = (v: EditorView, level: number): string | null => {
+  const questionFor = (v: EditorView, level: StyleLevel): string | null => {
     const line = v.state.doc.lineAt(v.state.selection.main.head).number;
-    return (
-      adapter?.confirmHeadingChange(
-        v.state,
-        line,
-        headingLevelAfter(v.state, line, level),
-      ) ?? null
-    );
+    return adapter?.confirmHeadingChange(v.state, line, level) ?? null;
   };
-  const pickHeading = (v: EditorView, level: number): boolean => {
-    // The line the change is made on, as `cycleHeading` will find it: off a
+  const pickHeading = (v: EditorView, level: StyleLevel): boolean => {
+    // The line the change is made on, as `setHeadingLevel` will find it: off a
     // hidden id line first, so the question is about that same line.
     stepOffIdLines(v);
     const sentence = questionFor(v, level);
     if (sentence === null) {
-      return cycleHeading(v, level);
+      return setHeadingLevel(v, level);
     }
     askingNow.current = true;
     setAsking({ level, sentence });
@@ -576,7 +567,7 @@ export function EditorToolbar({
     // while the dialog was open, and a line that no longer asks is left as
     // it is.
     if (view && level !== undefined && questionFor(view, level) !== null) {
-      cycleHeading(view, level, { joinSections: true });
+      setHeadingLevel(view, level, { joinSections: true });
     }
   };
   return (
@@ -624,44 +615,16 @@ export function EditorToolbar({
           {...pressed("code")}
           onClick={actInline((v) => toggleFormat(v, "code"))}
         />
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <IconButton label="Heading" icon={Heading} disabled={lineOff} />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              sideOffset={6}
-              className={MENU_CLASSES}
-              // Radix hands focus back to the trigger when the menu closes,
-              // which would leave the caret out of the buffer right after a
-              // command put it back there. The buffer is where an author wants
-              // to be either way - having picked a heading, or having changed
-              // their mind and pressed Escape - so this bar always returns them.
-              onCloseAutoFocus={(event) => {
-                event.preventDefault();
-                // A change that asks first hands focus to its dialog instead.
-                if (!askingNow.current) {
-                  view?.focus();
-                }
-              }}
-            >
-              {HEADING_LEVELS.map((level) => (
-                <DropdownMenu.Item
-                  key={level}
-                  className={ITEM_CLASSES}
-                  onSelect={() => {
-                    if (view && verbTarget(view) === view) {
-                      pickHeading(view, level);
-                    }
-                  }}
-                >
-                  Heading {level}
-                </DropdownMenu.Item>
-              ))}
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        <TextStyleMenu
+          view={view}
+          disabled={lineOff}
+          keepsFocus={() => askingNow.current}
+          onPick={(level) => {
+            if (view && verbTarget(view) === view) {
+              pickHeading(view, level);
+            }
+          }}
+        />
         <IconButton
           label="Bulleted list"
           icon={List}

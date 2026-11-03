@@ -852,9 +852,9 @@ describe("the engram editor", () => {
       view.dispatch({ selection: { anchor: content.indexOf("## Part") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(docText(view.state)).toContain("### Part\n<!-- r:aaaa0001 -->\n");

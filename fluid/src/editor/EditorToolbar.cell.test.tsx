@@ -106,7 +106,7 @@ describe("the sticky bar with a cell open", () => {
     const { main } = mainWithOpenCell();
     bar(main, true);
     for (const name of [
-      "Heading",
+      "Text style",
       "Bulleted list",
       "Numbered list",
       "Task list",
@@ -203,7 +203,12 @@ describe("a torn-down cell's parked selection (round 2 A and B)", () => {
       <EditorToolbar view={main} cellOpen={false} onAttach={() => undefined} />,
       { wrapper: Tooltips },
     );
-    for (const name of ["Insert table", "Insert", "Attach a file", "Heading"]) {
+    for (const name of [
+      "Insert table",
+      "Insert",
+      "Attach a file",
+      "Text style",
+    ]) {
       expect(button(name)).toBeDisabled();
     }
   });
