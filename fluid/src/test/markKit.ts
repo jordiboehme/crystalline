@@ -30,6 +30,10 @@ export interface MarkViewOptions {
   adapter?: "engram" | "reflection";
   /** The source view: no preview layers at all. */
   raw?: boolean;
+  /** Told the formats the format buttons show as pressed. */
+  onFormatState?: (formats: ReadonlySet<string>) => void;
+  /** The room's shared text, for a second peer (`markPeers`). */
+  ytext?: Y.Text;
 }
 
 const views = new Set<EditorView>();
@@ -63,11 +67,17 @@ export function markView(
   const marks = new Compartment();
   let doc = text;
   let roomText: Y.Text | null = null;
-  if (options.room) {
-    const ydoc = new Y.Doc();
-    const ytext = ydoc.getText("content");
+  if (options.room || options.ytext) {
+    let ytext = options.ytext;
+    if (!ytext) {
+      ytext = new Y.Doc().getText("content");
+      ytext.insert(0, text);
+    }
+    const ydoc = ytext.doc;
+    if (!ydoc) {
+      throw new Error("a room text belongs to a Y.Doc");
+    }
     roomText = ytext;
-    ytext.insert(0, text);
     undoManager = new Y.UndoManager(ytext);
     doc = ytext.toJSON();
     screen = [
@@ -94,6 +104,9 @@ export function markView(
           onImageContext: () => {},
           onElementContext: () => {},
           onFloatingContext: () => {},
+          ...(options.onFormatState
+            ? { onFormatState: options.onFormatState }
+            : {}),
           marks,
           showMarks: options.mode === "show",
         }),
@@ -124,6 +137,46 @@ export function remoteInsert(view: EditorView, at: number, text: string): void {
   ytext.doc?.transact(() => {
     ytext.insert(at, text);
   }, "peer");
+}
+
+/**
+ * Two peers of one room on `text`, each a view built by `markView`. What one
+ * peer writes reaches the other only on `sync()`, so a test can let both
+ * type before either sees the other.
+ */
+export function markPeers(
+  text: string,
+  options: Omit<MarkViewOptions, "room" | "ytext"> = {},
+): { local: EditorView; peer: EditorView; sync: () => void } {
+  const localDoc = new Y.Doc();
+  const peerDoc = new Y.Doc();
+  localDoc.getText("content").insert(0, text);
+  Y.applyUpdate(peerDoc, Y.encodeStateAsUpdate(localDoc));
+  const queue: { to: Y.Doc; update: Uint8Array }[] = [];
+  localDoc.on("update", (update: Uint8Array, origin: unknown) => {
+    if (origin !== "sync") queue.push({ to: peerDoc, update });
+  });
+  peerDoc.on("update", (update: Uint8Array, origin: unknown) => {
+    if (origin !== "sync") queue.push({ to: localDoc, update });
+  });
+  const local = markView(text, {
+    ...options,
+    ytext: localDoc.getText("content"),
+  });
+  const peer = markView(text, {
+    ...options,
+    ytext: peerDoc.getText("content"),
+  });
+  return {
+    local,
+    peer,
+    sync: () => {
+      while (queue.length > 0) {
+        const next = queue.shift();
+        if (next) Y.applyUpdate(next.to, next.update, "sync");
+      }
+    },
+  };
 }
 
 /** Whether the setting says to show marks on the edited line. */

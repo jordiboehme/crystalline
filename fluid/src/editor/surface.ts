@@ -23,7 +23,13 @@ import { floatingContextListener } from "./floatingContext";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
-import { crossEdge, hiddenMarkLayer } from "./marks";
+import type { Format } from "./marks";
+import {
+  crossEdge,
+  formatKeymap,
+  formatStateListener,
+  hiddenMarkLayer,
+} from "./marks";
 import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
@@ -32,7 +38,6 @@ import { RAW_MONO, baseExtensions } from "./setup";
 import { slashCompletions } from "./slashMenu";
 import type { TableUiContext } from "./tableVerbs";
 import { tableContextListener } from "./tableVerbs";
-import { formattingKeymap } from "./toolbar";
 
 /** Everything one buffer on either editor is built from. */
 export interface SurfaceOptions {
@@ -93,6 +98,13 @@ export interface SurfaceOptions {
    * reason.
    */
   onFloatingContext: (context: FloatingContext) => void;
+  /**
+   * Told the formats the format buttons show as pressed (Bold, Italic,
+   * Strikethrough, Inline code), read from the view a format verb acts on.
+   * It travels with the listeners above for their reason. Absent, nothing
+   * is told.
+   */
+  onFormatState?: (formats: ReadonlySet<Format>) => void;
   /**
    * The compartment the screen reconfigures when the marks setting flips. It
    * sits outside the preview compartment, so a flip never rebuilds Raw or the
@@ -189,6 +201,11 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // selection is a selection in Raw mode too, and the screen decides
     // there whether the bar draws.
     floatingContextListener(options.onFloatingContext),
+    // And for the pressed format buttons. Outside the preview compartment:
+    // bold is bold in Raw mode too.
+    ...(options.onFormatState
+      ? [formatStateListener(options.onFormatState)]
+      : []),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.
     options.uploads,
@@ -200,10 +217,10 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     richPaste(),
     // The toolbar's own shortcuts. Outside the preview compartment: Mod-b and
     // Mod-i are typing help like the completions below, and raw mode is
-    // still markdown being written. Its `Prec.high` wrapper - not its
-    // position here - is what beats defaultKeymap's own Mod-i; see
-    // `formattingKeymap`.
-    formattingKeymap,
+    // still markdown being written (`toggleFormat` wraps there as the source
+    // view always has). Its `Prec.high` wrapper - not its position here - is
+    // what beats defaultKeymap's own Mod-i; see `formatKeymap`.
+    formatKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties. One `autocompletion` for every
     // source, because two would fight over the override. The `/` menu comes

@@ -13,12 +13,16 @@
  *   run through the grid's own action path (`runCellAction`), so they keep
  *   its undo groups, its focus rule and the cell they land in.
  *
- * Every command runs on `openCellView(main) ?? main`, read when it runs,
- * and the focus goes back to that view afterwards. The bar never takes focus
- * on its own: Alt+F10 moves it to the first button, the arrows move along
- * (one roving tab stop), Home and End jump, and Escape hands it back to the
- * view it came from with that view's selection as it was. Like the sticky bar
- * it cancels its own mousedown, so a click never takes the selection away.
+ * Every command runs on `verbTarget(main)`, the sticky bar's own rule, read
+ * when it runs: the open cell's view, else main, and nothing while main's
+ * selection is parked with no cell mounted. The focus goes back to that view
+ * afterwards. Bold, Italic, Strikethrough and Inline code run `toggleFormat`
+ * and show as pressed the formats the screen is told by the buffer. The bar
+ * never takes focus on its own: Alt+F10 moves it to the first button, the
+ * arrows move along (one roving tab stop), Home and End jump, and Escape
+ * hands it back to the view it came from with that view's selection as it
+ * was. Like the sticky bar it cancels its own mousedown, so a click never
+ * takes the selection away.
  *
  * It hides while the pointer button is down in the editor (a drag selection),
  * on Escape, when the focus leaves the editor and the bar, and when the
@@ -58,9 +62,9 @@ import type { IconComponent } from "../components/primitives";
 import { IconButton } from "../components/primitives";
 import type { FloatingContext } from "./floatingContext";
 import {
-  openCellView,
   selectionMoves,
   setFloatingFocus,
+  verbTarget,
 } from "./floatingContext";
 import {
   cellActionApplies,
@@ -75,7 +79,9 @@ import {
   DeleteColumnIcon,
   DeleteRowIcon,
 } from "./tableIcons";
-import { insertMarkdownLink, insertWikilink, toggleInline } from "./toolbar";
+import type { Format } from "./marks/formatting";
+import { toggleFormat } from "./marks/formatting";
+import { insertMarkdownLink, insertWikilink } from "./toolbar";
 
 export interface FloatingBarProps {
   /** The main view; the open cell's view is found from it when needed. */
@@ -83,6 +89,11 @@ export interface FloatingBarProps {
   context: FloatingContext;
   /** Whether the document links engrams: a Reflection page does not. */
   wikilinks: boolean;
+  /**
+   * The formats to draw pressed, as the sticky bar draws them. Absent, the
+   * format buttons are plain buttons.
+   */
+  formats?: ReadonlySet<Format>;
 }
 
 /** Marks the bar and its own menu, for the "is the focus still here" test. */
@@ -95,6 +106,8 @@ interface Item {
   label: string;
   icon: IconComponent;
   disabled?: boolean;
+  /** The format a format button toggles, for its pressed state. */
+  format?: Format;
   run: (main: EditorView) => void;
 }
 
@@ -104,38 +117,43 @@ const ALIGNMENTS: { label: string; icon: IconComponent }[] = [
   { label: "Align right", icon: AlignColumnRightIcon },
 ];
 
-/**
- * The view a command acts on: the open cell's, or main (also when main
- * itself holds the focus while a cell is still mounted).
- */
-function targetOf(main: EditorView): EditorView {
-  return openCellView(main) ?? main;
+/** A verb on the view `verbTarget` names, or nothing when it names none. */
+function onTarget(run: (view: EditorView) => void) {
+  return (main: EditorView) => {
+    const target = verbTarget(main);
+    if (target) run(target);
+  };
 }
 
 function textItems(wikilinks: boolean): Item[] {
-  const inline = (marker: string) => (main: EditorView) => {
-    toggleInline(targetOf(main), marker);
-  };
+  const format = (label: string, icon: IconComponent, which: Format): Item => ({
+    label,
+    icon,
+    format: which,
+    run: onTarget((view) => {
+      toggleFormat(view, which);
+    }),
+  });
   return [
-    { label: "Bold", icon: Bold, run: inline("**") },
-    { label: "Italic", icon: Italic, run: inline("*") },
-    { label: "Strikethrough", icon: Strikethrough, run: inline("~~") },
-    { label: "Inline code", icon: Code, run: inline("`") },
+    format("Bold", Bold, "strong"),
+    format("Italic", Italic, "em"),
+    format("Strikethrough", Strikethrough, "strike"),
+    format("Inline code", Code, "code"),
     {
       label: "Link",
       icon: Link,
-      run: (main) => {
-        insertMarkdownLink(targetOf(main));
-      },
+      run: onTarget((view) => {
+        insertMarkdownLink(view);
+      }),
     },
     ...(wikilinks
       ? [
           {
             label: "Wiki link",
             icon: Brackets,
-            run: (main: EditorView) => {
-              insertWikilink(targetOf(main));
-            },
+            run: onTarget((view) => {
+              insertWikilink(view);
+            }),
           },
         ]
       : []),
@@ -163,6 +181,7 @@ export default function FloatingBar({
   main,
   context,
   wikilinks,
+  formats,
 }: FloatingBarProps): ReactElement | null {
   const bar = useRef<HTMLDivElement>(null);
   /** The view Alt+F10 came from, where Escape returns. */
@@ -361,7 +380,7 @@ export default function FloatingBar({
   if (!visible) return null;
 
   const back = () => {
-    const to = origin.current ?? targetOf(main);
+    const to = origin.current ?? verbTarget(main) ?? main;
     origin.current = null;
     dismiss();
     to.focus();
@@ -431,6 +450,9 @@ export default function FloatingBar({
           label={item.label}
           icon={item.icon}
           disabled={item.disabled ?? false}
+          {...(item.format && formats
+            ? { "aria-pressed": formats.has(item.format) }
+            : {})}
           onClick={() => {
             item.run(main);
             // The view Alt+F10 came from may be gone now (a verb that
@@ -462,7 +484,7 @@ export default function FloatingBar({
               {...{ [MARK]: "" }}
               onCloseAutoFocus={(event) => {
                 event.preventDefault();
-                targetOf(main).focus();
+                (verbTarget(main) ?? main).focus();
               }}
             >
               {ALIGNMENTS.map(({ label, icon: Icon }) => (

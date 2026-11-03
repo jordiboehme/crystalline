@@ -56,7 +56,7 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
 import { keptWhole } from "../marks/deleting";
 import { documentLanguage } from "../setup";
-import { formattingKeymap } from "../toolbar";
+import { formatKeymap } from "../marks/formatting";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
 import type { MountedCell, OpenCell } from "./openCell";
@@ -977,7 +977,7 @@ export function mountCellEditor(
         cellPresence,
         documentLanguage,
         ...main.state.facet(cellPreviewLayers),
-        formattingKeymap,
+        formatKeymap,
         ...extensions,
         keymap.of([
           { key: "Shift-Enter", run: insertLineBreakTag },

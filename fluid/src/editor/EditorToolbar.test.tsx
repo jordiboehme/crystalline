@@ -28,6 +28,14 @@ import { EditorToolbar } from "./EditorToolbar";
 import { frontmatterFold } from "./frontmatterFold";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import { MERMAID_SKELETON } from "./toolbar";
+import type { Format } from "./marks/formatting";
+import {
+  cleanupMarkViews,
+  keys,
+  markView,
+  setCaret,
+  typeText,
+} from "../test/markKit";
 
 const TABLE_DOC = "Before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nAfter\n";
 const IN_TABLE = TABLE_DOC.indexOf("| 1") + 2;
@@ -944,5 +952,81 @@ describe("a heading change the document asks about first", () => {
     await pickHeading(2);
     expect(docText(v.state)).toContain("\n## one\n");
     expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+});
+
+describe("the pressed format buttons", () => {
+  afterEach(cleanupMarkViews);
+
+  /** A hidden-mode buffer with the bar drawing what the buffer reports. */
+  function pressedBar(doc: string): EditorView {
+    let formats: ReadonlySet<Format> = new Set();
+    let redraw: ((formats: ReadonlySet<Format>) => void) | null = null;
+    const v = markView(doc, {
+      onFormatState: (next) => {
+        formats = next as ReadonlySet<Format>;
+        redraw?.(formats);
+      },
+    });
+    const ui = (now: ReadonlySet<Format>) => (
+      <EditorToolbar view={v} formats={now} />
+    );
+    const result = render(ui(formats), { wrapper: Tooltips });
+    redraw = (now) => {
+      act(() => {
+        result.rerender(ui(now));
+      });
+    };
+    return v;
+  }
+
+  const pressed = (name: string) =>
+    screen.getByRole("button", { name }).getAttribute("aria-pressed");
+
+  test("Bold is pressed with the caret in bold, not outside it, and after Mod-b", () => {
+    const v = pressedBar("a **bold** c");
+    act(() => {
+      setCaret(v, 5);
+    });
+    expect(pressed("Bold")).toBe("true");
+    expect(pressed("Italic")).toBe("false");
+    act(() => {
+      setCaret(v, 1);
+    });
+    expect(pressed("Bold")).toBe("false");
+    act(() => {
+      keys(v, "Mod-b");
+    });
+    expect(pressed("Bold")).toBe("true");
+  });
+
+  test("with no formats told (the MANIFEST), the buttons are not toggles", () => {
+    mount("a **b** c", 5);
+    expect(
+      screen.getByRole("button", { name: "Bold" }).hasAttribute("aria-pressed"),
+    ).toBe(false);
+  });
+
+  test("Bold with no selection writes nothing until a letter is typed", async () => {
+    const v = pressedBar("ab");
+    act(() => {
+      setCaret(v, 2);
+    });
+    await press("Bold");
+    expect(docText(v.state)).toBe("ab");
+    expect(pressed("Bold")).toBe("true");
+    act(() => {
+      typeText(v, "c");
+    });
+    expect(docText(v.state)).toBe("ab**c**");
+  });
+
+  test("Bold on a selection formats the visible characters", async () => {
+    const v = pressedBar("ab **cd** ef");
+    act(() => {
+      v.dispatch({ selection: EditorSelection.range(1, 6) });
+    });
+    await press("Bold");
+    expect(docText(v.state)).toBe("a**b cd** ef");
   });
 });

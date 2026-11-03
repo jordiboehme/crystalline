@@ -142,15 +142,21 @@ function isSpace(char: string): boolean {
 
 /**
  * The marks of line `line` (1-based), sorted by position. Empty when the
- * line's marks show, apart from a Reflection's comments.
+ * line's marks show, apart from a Reflection's comments. With `always`, the
+ * marks the line has whether they show or not (Raw, show mode on the caret's
+ * line, a table cell): what the format commands read a line's formats from.
  */
-export function marksOnLine(state: EditorState, line: number): Mark[] {
+export function marksOnLine(
+  state: EditorState,
+  line: number,
+  options: { always?: boolean } = {},
+): Mark[] {
   const doc = state.doc;
   const at = doc.line(line);
   if (at.from <= frontmatterEnd(doc)) {
     return [];
   }
-  const hidden = marksHiddenOnLine(state, line);
+  const hidden = options.always === true || marksHiddenOnLine(state, line);
   // A Reflection never shows a comment, in either mode.
   const comments = hidden || hidesIdLines(state);
   if (!comments) {
@@ -394,8 +400,13 @@ export function marksOnLine(state: EditorState, line: number): Mark[] {
 
 /** The marks of line `line` grouped into runs of touching marks. */
 export function runsOnLine(state: EditorState, line: number): MarkRun[] {
+  return runsOf(marksOnLine(state, line));
+}
+
+/** Sorted marks grouped into runs of touching marks. */
+export function runsOf(marks: readonly Mark[]): MarkRun[] {
   const runs: MarkRun[] = [];
-  for (const mark of marksOnLine(state, line)) {
+  for (const mark of marks) {
     const last = runs.at(-1);
     if (last && last.to >= mark.from) {
       last.to = Math.max(last.to, mark.to);

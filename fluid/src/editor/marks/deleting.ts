@@ -578,7 +578,10 @@ function carried(tr: Transaction): Annotation<unknown>[] {
  * partner on its own line): the other end of the syntax node the mark
  * belongs to, or null.
  */
-function partnerAcrossLines(state: EditorState, mark: Mark): Range | null {
+export function partnerAcrossLines(
+  state: EditorState,
+  mark: Mark,
+): Range | null {
   const node = syntaxTree(state).resolveInner(mark.from, 1);
   const parent =
     node.from === mark.from && node.to === mark.to ? node.parent : null;

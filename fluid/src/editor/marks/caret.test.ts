@@ -36,8 +36,8 @@ beforeAll(async () => {
 
 const BOLD = "a **bold** c";
 
-/** What typing `**word** next` writes before Task 4. */
-const TYPED_BY_HAND = "**word next**";
+/** What typing `**word** next` writes: exactly what was typed. */
+const TYPED_BY_HAND = "**word** next";
 
 /** From, ArrowRight, ArrowLeft; null where the key is handed on. */
 const TABLE: [number, number | null, number | null][] = [
@@ -207,12 +207,12 @@ it("crosses a chip whole, one press", () => {
   expect(caret(v)).toBe(6);
 });
 
-it("typing a closing pair by hand, until Task 4's typing rules", () => {
+it("typing a closing pair by hand ends the bold there", () => {
   const v = markView("");
   typeText(v, "**word** next");
   // The caret after the typed closing `**` rests inside the bold (the left
-  // side wins), so what follows joins it. Task 4 (formatInput rule 3) gives
-  // `"**word** next"`.
+  // side wins), but the closing mark just typed turns the bold off for the
+  // next text (formatInput rule 3), so the space and `next` go after it.
   expect(bytes(v.state)).toBe(TYPED_BY_HAND);
 });
 

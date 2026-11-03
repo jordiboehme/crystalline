@@ -68,6 +68,8 @@ import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
 import type { FloatingContext } from "../editor/floatingContext";
+import type { Format } from "../editor/marks/formatting";
+import { NO_FORMATS } from "../editor/marks/formatting";
 import {
   imagePreviews,
   refreshPreviews,
@@ -241,6 +243,8 @@ interface EngramSurfaceOptions {
   onElementContext: (face: ElementFace) => void;
   /** Told what the floating bar stands by; see `SurfaceOptions`. */
   onFloatingContext: (context: FloatingContext) => void;
+  /** Told the formats the format buttons show pressed; see `SurfaceOptions`. */
+  onFormatState: (formats: ReadonlySet<Format>) => void;
 }
 
 /**
@@ -301,6 +305,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       onImageContext: options.onImageContext,
       onElementContext: options.onElementContext,
       onFloatingContext: options.onFloatingContext,
+      onFormatState: options.onFormatState,
     }),
   ];
 }
@@ -534,6 +539,8 @@ function Surface({
   const [element, setElement] = useState<ElementFace>(null);
   /** What the floating action bar stands by: a selection, a cell, nothing. */
   const [floating, setFloating] = useState<FloatingContext>(null);
+  /** The formats the format buttons draw pressed. */
+  const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -667,6 +674,7 @@ function Surface({
       onImageContext: setImageActive,
       onElementContext: setElement,
       onFloatingContext: setFloating,
+      onFormatState: setFormats,
     });
 
   /**
@@ -960,6 +968,7 @@ function Surface({
         onImageContext: setImageActive,
         onElementContext: setElement,
         onFloatingContext: setFloating,
+        onFormatState: setFormats,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -1407,6 +1416,7 @@ function Surface({
             tableDrawn={tableContext.drawn}
             raw={raw}
             cellOpen={floating?.kind === "cell"}
+            formats={formats}
             imageActive={imageActive}
             calloutActive={element?.kind === "callout" ? element : null}
             statusActive={element?.kind === "status" ? element.colour : null}
@@ -1458,6 +1468,7 @@ function Surface({
             main={view}
             context={raw ? null : floating}
             wikilinks={adapter.wikilinks}
+            formats={formats}
           />
         </div>
         <EditorDetails hasHardErrors={session.hardErrors > 0}>

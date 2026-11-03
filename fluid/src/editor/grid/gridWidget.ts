@@ -35,6 +35,7 @@ import {
 
 import type { WikilinkResolver } from "../../wikilinks";
 import { floatingCell } from "../floatingContext";
+import { formatCell } from "../marks/formatting";
 import { parseAdvanced } from "../parseProgress";
 import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
@@ -329,6 +330,7 @@ function host(
     cellPaste,
     cellKeymap,
     floatingCell(main),
+    formatCell(main),
     cellAttributes(main),
   ]);
   hostOf.set(main, el);

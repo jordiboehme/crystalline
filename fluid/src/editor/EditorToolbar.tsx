@@ -61,7 +61,9 @@ import {
   setCalloutKind,
   setStatusColour,
 } from "./elementContext";
-import { openCellView } from "./floatingContext";
+import { verbTarget } from "./floatingContext";
+import type { Format } from "./marks/formatting";
+import { toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
@@ -93,7 +95,6 @@ import {
   headingLevelAfter,
   insertMarkdownLink,
   insertWikilink,
-  toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
 import {
@@ -413,6 +414,7 @@ export function EditorToolbar({
   disabled = false,
   attachDisabled = false,
   cellOpen = false,
+  formats,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
@@ -476,6 +478,14 @@ export function EditorToolbar({
    * segments drawn from main's caret (image, table, callout, status).
    */
   cellOpen?: boolean;
+  /**
+   * The formats the view a format verb acts on has at its caret or over its
+   * selection, drawn as Bold, Italic, Strikethrough and Inline code pressed.
+   * The screen is told them by the buffer's format state listener. Absent
+   * (a surface with no listener, the MANIFEST), the buttons are plain
+   * buttons rather than toggles that would always say "not pressed".
+   */
+  formats?: ReadonlySet<Format>;
 }): ReactElement {
   const view = disabled ? null : buffer;
   const off = view === null;
@@ -507,14 +517,10 @@ export function EditorToolbar({
    * main, or nothing. Nothing while main's selection is parked behind an
    * open cell whose editor is not mounted (its table scrolled away): that
    * selection is stale, and the cell is not there to take the verb. Main
-   * holding the focus itself always means main.
+   * holding the focus itself always means main. The floating bar's rule
+   * too, so it lives in one place (`verbTarget`).
    */
-  const targetOf = (v: EditorView): EditorView | null => {
-    const cell = openCellView(v);
-    if (cell) return cell;
-    const focused = v.dom.ownerDocument.activeElement === v.contentDOM;
-    return v.state.facet(mainSelectionParked) && !focused ? null : v;
-  };
+  const targetOf = verbTarget;
   /** Whether a verb on main's line or caret may run now. */
   const mainTurn = (v: EditorView): boolean => targetOf(v) === v;
   /**
@@ -537,6 +543,9 @@ export function EditorToolbar({
   const keepSelection = (event: MouseEvent) => {
     event.preventDefault();
   };
+  /** A format button's pressed state, when the screen tells the formats. */
+  const pressed = (format: Format) =>
+    formats ? { "aria-pressed": formats.has(format) } : {};
   /** The question a heading change on the caret's line asks, or null. */
   const questionFor = (v: EditorView, level: number): string | null => {
     const line = v.state.doc.lineAt(v.state.selection.main.head).number;
@@ -595,25 +604,29 @@ export function EditorToolbar({
           label="Bold"
           icon={Bold}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "**"))}
+          {...pressed("strong")}
+          onClick={actInline((v) => toggleFormat(v, "strong"))}
         />
         <IconButton
           label="Italic"
           icon={Italic}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "*"))}
+          {...pressed("em")}
+          onClick={actInline((v) => toggleFormat(v, "em"))}
         />
         <IconButton
           label="Strikethrough"
           icon={Strikethrough}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "~~"))}
+          {...pressed("strike")}
+          onClick={actInline((v) => toggleFormat(v, "strike"))}
         />
         <IconButton
           label="Inline code"
           icon={Code}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "`"))}
+          {...pressed("code")}
+          onClick={actInline((v) => toggleFormat(v, "code"))}
         />
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>

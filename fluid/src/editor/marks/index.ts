@@ -14,6 +14,7 @@ import type { EditorState, Extension } from "@codemirror/state";
 import { hiddenMarkDrawing } from "../preview";
 import { caretKeymap, caretNormalizer } from "./caret";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
+import { formatting } from "./formatting";
 import { hiddenMarkLayerOn } from "./mode";
 
 export type { Mark, MarkKind, MarkRun } from "./hiddenMarks";
@@ -29,6 +30,17 @@ export {
   stepVisible,
 } from "./caret";
 export { deleteVisible, deletionKeymap, keepPartnerMarks } from "./deleting";
+export type { Format, Pending } from "./formatting";
+export {
+  FORMAT_MARKER,
+  formatCell,
+  formatInput,
+  formatKeymap,
+  formatStateListener,
+  formatsAt,
+  pendingFormat,
+  toggleFormat,
+} from "./formatting";
 
 export interface HiddenMarkOptions {
   /**
@@ -48,6 +60,8 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
     hiddenMarkDrawing,
     caretKeymap,
     deletionKeymap,
+    // The format waiting for typing and the typing rules around formats.
+    formatting,
     // Filters run last-listed first: a range deletion is rewritten to keep
     // its partner marks before the caret it leaves is normalized.
     caretNormalizer,

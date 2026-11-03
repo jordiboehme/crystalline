@@ -76,6 +76,8 @@ import {
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
 import type { FloatingContext } from "../editor/floatingContext";
+import type { Format } from "../editor/marks/formatting";
+import { NO_FORMATS } from "../editor/marks/formatting";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
 import { imagePreviews } from "../editor/imagePreviews";
 import { readScalar } from "../editor/frontmatterFields";
@@ -636,6 +638,8 @@ function Surface({
   const [element, setElement] = useState<ElementFace>(null);
   /** What the floating action bar stands by: a selection, a cell, nothing. */
   const [floating, setFloating] = useState<FloatingContext>(null);
+  /** The formats the format buttons draw pressed. */
+  const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
   const extensions = useMemo(() => {
     const undoManager = new Y.UndoManager(ytext);
     return [
@@ -666,6 +670,7 @@ function Surface({
         onImageContext: setImageActive,
         onElementContext: setElement,
         onFloatingContext: setFloating,
+        onFormatState: setFormats,
       }),
     ];
   }, [
@@ -1092,6 +1097,7 @@ function Surface({
           tableDrawn={tableContext.drawn}
           raw={false}
           cellOpen={floating?.kind === "cell"}
+          formats={formats}
           imageActive={imageActive}
           calloutActive={element?.kind === "callout" ? element : null}
           statusActive={element?.kind === "status" ? element.colour : null}
@@ -1117,6 +1123,7 @@ function Surface({
           main={view}
           context={ended ? null : floating}
           wikilinks={adapter.wikilinks}
+          formats={formats}
         />
       </div>
       {collab.conflict !== null && resolving && (
