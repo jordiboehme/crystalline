@@ -32,6 +32,7 @@ import {
   isolateHistory,
   undo as historyUndo,
 } from "@codemirror/commands";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
@@ -960,6 +961,36 @@ export function activeCell(main: EditorView): CellEditor | null {
 const editors = new WeakMap<EditorView, CellEditor>();
 
 /**
+ * How long a cell may parse the page up to its row when it opens: a
+ * watchdog, not a budget. Main has parsed the same text already, so this is
+ * tens of milliseconds on the longest page. Read from main, so a test can
+ * make it fire.
+ */
+export const cellParseBudget = Facet.define<number, number>({
+  combine: (values) => values[0] ?? 2_000,
+});
+
+/** What a delete in a cell says while its row is not read yet. */
+export const CELL_NOT_READ =
+  "This cell is still loading. Try again in a moment.";
+
+/**
+ * When the watchdog fired before the parse reached the row, the cell opens
+ * with no marks hidden and no atoms drawn: a delete then could split a
+ * label or leave a lone mark. Every delete is refused, with one sentence,
+ * until the background parse has read the row.
+ */
+const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
+  if (!tr.docChanged || !tr.isUserEvent("delete")) return tr;
+  const cell = tr.startState.field(rangeField, false);
+  if (!cell || syntaxTree(tr.startState).length >= cell.to) return tr;
+  return {
+    selection: tr.startState.selection,
+    effects: EditorView.announce.of(CELL_NOT_READ),
+  };
+});
+
+/**
  * Mounts the cell editor for `main`'s open cell (`openCellField`, which must
  * be set) into `parent`, with the cell's caret. One per main view: a second
  * mount destroys the first without closing the cell. `extensions` come
@@ -1032,7 +1063,7 @@ export function mountCellEditor(
     }
   });
 
-  const created = EditorState.create({
+  const fresh = EditorState.create({
     doc: main.state.doc,
     selection: selectionFor(open, range),
     extensions: [
@@ -1041,6 +1072,7 @@ export function mountCellEditor(
       rangeField.init(() => range),
       Prec.highest([hideOutside, cellMarks]),
       clampToCell,
+      unreadRowGuard,
       // Backspace and Delete over hidden marks leave every hidden escape to
       // `cellChange`, which takes such a unit whole.
       keptWhole.of(keepsEscape),
@@ -1093,6 +1125,13 @@ export function mountCellEditor(
       keymap.of(defaultKeymap),
     ],
   });
+  // A new state parses only what fits a short time budget, and the rest
+  // later in the background: on a long page that stops above the table, so
+  // the cell would open with no marks hidden and no atoms drawn, and a key
+  // pressed then would edit the raw text. Its row is read at once instead;
+  // the empty update publishes the parse into the state.
+  ensureSyntaxTree(fresh, range.to, main.state.facet(cellParseBudget));
+  const created = fresh.update({}).state;
   // The caret the cell opens with rests on its drawn place, as every caret a
   // transaction sets does: "start" in a bold cell is inside the `**`. Main
   // takes that head once the cell is registered (`settleMainCaret`).

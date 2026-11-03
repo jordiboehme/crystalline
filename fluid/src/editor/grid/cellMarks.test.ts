@@ -9,6 +9,7 @@
  * own mount, solo and in a room.
  */
 
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { MockInstance } from "vitest";
@@ -24,7 +25,7 @@ import {
 
 import * as Y from "yjs";
 
-import { cleanupCells, roomMain } from "../../test/cellKit";
+import { cleanupCells, openAt, roomMain } from "../../test/cellKit";
 import {
   bytes,
   caret,
@@ -43,7 +44,7 @@ import { footnoteVersion } from "../footnotes";
 import { verbTarget } from "../floatingContext";
 import { hiddenMarkLayer } from "../marks";
 import { marksOnEditLine } from "../marks/mode";
-import { activeCell } from "./cellEditor";
+import { CELL_NOT_READ, activeCell, cellParseBudget } from "./cellEditor";
 import { GridWidget, gridField, hostOpenCell } from "./gridWidget";
 import { cellPreviewLayers } from "./draws";
 import { gridExtension } from "./index";
@@ -772,5 +773,60 @@ describe("Cell actions on a cell that is only a link (F8)", () => {
     keydown(el, "F10", { shiftKey: true, keyCode: 121 });
     expect(cellActions()).not.toBeNull();
     expect(bytes(main.state)).toBe(text);
+  });
+});
+
+describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
+  // Far more text above the table than a state's first parse covers in its
+  // time budget: the cell's own state must still read its row at once.
+  const above = Array.from(
+    { length: 4000 },
+    (_, i) => `Paragraph ${String(i)} with **bold**, a [link](u) and \`code\`.`,
+  ).join("\n\n");
+  const text = `${above}\n\n| a | b |\n| - | - |\n| label | :status[Done]{green} |\n`;
+
+  it("draws its marks and atoms the moment it opens", () => {
+    const main = page(text, { room });
+    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    if (!cell) throw new Error("no cell");
+    const view = openAt(main, cell.content.from, false).view;
+    expect(syntaxTree(view.state).length).toBeGreaterThanOrEqual(
+      cell.content.to,
+    );
+    // The label is one pill: Delete before it takes the whole label.
+    keys(view, "Delete");
+    expect(main.state.doc.lineAt(cell.content.from).text).toBe("| label |  |");
+  });
+
+  it("refuses deletes until its row is read when the parse watchdog fires", () => {
+    const main = page(text, { room });
+    // A watchdog that fires at once: the cell opens before its row is read.
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
+    });
+    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    if (!cell) throw new Error("no cell");
+    const view = openAt(main, cell.content.from, false).view;
+    expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
+    const said: string[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) said.push(effect.value);
+            }
+          }
+        }),
+      ),
+    });
+    keys(view, "Delete");
+    expect(bytes(main.state)).toBe(text);
+    expect(said).toEqual([CELL_NOT_READ]);
+    // The background parse arrives: the label is a pill again, taken whole.
+    ensureSyntaxTree(view.state, view.state.doc.length, 30_000);
+    view.dispatch({});
+    keys(view, "Delete");
+    expect(main.state.doc.lineAt(cell.content.from).text).toBe("| label |  |");
   });
 });

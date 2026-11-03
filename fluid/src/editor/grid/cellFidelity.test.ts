@@ -8,11 +8,26 @@
  */
 
 import { undo } from "@codemirror/commands";
+import { ensureSyntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
-import { Compartment, EditorState } from "@codemirror/state";
+import {
+  Compartment,
+  EditorSelection,
+  EditorState,
+  StateEffect,
+} from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { QueryClient } from "@tanstack/react-query";
 import type { MockInstance } from "vitest";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
 
 import {
   bytes,
@@ -22,16 +37,28 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
-import { typeText } from "../../test/markKit";
+import type { MarkViewOptions } from "../../test/markKit";
+import {
+  cleanupMarkViews,
+  keys,
+  markView,
+  setCaret,
+  setShowMarks,
+  showsMarks,
+  typeText,
+  undoOnce,
+} from "../../test/markKit";
 import { parsedState } from "../../test/parse";
 import { engramAdapter } from "../adapter";
 import { baseExtensions, lineSeparatorFor } from "../setup";
 import { canonical } from "../marks/caret";
+import { runsOnLine } from "../marks/hiddenMarks";
 import { hiddenMarkLayerOn, marksOnEditLine } from "../marks/mode";
 import { previewConfig } from "../surface";
 import { activeCell, cellForwarding } from "./cellEditor";
 import { cellPreviewLayers } from "./draws";
 import { closeCell, onCellClosed, openCellField } from "./openCell";
+import { prefetchGrid } from "./loader";
 import { gridTables } from "./structure";
 
 const ENGRAMS = import.meta.glob<string>("../fixtures/**/*.md", {
@@ -82,6 +109,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanupCells();
+  cleanupMarkViews();
   expect(errors).not.toHaveBeenCalled();
   errors.mockRestore();
 });
@@ -148,6 +176,273 @@ describe.each(
       expect(activeCell(main)).toBeNull();
       expect(undo(main)).toBe(true);
       expect(bytes(main.state)).toBe(text);
+    },
+  );
+});
+
+/**
+ * The hidden-mark fidelity properties (`marks/fidelity.test.ts`) in a cell,
+ * on the page main view the screens build (`markView`), in both modes, LF and
+ * CRLF solo and LF in a room:
+ *
+ * 1. Moving the cell's caret to every stop, selecting the cell's text and
+ *    flipping the setting twice dispatch no change.
+ * 2. At every run boundary and the cell's end, one typed letter adds exactly
+ *    that letter, and one undo gives back the bytes.
+ * 3. Backspace and Delete there never change the mark pairs of the row,
+ *    except by removing a pair they emptied (in show mode a key that takes a
+ *    mark character is not judged: the marks are text there).
+ * 4. Mod-b on the cell's text undoes to the bytes; on a cell with no bold,
+ *    Mod-b twice gives the bytes back (or the first one is refused).
+ *
+ * The one byte Part 1 allows outside the typed letter is R24's edge pipe
+ * (`withEdges`), written when a bare edge cell is emptied; no property here
+ * types into an emptied cell, and a removal is judged by its pairs.
+ */
+describe("hidden-mark properties in a cell", () => {
+  beforeAll(async () => {
+    await prefetchGrid();
+  });
+
+  const PAIRS = new Set([
+    "Emphasis",
+    "StrongEmphasis",
+    "Strikethrough",
+    "InlineCode",
+    "Link",
+  ]);
+
+  /** The pair nodes on line `n`, by name, with their visible characters. */
+  function pairsOn(state: EditorState, n: number) {
+    const tree = ensureSyntaxTree(state, state.doc.length, 10_000);
+    if (!tree) throw new Error("the parse did not finish");
+    const line = state.doc.line(n);
+    const pairs: { name: string; visible: number[] }[] = [];
+    tree.iterate({
+      from: line.from,
+      to: line.to,
+      enter: (node) => {
+        if (!PAIRS.has(node.name)) return;
+        // Lezer reads any bracketed text as a Link; the page needs an address.
+        if (node.name === "Link" && !node.node.getChild("URL")) return;
+        const first = node.node.firstChild;
+        const last = node.node.lastChild;
+        const marks: [number, number][] = [];
+        for (let c = node.node.firstChild; c; c = c.nextSibling) {
+          if (/Mark$|^URL$|^LinkTitle$|^LinkLabel$/.test(c.name)) {
+            marks.push([c.from, c.to]);
+          }
+        }
+        const visible: number[] = [];
+        for (let p = first?.to ?? node.from; p < (last?.from ?? node.to); p++) {
+          if (!marks.some(([a, b]) => a <= p && p < b)) visible.push(p);
+        }
+        pairs.push({ name: node.name, visible });
+      },
+    });
+    return pairs;
+  }
+
+  function oneLetterAdded(before: string, after: string): boolean {
+    if (after.length !== before.length + 1) return false;
+    let i = 0;
+    while (i < before.length && before[i] === after[i]) i++;
+    return after.slice(0, i) + after.slice(i + 1) === before;
+  }
+
+  /** The positions of `a` a change to `b` removed, as one stretch. */
+  function removedFrom(a: string, b: string): Set<number> {
+    let head = 0;
+    while (head < a.length && a[head] === b[head]) head++;
+    let tail = 0;
+    while (
+      tail < a.length - head &&
+      tail < b.length - head &&
+      a[a.length - 1 - tail] === b[b.length - 1 - tail]
+    ) {
+      tail++;
+    }
+    const out = new Set<number>();
+    for (let p = head; p < a.length - tail; p++) out.add(p);
+    return out;
+  }
+
+  const RUNS = [
+    ...FIXTURES.flatMap(([name, text]) =>
+      MODES.map(({ mode }) => ({ name, text, mode, room: false })),
+    ),
+    ...LF_FIXTURES.flatMap(([name, text]) =>
+      MODES.map(({ mode }) => ({ name, text, mode, room: true })),
+    ),
+  ];
+
+  test.each(RUNS)(
+    "$name, $mode mode, room $room",
+    { timeout: 30_000 },
+    ({ text, mode, room }) => {
+      const options: MarkViewOptions = {
+        mode: mode as "hidden" | "show",
+        room,
+        ...(!room && text.includes("\r\n")
+          ? { lineSeparator: "\r\n" as const }
+          : {}),
+      };
+      // The run boundaries, read where every mark is hidden.
+      const probe = markView(text, { ...options, mode: "hidden", room: false });
+      const main = markView(text, options);
+      let changed = 0;
+      main.dispatch({
+        effects: StateEffect.appendConfig.of(
+          EditorView.updateListener.of((update) => {
+            if (update.docChanged) changed += 1;
+          }),
+        ),
+      });
+      const show = mode === "show";
+      const failures: string[] = [];
+      let checks = 0;
+      const now = () => bytes(main.state);
+      const cells = gridTables(main.state).flatMap((table) =>
+        table.rows.flat(),
+      );
+      expect(cells.length).toBeGreaterThan(0);
+      for (const cell of cells) {
+        const { from, to } = cell.content;
+        const n = main.state.doc.lineAt(from).number;
+        const runs = runsOnLine(probe.state, n).filter(
+          (run) => run.from >= from && run.to <= to,
+        );
+        const marks = runs.flatMap((run) =>
+          run.marks.map((m): [number, number] => [m.from, m.to]),
+        );
+        const stops = [
+          ...new Set([from, to, ...runs.flatMap((r) => [r.from, r.to])]),
+        ].sort((a, b) => a - b);
+        const label = `line ${n} cell ${cell.row}/${cell.column} ${JSON.stringify(probe.state.doc.line(n).text)}`;
+        const at = (pos: number) => `${label} at ${pos - from}`;
+
+        // Property 1.
+        const before = changed;
+        let view = openAt(main, to, false).view;
+        for (const stop of stops) {
+          setCaret(view, stop);
+          setCaret(view, stop, "select");
+          checks += 2;
+        }
+        keys(view, "Home", "End");
+        view.dispatch({
+          selection: EditorSelection.range(from, to),
+          userEvent: "select.pointer",
+        });
+        const was = showsMarks(main);
+        setShowMarks(main, !was);
+        setShowMarks(main, was);
+        checks += 2;
+        if (changed !== before || now() !== text) {
+          failures.push(`moving in ${label} changed the bytes`);
+        }
+
+        /** The open cell's view, mounted again only when it was closed. */
+        const cellView = (pos: number) => {
+          const open = activeCell(main);
+          return open ? open.view : openAt(main, pos, false).view;
+        };
+        for (const stop of stops) {
+          // Property 2.
+          view = cellView(stop);
+          setCaret(view, stop);
+          const head = view.state.selection.main.head;
+          typeText(view, "Z");
+          checks += 1;
+          if (!oneLetterAdded(text, now())) {
+            failures.push(
+              `typing ${at(head)} wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+            );
+          }
+          undoOnce(main);
+          if (now() !== text) {
+            failures.push(`undo after typing ${at(head)}`);
+            return void expect(failures).toEqual([]);
+          }
+          // Property 3.
+          for (const key of ["Backspace", "Delete"]) {
+            view = cellView(stop);
+            setCaret(view, stop);
+            const start = main.state;
+            keys(view, key);
+            if (now() === text) continue;
+            const deleted = removedFrom(
+              start.doc.toString(),
+              main.state.doc.toString(),
+            );
+            const touches = [...deleted].some((p) =>
+              marks.some(([a, b]) => a <= p && p < b),
+            );
+            if (!(show && touches)) {
+              checks += 1;
+              const old = pairsOn(start, n);
+              const after = pairsOn(main.state, n);
+              for (const name of PAIRS) {
+                const x = old.filter((p) => p.name === name).length;
+                const y = after.filter((p) => p.name === name).length;
+                const emptied = old.filter(
+                  (p) =>
+                    p.name === name &&
+                    p.visible.length > 0 &&
+                    p.visible.every((q) => deleted.has(q)),
+                ).length;
+                if (y > x || x - y > emptied) {
+                  failures.push(
+                    `${key} ${at(stop)}: ${name} ${x} -> ${y}, wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+                  );
+                }
+              }
+            }
+            undoOnce(main);
+            if (now() !== text) {
+              failures.push(`undo after ${key} ${at(stop)}`);
+              return void expect(failures).toEqual([]);
+            }
+          }
+        }
+
+        // Property 4.
+        if (from === to) continue;
+        const bold = () => {
+          const cellView = openAt(main, to, false).view;
+          cellView.dispatch({
+            selection: EditorSelection.range(from, to),
+            userEvent: "select.pointer",
+          });
+          keys(cellView, "Mod-b");
+          return cellView;
+        };
+        const plain = !pairsOn(main.state, n).some(
+          (p) => p.name === "StrongEmphasis",
+        );
+        const once = bold();
+        checks += 1;
+        if (now() !== text) {
+          if (plain) {
+            keys(once, "Mod-b");
+            checks += 1;
+            if (now() !== text) {
+              failures.push(
+                `Mod-b twice in ${label} gave ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+              );
+              undoOnce(main);
+            }
+          }
+          if (now() !== text) undoOnce(main);
+          if (now() !== text) {
+            failures.push(`Mod-b then undo in ${label}`);
+            return void expect(failures).toEqual([]);
+          }
+        }
+        closeCell(main, "user", "none");
+      }
+      expect(failures).toEqual([]);
+      expect(checks).toBeGreaterThan(cells.length);
     },
   );
 });

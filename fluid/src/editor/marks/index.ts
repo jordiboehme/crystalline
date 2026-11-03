@@ -15,6 +15,7 @@ import { elementMenuKey } from "../elementEdit";
 import { hiddenMarkDrawing, linkClicks } from "../preview";
 import { blockDrawing, listEnter, taskKeymap } from "./blocks";
 import { caretKeymap, caretNormalizer } from "./caret";
+import { checkedDeletion } from "./deleteCheck";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
 import { formatting } from "./formatting";
 import { hiddenMarkLayerOn } from "./mode";
@@ -34,6 +35,8 @@ export {
   stepVisible,
 } from "./caret";
 export { deleteVisible, deletionKeymap, keepPartnerMarks } from "./deleting";
+export type { DeleteOutcome } from "./deleteCheck";
+export { CANNOT_JOIN, checkedDeletion, deletionOutcome } from "./deleteCheck";
 export type { Format, Pending } from "./formatting";
 export {
   FORMAT_MARKER,
@@ -75,8 +78,10 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
     // The format waiting for typing and the typing rules around formats.
     formatting,
     // Filters run last-listed first: a range deletion is rewritten to keep
-    // its partner marks before the caret it leaves is normalized.
+    // its partner marks, then checked against the text it leaves (repaired
+    // or refused), before the caret it leaves is normalized.
     caretNormalizer,
+    checkedDeletion,
     keepPartnerMarks,
     ...(options.confirmHeadingChange
       ? [headingQuestion.of(options.confirmHeadingChange)]

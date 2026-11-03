@@ -6,7 +6,7 @@
  * `Y.UndoManager` in a room).
  */
 
-import { undo } from "@codemirror/commands";
+import { undo, undoDepth } from "@codemirror/commands";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
 import { QueryClient } from "@tanstack/react-query";
@@ -38,6 +38,11 @@ export interface MarkViewOptions {
   onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
   /** The room's shared text, for a second peer (`markPeers`). */
   ytext?: Y.Text;
+  /**
+   * The buffer's line separator. Left out, it is LF, so a CRLF file keeps its
+   * `\r` in each line; a solo screen picks it from the file (`separatorOf`).
+   */
+  lineSeparator?: "\n" | "\r\n";
 }
 
 const views = new Set<EditorView>();
@@ -99,7 +104,7 @@ export function markView(
     state: EditorState.create({
       doc,
       extensions: [
-        EditorState.lineSeparator.of("\n"),
+        EditorState.lineSeparator.of(options.lineSeparator ?? "\n"),
         ...surfaceExtensions({
           adapter,
           dark: false,
@@ -318,6 +323,15 @@ export function typeText(view: EditorView, text: string): void {
       view.dispatch(insert());
     }
   }
+}
+
+/**
+ * How many undo steps the view's stack holds: CodeMirror's history solo, the
+ * room's manager in a room.
+ */
+export function undoSteps(view: EditorView): number {
+  const manager = undoManagers.get(view);
+  return manager ? manager.undoStack.length : undoDepth(view.state);
 }
 
 /** One undo step: CodeMirror's solo, the room's manager in a room. */
