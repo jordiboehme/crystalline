@@ -82,6 +82,10 @@ export function SelectionBar({
   );
   const dismissNow = useRef(onDismiss);
   const pressEndNow = useRef(onPressEnd);
+  // The grace after a release on the button, shared with the next press.
+  const graceTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const lostNow = useRef(onLost);
   useEffect(() => {
     dismissNow.current = onDismiss;
@@ -114,10 +118,9 @@ export function SelectionBar({
   // anywhere else (the bar's own padding included), taken over by the
   // browser, or with the window left, it ends at once.
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const end = () => {
-      clearTimeout(timer);
-      timer = undefined;
+      clearTimeout(graceTimer.current);
+      graceTimer.current = undefined;
       pressEndNow.current();
     };
     const onUp = (event: PointerEvent) => {
@@ -125,8 +128,8 @@ export function SelectionBar({
         event.target instanceof Node &&
         button.current?.contains(event.target) === true
       ) {
-        clearTimeout(timer);
-        timer = setTimeout(end, CLICK_GRACE_MS);
+        clearTimeout(graceTimer.current);
+        graceTimer.current = setTimeout(end, CLICK_GRACE_MS);
       } else {
         end();
       }
@@ -135,7 +138,7 @@ export function SelectionBar({
     document.addEventListener("pointercancel", end);
     window.addEventListener("blur", end);
     return () => {
-      clearTimeout(timer);
+      clearTimeout(graceTimer.current);
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("pointercancel", end);
       window.removeEventListener("blur", end);
@@ -282,6 +285,10 @@ export function SelectionBar({
       onMouseDown={keepSelection}
       onPointerDown={(event) => {
         if (event.isPrimary && event.button === 0) {
+          // A new press outlives the last one's grace: that timer would
+          // end this press before its click.
+          clearTimeout(graceTimer.current);
+          graceTimer.current = undefined;
           onPressStart();
         }
       }}

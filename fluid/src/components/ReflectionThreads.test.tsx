@@ -1959,6 +1959,56 @@ describe("the bar at the selection", () => {
     expect(within(form).queryByText("Deploys run **at** night")).toBeNull();
   });
 
+  it("lets a press go a moment after a release on the button with no click", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+      fireEvent.pointerUp(barButton(), { button: 0, isPrimary: true });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      expect(bar()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a second quick press past the first one's grace", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const button = barButton();
+      // A tap whose click never came, then a second press at once.
+      fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+      fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+      fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+      // The first grace runs out while the second press is still down.
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+      fireEvent.click(button);
+      const form = screen.getByRole("form", { name: "New comment" });
+      expect(within(form).getByText("Deploys run **at** night")).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("lets a press go when the window loses the focus", async () => {
     serve([]);
     renderApp("/d/eng/reflection/guides/deploying.md");
