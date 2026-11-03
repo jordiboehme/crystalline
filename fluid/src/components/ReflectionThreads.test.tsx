@@ -1705,6 +1705,183 @@ describe("comments on a reflection", () => {
   });
 });
 
+describe("the bar at the selection", () => {
+  const bar = () =>
+    screen.queryByRole("toolbar", { name: "Selection actions" });
+  const barButton = () =>
+    screen.getByRole("button", { name: "Comment on selection" });
+
+  it("stands at a selection on the page for a reader who may comment", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    expect(bar()).toBeNull();
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const toolbar = bar();
+    expect(toolbar).toBeVisible();
+    expect(within(toolbar as HTMLElement).getAllByRole("button")).toEqual([
+      barButton(),
+    ]);
+    // It never takes the focus on its own, and Tab passes it by.
+    expect(barButton()).not.toHaveFocus();
+    expect(barButton()).toHaveAttribute("tabindex", "-1");
+    // A collapse on the page takes it away.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    expect(bar()).toBeNull();
+  });
+
+  it("is not there for a reader who may not comment", async () => {
+    serve([], {
+      "/auth/me": () => meResponse({ user: null, anonymous: true }),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeNull();
+  });
+
+  it("goes while a comment is written", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(screen.getByRole("button", { name: "Comment" }));
+    expect(screen.getByRole("form", { name: "New comment" })).toBeVisible();
+    expect(bar()).toBeNull();
+  });
+
+  it("goes when the selection leaves the page, while the column keeps its button", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    // A click beside the page leaves a caret outside it.
+    window.getSelection()?.collapse(document.body, 0);
+    act(() => {
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(bar()).toBeNull();
+    expect(screen.getByRole("button", { name: "Comment" })).toBeVisible();
+  });
+
+  it("opens the form on the same passage as the column's button, focus in its field", async () => {
+    const opened = vi.fn((_path: string, _init?: RequestInit) =>
+      thread("t-00000001"),
+    );
+    serve([], {
+      "/domains/eng/reflection/threads": (path, init) => opened(path, init),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(barButton());
+    expect(screen.getByText("Deploys run **at** night")).toBeVisible();
+    const field = screen.getByRole("textbox", { name: "Your comment" });
+    expect(field).toHaveFocus();
+    await userEvent.type(field, "Still true?");
+    await userEvent.click(
+      within(screen.getByRole("form", { name: "New comment" })).getByRole(
+        "button",
+        { name: "Comment" },
+      ),
+    );
+    await waitFor(() => {
+      expect(opened).toHaveBeenCalledTimes(1);
+    });
+    expect(bodyOf(opened.mock.calls[0]?.[1])).toEqual({
+      path: "guides/deploying.md",
+      section: "7f3a9c2e",
+      quote: "Deploys run **at** night",
+      occurrence: 1,
+      text: "Still true?",
+    });
+  });
+
+  it("returns focus to the column's Comment button when the form is cancelled", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(barButton());
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("form", { name: "New comment" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Comment" })).toHaveFocus();
+  });
+
+  it("keeps the selection on a press", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const down = new MouseEvent("mousedown", {
+      bubbles: true,
+      cancelable: true,
+    });
+    barButton().dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    expect(window.getSelection()?.toString()).toBe("Deploys run at night");
+  });
+
+  it("goes on Escape until the selection changes", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(bar()).toBeNull();
+    // The key coming up reads the same selection again: still away.
+    fireEvent.keyUp(document.body, { key: "Escape" });
+    expect(bar()).toBeNull();
+    select(textNode("Deploys run "), textNode("Deploys run "), 7);
+    expect(bar()).toBeVisible();
+  });
+
+  it("hides while the pointer button is down on the page", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    fireEvent.pointerDown(textNode("Deploys run ").parentElement as Element, {
+      button: 0,
+      isPrimary: true,
+    });
+    expect(bar()).toBeNull();
+    fireEvent.pointerUp(document.body, { button: 0, isPrimary: true });
+    expect(bar()).toBeVisible();
+  });
+
+  it("takes the focus on Alt+F10 and hands it back on Escape, selection kept", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const before = document.activeElement;
+    // Without a bar, Alt+F10 does nothing.
+    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
+    expect(document.activeElement).toBe(before);
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(document.activeElement).toBe(before);
+    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
+    expect(barButton()).toHaveFocus();
+    fireEvent.keyDown(barButton(), { key: "Escape" });
+    expect(bar()).toBeNull();
+    expect(document.activeElement).toBe(before);
+    expect(window.getSelection()?.toString()).toBe("Deploys run at night");
+  });
+
+  it("says the bar is there, with its key", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const status = screen.getByRole("status", { hidden: true });
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(status).toHaveTextContent("Comment on the selection with Alt+F10");
+  });
+});
+
 describe("threads on a narrow screen", () => {
   // jsdom has no media queries at all; one is lent for these tests, with a
   // window that can grow past the threads breakpoint.
@@ -1944,7 +2121,9 @@ describe("threads on a narrow screen", () => {
     await screen.findByText("at");
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(
-      screen.getByText("Comment on the selection from the threads"),
+      screen.getByText(
+        "Comment on the selection with Alt+F10 or from the threads",
+      ),
     ).toHaveAttribute("role", "status");
     await userEvent.click(screen.getByRole("button", { name: "Show threads" }));
     const sheet = await screen.findByRole("dialog", { name: "Threads" });
@@ -1980,6 +2159,26 @@ describe("threads on a narrow screen", () => {
     await waitFor(() => {
       expect(status).toHaveTextContent("Comment posted.");
     });
+  });
+
+  it("opens the sheet with the form from the bar at the selection", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Comment on selection" }),
+    );
+    const sheet = await screen.findByRole("dialog", { name: "Threads" });
+    expect(within(sheet).getByText("Deploys run **at** night")).toBeVisible();
+    await waitFor(() => {
+      expect(
+        within(sheet).getByRole("textbox", { name: "Your comment" }),
+      ).toHaveFocus();
+    });
+    expect(
+      screen.queryByRole("toolbar", { name: "Selection actions" }),
+    ).toBeNull();
   });
 
   it("opens the sheet at a thread a link names", async () => {
