@@ -220,7 +220,6 @@ impl Forge {
     /// Renames the account `old_login` to `new_login` the way GitHub does:
     /// every repository of that owner is renamed (ids and installations
     /// move, each old name redirects) and the owner id stays.
-    #[allow(dead_code)] // used by the archived and org-rename tests
     pub(crate) fn rename_owner(&self, old_login: &str, new_login: &str) {
         let id = self.owner_id_of(old_login);
         let prefix = format!("{old_login}/");

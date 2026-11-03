@@ -274,8 +274,9 @@ pub(crate) trait GovernorEnv: Send + Sync {
     /// Record `ids` for `domain`, which had none: trust on first use, for a
     /// domain connected before the ids were recorded at connect.
     fn record_ids(&self, _domain: &str, _ids: RepositoryIds) {}
-    /// GitHub answers `old` under the name `live` (renamed within its owner,
-    /// the ids unchanged): the engine may connect the domains to `live`.
+    /// GitHub answers `old` under the name `live` with the repository and
+    /// owner ids every domain recorded (renamed, or its owner renamed): the
+    /// engine may connect the domains to `live`.
     fn renamed(&self, _old: &str, _live: &str) {}
 }
 
@@ -1087,8 +1088,8 @@ impl GithubGovernor {
     /// is (or nothing is recorded or answered to compare). An origin state
     /// that cannot be read fails closed. A domain with no recorded ids
     /// records the answered ones (trust on first use). A
-    /// rename within the owner (the same ids under another name) is not a
-    /// difference: the engine is told, and may follow it, but only when
+    /// rename (the same ids under another name, the owner's login included)
+    /// is not a difference: the engine is told, and may follow it, but only when
     /// every domain on `repo` had its ids recorded and they match.
     fn identity_differs(&self, repo: &str, snapshot: &Snapshot) -> Option<String> {
         let live = snapshot.ids?;
@@ -1660,6 +1661,13 @@ impl GovernorEnv for EngineEnv {
         });
     }
 
+    /// Connects the domains of `old` to `live`, in the background. A new
+    /// owner login is followed too: the governor calls this only when every
+    /// domain's recorded repository id and owner id equal GitHub's answer,
+    /// and a transfer changes the owner id, so a changed login here is the
+    /// same owner renamed (an organization rename whose delivery was
+    /// missed), never a move to another owner. A read-only instance moves
+    /// nothing.
     fn renamed(&self, old: &str, live: &str) {
         let (Some(engine), Ok(runtime)) =
             (self.engine.upgrade(), tokio::runtime::Handle::try_current())
@@ -1667,13 +1675,6 @@ impl GovernorEnv for EngineEnv {
             return;
         };
         if engine.read_only {
-            return;
-        }
-        let owner = |name: &str| name.split_once('/').map(|(o, _)| o.to_ascii_lowercase());
-        if owner(old).is_none() || owner(old) != owner(live) {
-            tracing::warn!(
-                "GitHub answers {old} as {live}, under another owner; that is never followed on its own"
-            );
             return;
         }
         let old_key = repo_key(old);
@@ -2020,6 +2021,18 @@ impl super::Engine {
     ///   GitHub, asked with the installation token, answers the same
     ///   repository id for `repository.id` and for the old name (through
     ///   its redirect) and the name it gives is the payload's.
+    /// * `organization` `renamed`: the domains on the old login's
+    ///   repositories are connected to the new names only when GitHub,
+    ///   asked by each domain's recorded repository id with the
+    ///   installation token, answers that id, the recorded owner id (the
+    ///   payload's `organization.id`) and a name under the new login. A
+    ///   domain without recorded ids, or recorded for another owner, keeps
+    ///   its origin, and both names are forgotten. A body missing the old
+    ///   login, the new one, the id or the installation only forgets.
+    /// * `organization` `deleted`: the domains of the organization's
+    ///   repositories are closed at once ([`GithubGovernor::close`]), except
+    ///   a domain recorded for another owner id, and open again only when
+    ///   the recheck finds GitHub still shows the App the repository.
     /// * `repository` `transferred` to another owner is never followed
     ///   (Ruling R32): the domain is closed for good
     ///   ([`GithubGovernor::close_moved`]) until an admin reconnects it. A
@@ -2076,6 +2089,41 @@ impl super::Engine {
             ("organization", "member_added" | "member_removed") => {
                 self.forget_github_user(&governor, payload.pointer("/membership/user/id"))
             }
+            ("organization", "renamed") => {
+                let old = login_at(payload, "/changes/login/from");
+                let new = login_at(payload, "/organization/login");
+                let org_id = payload
+                    .pointer("/organization/id")
+                    .and_then(serde_json::Value::as_u64);
+                match (&old, &new, org_id, installation_of(payload)) {
+                    (Some(old), Some(new), Some(org_id), Some(installation)) => {
+                        self.follow_github_org_rename(
+                            &governor,
+                            old,
+                            new,
+                            org_id,
+                            Some(installation),
+                        )
+                        .await?
+                    }
+                    _ => {
+                        for login in old.iter().chain(new.iter()) {
+                            self.forget_github_owner(&governor, login);
+                        }
+                        false
+                    }
+                }
+            }
+            ("organization", "deleted") => match login_at(payload, "/organization/login") {
+                Some(login) => self.close_github_org(
+                    &governor,
+                    &login,
+                    payload
+                        .pointer("/organization/id")
+                        .and_then(serde_json::Value::as_u64),
+                ),
+                None => false,
+            },
             ("repository", "renamed") => match (
                 repository_of(payload),
                 renamed_from("renamed", payload),
@@ -2468,6 +2516,168 @@ impl super::Engine {
         .then_some(by_id.1)
     }
 
+    /// Forgets every connected repository whose owner is `login`.
+    fn forget_github_owner(&self, governor: &GithubGovernor, login: &str) {
+        for (_, repo) in self.github_origins() {
+            if owned_by(&repo, login) {
+                governor.invalidate(Invalidate::Repo(repo));
+            }
+        }
+    }
+
+    /// An organization was renamed from `old_login` to `new_login` (what the
+    /// payload says), `org_id` being its `organization.id`. A domain whose
+    /// origin is a repository of `old_login` is connected to the new name
+    /// only when GitHub confirms it for that domain's own repository: the
+    /// domain recorded the repository's id and `org_id` as its owner's id,
+    /// and GitHub, asked by that repository id with `installation`'s token,
+    /// answers the same two ids under a name whose owner is `new_login`.
+    /// A domain with no ids recorded, or recorded for another owner, keeps
+    /// its origin (GitHub redirects the old name), and so does every domain
+    /// when no installation or no App is known, or the instance is
+    /// read-only. A domain that moves takes its repository's archived mark
+    /// along. The App client forgets which installation covers the old
+    /// names, and the governor forgets the old and the new names. Answers
+    /// false: a rename does not change who reads a repository.
+    async fn follow_github_org_rename(
+        &self,
+        governor: &GithubGovernor,
+        old_login: &str,
+        new_login: &str,
+        org_id: u64,
+        installation: Option<u64>,
+    ) -> super::Result<bool> {
+        // Every connected repository of the old login (by lowercased name),
+        // spelled as its origin spells it, with its domains.
+        let mut repos: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        for (domain, repo) in self.github_origins() {
+            if owned_by(&repo, old_login) {
+                repos
+                    .entry(repo_key(&repo))
+                    .or_insert_with(|| (repo.clone(), Vec::new()))
+                    .1
+                    .push(domain);
+            }
+        }
+        if repos.is_empty() || old_login.eq_ignore_ascii_case(new_login) {
+            self.forget_github_owner(governor, new_login);
+            return Ok(false);
+        }
+        let app = match self.github_app_slot_settled() {
+            Some(super::github_app::AppSlot::Ready(router)) => Some(router.app().clone()),
+            _ => None,
+        };
+        for (old_key, (old, domains)) in &repos {
+            // The domains that recorded this organization as the owner,
+            // grouped by the repository id they recorded.
+            let mut recorded: HashMap<u64, Vec<String>> = HashMap::new();
+            for domain in domains {
+                match self.recorded_repository_ids(domain) {
+                    Some(ids) if ids.owner == org_id => {
+                        recorded
+                            .entry(ids.repository)
+                            .or_default()
+                            .push(domain.clone());
+                    }
+                    Some(_) => tracing::info!(
+                        "a delivery says the organization {old_login} is now {new_login}, but the domain {domain} was connected to a repository of another owner of that name, so it keeps its origin"
+                    ),
+                    None => tracing::info!(
+                        "a delivery says the organization {old_login} is now {new_login}, but no repository ids are recorded for the domain {domain}, so it keeps its origin; GitHub redirects the old name"
+                    ),
+                }
+            }
+            let mut live_names = Vec::new();
+            if let (Some(app), Some(installation)) = (&app, installation) {
+                for (id, group) in &recorded {
+                    let Some(live) =
+                        github_confirms_org_rename(app, installation, *id, org_id, old, new_login)
+                            .await
+                    else {
+                        tracing::info!(
+                            "a delivery says the organization {old_login} is now {new_login}, but GitHub does not confirm it for {old}, so its domains keep their origin"
+                        );
+                        continue;
+                    };
+                    live_names.push(live.clone());
+                    if self.read_only {
+                        tracing::warn!(
+                            "GitHub says {old} is now {live} after its organization was renamed, but this instance is read-only, so its domains keep the old name; GitHub redirects it"
+                        );
+                        continue;
+                    }
+                    // Only the domains GitHub confirmed for this repository
+                    // move; every other domain on the old name stays.
+                    let skip: HashSet<String> = domains
+                        .iter()
+                        .filter(|domain| !group.contains(domain))
+                        .cloned()
+                        .collect();
+                    let moved = self.move_origin_repo(old_key, &live, &skip)?;
+                    if !moved.is_empty() {
+                        governor.follow_archived_rename(old, &live);
+                    }
+                    for domain in group.iter().filter(|d| !moved.contains(d)) {
+                        tracing::warn!(
+                            "GitHub says {old} is now {live}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
+                        );
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "a delivery says the organization {old_login} is now {new_login}, but there is no GitHub App or installation to confirm it with, so the domains of {old} keep their origin"
+                );
+            }
+            if let Some(app) = &app {
+                app.evict_repo(old);
+            }
+            governor.invalidate(Invalidate::Repo(old.clone()));
+            let name = old.split_once('/').map_or(old.as_str(), |(_, name)| name);
+            governor.invalidate(Invalidate::Repo(format!("{new_login}/{name}")));
+            for live in live_names {
+                governor.invalidate(Invalidate::Repo(live));
+            }
+        }
+        Ok(false)
+    }
+
+    /// The organization `login` was deleted: the domains of its connected
+    /// repositories are closed at once ([`GithubGovernor::close`]), so the
+    /// usual recheck after [`CLOSE_GRACE`] opens one again when GitHub still
+    /// shows the App its repository (a replayed delivery does not keep it
+    /// shut). A domain whose recorded owner id is not `org_id` was connected
+    /// to another owner of that name and is left out; a repository closes
+    /// when any of its domains is not left out. Without `org_id` every
+    /// repository of `login` closes: a payload may narrow on its own word.
+    /// Answers whether any was closed.
+    fn close_github_org(
+        &self,
+        governor: &GithubGovernor,
+        login: &str,
+        org_id: Option<u64>,
+    ) -> bool {
+        let mut repos = Vec::new();
+        for (domain, repo) in self.github_origins() {
+            if !owned_by(&repo, login) {
+                continue;
+            }
+            if let (Some(org_id), Some(ids)) = (org_id, self.recorded_repository_ids(&domain))
+                && ids.owner != org_id
+            {
+                tracing::info!(
+                    "a delivery says the GitHub organization {login} was deleted, but the domain {domain} was connected to another owner of that name, so it stays open"
+                );
+                continue;
+            }
+            repos.push(repo);
+        }
+        self.close_github_repos(governor, repos, |_| {
+            format!(
+                "the GitHub organization {login} was deleted: disconnect the domain or connect it to another repository"
+            )
+        })
+    }
+
     /// Connects every domain of the configuration file whose origin is the
     /// repository `old_key` (lowercased) to `new`, in one write under the
     /// configuration lock, and then records the new name in each domain's
@@ -2627,6 +2837,63 @@ fn full_name(repository: &serde_json::Value) -> Option<String> {
 /// The repository a payload is about (`repository.full_name`).
 fn repository_of(payload: &serde_json::Value) -> Option<String> {
     full_name(payload.get("repository")?)
+}
+
+/// The GitHub login (an account name) at `pointer` in `payload`, trimmed,
+/// when it is one.
+fn login_at(payload: &serde_json::Value, pointer: &str) -> Option<String> {
+    let login = payload.pointer(pointer)?.as_str()?.trim();
+    (!login.is_empty() && !login.contains('/')).then(|| login.to_string())
+}
+
+/// Whether `repo` (`owner/name`) belongs to the account `login` (GitHub
+/// names are case insensitive).
+fn owned_by(repo: &str, login: &str) -> bool {
+    repo.split_once('/')
+        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(login))
+}
+
+/// GitHub's own name for the repository `id` after its organization was
+/// renamed to `new_login`, when GitHub confirms it: asked by id with
+/// `installation`'s token, it answers the repository id `id`, the owner id
+/// `org_id`, and a name whose owner is `new_login`. `None` when it does
+/// not, or does not answer within [`CONFIRM_TIMEOUT`].
+async fn github_confirms_org_rename(
+    app: &GithubApp,
+    installation: u64,
+    id: u64,
+    org_id: u64,
+    old: &str,
+    new_login: &str,
+) -> Option<String> {
+    let facts = match tokio::time::timeout(
+        CONFIRM_TIMEOUT,
+        app.repository_facts_by_id(installation, id),
+    )
+    .await
+    {
+        Ok(Ok(facts)) => facts,
+        Ok(Err(e)) => {
+            tracing::info!(
+                "GitHub could not confirm where {old} is after its organization was renamed: {e}"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::info!(
+                "GitHub was slow to confirm where {old} is after its organization was renamed"
+            );
+            return None;
+        }
+    };
+    let live = facts.full_name?;
+    (facts.ids
+        == Some(RepositoryIds {
+            repository: id,
+            owner: org_id,
+        })
+        && owned_by(&live, new_login))
+    .then_some(live)
 }
 
 /// The installation a payload is about (`installation.id`).
@@ -3221,6 +3488,26 @@ mod tests {
         assert_eq!(
             *lock(&rig.env.renames),
             vec![(REPO.to_string(), "acme/guide".to_string())]
+        );
+    }
+
+    /// An organization renamed (the same repository and owner ids under a
+    /// new login) is reported to the engine like a rename, which follows it;
+    /// a new owner id is a transfer and closes the domain instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_organization_renamed_with_the_same_ids_tells_the_engine() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        rig.github.with(REPO, |r| {
+            r.ids = Some(IDS);
+            r.full_name = Some("acme-labs/handbook".to_string());
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert!(rig.governor.closed_domains().is_empty());
+        assert_eq!(
+            *lock(&rig.env.renames),
+            vec![(REPO.to_string(), "acme-labs/handbook".to_string())]
         );
     }
 

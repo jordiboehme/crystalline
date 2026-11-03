@@ -26,13 +26,17 @@
 //! a captured delivery can be sent again under a fresh id, and step 6 does
 //! not catch that. What makes a resent body harmless is that every event is
 //! idempotent and only ever narrows access: `member`, `team`, `membership`,
-//! `organization` and `repository` privatized/publicized make the governor
-//! forget (the next question asks GitHub); `repository` deleted,
+//! `organization` member_added/member_removed and `repository`
+//! privatized/publicized make the governor forget (the next question asks
+//! GitHub); `repository` deleted, `organization` deleted,
 //! `installation_repositories` removed and `installation` deleted/suspend
-//! close domains; `repository` transferred to another owner closes the
-//! domain for good; `installation` and `installation_repositories` added
-//! only let the governor ask GitHub again; `repository` renamed moves a
-//! domain only when GitHub itself confirms the new name; and
+//! close domains (a recheck opens one again while GitHub still shows the
+//! App its repository); `repository` transferred to another owner closes
+//! the domain for good; `installation` and `installation_repositories`
+//! added only let the governor ask GitHub again; `repository` renamed and
+//! `organization` renamed move a domain only when GitHub itself confirms
+//! the new name (for an organization: by the repository id and the owner
+//! id the domain recorded); and
 //! `github_app_authorization` revoked deletes a token. No role is ever read
 //! from a payload. A new event handled here must keep to that.
 //!
@@ -144,8 +148,9 @@ fn for_log(value: Option<&str>) -> String {
                    harmless because every event only narrows access. \
                    An event only makes the instance forget what it knew \
                    about a repository, a person or an installation (or \
-                   close a domain whose repository the App lost, or follow \
-                   a rename GitHub itself confirms); the next \
+                   close a domain whose repository the App lost or whose \
+                   organization was deleted, or follow a repository or \
+                   organization rename GitHub itself confirms); the next \
                    request asks GitHub. Nothing in a payload is believed \
                    about who may do what.",
     request_body(
