@@ -34,6 +34,7 @@ import {
 } from "@codemirror/view";
 
 import type { WikilinkResolver } from "../../wikilinks";
+import { elementEditCell } from "../elementEdit";
 import { floatingCell } from "../floatingContext";
 import { formatCell } from "../marks/formatting";
 import { parseAdvanced } from "../parseProgress";
@@ -331,6 +332,7 @@ function host(
     cellKeymap,
     floatingCell(main),
     formatCell(main),
+    elementEditCell(main),
     cellAttributes(main),
   ]);
   hostOf.set(main, el);

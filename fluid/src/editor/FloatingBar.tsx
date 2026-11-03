@@ -60,6 +60,7 @@ import {
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import type { IconComponent } from "../components/primitives";
 import { IconButton } from "../components/primitives";
+import { linkVerb } from "./elementEdit";
 import type { FloatingContext } from "./floatingContext";
 import {
   selectionMoves,
@@ -81,7 +82,7 @@ import {
 } from "./tableIcons";
 import type { Format } from "./marks/formatting";
 import { toggleFormat } from "./marks/formatting";
-import { insertMarkdownLink, insertWikilink } from "./toolbar";
+import { insertWikilink } from "./toolbar";
 
 export interface FloatingBarProps {
   /** The main view; the open cell's view is found from it when needed. */
@@ -143,7 +144,7 @@ function textItems(wikilinks: boolean): Item[] {
       label: "Link",
       icon: Link,
       run: onTarget((view) => {
-        insertMarkdownLink(view);
+        linkVerb(view);
       }),
     },
     ...(wikilinks

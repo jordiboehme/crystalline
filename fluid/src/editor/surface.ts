@@ -11,10 +11,13 @@
 
 import { autocompletion } from "@codemirror/autocomplete";
 import type { Compartment, Extension } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 
 import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
 import { elementContextListener } from "./elementContext";
+import type { ElementEdit } from "./elementEdit";
+import { elementEditListener } from "./elementEdit";
 import { elementPreviews } from "./elementPreviews";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
@@ -105,6 +108,14 @@ export interface SurfaceOptions {
    * is told.
    */
   onFormatState?: (formats: ReadonlySet<Format>) => void;
+  /**
+   * Told the element edit a click, Mod-k or Shift+F10 asked for (a link, a
+   * wikilink), with the view that asked (main, or the open table cell), and
+   * null when it closes; the screen's popover host answers it. It travels
+   * with the listeners above for their reason. Absent, nothing asks: the
+   * Link button and Mod-k insert `[text](url)` as the source view does.
+   */
+  onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
   /**
    * The compartment the screen reconfigures when the marks setting flips. It
    * sits outside the preview compartment, so a flip never rebuilds Raw or the
@@ -205,6 +216,12 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // bold is bold in Raw mode too.
     ...(options.onFormatState
       ? [formatStateListener(options.onFormatState)]
+      : []),
+    // And for the element popovers. Outside the preview compartment, so a
+    // Raw flip reaches the listener (which closes the popover) rather than
+    // tearing it down with the layer.
+    ...(options.onElementEdit
+      ? [elementEditListener(options.onElementEdit)]
       : []),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.

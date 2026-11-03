@@ -75,6 +75,8 @@ import {
 } from "../editor/drafts";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { ElementRequest } from "../editor/elementEdit";
+import { ElementPopoverSlot } from "../editor/popovers/ElementPopoverSlot";
 import type { FloatingContext } from "../editor/floatingContext";
 import type { Format } from "../editor/marks/formatting";
 import { NO_FORMATS } from "../editor/marks/formatting";
@@ -640,6 +642,8 @@ function Surface({
   const [floating, setFloating] = useState<FloatingContext>(null);
   /** The formats the format buttons draw pressed. */
   const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
+  /** The element popover asked for (a link), with the view that asked. */
+  const [elementEdit, setElementEdit] = useState<ElementRequest | null>(null);
   const extensions = useMemo(() => {
     const undoManager = new Y.UndoManager(ytext);
     return [
@@ -671,6 +675,9 @@ function Surface({
         onElementContext: setElement,
         onFloatingContext: setFloating,
         onFormatState: setFormats,
+        onElementEdit: (edit, from) => {
+          setElementEdit(edit ? { edit, view: from } : null);
+        },
       }),
     ];
   }, [
@@ -1125,6 +1132,8 @@ function Surface({
           wikilinks={adapter.wikilinks}
           formats={formats}
         />
+        {/* The element popovers; none once the room has ended (R17). */}
+        <ElementPopoverSlot main={view} request={ended ? null : elementEdit} />
       </div>
       {collab.conflict !== null && resolving && (
         <CollabConflictDialog

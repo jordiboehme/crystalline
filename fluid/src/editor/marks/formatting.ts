@@ -39,6 +39,7 @@ import {
 import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
+import { linkKey, plainLinkKey } from "../elementEdit";
 import { verbTarget } from "../floatingContext";
 import { isIdLineAt } from "../hiddenIdLines";
 import { mainSelectionParked, parkingChanged } from "../parkedSelection";
@@ -705,6 +706,9 @@ export const formatKeymap: Extension = Prec.high(
   keymap.of([
     { key: "Mod-b", run: (view) => toggleFormat(view, "strong") },
     { key: "Mod-i", run: (view) => toggleFormat(view, "em") },
+    // Where the "Link" popover does not answer (Raw); `linkKey` in the
+    // layer, at a higher precedence, opens it everywhere else.
+    { key: "Mod-k", run: plainLinkKey },
   ]),
 );
 
@@ -1098,7 +1102,13 @@ export const formatInput: Extension = EditorView.inputHandler.of(
 );
 
 /** What the hidden-mark layer installs for the format commands. */
-export const formatting: Extension = [pendingFormat, forgetOnBlur, formatInput];
+export const formatting: Extension = [
+  pendingFormat,
+  forgetOnBlur,
+  formatInput,
+  // Mod-k: the "Link" popover, where marks are hidden.
+  linkKey,
+];
 
 // The pressed state.
 

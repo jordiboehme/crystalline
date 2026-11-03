@@ -74,28 +74,38 @@ const PAIRS = new Map<string, MarkKind>([
 const NOT_APPLICABLE = /^\[~\](?=[ \t]|$)/;
 
 /** A link label as CommonMark matches it to a definition. */
-function labelKey(label: string): string {
+export function labelKey(label: string): string {
   return label.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-/** Every link definition's label, once per parse tree. */
-const definitionCache = new WeakMap<Tree, Set<string>>();
+/** Every link definition's label with its address span, once per parse tree. */
+const definitionCache = new WeakMap<
+  Tree,
+  Map<string, { from: number; to: number } | null>
+>();
 
-function definitions(state: EditorState): Set<string> {
+function definitions(
+  state: EditorState,
+): Map<string, { from: number; to: number } | null> {
   const tree = syntaxTree(state);
   const cached = definitionCache.get(tree);
   if (cached) {
     return cached;
   }
-  const labels = new Set<string>();
+  const labels = new Map<string, { from: number; to: number } | null>();
   tree.iterate({
     enter: (node) => {
       if (node.name === "LinkReference") {
         const label = node.node.getChild("LinkLabel");
         if (label) {
-          labels.add(
-            labelKey(state.doc.sliceString(label.from + 1, label.to - 1)),
+          const key = labelKey(
+            state.doc.sliceString(label.from + 1, label.to - 1),
           );
+          // The first definition of a label is the one CommonMark uses.
+          if (!labels.has(key)) {
+            const url = node.node.getChild("URL");
+            labels.set(key, url ? { from: url.from, to: url.to } : null);
+          }
         }
         return false;
       }
@@ -113,6 +123,17 @@ function definitions(state: EditorState): Set<string> {
   });
   definitionCache.set(tree, labels);
   return labels;
+}
+
+/**
+ * The address span of the definition `label` names: undefined when no
+ * definition has that label, null when it has one without an address.
+ */
+export function linkDefinition(
+  state: EditorState,
+  label: string,
+): { from: number; to: number } | null | undefined {
+  return definitions(state).get(labelKey(label));
 }
 
 /** Where the frontmatter block ends, once per document; -1 without one. */
@@ -193,7 +214,7 @@ export function marksOnLine(
   // Where an observation's category or a task box already took a `[`, so the
   // parser's link over the same brackets is not read twice.
   const taken = new Set<number>();
-  let defined: Set<string> | null = null;
+  let defined: Map<string, unknown> | null = null;
   const isDefined = (label: string) => {
     defined ??= definitions(state);
     return defined.has(labelKey(label));

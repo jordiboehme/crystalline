@@ -11,7 +11,8 @@
 
 import type { EditorState, Extension } from "@codemirror/state";
 
-import { hiddenMarkDrawing } from "../preview";
+import { elementMenuKey } from "../elementEdit";
+import { hiddenMarkDrawing, linkClicks } from "../preview";
 import { blockDrawing, listEnter, taskKeymap } from "./blocks";
 import { caretKeymap, caretNormalizer } from "./caret";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
@@ -61,6 +62,10 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
   return [
     hiddenMarkLayerOn.of(true),
     hiddenMarkDrawing,
+    // A press on a link's words, and Shift+F10 on the element at the caret,
+    // open its popover.
+    linkClicks,
+    elementMenuKey,
     // Bullets, numbers, task boxes, quote bars and rules in place of their marks.
     blockDrawing,
     listEnter,

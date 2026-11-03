@@ -67,6 +67,8 @@ import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { ElementEdit, ElementRequest } from "../editor/elementEdit";
+import { ElementPopoverSlot } from "../editor/popovers/ElementPopoverSlot";
 import type { FloatingContext } from "../editor/floatingContext";
 import type { Format } from "../editor/marks/formatting";
 import { NO_FORMATS } from "../editor/marks/formatting";
@@ -93,7 +95,10 @@ import {
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { useRoomExit } from "../editor/useRoomExit";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
-import { wikilinkResolverFacet } from "../editor/wikilinkChips";
+import {
+  wikilinkResolverFacet,
+  wikilinkTitleOptions,
+} from "../editor/wikilinkChips";
 import { useIgnoredEngram } from "../events/ignored";
 import { moveDraft } from "../editor/drafts";
 import { editRoute, engramRoute, engramsRoute } from "../paths";
@@ -245,6 +250,8 @@ interface EngramSurfaceOptions {
   onFloatingContext: (context: FloatingContext) => void;
   /** Told the formats the format buttons show pressed; see `SurfaceOptions`. */
   onFormatState: (formats: ReadonlySet<Format>) => void;
+  /** Told the element popover asked for; see `SurfaceOptions`. */
+  onElementEdit: (edit: ElementEdit | null, view: EditorView) => void;
 }
 
 /**
@@ -306,6 +313,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       onElementContext: options.onElementContext,
       onFloatingContext: options.onFloatingContext,
       onFormatState: options.onFormatState,
+      onElementEdit: options.onElementEdit,
     }),
   ];
 }
@@ -541,6 +549,19 @@ function Surface({
   const [floating, setFloating] = useState<FloatingContext>(null);
   /** The formats the format buttons draw pressed. */
   const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
+  /** The element popover asked for (a link, a wikilink), with the view that asked. */
+  const [elementEdit, setElementEdit] = useState<ElementRequest | null>(null);
+  /** The wikilink popover's title matches, the `[[` completion's lookup. */
+  const titleMatches = useCallback(
+    (term: string) => wikilinkTitleOptions(engram.domain, queryClient, term),
+    [engram.domain, queryClient],
+  );
+  const onElementEdit = useCallback(
+    (edit: ElementEdit | null, from: EditorView) => {
+      setElementEdit(edit ? { edit, view: from } : null);
+    },
+    [],
+  );
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -675,6 +696,7 @@ function Surface({
       onElementContext: setElement,
       onFloatingContext: setFloating,
       onFormatState: setFormats,
+      onElementEdit,
     });
 
   /**
@@ -969,6 +991,7 @@ function Surface({
         onElementContext: setElement,
         onFloatingContext: setFloating,
         onFormatState: setFormats,
+        onElementEdit,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -984,6 +1007,7 @@ function Surface({
       resolverBox,
       room,
       uploads.extension,
+      onElementEdit,
     ],
   );
 
@@ -1469,6 +1493,12 @@ function Surface({
             context={raw ? null : floating}
             wikilinks={adapter.wikilinks}
             formats={formats}
+          />
+          {/* The element popovers; Raw asks for none. */}
+          <ElementPopoverSlot
+            main={view}
+            request={raw ? null : elementEdit}
+            titles={titleMatches}
           />
         </div>
         <EditorDetails hasHardErrors={session.hardErrors > 0}>

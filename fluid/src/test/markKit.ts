@@ -14,10 +14,12 @@ import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import type { DocumentAdapter } from "../editor/adapter";
 import { engramAdapter, reflectionAdapter } from "../editor/adapter";
+import type { ElementEdit } from "../editor/elementEdit";
 import { marksOnEditLine } from "../editor/marks/mode";
 import { roomUndo } from "../editor/roomUndo";
-import { surfaceExtensions } from "../editor/surface";
+import { previewConfig, surfaceExtensions } from "../editor/surface";
 import { parsedView } from "./parse";
 
 export { bytes } from "./cellKit";
@@ -32,6 +34,8 @@ export interface MarkViewOptions {
   raw?: boolean;
   /** Told the formats the format buttons show as pressed. */
   onFormatState?: (formats: ReadonlySet<string>) => void;
+  /** Told the element edit a click, Mod-k or Shift+F10 asked for. */
+  onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
   /** The room's shared text, for a second peer (`markPeers`). */
   ytext?: Y.Text;
 }
@@ -40,6 +44,10 @@ const views = new Set<EditorView>();
 const undoManagers = new WeakMap<EditorView, Y.UndoManager>();
 const roomTexts = new WeakMap<EditorView, Y.Text>();
 const markCompartments = new WeakMap<EditorView, Compartment>();
+const previews = new WeakMap<
+  EditorView,
+  { compartment: Compartment; adapter: DocumentAdapter }
+>();
 
 /** Destroys every view `markView` built; call in `afterEach`. */
 export function cleanupMarkViews(): void {
@@ -65,6 +73,7 @@ export function markView(
   let screen: ReturnType<typeof yCollab>[] = [];
   let undoManager: Y.UndoManager | null = null;
   const marks = new Compartment();
+  const preview = new Compartment();
   let doc = text;
   let roomText: Y.Text | null = null;
   if (options.room || options.ytext) {
@@ -96,7 +105,7 @@ export function markView(
           dark: false,
           history: !options.room,
           screen,
-          preview: new Compartment(),
+          preview,
           raw: options.raw ?? false,
           images: [],
           uploads: [],
@@ -107,6 +116,9 @@ export function markView(
           ...(options.onFormatState
             ? { onFormatState: options.onFormatState }
             : {}),
+          ...(options.onElementEdit
+            ? { onElementEdit: options.onElementEdit }
+            : {}),
           marks,
           showMarks: options.mode === "show",
         }),
@@ -116,6 +128,7 @@ export function markView(
   });
   views.add(view);
   markCompartments.set(view, marks);
+  previews.set(view, { compartment: preview, adapter });
   if (undoManager) {
     undoManagers.set(view, undoManager);
   }
@@ -194,6 +207,19 @@ export function setShowMarks(view: EditorView, show: boolean): void {
     throw new Error("setShowMarks takes a view built by markView");
   }
   view.dispatch({ effects: marks.reconfigure(marksOnEditLine.of(show)) });
+}
+
+/** Flips Raw the way the engram editor does: a reconfigure of the preview. */
+export function setRaw(view: EditorView, raw: boolean): void {
+  const preview = previews.get(view);
+  if (!preview) {
+    throw new Error("setRaw takes a view built by markView");
+  }
+  view.dispatch({
+    effects: preview.compartment.reconfigure(
+      previewConfig(raw, false, [], preview.adapter),
+    ),
+  });
 }
 
 /** The caret (the main selection's head). */

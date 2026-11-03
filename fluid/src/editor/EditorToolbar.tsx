@@ -60,6 +60,7 @@ import {
   setCalloutKind,
   setStatusColour,
 } from "./elementContext";
+import { linkVerb } from "./elementEdit";
 import { verbTarget } from "./floatingContext";
 import type { Format } from "./marks/formatting";
 import { toggleFormat } from "./marks/formatting";
@@ -93,7 +94,6 @@ import type { Align } from "./tableModel";
 import {
   ORDERED_ITEM,
   setHeadingLevel,
-  insertMarkdownLink,
   insertWikilink,
   toggleLinePrefix,
 } from "./toolbar";
@@ -662,7 +662,7 @@ export function EditorToolbar({
           label="Link"
           icon={Link}
           disabled={off}
-          onClick={actInline(insertMarkdownLink)}
+          onClick={actInline(linkVerb)}
         />
         {/*
         The insert verbs are named buttons of their own, and this hairline

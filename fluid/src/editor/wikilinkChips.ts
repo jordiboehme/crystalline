@@ -31,10 +31,22 @@ import {
 } from "@codemirror/view";
 
 import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
+import { openRoute } from "../base";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, referenceState, wikilinkWords } from "../wikilinks";
+import {
+  answersElementEdits,
+  elementEditAt,
+  linksEngrams,
+  requestElementEdit,
+  writable,
+} from "./elementEdit";
 import { frontmatterRegion } from "./frontmatterRegion";
-import { markModeChanged, marksHiddenOnLine } from "./marks/mode";
+import {
+  hiddenMarkLayerOn,
+  markModeChanged,
+  marksHiddenOnLine,
+} from "./marks/mode";
 import { parkingChanged, revealRanges } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
@@ -77,14 +89,56 @@ class ChipWidget extends WidgetType {
     );
   }
 
-  override toDOM(): HTMLElement {
+  override toDOM(view: EditorView): HTMLElement {
     const chip = document.createElement("span");
     chip.className = `cm-wikilink cm-wikilink-${this.state}`;
     chip.textContent = this.label;
     // What is actually written, for a reader wondering which domain a
     // prefixed target names.
     chip.title = `[[${this.inner}]]`;
+    const inner = this.inner;
+    chip.addEventListener("mousedown", (event) => {
+      chipPressed(view, chip, inner, event);
+    });
     return chip;
+  }
+}
+
+/**
+ * A press on a chip where marks are hidden (not in Raw, where no chip is
+ * drawn, and not in a table cell before it has the layer): Cmd or Ctrl opens
+ * the engram the chip names in a new tab; a plain press asks for the "Wiki
+ * link" popover. With marks hidden on its line no caret lands inside the
+ * chip; with the setting to show them the press goes on as it always did.
+ */
+function chipPressed(
+  view: EditorView,
+  chip: HTMLElement,
+  inner: string,
+  event: MouseEvent,
+): void {
+  const { state } = view;
+  if (event.button !== 0 || !state.facet(hiddenMarkLayerOn)) {
+    return;
+  }
+  if (event.metaKey || event.ctrlKey) {
+    const resolution = state.facet(wikilinkResolverFacet)(inner);
+    if (resolution?.kind === "resolved") {
+      event.preventDefault();
+      openRoute(resolution.href);
+    }
+    return;
+  }
+  if (!writable(state) || !answersElementEdits(view)) {
+    return;
+  }
+  const pos = view.posAtDOM(chip);
+  if (marksHiddenOnLine(state, state.doc.lineAt(pos).number)) {
+    event.preventDefault();
+  }
+  const edit = elementEditAt(view, pos, chip.getBoundingClientRect());
+  if (edit?.kind === "wikilink") {
+    requestElementEdit(view, edit);
   }
 }
 
@@ -233,7 +287,7 @@ const chipTheme = EditorView.baseTheme({
 
 /** The chip layer; belongs inside the caller's preview compartment. */
 export function wikilinkChips(): Extension {
-  return [chipsPlugin, chipTheme];
+  return [chipsPlugin, chipTheme, linksEngrams.of(true)];
 }
 
 /** How many title matches the completion offers. A list read at a glance. */
@@ -249,6 +303,43 @@ const OPEN_BRACKETS = /\[\[[^\][]*$/;
  * them has already asked about is free for the other within this window.
  */
 const TITLE_MATCH_FRESH_MS = 30_000;
+
+/** One title match, as the completion and the "Wiki link" popover offer it. */
+export interface TitleOption {
+  /** The engram's title. */
+  label: string;
+  /** Its domain, only when it is not the engram's own. */
+  detail?: string;
+  /** What goes between the brackets: the title, prefixed when foreign. */
+  name: string;
+}
+
+/**
+ * The title matches for `term`, through the palette's own lookup and cache
+ * (see `wikilinkCompletions`). A hit outside `currentDomain` is named with
+ * its domain, because a bare title only resolves within the engram's domain.
+ */
+export async function wikilinkTitleOptions(
+  currentDomain: string,
+  client: QueryClient,
+  term: string,
+): Promise<TitleOption[]> {
+  const page = await client.fetchQuery({
+    // The palette's own key: the two lookups are the same question, and one
+    // having asked it already spares the other the request.
+    queryKey: titleMatchesKey(term),
+    queryFn: () => fetchSearch({ ...NO_SEARCH, q: term, mode: "title" }, 1),
+    staleTime: TITLE_MATCH_FRESH_MS,
+  });
+  return page.hits.slice(0, COMPLETION_HITS).map((hit) => {
+    const foreign = hit.domain !== currentDomain;
+    return {
+      label: hit.title,
+      ...(foreign ? { detail: hit.domain } : {}),
+      name: foreign ? `${hit.domain}:${hit.title}` : hit.title,
+    };
+  });
+}
 
 /**
  * The `[[` completion source, fed by title search across the domains.
@@ -291,29 +382,22 @@ export function wikilinkCompletions(
       // character to ask.
       return { from, options: [] };
     }
-    const page = await client.fetchQuery({
-      // The palette's own key: the two lookups are the same question, and one
-      // having asked it already spares the other the request.
-      queryKey: titleMatchesKey(term),
-      queryFn: () => fetchSearch({ ...NO_SEARCH, q: term, mode: "title" }, 1),
-      staleTime: TITLE_MATCH_FRESH_MS,
-    });
+    const options = await wikilinkTitleOptions(currentDomain, client, term);
     return {
       from,
-      options: page.hits.slice(0, COMPLETION_HITS).map((hit) => {
-        const foreign = hit.domain !== currentDomain;
+      options: options.map((option) => {
         return {
-          label: hit.title,
+          label: option.label,
           type: "text",
           // Named only where it is news: every other hit lives right here.
-          ...(foreign ? { detail: hit.domain } : {}),
+          ...(option.detail !== undefined ? { detail: option.detail } : {}),
           apply: (
             view: EditorView,
             _completion: unknown,
             applyFrom: number,
             applyTo: number,
           ) => {
-            const name = foreign ? `${hit.domain}:${hit.title}` : hit.title;
+            const name = option.name;
             // Swallow a closing pair the author already typed rather than
             // leaving `]]]]` behind.
             const closed =
