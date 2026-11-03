@@ -1068,6 +1068,17 @@ describe.each(MODES)("property 3 pins, %s mode", (mode) => {
     expect(after).toBe(EVERYTHING);
   });
 
+  it("refuses a word delete that takes a mark and a space and makes a pair onto a hidden line, in both modes (D28)", () => {
+    // The space and the backtick after `q *` go: `*a\` r\nb*` would pair.
+    const { outcome, bytes: after } = press(
+      "code star that wraps: q * `a` r\nb* c",
+      "q *",
+      "Mod-Delete",
+    );
+    expect(outcome).toBe("refused");
+    expect(after).toBe(EVERYTHING);
+  });
+
   it("lets a shown mark go in show mode, though its partner's line hides its marks (D25)", () => {
     if (mode === "hidden") return;
     // The caret's line shows the opener of a bold that wraps: Backspace

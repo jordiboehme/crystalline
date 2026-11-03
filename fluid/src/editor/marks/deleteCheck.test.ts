@@ -6,6 +6,7 @@
 
 import {
   deleteGroupBackward,
+  deleteGroupForward,
   deleteLineBoundaryBackward,
 } from "@codemirror/commands";
 import { EditorSelection, StateEffect } from "@codemirror/state";
@@ -225,6 +226,23 @@ describe.each([false, true])("a new pair, room %s", (room) => {
     expect(text()).toBe("q * a r\nb* c");
     expect(heard.outcome).toBe("refused");
     expect(heard.said).toEqual([CANNOT_JOIN]);
+  });
+
+  it("is refused in show mode when a key takes a shown mark and a normal character, and a hidden line changes (D28)", () => {
+    // A word delete after `q *` takes the space and the backtick: the space
+    // makes `*\`a\` r\nb*` pair, so `b` below would turn italic.
+    const word = page("q * `a` r\nb* c", "show", room);
+    setCaret(word.view, 5);
+    deleteGroupForward(word.view);
+    expect(word.text()).toBe("q * `a` r\nb* c");
+    expect(word.heard.outcome).toBe("refused");
+    expect(word.heard.said).toEqual([CANNOT_JOIN]);
+    // A selection over the same two characters, the same.
+    const picked = page("q * `a` r\nb* c", "show", room);
+    picked.view.dispatch({ selection: EditorSelection.range(5, 7) });
+    keys(picked.view, "Backspace");
+    expect(picked.text()).toBe("q * `a` r\nb* c");
+    expect(picked.heard.outcome).toBe("refused");
   });
 
   it("is left to today's keys in show mode when a shown mark goes, though its partner's line hides its marks (D25)", () => {

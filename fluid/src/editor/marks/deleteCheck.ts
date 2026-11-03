@@ -28,8 +28,9 @@
  * the plan keeps today's keys. A key on such lines that takes no mark is
  * left alone for the lines that show their marks only: a pair it makes or
  * breaks that changes a character on a line whose marks are hidden is
- * refused (D23). A key that takes a shown mark stays unchecked even then
- * (D25). A deletion during an IME composition and an
+ * refused (D23). A key that takes only shown marks stays unchecked even
+ * then (D25); one that takes a normal character beside a shown mark is
+ * judged (D28). A deletion during an IME composition and an
  * edit a table cell has judged already (`judgedElsewhere`) are left alone.
  */
 
@@ -558,16 +559,11 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       if (!marksHiddenOnLine(start, n)) shownTouched = true;
     }
   }
-  // Where a line shows its marks, a key that takes one is the person editing
-  // the Markdown itself (today's keys): the pairs after it may pair anew,
-  // also where a partner is on a line whose marks are hidden (D9, D25).
-  if (
-    lines.marks.some(
-      (mark) =>
-        touches(deleted, mark) &&
-        !marksHiddenOnLine(start, start.doc.lineAt(mark.from).number),
-    )
-  ) {
+  // Where a line shows its marks, a key that takes only such marks is the
+  // person editing the Markdown itself (today's keys): the pairs after it
+  // may pair anew, also where a partner is on a line whose marks are hidden
+  // (D9, D25). A key that takes a normal character too is judged (D28).
+  if (takesOnlyShownMarks(start, lines, deleted)) {
     return tr;
   }
   if (shownTouched) {
@@ -644,6 +640,31 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   }
   return refusal(start);
 });
+
+/**
+ * Whether every character `deleted` takes is a mark on a line that shows
+ * its marks (D25, D28).
+ */
+function takesOnlyShownMarks(
+  start: EditorState,
+  lines: Lines,
+  deleted: readonly Range[],
+): boolean {
+  const shown = lines.marks.filter(
+    (mark) =>
+      touches(deleted, mark) &&
+      !marksHiddenOnLine(start, start.doc.lineAt(mark.from).number),
+  );
+  if (shown.length === 0) return false;
+  const isShownMark = cover(shown);
+  for (const range of merged(deleted)) {
+    for (let p = range.from; p < range.to; p += 1) {
+      checkWork.positions += 1;
+      if (!isShownMark(p)) return false;
+    }
+  }
+  return true;
+}
 
 /** A refused deletion: the bytes stay and the page says so. */
 function refusal(start: EditorState): TransactionSpec {

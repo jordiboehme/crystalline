@@ -55,8 +55,9 @@ export interface MarkRun {
 
 /**
  * A test hook: how many syntax nodes `walkTree` has stood on, in all, the
- * ones it stepped over included. A cost test reads it to count work instead
- * of timing it.
+ * ones it stepped over included, plus every line the mark scan looks at for
+ * a node and every step of its line search (D29). A cost test reads it to
+ * count work instead of timing it.
  */
 export const treeWalkWork = { steps: 0 };
 
@@ -256,16 +257,18 @@ function pair(open: Draft | null, close: Draft | null): void {
   }
 }
 
-/** The first of `lines` (sorted, touching) whose end is at or after `pos`. */
-function firstReaching(lines: readonly Line[], pos: number): number {
-  let lo = 0;
-  let hi = lines.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if ((lines[mid]?.to ?? 0) < pos) lo = mid + 1;
-    else hi = mid;
+/**
+ * The first of `lines` (sorted, touching) from `index` on whose end is at or
+ * after `pos`. The walk asks with positions that never go back, so a cursor
+ * moved forward finds every line in one pass over them in all.
+ */
+function reaching(lines: readonly Line[], index: number, pos: number): number {
+  let at = index;
+  while (at < lines.length && (lines[at]?.to ?? 0) < pos) {
+    treeWalkWork.steps += 1;
+    at += 1;
   }
-  return lo;
+  return at;
 }
 
 /**
@@ -353,10 +356,16 @@ function walkMarks(
     defined ??= definitions(state);
     return defined.has(labelKey(label));
   };
-  // The line holding `pos`, if it was found on the node in hand.
+  // The first line the node in hand reaches: nodes come in the order they
+  // start, so it only moves forward.
+  let head = 0;
+  // The line holding `pos`, if it was found on the node in hand. Asked
+  // with growing positions inside one node, from its first line on.
   let step = 0;
+  let near = 0;
   const found = (pos: number): LineScan | null => {
-    const scan = scans[firstReaching(lines, pos)];
+    near = reaching(lines, near, pos);
+    const scan = scans[near];
     return scan && scan.seen === step && scan.at.from <= pos ? scan : null;
   };
 
@@ -567,11 +576,14 @@ function walkMarks(
       let any = false;
       // A line that reads only comments reads every inside.
       let inside = false;
+      head = reaching(lines, head, ref.from);
+      near = head;
       for (
-        let index = firstReaching(lines, ref.from);
+        let index = head;
         index < lines.length && (lines[index]?.from ?? 0) <= ref.to;
         index++
       ) {
+        treeWalkWork.steps += 1;
         const scan = scans[index];
         if (!scan) continue;
         if (scan.skip !== -1) {
@@ -591,11 +603,13 @@ function walkMarks(
         for (const comment of htmlCommentRanges(text)) {
           const start = ref.from + comment.from;
           const end = ref.from + comment.to;
+          near = reaching(lines, near, start);
           for (
-            let index = firstReaching(lines, start);
+            let index = near;
             index < lines.length && (lines[index]?.from ?? 0) <= end;
             index++
           ) {
+            treeWalkWork.steps += 1;
             const scan = scans[index];
             if (!scan || scan.seen !== step || isIdLine(scan.at.text)) continue;
             addTo(

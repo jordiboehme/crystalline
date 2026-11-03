@@ -29,6 +29,9 @@ bold** end.
 A loose star that wraps: q * a r
 b* c stays text.
 
+A code star that wraps: q * `a` r
+b* c stays text.
+
 Escaped: \*not italic\*, \*\*not bold\*\*, \_no\_, \~\~no\~\~ and \`no\`.
 Mixed escapes: **bold \* star** and *it \_ under*.
 A backslash at the end of a code span: `a\` and a double `` a`b `` span.
