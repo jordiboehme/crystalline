@@ -710,7 +710,9 @@ test.describe.serial("the Reflection journeys", () => {
       mimeType: "image/png",
       buffer: readFileSync(FLOW_PNG),
     });
-    await expect(editor).toContainText(/\.\.\/assets\/\S*sketch\.png/);
+    // The address is a hidden mark in the editor, so the drawn text shows
+    // the label; the bytes below carry the path.
+    await expect(editor).toContainText("sketch.png");
     await expect
       .poll(() => pageSource(page, "guides/welcome.md"))
       .toMatch(/Written in the smoke\.\n\n!\[sketch\.png\]\([^)]*\)\n$/);

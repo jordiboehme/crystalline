@@ -54,6 +54,7 @@ import {
 } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
+import { keptWhole } from "../marks/deleting";
 import { documentLanguage } from "../setup";
 import { formattingKeymap } from "../toolbar";
 import { cellPreviewLayers } from "./draws";
@@ -216,6 +217,15 @@ function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
     i = j;
   }
   return units;
+}
+
+/** Whether `[from, to)` touches an escape unit whose backslash is hidden. */
+function keepsEscape(state: EditorState, from: number, to: number): boolean {
+  const range = state.field(rangeField, false);
+  if (!range) return false;
+  return cellUnits(state.doc, range).some(
+    (unit) => unit.hide !== null && unit.from < to && from < unit.to,
+  );
 }
 
 /**
@@ -939,6 +949,9 @@ export function mountCellEditor(
         rangeField.init(() => range),
         Prec.highest([hideOutside, cellMarks]),
         clampToCell,
+        // Backspace and Delete over hidden marks leave every hidden escape to
+        // `cellChange`, which takes such a unit whole.
+        keptWhole.of(keepsEscape),
         composeEdges,
         forward,
         Prec.high([

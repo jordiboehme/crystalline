@@ -1,0 +1,305 @@
+/**
+ * Backspace and Delete over hidden marks remove exactly the visible character
+ * the person sees, plus the marks that would otherwise be left unpaired, and
+ * a range deletion a person makes keeps every mark whose partner survives.
+ * Every edit runs solo and in a room; show mode and Raw keep today's keys on
+ * the line the caret touches.
+ */
+
+import {
+  EditorSelection,
+  EditorState,
+  StateEffect,
+  Transaction,
+} from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+
+import { surfaceExtensions } from "../surface";
+import { engramAdapter } from "../adapter";
+import { QueryClient } from "@tanstack/react-query";
+import { Compartment } from "@codemirror/state";
+import {
+  bytes,
+  caret,
+  cleanupMarkViews,
+  keys,
+  markView,
+  setCaret,
+  typeText,
+  undoOnce,
+} from "../../test/markKit";
+import { cleanupCells, openAt } from "../../test/cellKit";
+import { parsedState } from "../../test/parse";
+import { prefetchGrid } from "../grid/loader";
+import { hiddenMarkLayerOn } from "./mode";
+import { deleteVisible } from "./deleting";
+
+afterEach(cleanupMarkViews);
+
+/** A cut as the browser sends it; what reached the clipboard comes back. */
+function cut(view: EditorView): string {
+  const data = new Map<string, string>();
+  const event = new Event("cut", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      clearData: () => {
+        data.clear();
+      },
+      setData: (type: string, value: string) => data.set(type, value),
+      getData: (type: string) => data.get(type) ?? "",
+    },
+  });
+  view.contentDOM.dispatchEvent(event);
+  return data.get("text/plain") ?? "";
+}
+
+function select(view: EditorView, from: number, to: number): void {
+  view.dispatch({
+    selection: EditorSelection.range(from, to),
+    userEvent: "select.pointer",
+  });
+}
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])("hidden mode, $name", ({ room }) => {
+  const view = (text: string) => markView(text, { room });
+
+  it("Backspace after a bold word's last letter removes the letter", () => {
+    const v = view("a **bold** c");
+    setCaret(v, 8);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a **bol** c");
+    expect(caret(v)).toBe(7);
+  });
+
+  it("removes a pair whose last visible letter goes", () => {
+    const v = view("a **b** c");
+    setCaret(v, 5);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a  c");
+    expect(caret(v)).toBe(2);
+    const w = view("a **b** c");
+    setCaret(w, 2);
+    keys(w, "Delete");
+    expect(bytes(w.state)).toBe("a  c");
+    expect(caret(w)).toBe(2);
+  });
+
+  it("Backspace before an opening mark removes the letter before it", () => {
+    const v = view("a **bold** c");
+    setCaret(v, 2);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a**bold** c");
+  });
+
+  it("Delete before a closing mark removes the letter after it", () => {
+    const v = view("a **bold** c");
+    setCaret(v, 8);
+    keys(v, "Delete");
+    expect(bytes(v.state)).toBe("a **bold**c");
+  });
+
+  it("Backspace at a heading's visible start removes the prefix, one undo restores it", () => {
+    const v = view("## Night\n\nText.");
+    setCaret(v, 3);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("Night\n\nText.");
+    expect(caret(v)).toBe(0);
+    undoOnce(v);
+    expect(bytes(v.state)).toBe("## Night\n\nText.");
+  });
+
+  it("the prefix is its own undo step, apart from the typing before it", () => {
+    const v = view("## Night");
+    setCaret(v, 8);
+    typeText(v, "s");
+    setCaret(v, 3);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("Nights");
+    undoOnce(v);
+    expect(bytes(v.state)).toBe("## Nights");
+  });
+
+  it("Backspace at a list item's visible start removes the bullet and the box", () => {
+    const task = view("- [ ] task");
+    setCaret(task, 6);
+    keys(task, "Backspace");
+    expect(bytes(task.state)).toBe("task");
+    const item = view("  - item");
+    setCaret(item, 4);
+    keys(item, "Backspace");
+    expect(bytes(item.state)).toBe("  item");
+    const quote = view("> > q");
+    setCaret(quote, 4);
+    keys(quote, "Backspace");
+    expect(bytes(quote.state)).toBe("> q");
+  });
+
+  it("Backspace at a visible line start with no prefix joins the lines", () => {
+    const v = view("a\n**b**");
+    setCaret(v, 4);
+    expect(caret(v)).toBe(4);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a**b**");
+  });
+
+  it("Delete at a visible line end joins the lines and keeps the marks", () => {
+    const v = view("x **b**\ny");
+    setCaret(v, 5);
+    keys(v, "Delete");
+    expect(bytes(v.state)).toBe("x **b**y");
+  });
+
+  it("Backspace right after a wikilink chip removes the link whole", () => {
+    const v = view("x [[Target]] y");
+    setCaret(v, 12);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("x  y");
+  });
+
+  it("a selection deleted, cut and typed over keeps the surviving partner", () => {
+    const deleted = view("ab **cd** ef");
+    select(deleted, 1, 6);
+    keys(deleted, "Backspace");
+    expect(bytes(deleted.state)).toBe("a**d** ef");
+    const cutOne = view("ab **cd** ef");
+    select(cutOne, 1, 6);
+    expect(cut(cutOne)).toBe("b **c");
+    expect(bytes(cutOne.state)).toBe("a**d** ef");
+    const typed = view("ab **cd** ef");
+    select(typed, 1, 6);
+    typeText(typed, "X");
+    expect(bytes(typed.state)).toBe("aX**d** ef");
+    expect(caret(typed)).toBe(2);
+  });
+
+  it("an autocorrect replacement keeps the closing mark", () => {
+    const v = view("ab **cd** ef");
+    v.dispatch({
+      changes: { from: 5, to: 9, insert: "the" },
+      userEvent: "input.type",
+    });
+    expect(bytes(v.state)).toBe("ab **the** ef");
+  });
+
+  it("a command's bare input deletion passes as it is", () => {
+    const v = view("ab **cd** ef");
+    v.dispatch({ changes: { from: 3, to: 5 }, userEvent: "input" });
+    expect(bytes(v.state)).toBe("ab cd** ef");
+  });
+
+  it("a deleted heading prefix goes with the selection", () => {
+    const v = view("## Title");
+    v.dispatch({
+      changes: { from: 0, to: 3 },
+      userEvent: "delete.selection",
+    });
+    expect(bytes(v.state)).toBe("Title");
+  });
+
+  it("one undo takes a split deletion back", () => {
+    const v = view("ab **cd** ef");
+    select(v, 1, 6);
+    keys(v, "Backspace");
+    undoOnce(v);
+    expect(bytes(v.state)).toBe("ab **cd** ef");
+  });
+});
+
+it("deletes as at the drawn place when the caret was never normalized", () => {
+  const view = markView("a **bold** c");
+  // A state with the raw selection at 10 that no filter has seen.
+  const state = parsedState(
+    EditorState.create({
+      doc: "a **bold** c",
+      selection: EditorSelection.cursor(10),
+      extensions: [
+        EditorState.lineSeparator.of("\n"),
+        ...surfaceExtensions({
+          adapter: engramAdapter({
+            domain: "eng",
+            client: new QueryClient(),
+            vocab: () => null,
+          }),
+          dark: false,
+          history: true,
+          screen: [],
+          preview: new Compartment(),
+          raw: false,
+          images: [],
+          uploads: [],
+          onTableContext: () => {},
+          onImageContext: () => {},
+          onElementContext: () => {},
+          onFloatingContext: () => {},
+        }),
+      ],
+    }),
+  );
+  view.setState(state);
+  expect(caret(view)).toBe(10);
+  expect(deleteVisible(view, false)).toBe(true);
+  expect(bytes(view.state)).toBe("a **bol** c");
+  expect(caret(view)).toBe(7);
+});
+
+describe("show mode, on the line the caret touches", () => {
+  it("Backspace after the stars removes one star, as today", () => {
+    const v = markView("a **bold** c", { mode: "show" });
+    setCaret(v, 10);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a **bold* c");
+  });
+
+  it("a selection deleted there is today's deletion", () => {
+    const v = markView("ab **cd** ef", { mode: "show" });
+    select(v, 1, 6);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("ad** ef");
+  });
+});
+
+it("Raw: Backspace after the stars removes one star", () => {
+  const v = markView("a **bold** c", { raw: true });
+  setCaret(v, 10);
+  keys(v, "Backspace");
+  expect(bytes(v.state)).toBe("a **bold* c");
+});
+
+it("a remote deletion is never rewritten", () => {
+  const v = markView("ab **cd** ef");
+  v.dispatch({
+    changes: { from: 1, to: 6 },
+    userEvent: "delete.selection",
+    annotations: Transaction.remote.of(true),
+  });
+  expect(bytes(v.state)).toBe("ad** ef");
+});
+
+describe("in a table cell, a hidden escape is left to the cell's own rule", () => {
+  beforeAll(async () => {
+    await prefetchGrid();
+  });
+  afterEach(cleanupCells);
+
+  it.each([
+    { name: "an escaped pipe", text: "| a\\|b | c |\n| - | - |\n" },
+    { name: "a backslash pair", text: "| a\\\\b | c |\n| - | - |\n" },
+  ])("$name", ({ text }) => {
+    const main = markView(text);
+    const cell = openAt(main, 5).view;
+    // The cell has no hidden-mark layer until it is given one; with it, the
+    // key still defers on the escape the cell keeps whole.
+    cell.dispatch({
+      effects: StateEffect.appendConfig.of(hiddenMarkLayerOn.of(true)),
+    });
+    cell.dispatch({ selection: EditorSelection.cursor(5) });
+    expect(deleteVisible(cell, false)).toBe(false);
+    cell.dispatch({ selection: EditorSelection.cursor(3) });
+    expect(deleteVisible(cell, true)).toBe(false);
+    expect(bytes(main.state)).toBe(text);
+  });
+});

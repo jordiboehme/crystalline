@@ -23,7 +23,7 @@ import { floatingContextListener } from "./floatingContext";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
-import { hiddenMarkLayer } from "./marks";
+import { crossEdge, hiddenMarkLayer } from "./marks";
 import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
@@ -137,10 +137,17 @@ export function previewConfig(
         // After the prose layers and outside `livePreview()`, so the cell
         // editor, which reads `proseLayers`, does not get it until it is
         // given the layer on purpose.
-        hiddenMarkLayer(),
+        hiddenMarkLayer({
+          confirmHeadingChange: (state, line, level) =>
+            adapter.confirmHeadingChange(state, line, level),
+        }),
         // Before the read-only previews: the grid takes over the tables it
         // draws once its chunk is in.
         tableGrid(),
+        // After the grid, whose way into a table from the line beside it
+        // comes first: an arrow at a line's visible edge, with hidden marks
+        // up to the raw edge, goes over the line break.
+        crossEdge,
         fencePreviews(dark),
         // A pasted screenshot is a path in the buffer and a picture on the
         // page, so the picture is drawn here too: an author placing an image

@@ -34,6 +34,7 @@ export interface MarkViewOptions {
 
 const views = new Set<EditorView>();
 const undoManagers = new WeakMap<EditorView, Y.UndoManager>();
+const roomTexts = new WeakMap<EditorView, Y.Text>();
 const markCompartments = new WeakMap<EditorView, Compartment>();
 
 /** Destroys every view `markView` built; call in `afterEach`. */
@@ -61,9 +62,11 @@ export function markView(
   let undoManager: Y.UndoManager | null = null;
   const marks = new Compartment();
   let doc = text;
+  let roomText: Y.Text | null = null;
   if (options.room) {
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText("content");
+    roomText = ytext;
     ytext.insert(0, text);
     undoManager = new Y.UndoManager(ytext);
     doc = ytext.toJSON();
@@ -103,7 +106,24 @@ export function markView(
   if (undoManager) {
     undoManagers.set(view, undoManager);
   }
+  if (roomText) {
+    roomTexts.set(view, roomText);
+  }
   return parsedView(view);
+}
+
+/**
+ * A peer's insert into the room `view` is in, arriving through the binding
+ * the way a remote change does (no selection, the binding's own annotation).
+ */
+export function remoteInsert(view: EditorView, at: number, text: string): void {
+  const ytext = roomTexts.get(view);
+  if (!ytext) {
+    throw new Error("remoteInsert takes a room view built by markView");
+  }
+  ytext.doc?.transact(() => {
+    ytext.insert(at, text);
+  }, "peer");
 }
 
 /** Whether the setting says to show marks on the edited line. */
