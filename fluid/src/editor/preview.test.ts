@@ -71,6 +71,33 @@ describe("hidden marks", () => {
     expect(show.contentDOM.textContent).toContain("**bold**");
   });
 
+  it("builds no new decoration set for a caret move in hidden mode", () => {
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: "a **bold** c\nnext",
+          extensions: [
+            ...baseExtensions(false),
+            livePreview(),
+            hiddenMarkLayer(),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    const sets = () =>
+      view.state.facet(EditorView.atomicRanges).map((ranges) => ranges(view));
+    const before = sets();
+    expect(before.some((set) => set.size > 0)).toBe(true);
+    view.dispatch({ selection: EditorSelection.cursor(14) });
+    const after = sets();
+    expect(after).toHaveLength(before.length);
+    after.forEach((set, index) => {
+      expect(set).toBe(before[index]);
+    });
+    view.destroy();
+  });
+
   it("shows every mark in the source view", () => {
     const raw = markView("a **bold** c", { raw: true });
     setCaret(raw, 6);

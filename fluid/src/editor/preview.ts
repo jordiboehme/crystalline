@@ -32,7 +32,7 @@ import {
 
 import { frontmatterRegion } from "./frontmatterRegion";
 import { marksOnLine } from "./marks/hiddenMarks";
-import { markModeChanged } from "./marks/mode";
+import { markModeChanged, marksOnEditLine } from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 
@@ -189,7 +189,8 @@ const hiddenMarkPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate) {
       if (
         update.docChanged ||
-        update.selectionSet ||
+        // A selection reveals marks only with the setting on.
+        (update.selectionSet && update.state.facet(marksOnEditLine)) ||
         update.viewportChanged ||
         parseAdvanced(update) ||
         parkingChanged(update) ||

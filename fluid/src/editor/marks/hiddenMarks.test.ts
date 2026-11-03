@@ -122,6 +122,24 @@ const CASES: Case[] = [
     hidden: [[2, 12, "comment", "whole"]],
     show: [],
   },
+  {
+    name: "an empty heading being given its words",
+    doc: "## ",
+    line: 1,
+    hidden: [[0, 3, "heading", "prefix"]],
+  },
+  {
+    name: "a code line of a fence in a callout",
+    doc: "> [!NOTE]\n> ```\n> code\n> ```",
+    line: 3,
+    hidden: [[16, 18, "quote", "prefix"]],
+  },
+  {
+    name: "the closing fence of a fence in a callout",
+    doc: "> [!NOTE]\n> ```\n> code\n> ```",
+    line: 4,
+    hidden: [[23, 25, "quote", "prefix"]],
+  },
 ];
 
 function spelled(marks: Mark[]): Spelled[] {
@@ -244,6 +262,36 @@ describe("marksOnLine", () => {
     expect(marksOnLine(view.state, 2)).toEqual([]);
     expect(marksOnLine(view.state, 5)).toHaveLength(2);
   });
+});
+
+describe("show mode, on a line the caret does not touch", () => {
+  const UNTOUCHED: Case[] = [
+    {
+      name: "a quote",
+      doc: "> q\nx",
+      line: 1,
+      hidden: [[0, 2, "quote", "prefix"]],
+    },
+    {
+      name: "a bullet",
+      doc: "- item\nx",
+      line: 1,
+      hidden: [[0, 2, "list", "prefix"]],
+    },
+    {
+      name: "a code line of a fence in a callout",
+      doc: "> [!NOTE]\n> ```\n> code\n> ```\nx",
+      line: 3,
+      hidden: [[16, 18, "quote", "prefix"]],
+    },
+  ];
+  for (const c of UNTOUCHED) {
+    it(`folds ${c.name}`, () => {
+      const view = markView(c.doc, { mode: "show" });
+      setCaret(view, view.state.doc.length);
+      expect(spelled(marksOnLine(view.state, c.line))).toEqual(c.hidden);
+    });
+  }
 });
 
 describe("runsOnLine and runAt", () => {

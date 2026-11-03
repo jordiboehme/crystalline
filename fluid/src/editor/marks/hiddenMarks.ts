@@ -179,6 +179,10 @@ export function marksOnLine(state: EditorState, line: number): Mark[] {
     }
   };
   const char = (pos: number) => doc.sliceString(pos, pos + 1);
+  // A `>` with the one optional space after it.
+  const quote = (from: number, to: number) => {
+    add(from, isSpace(char(to)) ? to + 1 : to, "quote", "prefix");
+  };
   let inCode = false;
   // Where an observation's category or a task box already took a `[`, so the
   // parser's link over the same brackets is not read twice.
@@ -260,12 +264,15 @@ export function marksOnLine(state: EditorState, line: number): Mark[] {
         return;
       }
       if (NO_MARKS.has(name)) {
-        if (
-          (name === "FencedCode" || name === "CodeBlock") &&
-          ref.from <= at.from &&
-          ref.to >= at.from
-        ) {
-          inCode = true;
+        if (name === "FencedCode" || name === "CodeBlock") {
+          if (ref.from <= at.from && ref.to >= at.from) {
+            inCode = true;
+          }
+          // In a quote or a callout the parser hangs each code line's `>`
+          // under the block: those are the quote's marks, not code.
+          for (const mark of ref.node.getChildren("QuoteMark")) {
+            quote(mark.from, mark.to);
+          }
         }
         return false;
       }
@@ -349,12 +356,7 @@ export function marksOnLine(state: EditorState, line: number): Mark[] {
         return;
       }
       if (name === "QuoteMark") {
-        add(
-          ref.from,
-          isSpace(char(ref.to)) ? ref.to + 1 : ref.to,
-          "quote",
-          "prefix",
-        );
+        quote(ref.from, ref.to);
         return;
       }
     },
