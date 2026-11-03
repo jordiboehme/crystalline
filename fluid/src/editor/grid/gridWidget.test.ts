@@ -162,6 +162,16 @@ describe("names for a screen reader (finding 7)", () => {
     expect(names).toEqual(["Table: a, b", "Table: x, y"]);
   });
 
+  test("a header's HTML never reaches the name, not even half a tag", () => {
+    const main = soloMain(
+      "| <<b>script>x | b |\n| - | - |\n| 1 | 2 |\n",
+      layers(),
+    );
+    const label = grid(main).getAttribute("aria-label") ?? "";
+    expect(label).not.toMatch(/[<>]/);
+    expect(label).toBe("Table: scriptx, b");
+  });
+
   test("the name follows a header edit", () => {
     const { main, rtext } = roomMain(DOC, layers());
     rtext.insert(DOC.indexOf(" a ") + 2, "ge");

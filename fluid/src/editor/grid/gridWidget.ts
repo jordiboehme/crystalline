@@ -209,6 +209,7 @@ function plainOf(text: string): string {
     ) // a wikilink: its label, else its target
     .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // a link: its text
     .replace(/<[^>]*>/g, "") // inline HTML tags
+    .replace(/[<>]/g, "") // and any bracket left over, so no tag survives
     .replace(/(\*\*|__|~~|\*|_|`)/g, "") // emphasis and code marks
     .replace(/\\(.)/g, "$1") // escapes: the character itself
     .replace(/\s+/g, " ")
