@@ -715,7 +715,9 @@ test.describe.serial("the Reflection journeys", () => {
     await expect(editor).toContainText("sketch.png");
     await expect
       .poll(() => pageSource(page, "guides/welcome.md"))
-      .toMatch(/Written in the smoke\.\n\n!\[sketch\.png\]\([^)]*\)\n$/);
+      .toMatch(
+        /Written in the smoke\.\n\n!\[sketch\.png\]\(\.\.\/assets\/[^)]*sketch\.png\)\n$/,
+      );
     await page.getByRole("link", { name: "Done", exact: true }).click();
     await expectLoaded(page.getByRole("img", { name: "sketch.png" }));
   });

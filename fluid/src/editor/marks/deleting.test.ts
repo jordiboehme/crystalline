@@ -12,6 +12,12 @@ import {
   StateEffect,
   Transaction,
 } from "@codemirror/state";
+import {
+  deleteGroupBackward,
+  deleteGroupForward,
+  deleteLineBoundaryBackward,
+  deleteToLineEnd,
+} from "@codemirror/commands";
 import type { EditorView } from "@codemirror/view";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -301,5 +307,90 @@ describe("in a table cell, a hidden escape is left to the cell's own rule", () =
     cell.dispatch({ selection: EditorSelection.cursor(3) });
     expect(deleteVisible(cell, true)).toBe(false);
     expect(bytes(main.state)).toBe(text);
+  });
+});
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])("word and line deletes keep the partner, $name", ({ room }) => {
+  const view = (text: string, at: number) => {
+    const v = markView(text, { room });
+    setCaret(v, at);
+    return v;
+  };
+
+  it.each([
+    {
+      name: "deleteGroupBackward",
+      command: deleteGroupBackward,
+      text: "a **bold** c",
+      at: 11,
+      // The space goes, the closing mark stays.
+      bytes: "a **bold**c",
+    },
+    {
+      name: "deleteGroupForward",
+      command: deleteGroupForward,
+      text: "a **bold** c",
+      at: 2,
+      // Only the hidden opening mark lay in reach: nothing is left to take.
+      bytes: "a **bold** c",
+    },
+    {
+      name: "deleteToLineEnd",
+      command: deleteToLineEnd,
+      text: "a **bold** c",
+      at: 5,
+      bytes: "a **b**",
+    },
+    {
+      name: "deleteLineBoundaryBackward",
+      command: deleteLineBoundaryBackward,
+      text: "a **bold**",
+      at: 8,
+      // The opening mark stays for its partner, then the pair is empty.
+      bytes: "",
+    },
+  ])("$name", ({ command, text, at, bytes: expected }) => {
+    const v = view(text, at);
+    command(v);
+    expect(bytes(v.state)).toBe(expected);
+  });
+
+  it("Mod+Backspace and Mod+Delete through the keymap", () => {
+    const back = view("a **bold** c", 11);
+    keys(back, "Mod-Backspace");
+    expect(bytes(back.state)).toBe("a **bold**c");
+    const forward = view("a **bold** c", 2);
+    keys(forward, "Mod-Delete");
+    expect(bytes(forward.state)).toBe("a **bold** c");
+  });
+
+  it("a selection delete that empties a pair takes both marks", () => {
+    const bold = markView("a **bold** c", { room });
+    select(bold, 4, 8);
+    keys(bold, "Backspace");
+    expect(bytes(bold.state)).toBe("a  c");
+    const link = markView("a [x](http://x) c", { room });
+    select(link, 3, 4);
+    keys(link, "Delete");
+    expect(bytes(link.state)).toBe("a  c");
+    const typed = markView("a **bold** c", { room });
+    select(typed, 4, 8);
+    typeText(typed, "X");
+    expect(bytes(typed.state)).toBe("a **X** c");
+  });
+
+  it("a pair across two lines keeps its partner", () => {
+    const v = markView("**a\nb** c", { room });
+    select(v, 1, 3);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("**\nb** c");
+    // Everything between the two marks gone: the pair goes with it.
+    const all = markView("**a\nb** c", { room });
+    select(all, 1, 5);
+    keys(all, "Backspace");
+    expect(bytes(all.state)).toBe(" c");
   });
 });

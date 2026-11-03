@@ -34,6 +34,7 @@ import {
 } from "@codemirror/state";
 import type { Command } from "@codemirror/view";
 import { EditorView, keymap } from "@codemirror/view";
+import { syntaxTree } from "@codemirror/language";
 
 import { roomUndo } from "../roomUndo";
 import {
@@ -394,6 +395,11 @@ const PERSON_REPLACES = new Set([
   "delete.selection",
   "delete.cut",
   "move.drop",
+  // The word and line deletes (Mod/Alt/Cmd+Backspace and Delete), and the
+  // plain keys where they fall through to CodeMirror's own command. A
+  // deletion from `deleteVisible` already keeps every partner, so it passes.
+  "delete.backward",
+  "delete.forward",
 ]);
 
 /** The annotations a rebuilt edit carries over from the one it replaces. */
@@ -415,13 +421,50 @@ function carried(tr: Transaction): Annotation<unknown>[] {
 }
 
 /**
- * The marks a range deletion keeps: one wholly inside a deleted range whose
- * partner lies outside every deleted range, and any mark a deleted range
- * only cuts into. A prefix, a comment or a mark whose partner goes too goes
- * with the range.
+ * The partner of a mark whose pair spans two lines (the model gives it no
+ * partner on its own line): the other end of the syntax node the mark
+ * belongs to, or null.
  */
-function keptMarks(state: EditorState, deleted: readonly Range[]): Range[] {
-  const kept: Range[] = [];
+function partnerAcrossLines(state: EditorState, mark: Mark): Range | null {
+  const node = syntaxTree(state).resolveInner(mark.from, 1);
+  const parent =
+    node.from === mark.from && node.to === mark.to ? node.parent : null;
+  if (!parent) {
+    return null;
+  }
+  const other = mark.side === "open" ? parent.lastChild : parent.firstChild;
+  if (!other || other.from === mark.from || other.name !== node.name) {
+    return null;
+  }
+  return { from: other.from, to: other.to };
+}
+
+/** The hidden marks of every line from `from`'s to `to`'s. */
+function marksBetween(state: EditorState, from: number, to: number): Mark[] {
+  const first = state.doc.lineAt(from).number;
+  const last = state.doc.lineAt(to).number;
+  const out: Mark[] = [];
+  for (let n = first; n <= last; n += 1) {
+    out.push(...marksOnLine(state, n));
+  }
+  return out;
+}
+
+/**
+ * What a range deletion does to the marks: `kept` are the marks it must
+ * leave (one wholly inside a deleted range whose partner lies outside every
+ * deleted range, and any mark a deleted range only cuts into); `dropped` are
+ * the marks of a pair the deletion leaves with no visible character and no
+ * inserted text between them, which go too. A prefix, a comment or a mark
+ * whose partner goes too goes with the range.
+ */
+function markFate(
+  state: EditorState,
+  deleted: readonly Range[],
+  inserts: readonly number[],
+): { kept: Range[]; dropped: Range[] } {
+  const kept: Mark[] = [];
+  const dropped: Range[] = [];
   const inside = (mark: Range) =>
     deleted.some((d) => d.from <= mark.from && mark.to <= d.to);
   const cut = (mark: Range) =>
@@ -444,19 +487,53 @@ function keptMarks(state: EditorState, deleted: readonly Range[]): Range[] {
         kept.push(mark);
         continue;
       }
-      if (!inside(mark) || mark.partner === null) {
+      if (!inside(mark) || (mark.side !== "open" && mark.side !== "close")) {
         continue;
       }
-      if (mark.side !== "open" && mark.side !== "close") {
-        continue;
-      }
-      const partner = marks[mark.partner];
+      const partner =
+        mark.partner === null
+          ? partnerAcrossLines(state, mark)
+          : (marks[mark.partner] ?? null);
       if (partner && !inside(partner)) {
         kept.push(mark);
       }
     }
+    // A pair whose marks both stay but whose inside the deletion emptied.
+    const stays = (mark: Range) =>
+      !inside(mark) || kept.some((k) => k.from === mark.from);
+    for (const open of marks) {
+      if (open.side !== "open") {
+        continue;
+      }
+      const close =
+        open.partner === null
+          ? partnerAcrossLines(state, open)
+          : (marks[open.partner] ?? null);
+      if (!close || !stays(open) || !stays(close)) {
+        continue;
+      }
+      const touched = deleted.some(
+        (d) => d.from < close.from && open.to < d.to,
+      );
+      const typed = inserts.some((at) => open.to <= at && at <= close.from);
+      if (
+        touched &&
+        !typed &&
+        !visibleBetween(
+          open.to,
+          close.from,
+          deleted,
+          marksBetween(state, open.to, close.from),
+        )
+      ) {
+        dropped.push(open, close);
+      }
+    }
   }
-  return merged(kept);
+  const keptRanges = kept.filter(
+    (mark) => !dropped.some((d) => d.from === mark.from),
+  );
+  return { kept: merged(keptRanges), dropped: merged(dropped) };
 }
 
 /**
@@ -478,19 +555,29 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
   }
   const start = tr.startState;
   const deleted: Range[] = [];
-  tr.changes.iterChangedRanges((fromA, toA) => {
+  const inserts: number[] = [];
+  tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
     if (fromA < toA) {
       deleted.push({ from: fromA, to: toA });
+    }
+    if (inserted.length > 0) {
+      inserts.push(fromA);
     }
   });
   if (deleted.length === 0) {
     return tr;
   }
-  const kept = keptMarks(start, deleted);
-  if (kept.length === 0) {
+  const { kept, dropped } = markFate(start, deleted, inserts);
+  if (kept.length === 0 && dropped.length === 0) {
     return tr;
   }
   const specs: ChangeSpec[] = [];
+  // The marks of an emptied pair that no deleted range covers.
+  for (const mark of dropped) {
+    if (!deleted.some((d) => d.from <= mark.from && mark.to <= d.to)) {
+      specs.push({ from: mark.from, to: mark.to });
+    }
+  }
   /** Where each original change's text went: `[fromB, toB, insertAt]`. */
   const placed: [number, number, number][] = [];
   tr.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
