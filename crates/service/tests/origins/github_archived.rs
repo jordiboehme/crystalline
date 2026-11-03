@@ -841,11 +841,24 @@ async fn the_share_reads_stay_open_on_an_archived_domain() {
         (
             reqwest::Method::POST,
             format!("/api/v1/domains/{KB}/sync/conflicts/nope/resolve"),
-            Some(json!({ "resolution": "theirs" })),
+            Some(json!({ "resolution": "mine" })),
         ),
     ] {
         let (status, answer) = send(&fx, &session, method, &path, body).await;
         assert_eq!(status, 403, "{path}: {answer}");
         assert_eq!(answer["detail"], SENTENCE, "{path}: {answer}");
     }
+    // Taking GitHub's side is a pull, which still applies: it is not refused
+    // with the sentence and goes on to look the conflict up.
+    let path = format!("/api/v1/domains/{KB}/sync/conflicts/nope/resolve");
+    let (status, answer) = send(
+        &fx,
+        &session,
+        reqwest::Method::POST,
+        &path,
+        Some(json!({ "resolution": "theirs" })),
+    )
+    .await;
+    assert_ne!(answer["detail"], SENTENCE, "{path}: {status} {answer}");
+    assert_eq!(status, 404, "{path}: {answer}");
 }

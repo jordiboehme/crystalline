@@ -2245,7 +2245,12 @@ pub async fn resolve_conflict(
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role_on(&state, &identity, &domain).await?;
-    refuse_archived_share(&state, &identity, &domain).await?;
+    // Taking GitHub's side is what a pull does, and a pull still applies on
+    // an archived domain: it leaves nothing unshared, so only "mine" and
+    // "merged" are refused there, as the engine path does.
+    if body.resolution != "theirs" {
+        refuse_archived_share(&state, &identity, &domain).await?;
+    }
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
