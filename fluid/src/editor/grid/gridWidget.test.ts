@@ -169,7 +169,7 @@ describe("names for a screen reader (finding 7)", () => {
     );
     const label = grid(main).getAttribute("aria-label") ?? "";
     expect(label).not.toMatch(/[<>]/);
-    expect(label).toBe("Table: scriptx, b");
+    expect(label).toBe("Table: x, b");
   });
 
   test("the name follows a header edit", () => {

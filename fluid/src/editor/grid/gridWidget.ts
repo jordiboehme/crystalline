@@ -197,19 +197,33 @@ function patch(root: HTMLElement, main: EditorView): void {
   }
 }
 
+/**
+ * Inline HTML tags taken out until none is left (a removal can join two
+ * halves into a new tag, `<<b>script>`), then any bracket left over.
+ */
+function withoutTags(text: string): string {
+  let rest = text;
+  let before: string;
+  do {
+    before = rest;
+    rest = rest.replace(/<[^<>]*>/g, "");
+  } while (rest !== before);
+  return rest.replace(/[<>]/g, "");
+}
+
 /** A cell's text as a reader hears it: drawn, then read back as plain text. */
 function plainOf(text: string): string {
   // Read as text, never rendered: a header holding an image starts no fetch.
-  return text
-    .replace(/\\\|/g, "|") // a cell's escaped pipe, as in a wikilink label
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // an image: its alt text
-    .replace(
-      /\[\[([^\]|]*)(?:\|([^\]]*))?\]\]/g,
-      (_m, target: string, label?: string) => label ?? target,
-    ) // a wikilink: its label, else its target
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // a link: its text
-    .replace(/<[^>]*>/g, "") // inline HTML tags
-    .replace(/[<>]/g, "") // and any bracket left over, so no tag survives
+  return withoutTags(
+    text
+      .replace(/\\\|/g, "|") // a cell's escaped pipe, as in a wikilink label
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // an image: its alt text
+      .replace(
+        /\[\[([^\]|]*)(?:\|([^\]]*))?\]\]/g,
+        (_m, target: string, label?: string) => label ?? target,
+      ) // a wikilink: its label, else its target
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1"), // a link: its text
+  )
     .replace(/(\*\*|__|~~|\*|_|`)/g, "") // emphasis and code marks
     .replace(/\\(.)/g, "$1") // escapes: the character itself
     .replace(/\s+/g, " ")
