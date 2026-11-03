@@ -285,6 +285,33 @@ describe("replacing inside cells (R20)", () => {
     expect(bytes(main.state)).toBe("| a |\n| - |\n| 1 |\n\nsome p|q\nr here\n");
   });
 
+  test("replaceAll with a pipe in several cells of one table escapes each (T6)", () => {
+    const text = "| a | b |\n| - | - |\n| 2 | x 2 |\n| 22 | y |\n\noutside 2\n";
+    const main = soloMain(text, layers());
+    query(main, "2", "p|q");
+    replaceAll(main);
+    // Each cell is escaped against the start document on its own, so a
+    // second hit in the same row or in the same cell is not shifted.
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| p\\|q | x p\\|q |\n| p\\|qp\\|q | y |\n\noutside p|q\n",
+    );
+    expect(shape(main.state)).toEqual([2, 2, 2]);
+  });
+
+  test("replaceAll with a trailing backslash in several cells keeps every row (T6)", () => {
+    const text = "|a|b|\n|-|-|\n|2|2|\n|2|q|\n";
+    const main = soloMain(text, layers());
+    query(main, "2", "x\\");
+    replaceAll(main);
+    const table = gridTables(main.state)[0];
+    expect(table?.rows.map((row) => row.length)).toEqual([2, 2, 2]);
+    expect(table?.rows[1]?.map((cell) => cell.text)).toEqual([
+      "x\\\\",
+      "x\\\\",
+    ]);
+    expect(table?.rows[2]?.map((cell) => cell.text)).toEqual(["x\\\\", "q"]);
+  });
+
   test("a backslash right before the closing pipe gets the one it needs", () => {
     const text = "|a|\n|-|\n|2|\n";
     const main = soloMain(text, layers());

@@ -5,9 +5,12 @@
  * dynamic import, and only when a table the grid draws shows up in a view (or
  * a screen calls `prefetchGrid`). One compartment and one load for the whole
  * app - `previewConfig` runs again on every Raw flip, and a compartment made
- * per call would forget what the chunk brought. Until the chunk is in, and for
- * good if its import fails, nothing here changes the editor, so every table
- * keeps the read-only preview.
+ * per call would forget what the chunk brought. Until the chunk is in, nothing
+ * here changes the editor, so every table keeps the read-only preview. A
+ * failed import (a network blip, or a redeploy that changed the chunk's
+ * hash) is asked for again on the next check, the next edit or scroll, so
+ * the tables do not stay read-only for the whole session. While the network
+ * is down that is a fresh `import()` per check, which fails fast.
  */
 
 import { syntaxTree } from "@codemirror/language";
@@ -54,7 +57,11 @@ export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
         loaded = chunk.gridExtension();
         return loaded;
       },
-      () => null,
+      () => {
+        // Forgotten, so the next check asks again.
+        loading = null;
+        return null;
+      },
     );
     return loading;
   };
@@ -78,7 +85,11 @@ export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
         if (this.asked || !hasGridTable(this.view.state)) return;
         this.asked = true;
         void request().then((extension) => {
-          if (extension === null || this.gone) return;
+          if (extension === null) {
+            this.asked = false; // the next check tries again
+            return;
+          }
+          if (this.gone) return;
           this.view.dispatch({ effects: compartment.reconfigure(extension) });
         });
       }

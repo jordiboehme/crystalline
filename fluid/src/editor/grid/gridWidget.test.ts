@@ -120,11 +120,50 @@ function widgetOf(main: EditorView): GridWidget {
   return found;
 }
 
+describe("names for a screen reader (finding 7)", () => {
+  test("the grid is named after its header, the plain text of each cell", () => {
+    const main = soloMain(
+      "| **Name** | `Role` |  |\n| - | - | - |\n| 1 | 2 | 3 |\n",
+      layers(),
+    );
+    expect(grid(main).getAttribute("aria-label")).toBe(
+      "Table: Name, Role, Column 3",
+    );
+  });
+
+  test("two tables on a page have their own names", () => {
+    const main = soloMain(
+      `${DOC}\n| x | y |\n| - | - |\n| 3 | 4 |\n`,
+      layers(),
+    );
+    const names = [...main.dom.querySelectorAll('table[role="grid"]')].map(
+      (el) => el.getAttribute("aria-label"),
+    );
+    expect(names).toEqual(["Table: a, b", "Table: x, y"]);
+  });
+
+  test("the name follows a header edit", () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    rtext.insert(DOC.indexOf(" a ") + 2, "ge");
+    expect(grid(main).getAttribute("aria-label")).toBe("Table: age, b");
+  });
+
+  test("the open cell's editor says which cell it is, single line", () => {
+    const main = soloMain(DOC, layers());
+    const cell = openByMouse(main, 1, 1);
+    const content = cell.view.contentDOM;
+    expect(content.getAttribute("aria-label")).toBe("b, row 1");
+    expect(content.getAttribute("aria-multiline")).toBe("false");
+    const header = openByMouse(main, 0, 0);
+    expect(header.view.contentDOM.getAttribute("aria-label")).toBe("a, header");
+  });
+});
+
 describe("drawing", () => {
   test("a table draws as a grid with header and data cells", () => {
     const main = soloMain(DOC, layers());
     const table = grid(main);
-    expect(table.getAttribute("aria-label")).toBe("Table");
+    expect(table.getAttribute("aria-label")).toBe("Table: a, b");
     const headers = [...table.querySelectorAll("th")];
     const cells = [...table.querySelectorAll("td")];
     expect(headers.map((el) => el.textContent)).toEqual(["a", "b"]);

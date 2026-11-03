@@ -31,13 +31,22 @@ import {
   mountedCell,
   openCellField,
   openCellRange,
+  parseThrough,
   setOpenCell,
 } from "./openCell";
 import { gridTableAt, tableIn } from "./structure";
 
-/** The rows and cells of a clipboard block; null when it is one value. */
-export function blockOf(plain: string): string[][] | null {
+/**
+ * The rows and cells of a clipboard block; null when it is one value. A
+ * block has a tab, or comes with an HTML table beside its plain text
+ * (finding 8): two lines of prose are one value, typed with the line break
+ * as a space, and never overwrite the cell below.
+ */
+export function blockOf(plain: string, html = ""): string[][] | null {
   if (!/[\t\r\n]/.test(plain)) return null;
+  // Lines with no tab are prose with line breaks, one value, unless the
+  // clipboard also holds an HTML table (a spreadsheet's copy of one column).
+  if (!plain.includes("\t") && !/<table[\s>]/i.test(html)) return null;
   const lines = plain.replace(/\r\n?/g, "\n").split("\n");
   if (lines.length > 1 && lines.at(-1) === "") lines.pop();
   const rows = lines.map((line) => line.split("\t").map((cell) => cell.trim()));
@@ -114,10 +123,16 @@ function absolute(from: number, changes: SpanChange[]): ChangeSpec[] {
   }));
 }
 
-/** Inserts `text` at the cell view's selection, as typed. */
+/**
+ * Inserts `text` at the cell view's selection, as typed: the line breaks of
+ * the ends dropped (a copied paragraph ends in one), the others turned into
+ * a space.
+ */
 function typed(view: EditorView, text: string): void {
   if (!view.dom.isConnected) return;
-  const flat = text.replace(/\s*(?:\r\n|\r|\n)[\s]*/g, " ");
+  const flat = text
+    .replace(/^[\s]*(?:\r\n|\r|\n)\s*|\s*(?:\r\n|\r|\n)[\s]*$/g, "")
+    .replace(/\s*(?:\r\n|\r|\n)[\s]*/g, " ");
   view.dispatch(view.state.replaceSelection(flat), {
     userEvent: "input.paste",
     scrollIntoView: true,
@@ -132,110 +147,129 @@ function fill(main: EditorView, rows: string[][]): boolean {
   const table = gridTableAt(main.state, open.head);
   if (!table) return false;
   const { state } = main;
-  const lb = state.lineBreak;
-  const wide = Math.max(...rows.map((row) => row.length));
+  /**
+   * Works the paste out on a scratch copy of the document. Null, or a throw
+   * (a grown table that stops parsing), means it cannot be done as a block,
+   * and the caller types the paste as one value instead (finding 9).
+   */
+  const plan = () => {
+    const lb = state.lineBreak;
+    const wide = Math.max(...rows.map((row) => row.length));
 
-  let doc: Text = state.doc;
-  let total = ChangeSet.empty(doc.length);
-  let to = table.to;
-  const from = table.from;
-  const apply = (specs: ChangeSpec[]) => {
-    const set = ChangeSet.of(specs, doc.length, lb);
-    doc = set.apply(doc);
-    total = total.compose(set);
-    to = set.mapPos(to, 1);
-  };
-  const model = () => {
-    const parsed = parseTable(doc.sliceString(from, to));
-    if (!parsed) throw new Error("the pasted-into table stopped parsing");
-    return parsed;
-  };
+    let doc: Text = state.doc;
+    let total = ChangeSet.empty(doc.length);
+    let to = table.to;
+    const from = table.from;
+    const apply = (specs: ChangeSpec[]) => {
+      const set = ChangeSet.of(specs, doc.length, lb);
+      doc = set.apply(doc);
+      total = total.compose(set);
+      to = set.mapPos(to, 1);
+    };
+    const model = () => {
+      const parsed = parseTable(doc.sliceString(from, to));
+      if (!parsed) throw new Error("the pasted-into table stopped parsing");
+      return parsed;
+    };
 
-  const columns = cell.column + wide;
-  while (model().columns < columns) {
-    const m = model();
-    const changes = addColumnAfter(m, m.columns - 1);
-    if (!changes) return false;
-    apply(absolute(from, changes));
-  }
-  const dataRows = cell.row + rows.length;
-  while (model().lines.length - 1 < dataRows) {
-    const m = model();
-    const changes = addRowBelow(m, m.lines.length - 1, lb);
-    if (!changes) return false;
-    apply(absolute(from, changes));
-  }
-
-  // A ragged row shorter than the paste reaches grows in the same change set,
-  // in its own spelling, so no pasted value is dropped.
-  const extend: ChangeSpec[] = [];
-  const shaped = model();
-  rows.forEach((values, r) => {
-    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
-    const line = shaped.lines[index];
-    const last = line?.cells.at(-1);
-    if (!line || !last) return;
-    const missing = cell.column + values.length - line.cells.length;
-    if (missing <= 0) return;
-    if (line.trailingPipe) {
-      extend.push({
-        from: from + line.start + last.to + 1,
-        insert: "  |".repeat(missing),
-      });
-    } else {
-      extend.push({
-        from: from + line.start + last.to,
-        insert: ` |${"  |".repeat(missing)}`,
-      });
+    const columns = cell.column + wide;
+    while (model().columns < columns) {
+      const m = model();
+      const changes = addColumnAfter(m, m.columns - 1);
+      if (!changes) return null;
+      apply(absolute(from, changes));
     }
-  });
-  if (extend.length > 0) apply(extend);
+    const dataRows = cell.row + rows.length;
+    while (model().lines.length - 1 < dataRows) {
+      const m = model();
+      const changes = addRowBelow(m, m.lines.length - 1, lb);
+      if (!changes) return null;
+      apply(absolute(from, changes));
+    }
 
-  const grown = tableIn(doc, from, to);
-  const fills: ChangeSpec[] = [];
-  rows.forEach((values, r) => {
-    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
-    const line = grown.model.lines[index];
-    values.forEach((value, c) => {
-      const target = grown.rows[cell.row + r]?.[cell.column + c];
-      if (!target || !line) return;
-      const closing = doc.sliceString(target.content.to, target.content.to + 1);
-      // An empty value at an edge without a pipe would take the cell with it
-      // (` | 2` is a leading pipe, `1 | ` a trailing one): the one pipe it
-      // needs to exist goes in its place (R23).
-      const column = cell.column + c;
-      const bare =
-        (column === 0 && !line.leadingPipe) ||
-        (column === line.cells.length - 1 && !line.trailingPipe);
-      fills.push({
-        from: target.content.from,
-        to: target.content.to,
-        insert: value === "" && bare ? "|" : stored(value, closing === "|"),
+    // A ragged row shorter than the paste reaches grows in the same change set,
+    // in its own spelling, so no pasted value is dropped.
+    const extend: ChangeSpec[] = [];
+    const shaped = model();
+    rows.forEach((values, r) => {
+      const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+      const line = shaped.lines[index];
+      const last = line?.cells.at(-1);
+      if (!line || !last) return;
+      const missing = cell.column + values.length - line.cells.length;
+      if (missing <= 0) return;
+      if (line.trailingPipe) {
+        extend.push({
+          from: from + line.start + last.to + 1,
+          insert: "  |".repeat(missing),
+        });
+      } else {
+        extend.push({
+          from: from + line.start + last.to,
+          insert: ` |${"  |".repeat(missing)}`,
+        });
+      }
+    });
+    if (extend.length > 0) apply(extend);
+
+    const grown = tableIn(doc, from, to);
+    const fills: ChangeSpec[] = [];
+    rows.forEach((values, r) => {
+      const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+      const line = grown.model.lines[index];
+      values.forEach((value, c) => {
+        const target = grown.rows[cell.row + r]?.[cell.column + c];
+        if (!target || !line) return;
+        const closing = doc.sliceString(
+          target.content.to,
+          target.content.to + 1,
+        );
+        // An empty value at an edge without a pipe would take the cell with it
+        // (` | 2` is a leading pipe, `1 | ` a trailing one): the one pipe it
+        // needs to exist goes in its place (R23).
+        const column = cell.column + c;
+        const bare =
+          (column === 0 && !line.leadingPipe) ||
+          (column === line.cells.length - 1 && !line.trailingPipe);
+        fills.push({
+          from: target.content.from,
+          to: target.content.to,
+          insert: value === "" && bare ? "|" : stored(value, closing === "|"),
+        });
       });
     });
-  });
-  apply(fills);
+    apply(fills);
 
-  // The rows the paste reached get the table's own spelling back where a
-  // grown row or column added an edge pipe they no longer need. A new row
-  // copies the spelling of the last row the table had.
-  const filled = model();
-  const trims: ChangeSpec[] = [];
-  const lastOld = table.model.lines.at(-1);
-  rows.forEach((_values, r) => {
-    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
-    const line = filled.lines[index];
-    const want = table.model.lines[index] ?? lastOld;
-    if (line && want) trims.push(...spare(from, line, want));
-  });
-  if (trims.length > 0) apply(trims);
+    // The rows the paste reached get the table's own spelling back where a
+    // grown row or column added an edge pipe they no longer need. A new row
+    // copies the spelling of the last row the table had.
+    const filled = model();
+    const trims: ChangeSpec[] = [];
+    const lastOld = table.model.lines.at(-1);
+    rows.forEach((_values, r) => {
+      const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+      const line = filled.lines[index];
+      const want = table.model.lines[index] ?? lastOld;
+      if (line && want) trims.push(...spare(from, line, want));
+    });
+    if (trims.length > 0) apply(trims);
 
-  const final = tableIn(doc, from, to);
-  const home = final.rows[cell.row]?.[cell.column];
-  if (!home) return false;
-  const reshaped =
-    final.model.columns !== table.model.columns ||
-    final.rows.length !== table.rows.length;
+    const final = tableIn(doc, from, to);
+    const home = final.rows[cell.row]?.[cell.column];
+    if (!home) return null;
+    const reshaped =
+      final.model.columns !== table.model.columns ||
+      final.rows.length !== table.rows.length;
+    return { total, home, reshaped, to };
+  };
+  let planned: ReturnType<typeof plan>;
+  try {
+    planned = plan();
+  } catch {
+    return false;
+  }
+  if (!planned) return false;
+  const { total, home, reshaped, to } = planned;
   const before = state.doc;
   closeUndoGroup(main, "before");
   main.dispatch({
@@ -248,6 +282,7 @@ function fill(main: EditorView, rows: string[][]): boolean {
     userEvent: "input.paste",
   });
   closeUndoGroup(main, "after");
+  parseThrough(main, to);
   if (reshaped) {
     const left = { anchor: open.anchor, head: open.head, focused: true };
     noteUndoLanding(main, {
@@ -302,7 +337,7 @@ export const cellPaste: Extension = Prec.highest(
         );
         return true;
       }
-      const rows = blockOf(plain);
+      const rows = blockOf(plain, data.getData("text/html"));
       if (rows === null || (rows.length === 1 && rows[0]?.length === 1)) {
         typed(view, rows?.[0]?.[0] ?? plain);
         return true;

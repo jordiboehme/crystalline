@@ -237,17 +237,25 @@ test("the hover plus inserts a column and the new header takes typing", async ({
   await edit(page, permalink);
 
   const header = cell(page, 1, 1);
-  const box = await header.boundingBox();
-  if (!box) throw new Error("the header cell has no box");
-  await page.mouse.move(box.x + box.width - 3, box.y + box.height / 2);
   const plus = page.getByRole("button", { name: "Insert column here" });
-  await expect(plus).toBeVisible();
+  // The pointer goes in from the middle of the cell to its right border, so
+  // the grid sees a few moves. The box is read again on each try: the page
+  // may still shift (the Details rail filling in) between the read and the
+  // move, and a single move to a stale box can miss the 8 px border zone.
+  await expect(async () => {
+    const box = await header.boundingBox();
+    if (!box) throw new Error("the header cell has no box");
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.move(box.x + box.width - 3, box.y + box.height / 2, {
+      steps: 4,
+    });
+    await expect(plus).toBeVisible({ timeout: 1_000 });
+  }).toPass({ timeout: 15_000 });
   await shot(page, "04-hover-plus.png");
   await plus.click();
 
   await expect(openCell(page)).toBeFocused();
-  // A new column starts with a placeholder name; replace it.
-  await page.keyboard.press("ControlOrMeta+A");
+  // A new column starts with a placeholder name, selected: typing replaces it.
   await page.keyboard.type("Boat");
   const file = await fileSatisfies(page, permalink, (f) => f.includes("Boat"));
   const rows = tableLines(file);
@@ -478,16 +486,14 @@ test("a table without outer pipes is drawn, edits and keeps its second column", 
   await expect(cell(page, 1, 1)).toContainText("a");
   await expect(cell(page, 2, 2)).toContainText("2");
 
-  // A cell edit works. The cells are entered from the keyboard: a mouse click
-  // on a one-character cell lands on the small "Cell actions" button, which
-  // covers most of such a cell while the pointer is over it.
-  await page
-    .locator(".cm-content > .cm-line")
-    .filter({ hasText: "Bare" })
-    .click();
-  await page.keyboard.press("End");
-  await page.keyboard.press("ArrowDown");
+  // A cell edit works, and a mouse click opens even a one-character cell:
+  // the small "Cell actions" button is drawn only on the focused or open
+  // cell, on its corner, so it never takes a click meant for a cell.
+  await cell(page, 1, 1).hover();
+  await expect(page.getByRole("button", { name: "Cell actions" })).toBeHidden();
+  await cell(page, 1, 1).click();
   await expect(openCell(page)).toBeFocused();
+  await expect(cell(page, 1, 1).locator(".cm-content")).toBeVisible();
   await page.keyboard.press("End");
   await page.keyboard.type("x");
   await fileSatisfies(page, permalink, (f) => /^ax \| b$/m.test(f));
@@ -508,6 +514,53 @@ test("a table without outer pipes is drawn, edits and keeps its second column", 
   expect(rows).toHaveLength(3);
   expect(rows[2]).toBe("|  | 2");
   await expect(cell(page, 2, 1)).toHaveText("");
+});
+
+test("the sticky bar's Bold acts on the open cell, its line verbs are off", async ({
+  page,
+}) => {
+  const permalink = await createEngram(page, titled("Grid Sticky"), CREW);
+  await edit(page, permalink);
+
+  // Main's caret on the heading first, then a cell opened by mouse.
+  await page
+    .locator(".cm-content > .cm-line")
+    .filter({ hasText: "Crew" })
+    .first()
+    .click();
+  await cell(page, 2, 1).click();
+  await expect(openCell(page)).toBeFocused();
+  // The heading's marks stay folded: main's caret line is not being edited.
+  await expect(
+    page.locator(".cm-content > .cm-line").filter({ hasText: "Crew" }).first(),
+  ).toHaveText("Crew");
+  const small = page.getByRole("button", { name: "Cell actions" });
+  await expect(small).toBeVisible();
+  await expect(
+    page.getByRole("toolbar", { name: "Quick format" }),
+  ).toBeVisible();
+  await shot(page, "09-cell-actions-button.png");
+
+  await page.keyboard.press("Home");
+  await page.keyboard.press("Shift+End");
+  const sticky = page.getByRole("toolbar", { name: "Formatting" });
+  await expect(
+    sticky.getByRole("button", { name: "Bulleted list" }),
+  ).toBeDisabled();
+  await expect(
+    sticky.getByRole("button", { name: "Insert", exact: true }),
+  ).toBeDisabled();
+  await sticky.getByRole("button", { name: "Bold" }).click();
+
+  const file = await fileSatisfies(page, permalink, (f) => f.includes("**"));
+  expect(file).toMatch(/\| \*\*Ada\*\* \| Lead \| High \|/);
+  expect(file).toMatch(/^## Crew$/m);
+  await expect(openCell(page)).toBeFocused();
+
+  // A mouse click on the next cell opens that cell, not the button's menu.
+  await cell(page, 2, 2).click();
+  await expect(page.getByRole("menu", { name: "Cell actions" })).toHaveCount(0);
+  await expect(cell(page, 2, 2).locator(".cm-content")).toBeVisible();
 });
 
 test("the grid in the dark theme", async ({ page }) => {

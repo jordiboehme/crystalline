@@ -121,6 +121,26 @@ describe("tableGridWith", () => {
     await expect(grid.prefetch()).resolves.toBeUndefined();
     view.destroy();
   });
+
+  it("asks again on the next check after a failed import (T2)", async () => {
+    let fail = true;
+    const load = vi.fn(() =>
+      fail ? Promise.reject(new Error("offline")) : Promise.resolve(chunk()),
+    );
+    const grid = tableGridWith(load);
+    const view = mount(TABLE, grid.extension());
+    await flush();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(view.state.facet(gridLoaded)).toBe(false);
+    fail = false;
+    // The next edit is the next check.
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "\n" } });
+    await flush();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(view.state.facet(gridLoaded)).toBe(true);
+    expect(view.contentDOM.getAttribute("data-grid")).toBe("on");
+    view.destroy();
+  });
 });
 
 describe("previewConfig", () => {

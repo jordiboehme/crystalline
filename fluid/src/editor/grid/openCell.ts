@@ -15,7 +15,7 @@
  * same way.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type {
   ChangeDesc,
   EditorState,
@@ -140,6 +140,32 @@ function closingDeleted(
  */
 export function gridWritable(state: EditorState): boolean {
   return state.facet(EditorView.editable) && !state.readOnly;
+}
+
+/**
+ * The wall clock a landing gives the parse to reach its table. A watchdog,
+ * not a tolerance: an incremental reparse of a changed table takes well
+ * under a millisecond.
+ */
+const LANDING_PARSE_MS = 1000;
+
+/**
+ * Makes `main`'s syntax tree reach `pos` and the line after it (the line
+ * that ends a table), and publishes it with an empty transaction, as the
+ * parse worker does. A document change reparses on a budget of 20 ms of
+ * `Date.now()`, so under load the tree can stop short of the table a gesture
+ * just changed; a landing that read it then found no cell to open. Call it
+ * after the gesture's dispatch and before the landing reads the table, never
+ * inside an update.
+ */
+export function parseThrough(main: EditorView, pos: number): void {
+  const doc = main.state.doc;
+  const line = doc.lineAt(Math.max(0, Math.min(pos, doc.length)));
+  const upto =
+    line.number < doc.lines ? doc.line(line.number + 1).to : doc.length;
+  if (syntaxTree(main.state).length >= upto) return;
+  ensureSyntaxTree(main.state, upto, LANDING_PARSE_MS);
+  main.dispatch({});
 }
 
 export const openCellField = StateField.define<OpenCell | null>({

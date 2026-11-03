@@ -484,3 +484,68 @@ describe("the floating bar in an open cell", () => {
     expect(landed?.hasFocus).toBe(true);
   });
 });
+
+describe("placement by an open cell (finding 3)", () => {
+  const box = (top: number, bottom: number, left = 20) =>
+    new DOMRect(left, top, 200, bottom - top);
+
+  /** Renders the bar for `context`, with a layout jsdom does not have. */
+  function placed(context: FloatingContext): HTMLElement {
+    const main = soloMain(DOC, [gridExtension(), fencePreviews(false)]);
+    main.focus();
+    const stubs = [
+      vi
+        .spyOn(HTMLElement.prototype, "offsetParent", "get")
+        .mockReturnValue(document.body),
+      vi
+        .spyOn(HTMLElement.prototype, "offsetHeight", "get")
+        .mockReturnValue(30),
+      vi
+        .spyOn(HTMLElement.prototype, "offsetWidth", "get")
+        .mockReturnValue(100),
+      vi
+        .spyOn(document.body, "getBoundingClientRect")
+        .mockReturnValue(new DOMRect(0, 0, 1000, 800)),
+    ];
+    try {
+      render(<FloatingBar main={main} context={context} wikilinks />, {
+        wrapper: Tooltips,
+      });
+    } finally {
+      for (const stub of stubs) stub.mockRestore();
+    }
+    return bar();
+  }
+
+  test("stands above the table, not above the caret's row", () => {
+    const el = placed({
+      kind: "cell",
+      rect: box(300, 400),
+      caret: box(350, 366, 80),
+      selection: false,
+    });
+    expect(el.style.top).toBe("264px");
+    expect(el.style.left).toBe("20px");
+  });
+
+  test("goes below the table with no room above it", () => {
+    const el = placed({
+      kind: "cell",
+      rect: box(10, 400),
+      caret: box(350, 366, 80),
+      selection: false,
+    });
+    expect(el.style.top).toBe("406px");
+  });
+
+  test("goes by the caret when the table leaves no room on either side", () => {
+    const el = placed({
+      kind: "cell",
+      rect: box(10, 760),
+      caret: box(350, 366, 80),
+      selection: false,
+    });
+    expect(el.style.top).toBe("314px");
+    expect(el.style.left).toBe("80px");
+  });
+});

@@ -61,6 +61,8 @@ import {
   setCalloutKind,
   setStatusColour,
 } from "./elementContext";
+import { openCellView } from "./floatingContext";
+import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
 import { TableSizePicker } from "./TableSizePicker";
@@ -404,6 +406,7 @@ export function EditorToolbar({
   adapter,
   disabled = false,
   attachDisabled = false,
+  cellOpen = false,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
@@ -460,9 +463,18 @@ export function EditorToolbar({
    * cannot take now.
    */
   attachDisabled?: boolean;
+  /**
+   * Whether a table cell is open in the grid. Main's selection is stale
+   * then: the inline verbs (marks and links) run in the cell, and the verbs
+   * that act on main's line or insert a block there are off, as are the
+   * segments drawn from main's caret (image, table, callout, status).
+   */
+  cellOpen?: boolean;
 }): ReactElement {
   const view = disabled ? null : buffer;
   const off = view === null;
+  /** Off for the verbs that act on main's line or insert into main. */
+  const lineOff = off || cellOpen;
   /** The heading change waiting for the person's answer, if any. */
   const [asking, setAsking] = useState<{
     level: number;
@@ -474,9 +486,34 @@ export function EditorToolbar({
    * because the menu closes before the state above has rendered.
    */
   const askingNow = useRef(false);
+  /**
+   * The view a verb acts on, read when it runs: the open cell's editor, or
+   * main, or nothing. Nothing while main's selection is parked behind an
+   * open cell whose editor is not mounted (its table scrolled away): that
+   * selection is stale, and the cell is not there to take the verb. Main
+   * holding the focus itself always means main.
+   */
+  const targetOf = (v: EditorView): EditorView | null => {
+    const cell = openCellView(v);
+    if (cell) return cell;
+    const focused = v.dom.ownerDocument.activeElement === v.contentDOM;
+    return v.state.facet(mainSelectionParked) && !focused ? null : v;
+  };
+  /**
+   * A verb on main's line or main's caret. Refused unless main is the
+   * target, so a click that beats the render that turned the button off
+   * still changes nothing.
+   */
   const act = (run: (view: EditorView) => boolean) => () => {
-    if (view) {
+    if (view && targetOf(view) === view) {
       run(view);
+    }
+  };
+  /** An inline verb: in the open cell when there is one, else on main. */
+  const actInline = (run: (view: EditorView) => boolean) => () => {
+    const target = view ? targetOf(view) : null;
+    if (target) {
+      run(target);
     }
   };
   const keepSelection = (event: MouseEvent) => {
@@ -540,29 +577,29 @@ export function EditorToolbar({
           label="Bold"
           icon={Bold}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "**"))}
+          onClick={actInline((v) => toggleInline(v, "**"))}
         />
         <IconButton
           label="Italic"
           icon={Italic}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "*"))}
+          onClick={actInline((v) => toggleInline(v, "*"))}
         />
         <IconButton
           label="Strikethrough"
           icon={Strikethrough}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "~~"))}
+          onClick={actInline((v) => toggleInline(v, "~~"))}
         />
         <IconButton
           label="Inline code"
           icon={Code}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "`"))}
+          onClick={actInline((v) => toggleInline(v, "`"))}
         />
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <IconButton label="Heading" icon={Heading} disabled={off} />
+            <IconButton label="Heading" icon={Heading} disabled={lineOff} />
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content
@@ -587,7 +624,7 @@ export function EditorToolbar({
                   key={level}
                   className={ITEM_CLASSES}
                   onSelect={() => {
-                    if (view) {
+                    if (view && targetOf(view) === view) {
                       pickHeading(view, level);
                     }
                   }}
@@ -601,25 +638,25 @@ export function EditorToolbar({
         <IconButton
           label="Bulleted list"
           icon={List}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "- "))}
         />
         <IconButton
           label="Numbered list"
           icon={ListOrdered}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "1. ", ORDERED_ITEM))}
         />
         <IconButton
           label="Task list"
           icon={ListTodo}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "- [ ] "))}
         />
         <IconButton
           label="Blockquote"
           icon={TextQuote}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "> "))}
         />
         {/* Only where the document links engrams: a Reflection page does not. */}
@@ -628,14 +665,14 @@ export function EditorToolbar({
             label="Wiki link"
             icon={Brackets}
             disabled={off}
-            onClick={act(insertWikilink)}
+            onClick={actInline(insertWikilink)}
           />
         )}
         <IconButton
           label="Link"
           icon={Link}
           disabled={off}
-          onClick={act(insertMarkdownLink)}
+          onClick={actInline(insertMarkdownLink)}
         />
         {/*
         The insert verbs are named buttons of their own, and this hairline
@@ -647,12 +684,12 @@ export function EditorToolbar({
         this bar's own icon button, so the row reads as one kind of thing
         whatever happens after the press.
       */}
-        <TableSizePicker view={view} />
+        <TableSizePicker view={lineOff ? null : view} />
         {/*
         Every other element, as words: callouts, diagrams, blocks and inline
         elements, from the same registry as the slash menu.
       */}
-        <InsertMenu view={view} />
+        <InsertMenu view={lineOff ? null : view} />
         {/*
         The other insert verb that asks first, and the only one whose question
         the browser asks: which file. Paste and drop reach the same flow with
@@ -660,9 +697,12 @@ export function EditorToolbar({
         the clipboard nor draggable onto the buffer.
       */}
         {onAttach && (
-          <AttachButton onAttach={onAttach} disabled={off || attachDisabled} />
+          <AttachButton
+            onAttach={onAttach}
+            disabled={lineOff || attachDisabled}
+          />
         )}
-        {imageActive && (
+        {imageActive && !cellOpen && (
           <>
             {/*
             The same hairline, in front of the one menu that acts on the image
@@ -722,7 +762,7 @@ export function EditorToolbar({
             </DropdownMenu.Root>
           </>
         )}
-        {tableActive && (raw || !tableDrawn) && (
+        {tableActive && !cellOpen && (raw || !tableDrawn) && (
           <>
             {/*
             The same hairline again, in front of the verbs that act on the
@@ -814,7 +854,7 @@ export function EditorToolbar({
             />
           </>
         )}
-        {calloutActive !== null && (
+        {calloutActive !== null && !cellOpen && (
           <>
             {/*
             The same hairline, in front of what acts on the callout the caret
@@ -824,7 +864,7 @@ export function EditorToolbar({
             <CalloutSegment face={calloutActive} view={view} />
           </>
         )}
-        {statusActive !== null && (
+        {statusActive !== null && !cellOpen && (
           <>
             <Divider />
             <StatusSegment colour={statusActive} view={view} />

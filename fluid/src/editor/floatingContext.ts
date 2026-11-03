@@ -24,8 +24,14 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 export type FloatingContext =
   /** A non-empty main selection outside tables. */
   | { kind: "text"; rect: DOMRect }
-  /** The caret, or a selection, in the open cell. */
-  | { kind: "cell"; rect: DOMRect; selection: boolean }
+  /**
+   * The caret, or a selection, in the open cell. `rect` is the table's box,
+   * so the bar stands above or below the whole table and never over a row
+   * (finding 3); for a table taller than the viewport it is the caret's.
+   * `caret` is the caret's box, where the bar goes when the table leaves no
+   * room on either side.
+   */
+  | { kind: "cell"; rect: DOMRect; caret: DOMRect; selection: boolean }
   | null;
 
 interface Hub {
@@ -158,14 +164,25 @@ function isDestroyed(view: EditorView): boolean {
 function derive(hub: Hub): FloatingContext {
   const { main } = hub;
   if (!writable(main.state)) return null;
-  const cell = hub.cell;
-  if (cell && !isDestroyed(cell)) {
+  const cell = openCellView(main);
+  if (cell) {
     const range = cell.state.selection.main;
-    const box =
+    const caret = toRect(
       rangeBox(cell, range.from, range.to) ??
-      cell.dom.parentElement?.getBoundingClientRect() ??
-      EMPTY;
-    return { kind: "cell", rect: toRect(box), selection: !range.empty };
+        cell.dom.parentElement?.getBoundingClientRect() ??
+        EMPTY,
+    );
+    // The table element, found from the cell's DOM: no grid code here.
+    const table = cell.dom.closest("table")?.getBoundingClientRect();
+    const laidOut =
+      table !== undefined && (table.width > 0 || table.height > 0);
+    const fits = laidOut && table.height <= window.innerHeight;
+    return {
+      kind: "cell",
+      rect: fits ? toRect(table) : caret,
+      caret,
+      selection: !range.empty,
+    };
   }
   const range = main.state.selection.main;
   if (range.empty) return null;
@@ -176,18 +193,24 @@ function derive(hub: Hub): FloatingContext {
   };
 }
 
+function sameRect(a: DOMRect, b: DOMRect): boolean {
+  return (
+    a.left === b.left &&
+    a.top === b.top &&
+    a.right === b.right &&
+    a.bottom === b.bottom
+  );
+}
+
 function same(a: FloatingContext, b: FloatingContext): boolean {
   if (a === null || b === null) return a === b;
   if (a.kind !== b.kind) return false;
-  if (a.kind === "cell" && b.kind === "cell" && a.selection !== b.selection) {
-    return false;
+  if (a.kind === "cell" && b.kind === "cell") {
+    if (a.selection !== b.selection || !sameRect(a.caret, b.caret)) {
+      return false;
+    }
   }
-  return (
-    a.rect.left === b.rect.left &&
-    a.rect.top === b.rect.top &&
-    a.rect.right === b.rect.right &&
-    a.rect.bottom === b.rect.bottom
-  );
+  return sameRect(a.rect, b.rect);
 }
 
 function emit(hub: Hub, context: FloatingContext): void {
@@ -225,6 +248,29 @@ function selectedByHand(update: ViewUpdate): boolean {
  */
 export function selectionMoves(main: EditorView): number {
   return hubs.get(main)?.moves ?? 0;
+}
+
+/**
+ * The cell editor open on `main` right now, or null. Eager, so the sticky
+ * Formatting bar can run its inline commands in the cell the person is
+ * typing in without importing the grid: while a cell is open, main's own
+ * selection is stale (the cell sends only its caret), and a command run
+ * there would change bytes the person is not looking at.
+ */
+export function openCellView(main: EditorView): EditorView | null {
+  if (mainFocused(main)) return null;
+  const cell = hubs.get(main)?.cell ?? null;
+  return cell && !isDestroyed(cell) ? cell : null;
+}
+
+/**
+ * Whether main itself holds the focus: the person is typing in main even
+ * though a cell is still mounted (Shift+Tab back in, a `main.focus()`), so
+ * main's selection is the live one. Read from the DOM, because
+ * `EditorView.hasFocus` also asks the document, which a test may not have.
+ */
+function mainFocused(main: EditorView): boolean {
+  return main.dom.ownerDocument.activeElement === main.contentDOM;
 }
 
 function changed(update: ViewUpdate): boolean {

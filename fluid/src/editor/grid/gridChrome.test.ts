@@ -345,11 +345,54 @@ describe("the Cell actions menu", () => {
     );
   });
 
-  test("the Cell actions button shows on a hovered cell", () => {
+  test("hover alone draws no Cell actions button (finding 2)", () => {
     const main = soloMain(DOC, layers());
-    cellEl(main, 2, 0).dispatchEvent(
-      new MouseEvent("mouseover", { bubbles: true }),
+    layout(main);
+    const el = cellEl(main, 2, 0);
+    el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    move(el, 50, 75);
+    expect(button("Cell actions")).toBeNull();
+  });
+
+  test("the button stands on the focused cell's top-right corner, half outside", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    // Cell 1/1 is the box 100..200 x 30..60; the button is 16 px square.
+    cellEl(main, 1, 1).focus();
+    const small = button("Cell actions");
+    expect(small?.style.left).toBe("192px");
+    expect(small?.style.top).toBe("22px");
+  });
+
+  test("the open cell gets the button too, and a click on another cell opens that cell", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    open(main, 1, 0);
+    expect(button("Cell actions")).not.toBeNull();
+    const other = cellEl(main, 2, 1);
+    other.dispatchEvent(
+      new MouseEvent("mousedown", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        clientX: 150,
+        clientY: 75,
+      }),
     );
+    expect(where(main)).toEqual([2, 1]);
+    expect(menu()).toBeNull();
+  });
+
+  test("a hovered plus takes the shared corner; the button comes back after", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    cellEl(main, 0, 0).focus();
+    expect(button("Cell actions")).not.toBeNull();
+    move(cellEl(main, 0, 0), 98, 15);
+    expect(button("Insert column here")).not.toBeNull();
+    expect(button("Cell actions")).toBeNull();
+    move(cellEl(main, 0, 0), 50, 15);
+    expect(button("Insert column here")).toBeNull();
     expect(button("Cell actions")).not.toBeNull();
   });
 
@@ -603,6 +646,213 @@ describe("the hover plus buttons", () => {
     expect(where(main)).toEqual([2, 0]);
     undo(main);
     expect(bytes(main.state)).toBe(DOC);
+  });
+});
+
+describe("the menu's life (findings 4 to 6, T7)", () => {
+  test("a mousedown outside closes it and leaves the document", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 1, 0));
+    expect(menu()).not.toBeNull();
+    document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(menu()).toBeNull();
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("a mousedown inside it keeps it open", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 1, 0));
+    items()[0]?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(menu()).not.toBeNull();
+  });
+
+  test("Escape from a menu opened by right click puts the focus on its cell", () => {
+    const main = soloMain(DOC, layers());
+    const el = cellEl(main, 2, 1);
+    contextMenu(el);
+    key(document.activeElement as HTMLElement, "Escape");
+    expect(menu()).toBeNull();
+    expect(document.activeElement).toBe(el);
+  });
+
+  test("dispose removes the menu and its document listeners", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 1, 0));
+    const removed = vi.spyOn(document, "removeEventListener");
+    try {
+      // The table goes, and its widget with it.
+      main.dispatch({ changes: { from: 0, to: main.state.doc.length } });
+      expect(menu()).toBeNull();
+      const kinds = removed.mock.calls.map((call) => call[0]);
+      expect(kinds).toContain("mousedown");
+      expect(kinds).toContain("scroll");
+    } finally {
+      removed.mockRestore();
+    }
+  });
+
+  test("a peer's edit to a cell of the table closes it, focus back on the cell (finding 4)", () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    const el = cellEl(main, 2, 0);
+    el.focus();
+    key(el, "F10", { shift: true });
+    expect(menu()).not.toBeNull();
+    // Same shape: the peer types into "3", the row the menu points at.
+    rtext.insert(DOC.indexOf("| 3") + 3, "9");
+    expect(bytes(main.state)).toContain("| 39 |");
+    expect(menu()).toBeNull();
+    expect(document.activeElement).toBe(cellEl(main, 2, 0));
+  });
+
+  test("a peer's edit outside the table leaves it open", () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    contextMenu(cellEl(main, 2, 0));
+    rtext.insert(0, "More ");
+    expect(menu()).not.toBeNull();
+    item("Delete row").click();
+    expect(bytes(main.state)).toBe(
+      "More Intro\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nOutro\n",
+    );
+  });
+
+  test("a rebuild under a focused menu keeps the focus in the table (finding 5)", async () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    const el = cellEl(main, 2, 1);
+    el.focus();
+    key(el, "F10", { shift: true });
+    expect(document.activeElement).toBe(items()[0]);
+    // A new row above: a shape change, so the widget is built again.
+    rtext.insert(DOC.indexOf("| 3"), "| x | y |\n");
+    await Promise.resolve();
+    expect(menu()).toBeNull();
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(cellEl(main, 3, 1));
+  });
+
+  test("a rebuild under a focused menu from an open cell refocuses the cell", async () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    const view = open(main, 1, 1);
+    key(view.contentDOM, "ContextMenu");
+    expect(document.activeElement).toBe(items()[0]);
+    rtext.insert(DOC.indexOf("| 3"), "| x | y |\n");
+    await Promise.resolve();
+    const cell = activeCell(main);
+    expect(cell).not.toBeNull();
+    expect(cell?.view.contentDOM.contains(document.activeElement)).toBe(true);
+    expect(where(main)).toEqual([1, 1]);
+  });
+
+  test("it is fixed, below its anchor with room (finding 6)", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    contextMenu(cellEl(main, 1, 0));
+    const m = menu();
+    expect(m?.style.position).toBe("fixed");
+    expect(m?.style.top).toBe("10px");
+    expect(m?.style.left).toBe("10px");
+  });
+
+  test("it flips above its anchor when there is no room below", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    const height = vi
+      .spyOn(HTMLElement.prototype, "offsetHeight", "get")
+      .mockReturnValue(200);
+    const room = vi.spyOn(window, "innerHeight", "get").mockReturnValue(400);
+    try {
+      const el = cellEl(main, 2, 0);
+      el.dispatchEvent(
+        new MouseEvent("contextmenu", {
+          bubbles: true,
+          cancelable: true,
+          clientX: 10,
+          clientY: 350,
+        }),
+      );
+      expect(menu()?.style.top).toBe("150px");
+    } finally {
+      height.mockRestore();
+      room.mockRestore();
+    }
+  });
+});
+
+describe("a new header lands selected (finding 10)", () => {
+  test("typing after the column plus replaces the placeholder", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    move(cellEl(main, 0, 1), 102, 15);
+    button("Insert column here")?.click();
+    const cell = activeCell(main);
+    if (!cell) throw new Error("no cell");
+    typeIn(cell, "Name");
+    expect(bytes(main.state)).toContain("| a | Name | b |");
+  });
+
+  test("Insert column right from the header selects the new header", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 0, 0));
+    item("Insert column right").click();
+    const cell = activeCell(main);
+    if (!cell) throw new Error("no cell");
+    typeIn(cell, "Role");
+    expect(bytes(main.state)).toContain("| a | Role | b |");
+  });
+
+  test("Insert column right from a data row lands in the empty data cell", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 1, 0));
+    item("Insert column right").click();
+    const cell = activeCell(main);
+    if (!cell) throw new Error("no cell");
+    expect(cell.view.state.selection.main.empty).toBe(true);
+  });
+});
+
+describe("a landing after a slow parse (finding 13)", () => {
+  /**
+   * The race behind the old flake of "Insert row here between two data
+   * rows": a document change gets 20 ms of `Date.now()` to reparse, and a
+   * landing that read the grown table before the rest was parsed found
+   * nothing to open. A clock that moves 21 ms per read makes every such
+   * budget run out after one step, so the test no longer depends on load.
+   */
+  function slowClock(): MockInstance<typeof Date.now> {
+    let now = Date.now();
+    return vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 21;
+      return now;
+    });
+  }
+
+  test("Insert row here lands in the new row", () => {
+    const main = soloMain(DOC, layers());
+    layout(main);
+    move(cellEl(main, 2, 0), 5, 61);
+    const plus = button("Insert row here");
+    expect(plus).not.toBeNull();
+    const clock = slowClock();
+    try {
+      plus?.click();
+    } finally {
+      clock.mockRestore();
+    }
+    expect(bytes(main.state)).toBe(
+      expected(2, 0, (v, at) => tableAddRowAbove(v, at)),
+    );
+    expect(where(main)).toEqual([2, 0]);
+  });
+
+  test("Insert row below from the menu lands in the new row", () => {
+    const main = soloMain(DOC, layers());
+    contextMenu(cellEl(main, 1, 1));
+    const clock = slowClock();
+    try {
+      item("Insert row below").click();
+    } finally {
+      clock.mockRestore();
+    }
+    expect(where(main)).toEqual([2, 1]);
   });
 });
 

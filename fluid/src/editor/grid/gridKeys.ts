@@ -52,6 +52,7 @@ import {
   mountedCell,
   openCellField,
   openCellRange,
+  parseThrough,
   setOpenCell,
 } from "./openCell";
 import type { GridCell, GridTable } from "./structure";
@@ -141,6 +142,7 @@ function addRowAndOpen(
   if (!tableAddRowBelow(main, from.content.from, { focus: false })) return true;
   closeUndoGroup(main, "after");
   const after = main.state.doc;
+  parseThrough(main, table.to + after.length - before.length);
   const left = { anchor: open.anchor, head: open.head, focused: true };
   noteUndoLanding(main, {
     before,
@@ -306,7 +308,12 @@ const mac =
   typeof navigator !== "undefined" &&
   /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
-/** A key that types one character: no Ctrl, Cmd or Alt-Ctrl chord. */
+/**
+ * A key that types one character: no Cmd chord and no Ctrl chord, except
+ * Ctrl together with Alt, which counts as printable (R18): that is AltGr on
+ * Windows and Linux. On a Mac, Ctrl+Option with a one-character key counts
+ * as printable too, which matches R18's intent.
+ */
 function printable(event: KeyboardEvent): boolean {
   if (event.metaKey) return false;
   // AltGr on Windows and Linux reports Ctrl and Alt together: on a German

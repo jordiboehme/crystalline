@@ -40,7 +40,12 @@ import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
-import { disposeChrome, mountChrome } from "./gridChrome";
+import {
+  disposeChrome,
+  mapChromeMenus,
+  mountChrome,
+  tableChangedUnderChrome,
+} from "./gridChrome";
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import { cellPaste } from "./gridPaste";
 import {
@@ -52,7 +57,7 @@ import {
   setOpenCell,
 } from "./openCell";
 import type { GridCell, GridTable } from "./structure";
-import { gridTables } from "./structure";
+import { gridTableAt, gridTables } from "./structure";
 
 const HOSTING = "cm-grid-hosting";
 
@@ -177,6 +182,11 @@ function patch(root: HTMLElement, main: EditorView): void {
   if (!table) return;
   const redrawAll = resolverOf.has(root) && resolverOf.get(root) !== resolve;
   resolverOf.set(root, resolve);
+  const label = gridLabel(table);
+  const grid = root.querySelector("table");
+  if (grid && grid.getAttribute("aria-label") !== label) {
+    grid.setAttribute("aria-label", label);
+  }
   for (const el of cellElements(root)) {
     const [row, column] = placeOf(el);
     if (hosts(main, el)) continue;
@@ -185,6 +195,58 @@ function patch(root: HTMLElement, main: EditorView): void {
     if (redrawAll || drawnOf.get(el) !== text || el.classList.contains(HOSTING))
       drawStatic(el, text, resolve);
   }
+}
+
+/** A cell's text as a reader hears it: drawn, then read back as plain text. */
+function plainOf(text: string): string {
+  const el = document.createElement("span");
+  renderCellContent(text, el, {});
+  return (el.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** What a column is called: its header's text, or its number when empty. */
+function columnName(table: GridTable, column: number): string {
+  return (
+    plainOf(table.rows[0]?.[column]?.text ?? "") ||
+    `Column ${String(column + 1)}`
+  );
+}
+
+/**
+ * The grid's name, from its header ("Table: Name, Role, Tide"), so two
+ * tables on one page can be told apart (finding 7).
+ */
+export function gridLabel(table: GridTable): string {
+  const names = (table.rows[0] ?? []).map((_cell, c) => columnName(table, c));
+  return names.length > 0 ? `Table: ${names.join(", ")}` : "Table";
+}
+
+/** The open cell editor's name: its column and its row ("Role, row 2"). */
+export function cellLabel(
+  table: GridTable,
+  row: number,
+  column: number,
+): string {
+  const name = columnName(table, column);
+  return row === 0 ? `${name}, header` : `${name}, row ${String(row)}`;
+}
+
+/**
+ * The hosted cell editor's content attributes, read again on every cell
+ * update: a name that says which cell it is, and single line, because Enter
+ * moves down a column rather than breaking the line.
+ */
+function cellAttributes(main: EditorView): Extension {
+  return EditorView.contentAttributes.of(() => {
+    const cell = openCellRange(main.state);
+    const table = cell ? gridTableAt(main.state, cell.span.from) : null;
+    return {
+      "aria-multiline": "false",
+      ...(cell && table
+        ? { "aria-label": cellLabel(table, cell.row, cell.column) }
+        : {}),
+    };
+  });
 }
 
 /** Draws a cell that hosted the editor and no longer does as text again. */
@@ -241,6 +303,7 @@ function host(
     cellPaste,
     cellKeymap,
     floatingCell(main),
+    cellAttributes(main),
   ]);
   hostOf.set(main, el);
   rove(el);
@@ -374,7 +437,7 @@ export class GridWidget extends WidgetType {
     root.className = "cm-grid";
     const grid = document.createElement("table");
     grid.setAttribute("role", "grid");
-    grid.setAttribute("aria-label", "Table");
+    grid.setAttribute("aria-label", gridLabel(this.table));
     grid.tabIndex = -1;
     const head = document.createElement("thead");
     const body = document.createElement("tbody");
@@ -439,6 +502,10 @@ export class GridWidget extends WidgetType {
       // the DOM holding the editor goes only to the table holding the cell.
       const cell = openCellRange(view.state);
       if (!cell || !holds(this.table, cell)) return false;
+    }
+    const shown = shownOf.get(dom) ?? from.table;
+    if (!sameTexts(shown, this.table) || !sameAligns(shown, this.table)) {
+      tableChangedUnderChrome(dom);
     }
     shownOf.set(dom, this.table);
     if (hostsHere && mounted.view.composing) {
@@ -514,6 +581,7 @@ const hostWatch = ViewPlugin.fromClass(
     }
 
     update(update: ViewUpdate): void {
+      if (update.docChanged) mapChromeMenus(update.view, update.changes);
       settleHost(update.view);
     }
 
@@ -546,9 +614,14 @@ const gridTheme = EditorView.baseTheme({
     color: "var(--color-slate-700)",
     zIndex: "5",
   },
-  ".cm-grid-cell-menu": { borderRadius: "4px", width: "20px" },
+  ".cm-grid-cell-menu": {
+    borderRadius: "4px",
+    width: "16px",
+    height: "16px",
+    lineHeight: "14px",
+  },
   ".cm-grid-menu": {
-    position: "absolute",
+    position: "fixed",
     zIndex: "20",
     minWidth: "11rem",
     padding: "0.25rem",

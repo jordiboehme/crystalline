@@ -1067,6 +1067,7 @@ function Surface({
           tableActive={tableContext.inTable}
           tableDrawn={tableContext.drawn}
           raw={false}
+          cellOpen={floating?.kind === "cell"}
           imageActive={imageActive}
           calloutActive={element?.kind === "callout" ? element : null}
           statusActive={element?.kind === "status" ? element.colour : null}

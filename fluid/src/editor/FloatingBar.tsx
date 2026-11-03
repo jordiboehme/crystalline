@@ -1,7 +1,8 @@
 /**
  * The floating action bar: a small `role="toolbar"` named "Quick format"
- * that stands just above a text selection, or above the caret in the open
- * table cell, with what makes sense there.
+ * that stands just above a text selection, or above (or below) the table
+ * whose cell is open, with what makes sense there. A table with no room on
+ * either side, or taller than the viewport, has the bar by the caret.
  *
  * - On text: Bold, Italic, Strikethrough, Inline code, Link and Wiki link,
  *   the sticky bar's own commands under the sticky bar's own names (the
@@ -12,7 +13,7 @@
  *   run through the grid's own action path (`runCellAction`), so they keep
  *   its undo groups, its focus rule and the cell they land in.
  *
- * Every command runs on `activeCell(main)?.view ?? main`, read when it runs,
+ * Every command runs on `openCellView(main) ?? main`, read when it runs,
  * and the focus goes back to that view afterwards. The bar never takes focus
  * on its own: Alt+F10 moves it to the first button, the arrows move along
  * (one roving tab stop), Home and End jump, and Escape hands it back to the
@@ -56,8 +57,11 @@ import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
 import type { IconComponent } from "../components/primitives";
 import { IconButton } from "../components/primitives";
 import type { FloatingContext } from "./floatingContext";
-import { selectionMoves, setFloatingFocus } from "./floatingContext";
-import { activeCell } from "./grid/cellEditor";
+import {
+  openCellView,
+  selectionMoves,
+  setFloatingFocus,
+} from "./floatingContext";
 import {
   cellActionApplies,
   openCellActions,
@@ -100,9 +104,12 @@ const ALIGNMENTS: { label: string; icon: IconComponent }[] = [
   { label: "Align right", icon: AlignColumnRightIcon },
 ];
 
-/** The view a command acts on: the open cell's, or main. */
+/**
+ * The view a command acts on: the open cell's, or main (also when main
+ * itself holds the focus while a cell is still mounted).
+ */
 function targetOf(main: EditorView): EditorView {
-  return activeCell(main)?.view ?? main;
+  return openCellView(main) ?? main;
 }
 
 function textItems(wikilinks: boolean): Item[] {
@@ -305,26 +312,31 @@ export default function FloatingBar({
   // The rect in page coordinates, fixed when the context arrives (it was
   // measured just before), so a later render after the page scrolled still
   // places the bar by the selection rather than by where it used to be.
-  const anchor = useMemo(
-    () =>
-      context && {
-        top: context.rect.top + window.scrollY,
-        bottom: context.rect.bottom + window.scrollY,
-        left: context.rect.left + window.scrollX,
-      },
-    [context],
-  );
+  const anchor = useMemo(() => {
+    if (!context) return null;
+    const page = (rect: DOMRect) => ({
+      top: rect.top + window.scrollY,
+      bottom: rect.bottom + window.scrollY,
+      left: rect.left + window.scrollX,
+    });
+    return {
+      ...page(context.rect),
+      caret: context.kind === "cell" ? page(context.caret) : null,
+    };
+  }, [context]);
 
   // Placed above the rect, or below it with no room above; never over it.
+  // For a cell the rect is the table: with no room on either side of it, the
+  // bar goes by the caret instead.
   useLayoutEffect(() => {
     const el = bar.current;
     const parent = el?.offsetParent;
     if (!el || !(parent instanceof HTMLElement) || !anchor) return;
-    const rect = {
-      top: anchor.top - window.scrollY,
-      bottom: anchor.bottom - window.scrollY,
-      left: anchor.left - window.scrollX,
-    };
+    const view = (at: { top: number; bottom: number; left: number }) => ({
+      top: at.top - window.scrollY,
+      bottom: at.bottom - window.scrollY,
+      left: at.left - window.scrollX,
+    });
     const box = parent.getBoundingClientRect();
     const sticky = parent
       .querySelector('[role="toolbar"][aria-label="Formatting"]')
@@ -332,6 +344,10 @@ export default function FloatingBar({
     const ceiling = Math.max(0, sticky ?? 0);
     const height = el.offsetHeight;
     const width = el.offsetWidth;
+    let rect = view(anchor);
+    const above = rect.top - height - GAP >= ceiling;
+    const below = rect.bottom + GAP + height <= window.innerHeight;
+    if (anchor.caret && !above && !below) rect = view(anchor.caret);
     let top = rect.top - height - GAP;
     if (top < ceiling) top = rect.bottom + GAP;
     const left = Math.max(
@@ -470,7 +486,11 @@ export default function FloatingBar({
             aria-haspopup="menu"
             onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
-              openCellActions(main, { x: rect.left, y: rect.bottom });
+              openCellActions(main, {
+                x: rect.left,
+                y: rect.bottom,
+                top: rect.top,
+              });
               origin.current = null;
             }}
             {...roving("More table actions")}

@@ -33,6 +33,7 @@ import { NO_SEARCH, fetchSearch, titleMatchesKey } from "../api/search";
 import type { ReferenceState, WikilinkResolver } from "../wikilinks";
 import { WIKILINK, referenceState, wikilinkWords } from "../wikilinks";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parkingChanged, revealRanges } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
 
@@ -136,7 +137,7 @@ function buildChips(view: EditorView): DecorationSet {
         continue;
       }
       // An atom a selection touches is text being edited, not a chip.
-      const touched = view.state.selection.ranges.some(
+      const touched = revealRanges(view.state).some(
         (range) => range.from <= end && range.to >= start,
       );
       if (touched) {
@@ -182,6 +183,7 @@ const chipsPlugin = ViewPlugin.fromClass(
         update.selectionSet ||
         update.viewportChanged ||
         parseAdvanced(update) ||
+        parkingChanged(update) ||
         // The resolver lands after the buffer does; the chips it was drawn
         // without have to be redrawn when it arrives.
         update.startState.facet(wikilinkResolverFacet) !==

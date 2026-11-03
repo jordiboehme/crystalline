@@ -92,6 +92,70 @@ function undo(main: EditorView, view: EditorView): void {
   expect(main.state.doc.length).toBeGreaterThan(0);
 }
 
+describe("multi-line text without a tab (finding 8)", () => {
+  test("two lines of prose are one value, typed at the caret", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 0, 0);
+    view.dispatch({ selection: { anchor: view.state.selection.main.head } });
+    paste(view, { plain: "First point.\nSecond point." });
+    expect(bytes(main.state)).toBe(
+      "| aFirst point. Second point. | b |\n| - | - |\n| 1 | 2 |\n",
+    );
+    expect(where(main)).toEqual([0, 0]);
+  });
+
+  test("the cell below is never overwritten, and no row is added", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 1);
+    paste(view, { plain: "one\ntwo\nthree\n" });
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| 1 | 2one two three |\n",
+    );
+  });
+
+  test("with an HTML table beside it, the same text is a block", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 0, 1);
+    paste(view, {
+      plain: "x\ny",
+      html: "<meta charset='utf-8'><table><tr><td>x</td></tr><tr><td>y</td></tr></table>",
+    });
+    expect(gridTables(main.state)[0]?.rows.map((r) => r[1]?.text)).toEqual([
+      "x",
+      "y",
+    ]);
+  });
+
+  test("other HTML does not make it a block", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "p\nq", html: "<p>p</p><p>q</p>" });
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1p q | 2 |\n");
+  });
+});
+
+describe("a block paste after a slow parse (finding 13)", () => {
+  test("lands in the open cell's new place", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 21;
+      return now;
+    });
+    try {
+      paste(view, { plain: "x\ty\nz\tw" });
+    } finally {
+      clock.mockRestore();
+    }
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| x | y |\n| z | w |\n",
+    );
+    expect(activeCell(main)).not.toBeNull();
+    expect(where(main)).toEqual([1, 0]);
+  });
+});
+
 describe("paste of one value", () => {
   test("plain text goes in as typed", () => {
     const main = soloMain(DOC, layers());
@@ -157,7 +221,11 @@ describe("paste of a block", () => {
   test("a CRLF clipboard gives two rows, the trailing empty line is dropped", () => {
     const main = soloMain(DOC, layers());
     const view = open(main, 1, 0);
-    paste(view, { plain: "x\r\ny\r\n" });
+    // One spreadsheet column: no tab, but an HTML table beside the text.
+    paste(view, {
+      plain: "x\r\ny\r\n",
+      html: "<table><tr><td>x</td></tr><tr><td>y</td></tr></table>",
+    });
     const table = gridTables(main.state)[0];
     expect(table?.rows.map((r) => r[0]?.text)).toEqual(["a", "x", "y"]);
   });

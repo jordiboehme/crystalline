@@ -186,6 +186,24 @@ describe("in a cell: Tab and Shift+Tab", () => {
     );
   });
 
+  test("Tab in the last cell lands in the new row after a slow parse", () => {
+    const main = solo();
+    open(main, 1, 1);
+    // Every `Date.now()` read moves 21 ms, so the 20 ms reparse budget of
+    // the row's own transaction runs out after one step (finding 13).
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 21;
+      return now;
+    });
+    try {
+      expect(press(cellView(main), "Tab")).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+    expectOpen(main, 2, 0);
+  });
+
   test("Tab in the last cell, then Mod-z, restores the bytes and the cell", async () => {
     const main = solo();
     const view = open(main, 1, 1);

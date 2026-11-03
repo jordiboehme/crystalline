@@ -159,3 +159,36 @@ describe("floatingContextListener", () => {
     });
   });
 });
+
+describe("the cell context's rect (finding 3)", () => {
+  function tableBox(main: EditorView, rect: DOMRect): void {
+    const table = main.dom.querySelector("table");
+    if (!table) throw new Error("no table");
+    table.getBoundingClientRect = () => rect;
+  }
+
+  test("is the table's box, with the caret's beside it", async () => {
+    const { main, last } = setup();
+    tableBox(main, new DOMRect(10, 200, 300, 120));
+    openCell(main, 1, 0);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("cell");
+    });
+    const context = last();
+    if (context?.kind !== "cell") throw new Error("no cell context");
+    expect([context.rect.top, context.rect.bottom]).toEqual([200, 320]);
+    expect(context.caret).toBeInstanceOf(DOMRect);
+  });
+
+  test("is the caret's for a table taller than the viewport", async () => {
+    const { main, last } = setup();
+    tableBox(main, new DOMRect(10, -50, 300, window.innerHeight + 100));
+    openCell(main, 1, 0);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("cell");
+    });
+    const context = last();
+    if (context?.kind !== "cell") throw new Error("no cell context");
+    expect(context.rect.top).toBe(context.caret.top);
+  });
+});
