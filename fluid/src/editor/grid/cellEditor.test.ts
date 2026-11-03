@@ -5,6 +5,7 @@
  * history) and in a room (Y.UndoManager).
  */
 
+import { syntaxTree } from "@codemirror/language";
 import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { MockInstance } from "vitest";
@@ -21,7 +22,7 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
-import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
+import { PIPELESS_FIXTURES, withTable } from "../../test/pipelessTables";
 import type { CellEditor } from "./cellEditor";
 import {
   activeCell,
@@ -127,6 +128,113 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
         );
       },
     );
+  });
+
+  // R24: an edit that would cost a bare edge cell its cellhood writes the
+  // edge pipe it needs in the same change, and the cell stays open.
+  describe.each(PIPELESS_FIXTURES)("R24 without outer pipes: $name", (f) => {
+    const row1 = (line: string) => {
+      const lines = [...f.lines];
+      lines[2] = line;
+      return withTable(f, lines);
+    };
+    const shape = (main: EditorView) =>
+      gridTables(main.state)[0]?.rows.map((r) => r.map((c) => c.text));
+
+    test("Backspace on a bare first cell's only character keeps the cell open", () => {
+      const main = make(f.text);
+      const cell = openAt(main, cellOf(main, 1, 0).content.to);
+      expect(press(cell.view, "Backspace")).toBe(true);
+      expect(bytes(main.state)).toBe(row1("|  | 2"));
+      expect(shape(main)).toEqual([
+        ["a", "b"],
+        ["", "2"],
+        ["3", "4"],
+      ]);
+      expect(activeCell(main)).toBe(cell);
+      expect(main.state.field(openCellField)?.head).toBe(
+        cellOf(main, 1, 0).content.from,
+      );
+      typeIn(cell, "z");
+      expect(bytes(main.state)).toBe(row1("| z | 2"));
+      expect(openText(main)).toBe("z");
+    });
+
+    test("Backspace on a bare last cell's only character keeps the cell open", () => {
+      const main = make(f.text);
+      const cell = openAt(main, cellOf(main, 1, 1).content.to);
+      expect(press(cell.view, "Backspace")).toBe(true);
+      expect(bytes(main.state)).toBe(row1("1 |  |"));
+      expect(shape(main)).toEqual([
+        ["a", "b"],
+        ["1", ""],
+        ["3", "4"],
+      ]);
+      expect(activeCell(main)).toBe(cell);
+      typeIn(cell, "z");
+      expect(bytes(main.state)).toBe(row1("1 | z |"));
+      expect(openText(main)).toBe("z");
+    });
+
+    test.each([
+      ["- ", "| - 1 | 2"],
+      ["* ", "| * 1 | 2"],
+      ["+ ", "| + 1 | 2"],
+      ["1. ", "| 1. 1 | 2"],
+      ["1) ", "| 1) 1 | 2"],
+      ["# ", "| # 1 | 2"],
+      ["### ", "| ### 1 | 2"],
+      ["> ", "| > 1 | 2"],
+      ["```", "| ```1 | 2"],
+    ])(
+      "typing %s at the start of a bare first cell adds the leading pipe",
+      (marker, line) => {
+        const main = make(f.text);
+        const cell = openAt(main, cellOf(main, 1, 0).content.from);
+        typeIn(cell, marker);
+        expect(bytes(main.state)).toBe(row1(line));
+        expect(shape(main)).toEqual([
+          ["a", "b"],
+          [`${marker}1`, "2"],
+          ["3", "4"],
+        ]);
+        expect(activeCell(main)).toBe(cell);
+        expect(cell.view.state.selection.main.head).toBe(
+          cellOf(main, 1, 0).content.from + marker.length,
+        );
+        // Lezer agrees: one table, every data row with its two cells.
+        let tables = 0;
+        let rows = 0;
+        syntaxTree(main.state).iterate({
+          enter: (node) => {
+            if (node.name === "Table") tables += 1;
+            if (node.name === "TableRow") rows += 1;
+          },
+        });
+        expect([tables, rows]).toEqual([1, 2]);
+      },
+    );
+
+    test("text that opens no block keeps the row bare", () => {
+      const main = make(f.text);
+      const cell = openAt(main, cellOf(main, 1, 0).content.from);
+      typeIn(cell, "-x");
+      expect(bytes(main.state)).toBe(row1("-x1 | 2"));
+    });
+
+    test("one undo gives back the exact bytes, pipe and all", () => {
+      const main = make(f.text);
+      const cell = openAt(main, cellOf(main, 1, 0).content.to);
+      press(cell.view, "Backspace");
+      expect(bytes(main.state)).toBe(row1("|  | 2"));
+      expect(press(cell.view, "z", { mod: true })).toBe(true);
+      expect(bytes(main.state)).toBe(f.text);
+      const other = openAt(main, cellOf(main, 1, 1).content.to);
+      press(other.view, "Backspace");
+      expect(bytes(main.state)).toBe(row1("1 |  |"));
+      expect(press(other.view, "z", { mod: true })).toBe(true);
+      expect(bytes(main.state)).toBe(f.text);
+    });
   });
 
   test("Delete in front of an escaped pipe removes the pair", () => {

@@ -38,7 +38,7 @@ import {
 } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
-import { fromCell, withEscapes } from "./cellEditor";
+import { fromCell, withEdges, withEscapes } from "./cellEditor";
 import { cellElement, hostOpenCell, tableOf } from "./gridWidget";
 import {
   closeCell,
@@ -270,6 +270,9 @@ const replaceInCells = EditorState.transactionFilter.of(
     let changes = plain;
     for (const cell of cells) {
       changes = withEscapes(start.doc, cell.content, changes, lb);
+      // R24: a replace that empties a bare edge cell, or opens a bare first
+      // cell with a block marker, keeps the cell with its edge pipe.
+      changes = withEdges(start.doc, cell.content, changes, lb).changes;
     }
     if (!altered && changes === plain) return tr;
     // The selection and the effects are in the coordinates of the changes

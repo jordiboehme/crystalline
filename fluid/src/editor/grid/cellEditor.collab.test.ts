@@ -286,6 +286,32 @@ describe("cell editor under co-editing", () => {
       },
     );
 
+    test.each([
+      [0, "|  | 2"],
+      [1, "1 |  |"],
+    ])(
+      "clearing bare cell 1/%i reaches the peer as one change with its pipe (R24)",
+      async (column, line) => {
+        const { main, rtext } = roomMain(f.text);
+        const cell = openAt(main, cellOf(main, 1, column).content.to);
+        let changes = 0;
+        rtext.observe(() => {
+          changes += 1;
+        });
+        press(cell.view, "Backspace");
+        await Promise.resolve();
+        const lines = [...f.lines];
+        lines[2] = line;
+        expect(changes).toBe(1);
+        expect(rtext.toJSON()).toBe(
+          f.text.replace(f.lines.join("\n"), lines.join("\n")),
+        );
+        expect(activeCell(main)).toBe(cell);
+        expect(press(cell.view, "z", { mod: true })).toBe(true);
+        expect(rtext.toJSON()).toBe(f.text);
+      },
+    );
+
     test("a peer deleting part of a bare last cell leaves it open", async () => {
       const { main, rtext } = roomMain(f.text);
       const cell = openAt(main, cellOf(main, 1, 1).content.to);

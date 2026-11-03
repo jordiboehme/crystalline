@@ -311,6 +311,72 @@ export function withEscapes(
 }
 
 /**
+ * Whether a bare first cell's text would start another block (or indented
+ * code) instead of a table row: a list marker, an ATX heading, a quote, an
+ * HTML block, a fence, or a leading blank that would grow the line's indent.
+ * These are the line starts the server's merge reads as a new block too.
+ */
+function opensBlock(text: string): boolean {
+  return (
+    /^\s/.test(text) ||
+    /^[-*+](\s|$)/.test(text) ||
+    /^\d{1,9}[.)](\s|$)/.test(text) ||
+    /^#{1,6}(\s|$)/.test(text) ||
+    /^[><]/.test(text) ||
+    /^(`{3,}|~{3,})/.test(text)
+  );
+}
+
+/**
+ * R24: the table's shape wins over byte fidelity outside the cell, by the
+ * minimum. After a local edit (or a replace) of the cell whose content is
+ * `range`, a cell on a bare edge (no edge pipe) that would stop being a cell
+ * gets that edge's pipe in the same change:
+ *
+ * - a bare first cell left empty, or opening with a block marker, gets a
+ *   leading `| ` (` | 2` would be a leading pipe and one cell, `- x | 2` a
+ *   list item);
+ * - a bare last cell left empty gets a closing ` |` (`1 | ` reads as a
+ *   trailing pipe, the R10 shape).
+ *
+ * Returns the changes (itself when nothing was needed) and the cell's content
+ * range in the document they make, which the added pipe stays outside of.
+ */
+export function withEdges(
+  doc: EditorState["doc"],
+  range: CellRange,
+  changes: ChangeSet,
+  lineBreak: string,
+): { changes: ChangeSet; range: CellRange } {
+  const next = changes.apply(doc);
+  const from = changes.mapPos(range.from, -1);
+  const to = Math.max(from, changes.mapPos(range.to, 1));
+  const unchanged = { changes, range: { from, to } };
+  const line = doc.lineAt(range.from);
+  if (range.to > line.to) return unchanged;
+  const leadBare = /^[ \t]*$/.test(doc.sliceString(line.from, range.from));
+  const trailBare = /^[ \t\r]*$/.test(doc.sliceString(range.to, line.to));
+  if (!leadBare && !trailBare) return unchanged;
+  const text = next.sliceString(from, to);
+  if (leadBare && (text.trim() === "" || opensBlock(text))) {
+    const fix = ChangeSet.of([{ from, insert: "| " }], next.length, lineBreak);
+    return {
+      changes: changes.compose(fix),
+      range: { from: from + 2, to: to + 2 },
+    };
+  }
+  if (trailBare && text.trim() === "") {
+    const fix = ChangeSet.of(
+      [{ from: to, insert: " |" }],
+      next.length,
+      lineBreak,
+    );
+    return { changes: changes.compose(fix), range: { from, to } };
+  }
+  return unchanged;
+}
+
+/**
  * Keeps local cell edits inside the cell: a change not fully inside
  * `[from, to]` is dropped, inserts lose their line breaks and get their pipes
  * escaped, an insert left empty is dropped, and the selection - an explicit
@@ -351,7 +417,9 @@ const clampToCell = EditorState.transactionFilter.of(
     });
     const lb = tr.startState.lineBreak;
     const plain = ChangeSet.of(kept, doc.length, lb);
-    const changes = withEscapes(doc, range, plain, lb);
+    const escaped = withEscapes(doc, range, plain, lb);
+    const edged = withEdges(doc, range, escaped, lb);
+    const changes = edged.changes;
     if (changes !== plain) altered = true;
     if (!altered) {
       if (!tr.selection) return tr;
@@ -367,8 +435,15 @@ const clampToCell = EditorState.transactionFilter.of(
         },
       ];
     }
-    const from = changes.mapPos(range.from, -1);
-    const mapped = { from, to: Math.max(from, changes.mapPos(range.to, 1)) };
+    // The content range in the new document: the inclusive mapping, unless
+    // R24 added an edge pipe, which stays outside the cell.
+    const mapped =
+      edged.changes === escaped
+        ? (() => {
+            const from = changes.mapPos(range.from, -1);
+            return { from, to: Math.max(from, changes.mapPos(range.to, 1)) };
+          })()
+        : edged.range;
     // An explicit selection is in the coordinates of the refused changes:
     // take it back to the start document, then through the kept ones.
     const base = tr.selection
@@ -378,7 +453,10 @@ const clampToCell = EditorState.transactionFilter.of(
       {
         ...(changes.empty ? {} : { changes }),
         selection: clampSelection(base.map(changes, 1), mapped),
-        effects: tr.effects,
+        effects:
+          edged.changes === escaped
+            ? tr.effects
+            : [...tr.effects, setRange.of(mapped)],
         scrollIntoView: tr.scrollIntoView,
         ...(changes.empty ? {} : userEventOf(tr)),
       },

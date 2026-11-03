@@ -20,7 +20,10 @@ import * as Y from "yjs";
 
 import { parsedState } from "../test/parse";
 import { PIPELESS_FIXTURES, tableStart } from "../test/pipelessTables";
+import { cellOf, cleanupCells, openAt, soloMain } from "../test/cellKit";
+import { cellForwarding } from "./grid/cellEditor";
 import { gridLoaded } from "./grid/draws";
+import { gridExtension } from "./grid/index";
 import type { Align } from "./tableModel";
 import { parseTable } from "./tableModel";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
@@ -638,9 +641,78 @@ describe("every verb on tables without outer pipes (R23)", () => {
       /^[><]/.test(trimmed) ||
       /^#{1,6}(\s|$)/.test(trimmed) ||
       /^[-*+](\s|$)/.test(trimmed) ||
-      /^\d{1,9}[.)](\s|$)/.test(trimmed);
+      /^\d{1,9}[.)](\s|$)/.test(trimmed) ||
+      /^(`{3,}|~{3,})/.test(trimmed);
     return pipe && !block && !/^( {4}|\t)/.test(text);
   }
+
+  /**
+   * One table every reader agrees on, between the page's own `before` and
+   * `after`; returns the model. `shape` also pins the row and column count.
+   */
+  function agree(
+    state: EditorState,
+    before: string,
+    after: string,
+    label: string,
+    shape?: { lines: number; columns: number },
+  ) {
+    const text = docText(state);
+    expect(text.startsWith(before), label).toBe(true);
+    expect(text.endsWith(after), label).toBe(true);
+    const span = text.slice(before.length, text.length - after.length);
+    const model = parseTable(span);
+    expect(model, `${label}: ${span}`).not.toBeNull();
+    if (!model) return;
+    expect(
+      model.lines.map((l) => l.cells.length),
+      `${label}: ${span}`,
+    ).toEqual(model.lines.map(() => model.columns));
+    if (shape) {
+      expect([model.lines.length, model.columns], `${label}: ${span}`).toEqual([
+        shape.lines,
+        shape.columns,
+      ]);
+    }
+    expect(
+      model.lines.every((l) => mergeRow(l.text)),
+      `${label}: ${span}`,
+    ).toBe(true);
+    const tables: [number, number][] = [];
+    let rows = 0;
+    syntaxTree(state).iterate({
+      enter: (node) => {
+        if (node.name === "Table") tables.push([node.from, node.to]);
+        if (node.name === "TableRow") rows += 1;
+      },
+    });
+    expect(tables, `${label}: ${span}`).toEqual([
+      [before.length, before.length + span.length],
+    ]);
+    expect(rows, label).toBe(model.lines.length - 2);
+  }
+
+  /**
+   * R24: what the cell editor and a replace may write into a cell, at its
+   * start: nothing at all (the cell cleared) or a block marker.
+   */
+  const EDITS: [string, string | null][] = [
+    ["clear", null],
+    ...[
+      "- ",
+      "* ",
+      "+ ",
+      "1. ",
+      "1) ",
+      "# ",
+      "###### ",
+      "> ",
+      "```",
+      "~~~",
+      "<b>",
+      " ",
+    ].map((prefix): [string, string] => [JSON.stringify(prefix), prefix]),
+  ];
 
   for (const fixture of PIPELESS_FIXTURES) {
     const start = tableStart(fixture);
@@ -665,6 +737,67 @@ describe("every verb on tables without outer pipes (R23)", () => {
     });
 
     describe(fixture.name, () => {
+      afterEach(() => {
+        cleanupCells();
+      });
+
+      /** Every cell's content range, in the fixture's document. */
+      function contents(main: EditorView) {
+        return fixture.cells.flatMap((row, r) =>
+          row.map((_, c) => ({
+            cell: `${String(r)}/${String(c)}`,
+            ...cellOf(main, r, c).content,
+          })),
+        );
+      }
+
+      for (const [label, prefix] of EDITS) {
+        test(`the cell editor writing ${label} in every cell keeps the table (R24)`, () => {
+          const probe = soloMain(fixture.text);
+          for (const { cell, from, to } of contents(probe)) {
+            const main = soloMain(fixture.text, [cellForwarding]);
+            const editor = openAt(main, to);
+            editor.view.dispatch(
+              prefix === null
+                ? { changes: { from, to }, userEvent: "delete.backward" }
+                : {
+                    changes: { from, insert: prefix },
+                    selection: { anchor: from + prefix.length },
+                    userEvent: "input.type",
+                  },
+            );
+            agree(main.state, before, after, `${label} in ${cell}`, {
+              lines: 4,
+              columns: 2,
+            });
+            undo(main);
+            expect(docText(main.state), `${label} in ${cell}`).toBe(
+              fixture.text,
+            );
+          }
+        });
+
+        test(`a replace writing ${label} in every cell keeps the table (R24)`, () => {
+          const probe = soloMain(fixture.text);
+          for (const { cell, from, to } of contents(probe)) {
+            const main = soloMain(fixture.text, [gridExtension()]);
+            const text = docText(main.state).slice(from, to);
+            main.dispatch({
+              changes: {
+                from,
+                to,
+                insert: prefix === null ? "" : `${prefix}${text}`,
+              },
+              userEvent: "input.replace",
+            });
+            agree(main.state, before, after, `replace ${label} in ${cell}`, {
+              lines: 4,
+              columns: 2,
+            });
+          }
+        });
+      }
+
       for (const [name, run] of verbs) {
         test(`${name} in every cell keeps one table every reader agrees on`, () => {
           for (const [cell, at] of positions) {
@@ -674,33 +807,7 @@ describe("every verb on tables without outer pipes (R23)", () => {
               v.destroy();
               continue;
             }
-            const text = docText(v.state);
-            expect(text.startsWith(before), `${name} at ${cell}`).toBe(true);
-            expect(text.endsWith(after), `${name} at ${cell}`).toBe(true);
-            const span = text.slice(before.length, text.length - after.length);
-            const model = parseTable(span);
-            expect(model, `${name} at ${cell}`).not.toBeNull();
-            if (!model) continue;
-            expect(
-              model.lines.map((l) => l.cells.length),
-              `${name} at ${cell}: ${span}`,
-            ).toEqual(model.lines.map(() => model.columns));
-            expect(
-              model.lines.every((l) => mergeRow(l.text)),
-              `${name} at ${cell}: ${span}`,
-            ).toBe(true);
-            const tables: [number, number][] = [];
-            let rows = 0;
-            syntaxTree(v.state).iterate({
-              enter: (node) => {
-                if (node.name === "Table") tables.push([node.from, node.to]);
-                if (node.name === "TableRow") rows += 1;
-              },
-            });
-            expect(tables, `${name} at ${cell}: ${span}`).toEqual([
-              [before.length, before.length + span.length],
-            ]);
-            expect(rows, `${name} at ${cell}`).toBe(model.lines.length - 2);
+            agree(v.state, before, after, `${name} at ${cell}`);
             v.destroy();
           }
         });

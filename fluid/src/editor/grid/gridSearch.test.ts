@@ -16,6 +16,7 @@ import {
   searchPanelOpen,
   setSearchQuery,
 } from "@codemirror/search";
+import { undo } from "@codemirror/commands";
 import { syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import { EditorState } from "@codemirror/state";
@@ -329,6 +330,44 @@ describe.each(PIPELESS_FIXTURES)("search without outer pipes: $name", (f) => {
     expect(gridTables(main.state)[0]?.rows[2]?.[column]?.text).toBe("a\\|b");
   });
 });
+
+// R24: a replace that empties a bare edge cell, or opens a bare first cell
+// with a block marker, writes the edge pipe the cell needs (R20 keeps shape).
+describe.each(PIPELESS_FIXTURES)(
+  "replace keeps the shape (R24): $name",
+  (f) => {
+    test.each([
+      ["1", "", "|  | 2", 0],
+      ["2", "", "1 |  |", 1],
+      ["1", "- x", "| - x | 2", 0],
+      ["1", "# x", "| # x | 2", 0],
+      ["1", "> x", "| > x | 2", 0],
+    ])("replacing %s with %j writes %s", (hit, by, line, column) => {
+      const main = soloMain(f.text, layers());
+      query(main, hit, by);
+      openSearchPanel(main);
+      findNext(main);
+      expect(openPlace(main)).toEqual([1, column]);
+      replaceNext(main);
+      const lines = [...f.lines];
+      lines[2] = line;
+      expect(bytes(main.state)).toBe(withTable(f, lines));
+      expect(shape(main.state)).toEqual([2, 2, 2]);
+      expect(gridTables(main.state)[0]?.rows[1]?.[column]?.text).toBe(by);
+    });
+
+    test("replaceAll that empties a bare cell is one undo step", () => {
+      const main = soloMain(f.text, layers());
+      query(main, "2", "");
+      replaceAll(main);
+      const lines = [...f.lines];
+      lines[2] = "1 |  |";
+      expect(bytes(main.state)).toBe(withTable(f, lines));
+      undo(main);
+      expect(bytes(main.state)).toBe(f.text);
+    });
+  },
+);
 
 describe("a hit outside every table", () => {
   test("closes the open cell, with focus left in the panel", () => {
