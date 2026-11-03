@@ -1,7 +1,10 @@
 /**
  * The element popover host: one small `role="dialog"` named for what it
- * edits ("Link", "Wiki link"), placed under the element (above it when there
- * is no room below), with the focus on its first field.
+ * edits ("Link", "Wiki link", "Status label", "Formula"), or a
+ * `role="menu"` for a choice ("Task state", "Callout kind"), placed under
+ * the element (above it when there is no room below), with the focus on its
+ * first field or on the menu's checked item. In a menu the arrow keys, Home
+ * and End move between the items, and picking one commits.
  *
  * Enter or Save commits: the popover's verb runs again on the view that
  * asked, and its changes go in as one gesture there (`commitElementEdit`),
@@ -35,8 +38,12 @@ import {
   openElementEdit,
 } from "../elementEdit";
 import type { ElementPopoverProps } from "./ElementPopoverSlot";
-import { placement } from "./placement";
+import { CalloutKindMenu } from "./CalloutKindMenu";
 import { LinkPopover } from "./LinkPopover";
+import { MathPopover } from "./MathPopover";
+import { placement } from "./placement";
+import { StatusPopover } from "./StatusPopover";
+import { TaskMenu } from "./TaskMenu";
 import { WikilinkPopover } from "./WikilinkPopover";
 
 /** What a popover's verb makes of the request, re-read at commit. */
@@ -67,9 +74,60 @@ function nameOf(edit: ElementEdit): string {
   switch (edit.kind) {
     case "wikilink":
       return "Wiki link";
+    case "status":
+      return "Status label";
+    case "math":
+      return "Formula";
+    case "task":
+      return "Task state";
+    case "callout-kind":
+      return "Callout kind";
     default:
       return "Link";
   }
+}
+
+/** Whether the popover for `edit` is a menu of choices rather than a form. */
+function isMenu(edit: ElementEdit): boolean {
+  return edit.kind === "task" || edit.kind === "callout-kind";
+}
+
+const MENU_ITEM = '[role="menuitemradio"]';
+
+/** The item the focus goes to in a menu: the checked one, else the first. */
+function firstFocus(root: HTMLElement): HTMLElement | null {
+  return (
+    root.querySelector<HTMLElement>(`${MENU_ITEM}[aria-checked="true"]`) ??
+    root.querySelector<HTMLElement>(MENU_ITEM) ??
+    root.querySelector<HTMLElement>('input:not([type="radio"]), textarea')
+  );
+}
+
+/** Moves the focus between a menu's items for an arrow key, Home or End. */
+function moveInMenu(root: HTMLElement, key: string): boolean {
+  const items = [...root.querySelectorAll<HTMLElement>(MENU_ITEM)];
+  if (items.length === 0) return false;
+  const now = items.findIndex((item) => item === document.activeElement);
+  let next: number;
+  switch (key) {
+    case "ArrowDown":
+      next = now < 0 ? 0 : (now + 1) % items.length;
+      break;
+    case "ArrowUp":
+      next =
+        now < 0 ? items.length - 1 : (now - 1 + items.length) % items.length;
+      break;
+    case "Home":
+      next = 0;
+      break;
+    case "End":
+      next = items.length - 1;
+      break;
+    default:
+      return false;
+  }
+  items[next]?.focus();
+  return true;
 }
 
 /** A press in a field keeps its own default (it places the caret there). */
@@ -152,7 +210,7 @@ function Open({
   // taking writes) with the focus in it, the focus goes back to the view
   // that asked, so a keyboard user keeps their place.
   useEffect(() => {
-    root.current?.querySelector<HTMLElement>("input, textarea")?.focus();
+    if (root.current) firstFocus(root.current)?.focus();
     // One object for the popover's life; its fields are read at teardown.
     const now = flags.current;
     return () => {
@@ -200,8 +258,15 @@ function Open({
     el.style.left = `${String(at.left)}px`;
   });
 
+  const menu = isMenu(edit);
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== "Escape" || event.defaultPrevented) return;
+    if (event.defaultPrevented) return;
+    if (menu && root.current && moveInMenu(root.current, event.key)) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (event.key !== "Escape") return;
     event.preventDefault();
     event.stopPropagation();
     discard();
@@ -237,19 +302,27 @@ function Open({
   return (
     <div
       ref={root}
-      role="dialog"
+      role={menu ? "menu" : "dialog"}
       aria-label={nameOf(edit)}
       {...{ [POPOVER_MARK]: "" }}
       onKeyDown={onKeyDown}
       onFocus={onFocus}
       onBlur={onBlur}
       onMouseDown={onMouseDown}
-      className="absolute z-30 w-80 max-w-[calc(100vw-2rem)] rounded-md border border-slate-200 bg-white p-3 text-sm shadow-md print:hidden dark:border-slate-700 dark:bg-slate-900"
+      className={`absolute z-30 max-w-[calc(100vw-2rem)] rounded-md border border-slate-200 bg-white text-sm shadow-md print:hidden dark:border-slate-700 dark:bg-slate-900 ${menu ? "w-52 py-1" : "w-80 p-3"}`}
     >
       {edit.kind === "wikilink" ? (
         <WikilinkPopover {...body} />
       ) : edit.kind === "link" || edit.kind === "new-link" ? (
         <LinkPopover {...body} />
+      ) : edit.kind === "status" ? (
+        <StatusPopover {...body} />
+      ) : edit.kind === "math" ? (
+        <MathPopover {...body} />
+      ) : edit.kind === "task" ? (
+        <TaskMenu {...body} />
+      ) : edit.kind === "callout-kind" ? (
+        <CalloutKindMenu {...body} />
       ) : null}
     </div>
   );

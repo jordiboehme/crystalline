@@ -36,13 +36,19 @@ import {
 } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
+import { answersElementEdits, requestElementEdit } from "../elementEdit";
 import { frontmatterRegion } from "../frontmatterRegion";
 import { parkingChanged } from "../parkedSelection";
 import { parseAdvanced } from "../parseProgress";
 import { roomUndo } from "../roomUndo";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine } from "./hiddenMarks";
-import { markModeChanged, marksHiddenOnLine, marksOnEditLine } from "./mode";
+import {
+  hiddenMarkLayerOn,
+  markModeChanged,
+  marksHiddenOnLine,
+  marksOnEditLine,
+} from "./mode";
 
 /** The three states of a task box. */
 export type TaskState = "open" | "done" | "na";
@@ -182,6 +188,11 @@ class NotApplicableWidget extends WidgetType {
   }
 }
 
+/** A Ctrl+click on a Mac: the browser opens the context menu for it. */
+function macMenuClick(event: MouseEvent): boolean {
+  return event.ctrlKey && /Mac/.test(navigator.platform);
+}
+
 /** The primary press, a bare click and Space or Enter on a focused box write `to` once. */
 function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
   // A press that already wrote must not write again when the browser then
@@ -191,8 +202,9 @@ function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
     writeTask(view, view.posAtDOM(box), to);
   };
   box.addEventListener("mousedown", (event) => {
-    // Only the primary button flips; a right click is the task menu's.
-    if (event.button !== 0) {
+    // Only the primary button flips; a right click is the task menu's, and
+    // so is a Ctrl+click on a Mac, which sends the menu event after it.
+    if (event.button !== 0 || macMenuClick(event)) {
       return;
     }
     // The press must not also move the selection into the hidden marker.
@@ -202,6 +214,9 @@ function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
   });
   box.addEventListener("click", (event) => {
     event.preventDefault();
+    if (macMenuClick(event)) {
+      return;
+    }
     if (handled) {
       handled = false;
       return;
@@ -217,11 +232,46 @@ function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
       }
     }
   });
+  // A right click (or the context-menu key on the box) is the task menu's.
+  box.addEventListener("contextmenu", (event) => {
+    askForTaskMenu(view, box, event);
+  });
   box.addEventListener("keyup", () => {
     // The click of Space arrives right after the keyup; drop the flag after.
     setTimeout(() => {
       handled = false;
     }, 0);
+  });
+}
+
+/**
+ * Asks for the "Task state" menu of the box `box` draws, in place of the
+ * browser's menu. Nothing on a page that takes no writes, where no popover
+ * host answers, or where marks are not hidden (a table cell before it has
+ * the layer): the browser's menu then opens as it always did.
+ */
+function askForTaskMenu(
+  view: EditorView,
+  box: HTMLElement,
+  event: MouseEvent,
+): void {
+  const { state } = view;
+  if (
+    !writable(state) ||
+    !state.facet(hiddenMarkLayerOn) ||
+    !answersElementEdits(view)
+  ) {
+    return;
+  }
+  const mark = taskMark(state, view.posAtDOM(box));
+  if (!mark) {
+    return;
+  }
+  event.preventDefault();
+  requestElementEdit(view, {
+    kind: "task",
+    at: mark.from,
+    rect: box.getBoundingClientRect(),
   });
 }
 

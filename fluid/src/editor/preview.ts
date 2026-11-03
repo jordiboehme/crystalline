@@ -26,18 +26,14 @@ import { openWindow } from "../base";
 import {
   answersElementEdits,
   elementEditAt,
-  requestElementEdit,
+  pressElement,
   writable,
 } from "./elementEdit";
 import { linkAddress, linkAt, openableAddress } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
 import type { MarkKind } from "./marks/hiddenMarks";
 import { marksOnLine } from "./marks/hiddenMarks";
-import {
-  markModeChanged,
-  marksHiddenOnLine,
-  marksOnEditLine,
-} from "./marks/mode";
+import { markModeChanged, marksOnEditLine } from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 
@@ -204,18 +200,7 @@ export function linkPressed(event: MouseEvent, view: EditorView): boolean {
   if (!edit) {
     return false;
   }
-  if (marksHiddenOnLine(state, state.doc.lineAt(pos).number)) {
-    requestElementEdit(view, edit);
-    event.preventDefault();
-    return true;
-  }
-  // CodeMirror places the caret for this press and takes the focus while
-  // doing so; the popover is asked for once it is done, so the focus it
-  // takes is not taken back.
-  queueMicrotask(() => {
-    requestElementEdit(view, edit);
-  });
-  return false;
+  return pressElement(view, event, edit, pos);
 }
 
 const linkTexts = ViewPlugin.fromClass(

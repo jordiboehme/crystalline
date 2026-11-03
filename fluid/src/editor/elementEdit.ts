@@ -1,7 +1,9 @@
 /**
- * Element edit requests: a click on a drawn link or chip, Mod-k, Shift+F10 or
- * the context-menu key asks for a popover, and the screen's lazy host
- * (`popovers/ElementPopover.tsx`) answers it.
+ * Element edit requests: a click on a drawn link, chip, status pill, formula
+ * or callout kind icon, a right click on a task box, Mod-k, Shift+F10 or the
+ * context-menu key asks for a popover or a menu, and the screen's lazy host
+ * (`popovers/ElementPopover.tsx`) answers it. Each kind has its own reader
+ * (`spanAt`), so a request follows its own element and nothing else.
  *
  * A request is a state effect on the view it came from. Per main view one hub
  * holds the open request and the view that sent it: main itself, or the open
@@ -38,8 +40,20 @@ import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import type { LinkElement, Span } from "./elementVerbs";
-import { linkAt, newLinkChanges, wikilinkAt } from "./elementVerbs";
-import { hiddenMarkLayerOn, markModeChanged } from "./marks/mode";
+import {
+  calloutMarkAt,
+  linkAt,
+  mathAt,
+  newLinkChanges,
+  statusAt,
+  taskAt,
+  wikilinkAt,
+} from "./elementVerbs";
+import {
+  hiddenMarkLayerOn,
+  markModeChanged,
+  marksHiddenOnLine,
+} from "./marks/mode";
 import { roomUndo } from "./roomUndo";
 import { insertMarkdownLink } from "./toolbar";
 
@@ -59,6 +73,11 @@ export type ElementEdit =
   | { kind: "task"; at: number; rect: DOMRect }
   | { kind: "callout-kind"; at: number; rect: DOMRect }
   | { kind: "language"; at: number; rect: DOMRect };
+
+/** Where the element a request names starts. */
+export function editAt(edit: ElementEdit): number {
+  return edit.kind === "new-link" ? edit.range.from : edit.at;
+}
 
 /**
  * Whether this document links engrams with `[[...]]`: provided by the chip
@@ -112,17 +131,22 @@ function tell(hub: Hub, next: ElementRequest | null): void {
 }
 
 /**
- * The element `edit` names in `state`, re-read: its fresh spans, or null when
- * it is not there any more.
+ * The element `edit` names in `state`, re-read at `at`: its fresh spans, or
+ * null when it is not there any more. Each kind reads with its own reader,
+ * so a request never turns into another kind of element.
  */
-function reread(state: EditorState, edit: ElementEdit): ElementEdit | null {
+function reread(
+  state: EditorState,
+  edit: Exclude<ElementEdit, { kind: "new-link" }>,
+  at: number,
+): ElementEdit | null {
   switch (edit.kind) {
     case "link": {
-      const link = linkAt(state, edit.at);
+      const link = linkAt(state, at);
       return link ? linkEdit(link, edit.rect) : null;
     }
     case "wikilink": {
-      const link = wikilinkAt(state, edit.at);
+      const link = wikilinkAt(state, at);
       return link
         ? {
             kind: "wikilink",
@@ -132,28 +156,46 @@ function reread(state: EditorState, edit: ElementEdit): ElementEdit | null {
           }
         : null;
     }
-    default:
-      return edit;
+    case "math": {
+      const math = mathAt(state, at);
+      return math ? { ...edit, at: math.from, block: math.block } : null;
+    }
+    default: {
+      const span = spanAt(state, edit.kind, at);
+      return span ? { ...edit, at: span.from } : null;
+    }
   }
 }
 
-/** Where the element `edit` names spans in `state`, or null. */
-function spanOf(state: EditorState, edit: ElementEdit): Span | null {
-  switch (edit.kind) {
+/** Where the element of kind `kind` at `at` spans in `state`, or null. */
+function spanAt(
+  state: EditorState,
+  kind: Exclude<ElementEdit["kind"], "new-link">,
+  at: number,
+): Span | null {
+  switch (kind) {
     case "link":
-      return linkAt(state, edit.at);
+      return linkAt(state, at);
     case "wikilink":
-      return wikilinkAt(state, edit.at);
-    default:
-      return null;
+      return wikilinkAt(state, at);
+    case "status":
+      return statusAt(state, at);
+    case "math":
+      return mathAt(state, at);
+    case "task":
+      return taskAt(state, at);
+    case "callout-kind":
+      return calloutMarkAt(state, at);
+    case "language":
+      return { from: at, to: at };
   }
 }
 
 /**
  * `edit` carried through `tr`'s changes, or null when its element went. Both
- * ends are mapped, and the element read again must start and end exactly
- * there: a deletion that takes the element away must never leave the request
- * standing on the link next to it.
+ * ends are mapped, and the element read again must be the same kind and
+ * start and end exactly there: a deletion that takes the element away must
+ * never leave the request standing on the element next to it.
  */
 function mapEdit(edit: ElementEdit, tr: Transaction): ElementEdit | null {
   const { changes } = tr;
@@ -169,22 +211,23 @@ function mapEdit(edit: ElementEdit, tr: Transaction): ElementEdit | null {
     }
     return { ...edit, range: { from, to } };
   }
-  const before = spanOf(tr.startState, edit);
-  if (edit.kind === "link" || edit.kind === "wikilink") {
-    if (!before) {
-      return null;
-    }
-    const from = changes.mapPos(before.from, 1, MapMode.TrackDel);
-    const to = changes.mapPos(before.to, -1, MapMode.TrackDel);
-    if (from === null || to === null || from >= to) {
-      return null;
-    }
-    const next = reread(tr.state, { ...edit, at: from });
-    const after = next ? spanOf(tr.state, next) : null;
-    return after && after.from === from && after.to === to ? next : null;
+  if (edit.kind === "language") {
+    const at = changes.mapPos(edit.at, 1, MapMode.TrackDel);
+    return at === null ? null : { ...edit, at };
   }
-  const at = changes.mapPos(edit.at, 1, MapMode.TrackDel);
-  return at === null ? null : { ...edit, at };
+  const before = spanAt(tr.startState, edit.kind, edit.at);
+  if (!before) {
+    return null;
+  }
+  const from = changes.mapPos(before.from, 1, MapMode.TrackDel);
+  const to = changes.mapPos(before.to, -1, MapMode.TrackDel);
+  if (from === null || to === null || from >= to) {
+    return null;
+  }
+  const next = reread(tr.state, edit, from);
+  const after =
+    next && next.kind !== "new-link" ? spanAt(tr.state, next.kind, from) : null;
+  return after && after.from === from && after.to === to ? next : null;
 }
 
 /** What every view a hub hears from does with one update. */
@@ -302,16 +345,9 @@ export function closeElementEdit(main: EditorView): void {
 
 /** Where the element `edit` names ends in `state`, or null when it is gone. */
 function elementEnd(state: EditorState, edit: ElementEdit): number | null {
-  switch (edit.kind) {
-    case "link":
-      return linkAt(state, edit.at)?.to ?? null;
-    case "wikilink":
-      return wikilinkAt(state, edit.at)?.to ?? null;
-    case "new-link":
-      return edit.range.to;
-    default:
-      return edit.at;
-  }
+  return edit.kind === "new-link"
+    ? edit.range.to
+    : (spanAt(state, edit.kind, edit.at)?.to ?? null);
 }
 
 /**
@@ -412,9 +448,10 @@ export function elementEditAt(
   rect?: DOMRect,
 ): ElementEdit | null {
   const { state } = view;
+  const box = (span: Span) => rect ?? rectOf(view, span.from, span.to);
   const link = linkAt(state, pos);
   if (link) {
-    return linkEdit(link, rect ?? rectOf(view, link.from, link.to));
+    return linkEdit(link, box(link));
   }
   if (state.facet(linksEngrams)) {
     const wikilink = wikilinkAt(state, pos);
@@ -422,10 +459,31 @@ export function elementEditAt(
       return {
         kind: "wikilink",
         at: wikilink.from,
-        rect: rect ?? rectOf(view, wikilink.from, wikilink.to),
+        rect: box(wikilink),
         target: wikilink.target,
       };
     }
+  }
+  const status = statusAt(state, pos);
+  if (status) {
+    return { kind: "status", at: status.from, rect: box(status) };
+  }
+  const math = mathAt(state, pos);
+  if (math) {
+    return { kind: "math", at: math.from, rect: box(math), block: math.block };
+  }
+  const task = taskAt(state, pos);
+  if (task) {
+    return { kind: "task", at: task.from, rect: box(task) };
+  }
+  // A callout's kind from its head line only: the body is prose, where the
+  // key goes on.
+  const callout = calloutMarkAt(state, pos);
+  if (
+    callout &&
+    state.doc.lineAt(callout.from).number === state.doc.lineAt(pos).number
+  ) {
+    return { kind: "callout-kind", at: callout.from, rect: box(callout) };
   }
   return null;
 }
@@ -439,7 +497,46 @@ export function elementAtCaret(state: EditorState): ElementEdit["kind"] | null {
   if (state.facet(linksEngrams) && wikilinkAt(state, head)) {
     return "wikilink";
   }
-  return null;
+  if (statusAt(state, head)) {
+    return "status";
+  }
+  if (mathAt(state, head)) {
+    return "math";
+  }
+  if (taskAt(state, head)) {
+    return "task";
+  }
+  const callout = calloutMarkAt(state, head);
+  return callout &&
+    state.doc.lineAt(callout.from).number === state.doc.lineAt(head).number
+    ? "callout-kind"
+    : null;
+}
+
+/**
+ * A press on a drawn element (a link's words, a pill, a formula, a callout's
+ * kind icon) that asks for its popover with `edit`, read at press time. With
+ * marks hidden on its line the press places no caret (it is prevented, and
+ * true is returned); with the setting to show them CodeMirror places the
+ * caret and takes the focus first, so the request waits for that, and goes
+ * only if the view still takes writes then.
+ */
+export function pressElement(
+  view: EditorView,
+  event: MouseEvent,
+  edit: ElementEdit,
+  pos: number,
+): boolean {
+  const { state } = view;
+  if (marksHiddenOnLine(state, state.doc.lineAt(pos).number)) {
+    requestElementEdit(view, edit);
+    event.preventDefault();
+    return true;
+  }
+  queueMicrotask(() => {
+    requestElementEdit(view, edit);
+  });
+  return false;
 }
 
 /** Opens the popover of the element at the caret; false with none there. */

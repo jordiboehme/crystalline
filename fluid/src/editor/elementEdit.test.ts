@@ -36,7 +36,15 @@ import {
   openElementEdit,
   requestElementEdit,
 } from "./elementEdit";
-import { linkChanges, newLinkChanges, wikilinkChanges } from "./elementVerbs";
+import { calloutKindChanges } from "./elementContext";
+import {
+  linkChanges,
+  mathChanges,
+  newLinkChanges,
+  statusChanges,
+  wikilinkChanges,
+} from "./elementVerbs";
+import { taskChanges } from "./marks";
 import { cellForwarding } from "./grid/cellEditor";
 import { marksOnEditLine } from "./marks/mode";
 import { linkPressed } from "./preview";
@@ -300,6 +308,28 @@ describe("a press on a link", () => {
     await Promise.resolve();
     expect(last(heard)).toMatchObject({ kind: "link", at: 4 });
   });
+
+  it.each(["destroyed", "read only"])(
+    "asks nothing in show mode when the view is %s before the request goes",
+    async (how) => {
+      // The caret on the link's line: there its marks show, and the
+      // request waits for CodeMirror to place the caret.
+      const { view, heard } = listened("x\na [t](u) b", { mode: "show" });
+      setCaret(view, 2);
+      press(linkText(view));
+      expect(heard).toEqual([]);
+      if (how === "destroyed") {
+        view.destroy();
+      } else {
+        view.dispatch({
+          effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+        });
+      }
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(heard.filter((entry) => entry.edit !== null)).toEqual([]);
+    },
+  );
 
   it("opens a web address in a new tab with Cmd or Ctrl and asks nothing", () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
@@ -656,6 +686,152 @@ describe.each([false, true])(
       expect(last(heard)).toBeNull();
       expect(commitElementEdit(main, address("v"))).toBe(false);
       expect(bytes(main.state)).toBe(TABLE);
+    });
+  },
+);
+
+describe.each(MODES)("Shift+F10 on the other elements (%s mode)", (mode) => {
+  it.each([
+    ["a status label", "x :status[a]{red} y", 5, "status", 2],
+    ["inline math", "x $`a`$ y", 4, "math", 2],
+    ["a dollar block", "$$\na\n$$", 3, "math", 0],
+    ["a task line", "- [ ] buy milk", 10, "task", 2],
+    ["a callout head", "> [!NOTE] Title\n> body", 12, "callout-kind", 2],
+  ])("opens %s", (_name, text, at, kind, from) => {
+    const { view, heard } = listened(text, { mode });
+    setCaret(view, at);
+    expect(elementAtCaret(view.state)).toBe(kind);
+    expect(keys(view, "Shift-F10")).toBe(true);
+    expect(last(heard)).toMatchObject({ kind, at: from });
+  });
+
+  it("lets the key go on in a callout's body", () => {
+    const { view, heard } = listened("> [!NOTE] Title\n> body", { mode });
+    setCaret(view, 19);
+    expect(keys(view, "Shift-F10")).toBe(false);
+    expect(heard).toEqual([]);
+  });
+
+  it("opens nothing on a page that takes no writes (C12)", () => {
+    const { view, heard } = listened("- [ ] buy milk", {
+      mode,
+      adapter: "reflection",
+    });
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    setCaret(view, 10);
+    keys(view, "Shift-F10");
+    expect(heard).toEqual([]);
+  });
+});
+
+describe("a stale request for the other elements", () => {
+  const status = (state: EditorState, edit: ElementEdit) =>
+    edit.kind === "status"
+      ? statusChanges(state, edit.at, { words: "Z" })
+      : null;
+  const math = (state: EditorState, edit: ElementEdit) =>
+    edit.kind === "math" ? mathChanges(state, edit.at, { formula: "z" }) : null;
+  const task = (state: EditorState, edit: ElementEdit) => {
+    if (edit.kind !== "task") return null;
+    const change = taskChanges(state, edit.at, "done");
+    return change ? [change] : null;
+  };
+  const kind = (state: EditorState, edit: ElementEdit) =>
+    edit.kind === "callout-kind"
+      ? calloutKindChanges(state, edit.at, "warning")
+      : null;
+
+  it.each([
+    ["status label", ":status[a] :status[b]", 3, 0, 11, ":status[b]", status],
+    ["status label", ":status[a]:status[b]", 13, 10, 20, ":status[a]", status],
+    ["formula", "$`a`$ $`b`$", 2, 0, 6, "$`b`$", math],
+    ["formula", "$$\na\n$$\n\n$$\nb\n$$", 3, 0, 9, "$$\nb\n$$", math],
+    ["task", "- [ ] a\n- [ ] b", 6, 0, 8, "- [ ] b", task],
+    ["callout", "> [!NOTE] a\n\n> [!TIP] b", 5, 0, 13, "> [!TIP] b", kind],
+  ])(
+    "writes nothing to the %s next to it when a peer deleted it",
+    (_name, text, at, from, to, after, write) => {
+      const heard: Heard[] = [];
+      const { local, peer, sync } = markPeers(text, {
+        onElementEdit: (edit, view) => {
+          heard.push({ edit, view });
+        },
+      });
+      setCaret(local, at);
+      keys(local, "Shift-F10");
+      expect(last(heard)).not.toBeNull();
+      peer.dispatch({ changes: { from, to }, userEvent: "delete" });
+      sync();
+      expect(bytes(local.state)).toBe(after);
+      expect(last(heard)).toBeNull();
+      expect(commitElementEdit(local, write)).toBe(false);
+      expect(bytes(local.state)).toBe(after);
+    },
+  );
+
+  it("follows a label when a peer types before it", () => {
+    const heard: Heard[] = [];
+    const { local, peer, sync } = markPeers("a :status[b] c", {
+      onElementEdit: (edit, from) => {
+        heard.push({ edit, view: from });
+      },
+    });
+    setCaret(local, 5);
+    keys(local, "Shift-F10");
+    peer.dispatch({ changes: { from: 0, insert: "zz " }, userEvent: "input" });
+    sync();
+    expect(commitElementEdit(local, status)).toBe(true);
+    expect(bytes(local.state)).toBe("zz a :status[Z] c");
+  });
+
+  it("keeps the kind menu open when a peer adds a fold sign", () => {
+    const heard: Heard[] = [];
+    const { local, peer, sync } = markPeers("> [!NOTE] a\n> b", {
+      onElementEdit: (edit, from) => {
+        heard.push({ edit, view: from });
+      },
+    });
+    setCaret(local, 11);
+    keys(local, "Shift-F10");
+    peer.dispatch({ changes: { from: 9, insert: "-" }, userEvent: "input" });
+    sync();
+    expect(last(heard)?.kind).toBe("callout-kind");
+    expect(commitElementEdit(local, kind)).toBe(true);
+    expect(bytes(local.state)).toBe("> [!WARNING]- a\n> b");
+  });
+});
+
+describe.each([false, true])(
+  "a status request from the open cell (room: %s)",
+  (room) => {
+    const TABLE = "| h |\n| - |\n| :status[a] |\n";
+
+    it("commits on the cell's view (C9)", () => {
+      const heard: Heard[] = [];
+      const listener = elementEditListener((edit, from) => {
+        heard.push({ edit, view: from });
+      });
+      const main = room
+        ? roomMain(TABLE, [cellForwarding, listener]).main
+        : soloMain(TABLE, [cellForwarding, listener]);
+      const at = TABLE.indexOf(":status");
+      const cell = openAt(main, at + 9, true, [elementEditCell(main)]);
+      requestElementEdit(cell.view, {
+        kind: "status",
+        at,
+        rect: new DOMRect(),
+      });
+      expect(heard.at(-1)?.view).toBe(cell.view);
+      expect(
+        commitElementEdit(main, (state, edit) =>
+          edit.kind === "status"
+            ? statusChanges(state, edit.at, { words: "b" })
+            : null,
+        ),
+      ).toBe(true);
+      expect(bytes(main.state)).toBe("| h |\n| - |\n| :status[b] |\n");
     });
   },
 );

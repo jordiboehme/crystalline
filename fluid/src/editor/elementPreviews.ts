@@ -40,7 +40,7 @@ import {
 } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 import { ChevronRight } from "lucide-react";
-import type { ReactElement } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactElement } from "react";
 import { createElement } from "react";
 import type { Root } from "react-dom/client";
 import { createRoot } from "react-dom/client";
@@ -51,12 +51,25 @@ import type { CalloutKind } from "../markdown/callouts";
 import type { StatusColour } from "../markdown/directives";
 import { labelPlainWords } from "../markdown/statusText";
 import { SWATCH_CLASSES, colourOf } from "../markdown/swatch";
-import { calloutAt, calloutOf, statusOf } from "./elementContext";
+import {
+  calloutAt,
+  calloutOf,
+  setCalloutFold,
+  statusOf,
+} from "./elementContext";
+import type { ElementEdit } from "./elementEdit";
+import { answersElementEdits, pressElement, writable } from "./elementEdit";
+import { calloutMarkAt, mathAt, statusAt } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
-import { markModeChanged, marksHiddenOnLine } from "./marks/mode";
+import type { MathBlock } from "./mathBlocks";
+import { mathBlocks, mathSections } from "./mathBlocks";
+import {
+  hiddenMarkLayerOn,
+  markModeChanged,
+  marksHiddenOnLine,
+} from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
-import { CODE_CONTEXTS } from "./prose";
 
 /** The reading page's formula part: its own chunk, KaTeX inside it. */
 const MathPart = lazyPart(() => import("../components/MathPart"));
@@ -87,6 +100,33 @@ function undraw(dom: HTMLElement): void {
   }
 }
 
+/**
+ * A press on a drawn element asks for its popover (`pressElement`): only the
+ * primary button, only where marks are hidden (never in Raw, never in a
+ * table cell before it has the layer), only on a page that takes writes.
+ */
+function askOnPress(
+  view: EditorView,
+  dom: HTMLElement,
+  event: MouseEvent,
+  read: (pos: number) => ElementEdit | null,
+): void {
+  const { state } = view;
+  if (
+    event.button !== 0 ||
+    !state.facet(hiddenMarkLayerOn) ||
+    !writable(state) ||
+    !answersElementEdits(view)
+  ) {
+    return;
+  }
+  const pos = view.posAtDOM(dom);
+  const edit = read(pos);
+  if (edit !== null) {
+    pressElement(view, event, edit, pos);
+  }
+}
+
 /** A callout's head as the page draws it, in place of its marker. */
 class CalloutHeadWidget extends WidgetType {
   readonly kind: CalloutKind;
@@ -112,7 +152,7 @@ class CalloutHeadWidget extends WidgetType {
     );
   }
 
-  override toDOM(): HTMLElement {
+  override toDOM(view: EditorView): HTMLElement {
     const dom = document.createElement("span");
     dom.className = "cm-callout-head";
     const Icon = CALLOUT_ICONS[this.kind];
@@ -121,6 +161,35 @@ class CalloutHeadWidget extends WidgetType {
       size: 16,
       className: "shrink-0 text-(--callout)",
     };
+    const kind = this.kind;
+    const fold = this.fold;
+    // The chevron flips the sign; a press must not also move the caret.
+    const onFold = (event: ReactMouseEvent) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const { state } = view;
+      if (!state.facet(hiddenMarkLayerOn) || !writable(state)) return;
+      setCalloutFold(
+        view,
+        fold === "open" ? "closed" : "open",
+        view.posAtDOM(dom),
+      );
+    };
+    const onKind = (event: ReactMouseEvent) => {
+      askOnPress(view, dom, event.nativeEvent, (pos) => {
+        const mark = calloutMarkAt(view.state, pos);
+        return mark === null
+          ? null
+          : {
+              kind: "callout-kind",
+              at: mark.from,
+              rect: dom.getBoundingClientRect(),
+            };
+      });
+      // A press on the icon never places the caret in the marker.
+      event.preventDefault();
+    };
+    const button = "inline-flex cursor-pointer items-center rounded-sm";
     draw(
       dom,
       createElement(
@@ -128,19 +197,42 @@ class CalloutHeadWidget extends WidgetType {
         { className: "inline-flex items-center gap-1.5 align-[-0.15em]" },
         // The page's head: a chevron when it folds, the kind's icon unless
         // the kind is the fold itself, the word when nothing else names it.
-        this.fold === null
+        fold === null
           ? null
-          : createElement(ChevronRight, {
-              ...icon,
-              key: "fold",
-              className: `${icon.className} ${this.fold === "open" ? "rotate-90" : ""}`,
-            }),
-        this.fold !== null && this.kind === "details"
+          : createElement(
+              "button",
+              {
+                key: "fold",
+                type: "button",
+                tabIndex: -1,
+                className: button,
+                "aria-label": "Callout fold",
+                "aria-expanded": fold === "open",
+                onMouseDown: onFold,
+              },
+              createElement(ChevronRight, {
+                ...icon,
+                className: `${icon.className} ${fold === "open" ? "rotate-90" : ""}`,
+              }),
+            ),
+        fold !== null && kind === "details"
           ? null
-          : createElement(Icon, { ...icon, key: "kind" }),
+          : createElement(
+              "button",
+              {
+                key: "kind",
+                type: "button",
+                tabIndex: -1,
+                className: button,
+                "aria-label": `Callout kind: ${CALLOUT_WORDS[kind]}`,
+                "aria-haspopup": "menu",
+                onMouseDown: onKind,
+              },
+              createElement(Icon, icon),
+            ),
         this.titled
           ? null
-          : createElement("span", { key: "word" }, CALLOUT_WORDS[this.kind]),
+          : createElement("span", { key: "word" }, CALLOUT_WORDS[kind]),
       ),
     );
     return dom;
@@ -150,10 +242,13 @@ class CalloutHeadWidget extends WidgetType {
     undraw(dom);
   }
 
-  override ignoreEvent(): boolean {
-    // A click is a click into the text: the caret lands on the head's line
-    // and the marker shows as written.
-    return false;
+  override ignoreEvent(event: Event): boolean {
+    // A press on a button is the button's; any other click is a click into
+    // the text: the caret lands on the head's line and the marker shows as
+    // written.
+    return (
+      event.target instanceof Element && event.target.closest("button") !== null
+    );
   }
 }
 
@@ -172,11 +267,23 @@ class StatusWidget extends WidgetType {
     return other.label === this.label && other.colour === this.colour;
   }
 
-  override toDOM(): HTMLElement {
+  override toDOM(view: EditorView): HTMLElement {
     const pill = document.createElement("span");
     pill.className = "status-label";
     pill.dataset["status"] = this.colour;
     pill.textContent = this.label;
+    pill.addEventListener("mousedown", (event) => {
+      askOnPress(view, pill, event, (pos) => {
+        const status = statusAt(view.state, pos);
+        return status === null
+          ? null
+          : {
+              kind: "status",
+              at: status.from,
+              rect: pill.getBoundingClientRect(),
+            };
+      });
+    });
     return pill;
   }
 
@@ -246,7 +353,9 @@ class MathWidget extends WidgetType {
   }
 
   override toDOM(view: EditorView): HTMLElement {
-    const dom = document.createElement(this.display ? "div" : "span");
+    const dom: HTMLElement = document.createElement(
+      this.display ? "div" : "span",
+    );
     dom.className = this.display ? "cm-math-block" : "cm-math-inline";
     if (this.callout !== null) {
       dom.classList.add("callout");
@@ -255,6 +364,19 @@ class MathWidget extends WidgetType {
         dom.classList.add(name);
       }
     }
+    dom.addEventListener("mousedown", (event) => {
+      askOnPress(view, dom, event, (pos) => {
+        const math = mathAt(view.state, pos);
+        return math === null
+          ? null
+          : {
+              kind: "math",
+              at: math.from,
+              rect: dom.getBoundingClientRect(),
+              block: math.block,
+            };
+      });
+    });
     // The source as code until the part arrives, as on the page.
     const fallback = createElement("code", null, this.tex);
     draw(
@@ -506,135 +628,8 @@ const inlinePreviews = ViewPlugin.fromClass(
   },
 );
 
-/** The source and the span of one display formula. */
-interface Block {
-  from: number;
-  to: number;
-  tex: string;
-}
-
-/** A line's quote marks: how many, and how long the run of them is. */
-const QUOTE_RUN = /^[ \t]*((?:>[ \t]?)*)/;
-
-function quoteDepth(text: string): number {
-  return (QUOTE_RUN.exec(text)?.[1] ?? "").split(">").length - 1;
-}
-
-/** `text` without its first `depth` quote marks (and a space after each). */
-function unquoted(text: string, depth: number): string {
-  let rest = text;
-  for (let mark = 0; mark < depth; mark += 1) {
-    const prefix = /^[ \t]*>[ \t]?/.exec(rest);
-    if (prefix === null) {
-      break;
-    }
-    rest = rest.slice(prefix[0].length);
-  }
-  return rest;
-}
-
-/** A page section's heading, which ends anything a section holds. */
-const SECTION_HEADING = /^##(?:[ \t]|$)/;
-
-/**
- * A `math` fence and a `$$` block, each with its formula, outside code. Both
- * may stand in a quote: their lines are read without the quote's marks, and
- * a `$$` closes only at the depth it opened, inside the same quote. With
- * `sections`, a section heading ends an open `$$`, because each section of
- * the page is read on its own.
- */
-function mathBlocks(state: EditorState, sections: boolean): Block[] {
-  const doc = state.doc;
-  const blocks: Block[] = [];
-  const code: { from: number; to: number }[] = [];
-  syntaxTree(state).iterate({
-    enter: (node) => {
-      if (!CODE_CONTEXTS.has(node.name) || node.name === "InlineCode") {
-        return;
-      }
-      code.push({ from: node.from, to: node.to });
-      if (node.name !== "FencedCode") {
-        return false;
-      }
-      const first = doc.lineAt(node.from);
-      const last = doc.lineAt(node.to);
-      const depth = quoteDepth(first.text);
-      const lines: string[] = [];
-      for (let number = first.number; number <= last.number; number += 1) {
-        lines.push(unquoted(doc.line(number).text, depth));
-      }
-      // A fence that does not start its line (one in a list item) stays
-      // source: its block would have to start mid-line.
-      const fence = /^```math[ \t]*\n([\s\S]*?)\n?```[ \t]*$/.exec(
-        lines.join("\n"),
-      );
-      // On a page read section by section, a fence that runs over a section
-      // heading is not one block on the page: draw none.
-      const crosses =
-        sections &&
-        lines.some(
-          (text, index) =>
-            index > 0 &&
-            quoteDepth(doc.line(first.number + index).text) === 0 &&
-            SECTION_HEADING.test(text),
-        );
-      if (fence !== null && !crosses) {
-        blocks.push({ from: first.from, to: last.to, tex: fence[1] ?? "" });
-      }
-      return false;
-    },
-  });
-  const fmEnd = frontmatterRegion(doc)?.to ?? -1;
-  const inCode = (pos: number) =>
-    pos <= fmEnd || code.some((range) => pos >= range.from && pos <= range.to);
-  let open: { number: number; depth: number } | null = null;
-  for (let number = 1; number <= doc.lines; number += 1) {
-    const line = doc.line(number);
-    if (inCode(line.from)) {
-      continue;
-    }
-    const depth = quoteDepth(line.text);
-    const rest = unquoted(line.text, depth);
-    if (open !== null && depth < open.depth) {
-      // The quote the block opened in has ended.
-      open = null;
-    }
-    if (
-      open !== null &&
-      sections &&
-      depth === 0 &&
-      SECTION_HEADING.test(rest)
-    ) {
-      open = null;
-      continue;
-    }
-    if (rest.trim() !== "$$") {
-      continue;
-    }
-    if (open !== null && depth > open.depth) {
-      // A deeper line is the formula's content, as the reader reads it.
-      continue;
-    }
-    if (open === null) {
-      open = { number, depth };
-      continue;
-    }
-    const tex: string[] = [];
-    for (let inner = open.number + 1; inner < number; inner += 1) {
-      tex.push(unquoted(doc.line(inner).text, depth));
-    }
-    blocks.push({
-      from: doc.line(open.number).from,
-      to: line.to,
-      tex: tex.join("\n"),
-    });
-    open = null;
-  }
-  return blocks;
-}
-
 /** A display formula as the scan found it: where, what and in which callout. */
-interface Scanned extends Block {
+interface Scanned extends MathBlock {
   callout: CalloutKind | null;
   edge: string;
 }
@@ -767,6 +762,7 @@ export function elementPreviews(
   options: { sections?: boolean } = {},
 ): Extension {
   return [
+    mathSections.of(options.sections ?? false),
     inlinePreviews,
     blockPreviews(options.sections ?? false),
     elementTheme,

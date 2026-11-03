@@ -9,9 +9,18 @@ import { ChangeSet } from "@codemirror/state";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { bytes, cleanupMarkViews, markView } from "../test/markKit";
+import { calloutFoldChanges, calloutKindChanges } from "./elementContext";
 import {
+  formulaRefusal,
   linkAddress,
   linkAt,
+  mathAt,
+  mathChanges,
+  removeMathChanges,
+  statusAt,
+  statusChanges,
+  statusWords,
+  taskAt,
   linkChanges,
   linkWords,
   newLinkChanges,
@@ -470,5 +479,306 @@ describe("two elements side by side", () => {
   it("reads the link that starts at a shared position", () => {
     const state = stateOf("[a](b)[t](u)");
     expect(linkAt(state, 6)).toMatchObject({ from: 6, to: 12 });
+  });
+});
+
+describe("statusChanges", () => {
+  it("replaces only the words when only they changed", () => {
+    const state = stateOf(":status[Done]{green}");
+    const changes = statusChanges(state, 0, { words: "Shipped" });
+    expect(spans(state, changes)).toEqual([[8, 12]]);
+    expect(apply(state, changes)).toBe(":status[Shipped]{green}");
+  });
+
+  it("replaces only the colour word when only it changed", () => {
+    const state = stateOf(":status[Done]{green}");
+    const changes = statusChanges(state, 0, { colour: "blue" });
+    expect(spans(state, changes)).toEqual([[14, 19]]);
+    expect(apply(state, changes)).toBe(":status[Done]{blue}");
+  });
+
+  it("writes both in one change list", () => {
+    const state = stateOf(":status[Done]{green}");
+    expect(
+      apply(
+        state,
+        statusChanges(state, 0, { words: "Shipped", colour: "blue" }),
+      ),
+    ).toBe(":status[Shipped]{blue}");
+  });
+
+  it("adds braces to a label that has none", () => {
+    const state = stateOf("a :status[Done] b");
+    expect(apply(state, statusChanges(state, 4, { colour: "red" }))).toBe(
+      "a :status[Done]{red} b",
+    );
+  });
+
+  it("writes nothing for a field that says what the document says", () => {
+    const state = stateOf(":status[Done]{green}");
+    expect(statusChanges(state, 0, { words: "Done", colour: "green" })).toEqual(
+      [],
+    );
+  });
+
+  it.each(["", "   "])("refuses the words %j", (words) => {
+    const state = stateOf(":status[Done]{green}");
+    expect(statusChanges(state, 0, { words })).toBeNull();
+  });
+
+  it.each([
+    "a]b",
+    "a[b",
+    "a\\",
+    "a\\]",
+    "\\*",
+    "a\\[b",
+    "see [t](u)",
+    "[x",
+    "x]]",
+    "]",
+    "a\\\\b",
+  ])("writes the words %j so they read back the same", (words) => {
+    const state = stateOf("a :status[Done]{green} tail");
+    const next = state.update({
+      changes: statusChanges(state, 2, { words }) ?? [],
+    }).state;
+    expect(statusWords(next, 2)).toBe(words);
+    const label = statusAt(next, 2);
+    expect(label?.from).toBe(2);
+    expect(bytes(next).slice(label?.to ?? 0)).toBe(" tail");
+    expect(label?.colour).toBe("green");
+  });
+
+  it("keeps a source escape it does not own as written", () => {
+    const state = stateOf(":status[a \\* b]");
+    expect(statusWords(state, 0)).toBe("a \\* b");
+  });
+
+  it("reads no label inside code, the frontmatter or an id line", () => {
+    expect(statusAt(stateOf("`:status[a]`"), 2)).toBeNull();
+    expect(statusAt(stateOf("---\nt: :status[a]\n---\nb"), 8)).toBeNull();
+  });
+});
+
+describe("mathChanges", () => {
+  it("replaces only the formula of inline math", () => {
+    const state = stateOf("$`x^2`$");
+    const changes = mathChanges(state, 0, { formula: "y" });
+    expect(spans(state, changes)).toEqual([[2, 5]]);
+    expect(apply(state, changes)).toBe("$`y`$");
+  });
+
+  it("replaces only the formula of double-dollar math on one line", () => {
+    const state = stateOf("a $$x$$ b");
+    expect(apply(state, mathChanges(state, 3, { formula: "y + 1" }))).toBe(
+      "a $$y + 1$$ b",
+    );
+  });
+
+  it("replaces the inner lines of a dollar block", () => {
+    const state = stateOf("$$\na\n$$");
+    expect(mathAt(state, 0)).toMatchObject({ block: true, formula: "a" });
+    expect(apply(state, mathChanges(state, 0, { formula: "b" }))).toBe(
+      "$$\nb\n$$",
+    );
+  });
+
+  it("keeps a math fence's lines byte for byte", () => {
+    const state = stateOf("```math  \na\n```  \nafter");
+    expect(apply(state, mathChanges(state, 0, { formula: "b\nc" }))).toBe(
+      "```math  \nb\nc\n```  \nafter",
+    );
+  });
+
+  it("gives every new line of a block in a quote its quote marks", () => {
+    const state = stateOf("> $$\n> a\n> $$");
+    expect(apply(state, mathChanges(state, 2, { formula: "b\nc" }))).toBe(
+      "> $$\n> b\n> c\n> $$",
+    );
+  });
+
+  it("fills a block with no inner lines", () => {
+    const state = stateOf("```math\n```");
+    expect(apply(state, mathChanges(state, 0, { formula: "x" }))).toBe(
+      "```math\nx\n```",
+    );
+  });
+
+  it("writes nothing for an unchanged formula and refuses an empty one", () => {
+    const state = stateOf("$`x`$");
+    expect(mathChanges(state, 0, { formula: "x" })).toEqual([]);
+    expect(mathChanges(state, 0, { formula: " " })).toBeNull();
+  });
+
+  it.each([
+    ["$`x`$", "a`b", "backtick"],
+    ["$$x$$", "a$$b", "dollars"],
+    ["$$x$$", "a$", "dollar-edge"],
+    ["$$\nx\n$$", "a\n$$\nb", "dollar-line"],
+    ["```math\nx\n```", "a\n```\nb", "fence-line"],
+  ])(
+    "refuses a formula that holds its own delimiter (%j, %j)",
+    (text, formula, why) => {
+      const state = stateOf(text);
+      const math = mathAt(state, 0);
+      expect(math).not.toBeNull();
+      expect(formulaRefusal(math!.form, formula)).toBe(why);
+      expect(mathChanges(state, 0, { formula })).toBeNull();
+    },
+  );
+
+  it.each([
+    ["$`x`$", "a$b \\$ c"],
+    ["$$x$$", "a$b"],
+    ["$$\nx\n$$", "a\n$\n \\$$ b"],
+    ["```math\nx\n```", "a\n``\nb ```"],
+    ["> $$\n> x\n> $$", "a\n\n> b"],
+  ])(
+    "writes into %j the formula %j so it reads back the same",
+    (text, formula) => {
+      const state = stateOf(text);
+      const next = state.update({
+        changes: mathChanges(state, 0, { formula }) ?? [],
+      }).state;
+      expect(mathAt(next, 0)?.formula).toBe(formula);
+    },
+  );
+
+  it("removes the whole element in one change", () => {
+    const state = stateOf("a $`x`$ b");
+    const changes = removeMathChanges(state, 3);
+    expect(changes).toHaveLength(1);
+    expect(apply(state, changes)).toBe("a  b");
+  });
+
+  it("reads no formula in the frontmatter or in code", () => {
+    expect(mathAt(stateOf("`$$x$$`"), 3)).toBeNull();
+    expect(mathAt(stateOf("```\n$$\nx\n$$\n```"), 5)).toBeNull();
+  });
+});
+
+describe("the task and callout readers", () => {
+  it("reads the box of the task line", () => {
+    const state = stateOf("- [ ] t");
+    expect(taskAt(state, 6)).toEqual({ from: 2, to: 5 });
+    expect(taskAt(stateOf("- t"), 2)).toBeNull();
+  });
+
+  it("writes a callout kind and fold sign as one character run each", () => {
+    const state = stateOf("> [!NOTE]+ T\n> b");
+    expect(apply(state, calloutKindChanges(state, 2, "warning"))).toBe(
+      "> [!WARNING]+ T\n> b",
+    );
+    expect(apply(state, calloutFoldChanges(state, 2, "closed"))).toBe(
+      "> [!NOTE]- T\n> b",
+    );
+    expect(apply(state, calloutFoldChanges(state, 2, null))).toBe(
+      "> [!NOTE] T\n> b",
+    );
+    expect(
+      calloutFoldChanges(stateOf("> [!DETAILS]\n> b"), 2, null),
+    ).toBeNull();
+  });
+});
+
+describe("two status labels and formulas side by side", () => {
+  it("reads the label that starts at a shared position", () => {
+    const state = stateOf(":status[a]:status[b]");
+    expect(statusAt(state, 10)).toMatchObject({ from: 10, to: 20 });
+  });
+
+  it("reads the formula that starts at a shared position", () => {
+    const state = stateOf("$`a`$$`b`$");
+    expect(mathAt(state, 5)).toMatchObject({ from: 5, to: 10 });
+  });
+});
+
+describe("the formula verbs at the edges", () => {
+  it.each([
+    [
+      "a block in a callout's body",
+      "> [!NOTE] T\n> $$\n> x\n> $$\n> b",
+      14,
+      "> [!NOTE] T\n> b",
+    ],
+    [
+      "a block that ends a callout",
+      "> [!NOTE] T\n> $$\n> x\n> $$",
+      14,
+      "> [!NOTE] T",
+    ],
+    ["a block on its own", "a\n\n$$\nx\n$$\n\nb", 4, "a\n\n\nb"],
+  ])("removes %s with its line break", (_name, text, at, after) => {
+    const state = stateOf(text);
+    const next = state.update({
+      changes: removeMathChanges(state, at) ?? [],
+    }).state;
+    expect(bytes(next)).toBe(after);
+  });
+
+  it("keeps a callout one callout after its formula is removed", () => {
+    const state = stateOf("> [!NOTE] T\n> $$\n> x\n> $$\n> b");
+    const next = state.update({
+      changes: removeMathChanges(state, 14) ?? [],
+    }).state;
+    expect(calloutFoldChanges(next, bytes(next).indexOf("b"), "open")).toEqual([
+      { from: 9, to: 9, insert: "+" },
+    ]);
+  });
+
+  it.each([
+    ["a dollar block", "a\n\n$$\nx\n$$\n"],
+    ["a math fence", "a\n\n```math\nx\n```\n"],
+  ])("refuses a ## line in %s on a Reflection page", (_name, text) => {
+    const state = stateOf(text, "reflection");
+    const at = text.indexOf("x");
+    const math = mathAt(state, at);
+    expect(math).not.toBeNull();
+    expect(formulaRefusal(math!.form, "y\n## z", true)).toBe("heading-line");
+    expect(mathChanges(state, at, { formula: "y\n## z" })).toBeNull();
+    // An engram is not read section by section.
+    expect(
+      mathChanges(stateOf(text), at, { formula: "y\n## z" }),
+    ).not.toBeNull();
+  });
+
+  it("writes a ## line into a quoted block on a Reflection page", () => {
+    const text = "a\n\n> $$\n> x\n> $$\n";
+    const state = stateOf(text, "reflection");
+    const at = text.indexOf("x");
+    const next = state.update({
+      changes: mathChanges(state, at, { formula: "y\n## z" }) ?? [],
+    }).state;
+    expect(bytes(next)).toBe("a\n\n> $$\n> y\n> ## z\n> $$\n");
+    expect(mathAt(next, at)?.formula).toBe("y\n## z");
+  });
+});
+
+describe("no reader reaches an id line, a comment or the frontmatter", () => {
+  it("reads nothing from a Reflection id line", () => {
+    const text = "## A :status[x] $`y`$\n<!-- r:0a1b -->\n- [ ] t\n";
+    const state = stateOf(text, "reflection");
+    expect(statusAt(state, text.indexOf(":status") + 1)).not.toBeNull();
+    const id = text.indexOf("<!--");
+    for (let at = id; at <= id + 15; at += 1) {
+      expect(statusAt(state, at)).toBeNull();
+      expect(mathAt(state, at)).toBeNull();
+      expect(taskAt(state, at)).toBeNull();
+      expect(statusChanges(state, at, { words: "z" })).toBeNull();
+      expect(mathChanges(state, at, { formula: "z" })).toBeNull();
+    }
+  });
+
+  it("reads no formula inside an HTML comment", () => {
+    expect(mathAt(stateOf("<!--\n$$\nx\n$$\n-->"), 8)).toBeNull();
+    expect(mathAt(stateOf("<!--\n$$\nx\n$$\n-->\n"), 5)).toBeNull();
+  });
+
+  it("reads no formula or label in the frontmatter", () => {
+    const text = "---\na: $$x$$ :status[b]\n---\nc";
+    const state = stateOf(text);
+    expect(mathAt(state, 8)).toBeNull();
+    expect(statusAt(state, 15)).toBeNull();
   });
 });

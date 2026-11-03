@@ -15,8 +15,17 @@ import type { ChangeSpec, EditorState } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
 
 import { isWebAddress } from "../format";
+import type { StatusColour } from "../markdown/directives";
 import { isIdLine } from "../reflectionText";
+import { STATUS_OPEN } from "./dialectHighlight";
+import { calloutAt, statusAround, statusColourChanges } from "./elementContext";
 import { frontmatterRegion } from "./frontmatterRegion";
+import {
+  SECTION_HEADING,
+  mathBlocks,
+  mathSections,
+  quotePrefix,
+} from "./mathBlocks";
 import { linkDefinition, marksOnLine } from "./marks/hiddenMarks";
 import { CODE_CONTEXTS } from "./prose";
 
@@ -529,4 +538,405 @@ export function openableAddress(address: string): string | null {
   return isWebAddress(trimmed) || trimmed.startsWith("mailto:")
     ? trimmed
     : null;
+}
+
+/** A status label as the popover reads it. */
+export interface StatusElement extends Span {
+  /** The words between `:status[` and their closing `]`. */
+  words: Span;
+  colour: StatusColour;
+}
+
+/** The status label at `pos` (inclusive of both ends), or null. */
+export function statusAt(
+  state: EditorState,
+  pos: number,
+): StatusElement | null {
+  if (pos < 0 || pos > state.doc.length || !editableAt(state, pos)) {
+    return null;
+  }
+  const status = statusAround(state, pos);
+  if (status === null) {
+    return null;
+  }
+  return {
+    from: status.from,
+    to: status.to,
+    words: { from: status.from + STATUS_OPEN.length, to: status.closeFrom },
+    colour: status.colour,
+  };
+}
+
+/**
+ * A label's words as the field shows them: the source, with the three
+ * escapes the writer makes (`\\`, `\[`, `\]`) read back. Every other escape
+ * stays as written, so the words' own Markdown is kept.
+ */
+export function statusWords(state: EditorState, pos: number): string | null {
+  const status = statusAt(state, pos);
+  if (status === null) {
+    return null;
+  }
+  return state.doc
+    .sliceString(status.words.from, status.words.to)
+    .replace(/\\([\\[\]])/g, "$1");
+}
+
+/**
+ * Words as they are written between `:status[` and `]`, so that the label
+ * closes where the reader closes it (`labelEnd`) and reads back as typed: a
+ * bracket with no partner is escaped (a pair stays, a link inside the words
+ * keeps working), and a backslash before a backslash, a bracket or the end.
+ * Null for words that cannot be a label: nothing but spaces, or a line break.
+ */
+export function writtenLabel(words: string): string | null {
+  if (words.trim() === "" || /[\r\n]/.test(words)) {
+    return null;
+  }
+  const chars = [...words];
+  const unpaired = new Set<number>();
+  const open: number[] = [];
+  chars.forEach((c, index) => {
+    if (c === "[") {
+      open.push(index);
+    } else if (c === "]") {
+      if (open.length > 0) {
+        open.pop();
+      } else {
+        unpaired.add(index);
+      }
+    }
+  });
+  for (const index of open) {
+    unpaired.add(index);
+  }
+  return chars
+    .map((c, index) => {
+      if (c === "\\") {
+        const next = chars[index + 1];
+        return next === undefined || "\\[]".includes(next) ? "\\\\" : c;
+      }
+      return unpaired.has(index) ? `\\${c}` : c;
+    })
+    .join("");
+}
+
+/**
+ * Gives the label at `at` new words, a new colour, or both, in one change
+ * list. A field left out (or equal to what the document says) is not
+ * written, so a peer's change to it stays. Null when there is no label at
+ * `at` or the words cannot be written.
+ */
+export function statusChanges(
+  state: EditorState,
+  at: number,
+  { words, colour }: { words?: string; colour?: StatusColour },
+): ChangeSpec[] | null {
+  const status = statusAt(state, at);
+  if (status === null) {
+    return null;
+  }
+  const changes: ChangeSpec[] = [];
+  if (words !== undefined && words !== statusWords(state, at)) {
+    const written = writtenLabel(words);
+    if (written === null) {
+      return null;
+    }
+    changes.push({ ...status.words, insert: written });
+  } else if (words !== undefined && writtenLabel(words) === null) {
+    return null;
+  }
+  if (colour !== undefined && colour !== status.colour) {
+    const coloured = statusColourChanges(state, status.from, colour);
+    if (coloured === null) {
+      return null;
+    }
+    changes.push(...coloured);
+  }
+  return changes;
+}
+
+/** How a formula is written. */
+export type FormulaForm =
+  /** `` $`...`$ ``: inline code between two dollar signs. */
+  | "code"
+  /** `$$...$$` on one line. */
+  | "inline"
+  /** A `$$` block. */
+  | "dollars"
+  /** A `math` fence. */
+  | "fence";
+
+/** A formula as the popover reads it. */
+export interface MathElement extends Span {
+  form: FormulaForm;
+  block: boolean;
+  /** The formula as the preview sets it (a block's lines without their quote marks). */
+  formula: string;
+  /** Inline: the formula's span. A block: its inner lines, or none. */
+  body: Span | null;
+  /** A block's line where an empty body is written after. */
+  openLine: Span;
+  /** The quote marks a block's lines start with. */
+  prefix: string;
+}
+
+/** The inline formula `node` is, or null. */
+function inlineFormula(
+  state: EditorState,
+  node: SyntaxNode,
+): MathElement | null {
+  const doc = state.doc;
+  if (node.name === "InlineMath") {
+    const open = node.firstChild;
+    const close = node.lastChild;
+    if (open === null || close === null || open === close) {
+      return null;
+    }
+    const body = { from: open.to, to: close.from };
+    return {
+      from: node.from,
+      to: node.to,
+      form: "inline",
+      block: false,
+      formula: doc.sliceString(body.from, body.to),
+      body,
+      openLine: body,
+      prefix: "",
+    };
+  }
+  if (node.name !== "InlineCode") {
+    return null;
+  }
+  const open = node.firstChild;
+  const close = node.lastChild;
+  // The form the preview and the reader set: `$` on both sides, the first
+  // one not escaped, and single backticks.
+  if (
+    open === null ||
+    close === null ||
+    open === close ||
+    open.to - open.from !== 1 ||
+    doc.sliceString(node.from - 1, node.from) !== "$" ||
+    doc.sliceString(node.from - 2, node.from - 1) === "\\" ||
+    doc.sliceString(node.to, node.to + 1) !== "$"
+  ) {
+    return null;
+  }
+  const body = { from: open.to, to: close.from };
+  return {
+    from: node.from - 1,
+    to: node.to + 1,
+    form: "code",
+    block: false,
+    formula: doc.sliceString(body.from, body.to),
+    body,
+    openLine: body,
+    prefix: "",
+  };
+}
+
+/** The display formula whose lines hold `pos`, or null. */
+function blockFormula(state: EditorState, pos: number): MathElement | null {
+  const doc = state.doc;
+  const block = mathBlocks(state).find(
+    (found) => found.from <= pos && pos <= found.to,
+  );
+  if (block === undefined) {
+    return null;
+  }
+  for (let number = block.open; number <= block.close; number += 1) {
+    if (isIdLine(doc.line(number).text)) {
+      return null;
+    }
+  }
+  if (touchesNotProse(state, block.from, block.from)) {
+    return null;
+  }
+  const openLine = doc.line(block.open);
+  const body =
+    block.close - block.open > 1
+      ? {
+          from: doc.line(block.open + 1).from,
+          to: doc.line(block.close - 1).to,
+        }
+      : null;
+  return {
+    from: block.from,
+    to: block.to,
+    form: block.form,
+    block: true,
+    formula: block.tex,
+    body,
+    openLine: { from: openLine.from, to: openLine.to },
+    prefix: quotePrefix(openLine.text, block.depth),
+  };
+}
+
+/**
+ * The formula at `pos` (inclusive of both ends), or null: inline first (the
+ * one starting there wins over the one ending there), then a block.
+ */
+export function mathAt(state: EditorState, pos: number): MathElement | null {
+  if (pos < 0 || pos > state.doc.length || !editableAt(state, pos)) {
+    return null;
+  }
+  const tree = syntaxTree(state);
+  // `` $`x`$ ``: the dollar sign outside the code span is a position away.
+  for (const [at, side] of [
+    [pos, 1],
+    [pos + 1, 1],
+    [pos, -1],
+    [pos - 1, -1],
+  ] as const) {
+    if (at < 0 || at > state.doc.length) continue;
+    for (
+      let node: SyntaxNode | null = tree.resolveInner(at, side);
+      node;
+      node = node.parent
+    ) {
+      if (node.name === "InlineMath" || node.name === "InlineCode") {
+        const math = inlineFormula(state, node);
+        if (math !== null && math.from <= pos && pos <= math.to) {
+          return math;
+        }
+        break;
+      }
+    }
+  }
+  return blockFormula(state, pos);
+}
+
+/** Why a formula cannot be written in `form`, or null when it can. */
+export type FormulaRefusal =
+  | "empty"
+  | "line-break"
+  | "backtick"
+  | "dollars"
+  | "dollar-edge"
+  | "dollar-line"
+  | "fence-line"
+  | "heading-line";
+
+/**
+ * Why `formula` cannot be written in `form` so that it reads back as typed,
+ * or null. A formula that holds its own delimiter would close early: a
+ * backtick in `` $`...`$ ``, `$$` (or a `$` at an end) in `$$...$$`, a line
+ * of only `$$` in a `$$` block, a line of backticks in a fence, and on a page
+ * read section by section a `##` line in a `$$` block.
+ */
+export function formulaRefusal(
+  form: FormulaForm,
+  formula: string,
+  sections = false,
+  quoted = false,
+): FormulaRefusal | null {
+  if (formula.trim() === "") {
+    return "empty";
+  }
+  if (form === "code" || form === "inline") {
+    if (/[\r\n]/.test(formula)) return "line-break";
+    if (form === "code") return formula.includes("`") ? "backtick" : null;
+    if (formula.includes("$$")) return "dollars";
+    return formula.startsWith("$") || formula.endsWith("$")
+      ? "dollar-edge"
+      : null;
+  }
+  const lines = formula.split(/\r?\n/);
+  if (form === "fence") {
+    if (lines.some((line) => /^ {0,3}`{3,}[ \t]*$/.test(line))) {
+      return "fence-line";
+    }
+  } else if (lines.some((line) => line.trim() === "$$")) {
+    return "dollar-line";
+  }
+  // A section heading ends a block only outside a quote: a line written
+  // into a quote carries its quote marks.
+  return sections && !quoted && lines.some((line) => SECTION_HEADING.test(line))
+    ? "heading-line"
+    : null;
+}
+
+/**
+ * Gives the formula at `at` the text `formula`: only the text between its
+ * delimiters is written (a block's inner lines, each with the quote marks
+ * the block's lines carry). Nothing for an unchanged formula; null when
+ * there is none at `at` or `formulaRefusal` refuses it.
+ */
+export function mathChanges(
+  state: EditorState,
+  at: number,
+  { formula }: { formula: string },
+): ChangeSpec[] | null {
+  const math = mathAt(state, at);
+  if (
+    math === null ||
+    formulaRefusal(
+      math.form,
+      formula,
+      state.facet(mathSections),
+      math.prefix !== "",
+    ) !== null
+  ) {
+    return null;
+  }
+  if (formula === math.formula) {
+    return [];
+  }
+  if (!math.block && math.body !== null) {
+    return [{ ...math.body, insert: formula }];
+  }
+  const lines = formula
+    .split(/\r?\n/)
+    .map((line) => `${math.prefix}${line}`)
+    .join("\n");
+  return math.body !== null
+    ? [{ ...math.body, insert: lines }]
+    : [{ from: math.openLine.to, insert: `\n${lines}` }];
+}
+
+/**
+ * Takes the formula at `at` away whole: one deletion. A block goes with its
+ * lines and one line break, so no empty line is left behind (in a quote or a
+ * callout an empty line would end it).
+ */
+export function removeMathChanges(
+  state: EditorState,
+  at: number,
+): ChangeSpec[] | null {
+  const math = mathAt(state, at);
+  if (math === null) {
+    return null;
+  }
+  if (!math.block) {
+    return [{ from: math.from, to: math.to }];
+  }
+  if (math.to < state.doc.length) {
+    return [{ from: math.from, to: math.to + 1 }];
+  }
+  return [{ from: Math.max(0, math.from - 1), to: math.to }];
+}
+
+/** The task box (`[ ]`, `[x]`, `[~]`) of the line `pos` is on, or null. */
+export function taskAt(state: EditorState, pos: number): Span | null {
+  if (pos < 0 || pos > state.doc.length || !editableAt(state, pos)) {
+    return null;
+  }
+  const line = state.doc.lineAt(pos);
+  const mark = marksOnLine(state, line.number, { always: true }).find(
+    (found) => found.kind === "task",
+  );
+  // The mark holds the space after the box too; the box is three characters.
+  return mark ? { from: mark.from, to: mark.from + 3 } : null;
+}
+
+/** The callout marker `[!KIND]` (without its sign) of the callout around `pos`, or null. */
+export function calloutMarkAt(state: EditorState, pos: number): Span | null {
+  if (pos < 0 || pos > state.doc.length || !editableAt(state, pos)) {
+    return null;
+  }
+  const callout = calloutAt(state, pos);
+  return callout === null
+    ? null
+    : { from: callout.markFrom, to: callout.kindTo + 1 };
 }

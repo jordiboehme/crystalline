@@ -16,7 +16,8 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Extension } from "@codemirror/state";
+import { isolateHistory } from "@codemirror/commands";
+import type { ChangeSpec, EditorState, Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { EditorView as View, ViewPlugin } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
@@ -25,6 +26,9 @@ import type { CalloutKind } from "../markdown/callouts";
 import { parseCalloutHead } from "../markdown/callouts";
 import type { StatusColour } from "../markdown/directives";
 import { statusColour } from "../markdown/directives";
+import { isIdLine } from "../reflectionText";
+import { frontmatterRegion } from "./frontmatterRegion";
+import { roomUndo } from "./roomUndo";
 import { clearOfFoldedFrontmatter } from "./toolbar";
 
 /** The element the caret is in, in document terms. */
@@ -163,10 +167,31 @@ function ancestorsAt(state: EditorState, pos: number): SyntaxNode[] {
 
 /** The label the caret is in, or null. */
 export function statusAtCaret(state: EditorState): StatusAt | null {
-  const pos = state.selection.main.head;
-  for (const node of ancestorsAt(state, pos)) {
-    if (node.name === "StatusLabel") {
-      return statusOf(state, node);
+  return statusAround(state, state.selection.main.head);
+}
+
+/**
+ * The label around `pos` (inclusive of both ends), or null. Two labels side
+ * by side share a position: the one starting there wins, as links are read.
+ */
+export function statusAround(state: EditorState, pos: number): StatusAt | null {
+  if (pos < 0 || pos > state.doc.length) {
+    return null;
+  }
+  const tree = syntaxTree(state);
+  for (const side of [1, -1] as const) {
+    for (
+      let node: SyntaxNode | null = tree.resolveInner(pos, side);
+      node;
+      node = node.parent
+    ) {
+      if (node.name === "StatusLabel") {
+        const status = statusOf(state, node);
+        if (status !== null && status.from <= pos && pos <= status.to) {
+          return status;
+        }
+        break;
+      }
     }
   }
   return null;
@@ -235,39 +260,52 @@ function keyOf(face: ElementFace): string {
     : `callout:${face.callout}:${face.fold ?? ""}`;
 }
 
-/**
- * One edit, or none when the text already says it. Tagged `input` rather
- * than `input.type`, so it is an undo step of its own and never merges into
- * the words around it.
- */
-function write(
-  view: EditorView,
+/** Whether a verb may write at `at`: off an id line, outside the frontmatter. */
+function verbsReach(state: EditorState, at: number): boolean {
+  if (at < 0 || at > state.doc.length) {
+    return false;
+  }
+  const region = frontmatterRegion(state.doc);
+  return (
+    !(region !== null && at <= region.to) &&
+    !isIdLine(state.doc.lineAt(at).text)
+  );
+}
+
+/** One change, or none when the text already says it. */
+function change(
+  state: EditorState,
   from: number,
   to: number,
   insert: string,
-): boolean {
-  if (view.state.doc.sliceString(from, to) !== insert) {
-    view.dispatch({ changes: { from, to, insert }, userEvent: "input" });
+): ChangeSpec[] {
+  return state.doc.sliceString(from, to) === insert
+    ? []
+    : [{ from, to, insert }];
+}
+
+/** The callout whose marker starts at or around `at`, off an id line. */
+function calloutForVerb(state: EditorState, at: number): CalloutAt | null {
+  if (!verbsReach(state, at)) {
+    return null;
   }
-  // The bar cancels its own mousedown; a menu that opened over it did take
-  // focus, and this hands it back.
-  view.focus();
-  return true;
+  return calloutAt(state, at);
 }
 
 /**
- * Give the callout the caret is in another kind, or refuse. A details
- * callout with no sign folds closed by its kind alone, so leaving that kind
- * writes the `-` that keeps it folded: a kind change never changes how the
- * block opens.
+ * The changes that give the callout around `at` the kind `kind`, or null. A
+ * details callout with no sign folds closed by its kind alone, so leaving
+ * that kind writes the `-` that keeps it folded: a kind change never changes
+ * how the block opens.
  */
-export function setCalloutKind(view: EditorView, kind: CalloutKind): boolean {
-  if (!clearOfFoldedFrontmatter(view)) {
-    return false;
-  }
-  const callout = calloutAtCaret(view.state);
+export function calloutKindChanges(
+  state: EditorState,
+  at: number,
+  kind: CalloutKind,
+): ChangeSpec[] | null {
+  const callout = calloutForVerb(state, at);
   if (callout === null) {
-    return false;
+    return null;
   }
   const word = kind.toUpperCase();
   if (
@@ -275,66 +313,142 @@ export function setCalloutKind(view: EditorView, kind: CalloutKind): boolean {
     callout.signAt === null &&
     kind !== "details"
   ) {
-    view.dispatch({
-      changes: [
-        { from: callout.kindFrom, to: callout.kindTo, insert: word },
-        { from: callout.markTo, insert: "-" },
-      ],
-      userEvent: "input",
-    });
-    view.focus();
-    return true;
+    return [
+      { from: callout.kindFrom, to: callout.kindTo, insert: word },
+      { from: callout.markTo, insert: "-" },
+    ];
   }
-  return write(view, callout.kindFrom, callout.kindTo, word);
+  return change(state, callout.kindFrom, callout.kindTo, word);
 }
 
 /**
- * Make the callout the caret is in start open or closed, or (`null`) not
- * fold at all, or refuse. A details callout always folds, so it has no
- * "does not fold": `null` there is refused.
+ * The changes that make the callout around `at` start open or closed, or
+ * (`null`) not fold at all, or null to refuse. A details callout always
+ * folds, so it has no "does not fold": `null` there is refused.
  */
-export function setCalloutFold(
-  view: EditorView,
+export function calloutFoldChanges(
+  state: EditorState,
+  at: number,
   fold: "open" | "closed" | null,
-): boolean {
-  if (!clearOfFoldedFrontmatter(view)) {
-    return false;
-  }
-  const callout = calloutAtCaret(view.state);
+): ChangeSpec[] | null {
+  const callout = calloutForVerb(state, at);
   if (callout === null) {
-    return false;
+    return null;
   }
   if (fold === null) {
     if (callout.callout === "details") {
-      return false;
+      return null;
     }
     return callout.signAt === null
-      ? write(view, callout.markTo, callout.markTo, "")
-      : write(view, callout.signAt, callout.signAt + 1, "");
+      ? []
+      : change(state, callout.signAt, callout.signAt + 1, "");
   }
   const sign = fold === "open" ? "+" : "-";
   return callout.signAt === null
-    ? write(view, callout.markTo, callout.markTo, sign)
-    : write(view, callout.signAt, callout.signAt + 1, sign);
+    ? change(state, callout.markTo, callout.markTo, sign)
+    : change(state, callout.signAt, callout.signAt + 1, sign);
 }
 
-/** Give the label the caret is in another colour, or refuse. */
-export function setStatusColour(
-  view: EditorView,
+/** The changes that give the label around `at` the colour `colour`, or null. */
+export function statusColourChanges(
+  state: EditorState,
+  at: number,
   colour: StatusColour,
-): boolean {
-  if (!clearOfFoldedFrontmatter(view)) {
-    return false;
+): ChangeSpec[] | null {
+  if (!verbsReach(state, at)) {
+    return null;
   }
-  const status = statusAtCaret(view.state);
+  const status = statusAround(state, at);
   if (status === null) {
-    return false;
+    return null;
   }
   // `]` alone, or `]{...}`: the braces' words are replaced, or braces added.
   const hasBraces = status.to - status.closeFrom > 1;
   return hasBraces
-    ? write(view, status.closeFrom + 2, status.to - 1, colour)
-    : write(view, status.to, status.to, `{${colour}}`);
+    ? change(state, status.closeFrom + 2, status.to - 1, colour)
+    : change(state, status.to, status.to, `{${colour}}`);
+}
+
+/**
+ * Writes `changes` as a gesture of its own: one undo step solo and in a
+ * room, tagged `input` so it never merges into the words around it. Nothing
+ * on a page that takes no writes. Hands the view the focus: the bar cancels
+ * its own mousedown, and a menu that opened over it did take the focus.
+ */
+function writeGesture(view: EditorView, changes: ChangeSpec[] | null): boolean {
+  const { state } = view;
+  if (changes === null || !state.facet(View.editable) || state.readOnly) {
+    return false;
+  }
+  if (changes.length > 0) {
+    const room = state.facet(roomUndo);
+    room?.stopCapturing();
+    view.dispatch({
+      changes,
+      userEvent: "input",
+      annotations: isolateHistory.of("full"),
+    });
+    room?.stopCapturing();
+  }
+  view.focus();
+  return true;
+}
+
+/**
+ * Where a verb acts: `at` when given (a press on the element itself), else
+ * the caret, once it is off a hidden id line and clear of the folded
+ * frontmatter. Null to refuse.
+ */
+function verbAt(view: EditorView, at: number | undefined): number | null {
+  if (at !== undefined) {
+    return at;
+  }
+  return clearOfFoldedFrontmatter(view) ? view.state.selection.main.head : null;
+}
+
+/**
+ * Give the callout the caret is in (or the one around `at`) another kind,
+ * or refuse.
+ */
+export function setCalloutKind(
+  view: EditorView,
+  kind: CalloutKind,
+  at?: number,
+): boolean {
+  const pos = verbAt(view, at);
+  return (
+    pos !== null &&
+    writeGesture(view, calloutKindChanges(view.state, pos, kind))
+  );
+}
+
+/**
+ * Make the callout the caret is in (or the one around `at`) start open or
+ * closed, or (`null`) not fold at all, or refuse.
+ */
+export function setCalloutFold(
+  view: EditorView,
+  fold: "open" | "closed" | null,
+  at?: number,
+): boolean {
+  const pos = verbAt(view, at);
+  return (
+    pos !== null &&
+    writeGesture(view, calloutFoldChanges(view.state, pos, fold))
+  );
+}
+
+/** Give the label the caret is in (or the one around `at`) another colour, or refuse. */
+export function setStatusColour(
+  view: EditorView,
+  colour: StatusColour,
+  at?: number,
+): boolean {
+  const pos = verbAt(view, at);
+  return (
+    pos !== null &&
+    writeGesture(view, statusColourChanges(view.state, pos, colour))
+  );
 }
 
 /**

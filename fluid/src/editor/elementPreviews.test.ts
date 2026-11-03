@@ -7,14 +7,16 @@
  */
 
 import { cursorCharLeft } from "@codemirror/commands";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { render, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { cleanupMarkViews, markView } from "../test/markKit";
 import { parsedState } from "../test/parse";
 import CmEditor from "./CmEditor";
+import type { ElementEdit } from "./elementEdit";
 import { elementPreviews } from "./elementPreviews";
 import { hiddenMarkLayer } from "./marks";
 import { marksOnEditLine } from "./marks/mode";
@@ -418,5 +420,66 @@ describe("math, the edges", () => {
     page.destroy();
     const engram = editor(doc, doc.length);
     expect(engram.dom.querySelector(".cm-math-block")).not.toBeNull();
+  });
+});
+
+describe("the drawn elements ask for their editors", () => {
+  it("draws the callout's kind icon and chevron as named buttons", async () => {
+    const doc = "> [!TIP]- Short way\n> body\n\nEnd\n";
+    const v = editor(doc, doc.length);
+    const head = v.dom.querySelector(".cm-callout-head");
+    await waitFor(() => {
+      expect(head?.querySelector("button")).not.toBeNull();
+    });
+    const kind = head?.querySelector('button[aria-label="Callout kind: Tip"]');
+    const fold = head?.querySelector('button[aria-label="Callout fold"]');
+    expect(kind).not.toBeNull();
+    expect(fold?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it.each([
+    ["a pill", "x\n:status[Done]{green}", ".status-label", "status", 2],
+    ["inline math", "x\na $`y`$", ".cm-math-inline", "math", 4],
+    ["a display formula", "x\n\n$$\na\n$$", ".cm-math-block", "math", 3],
+  ])(
+    "asks for %s's editor on a press (show mode)",
+    (_name, doc, selector, kind, at) => {
+      const heard: (ElementEdit | null)[] = [];
+      const v = markView(doc, {
+        mode: "show",
+        onElementEdit: (edit) => {
+          heard.push(edit);
+        },
+      });
+      const el = v.contentDOM.querySelector(selector);
+      expect(el).not.toBeNull();
+      el?.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+      expect(heard.at(-1)).toMatchObject({ kind, at });
+      cleanupMarkViews();
+    },
+  );
+
+  it("asks nothing for a pill in Raw or on a page that takes no writes", () => {
+    const heard: (ElementEdit | null)[] = [];
+    const v = markView("x\n:status[Done]", {
+      onElementEdit: (edit) => {
+        heard.push(edit);
+      },
+    });
+    v.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    v.contentDOM
+      .querySelector(".status-label")
+      ?.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+    expect(heard).toEqual([]);
+    cleanupMarkViews();
+    const raw = markView("x\n:status[Done]", { raw: true });
+    expect(raw.contentDOM.querySelector(".status-label")).toBeNull();
+    cleanupMarkViews();
   });
 });
