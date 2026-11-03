@@ -85,14 +85,32 @@ export function LanguageMenu({
     }
   }, []);
 
+  const [refused, setRefused] = useState(false);
   const pick = (choice: LanguageChoice) => {
+    // Plain text cannot leave more info behind: CommonMark would read that
+    // text as the language. The word stays, and the menu says why.
+    if (choice.word === null) {
+      const fence = codeFenceAt(view.state, editAt(edit));
+      const written = fence
+        ? languageOf(view.state.doc.sliceString(fence.word.from, fence.word.to))
+        : null;
+      if (fence?.more === true && written !== null) {
+        setRefused(true);
+        return;
+      }
+    }
     commit(pickWrite(choice));
   };
   const onFieldKey = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") return;
     event.preventDefault();
-    const first = shown[0];
-    if (first) pick(first);
+    // An empty field picks the checked language; a filter its first match,
+    // and nothing when nothing matches.
+    const choice =
+      typed.trim() === ""
+        ? LANGUAGE_CHOICES.find((entry) => entry.name === current)
+        : shown[0];
+    if (choice) pick(choice);
   };
   return (
     <>
@@ -127,6 +145,14 @@ export function LanguageMenu({
           />
         ))}
       </div>
+      {refused ? (
+        <p
+          role="status"
+          className="px-3 pt-1 text-xs text-slate-600 dark:text-slate-300"
+        >
+          Plain text cannot keep the info after the language.
+        </p>
+      ) : null}
     </>
   );
 }

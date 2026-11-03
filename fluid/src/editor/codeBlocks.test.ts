@@ -6,7 +6,11 @@
  * hidden fence line.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
+import { render } from "@testing-library/react";
+import { createElement } from "react";
+import ReactMarkdown from "react-markdown";
 import type { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -22,6 +26,7 @@ import {
   setRaw,
   setShowMarks,
   typeText,
+  undoOnce,
 } from "../test/markKit";
 import type { ElementEdit } from "./elementEdit";
 import {
@@ -36,6 +41,8 @@ import {
   paragraphBelowChanges,
 } from "./elementVerbs";
 import { cellForwarding } from "./grid/cellEditor";
+import { codeLanguageFor, languageOf } from "./codeLanguage";
+import { toggleLinePrefix } from "./toolbar";
 
 afterEach(() => {
   cleanupMarkViews();
@@ -123,13 +130,32 @@ describe.each(MODES)("the code box (%s mode)", (mode) => {
   it.each([
     ["no word", "a\n\n```\nx\n```"],
     ["a word no language has", "a\n\n```foo\nx\n```"],
-    ["a word after a space", "a\n\n``` ts\nx\n```"],
+    ["text", "a\n\n```text\nx\n```"],
+    ["plaintext", "a\n\n```plaintext\nx\n```"],
+    ["context, which holds tex", "a\n\n```context\nx\n```"],
   ])("names Plain text for %s", (_name, text) => {
     const view = markView(text, { mode });
     setCaret(view, 0);
     expect(languageButton(view).getAttribute("aria-label")).toBe(
       "Code language: Plain text",
     );
+  });
+
+  it("reads the word after spaces, as CommonMark does", () => {
+    const view = markView("a\n\n```  ts\nx\n```", { mode });
+    setCaret(view, 0);
+    expect(languageButton(view).getAttribute("aria-label")).toBe(
+      "Code language: TypeScript",
+    );
+  });
+
+  it.each([
+    ["an empty math fence", "a\n\n```math\n\n```"],
+    ["an empty mermaid fence", "a\n\n```mermaid\n\n```"],
+  ])("draws a box for %s, which no other layer draws", (_name, text) => {
+    const view = markView(text, { mode });
+    setCaret(view, 0);
+    expect(header(view)).not.toBeNull();
   });
 
   it("draws a tilde fence as a box too", () => {
@@ -180,6 +206,48 @@ describe.each(MODES)("the code box (%s mode)", (mode) => {
     expect(languageButton(view).getAttribute("aria-label")).toBe(
       "Code language: TypeScript",
     );
+  });
+});
+
+describe.each([
+  ["in a list item", "- a\n\n  ```ts\n  x\n  ```\n\nb", 5],
+  ["with three spaces", "a\n\n   ```ts\n   x\n   ```\n\nb", 3],
+])("an indented fence (%s)", (_name, text, lineStart) => {
+  const marks = text.indexOf("```");
+  const wordFrom = marks + 3;
+
+  it("asks from both header buttons and from Shift+F10", () => {
+    const { view, heard } = listened(text);
+    setCaret(view, 0);
+    press(languageButton(view));
+    expect(heard.at(-1)).toMatchObject({ kind: "language", at: lineStart });
+    press(moreButton(view));
+    expect(heard.at(-1)).toMatchObject({ kind: "code-actions", at: lineStart });
+    setCaret(view, text.indexOf("x"));
+    keys(view, "Shift-F10");
+    expect(heard.at(-1)).toMatchObject({ kind: "code-actions", at: lineStart });
+  });
+
+  it("writes the word after the indent, and a paragraph below", () => {
+    const view = markView(text, { onElementEdit: () => {} });
+    expect(languageChanges(view.state, lineStart, "python")).toEqual([
+      { from: wordFrom, to: wordFrom + 2, insert: "python" },
+    ]);
+    requestElementEdit(view, {
+      kind: "language",
+      at: lineStart,
+      rect: new DOMRect(),
+    });
+    expect(
+      commitElementEdit(view, (state, edit) =>
+        edit.kind === "language"
+          ? languageChanges(state, edit.at, "python")
+          : null,
+      ),
+    ).toBe(true);
+    expect(bytes(view.state)).toBe(text.replace("```ts", "```python"));
+    const below = paragraphBelowChanges(view.state, lineStart);
+    expect(below).not.toBeNull();
   });
 });
 
@@ -296,6 +364,38 @@ describe("the caret around the box", () => {
     expect(view.state.doc.lineAt(caret(view)).number).toBe(2);
   });
 
+  it("reaches the last code line with Mod-End and a press below the text", () => {
+    // a=0, ```=2..5, x=6, ```=8..11
+    const end = "a\n```\nx\n```";
+    const view = markView(end);
+    setCaret(view, 0);
+    keys(view, "Mod-End");
+    expect(caret(view)).toBe(7);
+    setCaret(view, 0);
+    setCaret(view, end.length);
+    expect(caret(view)).toBe(7);
+  });
+
+  it("reaches the first code line with Mod-Home", () => {
+    const start = "```\nx\n```\nb";
+    const view = markView(start);
+    setCaret(view, start.length);
+    keys(view, "Mod-Home");
+    expect(caret(view)).toBe(4);
+  });
+
+  it("keeps the goal column across a box", () => {
+    const view = markView(TEXT);
+    view.dispatch({
+      selection: EditorSelection.create([
+        EditorSelection.cursor(0, 0, undefined, 123),
+      ]),
+    });
+    keys(view, "ArrowDown");
+    expect(caret(view)).toBe(8);
+    expect(view.state.selection.main.goalColumn).toBe(123);
+  });
+
   it("puts a caret mapped onto a hidden fence line into the box", () => {
     const view = markView(TEXT);
     view.dispatch({ selection: EditorSelection.cursor(4) });
@@ -345,6 +445,28 @@ describe("the header's buttons", () => {
       expect(bytes(view.state)).toBe(DOC);
     },
   );
+
+  it("ask on a plain click (a screen reader, Enter or Space), once per press", () => {
+    const { view, heard } = listened(DOC);
+    setCaret(view, 0);
+    languageButton(view).dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true }),
+    );
+    expect(heard.at(-1)).toMatchObject({ kind: "language", at: 3 });
+    moreButton(view).dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true }),
+    );
+    expect(heard.at(-1)).toMatchObject({ kind: "code-actions", at: 3 });
+    const count = heard.filter((edit) => edit !== null).length;
+    // A mouse press, then the click the browser sends after it: one ask.
+    press(languageButton(view));
+    languageButton(view).dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true }),
+    );
+    expect(heard.filter((edit) => edit !== null).length).toBe(count + 1);
+    expect(caret(view)).toBe(0);
+    expect(bytes(view.state)).toBe(DOC);
+  });
 
   it("ask for nothing on a Mac Ctrl+click", () => {
     vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
@@ -400,23 +522,65 @@ describe("the language word writer", () => {
     ).toBe("```rust title=x\ny\n```");
   });
 
+  it("puts the word right after the marks when spaces come first", () => {
+    expect(
+      apply("```  ts title=x\ny\n```", (s) => languageChanges(s, 0, "rust")),
+    ).toBe("```rust title=x\ny\n```");
+    expect(apply("``` ts\ny\n```", (s) => languageChanges(s, 0, null))).toBe(
+      "```\ny\n```",
+    );
+  });
+
+  it("refuses Plain text when more info text follows the word", () => {
+    const view = markView("```ts title=x\ny\n```");
+    expect(languageChanges(view.state, 0, null)).toBeNull();
+  });
+
   it("takes the word away for Plain text", () => {
     expect(apply("```ts\nx\n```", (s) => languageChanges(s, 0, null))).toBe(
       "```\nx\n```",
     );
   });
 
-  it("puts a word back where Plain text took one away", () => {
-    const view = markView("```ts title=x\ny\n```");
-    const remove = languageChanges(view.state, 0, null);
-    if (!remove) throw new Error("no change");
-    view.dispatch({ changes: remove });
-    expect(bytes(view.state)).toBe("``` title=x\ny\n```");
-    const add = languageChanges(view.state, 0, "rust");
-    if (!add) throw new Error("no change");
-    view.dispatch({ changes: add });
-    expect(bytes(view.state)).toBe("```rust title=x\ny\n```");
-  });
+  it.each([
+    ["```ts\ny\n```", "python", "python"],
+    ["``` ts title=x\ny\n```", "rust", "rust"],
+    ["```ts title=x\ny\n```", "go", "go"],
+    ["``` ts\ny\n```", null, null],
+  ])(
+    "writes %s so the editor and the reading page read the same word",
+    (text, word, read) => {
+      const after = apply(text, (s) => languageChanges(s, 0, word));
+      if (after === null) throw new Error("no change");
+      const view = markView(after);
+      // The editor: the parser's info and the header's word.
+      const info = codeFenceAt(view.state, 0);
+      const editorWord = info
+        ? view.state.doc.sliceString(info.word.from, info.word.to)
+        : "";
+      expect(editorWord === "" ? null : editorWord).toBe(read);
+      let parsed: string | null = null;
+      syntaxTree(view.state).iterate({
+        enter: (node) => {
+          // The parser's info is the whole info string; its first word is
+          // what the highlighting looks up.
+          if (node.name === "CodeInfo") {
+            parsed =
+              view.state.doc.sliceString(node.from, node.to).split(/\s/)[0] ??
+              null;
+          }
+        },
+      });
+      expect(parsed).toBe(read);
+      // CommonMark, as the reading page renders it.
+      const page = render(createElement(ReactMarkdown, null, after));
+      const code = page.container.querySelector("code");
+      expect(code?.className || null).toBe(
+        read === null ? null : `language-${read}`,
+      );
+      page.unmount();
+    },
+  );
 
   it("keeps a tilde fence's tildes and lets its word hold a backtick", () => {
     expect(apply("~~~ts\nx\n~~~", (s) => languageChanges(s, 0, "python"))).toBe(
@@ -529,6 +693,20 @@ describe("a caret a peer's edit leaves on a hidden fence line", () => {
     expect(caret(local)).toBe(17);
   });
 
+  it("goes into the box right after the peer's edit, so no verb writes into a fence", async () => {
+    const { local, peer, sync } = markPeers(TEXT);
+    setCaret(local, 16);
+    peer.dispatch({ changes: { from: 15, to: 17 }, userEvent: "delete" });
+    sync();
+    await Promise.resolve();
+    expect(caret(local)).toBe(11);
+    toggleLinePrefix(local, "> ");
+    expect(bytes(local.state)).toBe("a\n```ts\nx\n> y\n```");
+    // Moving the caret is no step of its own to undo.
+    undoOnce(local);
+    expect(bytes(local.state)).toBe("a\n```ts\nx\ny\n```");
+  });
+
   it("writes into the first code line from the opening fence", () => {
     const { local, peer, sync } = markPeers(TEXT);
     setCaret(local, 1);
@@ -619,5 +797,31 @@ describe("a long document", () => {
     expect(
       view.contentDOM.querySelectorAll(".cm-code-header").length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("the language lookup the editor and its highlighting share", () => {
+  it.each(["text", "plaintext", "txt", "plain", "context", "TEXT"])(
+    "names no language for %s",
+    (word) => {
+      expect(languageOf(word)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["ts", "TypeScript"],
+    ["typescript", "TypeScript"],
+    ["Python", "Python"],
+    ["tex", "LaTeX"],
+    ["c++", "C++"],
+  ])("finds %s exactly", (word, name) => {
+    expect(languageOf(word)?.name).toBe(name);
+  });
+
+  it("hands the highlighting the same answer for a fence's info", () => {
+    expect(codeLanguageFor("context")).toBeNull();
+    expect(codeLanguageFor("text")).toBeNull();
+    expect(codeLanguageFor("ts")?.name).toBe("TypeScript");
+    expect(codeLanguageFor("")).toBeNull();
   });
 });

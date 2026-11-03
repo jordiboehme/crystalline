@@ -10,8 +10,7 @@
  * document positions; spans are read with `doc.sliceString`.
  */
 
-import { LanguageDescription, syntaxTree } from "@codemirror/language";
-import { languages } from "@codemirror/language-data";
+import { syntaxTree } from "@codemirror/language";
 import type { ChangeSpec, EditorState } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
 
@@ -20,11 +19,13 @@ import type { StatusColour } from "../markdown/directives";
 import { isIdLine } from "../reflectionText";
 import { STATUS_OPEN } from "./dialectHighlight";
 import { calloutAt, statusAround, statusColourChanges } from "./elementContext";
+import { fenceBody, fenceInfo } from "./fenceInfo";
 import { frontmatterRegion } from "./frontmatterRegion";
 import {
   SECTION_HEADING,
   escapedAt,
   mathBlocks,
+  mathFence,
   mathSections,
   quotePrefix,
   unpadded,
@@ -799,7 +800,10 @@ function blockFormula(state: EditorState, pos: number): MathElement | null {
     return null;
   }
   const openLine = doc.line(block.open);
-  const mark = openLine.text.indexOf(block.form === "fence" ? "```" : "$$");
+  const mark =
+    block.form === "fence"
+      ? (/[`~]{3,}/.exec(openLine.text)?.index ?? -1)
+      : openLine.text.indexOf("$$");
   const prefix =
     mark >= 0
       ? openLine.text.slice(0, mark)
@@ -888,7 +892,8 @@ export function formulaRefusal(
   }
   const lines = formula.split(/\r?\n/);
   if (form === "fence") {
-    if (lines.some((line) => /^ {0,3}`{3,}[ \t]*$/.test(line))) {
+    // A line of backticks or tildes would close the fence (either kind).
+    if (lines.some((line) => /^ {0,3}(?:`{3,}|~{3,})[ \t]*$/.test(line))) {
       return "fence-line";
     }
   } else if (lines.some((line) => line.trim() === "$$")) {
@@ -1034,16 +1039,46 @@ export interface CodeFence extends Span {
   /** The opening fence's backticks or tildes. */
   marks: Span;
   /**
-   * The info word: the text right after the marks up to the first space or
-   * the line end. Empty (at the marks' end) when the info starts with a space.
+   * The info word, read as CommonMark and the editor's parser read it: after
+   * any spaces that follow the marks, up to the next space or the line end.
+   * Empty (at the marks' end) when there is none.
    */
   word: Span;
+  /** Whether more info text follows the word on the opening line. */
+  more: boolean;
   /** A tilde fence, whose info may hold a backtick. */
   tilde: boolean;
 }
 
-/** The info words the code box leaves to other layers: Part 4's and math's. */
-const NOT_CODE_BOXES = new Set(["mermaid", "math"]);
+/**
+ * The source of a mermaid fence the editor draws as a diagram
+ * (`fencePreviews.ts`), or null: a closed fence whose info word is
+ * `mermaid` (read as the page reads it, `fenceInfo`), with something in it.
+ * The reading page draws exactly these. The one test for both layers.
+ */
+export function mermaidFence(
+  state: EditorState,
+  node: SyntaxNode,
+): string | null {
+  const info = fenceInfo(state.doc, node);
+  if (info?.name !== "mermaid" || info.close === null) {
+    return null;
+  }
+  const body = fenceBody(state.doc, info);
+  return body.trim() === "" ? null : body;
+}
+
+/**
+ * Whether another layer draws the fence `node`: a mermaid diagram, or a
+ * formula with something in it. The code box leaves exactly those.
+ */
+function drawnElsewhere(state: EditorState, node: SyntaxNode): boolean {
+  if (mermaidFence(state, node) !== null) {
+    return true;
+  }
+  const math = mathFence(state, node);
+  return math !== null && math.tex.trim() !== "";
+}
 
 /** Whether `text` before position `upTo` holds only indentation. */
 function onlyIndent(text: string, upTo: number): boolean {
@@ -1053,7 +1088,8 @@ function onlyIndent(text: string, upTo: number): boolean {
 /**
  * The code box of `node`, a `FencedCode`, or null when it draws none: an
  * unclosed fence, one with no code line, one in a quote or after a list
- * marker, one in the frontmatter, on an id line, or a mermaid or math fence.
+ * marker, one in the frontmatter, on an id line, or one another layer
+ * draws (a mermaid diagram, a formula).
  */
 export function codeFenceOf(
   state: EditorState,
@@ -1084,10 +1120,11 @@ export function codeFenceOf(
   ) {
     return null;
   }
-  const after = doc.sliceString(first.to, openLine.to);
-  const length = /^[^ \t]*/.exec(after)?.[0].length ?? 0;
-  const word = { from: first.to, to: first.to + length };
-  if (NOT_CODE_BOXES.has(doc.sliceString(word.from, word.to))) {
+  if (drawnElsewhere(state, node)) {
+    return null;
+  }
+  const info = fenceInfo(doc, node);
+  if (info === null) {
     return null;
   }
   return {
@@ -1095,8 +1132,9 @@ export function codeFenceOf(
     to: closeLine.to,
     open: openLine.number,
     close: closeLine.number,
-    marks: { from: first.from, to: first.to },
-    word,
+    marks: info.marks,
+    word: info.word,
+    more: info.more,
     tilde: doc.sliceString(first.from, first.from + 1) === "~",
   };
 }
@@ -1107,9 +1145,14 @@ export function codeFenceAt(state: EditorState, pos: number): CodeFence | null {
     return null;
   }
   const tree = syntaxTree(state);
+  // In a fence line's indentation (a list item's, up to three spaces) the
+  // fence starts at its marks, past the indent.
+  const line = state.doc.lineAt(pos);
+  const indent = /^[ \t]*/.exec(line.text)?.[0].length ?? 0;
+  const at = pos < line.from + indent ? line.from + indent : pos;
   for (const side of [1, -1] as const) {
     for (
-      let node: SyntaxNode | null = tree.resolve(pos, side);
+      let node: SyntaxNode | null = tree.resolve(at, side);
       node;
       node = node.parent
     ) {
@@ -1125,24 +1168,18 @@ export function codeFenceAt(state: EditorState, pos: number): CodeFence | null {
   return null;
 }
 
-/**
- * The language an info word names, as the editor's highlighting finds it
- * (`matchLanguageName`, fuzzy), or null for none.
- */
-export function languageOf(word: string | null): LanguageDescription | null {
-  return word === null || word === ""
-    ? null
-    : LanguageDescription.matchLanguageName(languages, word, true);
-}
+export { languageOf } from "./codeLanguage";
 
 /**
  * Writes `word` as the info word of the code box starting at `at` (`null`
- * takes the word away, which is "Plain text"). Only the word's span is
- * written; any further info text stays, and the fence keeps its backticks
- * or tildes. Nothing is written when the word is already that text. Null
- * when there is no code box
- * starting at `at`, or `word` cannot be an info word: empty, with a space,
- * or with a backtick in a backtick fence.
+ * takes the word away, which is "Plain text"). The word goes right after the
+ * fence marks, in place of the old word and the spaces before it; any
+ * further info text stays, and the fence keeps its backticks or tildes.
+ * Nothing is written when the word is already that text. Null when there is
+ * no code box starting at `at`, when `word` cannot be an info word (empty,
+ * with a space, or with a backtick in a backtick fence), or for Plain text
+ * when more info follows the word: CommonMark would read that text as the
+ * language (`CodeFence.more`).
  */
 export function languageChanges(
   state: EditorState,
@@ -1159,10 +1196,13 @@ export function languageChanges(
   ) {
     return null;
   }
+  if (word === null && fence.more) {
+    return null;
+  }
   if (state.doc.sliceString(fence.word.from, fence.word.to) === (word ?? "")) {
     return [];
   }
-  return [{ from: fence.word.from, to: fence.word.to, insert: word ?? "" }];
+  return [{ from: fence.marks.to, to: fence.word.to, insert: word ?? "" }];
 }
 
 /**

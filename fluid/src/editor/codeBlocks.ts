@@ -34,8 +34,14 @@ import {
   StateField,
   Transaction,
 } from "@codemirror/state";
-import type { Command, DecorationSet } from "@codemirror/view";
-import { Decoration, EditorView, WidgetType, keymap } from "@codemirror/view";
+import type { Command, DecorationSet, ViewUpdate } from "@codemirror/view";
+import {
+  Decoration,
+  EditorView,
+  ViewPlugin,
+  WidgetType,
+  keymap,
+} from "@codemirror/view";
 
 import type { ElementEdit } from "./elementEdit";
 import {
@@ -168,13 +174,8 @@ function ask(
   view: EditorView,
   dom: HTMLElement,
   button: HTMLElement,
-  event: MouseEvent,
   kind: "language" | "code-actions",
 ): void {
-  if (event.button !== 0 || macMenuClick(event)) {
-    return;
-  }
-  event.preventDefault();
   const { state } = view;
   if (
     !state.facet(hiddenMarkLayerOn) ||
@@ -193,6 +194,40 @@ function ask(
     rect: button.getBoundingClientRect(),
   };
   requestElementEdit(view, edit);
+}
+
+/**
+ * The header button's ways in: the primary press (which places no caret),
+ * and a bare click (a screen reader's activation, Enter or Space on the
+ * focused button). A press asks once: the click the browser sends after it
+ * asks nothing more.
+ */
+function askOn(
+  view: EditorView,
+  dom: HTMLElement,
+  button: HTMLElement,
+  kind: "language" | "code-actions",
+): void {
+  let pressed = false;
+  button.addEventListener("mousedown", (event) => {
+    if (event.button !== 0 || macMenuClick(event)) {
+      return;
+    }
+    event.preventDefault();
+    pressed = true;
+    ask(view, dom, button, kind);
+  });
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    if (macMenuClick(event)) {
+      return;
+    }
+    if (pressed) {
+      pressed = false;
+      return;
+    }
+    ask(view, dom, button, kind);
+  });
 }
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -236,18 +271,14 @@ class CodeHeaderWidget extends WidgetType {
     language.className = "cm-code-language";
     language.setAttribute("aria-label", `Code language: ${this.name}`);
     language.textContent = this.name;
-    language.addEventListener("mousedown", (event) => {
-      ask(view, dom, language, event, "language");
-    });
+    askOn(view, dom, language, "language");
     const more = document.createElement("button");
     more.type = "button";
     more.className = "cm-code-more";
     more.setAttribute("aria-label", "More code block actions");
     more.title = "More code block actions";
     more.appendChild(moreIcon());
-    more.addEventListener("mousedown", (event) => {
-      ask(view, dom, more, event, "code-actions");
-    });
+    askOn(view, dom, more, "code-actions");
     dom.append(language, more);
     return dom;
   }
@@ -417,14 +448,16 @@ function offOneFence(
   }
   if (line.number === fence.open) {
     const fromBelow = before !== null && before > line.to;
-    if (fromBelow) {
-      return fence.open > 1 ? doc.line(fence.open - 1).to : before;
+    if (fromBelow && fence.open > 1) {
+      return doc.line(fence.open - 1).to;
     }
     return doc.line(fence.open + 1).from;
   }
   const fromAbove = before !== null && before < line.from;
-  if (fromAbove) {
-    return fence.close < doc.lines ? doc.line(fence.close + 1).from : before;
+  // With no line below (the box ends the document: Mod-End, a press below
+  // the text), the edge of the last code line is the place to rest.
+  if (fromAbove && fence.close < doc.lines) {
+    return doc.line(fence.close + 1).from;
   }
   return doc.line(fence.close - 1).to;
 }
@@ -433,8 +466,10 @@ function offOneFence(
  * A caret never rests on a hidden fence line: both its ends are positions,
  * and typing there would write into the fence. A step of this person's
  * (`select`) goes on the way it came: down into the box from above, out of
- * it to the line below, up out of it to the line above, and stays where it
- * was where there is no such line (a box that starts or ends the document).
+ * it to the line below, up out of it to the line above, and where there is
+ * no such line (a box that starts or ends the document: an arrow, Mod-Home,
+ * Mod-End, a press below the text) it rests on the box's first or last code
+ * line.
  * Any other caret (a commit, a mapped caret) goes into the box. Default
  * precedence, and never while main's selection is parked behind a cell or an
  * IME composes. A remote change sets no selection, so it is never steered:
@@ -487,6 +522,54 @@ const caretOffFenceLines = EditorState.transactionFilter.of((tr) => {
     },
   ];
 });
+
+/**
+ * After a change that set no selection (a peer's edit, a room undo) left the
+ * caret on a hidden fence line, a follow-up moves it into the box: a
+ * selection only, kept out of the undo history, so any write of the
+ * person's (typing, a toolbar or slash verb, an insert) starts inside the
+ * box. The remote transaction itself is never changed.
+ */
+const caretIntoBoxAfterRemote = ViewPlugin.define((view) => ({
+  update(update: ViewUpdate) {
+    if (
+      !update.docChanged ||
+      update.transactions.some((tr) => tr.selection !== undefined)
+    ) {
+      return;
+    }
+    const stray = () => {
+      const { state } = view;
+      const { main } = state.selection;
+      if (
+        view.composing ||
+        state.facet(mainSelectionParked) ||
+        state.selection.ranges.length !== 1 ||
+        !main.empty
+      ) {
+        return null;
+      }
+      return offFence(state, main.head, null);
+    };
+    if (stray() === null) {
+      return;
+    }
+    // Not from inside an update: once it is over.
+    queueMicrotask(() => {
+      if ((view as unknown as { destroyed?: boolean }).destroyed === true) {
+        return;
+      }
+      const pos = stray();
+      if (pos === null || pos === view.state.selection.main.head) {
+        return;
+      }
+      view.dispatch({
+        selection: EditorSelection.cursor(pos),
+        annotations: Transaction.addToHistory.of(false),
+      });
+    });
+  },
+}));
 
 /** What this person types or pastes, and their deletes. */
 const PERSON_WRITES = [
@@ -638,8 +721,18 @@ function fenceArrow(forward: boolean): Command {
     // The same column on the line it goes to, or that line's end.
     const to = doc.line(target);
     const head = to.from + Math.min(range.head - line.from, to.length);
+    // The goal column goes along, so a move on from the far side keeps the
+    // column CodeMirror's own vertical moves keep.
     view.dispatch({
-      selection: EditorSelection.cursor(head),
+      // A set, not a bare range: a bare range loses its goal column.
+      selection: EditorSelection.create([
+        EditorSelection.cursor(
+          head,
+          0,
+          undefined,
+          moved.goalColumn ?? range.goalColumn,
+        ),
+      ]),
       userEvent: "select",
       scrollIntoView: true,
     });
@@ -717,6 +810,7 @@ export function codeBlocks(): Extension {
     // listed first): a write it moves out of a fence sets a caret the caret
     // rule then finds already off the fence.
     writesOffFenceLines,
+    caretIntoBoxAfterRemote,
     fenceArrows,
     codeBoxTheme,
   ];

@@ -13,7 +13,9 @@
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Text } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
+import type { SyntaxNode } from "@lezer/common";
 
+import { fenceInfo } from "./fenceInfo";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { CODE_CONTEXTS } from "./prose";
 
@@ -96,6 +98,60 @@ export function unpadded(text: string): string {
 /** A page section's heading, which ends anything a section holds. */
 export const SECTION_HEADING = /^##(?:[ \t]|$)/;
 
+/**
+ * The formula a `FencedCode` node holds when it is a `math` fence the page
+ * draws as one block, or null. Shared with the code box, which leaves to
+ * this layer exactly the fences it draws.
+ */
+export function mathFence(
+  state: EditorState,
+  node: SyntaxNode,
+  sections = state.facet(mathSections),
+): MathBlock | null {
+  const doc = state.doc;
+  // The info word as the page reads it (`fenceInfo`): "``` math", a tilde
+  // fence and info after the word are math there too.
+  const info = fenceInfo(doc, node);
+  if (info === null || info.name !== "math" || info.close === null) {
+    return null;
+  }
+  const first = doc.line(info.open);
+  const last = doc.line(info.close);
+  const depth = quoteDepth(first.text);
+  const lines: string[] = [];
+  for (let number = first.number; number <= last.number; number += 1) {
+    lines.push(unquoted(doc.line(number).text, depth));
+  }
+  // A fence that does not start its line (one in a list item) stays
+  // source: its block would have to start mid-line.
+  const marks = doc.sliceString(info.marks.from, info.marks.to);
+  const fence = (lines[0] ?? "").startsWith(marks)
+    ? [lines.join("\n"), lines.slice(1, -1).join("\n")]
+    : null;
+  // On a page read section by section, a fence that runs over a section
+  // heading is not one block on the page: draw none.
+  const crosses =
+    sections &&
+    lines.some(
+      (text, index) =>
+        index > 0 &&
+        quoteDepth(doc.line(first.number + index).text) === 0 &&
+        SECTION_HEADING.test(text),
+    );
+  if (fence === null || crosses || last.number <= first.number) {
+    return null;
+  }
+  return {
+    from: first.from,
+    to: last.to,
+    tex: fence[1] ?? "",
+    form: "fence",
+    open: first.number,
+    close: last.number,
+    depth,
+  };
+}
+
 /** Every display formula of `state`, in document order of their ends. */
 export function mathBlocks(
   state: EditorState,
@@ -113,38 +169,9 @@ export function mathBlocks(
       if (node.name !== "FencedCode") {
         return false;
       }
-      const first = doc.lineAt(node.from);
-      const last = doc.lineAt(node.to);
-      const depth = quoteDepth(first.text);
-      const lines: string[] = [];
-      for (let number = first.number; number <= last.number; number += 1) {
-        lines.push(unquoted(doc.line(number).text, depth));
-      }
-      // A fence that does not start its line (one in a list item) stays
-      // source: its block would have to start mid-line.
-      const fence = /^```math[ \t]*\n([\s\S]*?)\n?```[ \t]*$/.exec(
-        lines.join("\n"),
-      );
-      // On a page read section by section, a fence that runs over a section
-      // heading is not one block on the page: draw none.
-      const crosses =
-        sections &&
-        lines.some(
-          (text, index) =>
-            index > 0 &&
-            quoteDepth(doc.line(first.number + index).text) === 0 &&
-            SECTION_HEADING.test(text),
-        );
-      if (fence !== null && !crosses && last.number > first.number) {
-        blocks.push({
-          from: first.from,
-          to: last.to,
-          tex: fence[1] ?? "",
-          form: "fence",
-          open: first.number,
-          close: last.number,
-          depth,
-        });
+      const block = mathFence(state, node.node, sections);
+      if (block !== null) {
+        blocks.push(block);
       }
       return false;
     },

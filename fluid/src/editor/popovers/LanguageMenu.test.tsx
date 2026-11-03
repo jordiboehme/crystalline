@@ -171,6 +171,71 @@ describe.each(CASES)(
       );
     });
 
+    it("picks the checked language on Enter in an empty filter", async () => {
+      const user = userEvent.setup();
+      const view = popoverView(DOC, { mode, room });
+      setCaret(view, 0);
+      press(languageButton(view));
+      await languageMenu();
+      await user.keyboard("{Enter}");
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(bytes(view.state)).toBe(DOC);
+    });
+
+    it("does nothing on Enter when nothing matches", async () => {
+      const user = userEvent.setup();
+      const view = popoverView(DOC, { mode, room });
+      setCaret(view, 0);
+      press(languageButton(view));
+      await languageMenu();
+      await user.keyboard("zzzz{Enter}");
+      expect(
+        screen.getByRole("menu", { name: "Code language" }),
+      ).not.toBeNull();
+      expect(bytes(view.state)).toBe(DOC);
+    });
+
+    it("keeps the word and says why when Plain text would lose the info after it", async () => {
+      const user = userEvent.setup();
+      const text = "a\n\n```ts title=x\nx\n```";
+      const view = popoverView(text, { mode, room });
+      setCaret(view, 0);
+      press(languageButton(view));
+      await languageMenu();
+      await user.click(
+        screen.getByRole("menuitemradio", { name: "Plain text" }),
+      );
+      expect(bytes(view.state)).toBe(text);
+      expect(screen.getByRole("status").textContent).toBe(
+        "Plain text cannot keep the info after the language.",
+      );
+      await user.click(screen.getByRole("menuitemradio", { name: "Rust" }));
+      expect(bytes(view.state)).toBe("a\n\n```rust title=x\nx\n```");
+    });
+
+    it.each(["language", "actions"])(
+      "writes nothing when the focus leaves the %s menu",
+      async (which) => {
+        const view = popoverView(DOC, { mode, room });
+        setCaret(view, 0);
+        if (which === "language") {
+          press(languageButton(view));
+          await languageMenu();
+        } else {
+          press(moreButton(view));
+          await actionsMenu();
+        }
+        const outside = document.createElement("button");
+        document.body.appendChild(outside);
+        outside.focus();
+        await waitFor(() => {
+          expect(screen.queryByRole("menu")).toBeNull();
+        });
+        expect(bytes(view.state)).toBe(DOC);
+        outside.remove();
+      },
+    );
+
     it("moves from the filter into the list with the arrow keys", async () => {
       const user = userEvent.setup();
       const view = popoverView(DOC, { mode, room });
