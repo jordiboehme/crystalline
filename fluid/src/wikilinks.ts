@@ -43,6 +43,7 @@
 import type { EngramDetail, LinkTarget } from "./api/engram";
 import type { GraphNeighborhood } from "./api/graph";
 import type { DomainSpellings } from "./domainNames";
+import { headingSlug } from "./anchors";
 import { engramRoute } from "./paths";
 
 /** What one `[[Target]]` turned out to be. */
@@ -124,15 +125,28 @@ function splitAlias(inner: string): { target: string; alias?: string } {
 export function parseWikiTarget(inner: string): LinkTarget {
   const { target: text, alias } = splitAlias(inner);
   const withAlias = alias === undefined ? {} : { alias };
+  let domain: string | null = null;
+  let rest = text;
   const colon = text.indexOf(":");
   if (colon > 0) {
-    const domain = text.slice(0, colon).trim();
-    const rest = text.slice(colon + 1).trim();
-    if (domain !== "" && rest !== "" && !/\s/.test(domain)) {
-      return { domain, target: rest, ...withAlias };
+    const prefix = text.slice(0, colon).trim();
+    const after = text.slice(colon + 1).trim();
+    if (prefix !== "" && after !== "" && !/\s/.test(prefix)) {
+      domain = prefix;
+      rest = after;
     }
   }
-  return { domain: null, target: text, ...withAlias };
+  // A `#` splits off a heading only when something precedes it, so `[[#setup]]`
+  // keeps its text whole, as the server's parser does.
+  const hash = rest.indexOf("#");
+  if (hash > 0) {
+    const target = rest.slice(0, hash).trim();
+    const fragment = rest.slice(hash + 1).trim();
+    if (target !== "" && fragment !== "") {
+      return { domain, target, fragment, whole: rest, ...withAlias };
+    }
+  }
+  return { domain, target: rest, ...withAlias };
 }
 
 /**
@@ -141,10 +155,11 @@ export function parseWikiTarget(inner: string): LinkTarget {
  * same question.
  */
 export function innerOf(target: LinkTarget): string {
-  const written =
-    target.domain === null
+  const base =
+    target.fragment === undefined
       ? target.target
-      : `${target.domain}:${target.target}`;
+      : `${target.target}#${target.fragment}`;
+  const written = target.domain === null ? base : `${target.domain}:${base}`;
   return target.alias === undefined ? written : `${written}|${target.alias}`;
 }
 
@@ -158,7 +173,12 @@ export function wikilinkWords(inner: string): string | null {
   if (parsed.target === "") {
     return null;
   }
-  return parsed.alias ?? parsed.target;
+  return (
+    parsed.alias ??
+    (parsed.fragment === undefined
+      ? parsed.target
+      : `${parsed.target}#${parsed.fragment}`)
+  );
 }
 
 /**
@@ -194,14 +214,20 @@ function readings(
   known: DomainSpellings | undefined,
 ): LinkTarget[] {
   const parsed = parseWikiTarget(inner);
+  // A title that holds a `#` (`C# Basics`) is tried as a whole first, the way
+  // the server does, before the heading split.
+  const first: LinkTarget[] =
+    parsed.whole === undefined
+      ? []
+      : [{ domain: parsed.domain, target: parsed.whole }];
   if (
     parsed.domain === null ||
     known === undefined ||
     known.has(parsed.domain)
   ) {
-    return [parsed];
+    return [...first, parsed];
   }
-  return [parsed, { domain: null, target: splitAlias(inner).target }];
+  return [...first, parsed, { domain: null, target: splitAlias(inner).target }];
 }
 
 /**
@@ -281,8 +307,9 @@ export function buildWikilinkResolver(
 
   return (inner: string) => {
     const candidates = readings(inner, known);
-    const alias = candidates[0]?.alias;
-    if (candidates[0]?.target === "") {
+    const split = candidates.find((c) => c.fragment !== undefined);
+    const { alias, target: written } = parseWikiTarget(inner);
+    if (written === "") {
       // `[[|b]]` names no target, so it is no link.
       return null;
     }
@@ -309,16 +336,24 @@ export function buildWikilinkResolver(
     for (const target of candidates) {
       const where = located.get(keyOf(target, home, known));
       if (where !== undefined) {
+        // Only the split reading carries a heading; a link located by its
+        // whole text opens the engram itself.
+        const fragment = target === split ? split.fragment : undefined;
+        const base = engramRoute(where.domain, where.permalink);
+        const shown = where.title === "" ? target.target : where.title;
         return {
           kind: "resolved",
-          href: engramRoute(where.domain, where.permalink),
+          href:
+            fragment === undefined ? base : `${base}#${headingSlug(fragment)}`,
           // The engram's own title, falling back to the bracket text for a node
           // that carries none. A link written by title is labelled with that
           // title in its canonical spelling; a link written by permalink is
           // labelled with the title too, which is the whole reason the engine
           // may write the address without costing a reader the name.
           // The author's display text wins over both: `[[a|b]]` reads "b".
-          label: alias ?? (where.title === "" ? target.target : where.title),
+          label:
+            alias ??
+            (fragment === undefined ? shown : `${shown} › ${fragment}`),
         };
       }
     }

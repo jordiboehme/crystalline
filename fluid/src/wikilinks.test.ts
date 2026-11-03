@@ -522,3 +522,91 @@ describe("a relative note link", () => {
     });
   });
 });
+
+describe("a wikilink to a heading", () => {
+  const headingDetail = (links: unknown[]) =>
+    readEngramDetail(
+      { domain: "notes", permalink: "a", title: "A", content: "", links },
+      "notes",
+      "a",
+    );
+  const headingGraph = (titles: [string, string][]) =>
+    readGraph({
+      nodes: titles.map(([permalink, title], i) => ({
+        id: i + 1,
+        domain: "notes",
+        permalink,
+        title,
+        status: "stable",
+        type: "engram",
+      })),
+      edges: [],
+      truncated: false,
+    });
+
+  it("splits the heading off a target and keeps the alias", () => {
+    expect(parseWikiTarget("b#Setup Guide|x")).toEqual({
+      domain: null,
+      target: "b",
+      fragment: "Setup Guide",
+      whole: "b#Setup Guide",
+      alias: "x",
+    });
+  });
+
+  it("keeps a leading hash as part of the target", () => {
+    expect(parseWikiTarget("#setup")).toEqual({
+      domain: null,
+      target: "#setup",
+    });
+  });
+
+  it("writes the heading back and shows it as written", () => {
+    expect(innerOf(parseWikiTarget("ops:b#Setup|x"))).toBe("ops:b#Setup|x");
+    expect(wikilinkWords("b#setup")).toBe("b#setup");
+    expect(wikilinkWords("b#setup|see")).toBe("see");
+  });
+
+  it("opens the engram at the heading slug, labelled with title and heading", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        {
+          resolved: true,
+          target: { domain: null, target: "b", fragment: "setup" },
+        },
+        {
+          resolved: true,
+          target: { domain: null, target: "b", fragment: "Setup Guide" },
+        },
+      ]),
+      headingGraph([["b", "Bee"]]),
+    );
+    expect(resolve("b#setup")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b#setup",
+      label: "Bee \u203a setup",
+    });
+    expect(resolve("b#Setup Guide|see")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/b#setup-guide",
+      label: "see",
+    });
+  });
+
+  it("opens a title holding a hash as a whole, without a fragment", () => {
+    const resolve = buildWikilinkResolver(
+      headingDetail([
+        { resolved: true, target: { domain: null, target: "C# Basics" } },
+      ]),
+      headingGraph([
+        ["c", "C"],
+        ["c-basics", "C# Basics"],
+      ]),
+    );
+    expect(resolve("C# Basics")).toEqual({
+      kind: "resolved",
+      href: "/d/notes/e/c-basics",
+      label: "C# Basics",
+    });
+  });
+});

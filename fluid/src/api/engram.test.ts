@@ -157,4 +157,31 @@ describe("the page address a detail payload carries", () => {
       readEngramDetail({ local_change: "renamed" }, "eng", "alpha").localChange,
     ).toBeNull();
   });
+
+  it("keeps the fragment of a link target and never reads whole", () => {
+    const read = readEngramDetail(
+      {
+        links: [
+          {
+            resolved: true,
+            target: {
+              domain: null,
+              target: "b",
+              fragment: "setup",
+              whole: "x",
+            },
+          },
+          { resolved: true, target: { domain: null, target: "c" } },
+        ],
+      },
+      "eng",
+      "alpha",
+    );
+    expect(read.links[0]?.target).toEqual({
+      domain: null,
+      target: "b",
+      fragment: "setup",
+    });
+    expect(read.links[1]?.target).toEqual({ domain: null, target: "c" });
+  });
 });

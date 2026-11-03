@@ -44,6 +44,16 @@ export interface LinkTarget {
    * where a link points.
    */
   alias?: string;
+  /**
+   * The heading a `[[target#heading]]` link names, without the `#`. Absent
+   * when the link has none.
+   */
+  fragment?: string;
+  /**
+   * Fluid side only, never read from the payload: the target text with its
+   * `#` kept, tried as a whole title before the heading split.
+   */
+  whole?: string;
 }
 
 /** One parsed reference out of the body: a prose wikilink or a relation. */
@@ -258,9 +268,12 @@ function readTarget(value: unknown): LinkTarget | null {
     return null;
   }
   const domain = asString(record?.domain);
-  return record?.form === "relative"
-    ? { domain, target, form: "relative" }
-    : { domain, target };
+  const fragment = asString(record?.fragment);
+  const base: LinkTarget =
+    record?.form === "relative"
+      ? { domain, target, form: "relative" }
+      : { domain, target };
+  return fragment === null || fragment === "" ? base : { ...base, fragment };
 }
 
 /** Read one reference, or null when it names nothing to point at. */
