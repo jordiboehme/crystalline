@@ -355,9 +355,11 @@ async fn assert_ada_keeps_her_role(eng: &Engine, title: &str) {
     let written = eng
         .write_engram_as(
             &WriteParams {
+                path: None,
+                base64: None,
                 domain: "kb".to_string(),
                 title: title.to_string(),
-                content: "- [fact] written without a user token".to_string(),
+                content: Some("- [fact] written without a user token".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: Vec::new(),
