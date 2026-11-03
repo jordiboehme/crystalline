@@ -96,6 +96,8 @@ import { useIgnoredEngram } from "../events/ignored";
 import { moveDraft } from "../editor/drafts";
 import { editRoute, engramRoute, engramsRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
+import { marksOnEditLine } from "../editor/marks/mode";
+import { useMarkSetting } from "../markSetting/context";
 import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
@@ -221,6 +223,9 @@ interface EngramSurfaceOptions {
   /** The layer switch the Raw toggle reconfigures. */
   preview: Compartment;
   raw: boolean;
+  /** The marks setting's switch, reconfigured when the person flips it. */
+  marks: Compartment;
+  showMarks: boolean;
   /** The resolver's own switch, reconfigured when the graph lands. */
   resolverBox: Compartment;
   resolver: WikilinkResolver;
@@ -287,6 +292,8 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
         options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
       ],
       preview: options.preview,
+      marks: options.marks,
+      showMarks: options.showMarks,
       raw: options.raw,
       images: imagePreviews(options.domain),
       uploads: options.uploads,
@@ -485,6 +492,18 @@ function Surface({
    */
   const [preview] = useState(() => new Compartment());
   /**
+   * The marks setting's switch, outside the preview compartment: a flip
+   * reconfigures this alone, so Raw and the previews are never rebuilt.
+   */
+  const [marks] = useState(() => new Compartment());
+  const { showOnEditLine } = useMarkSetting();
+  useEffect(() => {
+    // Nothing else in the transaction: no selection, no changes, no userEvent.
+    view?.dispatch({
+      effects: marks.reconfigure(marksOnEditLine.of(showOnEditLine)),
+    });
+  }, [view, marks, showOnEditLine]);
+  /**
    * The resolver's own switch. It is not part of the preview compartment
    * because it is not a layer: it is the answer the chips inside that layer
    * ask for, and it arrives once the neighborhood request lands rather than
@@ -633,6 +652,8 @@ function Surface({
       dark: resolved === "dark",
       domain: engram.domain,
       preview,
+      marks,
+      showMarks: showOnEditLine,
       raw,
       resolverBox,
       resolver,
@@ -920,6 +941,10 @@ function Surface({
         dark: resolved === "dark",
         domain: engram.domain,
         preview,
+        marks,
+        // The effect below carries the real setting in as soon as the view
+        // exists, the way the resolver's compartment does.
+        showMarks: false,
         raw: RAW_AT_MOUNT,
         resolverBox,
         // The graph has not landed at mount; the compartment above carries
@@ -941,6 +966,7 @@ function Surface({
       adapter,
       resolved,
       preview,
+      marks,
       resolverBox,
       room,
       uploads.extension,

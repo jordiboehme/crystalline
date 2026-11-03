@@ -25,6 +25,7 @@ import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
 import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
 import { FakeEventSource } from "../events/testSupport";
@@ -426,6 +427,47 @@ describe("the engram editor on a domain GitHub governs", () => {
 });
 
 describe("the engram editor", () => {
+  it("keeps the bytes and the caret when the marks setting flips, and the next key lands at the caret", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await openBuffer();
+    const view = mountedView(editor);
+    expect(view.state.facet(marksOnEditLine)).toBe(false);
+    const at = view.state.doc.toString().indexOf("rule");
+    act(() => {
+      view.dispatch({ selection: { anchor: at } });
+    });
+    const before = docText(view.state);
+
+    const menu = userEvent.setup();
+    await menu.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
+    await menu.click(
+      await screen.findByRole("menuitemcheckbox", {
+        name: "Show Markdown marks on the line I edit",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(view.state.facet(marksOnEditLine)).toBe(true);
+    });
+    expect(docText(view.state)).toBe(before);
+    expect(view.state.selection.main.head).toBe(at);
+    expect(view.state.selection.ranges).toHaveLength(1);
+
+    act(() => {
+      view.dispatch({
+        changes: { from: at, insert: "X" },
+        selection: { anchor: at + 1 },
+        userEvent: "input.type",
+      });
+    });
+    expect(docText(view.state)).toBe(
+      `${before.slice(0, at)}X${before.slice(at)}`,
+    );
+  });
+
   it("loads the exact file text into the buffer", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");

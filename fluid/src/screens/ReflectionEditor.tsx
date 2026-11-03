@@ -83,7 +83,9 @@ import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import type { ElementFace } from "../editor/elementContext";
 import { roomUndo } from "../editor/roomUndo";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { surfaceExtensions } from "../editor/surface";
+import { useMarkSetting } from "../markSetting/context";
 import type { TableUiContext } from "../editor/tableVerbs";
 import {
   UploadScreenContext,
@@ -608,6 +610,18 @@ function Surface({
    */
   const adapter = useMemo(() => reflectionAdapter(), []);
   const preview = useMemo(() => new Compartment(), []);
+  /**
+   * The marks setting's switch, outside the preview compartment: a flip
+   * reconfigures this alone and never rebuilds the previews.
+   */
+  const marks = useMemo(() => new Compartment(), []);
+  const { showOnEditLine } = useMarkSetting();
+  useEffect(() => {
+    // Nothing else in the transaction: no selection, no changes, no userEvent.
+    view?.dispatch({
+      effects: marks.reconfigure(marksOnEditLine.of(showOnEditLine)),
+    });
+  }, [view, marks, showOnEditLine]);
   /** Whether the caret is in a table or on an image: the bar's context verbs. */
   const [tableContext, setTableContext] = useState<TableUiContext>({
     inTable: false,
@@ -637,6 +651,9 @@ function Surface({
           editable.of(readOnly(mountEnded)),
         ],
         preview,
+        marks,
+        // The effect above carries the real setting in once the view exists.
+        showMarks: false,
         raw: false,
         images: previews.of(imagePreviews(home)),
         uploads: uploads.extension,
@@ -652,6 +669,7 @@ function Surface({
     resolved,
     adapter,
     preview,
+    marks,
     editable,
     mountEnded,
     uploads.extension,

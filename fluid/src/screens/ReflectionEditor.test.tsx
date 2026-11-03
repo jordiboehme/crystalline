@@ -13,6 +13,7 @@ import { TEXT_NAME } from "../collab/provider";
 import type { CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
 import { addOffer, readDraft, readOffers, writeDraft } from "../editor/drafts";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { formatInstant } from "../format";
 import {
   answersFor,
@@ -92,6 +93,50 @@ beforeEach(() => {
 });
 
 describe("the reflection editor", () => {
+  it("keeps the bytes and the caret when the marks setting flips, and the next key lands at the caret", async () => {
+    serve("edit");
+    live(room(PAGE));
+    const editor = await openEditor();
+    const host = editor.closest(".cm-editor");
+    const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+    if (!view) {
+      throw new Error("no EditorView is mounted on the page");
+    }
+    expect(view.state.facet(marksOnEditLine)).toBe(false);
+    const at = view.state.doc.toString().indexOf("First");
+    act(() => {
+      view.dispatch({ selection: { anchor: at } });
+    });
+    const before = view.state.doc.toString();
+
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
+    await user.click(
+      await screen.findByRole("menuitemcheckbox", {
+        name: "Show Markdown marks on the line I edit",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(view.state.facet(marksOnEditLine)).toBe(true);
+    });
+    expect(view.state.doc.toString()).toBe(before);
+    expect(view.state.selection.main.head).toBe(at);
+
+    act(() => {
+      view.dispatch({
+        changes: { from: at, insert: "X" },
+        selection: { anchor: at + 1 },
+        userEvent: "input.type",
+      });
+    });
+    expect(view.state.doc.toString()).toBe(
+      `${before.slice(0, at)}X${before.slice(at)}`,
+    );
+  });
+
   it("opens the live room with the ids hidden and Done back to the page", async () => {
     serve("edit");
     sessionMock.mockReturnValue(room(PAGE));

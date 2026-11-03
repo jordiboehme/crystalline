@@ -23,6 +23,8 @@ import { floatingContextListener } from "./floatingContext";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
 import { richPaste } from "./richPaste";
@@ -91,6 +93,14 @@ export interface SurfaceOptions {
    * reason.
    */
   onFloatingContext: (context: FloatingContext) => void;
+  /**
+   * The compartment the screen reconfigures when the marks setting flips. It
+   * sits outside the preview compartment, so a flip never rebuilds Raw or the
+   * previews. Absent, the setting is a bare value for the life of the state.
+   */
+  marks?: Compartment;
+  /** Whether marks show on the line being edited. Absent means hidden. */
+  showMarks?: boolean;
 }
 
 /**
@@ -124,6 +134,10 @@ export function previewConfig(
         // replaces its whole span over the marks folded inside it.
         ...proseLayers,
         cellPreviewLayers.of(proseLayers),
+        // After the prose layers and outside `livePreview()`, so the cell
+        // editor, which reads `proseLayers`, does not get it until it is
+        // given the layer on purpose.
+        hiddenMarkLayer(),
         // Before the read-only previews: the grid takes over the tables it
         // draws once its chunk is in.
         tableGrid(),
@@ -190,6 +204,11 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // starts a line, where no other source does.
     autocompletion({ override: [slashCompletions, ...adapter.completions] }),
     ...adapter.extensions,
+    // The marks setting. Outside the preview compartment: a flip dispatches
+    // `marks.reconfigure(...)` alone and never rebuilds Raw or the previews.
+    options.marks
+      ? options.marks.of(marksOnEditLine.of(options.showMarks ?? false))
+      : marksOnEditLine.of(options.showMarks ?? false),
     // Every later flip goes through the compartment rather than through this
     // array, which is read once per state.
     options.preview.of(

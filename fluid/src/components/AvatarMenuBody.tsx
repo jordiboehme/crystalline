@@ -14,6 +14,7 @@
 
 import {
   BookOpen,
+  Check,
   ExternalLink,
   Keyboard,
   LogIn,
@@ -36,6 +37,7 @@ import { useAuth } from "../auth/AuthContext";
 import { HANDBOOK_URL } from "../handbook";
 import { useLargeText } from "../layoutText";
 import { useFullWidth } from "../layoutWidth";
+import { useMarkSetting } from "../markSetting/context";
 import {
   githubSettingsRoute,
   maintenanceRoute,
@@ -165,6 +167,7 @@ export default function AvatarMenuBody({
   const { preference, resolved, choose } = useTheme();
   const { largeText, toggleLargeText } = useLargeText();
   const { fullWidth, toggleFullWidth } = useFullWidth();
+  const { showOnEditLine, setShowOnEditLine } = useMarkSetting();
   const wide = useWide();
   const onMaintenance = useMatch(maintenanceRoute()) !== null;
   const glyph = { "aria-hidden": true, size: 16, strokeWidth: 1.75 } as const;
@@ -292,6 +295,21 @@ export default function AvatarMenuBody({
             }}
           />
         )}
+        <DropdownMenu.CheckboxItem
+          className={ITEM_CLASSES}
+          checked={showOnEditLine}
+          onCheckedChange={setShowOnEditLine}
+          onSelect={(event) => {
+            event.preventDefault();
+          }}
+        >
+          <span className="grid size-4 shrink-0 place-items-center">
+            <DropdownMenu.ItemIndicator>
+              <Check {...glyph} className="text-ink" />
+            </DropdownMenu.ItemIndicator>
+          </span>
+          Show Markdown marks on the line I edit
+        </DropdownMenu.CheckboxItem>
       </DropdownMenu.Group>
 
       <DropdownMenu.Separator className={MENU_SEPARATOR} />
