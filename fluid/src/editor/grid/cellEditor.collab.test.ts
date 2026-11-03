@@ -22,7 +22,12 @@ import {
 import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
 import { activeCell } from "./cellEditor";
 import { gridTables } from "./structure";
-import { closeCell, onCellClosed, openCellField } from "./openCell";
+import {
+  closeCell,
+  onCellClosed,
+  openCellField,
+  openCellRange,
+} from "./openCell";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
 const TWO_ROWS = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
@@ -311,6 +316,41 @@ describe("cell editor under co-editing", () => {
         expect(rtext.toJSON()).toBe(f.text);
       },
     );
+
+    test("LIMIT: two people clearing the same bare first cell at once leave two pipes", async () => {
+      // Accepted limit (R24, fix round 2): each side writes its own `| `, the
+      // merge keeps both, and the row reads `| |  | 2`: three cells, so the
+      // `2` falls past the table's two columns. No remote normaliser.
+      const { main, rtext, remote } = roomMain(f.text);
+      const offline = new Y.Doc();
+      Y.applyUpdate(offline, Y.encodeStateAsUpdate(remote));
+      const otext = offline.getText("content");
+      const at = otext.toJSON().indexOf(`\n${f.lines[2] ?? ""}\n`) + 1;
+      // The other person's R24 result: `1` gone, `| ` in its place.
+      otext.delete(at, 1);
+      otext.insert(at, "| ");
+      const cell = openAt(main, cellOf(main, 1, 0).content.to);
+      press(cell.view, "Backspace");
+      await Promise.resolve();
+      Y.applyUpdate(remote, Y.encodeStateAsUpdate(offline), "offline");
+      await Promise.resolve();
+      const lines = [...f.lines];
+      lines[2] = "| |  | 2";
+      const merged = f.text.replace(f.lines.join("\n"), lines.join("\n"));
+      expect(rtext.toJSON()).toBe(merged);
+      expect(main.state.doc.toString()).toBe(merged);
+      const table = gridTables(main.state)[0];
+      expect(table?.rows[1]?.map((c) => c.text)).toEqual(["", "", "2"]);
+      expect(table?.model.columns).toBe(2);
+      // The local cell stays open on one of the two empty cells of row 1:
+      // which one depends on how Yjs orders the two equal inserts (client
+      // ids), so only that much is pinned.
+      expect(activeCell(main)).toBe(cell);
+      const open = openCellRange(main.state);
+      expect(open?.row).toBe(1);
+      expect([0, 1]).toContain(open?.column);
+      expect(open?.text).toBe("");
+    });
 
     test("a peer deleting part of a bare last cell leaves it open", async () => {
       const { main, rtext } = roomMain(f.text);

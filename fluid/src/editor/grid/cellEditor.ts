@@ -313,12 +313,13 @@ export function withEscapes(
 /**
  * Whether a bare first cell's text would start another block (or indented
  * code) instead of a table row: a list marker, an ATX heading, a quote, an
- * HTML block, a fence, or a leading blank that would grow the line's indent.
+ * HTML block, a fence, or a leading blank or tab that would grow the line's
+ * indent (only those are Markdown indent: U+3000 or a no-break space is text).
  * These are the line starts the server's merge reads as a new block too.
  */
 function opensBlock(text: string): boolean {
   return (
-    /^\s/.test(text) ||
+    /^[ \t]/.test(text) ||
     /^[-*+](\s|$)/.test(text) ||
     /^\d{1,9}[.)](\s|$)/.test(text) ||
     /^#{1,6}(\s|$)/.test(text) ||
@@ -348,33 +349,151 @@ export function withEdges(
   changes: ChangeSet,
   lineBreak: string,
 ): { changes: ChangeSet; range: CellRange } {
-  const next = changes.apply(doc);
   const from = changes.mapPos(range.from, -1);
   const to = Math.max(from, changes.mapPos(range.to, 1));
   const unchanged = { changes, range: { from, to } };
+  // Only an edit that reaches the cell's opening or closing edge can empty
+  // it or put a marker at its start; any other edit leaves the row as it is.
+  let opening = false;
+  let closing = false;
+  changes.iterChangedRanges((fromA, toA) => {
+    if (fromA <= range.from && toA >= range.from) opening = true;
+    if (fromA <= range.to && toA >= range.to) closing = true;
+  });
+  if (changes.empty || (!opening && !closing)) return unchanged;
+  const next = changes.apply(doc);
+  const fix = edgeFix(doc, range, next, { from, to });
+  if (!fix) return unchanged;
+  if (fix.leading && !opening) return unchanged;
+  if (!fix.leading && !closing) return unchanged;
+  return {
+    changes: changes.compose(
+      ChangeSet.of([fix.change], next.length, lineBreak),
+    ),
+    range: fix.range,
+  };
+}
+
+/** Blank as Markdown reads it: spaces and tabs, nothing else. */
+function blank(text: string): boolean {
+  return /^[ \t]*$/.test(text);
+}
+
+/**
+ * The one edge pipe R24 adds to the cell whose content was `range` in `doc`
+ * and is `now` in `next`, or null when it needs none. Whether an edge is
+ * bare is read off `doc`, the line as it was.
+ */
+function edgeFix(
+  doc: EditorState["doc"],
+  range: CellRange,
+  next: EditorState["doc"],
+  now: CellRange,
+): {
+  change: { from: number; insert: string };
+  range: CellRange;
+  leading: boolean;
+} | null {
   const line = doc.lineAt(range.from);
-  if (range.to > line.to) return unchanged;
-  const leadBare = /^[ \t]*$/.test(doc.sliceString(line.from, range.from));
+  if (range.to > line.to) return null;
+  const leadBare = blank(doc.sliceString(line.from, range.from));
   const trailBare = /^[ \t\r]*$/.test(doc.sliceString(range.to, line.to));
-  if (!leadBare && !trailBare) return unchanged;
-  const text = next.sliceString(from, to);
-  if (leadBare && (text.trim() === "" || opensBlock(text))) {
-    const fix = ChangeSet.of([{ from, insert: "| " }], next.length, lineBreak);
+  const text = next.sliceString(now.from, now.to);
+  if (leadBare && (blank(text) || opensBlock(text))) {
     return {
-      changes: changes.compose(fix),
-      range: { from: from + 2, to: to + 2 },
+      change: { from: now.from, insert: "| " },
+      range: { from: now.from + 2, to: now.to + 2 },
+      leading: true,
     };
   }
-  if (trailBare && text.trim() === "") {
-    const fix = ChangeSet.of(
-      [{ from: to, insert: " |" }],
-      next.length,
-      lineBreak,
-    );
-    return { changes: changes.compose(fix), range: { from, to } };
+  if (trailBare && blank(text)) {
+    return {
+      change: { from: now.to, insert: " |" },
+      range: { ...now },
+      leading: false,
+    };
   }
-  return unchanged;
+  return null;
 }
+
+/** Marks the edge fix a composition gets once it has ended. */
+const edgeSettle = Annotation.define<boolean>();
+
+/**
+ * R24 for a composition: an IME (or the emoji picker) writes its text in
+ * many transactions while `view.composing`, and an edge pipe added in the
+ * middle would land inside the text being composed. So the cell filter skips
+ * the edge rule for composing transactions, and once the composition has
+ * ended this applies it once, to the cell as it now reads, with the pipe
+ * outside the cell's range. It joins the composition's own undo step.
+ *
+ * The limit: a composition whose own text already ends the cell (it empties
+ * a bare cell, or opens a bare first cell with `- `, `# `, `> `, ...) loses
+ * the cell before it ends, as before R24, so there is nothing left to settle.
+ */
+function settleEdges(view: EditorView): void {
+  if (view.composing || !view.dom.isConnected) return;
+  const { state } = view;
+  const range = state.field(rangeField);
+  const fix = edgeFix(state.doc, range, state.doc, range);
+  if (!fix) return;
+  const head = state.selection.main.head + (fix.leading ? 2 : 0);
+  view.dispatch({
+    changes: fix.change,
+    selection: {
+      anchor: Math.min(fix.range.to, Math.max(fix.range.from, head)),
+    },
+    effects: setRange.of(fix.range),
+    annotations: [edgeSettle.of(true)],
+    userEvent: "input.type.compose",
+  });
+}
+
+/**
+ * Watches a cell view's compositions and settles the edges once one that
+ * changed the document has ended. CodeMirror may flush the composition's
+ * last DOM change a microtask after `compositionend` (Android later still),
+ * so the settle waits for a task, and an update that lands after the end
+ * settles too; whichever comes first does it, once.
+ */
+const composeEdges = ViewPlugin.fromClass(
+  class {
+    composed = false;
+    ended = false;
+    readonly view: EditorView;
+    constructor(view: EditorView) {
+      this.view = view;
+    }
+    update(update: ViewUpdate): void {
+      if (update.docChanged && update.view.composing) this.composed = true;
+      if (this.ended && update.docChanged && !update.view.composing) {
+        queueMicrotask(() => {
+          this.settle();
+        });
+      }
+    }
+    end(): void {
+      if (!this.composed) return;
+      this.ended = true;
+      setTimeout(() => {
+        this.settle();
+      }, 0);
+    }
+    settle(): void {
+      if (!this.ended || this.view.composing) return;
+      this.ended = false;
+      this.composed = false;
+      settleEdges(this.view);
+    }
+  },
+  {
+    eventHandlers: {
+      compositionend() {
+        this.end();
+      },
+    },
+  },
+);
 
 /**
  * Keeps local cell edits inside the cell: a change not fully inside
@@ -384,7 +503,7 @@ export function withEdges(
  */
 const clampToCell = EditorState.transactionFilter.of(
   (tr: Transaction): TransactionSpec | readonly TransactionSpec[] => {
-    if (tr.annotation(fromMain)) return tr;
+    if (tr.annotation(fromMain) || tr.annotation(edgeSettle)) return tr;
     const range = tr.startState.field(rangeField);
     if (!tr.docChanged) {
       if (!tr.selection) return tr;
@@ -418,7 +537,10 @@ const clampToCell = EditorState.transactionFilter.of(
     const lb = tr.startState.lineBreak;
     const plain = ChangeSet.of(kept, doc.length, lb);
     const escaped = withEscapes(doc, range, plain, lb);
-    const edged = withEdges(doc, range, escaped, lb);
+    // A composition gets its edge pipe once it has ended (composeEdges).
+    const edged = tr.isUserEvent("input.type.compose")
+      ? { changes: escaped, range }
+      : withEdges(doc, range, escaped, lb);
     const changes = edged.changes;
     if (changes !== plain) altered = true;
     if (!altered) {
@@ -817,6 +939,7 @@ export function mountCellEditor(
         rangeField.init(() => range),
         Prec.highest([hideOutside, cellMarks]),
         clampToCell,
+        composeEdges,
         forward,
         Prec.high([
           keymap.of([

@@ -407,14 +407,17 @@ function navigate(
         // pipe), so clearing it leaves the one pipe it needs, as a paste of
         // an empty value does.
         const line = table.model.lines[row === 0 ? 0 : row + 1];
-        const bare =
+        const leading = line !== undefined && column === 0 && !line.leadingPipe;
+        const trailing =
           line !== undefined &&
-          ((column === 0 && !line.leadingPipe) ||
-            (column === line.cells.length - 1 && !line.trailingPipe));
+          column === line.cells.length - 1 &&
+          !line.trailingPipe;
+        // The model's and the cell editor's spelling: `|  | 2`, `1 |  |`.
+        const insert = leading ? "| " : trailing ? " |" : "";
         // Its own undo step, never joined to typing just before or after.
         closeUndoGroup(main, "before");
         main.dispatch({
-          changes: bare ? { from, to, insert: "|" } : { from, to },
+          changes: insert === "" ? { from, to } : { from, to, insert },
           userEvent:
             event.key === "Delete" ? "delete.forward" : "delete.backward",
         });

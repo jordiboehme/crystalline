@@ -681,10 +681,10 @@ describe("grid navigation", () => {
     "clearing without outer pipes: $name",
     (f) => {
       test.each([
-        ["Delete", 0, "| | 2"],
-        ["Backspace", 0, "| | 2"],
-        ["Delete", 1, "1 | |"],
-        ["Backspace", 1, "1 | |"],
+        ["Delete", 0, "|  | 2"],
+        ["Backspace", 0, "|  | 2"],
+        ["Delete", 1, "1 |  |"],
+        ["Backspace", 1, "1 |  |"],
       ])("%s on cell 1/%i keeps the row's two cells", (key, column, line) => {
         const main = solo(f.text);
         const el = navOn(main, 1, column);

@@ -268,11 +268,22 @@ const replaceInCells = EditorState.transactionFilter.of(
       lb,
     );
     let changes = plain;
+    const open = start.field(openCellField, false) ?? null;
+    let reopen: { from: number; to: number } | null = null;
     for (const cell of cells) {
       changes = withEscapes(start.doc, cell.content, changes, lb);
       // R24: a replace that empties a bare edge cell, or opens a bare first
       // cell with a block marker, keeps the cell with its edge pipe.
-      changes = withEdges(start.doc, cell.content, changes, lb).changes;
+      const result = withEdges(start.doc, cell.content, changes, lb);
+      const edged = result.changes;
+      if (
+        edged !== changes &&
+        open &&
+        cell.span.from <= open.head &&
+        open.head <= cell.span.to
+      )
+        reopen = result.range;
+      changes = edged;
     }
     if (!altered && changes === plain) return tr;
     // The selection and the effects are in the coordinates of the changes
@@ -281,10 +292,26 @@ const replaceInCells = EditorState.transactionFilter.of(
     const selection = tr.selection
       ? tr.selection.map(back, 1).map(changes, 1)
       : undefined;
-    const effects = StateEffect.mapEffects(
-      StateEffect.mapEffects(tr.effects, back),
-      changes,
-    );
+    const effects = [
+      ...StateEffect.mapEffects(
+        StateEffect.mapEffects(tr.effects, back),
+        changes,
+      ),
+    ];
+    // The open cell's caret stays in the cell, never on an edge pipe the
+    // replace added beside it (a later cell's fixes sit on other lines).
+    if (reopen && open) {
+      const range = reopen;
+      const inside = (pos: number) =>
+        Math.min(range.to, Math.max(range.from, changes.mapPos(pos, -1)));
+      effects.push(
+        setOpenCell.of({
+          anchor: inside(open.anchor),
+          head: inside(open.head),
+          focused: open.focused,
+        }),
+      );
+    }
     const userEvent = tr.annotation(Transaction.userEvent);
     return [
       {

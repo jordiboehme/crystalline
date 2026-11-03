@@ -215,6 +215,129 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
       },
     );
 
+    test("an ideographic or no-break space at the start is text, not indent", () => {
+      const main = make(f.text);
+      const cell = openAt(main, cellOf(main, 1, 0).content.from);
+      typeIn(cell, "\u3000");
+      expect(bytes(main.state)).toBe(row1("\u30001 | 2"));
+      const other = openAt(main, cellOf(main, 2, 0).content.from);
+      typeIn(other, "\u00a0");
+      const lines = [...f.lines];
+      lines[2] = "\u30001 | 2";
+      lines[3] = (f.lines[3] ?? "").replace("3", "\u00a03");
+      expect(bytes(main.state)).toBe(withTable(f, lines));
+    });
+
+    test("an edit away from the cell's edges leaves the row's spelling alone", () => {
+      // `<b>` opens a block to the server's merge, but this row was written so
+      // and the edit only reaches the cell's end: no pipe is added for it.
+      const text = withTable(f, [
+        ...f.lines.slice(0, 2),
+        "<b>1</b> | 2",
+        f.lines[3] ?? "",
+      ]);
+      const main = make(text);
+      const cell = openAt(main, cellOf(main, 1, 0).content.to);
+      typeIn(cell, "x");
+      expect(bytes(main.state)).toBe(text.replace("<b>1</b> |", "<b>1</b>x |"));
+    });
+
+    /** Marks the cell view as composing, as CodeMirror does under an IME. */
+    function composing(cell: CellEditor, on: boolean): void {
+      if (on) {
+        Object.defineProperty(cell.view, "composing", {
+          get: () => true,
+          configurable: true,
+        });
+        return;
+      }
+      delete (cell.view as unknown as { composing?: boolean }).composing;
+      cell.view.contentDOM.dispatchEvent(
+        new CompositionEvent("compositionend"),
+      );
+    }
+
+    function compose(cell: CellEditor, from: number, to: number, text: string) {
+      cell.view.dispatch({
+        changes: { from, to, insert: text },
+        selection: { anchor: from + text.length },
+        userEvent: "input.type.compose",
+      });
+    }
+
+    /** CodeMirror may flush a composition's last change after its end. */
+    const settled = () => new Promise<void>((done) => setTimeout(done, 0));
+
+    test.each([
+      ["<b>", "| <b>1 | 2"],
+      [" ", "|  1 | 2"],
+    ])(
+      "a composition opening a bare first cell with %j gets its pipe once it ends",
+      async (marker, line) => {
+        const main = make(f.text);
+        const { content } = cellOf(main, 1, 0);
+        const cell = openAt(main, content.to);
+        composing(cell, true);
+        compose(cell, content.from, content.from, marker.slice(0, 1));
+        if (marker.length > 1)
+          compose(cell, content.from, content.from + 1, marker);
+        // Mid-composition no pipe: nothing outside the composed text moves,
+        // and the cell stays open.
+        expect(bytes(main.state)).toBe(row1(`${marker}1 | 2`));
+        expect(activeCell(main)).toBe(cell);
+        composing(cell, false);
+        await settled();
+        expect(bytes(main.state)).toBe(row1(line));
+        expect(openText(main)).toBe(`${marker}1`);
+        expect(activeCell(main)).toBe(cell);
+        const head = cell.view.state.selection.main.head;
+        const now = cellOf(main, 1, 0).content;
+        expect(head >= now.from && head <= now.to).toBe(true);
+        expect(press(cell.view, "z", { mod: true })).toBe(true);
+        expect(bytes(main.state)).toBe(f.text);
+      },
+    );
+
+    test("a composition of plain text, or one opening with U+3000, never gets a pipe", async () => {
+      const main = make(f.text);
+      const { content } = cellOf(main, 1, 0);
+      const cell = openAt(main, content.to);
+      composing(cell, true);
+      compose(cell, content.from, content.to, "\u3042");
+      compose(cell, content.from, content.from + 1, "\u3000\u65e5\u672c");
+      composing(cell, false);
+      await settled();
+      expect(bytes(main.state)).toBe(row1("\u3000\u65e5\u672c | 2"));
+      expect(openText(main)).toBe("\u3000\u65e5\u672c");
+      expect(activeCell(main)).toBe(cell);
+    });
+
+    // The accepted limit: a composition whose own text ends the cell before
+    // it ends closes the cell as gone, as before R24. Its bytes are exactly
+    // the composed text, and no pipe is added afterwards.
+    test.each([
+      ["empties a bare last cell", 1, "", "1 | "],
+      ["opens a bare first cell with a list marker", 0, "- ", "- 1 | 2"],
+    ])(
+      "LIMIT: a composition that %s closes the cell, no pipe",
+      async (_what, column, text, line) => {
+        const main = make(f.text);
+        const { content } = cellOf(main, 1, column);
+        const cell = openAt(main, content.to);
+        const heard = vi.fn();
+        onCellClosed(main, heard);
+        composing(cell, true);
+        if (text === "") compose(cell, content.from, content.to, "");
+        else compose(cell, content.from, content.from, text);
+        await Promise.resolve();
+        expect(heard).toHaveBeenCalledWith("gone");
+        expect(activeCell(main)).toBeNull();
+        composing(cell, false);
+        await settled();
+        expect(bytes(main.state)).toBe(row1(line));
+      },
+    );
+
     test("text that opens no block keeps the row bare", () => {
       const main = make(f.text);
       const cell = openAt(main, cellOf(main, 1, 0).content.from);

@@ -349,6 +349,8 @@ describe.each(PIPELESS_FIXTURES)(
       findNext(main);
       expect(openPlace(main)).toEqual([1, column]);
       replaceNext(main);
+      // The cell stays open on the same cell.
+      expect(openPlace(main)).toEqual([1, column]);
       const lines = [...f.lines];
       lines[2] = line;
       expect(bytes(main.state)).toBe(withTable(f, lines));
