@@ -202,6 +202,15 @@ impl Engine {
             self.require_domain(domain, scope).await?;
             return Err(EngineError::DomainReadOnly(read_only_sentence(domain)));
         }
+        // The switch-off is a MANIFEST write as well, and an archived
+        // repository takes no write from anybody, the owner included. The
+        // unlock view below skips the archived check, so it is asked here.
+        if unlocking && let Some(repo) = self.github_archived_repo(domain) {
+            self.require_domain(domain, scope).await?;
+            return Err(EngineError::DomainReadOnly(archived_sentence(
+                domain, &repo,
+            )));
+        }
         // Reflection: a switch-on is screened against the text the edits
         // would produce, so the policy PATCH, configure and a raw MANIFEST
         // edit refuse with one sentence. A switch-off (`set reflection: off`,

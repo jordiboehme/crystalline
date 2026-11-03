@@ -202,3 +202,39 @@ fn a_real_domain_prefix_is_never_read_as_a_title() {
         other => panic!("expected resolved, got {other:?}"),
     }
 }
+
+/// A table holding `c` (title `C`) and `c-basics` (title `C# Basics`) in
+/// `notes`, the same two in `ops`, and `b` in `notes`.
+fn hash_table() -> LookupTable {
+    let mut t = LookupTable::new();
+    for domain in ["notes", "ops"] {
+        t.insert(domain, "c", "C");
+        t.insert(domain, "c-basics", "C# Basics");
+    }
+    t.insert("notes", "b", "B");
+    t
+}
+
+fn resolved_to(link: &str, domain: &str) -> Option<(String, String)> {
+    match resolve(&LinkTarget::parse(link), domain, &hash_table()) {
+        Resolution::Resolved(r) => Some((r.domain, r.permalink)),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_title_holding_a_hash_is_tried_whole_before_the_fragment_splits() {
+    let pair = |d: &str, p: &str| Some((d.to_string(), p.to_string()));
+    assert_eq!(resolved_to("C# Basics", "notes"), pair("notes", "c-basics"));
+    assert_eq!(resolved_to("c#intro", "notes"), pair("notes", "c"));
+    assert_eq!(resolved_to("ops:C# Basics", "ops"), pair("ops", "c-basics"));
+    assert_eq!(
+        resolved_to("ops:C# Basics", "notes"),
+        pair("ops", "c-basics")
+    );
+    assert_eq!(resolved_to("b#setup", "notes"), pair("notes", "b"));
+    assert_eq!(
+        resolve(&LinkTarget::parse("ghost#x"), "notes", &hash_table()),
+        Resolution::Unresolved
+    );
+}

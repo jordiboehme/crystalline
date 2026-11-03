@@ -168,7 +168,7 @@ impl Engine {
         for (domain, path, _, in_draft) in self.local_spelling_counts(&table, &busy).await? {
             // A read-only domain keeps its links as they are (decision D7);
             // `name_report` still lists them.
-            if self.domain_is_read_only(&domain).await {
+            if self.writes_refused(&domain).await {
                 continue;
             }
             // Already respelled in the owner's draft: nothing to write again.

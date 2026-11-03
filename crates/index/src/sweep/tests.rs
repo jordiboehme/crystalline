@@ -339,6 +339,7 @@ fn v004_distinguishes_a_missing_relation_from_an_unresolved_one() {
         target: "Newer Checklist".to_string(),
         raw: "Newer Checklist".to_string(),
         alias: None,
+        whole: None,
         line: Some(7),
     }];
 
@@ -769,6 +770,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             target: "Deployment Pipline Runbook".to_string(),
             raw: "Deployment Pipline Runbook".to_string(),
             alias: None,
+            whole: None,
             line: Some(12),
         },
         UnresolvedRef {
@@ -779,6 +781,7 @@ fn v102_is_mechanical_only_with_a_near_exact_candidate() {
             target: "Nothing Like That At All".to_string(),
             raw: "Nothing Like That At All".to_string(),
             alias: None,
+            whole: None,
             line: Some(14),
         },
     ];
@@ -821,6 +824,7 @@ fn v102_names_an_unregistered_target_domain() {
         target: "Old Notes".to_string(),
         raw: "archive:Old Notes".to_string(),
         alias: None,
+        whole: None,
         line: None,
     }];
 
@@ -885,6 +889,31 @@ fn v102_repairs_a_plain_typo_without_inventing_a_prefix() {
     let finding = only(&detect(&sweep), "V102");
     assert_eq!(finding.fix, "[[Release Checklst]] -> [[Release Checklist]]");
     assert_eq!(finding.class, Class::Mechanical);
+}
+
+/// A dangling link with a `#heading` is named and quoted with it, and a
+/// repair keeps it on both sides.
+#[test]
+fn v102_quotes_a_link_with_its_heading_fragment() {
+    let mut sweep = input(vec![fact(2, "runbook")]);
+    let mut reference = unresolved(2, "ghost");
+    reference.whole = Some("ghost#x".to_string());
+    sweep.unresolved = vec![reference];
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(finding.finding, "unresolved reference [[ghost#x]]");
+    assert_eq!(finding.fix, "[[ghost#x]]");
+
+    let mut target = fact(1, "release-checklist");
+    target.title = "Release Checklist".to_string();
+    let mut sweep = input(vec![target, fact(2, "runbook")]);
+    let mut reference = unresolved(2, "Release Checklst");
+    reference.whole = Some("Release Checklst#steps".to_string());
+    sweep.unresolved = vec![reference];
+    let finding = only(&detect(&sweep), "V102");
+    assert_eq!(
+        finding.fix,
+        "[[Release Checklst#steps]] -> [[Release Checklist#steps]]"
+    );
 }
 
 /// A link with display text is quoted with it on both sides: the left side is
@@ -3049,6 +3078,7 @@ fn unresolved(from: i64, target: &str) -> UnresolvedRef {
         // was written, which is what an unprefixed link actually stores.
         raw: target.to_string(),
         alias: None,
+        whole: None,
         line: Some(3),
     }
 }
@@ -3168,6 +3198,7 @@ fn spelled(from: i64, spelling: &str, target: &str) -> SpelledRef {
         spelling: spelling.to_string(),
         raw: format!("{spelling}:{target}"),
         alias: None,
+        whole: None,
     }
 }
 

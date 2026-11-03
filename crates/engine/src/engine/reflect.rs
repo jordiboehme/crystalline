@@ -1037,7 +1037,7 @@ impl Engine {
         let mut unreadable = Vec::new();
         let mut pending = Vec::new();
         for name in names {
-            if shadowed.contains(&name) || self.domain_is_read_only(&name).await {
+            if shadowed.contains(&name) || self.writes_refused(&name).await {
                 continue;
             }
             match self.reflection_state(&name).await {

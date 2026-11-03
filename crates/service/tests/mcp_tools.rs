@@ -1074,6 +1074,14 @@ async fn tool_descriptions_teach_folders() {
         move_description.contains("subfolder"),
         "move_engram names the topic subfolder a cluster earns: {move_description}"
     );
+    assert!(
+        move_description.contains("[[old#heading]]"),
+        "move_engram names the heading link it keeps: {move_description}"
+    );
+    assert!(
+        !move_description.contains("never resolves"),
+        "move_engram no longer calls a heading link dead: {move_description}"
+    );
 }
 
 /// A remote client never sees the initialize instructions, so `list_domains`

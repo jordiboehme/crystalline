@@ -303,8 +303,10 @@ pub struct WholeLinks {
     pub text: String,
     /// How many links changed.
     pub changed: usize,
-    /// Links written as a wikilink, as they were written before, whose
-    /// `#fragment` or title a wikilink cannot carry.
+    /// Links written as a wikilink, as they were written before, whose title
+    /// a wikilink cannot carry, or whose `#fragment` holds `|`, `[`, `]` or
+    /// `#` once percent-decoded and so cannot follow the address. Any other
+    /// fragment is carried as `[[address#fragment|text]]`.
     pub dropped: Vec<String>,
     /// Links that should have become a wikilink, left as written because
     /// their text cannot sit inside `[[...]]` (it holds `[[` or `]]`).
@@ -314,7 +316,8 @@ pub struct WholeLinks {
 /// `map_note_links` that may also replace a whole link: `map` is handed
 /// each decoded target and answers a new destination, a wikilink address, or
 /// `None` to keep the link. A wikilink keeps the link text as its display
-/// text; a `#fragment` and a title cannot follow it and are named in
+/// text and the `#fragment`, percent-decoded, after the address; a title, and
+/// a fragment a wikilink cannot hold, cannot follow it and are named in
 /// [`WholeLinks::dropped`].
 pub fn map_note_links_whole(source: &str, map: &dyn Fn(&str) -> Option<NoteLinkTo>) -> WholeLinks {
     use std::cell::RefCell;
@@ -376,12 +379,25 @@ fn whole_line(
                     out.push_str(&line[cursor..open]);
                     out.push_str(&line[open..dest.close]);
                 } else {
-                    if dest.fragment.is_some() || !dest.rest.trim().is_empty() {
+                    // A `#fragment` follows the address, percent-decoded, when
+                    // a wikilink can carry it; a title never can.
+                    let fragment = dest.fragment.map(percent_decode_target);
+                    let carried = fragment
+                        .as_deref()
+                        .filter(|f| !f.contains(['|', '[', ']', '#']));
+                    let lost = fragment
+                        .as_deref()
+                        .is_some_and(|f| carried.is_none() && !f.is_empty());
+                    if lost || !dest.rest.trim().is_empty() {
                         dropped.borrow_mut().push(written.to_string());
                     }
                     out.push_str(&line[cursor..start]);
                     out.push_str("[[");
                     out.push_str(&address);
+                    if let Some(fragment) = carried.filter(|f| !f.trim().is_empty()) {
+                        out.push('#');
+                        out.push_str(fragment);
+                    }
                     if !text.trim().is_empty() {
                         out.push('|');
                         out.push_str(text);

@@ -1252,8 +1252,9 @@ fn pending_predicates(
 }
 
 /// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
-/// link), rel_type (NULL for a link), target text, target domain and resolved
-/// flag. The column layout is identical across both backends.
+/// link), rel_type (NULL for a link), target text, target domain, resolved
+/// flag and the whole target text with its `#heading`. The column layout is
+/// identical across both backends.
 fn outbound_ref_from_row(r: &PgRow) -> OutboundRef {
     OutboundRef {
         line: cell_i64(r, 0).unwrap_or(0) as usize,
@@ -1265,14 +1266,16 @@ fn outbound_ref_from_row(r: &PgRow) -> OutboundRef {
         rel_type: cell_text(r, 2),
         to_target: cell_text(r, 3).unwrap_or_default(),
         to_domain: cell_text(r, 4),
+        to_whole: cell_text(r, 6),
         resolved: cell_i64(r, 5).unwrap_or(0) != 0,
     }
 }
 
 /// Decode one row of the unresolved-reference query. The column layout is
 /// identical across both backends; column 6 is the source path, selected only to
-/// order by, so it is not read back, and column 7 is the bracket text as
-/// written, which the repair scores against.
+/// order by, so it is not read back, column 7 is the bracket text as written,
+/// which the repair scores against, and column 9 the whole target text with
+/// its `#heading`, which a quote rebuilds it from.
 fn unresolved_ref_from_row(r: &PgRow) -> UnresolvedRef {
     UnresolvedRef {
         from: EngramId(cell_i64(r, 0).unwrap_or(0)),
@@ -1288,6 +1291,7 @@ fn unresolved_ref_from_row(r: &PgRow) -> UnresolvedRef {
         // the repair treats as "nothing extra to score" rather than as a match.
         raw: cell_text(r, 7).unwrap_or_default(),
         alias: cell_text(r, 8),
+        whole: cell_text(r, 9),
         // The parser writes 0 when it has no line to report, which the sweep
         // reads as "no line" rather than as line zero.
         line: cell_i64(r, 5).filter(|l| *l > 0).map(|l| l as usize),
@@ -1763,15 +1767,15 @@ pub fn folder_level_sql(rel: &str, under: &str) -> String {
 pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &str) -> String {
     format!(
         "SELECT u.engram_id, u.kind, u.rel_type, u.to_domain, u.to_target, u.line, u.path, u.to_raw, \
-                u.to_alias \
+                u.to_alias, u.to_whole \
          FROM ( \
            SELECT r.engram_id, 0::int8 AS kind, r.rel_type, r.to_domain, r.to_target, \
-                  r.line, e.path, r.to_raw, r.to_alias \
+                  r.line, e.path, r.to_raw, r.to_alias, r.to_whole \
            FROM relation r JOIN engram e ON e.id=r.engram_id \
            WHERE {src_screen} AND {rel_pending} AND r.domain_id=$1 \
            UNION ALL \
            SELECT l.engram_id, 1::int8, 'links_to', l.to_domain, l.to_target, l.line, e.path, \
-                  l.to_raw, l.to_alias \
+                  l.to_raw, l.to_alias, l.to_whole \
            FROM link l JOIN engram e ON e.id=l.engram_id \
            WHERE {src_screen} AND {link_pending} AND l.domain_id=$1 \
          ) u \
@@ -2208,6 +2212,7 @@ impl Store for PostgresStore {
                         spelling: cell_text(r, 2).unwrap_or_default(),
                         raw: cell_text(r, 3).unwrap_or_default(),
                         alias: cell_text(r, 5),
+                        whole: cell_text(r, 6),
                     },
                 )
             })
@@ -3212,11 +3217,11 @@ impl Store for PostgresStore {
             conn.as_mut(),
             &format!(
                 "SELECT r.line AS line, 0::int8 AS kind, r.rel_type, r.to_target, r.to_domain, \
-                    ({rel_resolved})::int8 AS resolved \
+                    ({rel_resolved})::int8 AS resolved, r.to_whole \
              FROM relation r WHERE r.engram_id=$1 \
              UNION ALL \
              SELECT l.line, 1::int8, NULL, l.to_target, l.to_domain, \
-                    ({link_resolved})::int8 \
+                    ({link_resolved})::int8, l.to_whole \
              FROM link l WHERE l.engram_id=$1 \
              ORDER BY line"
             ),
@@ -5617,6 +5622,20 @@ impl PostgresStore {
             delete_children(&mut *c, engram_id).await?;
         }
 
+        // A base row whose title holds a `#`: references that name it whole
+        // and were bound through their split target before it existed are
+        // unbound, so the resolve pass after this write binds them here.
+        if actor.is_empty() && record.title.contains('#') {
+            for table in ["relation", "link"] {
+                exec(
+                    &mut *c,
+                    &crate::store::unbind_shadowed_by_title_sql(table, "$1", "$2"),
+                    vec![Param::Int(domain.0), Param::Text(record.title.clone())],
+                )
+                .await?;
+            }
+        }
+
         // Observations: insert in chunks and read each new row's id back joined
         // on its source line (unique within one engram), so observation tags map
         // to the right observation without relying on RETURNING row order.
@@ -5664,7 +5683,7 @@ impl PostgresStore {
         }
 
         for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 8);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 9);
             for rel in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
@@ -5674,16 +5693,17 @@ impl PostgresStore {
                 params.push(Param::TextOpt(rel.to_domain.clone()));
                 params.push(Param::Text(rel.to_raw.clone()));
                 params.push(Param::TextOpt(rel.to_alias.clone()));
+                params.push(Param::TextOpt(rel.to_whole.clone()));
             }
             let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_alias, to_id) VALUES {}",
-                value_rows(8, batch.len(), Some("NULL"))
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_alias, to_whole, to_id) VALUES {}",
+                value_rows(9, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
 
         for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 8);
             for link in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
@@ -5692,10 +5712,11 @@ impl PostgresStore {
                 params.push(Param::TextOpt(link.to_domain.clone()));
                 params.push(Param::Text(link.to_raw.clone()));
                 params.push(Param::TextOpt(link.to_alias.clone()));
+                params.push(Param::TextOpt(link.to_whole.clone()));
             }
             let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_alias, to_id) VALUES {}",
-                value_rows(7, batch.len(), Some("NULL"))
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_alias, to_whole, to_id) VALUES {}",
+                value_rows(8, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
@@ -5996,9 +6017,9 @@ mod tests {
                 }
             }
             assert_eq!(
-                id_keys, 5,
+                id_keys, 6,
                 "reference_match({label}) should carry the id tie-break on every one of \
-                 its five COALESCE arms: {rendered}"
+                 its six COALESCE arms: {rendered}"
             );
         }
     }

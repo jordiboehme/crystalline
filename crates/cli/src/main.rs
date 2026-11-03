@@ -1377,7 +1377,8 @@ enum DomainCommand {
         is_virtual: bool,
         /// Connect to a GitHub repository: owner/repo, or owner/repo/subpath
         /// when the team domain is a subfolder of the repository. Requires
-        /// github.enabled and a prior `crystalline connect github`.
+        /// github.enabled and either a GitHub App or a prior
+        /// `crystalline connect github`.
         #[arg(long)]
         origin: Option<String>,
         /// The branch to track. Only meaningful with --origin; defaults to

@@ -1272,4 +1272,41 @@ describe("the members card on a domain GitHub governs", () => {
       ),
     ).toBeVisible();
   });
+
+  it("says a domain is read-only when its repository is archived", async () => {
+    const reason =
+      "'eng' is read-only because its GitHub repository acme/eng is archived; reading still works";
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({ archived_reason: reason, github_people: [] }),
+      },
+      "root",
+      "admin",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    expect(
+      within(card).getByText(
+        "'eng' is read-only because its GitHub repository acme/eng is archived; reading still works.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("shows no archived sentence when the reason is null", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({ archived_reason: null, github_people: [] }),
+      },
+      "root",
+      "admin",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    expect(within(card).queryByText(/is read-only because/)).toBeNull();
+    expect(within(card).queryByRole("status")).toBeNull();
+  });
 });

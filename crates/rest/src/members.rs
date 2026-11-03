@@ -141,6 +141,13 @@ pub struct MembersResponse {
     /// Why this domain is closed (the GitHub App is not installed on its
     /// repository), for an instance admin; `null` otherwise.
     pub closed_reason: Option<String>,
+    /// On a domain GitHub governs whose repository is archived on GitHub,
+    /// the sentence that says the domain is read-only for everybody until
+    /// the repository is unarchived; `null` otherwise.
+    #[schema(
+        example = "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
+    )]
+    pub archived_reason: Option<String>,
 }
 
 /// Who decides access to a domain.
@@ -486,6 +493,10 @@ pub async fn list(
             .is_some_and(|user| user.role == Role::Admin)
             .then(|| state.engine.github_closed_reason(&domain))
             .flatten();
+        let archived_reason = state
+            .engine
+            .github_archived_repo(&domain)
+            .map(|repo| crate::engine::archived_sentence(&domain, &repo));
         return Ok(Json(MembersResponse {
             owner: None,
             visibility,
@@ -496,6 +507,7 @@ pub async fn list(
             reflection_collaborators,
             visibility_fixed_by,
             closed_reason,
+            archived_reason,
         }));
     }
     let Some(acl) = acl else {
@@ -509,6 +521,7 @@ pub async fn list(
             reflection_collaborators,
             visibility_fixed_by: None,
             closed_reason: None,
+            archived_reason: None,
         }));
     };
     let members = state
@@ -529,6 +542,7 @@ pub async fn list(
         reflection_collaborators,
         visibility_fixed_by: None,
         closed_reason: None,
+        archived_reason: None,
     }))
 }
 

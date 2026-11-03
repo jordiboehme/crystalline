@@ -9378,7 +9378,7 @@
           "settings"
         ],
         "summary": "Where the GitHub App delivers its webhook events.",
-        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything in the body is read. A delivery id seen in the last day is answered 200 and does nothing; a body sent again under a fresh id is harmless because every event only narrows access. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost, or follow a rename GitHub itself confirms); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
+        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything in the body is read. A delivery id seen in the last day is answered 200 and does nothing; a body sent again under a fresh id is harmless because every event only narrows access. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost or whose organization was deleted, or follow a repository or organization rename GitHub itself confirms); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
         "operationId": "receive_github_webhook",
         "requestBody": {
           "description": "The event's payload, as GitHub sends it, at most 25 MiB.",
@@ -14336,6 +14336,14 @@
           "overridden"
         ],
         "properties": {
+          "archived_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a domain GitHub governs whose repository is archived on GitHub,\nthe sentence that says the domain is read-only for everybody until\nthe repository is unarchived; `null` otherwise.",
+            "example": "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
+          },
           "closed_reason": {
             "type": [
               "string",

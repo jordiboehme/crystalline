@@ -73,6 +73,30 @@ pub(crate) async fn require_share_role_on(
     }
 }
 
+/// Refuse a share surface that changes something (the preview, the share,
+/// a withdrawal, a conflict resolution) on a domain whose GitHub repository
+/// is archived: read-only for everyone on a governed domain, an instance
+/// admin included. The reads beside them (the status and a conflict's
+/// sides) stay open, since reading still works. A daemon with no resolver
+/// governs nothing and skips this; GitHub refuses the push anyway.
+/// Screened first, so a domain the caller may not see is never named.
+pub(crate) async fn refuse_archived_share(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<(), ApiError> {
+    if let Some(repo) = state.engine.github_archived_repo(domain) {
+        state
+            .engine
+            .require_domain(domain, &identity.scope())
+            .await?;
+        return Err(
+            EngineError::DomainReadOnly(crate::engine::archived_sentence(domain, &repo)).into(),
+        );
+    }
+    Ok(())
+}
+
 /// The account a request is being served as, or `None` for the anonymous
 /// viewer, which has no account to attribute anybody's work to.
 ///
@@ -1592,6 +1616,7 @@ pub async fn share_changes_preview(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role_on(&state, &identity, &domain).await?;
+    refuse_archived_share(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The domain gate `sync_status` explains: a domain the caller may not see
     // is refused as one nobody registered.
@@ -1844,6 +1869,7 @@ pub async fn share_now(
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role_on(&state, &identity, &domain).await?;
+    refuse_archived_share(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -1992,6 +2018,7 @@ pub async fn withdraw_proposal(
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role_on(&state, &identity, &domain).await?;
+    refuse_archived_share(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -2218,6 +2245,12 @@ pub async fn resolve_conflict(
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role_on(&state, &identity, &domain).await?;
+    // Taking GitHub's side is what a pull does, and a pull still applies on
+    // an archived domain: it leaves nothing unshared, so only "mine" and
+    // "merged" are refused there, as the engine path does.
+    if body.resolution != "theirs" {
+        refuse_archived_share(&state, &identity, &domain).await?;
+    }
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.

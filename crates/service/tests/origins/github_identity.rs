@@ -35,6 +35,11 @@ fn recorded(fx: &Fx, domain: &str) -> Option<RepositoryIds> {
 /// The engine started again on the same configuration file and state, the
 /// way a restarted daemon is: nothing the old one learned in memory.
 async fn restart(fx: &Fx) -> Arc<Engine> {
+    restart_engine(fx, false).await
+}
+
+/// [`restart`], read-only when `read_only`.
+pub(crate) async fn restart_engine(fx: &Fx, read_only: bool) -> Arc<Engine> {
     let path = fx.tmp.path().join("config.yaml");
     let cfg: GlobalConfig = crystalline_core::config::load_yaml(&path).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
@@ -51,7 +56,8 @@ async fn restart(fx: &Fx) -> Arc<Engine> {
             .with_origins_dir(tmp.join("origins"))
             .with_state_dir(tmp.to_path_buf())
             .with_token_store_dir(tmp.join("tokens"))
-            .with_env_overlay(overlay),
+            .with_env_overlay(overlay)
+            .with_read_only(read_only),
     );
     eng.github_app().unwrap();
     eng.set_domain_access(Arc::new(
@@ -60,10 +66,10 @@ async fn restart(fx: &Fx) -> Arc<Engine> {
     eng
 }
 
-const MOVED: &str =
+pub(crate) const MOVED: &str =
     "the repository moved to newco/kb on GitHub; disconnect the domain and connect it again";
 
-fn closed_reason(eng: &Engine, domain: &str) -> Option<String> {
+pub(crate) fn closed_reason(eng: &Engine, domain: &str) -> Option<String> {
     eng.github_access_closed()
         .into_iter()
         .find(|c| c.domain == domain)
@@ -71,7 +77,7 @@ fn closed_reason(eng: &Engine, domain: &str) -> Option<String> {
 }
 
 /// Waits until `check` holds, for things done in the background.
-async fn eventually(check: impl Fn() -> bool) -> bool {
+pub(crate) async fn eventually(check: impl Fn() -> bool) -> bool {
     for _ in 0..100 {
         if check() {
             return true;

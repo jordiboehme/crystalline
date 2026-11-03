@@ -1423,6 +1423,12 @@ export type MemberLevel = 'none' | 'viewer' | 'editor' | 'manager';
  */
 export type MembersResponse = {
     /**
+     * On a domain GitHub governs whose repository is archived on GitHub,
+     * the sentence that says the domain is read-only for everybody until
+     * the repository is unarchived; `null` otherwise.
+     */
+    archived_reason?: string | null;
+    /**
      * Why this domain is closed (the GitHub App is not installed on its
      * repository), for an instance admin; `null` otherwise.
      */

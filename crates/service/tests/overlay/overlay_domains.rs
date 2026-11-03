@@ -7076,6 +7076,8 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         // The read-only half alone, for a preview that must claim no host lock.
         "refuse_read_only_flag(",
         "domain_is_read_only(",
+        // The lock or an archived GitHub repository (`Engine::writes_refused`).
+        "writes_refused(",
     ]
     .iter()
     .flat_map(|needle| call_sites(needle))

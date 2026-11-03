@@ -53,7 +53,7 @@ const DOMAINS: [&str; 5] = [SHARED, PUBLIC, PRIVATE, CLOSED_SHARED, CLOSED_PRIVA
 /// A domain with no origin, which GitHub does not govern.
 const PLAIN: &str = "plain";
 
-const PASSWORD: &str = "pw12345678";
+pub(crate) const PASSWORD: &str = "pw12345678";
 
 /// A GitHub link: the GitHub id, and the role GitHub lists it with (`None`:
 /// linked, but not listed).
@@ -540,13 +540,13 @@ fn row_engram(domain: &str, account: &str) -> WriteParams {
     }
 }
 
-fn client() -> reqwest::Client {
+pub(crate) fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 /// Log in, returning (session cookie value, csrf token); `None` when the
 /// login is refused.
-async fn login(addr: std::net::SocketAddr, name: &str) -> Option<(String, String)> {
+pub(crate) async fn login(addr: std::net::SocketAddr, name: &str) -> Option<(String, String)> {
     let resp = client()
         .post(format!("http://{addr}/api/v1/auth/login"))
         .json(&json!({"name": name, "password": PASSWORD}))
@@ -570,7 +570,7 @@ async fn login(addr: std::net::SocketAddr, name: &str) -> Option<(String, String
     Some((cookie, body["csrf"].as_str().unwrap().to_string()))
 }
 
-fn with_session(
+pub(crate) fn with_session(
     request: reqwest::RequestBuilder,
     session: Option<&(String, String)>,
 ) -> reqwest::RequestBuilder {
@@ -585,14 +585,14 @@ fn with_session(
 // --- MCP ---------------------------------------------------------------------
 
 /// One MCP conversation over the HTTP transport, as `token` or as nobody.
-struct Mcp {
+pub(crate) struct Mcp {
     addr: std::net::SocketAddr,
     token: Option<String>,
     session: Option<String>,
 }
 
 impl Mcp {
-    async fn open(addr: std::net::SocketAddr, token: Option<String>) -> Option<Mcp> {
+    pub(crate) async fn open(addr: std::net::SocketAddr, token: Option<String>) -> Option<Mcp> {
         let mut mcp = Mcp {
             addr,
             token,
@@ -661,7 +661,7 @@ impl Mcp {
     }
 
     /// Call `tool`: `Ok(text)` for an answer, `Err(text)` for a refusal.
-    async fn call(&self, tool: &str, arguments: Value) -> Result<String, String> {
+    pub(crate) async fn call(&self, tool: &str, arguments: Value) -> Result<String, String> {
         let (_, _, answer) = self
             .post(&json!({
                 "jsonrpc": "2.0",

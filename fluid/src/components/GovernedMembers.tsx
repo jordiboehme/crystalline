@@ -33,6 +33,12 @@ function closedSentence(reason: string): string {
   return `Closed. ${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}.`;
 }
 
+/** The archived reason as a sentence that starts with a capital and ends in a dot. */
+function archivedSentence(reason: string): string {
+  const trimmed = reason.trim().replace(/\.$/, "");
+  return `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}.`;
+}
+
 export function GovernedMembers({
   domain,
   isPrivate,
@@ -41,6 +47,7 @@ export function GovernedMembers({
   mayChoose,
   fixedBy,
   closedReason,
+  archivedReason,
   disabledReason,
 }: {
   domain: string;
@@ -53,6 +60,8 @@ export function GovernedMembers({
   /** The sentence that says the environment sets who reads it, or null. */
   fixedBy: string | null;
   closedReason: string | null;
+  /** Why the domain is read-only, when its repository is archived; else null. */
+  archivedReason: string | null;
   disabledReason?: string | undefined;
 }): ReactElement {
   return (
@@ -63,6 +72,14 @@ export function GovernedMembers({
           className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200"
         >
           {closedSentence(closedReason)}
+        </p>
+      )}
+      {archivedReason !== null && (
+        <p
+          role="status"
+          className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {archivedSentence(archivedReason)}
         </p>
       )}
       <WhoMayRead

@@ -167,6 +167,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "reflection disclosures",
         sql: SCHEMA_V29,
     },
+    Migration {
+        version: 30,
+        label: "wikilink whole target text",
+        sql: SCHEMA_V30,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -942,6 +947,22 @@ CREATE TABLE reflection_disclosure (
     records TEXT NOT NULL,
     PRIMARY KEY(domain_id, path)
 );
+"#;
+
+// The target of a `[[target#heading]]` reference as 0.30.0 read it, the `#`
+// and all, beside the split `to_target`, so an engram whose own title holds a
+// `#` (`C# Basics`) is still found by its whole title before the text after
+// the `#` is read as a heading. NULL when nothing was split off. Nullable, no
+// default, no backfill: the parse generation moved in the same release, so
+// every engram is parsed again and its rows are written with the column
+// filled. The partial `lower(to_whole)` indexes carry the unbind a base write
+// runs when a title that such a reference names whole appears
+// (`unbind_shadowed_by_title_sql`).
+const SCHEMA_V30: &str = r#"
+ALTER TABLE relation ADD COLUMN to_whole TEXT;
+ALTER TABLE link ADD COLUMN to_whole TEXT;
+CREATE INDEX idx_relation_to_whole ON relation(lower(to_whole)) WHERE to_whole IS NOT NULL;
+CREATE INDEX idx_link_to_whole ON link(lower(to_whole)) WHERE to_whole IS NOT NULL;
 "#;
 
 const SCHEMA_V9: &str = r#"

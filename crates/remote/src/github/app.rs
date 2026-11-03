@@ -445,10 +445,15 @@ pub struct RepositoryFacts {
     /// Its current `owner/name` (a renamed one answers under its new name),
     /// when GitHub sent it.
     pub full_name: Option<String>,
+    /// Whether the repository is archived (read-only on GitHub); an answer
+    /// without the field reads false.
+    pub archived: bool,
 }
 
 #[derive(Deserialize)]
 struct FactsResponse {
+    #[serde(default)]
+    archived: bool,
     #[serde(default)]
     id: Option<u64>,
     #[serde(default)]
@@ -480,6 +485,21 @@ struct VisibilityResponse {
     /// releases leave it out.
     #[serde(default)]
     visibility: Option<String>,
+}
+
+/// The facts a `GET /repos/{o}/{r}` or `GET /repositories/{id}` answer holds.
+fn facts_of(repo: &str, answer: FactsResponse) -> Result<RepositoryFacts, RemoteError> {
+    let visibility = visibility_of(repo, &answer.visibility)?;
+    let ids = match (answer.id, answer.owner.and_then(|o| o.id)) {
+        (Some(repository), Some(owner)) => Some(crate::state::RepositoryIds { repository, owner }),
+        _ => None,
+    };
+    Ok(RepositoryFacts {
+        visibility,
+        ids,
+        full_name: answer.full_name,
+        archived: answer.archived,
+    })
 }
 
 /// Who may read `repo`, from what `GET /repos/{o}/{r}` said.
@@ -1078,18 +1098,32 @@ impl GithubApp {
         let response = self.get_as_installation(repo, &path).await?;
         let response = check_response(response, Some(repo), true, &self.api_url).await?;
         let answer: FactsResponse = parse_json(response).await?;
-        let visibility = visibility_of(repo, &answer.visibility)?;
-        let ids = match (answer.id, answer.owner.and_then(|o| o.id)) {
-            (Some(repository), Some(owner)) => {
-                Some(crate::state::RepositoryIds { repository, owner })
-            }
-            _ => None,
-        };
-        Ok(RepositoryFacts {
-            visibility,
-            ids,
-            full_name: answer.full_name,
-        })
+        facts_of(repo, answer)
+    }
+
+    /// [`GithubApp::repository_facts`] for the repository with numeric id
+    /// `id`, from `GET /repositories/{id}` with the token of installation
+    /// `installation`. A 401 means the cached token was revoked early: the
+    /// installation's token is forgotten and the request goes out once more
+    /// on a fresh one. The id survives a rename, so this answers where a
+    /// name no longer does.
+    pub async fn repository_facts_by_id(
+        &self,
+        installation: u64,
+        id: u64,
+    ) -> Result<RepositoryFacts, RemoteError> {
+        let path = format!("/repositories/{id}");
+        let token = self.installation_token(installation).await?;
+        let mut response = send(self.request(Method::GET, &path, Some(&token))).await?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            self.evict_installation(installation);
+            let token = self.installation_token(installation).await?;
+            response = send(self.request(Method::GET, &path, Some(&token))).await?;
+        }
+        let label = format!("repository {id}");
+        let response = check_response(response, Some(&label), true, &self.api_url).await?;
+        let answer: FactsResponse = parse_json(response).await?;
+        facts_of(&label, answer)
     }
 
     /// What GitHub says `repo` is now: its numeric id and its current

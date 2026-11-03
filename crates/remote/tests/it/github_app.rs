@@ -1342,6 +1342,139 @@ async fn repository_facts_read_the_ids_the_name_and_the_visibility() {
     assert_eq!(facts.full_name.as_deref(), Some("acme/handbook"));
 }
 
+/// `archived` is read from `GET /repos/{o}/{r}`, and an answer without it
+/// reads false.
+#[tokio::test]
+async fn repository_facts_read_whether_it_is_archived() {
+    for (body, expected) in [
+        (
+            serde_json::json!({"id": 55, "full_name": "acme/kb", "private": true, "archived": true}),
+            true,
+        ),
+        (
+            serde_json::json!({"id": 55, "full_name": "acme/kb", "private": true}),
+            false,
+        ),
+    ] {
+        let routes = Router::new().route(
+            "/repos/{owner}/{name}",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+        assert_eq!(
+            app.repository_facts("acme/kb").await.unwrap().archived,
+            expected
+        );
+    }
+}
+
+/// `GET /repositories/{id}` with the installation's token answers the ids,
+/// the full name and archived.
+#[tokio::test]
+async fn repository_facts_by_id_answer_ids_name_and_archived() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let routes = Router::new().route(
+        "/repositories/{id}",
+        get(move |Path(id): Path<u64>, headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(headers["authorization"].to_str().unwrap().to_string());
+                Json(serde_json::json!({
+                    "id": id, "full_name": "acme/handbook", "private": true,
+                    "visibility": "private", "archived": true,
+                    "owner": {"id": 7, "login": "acme"},
+                }))
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let facts = app.repository_facts_by_id(11, 55).await.unwrap();
+    assert_eq!(facts.visibility, RepoVisibility::Private);
+    assert_eq!(
+        facts.ids,
+        Some(crystalline_remote::state::RepositoryIds {
+            repository: 55,
+            owner: 7
+        })
+    );
+    assert_eq!(facts.full_name.as_deref(), Some("acme/handbook"));
+    assert!(facts.archived);
+    assert_eq!(*seen.lock().unwrap(), vec!["Bearer ghs_11_1".to_string()]);
+}
+
+#[tokio::test]
+async fn repository_facts_by_id_renew_the_token_once_after_a_401() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let routes = Router::new().route(
+        "/repositories/{id}",
+        get(move |headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                recorded.lock().unwrap().push(auth.clone());
+                if auth == "Bearer ghs_11_1" {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"message": "Bad credentials"})),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": 55, "full_name": "acme/kb", "private": false,
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let facts = app.repository_facts_by_id(11, 55).await.unwrap();
+    assert!(!facts.archived);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["Bearer ghs_11_1".to_string(), "Bearer ghs_11_2".to_string()]
+    );
+}
+
+/// A 401 on the fresh token too is an error: the request is retried once,
+/// never more.
+#[tokio::test]
+async fn repository_facts_by_id_fail_after_a_second_401() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let routes = Router::new().route(
+        "/repositories/{id}",
+        get(move |headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                recorded.lock().unwrap().push(auth);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"message": "Bad credentials"})),
+                )
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let answer = app.repository_facts_by_id(11, 55).await;
+    assert!(answer.is_err(), "{answer:?}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["Bearer ghs_11_1".to_string(), "Bearer ghs_11_2".to_string()],
+        "exactly one retry"
+    );
+}
+
 // --- the manifest flow --------------------------------------------------------
 
 fn manifest_params(webhook_public: bool) -> ManifestParams {

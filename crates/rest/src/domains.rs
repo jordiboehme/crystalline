@@ -146,9 +146,13 @@ pub async fn list(
             // The share routes' own gate, asked per domain, so a client
             // draws the share surfaces exactly where they are served.
             let may_share = match row.get("name").and_then(Value::as_str) {
-                Some(name) => super::domains_admin::require_share_role_on(&state, &identity, name)
-                    .await
-                    .is_ok(),
+                Some(name) => {
+                    super::domains_admin::require_share_role_on(&state, &identity, name)
+                        .await
+                        .is_ok()
+                        // An archived repository takes no share at all.
+                        && state.engine.github_archived_repo(name).is_none()
+                }
                 None => false,
             };
             row["may_share"] = json!(may_share);

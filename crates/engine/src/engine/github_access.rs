@@ -274,8 +274,9 @@ pub(crate) trait GovernorEnv: Send + Sync {
     /// Record `ids` for `domain`, which had none: trust on first use, for a
     /// domain connected before the ids were recorded at connect.
     fn record_ids(&self, _domain: &str, _ids: RepositoryIds) {}
-    /// GitHub answers `old` under the name `live` (renamed within its owner,
-    /// the ids unchanged): the engine may connect the domains to `live`.
+    /// GitHub answers `old` under the name `live` with the repository and
+    /// owner ids every domain recorded (renamed, or its owner renamed): the
+    /// engine may connect the domains to `live`.
     fn renamed(&self, _old: &str, _live: &str) {}
 }
 
@@ -292,6 +293,8 @@ struct Snapshot {
     ids: Option<RepositoryIds>,
     /// Its current name, when GitHub sent it.
     live_name: Option<String>,
+    /// Whether GitHub calls the repository archived (read-only there).
+    archived: bool,
 }
 
 impl Snapshot {
@@ -346,6 +349,12 @@ struct State {
     failing: HashMap<String, Failing>,
     /// Bumped by every invalidation of one repository.
     generations: HashMap<String, u64>,
+    /// Repositories known to be archived on GitHub, by cache key: their
+    /// domains are read-only for everybody. Set at once by an `archived`
+    /// delivery ([`GithubGovernor::mark_archived`]) and set or cleared only
+    /// by a lookup GitHub answered, stored under the generation rule, so a
+    /// replayed `unarchived` body or any invalidation never clears it.
+    archived: HashSet<String>,
     /// Bumped by every invalidation of more than one repository.
     global: u64,
 }
@@ -779,6 +788,53 @@ impl GithubGovernor {
         state.moved.insert(key, reason);
     }
 
+    /// The repository (`owner/name`, as the domain's origin names it) of
+    /// `domain` when it is known to be archived on GitHub, else `None`.
+    /// Reads only what the governor remembers and never starts a lookup, so
+    /// the write gate never waits for GitHub: an unknown state reads as not
+    /// archived.
+    pub fn archived(&self, domain: &str) -> Option<String> {
+        let repo = self.repo_of(domain)?;
+        lock(&self.state)
+            .archived
+            .contains(&repo_key(&repo))
+            .then_some(repo)
+    }
+
+    /// Carry the archived mark of `old` over to `new` after the engine
+    /// followed a rename GitHub confirmed, so the renamed domain stays
+    /// read-only until a lookup of the new name decides. The old name keeps
+    /// its mark only while a domain is still connected to it.
+    pub fn follow_archived_rename(&self, old: &str, new: &str) {
+        let (old_key, new_key) = (repo_key(old), repo_key(new));
+        let still_connected = self
+            .env
+            .origins()
+            .iter()
+            .any(|(_, repo)| repo_key(repo) == old_key);
+        let mut state = lock(&self.state);
+        if !state.archived.contains(&old_key) {
+            return;
+        }
+        state.archived.insert(new_key);
+        if !still_connected {
+            state.archived.remove(&old_key);
+        }
+    }
+
+    /// Mark `repo` archived at once, because a webhook said so (a payload
+    /// may narrow on its own word). The generation is bumped under the same
+    /// lock, so a lookup that started before this cannot clear the mark
+    /// with its older answer; only a later lookup GitHub answers with
+    /// `archived: false` does.
+    pub fn mark_archived(&self, repo: &str) {
+        let mut state = lock(&self.state);
+        let key = repo_key(repo);
+        *state.generations.entry(key.clone()).or_default() += 1;
+        state.entries.remove(&key);
+        state.archived.insert(key);
+    }
+
     /// Who reads `domain`'s repository on GitHub: whether it is public and
     /// the GitHub ids with read or more, from the same snapshot as every
     /// other answer. `None` when that is not known right now (no usable
@@ -1003,6 +1059,17 @@ impl GithubGovernor {
                                 fetched_at: started,
                             },
                         );
+                        if snapshot.archived {
+                            if state.archived.insert(key.clone()) {
+                                tracing::info!(
+                                    "{repo} is archived on GitHub, so its domain is read-only"
+                                );
+                            }
+                        } else if state.archived.remove(&key) {
+                            tracing::info!(
+                                "{repo} is no longer archived on GitHub, so its domain can change again"
+                            );
+                        }
                     }
                     if state.failing.remove(&key).is_some() {
                         tracing::info!("GitHub answers again who may use {repo}");
@@ -1021,8 +1088,8 @@ impl GithubGovernor {
     /// is (or nothing is recorded or answered to compare). An origin state
     /// that cannot be read fails closed. A domain with no recorded ids
     /// records the answered ones (trust on first use). A
-    /// rename within the owner (the same ids under another name) is not a
-    /// difference: the engine is told, and may follow it, but only when
+    /// rename (the same ids under another name, the owner's login included)
+    /// is not a difference: the engine is told, and may follow it, but only when
     /// every domain on `repo` had its ids recorded and they match.
     fn identity_differs(&self, repo: &str, snapshot: &Snapshot) -> Option<String> {
         let live = snapshot.ids?;
@@ -1362,6 +1429,7 @@ async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, FetchE
         people,
         ids: facts.ids,
         live_name: facts.full_name,
+        archived: facts.archived,
     })
 }
 
@@ -1593,6 +1661,13 @@ impl GovernorEnv for EngineEnv {
         });
     }
 
+    /// Connects the domains of `old` to `live`, in the background. A new
+    /// owner login is followed too: the governor calls this only when every
+    /// domain's recorded repository id and owner id equal GitHub's answer,
+    /// and a transfer changes the owner id, so a changed login here is the
+    /// same owner renamed (an organization rename whose delivery was
+    /// missed), never a move to another owner. A read-only instance moves
+    /// nothing.
     fn renamed(&self, old: &str, live: &str) {
         let (Some(engine), Ok(runtime)) =
             (self.engine.upgrade(), tokio::runtime::Handle::try_current())
@@ -1600,13 +1675,6 @@ impl GovernorEnv for EngineEnv {
             return;
         };
         if engine.read_only {
-            return;
-        }
-        let owner = |name: &str| name.split_once('/').map(|(o, _)| o.to_ascii_lowercase());
-        if owner(old).is_none() || owner(old) != owner(live) {
-            tracing::warn!(
-                "GitHub answers {old} as {live}, under another owner; that is never followed on its own"
-            );
             return;
         }
         let old_key = repo_key(old);
@@ -1790,6 +1858,18 @@ impl super::Engine {
             .unwrap_or_default()
     }
 
+    /// The repository of `domain` when GitHub governs the domain and its
+    /// repository is known to be archived (see [`GithubGovernor::archived`]),
+    /// else `None`. Never builds the governor and never asks GitHub, so a
+    /// domain GitHub does not govern pays nothing.
+    pub fn github_archived_repo(&self, domain: &str) -> Option<String> {
+        let governor = self.github_governor.get()?;
+        if !self.github_governs(domain) {
+            return None;
+        }
+        governor.archived(domain)
+    }
+
     /// Why `domain` is closed (see [`GithubGovernor::closed`]), or `None`
     /// when it is open or not governed.
     pub fn github_closed_reason(&self, domain: &str) -> Option<String> {
@@ -1941,6 +2021,18 @@ impl super::Engine {
     ///   GitHub, asked with the installation token, answers the same
     ///   repository id for `repository.id` and for the old name (through
     ///   its redirect) and the name it gives is the payload's.
+    /// * `organization` `renamed`: the domains on the old login's
+    ///   repositories are connected to the new names only when GitHub,
+    ///   asked by each domain's recorded repository id with the
+    ///   installation token, answers that id, the recorded owner id (the
+    ///   payload's `organization.id`) and a name under the new login. A
+    ///   domain without recorded ids, or recorded for another owner, keeps
+    ///   its origin, and both names are forgotten. A body missing the old
+    ///   login, the new one, the id or the installation only forgets.
+    /// * `organization` `deleted`: the domains of the organization's
+    ///   repositories are closed at once ([`GithubGovernor::close`]), except
+    ///   a domain recorded for another owner id, and open again only when
+    ///   the recheck finds GitHub still shows the App the repository.
     /// * `repository` `transferred` to another owner is never followed
     ///   (Ruling R32): the domain is closed for good
     ///   ([`GithubGovernor::close_moved`]) until an admin reconnects it. A
@@ -1956,6 +2048,11 @@ impl super::Engine {
     ///   ([`Invalidate::Installation`]). A domain opens again only when
     ///   GitHub shows the App its repository, and its opening runs the
     ///   Reflection rescan.
+    /// * `repository` `archived`: the domain is read-only for everybody at
+    ///   once ([`GithubGovernor::mark_archived`]), and the repository is
+    ///   asked about again in the background, so GitHub's answer confirms
+    ///   or clears the mark within seconds. `unarchived` only asks again:
+    ///   the mark goes when GitHub answers `archived: false`.
     /// * `github_app_authorization` `revoked`: the person's user token is
     ///   deleted and their link kept (`sender.id` names them).
     ///
@@ -1992,6 +2089,41 @@ impl super::Engine {
             ("organization", "member_added" | "member_removed") => {
                 self.forget_github_user(&governor, payload.pointer("/membership/user/id"))
             }
+            ("organization", "renamed") => {
+                let old = login_at(payload, "/changes/login/from");
+                let new = login_at(payload, "/organization/login");
+                let org_id = payload
+                    .pointer("/organization/id")
+                    .and_then(serde_json::Value::as_u64);
+                match (&old, &new, org_id, installation_of(payload)) {
+                    (Some(old), Some(new), Some(org_id), Some(installation)) => {
+                        self.follow_github_org_rename(
+                            &governor,
+                            old,
+                            new,
+                            org_id,
+                            Some(installation),
+                        )
+                        .await?
+                    }
+                    _ => {
+                        for login in old.iter().chain(new.iter()) {
+                            self.forget_github_owner(&governor, login);
+                        }
+                        false
+                    }
+                }
+            }
+            ("organization", "deleted") => match login_at(payload, "/organization/login") {
+                Some(login) => self.close_github_org(
+                    &governor,
+                    &login,
+                    payload
+                        .pointer("/organization/id")
+                        .and_then(serde_json::Value::as_u64),
+                ),
+                None => false,
+            },
             ("repository", "renamed") => match (
                 repository_of(payload),
                 renamed_from("renamed", payload),
@@ -2002,6 +2134,29 @@ impl super::Engine {
             },
             ("repository", "transferred") => {
                 self.github_repo_transferred(&governor, payload).await?
+            }
+            // Archived narrows on the payload's word, at once; GitHub's
+            // answer to the lookup started here confirms or clears it.
+            ("repository", "archived") => {
+                if let Some(repo) = repository_of(payload)
+                    && self.github_repo_connected(&repo)
+                {
+                    governor.mark_archived(&repo);
+                    governor.invalidate(Invalidate::Repo(repo));
+                    governor.warm_up();
+                }
+                false
+            }
+            // Unarchived widens, so the payload is never believed: GitHub is
+            // asked again and only its answer clears the mark.
+            ("repository", "unarchived") => {
+                if let Some(repo) = repository_of(payload)
+                    && self.github_repo_connected(&repo)
+                {
+                    governor.invalidate(Invalidate::Repo(repo));
+                    governor.warm_up();
+                }
+                false
             }
             ("repository", "deleted") => match repository_of(payload) {
                 Some(repo) => self.close_github_repos(&governor, [repo], |repo| {
@@ -2308,6 +2463,9 @@ impl super::Engine {
                     );
                 }
                 let moved = self.move_origin_repo(&old_key, &live, &skip)?;
+                if !moved.is_empty() {
+                    governor.follow_archived_rename(old, &live);
+                }
                 for domain in connected
                     .iter()
                     .filter(|d| !moved.contains(d) && !skip.contains(*d))
@@ -2356,6 +2514,186 @@ impl super::Engine {
             && by_id.1.eq_ignore_ascii_case(new)
             && by_name.1.eq_ignore_ascii_case(new))
         .then_some(by_id.1)
+    }
+
+    /// Forgets every connected repository whose owner is `login`.
+    fn forget_github_owner(&self, governor: &GithubGovernor, login: &str) {
+        for (_, repo) in self.github_origins() {
+            if owned_by(&repo, login) {
+                governor.invalidate(Invalidate::Repo(repo));
+            }
+        }
+    }
+
+    /// An organization was renamed from `old_login` to `new_login` (what the
+    /// payload says), `org_id` being its `organization.id`. A domain whose
+    /// origin is a repository of `old_login` is connected to the new name
+    /// only when GitHub confirms it for that domain's own repository: the
+    /// domain recorded the repository's id and `org_id` as its owner's id,
+    /// and GitHub, asked by that repository id with `installation`'s token,
+    /// answers the same two ids under a name whose owner is `new_login`.
+    /// The domain moves to wherever GitHub says that repository id lives
+    /// now, even when the repository was also renamed: this is intended,
+    /// because GitHub confirms both the repository id and the owner id.
+    /// A domain with no ids recorded, or recorded for another owner, keeps
+    /// its origin (GitHub redirects the old name), and so does every domain
+    /// when no installation or no App is known, or the instance is
+    /// read-only. A domain that moves takes its repository's archived mark
+    /// along. The App client forgets which installation covers the old
+    /// names, and the governor forgets the old and the new names. Answers
+    /// false: a rename does not change who reads a repository.
+    async fn follow_github_org_rename(
+        &self,
+        governor: &GithubGovernor,
+        old_login: &str,
+        new_login: &str,
+        org_id: u64,
+        installation: Option<u64>,
+    ) -> super::Result<bool> {
+        // Every connected repository of the old login (by lowercased name),
+        // spelled as its origin spells it, with its domains.
+        let mut repos: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        for (domain, repo) in self.github_origins() {
+            if owned_by(&repo, old_login) {
+                repos
+                    .entry(repo_key(&repo))
+                    .or_insert_with(|| (repo.clone(), Vec::new()))
+                    .1
+                    .push(domain);
+            }
+        }
+        if repos.is_empty() || old_login.eq_ignore_ascii_case(new_login) {
+            self.forget_github_owner(governor, new_login);
+            return Ok(false);
+        }
+        let app = match self.github_app_slot_settled() {
+            Some(super::github_app::AppSlot::Ready(router)) => Some(router.app().clone()),
+            _ => None,
+        };
+        for (old_key, (old, domains)) in &repos {
+            // The domains that recorded this organization as the owner,
+            // grouped by the repository id they recorded.
+            let mut recorded: HashMap<u64, Vec<String>> = HashMap::new();
+            for domain in domains {
+                match self.recorded_repository_ids(domain) {
+                    Some(ids) if ids.owner == org_id => {
+                        recorded
+                            .entry(ids.repository)
+                            .or_default()
+                            .push(domain.clone());
+                    }
+                    Some(_) => tracing::info!(
+                        "a delivery says the organization {old_login} is now {new_login}, but the domain {domain} was connected to a repository of another owner of that name, so it keeps its origin"
+                    ),
+                    None => tracing::info!(
+                        "a delivery says the organization {old_login} is now {new_login}, but no repository ids are recorded for the domain {domain}, so it keeps its origin; GitHub redirects the old name"
+                    ),
+                }
+            }
+            let mut live_names = Vec::new();
+            if let (Some(app), Some(installation)) = (&app, installation) {
+                for (id, group) in &recorded {
+                    let Some(live) =
+                        github_confirms_org_rename(app, installation, *id, org_id, old, new_login)
+                            .await
+                    else {
+                        tracing::info!(
+                            "a delivery says the organization {old_login} is now {new_login}, but GitHub does not confirm it for {old}, so its domains keep their origin"
+                        );
+                        continue;
+                    };
+                    live_names.push(live.clone());
+                    if self.read_only {
+                        tracing::warn!(
+                            "GitHub says {old} is now {live} after its organization was renamed, but this instance is read-only, so its domains keep the old name; GitHub redirects it"
+                        );
+                        continue;
+                    }
+                    // Only the domains GitHub confirmed for this repository
+                    // move; every other domain on the old name stays.
+                    let skip: HashSet<String> = domains
+                        .iter()
+                        .filter(|domain| !group.contains(domain))
+                        .cloned()
+                        .collect();
+                    let moved = self.move_origin_repo(old_key, &live, &skip)?;
+                    if !moved.is_empty() {
+                        governor.follow_archived_rename(old, &live);
+                    }
+                    if moved.len() < group.len() {
+                        // A lookup may have followed the rename already.
+                        let live_key = repo_key(&live);
+                        let now: HashMap<String, String> =
+                            self.github_origins().into_iter().collect();
+                        for domain in group.iter().filter(|d| !moved.contains(d)) {
+                            if now
+                                .get(domain)
+                                .is_some_and(|repo| repo_key(repo) == live_key)
+                            {
+                                tracing::debug!(
+                                    "the domain {domain} is connected to {live} already"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "GitHub says {old} is now {live}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "a delivery says the organization {old_login} is now {new_login}, but there is no GitHub App or installation to confirm it with, so the domains of {old} keep their origin"
+                );
+            }
+            if let Some(app) = &app {
+                app.evict_repo(old);
+            }
+            governor.invalidate(Invalidate::Repo(old.clone()));
+            let name = old.split_once('/').map_or(old.as_str(), |(_, name)| name);
+            governor.invalidate(Invalidate::Repo(format!("{new_login}/{name}")));
+            for live in live_names {
+                governor.invalidate(Invalidate::Repo(live));
+            }
+        }
+        Ok(false)
+    }
+
+    /// The organization `login` was deleted: the domains of its connected
+    /// repositories are closed at once ([`GithubGovernor::close`]), so the
+    /// usual recheck after [`CLOSE_GRACE`] opens one again when GitHub still
+    /// shows the App its repository (a replayed delivery does not keep it
+    /// shut). A domain whose recorded owner id is not `org_id` was connected
+    /// to another owner of that name and is left out; a repository closes
+    /// when any of its domains is not left out. Without `org_id` every
+    /// repository of `login` closes: a payload may narrow on its own word.
+    /// Answers whether any was closed.
+    fn close_github_org(
+        &self,
+        governor: &GithubGovernor,
+        login: &str,
+        org_id: Option<u64>,
+    ) -> bool {
+        let mut repos = Vec::new();
+        for (domain, repo) in self.github_origins() {
+            if !owned_by(&repo, login) {
+                continue;
+            }
+            if let (Some(org_id), Some(ids)) = (org_id, self.recorded_repository_ids(&domain))
+                && ids.owner != org_id
+            {
+                tracing::info!(
+                    "a delivery says the GitHub organization {login} was deleted, but the domain {domain} was connected to another owner of that name, so it stays open"
+                );
+                continue;
+            }
+            repos.push(repo);
+        }
+        self.close_github_repos(governor, repos, |_| {
+            format!(
+                "the GitHub organization {login} was deleted: disconnect the domain or connect it to another repository"
+            )
+        })
     }
 
     /// Connects every domain of the configuration file whose origin is the
@@ -2519,6 +2857,63 @@ fn repository_of(payload: &serde_json::Value) -> Option<String> {
     full_name(payload.get("repository")?)
 }
 
+/// The GitHub login (an account name) at `pointer` in `payload`, trimmed,
+/// when it is one.
+fn login_at(payload: &serde_json::Value, pointer: &str) -> Option<String> {
+    let login = payload.pointer(pointer)?.as_str()?.trim();
+    (!login.is_empty() && !login.contains('/')).then(|| login.to_string())
+}
+
+/// Whether `repo` (`owner/name`) belongs to the account `login` (GitHub
+/// names are case insensitive).
+fn owned_by(repo: &str, login: &str) -> bool {
+    repo.split_once('/')
+        .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(login))
+}
+
+/// GitHub's own name for the repository `id` after its organization was
+/// renamed to `new_login`, when GitHub confirms it: asked by id with
+/// `installation`'s token, it answers the repository id `id`, the owner id
+/// `org_id`, and a name whose owner is `new_login`. `None` when it does
+/// not, or does not answer within [`CONFIRM_TIMEOUT`].
+async fn github_confirms_org_rename(
+    app: &GithubApp,
+    installation: u64,
+    id: u64,
+    org_id: u64,
+    old: &str,
+    new_login: &str,
+) -> Option<String> {
+    let facts = match tokio::time::timeout(
+        CONFIRM_TIMEOUT,
+        app.repository_facts_by_id(installation, id),
+    )
+    .await
+    {
+        Ok(Ok(facts)) => facts,
+        Ok(Err(e)) => {
+            tracing::info!(
+                "GitHub could not confirm where {old} is after its organization was renamed: {e}"
+            );
+            return None;
+        }
+        Err(_) => {
+            tracing::info!(
+                "GitHub was slow to confirm where {old} is after its organization was renamed"
+            );
+            return None;
+        }
+    };
+    let live = facts.full_name?;
+    (facts.ids
+        == Some(RepositoryIds {
+            repository: id,
+            owner: org_id,
+        })
+        && owned_by(&live, new_login))
+    .then_some(live)
+}
+
 /// The installation a payload is about (`installation.id`).
 fn installation_of(payload: &serde_json::Value) -> Option<u64> {
     payload.pointer("/installation/id")?.as_u64()
@@ -2585,6 +2980,8 @@ mod tests {
         ids: Option<RepositoryIds>,
         /// Its current name, when GitHub answers another one (renamed).
         full_name: Option<String>,
+        /// Whether GitHub calls it archived.
+        archived: bool,
     }
 
     /// GitHub, answering from tables and counting the collaborator listings
@@ -2718,6 +3115,7 @@ mod tests {
                     _ => RepoVisibility::Private,
                 },
                 ids: found.and_then(|r| r.ids),
+                archived: found.is_some_and(|r| r.archived),
                 full_name: Some(
                     found
                         .and_then(|r| r.full_name.clone())
@@ -3109,6 +3507,42 @@ mod tests {
             *lock(&rig.env.renames),
             vec![(REPO.to_string(), "acme/guide".to_string())]
         );
+    }
+
+    /// An organization renamed (the same repository and owner ids under a
+    /// new login) is reported to the engine like a rename, which follows it;
+    /// a new owner id is a transfer and closes the domain instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_organization_renamed_with_the_same_ids_tells_the_engine() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        rig.github.with(REPO, |r| {
+            r.ids = Some(IDS);
+            r.full_name = Some("acme-labs/handbook".to_string());
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert!(rig.governor.closed_domains().is_empty());
+        assert_eq!(
+            *lock(&rig.env.renames),
+            vec![(REPO.to_string(), "acme-labs/handbook".to_string())]
+        );
+        // The same login change with a new owner id is a transfer: closed,
+        // and not reported as a rename.
+        rig.github.with(REPO, |r| {
+            r.ids = Some(RepositoryIds {
+                repository: IDS.repository,
+                owner: IDS.owner + 1,
+            });
+        });
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(
+            rig.governor.closed()[0].reason,
+            "the repository moved to acme-labs/handbook on GitHub; disconnect the domain and connect it again"
+        );
+        assert_eq!(lock(&rig.env.renames).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3720,5 +4154,90 @@ mod tests {
         rig.governor.invalidate(Invalidate::All);
         assert!(rig.governor.closed_domains().is_empty());
         assert!(rig.governor.governed_domains().contains(DOMAIN));
+    }
+
+    /// Asks the governor about the domain, as a write's access check does.
+    async fn look_up(rig: &Rig) {
+        rig.knowledge("alice").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_archived_answer_marks_the_domain_and_only_a_later_lookup_clears_it() {
+        let rig = rig().await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // A member event forgets the repository; the mark stays.
+        rig.governor.invalidate(Invalidate::User(1));
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        rig.governor.invalidate(Invalidate::Installation(7));
+        rig.governor.invalidate(Invalidate::All);
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // A lookup GitHub answers with archived: false clears it.
+        rig.github.with(REPO, |r| r.archived = false);
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_unarchived_alone_never_clears_the_archived_mark() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        // What the `unarchived` arm does, while GitHub still says archived.
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_started_before_an_archived_delivery_does_not_clear_the_mark() {
+        let rig = rig().await;
+        look_up(&rig).await;
+        tokio::time::advance(6 * MIN).await;
+        // A lookup is on its way with GitHub's "not archived" ...
+        let gate = rig.github.park();
+        let governor = rig.governor.clone();
+        let asking = tokio::spawn(async move { governor.knowledge("alice", DOMAIN).await });
+        rig.github.parked(1).await;
+        // ... when the archived delivery lands.
+        rig.governor.mark_archived(REPO);
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        asking.await.unwrap();
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // The next lookup is GitHub's answer after the delivery, and it
+        // decides.
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archived_reads_nothing_for_a_domain_without_a_repository_and_starts_no_lookup() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+        assert_eq!(rig.governor.archived("elsewhere"), None);
+        assert_eq!(rig.github.listings(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmed_rename_carries_the_archived_mark_to_the_new_name() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        // The engine moved the domain to the new name.
+        *lock(&rig.env.origins) = vec![(DOMAIN.to_string(), "acme/guide".to_string())];
+        assert_eq!(rig.governor.archived(DOMAIN), None, "not carried yet");
+        rig.governor.follow_archived_rename(REPO, "acme/guide");
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some("acme/guide"));
+        assert!(
+            !lock(&rig.governor.state).archived.contains(&repo_key(REPO)),
+            "no domain is on the old name any more"
+        );
     }
 }
