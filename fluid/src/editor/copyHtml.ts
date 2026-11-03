@@ -331,6 +331,18 @@ export function copyHtmlOf(
 
   function table(t: SyntaxNode, lo: number, hi: number): string {
     const inWindow = kids(t).filter((c) => c.to > lo && c.from < hi);
+    // Inside one cell's content: its words, not a table of one cell.
+    const rows = inWindow.filter(
+      (c) => c.name === "TableHeader" || c.name === "TableRow",
+    );
+    const only = rows.length === 1 && rows[0] ? kids(rows[0]) : [];
+    const cells = only.filter(
+      (c) => c.name === "TableCell" && c.to > lo && c.from < hi,
+    );
+    const cell = cells.length === 1 ? cells[0] : undefined;
+    if (cell && lo >= cell.from && hi <= cell.to) {
+      return tidy(inl(cell, lo, hi));
+    }
     const head = inWindow
       .filter((c) => c.name === "TableHeader")
       .map((c) => row(c, "th", lo, hi))

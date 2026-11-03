@@ -27,6 +27,7 @@ import { openCellRange, setOpenCell } from "../editor/grid/openCell";
 import type { GridCell } from "../editor/grid/structure";
 import { gridTables } from "../editor/grid/structure";
 import { baseExtensions, lineSeparatorFor } from "../editor/setup";
+import { cellMarksExtensions } from "./cellMarksMode";
 import { parsedState } from "./parse";
 
 const cleanups: (() => void)[] = [];
@@ -46,6 +47,7 @@ export function soloMain(text: string, extra: Extension[] = []): EditorView {
           ...lineSeparatorFor(text),
           ...baseExtensions(false),
           ...extra,
+          ...cellMarksExtensions(),
         ],
       }),
     ),
@@ -109,6 +111,7 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
           keymap.of(yUndoManagerKeymap),
           normalizePastedEndings,
           ...extra,
+          ...cellMarksExtensions(),
         ],
       }),
     ),

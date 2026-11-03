@@ -231,6 +231,47 @@ export function footnoteNumberAt(
   return (ref && value.numbers.get(ref.key)) || null;
 }
 
+/** A drawn reference: its span and the number the page shows for it. */
+export interface DrawnRef {
+  from: number;
+  to: number;
+  number: number;
+}
+
+/**
+ * The references inside [from, to) with their numbers, as the editor draws
+ * them: none while a long page's first read is pending (they show as text
+ * then), and none in a state without the footnote layer. For the closed
+ * table grid, which draws cells outside the editor's decorations.
+ */
+export function footnoteRefsIn(
+  state: EditorState,
+  from: number,
+  to: number,
+): DrawnRef[] {
+  const value = state.field(model, false);
+  if (!value) {
+    return [];
+  }
+  const out: DrawnRef[] = [];
+  for (const ref of value.refs) {
+    const number = value.numbers.get(ref.key);
+    if (ref.from >= from && ref.to <= to && number) {
+      out.push({ from: ref.from, to: ref.to, number });
+    }
+  }
+  return out;
+}
+
+/**
+ * What changes whenever the drawn numbers may change: the model itself, a
+ * new value on every read, settle or carried edit. Undefined without the
+ * layer.
+ */
+export function footnoteVersion(state: EditorState): unknown {
+  return state.field(model, false);
+}
+
 interface Flight {
   id: number;
   revision: number;

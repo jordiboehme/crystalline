@@ -281,7 +281,7 @@ describe("the copy and cut handlers", () => {
     expect(copied.data.get("text/plain")).toBe("ab **cd** ef");
   });
 
-  it("gives inside a drawn table what the plain copy gives", () => {
+  it("gives inside one cell of a drawn table the cell's words, not a table (F4)", () => {
     const text = "| a | b |\n|---|---|\n| one | two |\n";
     const view = markView(text);
     view.focus();
@@ -289,9 +289,7 @@ describe("the copy and cut handlers", () => {
     select(view, from, from + 3);
     const copied = send(view, "copy");
     expect(copied.data.get("text/plain")).toBe("one");
-    expect(copied.data.get("text/html")).toBe(
-      `${OWN}<table><tbody><tr><td>one</td></tr></tbody></table></div>`,
-    );
+    expect(copied.data.get("text/html")).toBe(`${OWN}one</div>`);
   });
 });
 

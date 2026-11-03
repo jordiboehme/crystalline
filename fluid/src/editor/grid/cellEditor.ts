@@ -103,6 +103,12 @@ interface CellRange {
 export const fromCell = Annotation.define<boolean>();
 /** Marks a cell-view transaction that came from the main view. */
 const fromMain = Annotation.define<boolean>();
+/**
+ * Marks a local insert whose text is already cell Markdown (a paste of
+ * Fluid's own copy): its escapes stay as they are, and only a bare pipe gets
+ * its backslash (`withEscapes`), so the paste is byte for byte.
+ */
+export const cellMarkdown = Annotation.define<boolean>();
 /** Sets the cell's content range outright. */
 const setRange = StateEffect.define<CellRange>();
 
@@ -298,8 +304,11 @@ function cellChange(
   toA: number,
   text: string,
   floor: number,
+  markdown = false,
 ): { from: number; to: number; insert: string } {
-  const insert = text.replace(/\r\n|\r|\n/g, "").replaceAll("|", "\\|");
+  const flat = text.replace(/\r\n|\r|\n/g, "");
+  // Markdown keeps its escapes; `withEscapes` adds the one a bare pipe needs.
+  const insert = markdown ? flat : flat.replaceAll("|", "\\|");
   const inside = (pos: number) =>
     units.find((unit) => unit.from < pos && pos < unit.to);
   let from = inside(fromA)?.from ?? fromA;
@@ -558,7 +567,14 @@ const clampToCell = EditorState.transactionFilter.of(
       }
       const text = inserted.sliceString(0, inserted.length, "\n");
       const floor = kept.at(-1)?.to ?? 0;
-      const change = cellChange(units, fromA, toA, text, floor);
+      const change = cellChange(
+        units,
+        fromA,
+        toA,
+        text,
+        floor,
+        tr.annotation(cellMarkdown) === true,
+      );
       if (change.insert !== text || change.from !== fromA || change.to !== toA)
         altered = true;
       if (change.insert.length === 0 && change.from === change.to) return;
@@ -791,6 +807,32 @@ const forwardingOn = Facet.define<boolean, boolean>({
  */
 const cellMarksMode = new Compartment();
 
+/**
+ * Puts the cell view's caret into main's `openCellField`, so main holds the
+ * head the cell shows (F1): after the mount, which settles the opening caret
+ * on its drawn place, and after an outside change the cell's normalizer moved
+ * the caret for. Main is often mid-update then, so it waits for a microtask;
+ * it does nothing once the cell is gone or the views disagree.
+ */
+function settleMainCaret(main: EditorView, view: EditorView): void {
+  const run = (): void => {
+    if (isDestroyed(main) || mountedCell(main)?.view !== view) return;
+    if (inUpdate(main) || inUpdate(view)) {
+      queueMicrotask(run);
+      return;
+    }
+    const open = main.state.field(openCellField, false);
+    if (!open || !view.state.doc.eq(main.state.doc)) return;
+    const { anchor, head } = view.state.selection.main;
+    if (open.anchor === anchor && open.head === head) return;
+    main.dispatch({
+      effects: setOpenCell.of({ anchor, head, focused: open.focused }),
+      annotations: [fromCell.of(true)],
+    });
+  };
+  run();
+}
+
 /** Feeds main changes into the mounted cell and runs the gone check. */
 class Forwarding {
   readonly main: EditorView;
@@ -834,6 +876,16 @@ class Forwarding {
         effects: cellMarksMode.reconfigure(marksOnEditLine.of(show)),
         annotations: [fromMain.of(true)],
       });
+      // The drawn place stays; its one position may differ in the new mode.
+      const { main: range } = view.state.selection;
+      const place = canonical(view.state, range.head);
+      if (range.empty && place !== range.head) {
+        view.dispatch({
+          selection: { anchor: place },
+          annotations: [fromMain.of(true)],
+        });
+      }
+      settleMainCaret(main, view);
     }
     let touched = false;
     for (const tr of update.transactions) {
@@ -864,6 +916,8 @@ class Forwarding {
       effects: setRange.of(range),
       annotations: [fromMain.of(true)],
     });
+    // The normalizer may have moved main's head to its drawn place.
+    settleMainCaret(main, view);
   }
 
   destroy(): void {
@@ -1041,7 +1095,7 @@ export function mountCellEditor(
   });
   // The caret the cell opens with rests on its drawn place, as every caret a
   // transaction sets does: "start" in a bold cell is inside the `**`. Main
-  // keeps the raw head it asked for, which is the same drawn place.
+  // takes that head once the cell is registered (`settleMainCaret`).
   const opened = created.selection.main;
   const settled = canonical(created, opened.head);
   const view = new EditorView({
@@ -1071,5 +1125,6 @@ export function mountCellEditor(
   };
   editors.set(view, editor);
   registerCell(main, entry);
+  settleMainCaret(main, view);
   return editor;
 }

@@ -22,23 +22,32 @@ import {
   vi,
 } from "vitest";
 
+import * as Y from "yjs";
+
+import { cleanupCells, roomMain } from "../../test/cellKit";
 import {
   bytes,
   caret,
   cleanupMarkViews,
   keys,
   markView,
+  remoteInsert,
   setShowMarks,
   typeText,
   undoOnce,
 } from "../../test/markKit";
 import type { ElementEdit } from "../elementEdit";
 import { commitElementEdit, linkVerb } from "../elementEdit";
+import { fencePreviews } from "../fencePreviews";
 import { verbTarget } from "../floatingContext";
+import { hiddenMarkLayer } from "../marks";
+import { marksOnEditLine } from "../marks/mode";
 import { activeCell } from "./cellEditor";
 import { hostOpenCell } from "./gridWidget";
+import { cellPreviewLayers } from "./draws";
+import { gridExtension } from "./index";
 import { prefetchGrid } from "./loader";
-import { openCellRange, setOpenCell } from "./openCell";
+import { openCellField, openCellRange, setOpenCell } from "./openCell";
 import { gridTables } from "./structure";
 
 const DOC = "| a | **b** |\n| - | - |\n| 1 | 2 |\n";
@@ -57,6 +66,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanupCells();
   cleanupMarkViews();
   expect(errors).not.toHaveBeenCalled();
   errors.mockRestore();
@@ -470,44 +480,263 @@ describe.each(ROOMS)("element editors in a cell, $name", ({ room }) => {
 describe.each(MODES)("footnotes in a drawn table, %s mode", (mode) => {
   const text = "| a[^n] | c |\n| - | - |\n\n[^n]: N\n";
 
+  function closed(main: EditorView, row: number, column: number) {
+    const el = main.dom.querySelector<HTMLElement>(
+      `[role="grid"] [aria-rowindex="${String(row)}"][aria-colindex="${String(column)}"]`,
+    );
+    if (!el) throw new Error("no grid cell");
+    return el;
+  }
+
   it("the open cell draws the number, and its click and Enter do nothing", () => {
     const main = page(text, { mode });
     const cell = open(main, 0, 1);
     const refCell = open(main, 0, 0, text.indexOf("a") + 1);
     expect(cell).not.toBe(refCell);
-    const refs = [...refCell.contentDOM.querySelectorAll(".cm-footnote-ref")];
-    if (mode === "hidden") {
-      expect(refs.map((el) => el.textContent)).toEqual(["1"]);
-    }
     const button = refCell.contentDOM.querySelector<HTMLElement>(
       ".cm-footnote-button",
     );
-    const at = caret(refCell);
-    if (button) {
-      button.click();
-      keydown(button, "Enter");
+    if (mode === "show") {
+      // The edited line shows its source.
+      expect(button).toBeNull();
+      expect(shown(refCell)).toBe("a[^n]");
+      return;
     }
+    if (!button) throw new Error("no drawn reference");
+    expect(button.textContent).toBe("1");
+    const at = caret(refCell);
+    button.click();
+    keydown(button, "Enter");
     expect(caret(refCell)).toBe(at);
     expect(place(main)).toEqual([0, 0]);
     expect(bytes(main.state)).toBe(text);
   });
 
-  it("the closed grid draws the reference as its literal label", () => {
+  it("the closed grid draws the number the page shows", () => {
+    const two = "| a[^m] | b[^n] |\n| - | - |\n\n[^n]: N\n[^m]: M\n";
+    const main = page(two, { mode });
+    const first = closed(main, 1, 1);
+    expect(first.textContent).toBe("a1");
+    expect(first.querySelector(".cm-footnote-ref")?.textContent).toBe("1");
+    expect(closed(main, 1, 2).textContent).toBe("b2");
+  });
+
+  it("a closed cell redraws when the numbers change", () => {
     const main = page(text, { mode });
-    const el = main.dom.querySelector<HTMLElement>(
-      '[role="grid"] [aria-rowindex="1"][aria-colindex="1"]',
+    expect(closed(main, 1, 1).textContent).toBe("a1");
+    // A reference before it, with its note, makes it the second.
+    main.dispatch({
+      changes: [
+        { from: text.indexOf("a["), insert: "[^m]" },
+        { from: text.length, insert: "[^m]: M\n" },
+      ],
+    });
+    expect(bytes(main.state)).toBe(
+      "| [^m]a[^n] | c |\n| - | - |\n\n[^n]: N\n[^m]: M\n",
     );
-    expect(el?.textContent).toBe("a[^n]");
+    expect(closed(main, 1, 1).textContent).toBe("1a2");
+  });
+
+  it("a long page shows the label until its read settles, then the number", async () => {
+    const long = `${text}\n${"word ".repeat(1400)}\n`;
+    const main = page(long, { mode });
+    expect(closed(main, 1, 1).textContent).toBe("a[^n]");
+    await vi.waitFor(() => {
+      expect(closed(main, 1, 1).textContent).toBe("a1");
+    });
   });
 });
 
 describe.each(MODES)("a Reflection cell, %s mode", (mode) => {
+  const text = "| a <!-- note --> b | c |\n| - | - |\n";
+
   it("never shows an HTML comment", () => {
-    const text = "| a <!-- note --> b | c |\n| - | - |\n";
     const main = page(text, { mode, adapter: "reflection" });
     const cell = open(main, 0, 0);
     expect(shown(cell)).not.toContain("<!--");
     expect(shown(cell)).not.toContain("note");
+    expect(bytes(main.state)).toBe(text);
+  });
+
+  it("never draws an HTML comment in a closed cell", () => {
+    const main = page(text, { mode, adapter: "reflection" });
+    const el = main.dom.querySelector<HTMLElement>(
+      '[role="grid"] [aria-rowindex="1"][aria-colindex="1"]',
+    );
+    expect(el?.textContent).not.toContain("note");
+    expect(el?.textContent).not.toContain("<!--");
+    expect(el?.textContent).toContain("a");
+    expect(el?.textContent).toContain("b");
+  });
+});
+
+describe("one caret for the open cell (F1), in a room", () => {
+  const ROW_3 = DOC.indexOf("| 1 |");
+
+  async function settled(main: EditorView, cell: EditorView): Promise<void> {
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(main.state.field(openCellField)?.head).toBe(caret(cell));
+  }
+
+  it.each([
+    { where: "start" as const, want: "| a | **xb** |" },
+    { where: "end" as const, want: "| a | **bx** |" },
+  ])(
+    "opened at the $where, a flip and a peer edit elsewhere keep it",
+    async ({ where, want }) => {
+      const main = page(DOC, { room: true });
+      const cell = open(main, 0, 1, where);
+      await settled(main, cell);
+      setShowMarks(main, true);
+      await settled(main, cell);
+      remoteInsert(main, ROW_3 + 2, "q");
+      await settled(main, cell);
+      typeText(cell, "x");
+      expect(line(main, 1)).toBe(want);
+    },
+  );
+
+  it.each(["open", "click", "arrows"])(
+    "reached by %s, a peer's insert at the cell start keeps it",
+    async (route) => {
+      const main = page(DOC, { room: true });
+      let cell: EditorView;
+      if (route === "open") {
+        cell = open(main, 0, 1, "start");
+      } else {
+        cell = open(main, 0, 1);
+        if (route === "click") {
+          cell.dispatch({
+            selection: { anchor: B_FROM },
+            userEvent: "select.pointer",
+          });
+        } else {
+          keys(cell, "ArrowLeft");
+        }
+      }
+      expect(caret(cell)).toBe(B_FROM + 2);
+      await settled(main, cell);
+      remoteInsert(main, B_FROM, "z");
+      await settled(main, cell);
+      typeText(cell, "x");
+      expect(line(main, 1)).toBe("| a | zx**b** |");
+    },
+  );
+});
+
+describe.each(ROOMS)(
+  "a Fluid copy pasted back into a cell (F3), $name",
+  ({ room }) => {
+    const text = "| a\\|b **c** \\\\ | d |\n| - | - |\n";
+    const content = "a\\|b **c** \\\\";
+    const from = text.indexOf(content);
+
+    it.each([
+      { name: "whole", a: from, b: from + content.length },
+      { name: "partial", a: from + 1, b: from + content.length - 3 },
+    ])("$name, byte for byte", ({ a, b }) => {
+      const main = page(text, { room });
+      const cell = open(main, 0, 0);
+      cell.focus();
+      cell.dispatch({ selection: { anchor: a, head: b } });
+      const copied = copy(cell);
+      const plain = copied.data.get("text/plain") ?? "";
+      expect(plain).toBe(text.slice(a, b));
+      expect(copied.data.get("text/html")).toContain("data-crystalline-copy");
+      const target = open(main, 0, 1);
+      target.focus();
+      paste(target, copied);
+      expect(line(main, 1)).toBe(`| ${content} | d${plain} |`);
+    });
+  },
+);
+
+describe("a Fluid copy of prose with a bare pipe (F3)", () => {
+  it("gets the one backslash a cell needs", () => {
+    const text = "x|y\n\n| a | b |\n| - | - |\n";
+    const main = page(text);
+    main.focus();
+    main.dispatch({ selection: { anchor: 0, head: 3 } });
+    const copied = copy(main);
+    expect(copied.data.get("text/html")).toContain("data-crystalline-copy");
+    const target = open(main, 0, 1);
+    target.focus();
+    paste(target, copied);
+    expect(line(main, 3)).toBe("| a | bx\\|y |");
+  });
+});
+
+describe("the HTML of a copy inside a cell (F4)", () => {
+  it("is the cell's inline HTML inside one cell", () => {
+    const main = page(DOC);
+    const cell = open(main, 0, 1);
+    cell.focus();
+    cell.dispatch({ selection: { anchor: B_FROM + 2, head: B_FROM + 3 } });
+    expect(copy(cell).data.get("text/html")).toBe(
+      '<div data-crystalline-copy="1"><strong>b</strong></div>',
+    );
+  });
+
+  it("keeps the table across cells", () => {
+    const main = page(DOC);
+    main.focus();
+    main.dispatch({ selection: { anchor: 2, head: B_TO } });
+    const html = copy(main).data.get("text/html") ?? "";
+    expect(html).toContain("<table>");
+    expect(html).toContain("<strong>b</strong>");
+  });
+});
+
+describe.each(MODES)("a peer's caret in a bold cell (F5), %s mode", (mode) => {
+  it.each([
+    { name: "inside the opening marks", at: B_FROM + 1, hidden: B_FROM + 2 },
+    { name: "inside the closing marks", at: B_TO - 1, hidden: B_TO - 2 },
+  ])("$name is drawn at the visible place", async ({ at, hidden }) => {
+    const { main, rtext, remoteAwareness } = roomMain(DOC, [
+      gridExtension(),
+      fencePreviews(false),
+      cellPreviewLayers.of([hiddenMarkLayer()]),
+      marksOnEditLine.of(mode === "show"),
+    ]);
+    remoteAwareness.setLocalStateField("cursor", {
+      anchor: Y.createRelativePositionFromTypeIndex(rtext, at),
+      head: Y.createRelativePositionFromTypeIndex(rtext, at),
+    });
+    const cell = open(main, 1, 0);
+    // The caret on another line: the bold cell's line shows its marks only
+    // where the caret is.
+    const bold = open(main, 0, 1, B_FROM + 3);
+    expect(bold).not.toBe(cell);
+    await Promise.resolve();
+    await Promise.resolve();
+    const drawn = [
+      ...bold.contentDOM.querySelectorAll<HTMLElement>(".cm-grid-presence"),
+    ];
+    expect(drawn).toHaveLength(1);
+    const marker = drawn[0];
+    if (!marker) throw new Error("no marker");
+    expect(bold.posAtDOM(marker)).toBe(mode === "hidden" ? hidden : at);
+    cleanupCells();
+  });
+});
+
+describe("Cell actions on a cell that is only a link (F8)", () => {
+  it("Escape, then Shift+F10 opens Cell actions", () => {
+    const text = "| [t](https://x.y) | c |\n| - | - |\n";
+    const heard: Page["heard"] = [];
+    const main = page(text, { heard });
+    const cell = open(main, 0, 0, text.indexOf("t]"));
+    keydown(cell.contentDOM, "F10", { shiftKey: true, keyCode: 121 });
+    expect(heard.at(-1)?.edit?.kind).toBe("link");
+    expect(cellActions()).toBeNull();
+    keys(cell, "Escape");
+    expect(activeCell(main)).toBeNull();
+    const el = document.activeElement;
+    if (!(el instanceof HTMLElement)) throw new Error("no focus");
+    expect(el.getAttribute("aria-colindex")).toBe("1");
+    keydown(el, "F10", { shiftKey: true, keyCode: 121 });
+    expect(cellActions()).not.toBeNull();
     expect(bytes(main.state)).toBe(text);
   });
 });

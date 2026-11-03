@@ -22,7 +22,7 @@ import { transferFiles } from "../attachments";
 import { isOwnCopy } from "../clipboardHtml";
 import type { SpanChange, TableLine } from "../tableModel";
 import { addColumnAfter, addRowBelow, parseTable } from "../tableModel";
-import { noteUndoLanding } from "./cellEditor";
+import { cellMarkdown, noteUndoLanding } from "./cellEditor";
 import { closeUndoGroup } from "./gridKeys";
 import { hostOpenCell } from "./gridWidget";
 import {
@@ -148,7 +148,7 @@ function absolute(from: number, changes: SpanChange[]): ChangeSpec[] {
  * the ends dropped (a copied paragraph ends in one), the others turned into
  * a space.
  */
-function typed(view: EditorView, text: string): void {
+function typed(view: EditorView, text: string, markdown = false): void {
   if (!view.dom.isConnected) return;
   const flat = text
     .replace(/^[\s]*(?:\r\n|\r|\n)\s*|\s*(?:\r\n|\r|\n)[\s]*$/g, "")
@@ -156,6 +156,7 @@ function typed(view: EditorView, text: string): void {
   view.dispatch(view.state.replaceSelection(flat), {
     userEvent: "input.paste",
     scrollIntoView: true,
+    ...(markdown ? { annotations: cellMarkdown.of(true) } : {}),
   });
 }
 
@@ -360,9 +361,11 @@ export const cellPaste: Extension = Prec.highest(
       // Our own copy is read by its plain text alone, as a copy before it
       // carried HTML was.
       const clipHtml = data.getData("text/html");
-      const rows = blockOf(plain, isOwnCopy(clipHtml) ? "" : clipHtml);
+      const own = isOwnCopy(clipHtml);
+      const rows = blockOf(plain, own ? "" : clipHtml);
       if (rows === null || (rows.length === 1 && rows[0]?.length === 1)) {
-        typed(view, rows?.[0]?.[0] ?? plain);
+        // Our own copy is Markdown already: its escapes are kept (F3).
+        typed(view, rows?.[0]?.[0] ?? plain, own);
         return true;
       }
       if (!fill(main, rows)) typed(view, plain);

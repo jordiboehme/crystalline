@@ -16,6 +16,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import type { NodeSet } from "@lezer/common";
 
 import { isWebAddress } from "../../format";
+import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { statusColour } from "../../markdown/directives";
 import { labelPlainWords, statusPieces } from "../../markdown/statusText";
 import type { WikilinkResolver } from "../../wikilinks";
@@ -28,6 +29,22 @@ export interface CellRenderOptions {
    * whose main view draws no chips) a wikilink is its plain label text.
    */
   resolve?: WikilinkResolver;
+  /**
+   * The footnote references in the cell's text (offsets into it) with the
+   * numbers the page shows, drawn as those numbers. A reference not listed
+   * (a long page not read yet) is its label text.
+   */
+  notes?: readonly { from: number; to: number; number: number }[];
+  /** Leave out every HTML comment: a Reflection never shows one. */
+  hideComments?: boolean;
+}
+
+/** A stretch of the cell's text drawn other than as text. */
+interface Special {
+  from: number;
+  to: number;
+  /** The footnote number, or null for a hidden comment. */
+  number: number | null;
 }
 
 /**
@@ -169,11 +186,39 @@ class Drawer {
   readonly text: string;
   readonly nodes: NodeSet;
   readonly options: CellRenderOptions;
+  readonly specials: Special[];
 
   constructor(text: string, nodes: NodeSet, options: CellRenderOptions) {
     this.text = text;
     this.nodes = nodes;
     this.options = options;
+    const comments = options.hideComments
+      ? htmlCommentRanges(text).map((c) => ({ ...c, number: null }))
+      : [];
+    this.specials = [
+      ...(options.notes ?? []).map((n) => ({ ...n })),
+      ...comments,
+    ].sort((a, b) => a.from - b.from);
+  }
+
+  /** The special drawn in place of exactly [from, to), if any. */
+  specialAt(from: number, to: number): Special | undefined {
+    return this.specials.find((s) => s.from === from && s.to === to);
+  }
+
+  /** Whether [from, to) lies inside a hidden comment. */
+  inComment(from: number, to: number): boolean {
+    return this.specials.some(
+      (s) => s.number === null && s.from <= from && to <= s.to,
+    );
+  }
+
+  /** A footnote number, as the editor draws it, without the button. */
+  note(number: number, into: Node): void {
+    const sup = document.createElement("sup");
+    sup.className = "cm-footnote-ref";
+    sup.textContent = String(number);
+    into.appendChild(sup);
   }
 
   name(element: InlineElement): string {
@@ -181,6 +226,20 @@ class Drawer {
   }
 
   plain(from: number, to: number, into: Node): void {
+    let at = from;
+    for (const special of this.specials) {
+      if (special.to <= at || special.from >= to) continue;
+      // A note is drawn only when it lies whole in the stretch.
+      if (special.number !== null && (special.from < at || special.to > to))
+        continue;
+      this.literal(at, special.from, into);
+      if (special.number !== null) this.note(special.number, into);
+      at = Math.max(at, special.to);
+    }
+    this.literal(at, to, into);
+  }
+
+  literal(from: number, to: number, into: Node): void {
     if (to > from)
       into.appendChild(document.createTextNode(this.text.slice(from, to)));
   }
@@ -207,7 +266,11 @@ class Drawer {
         continue;
       }
       this.plain(at, element.from, into);
-      if (!MARKS.has(name)) this.element(element, name, into);
+      const special = this.specialAt(element.from, element.to);
+      if (special) {
+        if (special.number !== null) this.note(special.number, into);
+      } else if (!this.inComment(element.from, element.to) && !MARKS.has(name))
+        this.element(element, name, into);
       at = element.to;
     }
     this.plain(at, to, into);

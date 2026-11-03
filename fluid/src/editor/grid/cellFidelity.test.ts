@@ -26,6 +26,7 @@ import { typeText } from "../../test/markKit";
 import { parsedState } from "../../test/parse";
 import { engramAdapter } from "../adapter";
 import { baseExtensions, lineSeparatorFor } from "../setup";
+import { canonical } from "../marks/caret";
 import { hiddenMarkLayerOn, marksOnEditLine } from "../marks/mode";
 import { previewConfig } from "../surface";
 import { activeCell, cellForwarding } from "./cellEditor";
@@ -128,21 +129,20 @@ describe.each(
       const editor = openAt(main, at, false);
       expect(editor.view.state.facet(hiddenMarkLayerOn)).toBe(true);
       expect(editor.view.state.facet(marksOnEditLine)).toBe(show);
-      // Typed as the DOM types (C22): the format rules may put the letter
-      // before the cell's closing marks, never outside its content.
+      // Typed as the DOM types (C22), at the caret the cell shows: its
+      // canonical place, which the format rules type at (F6).
+      const head = editor.view.state.selection.main.head;
+      expect(head).toBe(canonical(editor.view.state, at));
+      expect(head).toBeGreaterThanOrEqual(cell.content.from);
+      expect(head).toBeLessThanOrEqual(cell.content.to);
       typeText(editor.view, "Z");
       const lb = before.lineBreak;
-      const was = bytes(before);
-      const now = bytes(main.state);
-      expect(now.length).toBe(was.length + 1);
-      let i = 0;
-      while (i < was.length && was[i] === now[i]) i += 1;
-      expect(now[i]).toBe("Z");
-      expect(now.slice(0, i) + now.slice(i + 1)).toBe(was);
-      const from = before.doc.sliceString(0, cell.content.from, lb).length;
-      const to = before.doc.sliceString(0, cell.content.to, lb).length;
-      expect(i).toBeGreaterThanOrEqual(from);
-      expect(i).toBeLessThanOrEqual(to);
+      const len = before.doc.length;
+      const want =
+        before.doc.sliceString(0, head, lb) +
+        "Z" +
+        before.doc.sliceString(head, len, lb);
+      expect(bytes(main.state)).toBe(want);
       expect(editor.view.state.doc.eq(main.state.doc)).toBe(true);
       closeCell(main, "user", "none");
       expect(activeCell(main)).toBeNull();

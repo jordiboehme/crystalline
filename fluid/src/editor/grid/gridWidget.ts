@@ -36,6 +36,8 @@ import {
 import type { WikilinkResolver } from "../../wikilinks";
 import { elementEditCell } from "../elementEdit";
 import { floatingCell } from "../floatingContext";
+import { footnoteRefsIn, footnoteVersion } from "../footnotes";
+import { hidesIdLines } from "../hiddenIdLines";
 import { formatCell } from "../marks/formatting";
 import { parseAdvanced } from "../parseProgress";
 import { wikilinkResolverFacet } from "../wikilinkChips";
@@ -159,14 +161,52 @@ function chipResolver(state: EditorState): WikilinkResolver | undefined {
   return resolve === noResolver ? undefined : resolve;
 }
 
+/**
+ * What a static cell is drawn from besides its text: the footnote numbers of
+ * its references (offsets into its text), and whether comments are left out
+ * (a Reflection). Its key tells a redraw is due.
+ */
+interface CellExtras {
+  notes: { from: number; to: number; number: number }[];
+  hideComments: boolean;
+  key: string;
+}
+
+function extrasOf(state: EditorState, cell: GridCell | undefined): CellExtras {
+  const hideComments = hidesIdLines(state);
+  const notes = cell
+    ? footnoteRefsIn(state, cell.content.from, cell.content.to).map((n) => ({
+        from: n.from - cell.content.from,
+        to: n.to - cell.content.from,
+        number: n.number,
+      }))
+    : [];
+  const key = `${hideComments ? "c" : ""}${notes
+    .map((n) => `${String(n.from)}-${String(n.to)}:${String(n.number)}`)
+    .join(",")}`;
+  return { notes, hideComments, key };
+}
+
+/** The numbers a table's references are drawn with, as one string. */
+function notesKey(state: EditorState, table: GridTable): string {
+  return footnoteRefsIn(state, table.from, table.to)
+    .map((n) => `${String(n.from)}:${String(n.number)}`)
+    .join(",");
+}
+
 function drawStatic(
   el: HTMLElement,
   text: string,
   resolve: WikilinkResolver | undefined,
+  extras: CellExtras,
 ): void {
   el.classList.remove(HOSTING);
-  renderCellContent(text, el, resolve ? { resolve } : {});
-  drawnOf.set(el, text);
+  renderCellContent(text, el, {
+    ...(resolve ? { resolve } : {}),
+    notes: extras.notes,
+    hideComments: extras.hideComments,
+  });
+  drawnOf.set(el, `${extras.key}\u0000${text}`);
 }
 
 function hosts(main: EditorView, el: HTMLElement): boolean {
@@ -193,9 +233,15 @@ function patch(root: HTMLElement, main: EditorView): void {
     const [row, column] = placeOf(el);
     if (hosts(main, el)) continue;
     setAlign(el, table, column);
-    const text = table.rows[row]?.[column]?.text ?? "";
-    if (redrawAll || drawnOf.get(el) !== text || el.classList.contains(HOSTING))
-      drawStatic(el, text, resolve);
+    const cell = table.rows[row]?.[column];
+    const text = cell?.text ?? "";
+    const extras = extrasOf(main.state, cell);
+    if (
+      redrawAll ||
+      drawnOf.get(el) !== `${extras.key}\u0000${text}` ||
+      el.classList.contains(HOSTING)
+    )
+      drawStatic(el, text, resolve, extras);
   }
 }
 
@@ -290,10 +336,12 @@ function restore(main: EditorView, el: HTMLElement): void {
     return;
   }
   const [row, column] = placeOf(el);
+  const cell = table.rows[row]?.[column];
   drawStatic(
     el,
-    table.rows[row]?.[column]?.text ?? "",
+    cell?.text ?? "",
     chipResolver(main.state),
+    extrasOf(main.state, cell),
   );
 }
 
@@ -441,20 +489,28 @@ function openFromMouse(
 export class GridWidget extends WidgetType {
   readonly table: GridTable;
   readonly resolve: WikilinkResolver | undefined;
+  /** The footnote numbers its references are drawn with (`notesKey`). */
+  readonly notes: string;
 
-  constructor(table: GridTable, resolve: WikilinkResolver | undefined) {
+  constructor(
+    table: GridTable,
+    resolve: WikilinkResolver | undefined,
+    notes = "",
+  ) {
     super();
     this.table = table;
     this.resolve = resolve;
+    this.notes = notes;
   }
 
-  /** Same shape, same alignments and same cell texts. */
+  /** Same shape, same alignments, same cell texts and footnote numbers. */
   override eq(other: GridWidget): boolean {
     return (
       sameShape(this.table, other.table) &&
       sameAligns(this.table, other.table) &&
       sameTexts(this.table, other.table) &&
-      this.resolve === other.resolve
+      this.resolve === other.resolve &&
+      this.notes === other.notes
     );
   }
 
@@ -577,7 +633,7 @@ function build(state: EditorView["state"]): DecorationSet {
   const ranges: Range<Decoration>[] = gridTables(state).map((table) =>
     Decoration.replace({
       block: true,
-      widget: new GridWidget(table, resolve),
+      widget: new GridWidget(table, resolve, notesKey(state, table)),
     }).range(doc.lineAt(table.from).from, doc.lineAt(table.to).to),
   );
   return Decoration.set(ranges);
@@ -590,7 +646,9 @@ export const gridField = StateField.define<DecorationSet>({
     tr.docChanged ||
     parseAdvanced(tr) ||
     tr.startState.facet(wikilinkResolverFacet) !==
-      tr.state.facet(wikilinkResolverFacet)
+      tr.state.facet(wikilinkResolverFacet) ||
+    // A footnote read settled: the closed cells draw its numbers.
+    footnoteVersion(tr.startState) !== footnoteVersion(tr.state)
       ? build(tr.state)
       : value,
   provide: (field) => EditorView.decorations.from(field),
