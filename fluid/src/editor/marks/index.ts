@@ -12,11 +12,14 @@
 import type { EditorState, Extension } from "@codemirror/state";
 
 import { hiddenMarkDrawing } from "../preview";
+import { blockDrawing, listEnter, taskKeymap } from "./blocks";
 import { caretKeymap, caretNormalizer } from "./caret";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
 import { formatting } from "./formatting";
 import { hiddenMarkLayerOn } from "./mode";
 
+export type { TaskState } from "./blocks";
+export { listEnter, taskChanges } from "./blocks";
 export type { Mark, MarkKind, MarkRun } from "./hiddenMarks";
 export { marksOnLine, runAt, runsOnLine } from "./hiddenMarks";
 export type { Segment } from "./caret";
@@ -58,6 +61,10 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
   return [
     hiddenMarkLayerOn.of(true),
     hiddenMarkDrawing,
+    // Bullets, numbers, task boxes, quote bars and rules in place of their marks.
+    blockDrawing,
+    listEnter,
+    taskKeymap,
     caretKeymap,
     deletionKeymap,
     // The format waiting for typing and the typing rules around formats.

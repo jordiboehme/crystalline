@@ -277,7 +277,7 @@ describe("live preview", () => {
 });
 
 describe("the not-applicable task state", () => {
-  it("draws [~] as a struck box that does not toggle", () => {
+  it("draws [~] as a struck box that a click marks open", () => {
     const doc = "# Doc\n\n- [~] skipped\n- [ ] open\n";
     const view = editor(doc, 0);
     const box = view.dom.querySelector<HTMLElement>(".cm-task-na");
@@ -285,10 +285,12 @@ describe("the not-applicable task state", () => {
     expect(box?.getAttribute("aria-label")).toBe("Not applicable");
     expect(box?.tagName).not.toBe("INPUT");
     expect(view.contentDOM.textContent).not.toContain("[~]");
-    box?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    expect(docText(view.state)).toBe(doc);
     // The open task keeps its own checkbox.
     expect(view.dom.querySelectorAll("input.cm-task-toggle").length).toBe(1);
+    // A click writes the one character: the box becomes an open task.
+    box?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(docText(view.state)).toBe("# Doc\n\n- [ ] skipped\n- [ ] open\n");
+    expect(view.dom.querySelector(".cm-task-na")).toBeNull();
     view.destroy();
   });
 
