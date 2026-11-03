@@ -175,20 +175,6 @@ export function toggleInline(view: EditorView, marker: string): boolean {
 const HEADING = /^(#{1,6})[ \t]+/;
 
 /**
- * The level line `lineNo` has once Heading `level` is picked on it: `level`,
- * or 0 when the line already wears that level and the pick takes it off.
- * What a document adapter is asked about before the change is made.
- */
-export function headingLevelAfter(
-  state: EditorState,
-  lineNo: number,
-  level: number,
-): number {
-  const worn = HEADING.exec(state.doc.line(lineNo).text)?.[1]?.length ?? 0;
-  return worn === level ? 0 : level;
-}
-
-/**
  * Heading level on the MAIN selection's line only - deliberate scope, not an
  * oversight: a heading is a line property, and cycling it under every cursor
  * of a multi-cursor selection is more surprise than help. The inline

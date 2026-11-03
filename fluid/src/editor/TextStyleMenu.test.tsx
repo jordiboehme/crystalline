@@ -122,6 +122,31 @@ describe("the text style menu", () => {
     });
   });
 
+  test("the keyboard opens, moves and closes the menu, and focus ends in the editor", async () => {
+    const v = mount("x", 1);
+    const user = userEvent.setup();
+    screen.getByRole("button", { name: "Text style" }).focus();
+    await user.keyboard("{Enter}");
+    const menu = await screen.findByRole("menu");
+    await user.keyboard("{ArrowDown}");
+    expect(within(menu).getAllByRole("menuitemradio")).toContain(
+      document.activeElement,
+    );
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("menu")).toBeNull();
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(v.contentDOM);
+    });
+  });
+
+  test("the trigger shows its name on hover", async () => {
+    mount("x", 1);
+    await userEvent.hover(screen.getByRole("button", { name: "Text style" }));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Text style");
+  });
+
   test("is off while the bar is off", () => {
     view = new EditorView({ state: EditorState.create({ doc: "x" }) });
     render(<EditorToolbar view={view} disabled />, { wrapper: Tooltips });

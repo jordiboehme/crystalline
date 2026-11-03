@@ -15,6 +15,7 @@ import { useState } from "react";
 import type { ReactElement } from "react";
 
 import { ITEM_CLASSES, MENU_CLASSES } from "../components/menu";
+import { Tooltip } from "../components/primitives";
 import { TRIGGER } from "./InsertMenu";
 
 /** The number of `#` a style writes. */
@@ -65,16 +66,18 @@ export function TextStyleMenu({
         }
       }}
     >
-      <DropdownMenu.Trigger asChild>
-        <button
-          type="button"
-          aria-label="Text style"
-          className={`${TRIGGER} font-semibold`}
-          disabled={disabled}
-        >
-          Aa
-        </button>
-      </DropdownMenu.Trigger>
+      <Tooltip label="Text style">
+        <DropdownMenu.Trigger asChild>
+          <button
+            type="button"
+            aria-label="Text style"
+            className={`${TRIGGER} font-semibold`}
+            disabled={disabled}
+          >
+            Aa
+          </button>
+        </DropdownMenu.Trigger>
+      </Tooltip>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
           align="start"
