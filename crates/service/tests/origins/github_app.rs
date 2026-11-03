@@ -134,6 +134,11 @@ pub(crate) struct Forge {
     /// Current name -> the name the repository was served under at first
     /// (the key of `repos`), for a renamed one.
     first_names: StdMutex<HashMap<String, String>>,
+    /// The repositories (current name) GitHub calls archived.
+    archived: StdMutex<std::collections::HashSet<String>>,
+    /// Lowercased login -> owner id, for an owner that was renamed: the id
+    /// stays the old login's. Any other login has `owner_id(login)`.
+    owner_ids: StdMutex<HashMap<String, u64>>,
 }
 
 impl Forge {
@@ -183,6 +188,59 @@ impl Forge {
         let mut public = self.public.lock().unwrap();
         if public.remove(old) {
             public.insert(new.to_string());
+        }
+        let mut archived = self.archived.lock().unwrap();
+        if archived.remove(old) {
+            archived.insert(new.to_string());
+        }
+    }
+
+    /// Archives `repo`: `archived` is true on `GET /repos/{o}/{r}` and
+    /// `GET /repositories/{id}` from now on.
+    #[allow(dead_code)] // used by the archived and org-rename tests
+    pub(crate) fn archive(&self, repo: &str) {
+        self.archived.lock().unwrap().insert(repo.to_string());
+    }
+
+    /// Takes the archive off `repo`.
+    #[allow(dead_code)] // used by the archived and org-rename tests
+    pub(crate) fn unarchive(&self, repo: &str) {
+        self.archived.lock().unwrap().remove(repo);
+    }
+
+    /// The id GitHub gives the account `login` now: `owner_id(login)`
+    /// unless the account was renamed, which keeps the id it had.
+    pub(crate) fn owner_id_of(&self, login: &str) -> u64 {
+        self.owner_ids
+            .lock()
+            .unwrap()
+            .get(&login.to_ascii_lowercase())
+            .copied()
+            .unwrap_or_else(|| owner_id(login))
+    }
+
+    /// Renames the account `old_login` to `new_login` the way GitHub does:
+    /// every repository of that owner is renamed (ids and installations
+    /// move, each old name redirects) and the owner id stays.
+    #[allow(dead_code)] // used by the archived and org-rename tests
+    pub(crate) fn rename_owner(&self, old_login: &str, new_login: &str) {
+        let id = self.owner_id_of(old_login);
+        let prefix = format!("{old_login}/");
+        let names: Vec<String> = self
+            .ids
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect();
+        self.owner_ids
+            .lock()
+            .unwrap()
+            .insert(new_login.to_ascii_lowercase(), id);
+        for name in names {
+            let short = &name[prefix.len()..];
+            self.rename(&name, &format!("{new_login}/{short}"));
         }
     }
 
@@ -271,6 +329,8 @@ pub(crate) async fn spawn_forge(
         ),
         redirects: StdMutex::new(HashMap::new()),
         first_names: StdMutex::new(HashMap::new()),
+        archived: StdMutex::new(std::collections::HashSet::new()),
+        owner_ids: StdMutex::new(HashMap::new()),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -429,7 +489,19 @@ async fn handle(
             .find(|(_, i)| **i == id)
             .map(|(name, _)| name.clone());
         return match found {
-            Some(name) => ok(json!({"id": id, "full_name": name})),
+            Some(name) => {
+                let public = forge.public.lock().unwrap().contains(&name);
+                let archived = forge.archived.lock().unwrap().contains(&name);
+                let login = name.split('/').next().unwrap_or_default().to_string();
+                ok(json!({
+                    "id": id,
+                    "full_name": name,
+                    "private": !public,
+                    "visibility": if public { "public" } else { "private" },
+                    "archived": archived,
+                    "owner": {"login": login, "id": forge.owner_id_of(&login)},
+                }))
+            }
             None => not_found(),
         };
     }
@@ -538,9 +610,10 @@ async fn repo_route(
                 "private": private,
                 "id": forge.id_of(&origin.repo).unwrap_or_default(),
                 "full_name": origin.repo,
+                "archived": forge.archived.lock().unwrap().contains(&origin.repo),
                 "owner": {
                     "login": origin.repo.split('/').next().unwrap_or_default(),
-                    "id": owner_id(origin.repo.split('/').next().unwrap_or_default()),
+                    "id": forge.owner_id_of(origin.repo.split('/').next().unwrap_or_default()),
                 },
             })),
             Err(e) => failed(e),

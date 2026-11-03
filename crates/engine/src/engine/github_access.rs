@@ -2718,6 +2718,7 @@ mod tests {
                     _ => RepoVisibility::Private,
                 },
                 ids: found.and_then(|r| r.ids),
+                archived: false,
                 full_name: Some(
                     found
                         .and_then(|r| r.full_name.clone())
