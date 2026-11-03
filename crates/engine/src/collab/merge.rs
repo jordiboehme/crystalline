@@ -225,13 +225,16 @@ fn table_rows(lines: &[&str]) -> Vec<Row> {
     for (k, line) in lines.iter().enumerate() {
         let text = line.trim_end_matches('\n');
         let trimmed = text.trim();
+        // A line indented four columns or more (or by a tab) is indented
+        // code in GFM: it neither opens nor closes a fence.
+        let fence_indent = indent_allows_fence(text);
         if let Some(open) = fence {
-            if Fence::closes(open, trimmed) {
+            if fence_indent && Fence::closes(open, trimmed) {
                 fence = None;
             }
             continue;
         }
-        if let Some(open) = Fence::opens(trimmed) {
+        if let Some(open) = Fence::opens(trimmed).filter(|_| fence_indent) {
             fence = Some(open);
             in_table = false;
             continue;
@@ -292,6 +295,13 @@ fn starts_a_block(trimmed: &str) -> bool {
 }
 
 /// An open code fence: its character and how many of it opened the fence.
+/// Whether a line's indent still lets it open or close a fence: at most
+/// three spaces and no tab before its first character, as GFM reads it.
+fn indent_allows_fence(line: &str) -> bool {
+    let lead = &line[..line.len() - line.trim_start().len()];
+    !lead.contains('\t') && lead.len() < 4
+}
+
 #[derive(Clone, Copy)]
 struct Fence {
     char: u8,
@@ -1066,6 +1076,27 @@ mod tests {
             ),
             MergeOutcome::Conflict
         ));
+    }
+
+    #[test]
+    fn an_indented_backtick_line_neither_opens_nor_closes_a_fence() {
+        // The indented line is code, so the real fence below opens a code
+        // block, and the table inside it is code too.
+        let inside = |row: &str| format!("    ```\n\n```\n| h | i |\n|---|---|\n{row}\n```\n");
+        let outcome = three_way(
+            &inside("| a | b |"),
+            &inside("| aX | b |"),
+            &inside("| a | bY |"),
+        );
+        assert!(matches!(outcome, MergeOutcome::Conflict));
+        // An indented line inside a fence does not close it either.
+        let fenced = |row: &str| format!("```\n    ```\n| h | i |\n|---|---|\n{row}\n```\n");
+        let outcome = three_way(
+            &fenced("| a | b |"),
+            &fenced("| aX | b |"),
+            &fenced("| a | bY |"),
+        );
+        assert!(matches!(outcome, MergeOutcome::Conflict));
     }
 
     #[test]
