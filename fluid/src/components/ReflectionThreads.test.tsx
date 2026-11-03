@@ -1536,7 +1536,7 @@ describe("comments on a reflection", () => {
     renderApp("/d/eng/reflection/guides/deploying.md");
     await screen.findByText("at");
     const status = screen.getByRole("status", { hidden: true });
-    expect(status).toHaveTextContent("");
+    expect(status.textContent).toBe("");
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(status).toHaveTextContent("Comment on the selection");
     await userEvent.click(screen.getByRole("button", { name: "Comment" }));
@@ -1702,6 +1702,508 @@ describe("comments on a reflection", () => {
         occurrence: 1,
       });
     });
+  });
+});
+
+describe("the bar at the selection", () => {
+  const bar = () =>
+    screen.queryByRole("toolbar", { name: "Selection actions" });
+  const barButton = () =>
+    screen.getByRole("button", { name: "Comment on selection" });
+
+  it("stands at a selection on the page for a reader who may comment", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    expect(bar()).toBeNull();
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const toolbar = bar();
+    expect(toolbar).toBeVisible();
+    expect(within(toolbar as HTMLElement).getAllByRole("button")).toEqual([
+      barButton(),
+    ]);
+    // It never takes the focus on its own, and Tab passes it by.
+    expect(barButton()).not.toHaveFocus();
+    expect(barButton()).toHaveAttribute("tabindex", "-1");
+    // A collapse on the page takes it away.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    expect(bar()).toBeNull();
+  });
+
+  it("is not there for a reader who may not comment", async () => {
+    serve([], {
+      "/auth/me": () => meResponse({ user: null, anonymous: true }),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const status = screen.getByRole("status", { hidden: true });
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeNull();
+    // Nor is the reader told to comment.
+    expect(status.textContent).toBe("");
+  });
+
+  it("goes while a comment is written", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(screen.getByRole("button", { name: "Comment" }));
+    expect(screen.getByRole("form", { name: "New comment" })).toBeVisible();
+    expect(bar()).toBeNull();
+  });
+
+  it("goes when the selection leaves the page, while the column keeps its button", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    // A click beside the page leaves a caret outside it.
+    window.getSelection()?.collapse(document.body, 0);
+    act(() => {
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(bar()).toBeNull();
+    expect(screen.getByRole("button", { name: "Comment" })).toBeVisible();
+  });
+
+  it("opens the form on the same passage as the column's button, focus in its field", async () => {
+    const opened = vi.fn((_path: string, _init?: RequestInit) =>
+      thread("t-00000001"),
+    );
+    serve([], {
+      "/domains/eng/reflection/threads": (path, init) => opened(path, init),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(barButton());
+    expect(screen.getByText("Deploys run **at** night")).toBeVisible();
+    const field = screen.getByRole("textbox", { name: "Your comment" });
+    expect(field).toHaveFocus();
+    await userEvent.type(field, "Still true?");
+    await userEvent.click(
+      within(screen.getByRole("form", { name: "New comment" })).getByRole(
+        "button",
+        { name: "Comment" },
+      ),
+    );
+    await waitFor(() => {
+      expect(opened).toHaveBeenCalledTimes(1);
+    });
+    expect(bodyOf(opened.mock.calls[0]?.[1])).toEqual({
+      path: "guides/deploying.md",
+      section: "7f3a9c2e",
+      quote: "Deploys run **at** night",
+      occurrence: 1,
+      text: "Still true?",
+    });
+  });
+
+  it("returns focus to the column's Comment button when the form is cancelled", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(barButton());
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("form", { name: "New comment" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Comment" })).toHaveFocus();
+  });
+
+  it("keeps the selection on a press", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const down = new MouseEvent("mousedown", {
+      bubbles: true,
+      cancelable: true,
+    });
+    barButton().dispatchEvent(down);
+    // jsdom never moves the selection on a press: the cancel is the proof.
+    expect(down.defaultPrevented).toBe(true);
+  });
+
+  it("goes on Escape until the selection changes", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(bar()).toBeNull();
+    // The key coming up reads the same selection again: still away.
+    fireEvent.keyUp(document.body, { key: "Escape" });
+    expect(bar()).toBeNull();
+    select(textNode("Deploys run "), textNode("Deploys run "), 7);
+    expect(bar()).toBeVisible();
+  });
+
+  it("hides while the pointer button is down on the page", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(bar()).toBeVisible();
+    fireEvent.pointerDown(textNode("Deploys run ").parentElement as Element, {
+      button: 0,
+      isPrimary: true,
+    });
+    expect(bar()).toBeNull();
+    fireEvent.pointerUp(document.body, { button: 0, isPrimary: true });
+    expect(bar()).toBeVisible();
+  });
+
+  it("takes the focus on Alt+F10 and hands it back on Escape, selection kept", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    // The reader was on a control outside the page (a button, not a field).
+    const before = screen.getByRole("switch", {
+      name: "Show resolved threads",
+    });
+    before.focus();
+    // Without a bar, Alt+F10 does nothing.
+    fireEvent.keyDown(before, { key: "F10", altKey: true });
+    expect(before).toHaveFocus();
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(before).toHaveFocus();
+    fireEvent.keyDown(before, { key: "F10", altKey: true });
+    expect(barButton()).toHaveFocus();
+    // A browser may collapse the selection as the bar takes the focus.
+    window.getSelection()?.collapse(document.body, 0);
+    act(() => {
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(bar()).toBeVisible();
+    fireEvent.keyDown(barButton(), { key: "Escape" });
+    expect(bar()).toBeNull();
+    expect(before).toHaveFocus();
+    expect(window.getSelection()?.toString()).toBe("Deploys run at night");
+  });
+
+  it("keeps the passage for a tap whose touch collapsed the selection first", async () => {
+    const opened = vi.fn((_path: string, _init?: RequestInit) =>
+      thread("t-00000001"),
+    );
+    serve([], {
+      "/domains/eng/reflection/threads": (path, init) => opened(path, init),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const button = barButton();
+    fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+    // The touch lands as a caret in the page before the click does.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+    fireEvent.click(button);
+    const form = screen.getByRole("form", { name: "New comment" });
+    expect(within(form).getByText("Deploys run **at** night")).toBeVisible();
+  });
+
+  it("says nothing of the bar while a comment is written", async () => {
+    // The status line's own clock, run by hand: no real seconds wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      const status = screen.getByRole("status", { hidden: true });
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect(status).toHaveTextContent("Comment on the selection with Alt+F10");
+      fireEvent.click(barButton());
+      // The first word goes as it always does, after a few seconds.
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(status.textContent).toBe("");
+      // Another passage while the form is open: the bar is not there.
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      select(textNode("Deploys run "), textNode("Deploys run "), 7);
+      expect(bar()).toBeNull();
+      expect(status.textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a press go wherever it ends, and a later press takes the passage then", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    const toolbar = bar() as HTMLElement;
+    // Down on the button, up on the bar's own padding: no click follows.
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    fireEvent.pointerUp(toolbar, { button: 0, isPrimary: true });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The press is over: a collapse on the page takes the bar away.
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    expect(bar()).toBeNull();
+    // A new passage, a new press: it comments on that one.
+    select(textNode("Deploys run "), textNode("Deploys run "), 7);
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    fireEvent.pointerUp(barButton(), { button: 0, isPrimary: true });
+    fireEvent.click(barButton());
+    const form = screen.getByRole("form", { name: "New comment" });
+    expect(within(form).getByText("Deploys")).toBeVisible();
+    expect(within(form).queryByText("Deploys run **at** night")).toBeNull();
+  });
+
+  it("lets a press go a moment after a release on the button with no click", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+      fireEvent.pointerUp(barButton(), { button: 0, isPrimary: true });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      expect(bar()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a second quick press past the first one's grace", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const button = barButton();
+      // A tap whose click never came, then a second press at once.
+      fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+      fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+      act(() => {
+        vi.advanceTimersByTime(100);
+      });
+      fireEvent.pointerDown(button, { button: 0, isPrimary: true });
+      // The first grace runs out while the second press is still down.
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      fireEvent.pointerUp(button, { button: 0, isPrimary: true });
+      fireEvent.click(button);
+      const form = screen.getByRole("form", { name: "New comment" });
+      expect(within(form).getByText("Deploys run **at** night")).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a press go when the window loses the focus", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    expect(bar()).toBeNull();
+  });
+
+  it("goes when a live edit takes the selected words away, until the next selection", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const words = textNode("Deploys run ");
+    select(words, words, 7);
+    expect(bar()).toBeVisible();
+    // The words go from under the selection the bar stood by.
+    act(() => {
+      words.data = "";
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(bar()).toBeNull();
+    const other = textNode(" night.");
+    select(other, other, 6);
+    expect(bar()).toBeVisible();
+  });
+
+  describe("where it stands", () => {
+    // jsdom lays nothing out: the boxes the bar measures are lent here.
+    const sel = { top: 300, bottom: 320, left: 900 };
+    // The shell's sticky header; 0 tall unless a test says otherwise.
+    const header = { bottom: 0 };
+    const box = (b: {
+      top?: number;
+      bottom?: number;
+      left?: number;
+      right?: number;
+      width?: number;
+    }) =>
+      ({
+        top: b.top ?? 0,
+        bottom: b.bottom ?? 0,
+        left: b.left ?? 0,
+        right: b.right ?? (b.left ?? 0) + (b.width ?? 0),
+        width: b.width ?? (b.right ?? 0) - (b.left ?? 0),
+        height: (b.bottom ?? 0) - (b.top ?? 0),
+        x: b.left ?? 0,
+        y: b.top ?? 0,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    const lent: [string, PropertyDescriptor | undefined][] = [];
+    const lend = (name: string, get: (this: HTMLElement) => unknown) => {
+      lent.push([
+        name,
+        Object.getOwnPropertyDescriptor(HTMLElement.prototype, name),
+      ]);
+      Object.defineProperty(HTMLElement.prototype, name, {
+        configurable: true,
+        get,
+      });
+    };
+    let observed: (() => void) | null = null;
+    const savedObserver = globalThis.ResizeObserver;
+    beforeEach(() => {
+      Object.assign(sel, { top: 300, bottom: 320, left: 900 });
+      header.bottom = 0;
+      vi.spyOn(Range.prototype, "getBoundingClientRect").mockImplementation(
+        () => box(sel),
+      );
+      vi.spyOn(Range.prototype, "getClientRects").mockImplementation(
+        () => [box(sel)] as unknown as DOMRectList,
+      );
+      vi.spyOn(
+        HTMLElement.prototype,
+        "getBoundingClientRect",
+      ).mockImplementation(function (this: HTMLElement) {
+        // The shell's frame is the window; the page column ends at 960,
+        // where the gap and the threads beside it begin.
+        if (this.tagName === "MAIN") return box({ left: 0, right: 1440 });
+        if (this.hasAttribute("data-app-header")) {
+          return box({ top: 0, bottom: header.bottom, left: 0, right: 1440 });
+        }
+        if (this.tagName === "ARTICLE") return box({ left: 40, right: 960 });
+        return box({});
+      });
+      lend("offsetParent", function () {
+        return this.parentElement?.closest("main") ?? null;
+      });
+      lend("offsetWidth", function () {
+        return this.getAttribute("role") === "toolbar" ? 105 : 0;
+      });
+      lend("offsetHeight", function () {
+        return this.getAttribute("role") === "toolbar" ? 40 : 0;
+      });
+      observed = null;
+      globalThis.ResizeObserver = class {
+        constructor(callback: () => void) {
+          observed = callback;
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {
+          observed = null;
+        }
+      } as unknown as typeof ResizeObserver;
+    });
+    afterEach(() => {
+      for (const [name, descriptor] of lent.splice(0).reverse()) {
+        if (descriptor) {
+          Object.defineProperty(HTMLElement.prototype, name, descriptor);
+        } else {
+          Reflect.deleteProperty(HTMLElement.prototype, name);
+        }
+      }
+      globalThis.ResizeObserver = savedObserver;
+    });
+
+    it("stays inside the page column, never over the threads beside it", async () => {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const toolbar = bar() as HTMLElement;
+      // Above the passage, by the gap.
+      expect(toolbar.style.top).toBe("254px");
+      // Its right edge on the column's: 960 - 105.
+      expect(toolbar.style.left).toBe("855px");
+    });
+
+    it("goes below a passage with no room above it", async () => {
+      Object.assign(sel, { top: 10, bottom: 30, left: 100 });
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect((bar() as HTMLElement).style.top).toBe("36px");
+    });
+
+    it("goes below a passage when the sticky header leaves no room above", async () => {
+      // 254 would be above the passage, but the header reaches down to 280.
+      header.bottom = 280;
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect((bar() as HTMLElement).style.top).toBe("326px");
+    });
+
+    it("stops watching the page's size once it is gone", async () => {
+      serve([]);
+      const { unmount } = renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect(observed).not.toBeNull();
+      const removed = vi.spyOn(window, "removeEventListener");
+      unmount();
+      expect(observed).toBeNull();
+      expect(removed).toHaveBeenCalledWith("resize", expect.any(Function));
+    });
+
+    it("follows the text when the window or the page changes size", async () => {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      const toolbar = bar() as HTMLElement;
+      Object.assign(sel, { top: 500, bottom: 520, left: 100 });
+      act(() => {
+        window.dispatchEvent(new Event("resize"));
+      });
+      expect(toolbar.style.top).toBe("454px");
+      expect(toolbar.style.left).toBe("100px");
+      // A picture above the passage loads: the page grows, the text moves.
+      Object.assign(sel, { top: 700, bottom: 720, left: 120 });
+      expect(observed).not.toBeNull();
+      act(() => {
+        observed?.();
+      });
+      expect(toolbar.style.top).toBe("654px");
+      expect(toolbar.style.left).toBe("120px");
+    });
+  });
+
+  it("says the bar is there, with its key", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const status = screen.getByRole("status", { hidden: true });
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(status).toHaveTextContent("Comment on the selection with Alt+F10");
   });
 });
 
@@ -1944,7 +2446,9 @@ describe("threads on a narrow screen", () => {
     await screen.findByText("at");
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(
-      screen.getByText("Comment on the selection from the threads"),
+      screen.getByText(
+        "Comment on the selection with Alt+F10 or from the threads",
+      ),
     ).toHaveAttribute("role", "status");
     await userEvent.click(screen.getByRole("button", { name: "Show threads" }));
     const sheet = await screen.findByRole("dialog", { name: "Threads" });
@@ -1980,6 +2484,47 @@ describe("threads on a narrow screen", () => {
     await waitFor(() => {
       expect(status).toHaveTextContent("Comment posted.");
     });
+  });
+
+  it("opens the sheet with the form from the bar at the selection", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Comment on selection" }),
+    );
+    const sheet = await screen.findByRole("dialog", { name: "Threads" });
+    expect(within(sheet).getByText("Deploys run **at** night")).toBeVisible();
+    await waitFor(() => {
+      expect(
+        within(sheet).getByRole("textbox", { name: "Your comment" }),
+      ).toHaveFocus();
+    });
+    expect(
+      screen.queryByRole("toolbar", { name: "Selection actions" }),
+    ).toBeNull();
+  });
+
+  it("is not at the selection while the sheet is open", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(
+      screen.getByRole("toolbar", { name: "Selection actions" }),
+    ).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Show threads" }));
+    await screen.findByRole("dialog", { name: "Threads" });
+    // The passage is still selected behind the sheet (jsdom drops it as the
+    // sheet takes the focus; a browser keeps it).
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    expect(
+      screen.queryByRole("toolbar", {
+        name: "Selection actions",
+        hidden: true,
+      }),
+    ).toBeNull();
   });
 
   it("opens the sheet at a thread a link names", async () => {

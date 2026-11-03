@@ -1085,7 +1085,10 @@ function TopBar({
   const { domain, mode } = useDomainMode();
 
   return (
-    <header className="sticky top-0 z-40 border-b border-hair bg-canvas/90 backdrop-blur print:hidden">
+    <header
+      data-app-header=""
+      className="sticky top-0 z-40 border-b border-hair bg-canvas/90 backdrop-blur print:hidden"
+    >
       {/*
         A fixed row rather than one sized by its contents: the sticky offsets
         below it - the reading surface's own sticky pieces, the editor's
