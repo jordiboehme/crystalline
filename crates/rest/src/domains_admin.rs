@@ -62,15 +62,28 @@ pub(crate) async fn require_share_role_on(
     identity: &Identity,
     domain: &str,
 ) -> Result<Caller, ApiError> {
-    match require_share_role(state, identity) {
-        Ok(caller) => Ok(caller),
+    let caller = match require_share_role(state, identity) {
+        Ok(caller) => caller,
         Err(e) if e.status == axum::http::StatusCode::FORBIDDEN && state.access.governs(domain) => {
             crate::require_domain_write(state, identity, domain)
                 .await
-                .map_err(|_| e)
+                .map_err(|_| e)?
         }
-        Err(e) => Err(e),
+        Err(e) => return Err(e),
+    };
+    // An archived repository takes no share from anybody, an instance admin
+    // included. Screened first, so a domain the caller may not see is never
+    // named.
+    if let Some(repo) = state.engine.github_archived_repo(domain) {
+        state
+            .engine
+            .require_domain(domain, &identity.scope())
+            .await?;
+        return Err(
+            EngineError::DomainReadOnly(crate::engine::archived_sentence(domain, &repo)).into(),
+        );
     }
+    Ok(caller)
 }
 
 /// The account a request is being served as, or `None` for the anonymous

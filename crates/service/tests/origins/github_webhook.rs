@@ -1125,3 +1125,122 @@ async fn a_rename_skips_a_domain_recorded_for_another_repository() {
     assert_eq!(resp.status(), 200);
     assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
 }
+
+/// A `repository` event with `action` for `acme/kb`.
+fn kb_repository_event(action: &str) -> Value {
+    json!({
+        "action": action,
+        "repository": {"full_name": "acme/kb", "name": "kb", "archived": action == "archived"},
+        "installation": {"id": 1},
+    })
+}
+
+/// What the archived domain answers a write with.
+const KB_ARCHIVED: &str = "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub";
+
+#[tokio::test]
+async fn a_signed_archived_delivery_makes_the_domain_read_only() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.forge.archive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-archived", &kb_repository_event("archived")),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        fx.eng.github_archived_repo("kb").as_deref(),
+        Some("acme/kb")
+    );
+    assert_eq!(fx.eng.github_archived_repo("vault"), None);
+    let page = WriteReflectionParams {
+        domain: "kb".into(),
+        path: "overview.md".into(),
+        markdown: Some(OVERVIEW.into()),
+        ..Default::default()
+    };
+    let refused = fx.eng.write_reflection(&page, &owner()).await.unwrap_err();
+    assert_eq!(refused.to_string(), KB_ARCHIVED);
+
+    // Unarchived on GitHub: the delivery asks again, and the answer opens it.
+    fx.forge.unarchive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-unarchived",
+            &kb_repository_event("unarchived"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    for _ in 0..250 {
+        if fx.eng.github_archived_repo("kb").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(fx.eng.github_archived_repo("kb"), None);
+    fx.eng.write_reflection(&page, &owner()).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_backup_tick_makes_no_push_for_an_archived_domain() {
+    let fx = setup(Some(SECRET)).await;
+    let later = || Instant::now() + Duration::from_secs(120);
+    let page = |path: &str| WriteReflectionParams {
+        domain: "kb".into(),
+        path: path.into(),
+        markdown: Some(OVERVIEW.into()),
+        ..Default::default()
+    };
+    fx.eng
+        .write_reflection(&page("overview.md"), &owner())
+        .await
+        .unwrap();
+    fx.eng.reflection_backup_tick(later()).await;
+    let head = || fx.kb.branch_commit(BACKUP_BRANCH);
+    let before = head();
+    assert!(before.is_some(), "the first backup went out");
+    // A change waits to be backed up when the repository is archived.
+    fx.eng
+        .write_reflection(&page("second.md"), &owner())
+        .await
+        .unwrap();
+    fx.forge.archive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-archived", &kb_repository_event("archived")),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let commits = fx.forge.commits().len();
+    let outcomes = fx.eng.reflection_backup_tick(later()).await;
+    assert!(
+        outcomes.iter().all(|(domain, _)| domain != "kb"),
+        "{outcomes:?}"
+    );
+    assert_eq!(head(), before, "nothing was pushed for kb");
+    assert_eq!(fx.forge.commits().len(), commits);
+    // Unarchived: the change goes out on the next tick.
+    fx.forge.unarchive("acme/kb");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-unarchived",
+            &kb_repository_event("unarchived"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    for _ in 0..250 {
+        if fx.eng.github_archived_repo("kb").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fx.eng.reflection_backup_tick(later()).await;
+    assert_ne!(head(), before, "the change goes out once unarchived");
+}

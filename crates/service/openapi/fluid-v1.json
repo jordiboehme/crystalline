@@ -14336,6 +14336,14 @@
           "overridden"
         ],
         "properties": {
+          "archived_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "On a domain GitHub governs whose repository is archived on GitHub,\nthe sentence that says the domain is read-only for everybody until\nthe repository is unarchived; `null` otherwise.",
+            "example": "'kb' is read-only because its GitHub repository acme/kb is archived; reading still works, and the domain can change again once the repository is unarchived on GitHub"
+          },
           "closed_reason": {
             "type": [
               "string",

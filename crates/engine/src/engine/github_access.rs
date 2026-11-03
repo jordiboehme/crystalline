@@ -292,6 +292,8 @@ struct Snapshot {
     ids: Option<RepositoryIds>,
     /// Its current name, when GitHub sent it.
     live_name: Option<String>,
+    /// Whether GitHub calls the repository archived (read-only there).
+    archived: bool,
 }
 
 impl Snapshot {
@@ -346,6 +348,12 @@ struct State {
     failing: HashMap<String, Failing>,
     /// Bumped by every invalidation of one repository.
     generations: HashMap<String, u64>,
+    /// Repositories known to be archived on GitHub, by cache key: their
+    /// domains are read-only for everybody. Set at once by an `archived`
+    /// delivery ([`GithubGovernor::mark_archived`]) and set or cleared only
+    /// by a lookup GitHub answered, stored under the generation rule, so a
+    /// replayed `unarchived` body or any invalidation never clears it.
+    archived: HashSet<String>,
     /// Bumped by every invalidation of more than one repository.
     global: u64,
 }
@@ -779,6 +787,32 @@ impl GithubGovernor {
         state.moved.insert(key, reason);
     }
 
+    /// The repository (`owner/name`, as the domain's origin names it) of
+    /// `domain` when it is known to be archived on GitHub, else `None`.
+    /// Reads only what the governor remembers and never starts a lookup, so
+    /// the write gate never waits for GitHub: an unknown state reads as not
+    /// archived.
+    pub fn archived(&self, domain: &str) -> Option<String> {
+        let repo = self.repo_of(domain)?;
+        lock(&self.state)
+            .archived
+            .contains(&repo_key(&repo))
+            .then_some(repo)
+    }
+
+    /// Mark `repo` archived at once, because a webhook said so (a payload
+    /// may narrow on its own word). The generation is bumped under the same
+    /// lock, so a lookup that started before this cannot clear the mark
+    /// with its older answer; only a later lookup GitHub answers with
+    /// `archived: false` does.
+    pub fn mark_archived(&self, repo: &str) {
+        let mut state = lock(&self.state);
+        let key = repo_key(repo);
+        *state.generations.entry(key.clone()).or_default() += 1;
+        state.entries.remove(&key);
+        state.archived.insert(key);
+    }
+
     /// Who reads `domain`'s repository on GitHub: whether it is public and
     /// the GitHub ids with read or more, from the same snapshot as every
     /// other answer. `None` when that is not known right now (no usable
@@ -1003,6 +1037,17 @@ impl GithubGovernor {
                                 fetched_at: started,
                             },
                         );
+                        if snapshot.archived {
+                            if state.archived.insert(key.clone()) {
+                                tracing::info!(
+                                    "{repo} is archived on GitHub, so its domain is read-only"
+                                );
+                            }
+                        } else if state.archived.remove(&key) {
+                            tracing::info!(
+                                "{repo} is no longer archived on GitHub, so its domain can change again"
+                            );
+                        }
                     }
                     if state.failing.remove(&key).is_some() {
                         tracing::info!("GitHub answers again who may use {repo}");
@@ -1362,6 +1407,7 @@ async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, FetchE
         people,
         ids: facts.ids,
         live_name: facts.full_name,
+        archived: facts.archived,
     })
 }
 
@@ -1790,6 +1836,18 @@ impl super::Engine {
             .unwrap_or_default()
     }
 
+    /// The repository of `domain` when GitHub governs the domain and its
+    /// repository is known to be archived (see [`GithubGovernor::archived`]),
+    /// else `None`. Never builds the governor and never asks GitHub, so a
+    /// domain GitHub does not govern pays nothing.
+    pub fn github_archived_repo(&self, domain: &str) -> Option<String> {
+        let governor = self.github_governor.get()?;
+        if !self.github_governs(domain) {
+            return None;
+        }
+        governor.archived(domain)
+    }
+
     /// Why `domain` is closed (see [`GithubGovernor::closed`]), or `None`
     /// when it is open or not governed.
     pub fn github_closed_reason(&self, domain: &str) -> Option<String> {
@@ -1956,6 +2014,11 @@ impl super::Engine {
     ///   ([`Invalidate::Installation`]). A domain opens again only when
     ///   GitHub shows the App its repository, and its opening runs the
     ///   Reflection rescan.
+    /// * `repository` `archived`: the domain is read-only for everybody at
+    ///   once ([`GithubGovernor::mark_archived`]), and the repository is
+    ///   asked about again in the background, so GitHub's answer confirms
+    ///   or clears the mark within seconds. `unarchived` only asks again:
+    ///   the mark goes when GitHub answers `archived: false`.
     /// * `github_app_authorization` `revoked`: the person's user token is
     ///   deleted and their link kept (`sender.id` names them).
     ///
@@ -2002,6 +2065,29 @@ impl super::Engine {
             },
             ("repository", "transferred") => {
                 self.github_repo_transferred(&governor, payload).await?
+            }
+            // Archived narrows on the payload's word, at once; GitHub's
+            // answer to the lookup started here confirms or clears it.
+            ("repository", "archived") => {
+                if let Some(repo) = repository_of(payload)
+                    && self.github_repo_connected(&repo)
+                {
+                    governor.mark_archived(&repo);
+                    governor.invalidate(Invalidate::Repo(repo));
+                    governor.warm_up();
+                }
+                false
+            }
+            // Unarchived widens, so the payload is never believed: GitHub is
+            // asked again and only its answer clears the mark.
+            ("repository", "unarchived") => {
+                if let Some(repo) = repository_of(payload)
+                    && self.github_repo_connected(&repo)
+                {
+                    governor.invalidate(Invalidate::Repo(repo));
+                    governor.warm_up();
+                }
+                false
             }
             ("repository", "deleted") => match repository_of(payload) {
                 Some(repo) => self.close_github_repos(&governor, [repo], |repo| {
@@ -2585,6 +2671,8 @@ mod tests {
         ids: Option<RepositoryIds>,
         /// Its current name, when GitHub answers another one (renamed).
         full_name: Option<String>,
+        /// Whether GitHub calls it archived.
+        archived: bool,
     }
 
     /// GitHub, answering from tables and counting the collaborator listings
@@ -2718,7 +2806,7 @@ mod tests {
                     _ => RepoVisibility::Private,
                 },
                 ids: found.and_then(|r| r.ids),
-                archived: false,
+                archived: found.is_some_and(|r| r.archived),
                 full_name: Some(
                     found
                         .and_then(|r| r.full_name.clone())
@@ -3721,5 +3809,74 @@ mod tests {
         rig.governor.invalidate(Invalidate::All);
         assert!(rig.governor.closed_domains().is_empty());
         assert!(rig.governor.governed_domains().contains(DOMAIN));
+    }
+
+    /// Asks the governor about the domain, as a write's access check does.
+    async fn look_up(rig: &Rig) {
+        rig.knowledge("alice").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_archived_answer_marks_the_domain_and_only_a_later_lookup_clears_it() {
+        let rig = rig().await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // A member event forgets the repository; the mark stays.
+        rig.governor.invalidate(Invalidate::User(1));
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        rig.governor.invalidate(Invalidate::Installation(7));
+        rig.governor.invalidate(Invalidate::All);
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // A lookup GitHub answers with archived: false clears it.
+        rig.github.with(REPO, |r| r.archived = false);
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replayed_unarchived_alone_never_clears_the_archived_mark() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        look_up(&rig).await;
+        // What the `unarchived` arm does, while GitHub still says archived.
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_started_before_an_archived_delivery_does_not_clear_the_mark() {
+        let rig = rig().await;
+        look_up(&rig).await;
+        tokio::time::advance(6 * MIN).await;
+        // A lookup is on its way with GitHub's "not archived" ...
+        let gate = rig.github.park();
+        let governor = rig.governor.clone();
+        let asking = tokio::spawn(async move { governor.knowledge("alice", DOMAIN).await });
+        rig.github.parked(1).await;
+        // ... when the archived delivery lands.
+        rig.governor.mark_archived(REPO);
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        asking.await.unwrap();
+        assert_eq!(rig.governor.archived(DOMAIN).as_deref(), Some(REPO));
+        // The next lookup is GitHub's answer after the delivery, and it
+        // decides.
+        look_up(&rig).await;
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archived_reads_nothing_for_a_domain_without_a_repository_and_starts_no_lookup() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.archived = true);
+        assert_eq!(rig.governor.archived(DOMAIN), None);
+        assert_eq!(rig.governor.archived("elsewhere"), None);
+        assert_eq!(rig.github.listings(), 0);
     }
 }

@@ -2117,7 +2117,12 @@ impl McpServer {
             Some(block @ (WriteBlock::Role | WriteBlock::WriteList { .. })) => {
                 Ok(Some(block.sentence(domain)))
             }
-            Some(WriteBlock::DomainLocked | WriteBlock::Reviewing) | None => Ok(None),
+            Some(
+                WriteBlock::DomainLocked
+                | WriteBlock::RepositoryArchived { .. }
+                | WriteBlock::Reviewing,
+            )
+            | None => Ok(None),
         }
     }
 

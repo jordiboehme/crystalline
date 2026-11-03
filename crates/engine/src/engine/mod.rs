@@ -1203,6 +1203,9 @@ pub struct Engine {
     // Per domain, the pages its last backup held back because they cite a
     // domain fewer people may read (`Engine::reflection_backup_held_back`).
     backup_held: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    // The domains whose Reflection backup was skipped because their GitHub
+    // repository is archived, so the tick says so once per process.
+    backup_archived_logged: std::sync::Mutex<HashSet<String>>,
     /// What the last complete walk of each domain saw of its Reflection:
     /// `None` when it was not in effect, else its threads files by page,
     /// with the checksum last seen or written. The next complete walk
@@ -2511,6 +2514,7 @@ impl Engine {
             app_store_lookup: None,
             backup_marks: Default::default(),
             backup_held: Default::default(),
+            backup_archived_logged: Default::default(),
             reflection_walks: Default::default(),
             origins_dir_override: None,
             state_dir_override: None,
@@ -4275,6 +4279,21 @@ impl Engine {
             }
         };
         for domain in due {
+            // The repository takes no push while it is archived. The mark
+            // stays, so the backup goes out once it is unarchived.
+            if let Some(repo) = self.github_archived_repo(&domain) {
+                if self
+                    .backup_archived_logged
+                    .lock()
+                    .expect("backup archived")
+                    .insert(domain.clone())
+                {
+                    tracing::info!(
+                        "reflection backup: skipping {domain}, its GitHub repository {repo} is archived"
+                    );
+                }
+                continue;
+            }
             if !self.backs_up_reflection_here(&domain).await {
                 self.backup_marks.clear(&domain);
                 continue;
@@ -5519,6 +5538,13 @@ impl Engine {
         if self.domain_is_read_only(name).await {
             self.require_domain(name, scope).await?;
             return Err(EngineError::DomainReadOnly(read_only_sentence(name)));
+        }
+        // An archived GitHub repository takes no push, so its domain takes
+        // no write either, from anybody. Read from what the governor last
+        // learned; this never asks GitHub.
+        if let Some(repo) = self.github_archived_repo(name) {
+            self.require_domain(name, scope).await?;
+            return Err(EngineError::DomainReadOnly(archived_sentence(name, &repo)));
         }
         Ok(())
     }
@@ -9887,6 +9913,18 @@ fn note_heading_stripped(receipt: &mut Value, stripped: Option<String>) {
 /// (`WriteBlock::DomainLocked`).
 pub fn read_only_sentence(domain: &str) -> String {
     format!("'{domain}' is read-only; its owner switches read_only off in the domain policies")
+}
+
+/// The sentence a domain whose GitHub repository is archived refuses a
+/// write with, for everybody (instance admins and the machine owner
+/// included): `'<domain>' is read-only because its GitHub repository
+/// <owner/name> is archived; ...`. One spelling for the engine, REST and the
+/// write-block reason (`WriteBlock::RepositoryArchived`).
+pub fn archived_sentence(domain: &str, repo: &str) -> String {
+    format!(
+        "'{domain}' is read-only because its GitHub repository {repo} is archived; reading still \
+         works, and the domain can change again once the repository is unarchived on GitHub"
+    )
 }
 
 /// Whether `rel` is the MANIFEST's path exactly, the file routing reads on a

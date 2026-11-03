@@ -197,13 +197,11 @@ impl Forge {
 
     /// Archives `repo`: `archived` is true on `GET /repos/{o}/{r}` and
     /// `GET /repositories/{id}` from now on.
-    #[allow(dead_code)] // used by the archived and org-rename tests
     pub(crate) fn archive(&self, repo: &str) {
         self.archived.lock().unwrap().insert(repo.to_string());
     }
 
     /// Takes the archive off `repo`.
-    #[allow(dead_code)] // used by the archived and org-rename tests
     pub(crate) fn unarchive(&self, repo: &str) {
         self.archived.lock().unwrap().remove(repo);
     }
