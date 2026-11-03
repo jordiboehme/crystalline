@@ -8,12 +8,16 @@
  * from the person's text and is untrusted: every text node and attribute
  * value is escaped, the only attributes ever written are `href` (http, https
  * and mailto only) and `start` on `ol`, and raw HTML in the source is written
- * as text. HTML comments and Reflection id lines are dropped.
+ * as text. HTML comments, Reflection id lines, link and footnote definitions
+ * are dropped. The copy handler wraps the result in one element carrying
+ * `data-crystalline-copy="1"`, the only extra attribute, which tells a paste
+ * in Fluid to take the Markdown from `text/plain`.
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
-import type { EditorState, Extension, SelectionRange } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import type { Extension, SelectionRange } from "@codemirror/state";
+import { EditorState } from "@codemirror/state";
+import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 import { decodeNamedCharacterReference } from "decode-named-character-reference";
 
@@ -101,8 +105,6 @@ export function copyHtmlOf(
   state: EditorState,
   ranges: readonly SelectionRange[],
 ): string {
-  const end = ranges.reduce((to, r) => Math.max(to, r.to), 0);
-  void end;
   const tree =
     ensureSyntaxTree(state, state.doc.length, 200) ?? syntaxTree(state);
   const maths = mathBlocks(state).filter((m) => m.form === "dollars");
@@ -391,6 +393,10 @@ export function copyHtmlOf(
     }
     switch (c.name) {
       case "Paragraph": {
+        // A footnote definition is not shown in place on the page.
+        if (/^\[\^[^\]\s]+\]:/.test(state.sliceDoc(c.from, c.from + 40))) {
+          return "";
+        }
         const tex = maths.find((m) => m.from <= c.from && c.to <= m.to);
         if (tex) {
           const part = state
@@ -446,80 +452,55 @@ export function copyHtmlOf(
     .join("");
 }
 
-/** Whether the page's selection sits in the view, as CodeMirror asks first. */
-function selectionIn(view: EditorView): boolean {
-  const sel = view.dom.ownerDocument.defaultView?.getSelection() ?? null;
-  const inside = (node: Node | null) =>
-    node !== null && view.contentDOM.contains(node);
-  return sel !== null && inside(sel.anchorNode) && inside(sel.focusNode);
-}
+/** The HTML of each copy or cut, taken before a cut deletes what it copies. */
+const pending = new WeakMap<Event, string>();
 
 /**
- * Copy and cut for the main view. Where CodeMirror's own copy can run, it
- * does, so its line-wise copy bookkeeping, its selection guard and its cut
- * (`delete.cut`, one undo step, through the same guards as any deletion) stay
- * its own: this handler only slips the HTML beside the text it writes. The
- * HTML root carries `COPY_MARKER`, so a paste in Fluid takes the Markdown.
- * Where it cannot (a view that is not editable must copy and never delete,
- * or the clipboard object is not replaceable), it writes both flavours
- * itself, with the text exactly as CodeMirror would put it: the selected
- * ranges joined with the line break, then the output filters. An empty
- * selection is left to CodeMirror's line-wise copy.
+ * Copy and cut for the main view. CodeMirror's own copy and cut run
+ * unchanged: the text, the selection guard, the line-wise bookkeeping and the
+ * deletion (`delete.cut`, one undo step, through the same guards as any
+ * deletion) stay its own. This extension reads the selection before they run
+ * (a handler that takes nothing), and after them, in the same event, adds
+ * `text/html` to the clipboard CodeMirror filled (a bubble listener on the
+ * view, which sees the event only when CodeMirror took it). A copy whose body
+ * would be empty (frontmatter alone, a lone definition, a comment) adds
+ * nothing. The HTML root carries `data-crystalline-copy="1"`, so a paste in
+ * Fluid takes the Markdown (see `isOwnCopy`). A cut in a view that is not
+ * editable copies and deletes nothing: a filter refuses its deletion.
  */
 export function copyAsHtml(): Extension {
-  const handle =
-    (cut: boolean) => (event: ClipboardEvent, view: EditorView) => {
-      const { state } = view;
-      const ranges = state.selection.ranges.filter((r) => !r.empty);
-      const data = event.clipboardData;
-      if (ranges.length === 0 || data === null) {
-        return false;
-      }
-      const html = `<div ${COPY_MARKER}>${copyHtmlOf(state, ranges)}</div>`;
-      const deletes = cut && !state.readOnly;
-      if (!deletes || state.facet(EditorView.editable)) {
-        try {
-          Object.defineProperty(event, "clipboardData", {
-            configurable: true,
-            value: {
-              clearData: () => data.clearData(),
-              setData: (type: string, value: string) => {
-                data.setData(type, value);
-                if (type === "text/plain") {
-                  data.setData("text/html", html);
-                }
-              },
-            },
-          });
-          return false;
-        } catch {
-          // Not replaceable: written here.
-        }
-      }
-      if (!selectionIn(view)) {
-        return false;
-      }
-      let text = ranges
-        .map((r) => state.sliceDoc(r.from, r.to))
-        .join(state.lineBreak);
-      for (const filter of state.facet(EditorView.clipboardOutputFilter)) {
-        text = filter(text, state);
-      }
-      event.preventDefault();
-      data.clearData();
-      data.setData("text/plain", text);
-      data.setData("text/html", html);
-      if (deletes && state.facet(EditorView.editable)) {
-        view.dispatch({
-          changes: ranges.map((r) => ({ from: r.from, to: r.to })),
-          scrollIntoView: true,
-          userEvent: "delete.cut",
-        });
-      }
-      return true;
-    };
-  return EditorView.domEventHandlers({
-    copy: handle(false),
-    cut: handle(true),
-  });
+  const take = (event: ClipboardEvent, view: EditorView) => {
+    const ranges = view.state.selection.ranges.filter((r) => !r.empty);
+    const body = ranges.length > 0 ? copyHtmlOf(view.state, ranges) : "";
+    if (body !== "") {
+      pending.set(event, `<div ${COPY_MARKER}>${body}</div>`);
+    }
+    return false;
+  };
+  const add = (event: Event) => {
+    const html = pending.get(event);
+    if (html !== undefined && event.defaultPrevented) {
+      (event as ClipboardEvent).clipboardData?.setData("text/html", html);
+    }
+  };
+  return [
+    EditorView.domEventHandlers({ copy: take, cut: take }),
+    ViewPlugin.define((view) => {
+      view.dom.addEventListener("copy", add);
+      view.dom.addEventListener("cut", add);
+      return {
+        destroy() {
+          view.dom.removeEventListener("copy", add);
+          view.dom.removeEventListener("cut", add);
+        },
+      };
+    }),
+    EditorState.transactionFilter.of((tr) =>
+      tr.docChanged &&
+      tr.isUserEvent("delete.cut") &&
+      !tr.startState.facet(EditorView.editable)
+        ? []
+        : tr,
+    ),
+  ];
 }

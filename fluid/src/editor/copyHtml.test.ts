@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { cleanupMarkViews, markView, undoOnce } from "../test/markKit";
 import { bytes } from "../test/cellKit";
+import { isOwnCopy } from "./clipboardHtml";
 import { copyHtmlOf } from "./copyHtml";
 
 afterEach(cleanupMarkViews);
@@ -408,5 +409,75 @@ describe("copyHtmlOf, fix round 1", () => {
       '<p><a href="https://x/_y">l</a></p>',
     );
     expect(html("[l](\\javascript:x)")).toBe("<p>l</p>");
+  });
+});
+
+describe("fix round 2", () => {
+  it.each([
+    ["frontmatter alone", "---\ntitle: x\n---\n"],
+    ["a lone definition", "[r]: https://x\n"],
+    ["a lone footnote definition", "[^1]: note\n"],
+    ["a comment", "<!-- c -->\n"],
+  ])("sets no HTML when the body would be empty (%s)", (_name, doc) => {
+    const view = markView(doc);
+    view.focus();
+    select(view, 0, doc.length);
+    const copied = send(view, "copy");
+    expect(copied.data.get("text/plain")).toBe(doc);
+    expect(copied.data.has("text/html")).toBe(false);
+  });
+
+  it("leaves out footnote definitions of any length", () => {
+    expect(html("a[^1]\n\n[^1]: several words of **note**")).toBe(
+      "<p>a<sup>1</sup></p>",
+    );
+    expect(html("a[^1]\n\n[^1]: first line\ncontinued here")).toBe(
+      "<p>a<sup>1</sup></p>",
+    );
+  });
+
+  it.each([
+    ["the bare root", '<div data-crystalline-copy="1"><p>x</p></div>'],
+    [
+      "a browser wrapper",
+      "<meta charset='utf-8'><html><body><!--StartFragment--><div data-crystalline-copy=\"1\"><p>x</p></div>",
+    ],
+    [
+      "a head and a doctype",
+      '<!DOCTYPE html><html><head><title>t</title></head><body><div data-crystalline-copy="1">x</div></body></html>',
+    ],
+    ["single quotes", "<div data-crystalline-copy='1'>x</div>"],
+    [
+      "extra attributes on the root",
+      '<div class="a" data-crystalline-copy="1" style="x:y">x</div>',
+    ],
+  ])("knows its own copy: %s", (_name, markup) => {
+    expect(isOwnCopy(markup)).toBe(true);
+  });
+
+  it.each([
+    ["no marker", "<div><p>x</p></div>"],
+    ["a marker deeper in", '<p>x</p><div data-crystalline-copy="1">y</div>'],
+    ["another value", '<div data-crystalline-copy="2">x</div>'],
+    ["plain text", "x"],
+  ])("does not take %s for its own copy", (_name, markup) => {
+    expect(isOwnCopy(markup)).toBe(false);
+  });
+
+  it("copies a read-only cut without deleting and leaves no line-wise memory", () => {
+    const view = markView("foo\nbar foo baz");
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(EditorView.editable.of(false)),
+    });
+    view.focus();
+    view.dispatch({ selection: { anchor: 1 } });
+    send(view, "copy");
+    select(view, 8, 11);
+    const cut = send(view, "cut");
+    expect(cut.data.get("text/html")).toBe(`${OWN}<p>foo</p></div>`);
+    expect(bytes(view.state)).toBe("foo\nbar foo baz");
+    view.dispatch({ selection: { anchor: 5 }, userEvent: "select.pointer" });
+    pasteInto(view, cut);
+    expect(bytes(view.state)).toBe("foo\nbfooar foo baz");
   });
 });

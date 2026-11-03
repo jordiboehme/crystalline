@@ -91,7 +91,10 @@ export function decodeEntities(text: string): string {
  * the person sees, whoever wrote the HTML.
  */
 export function isOwnCopy(html: string): boolean {
-  return /^(?:\s|<meta[^>]*>|<!--[\s\S]*?-->|<\/?(?:html|body)[^>]*>)*<div data-crystalline-copy="1">/.test(
-    html,
-  );
+  if (!html.includes("data-crystalline-copy")) {
+    return false;
+  }
+  const first = new DOMParser().parseFromString(html, "text/html").body
+    .firstElementChild;
+  return first?.getAttribute("data-crystalline-copy") === "1";
 }
