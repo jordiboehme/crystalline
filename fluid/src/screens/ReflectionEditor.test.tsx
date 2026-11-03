@@ -1,3 +1,4 @@
+import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -22,6 +23,7 @@ import {
   soloCollabSession,
   userFixture,
 } from "../test/harness";
+import { typeText } from "../test/markKit";
 
 vi.setConfig({ testTimeout: 15000 });
 vi.mock("../api/client", async (importOriginal) => {
@@ -93,6 +95,27 @@ beforeEach(() => {
 });
 
 describe("the reflection editor", () => {
+  it("builds the page showing marks, first frame included, for a person who has the setting on", async () => {
+    localStorage.setItem("fluid-marks-on-edit-line", "on");
+    const built: EditorState[] = [];
+    const create = EditorState.create.bind(EditorState);
+    vi.spyOn(EditorState, "create").mockImplementation((config) => {
+      const state = create(config);
+      built.push(state);
+      return state;
+    });
+    serve("edit");
+    live(room(PAGE));
+    const editor = await openEditor();
+    const first = built.find((state) =>
+      state.doc.toString().includes("First."),
+    );
+    expect(first?.facet(marksOnEditLine)).toBe(true);
+    const host = editor.closest(".cm-editor");
+    const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+    expect(view?.state.facet(marksOnEditLine)).toBe(true);
+  });
+
   it("keeps the bytes and the caret when the marks setting flips, and the next key lands at the caret", async () => {
     serve("edit");
     live(room(PAGE));
@@ -126,11 +149,7 @@ describe("the reflection editor", () => {
     expect(view.state.selection.main.head).toBe(at);
 
     act(() => {
-      view.dispatch({
-        changes: { from: at, insert: "X" },
-        selection: { anchor: at + 1 },
-        userEvent: "input.type",
-      });
+      typeText(view, "X");
     });
     expect(view.state.doc.toString()).toBe(
       `${before.slice(0, at)}X${before.slice(at)}`,

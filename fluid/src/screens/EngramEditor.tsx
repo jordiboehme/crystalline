@@ -497,6 +497,10 @@ function Surface({
    */
   const [marks] = useState(() => new Compartment());
   const { showOnEditLine } = useMarkSetting();
+  // The setting as it stood at mount, so the first frame is right. The
+  // effect below carries every later flip, and re-applies the live value to
+  // any view a later remount builds.
+  const [showAtMount] = useState(showOnEditLine);
   useEffect(() => {
     // Nothing else in the transaction: no selection, no changes, no userEvent.
     view?.dispatch({
@@ -942,9 +946,9 @@ function Surface({
         domain: engram.domain,
         preview,
         marks,
-        // The effect below carries the real setting in as soon as the view
-        // exists, the way the resolver's compartment does.
-        showMarks: false,
+        // The live setting, so the first frame is right; the effect above
+        // carries every later flip.
+        showMarks: showAtMount,
         raw: RAW_AT_MOUNT,
         resolverBox,
         // The graph has not landed at mount; the compartment above carries
@@ -967,6 +971,7 @@ function Surface({
       resolved,
       preview,
       marks,
+      showAtMount,
       resolverBox,
       room,
       uploads.extension,

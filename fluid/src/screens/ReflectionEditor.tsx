@@ -616,6 +616,10 @@ function Surface({
    */
   const marks = useMemo(() => new Compartment(), []);
   const { showOnEditLine } = useMarkSetting();
+  // The setting as it stood at mount, so the first frame is right. The
+  // effect below carries every later flip, and re-applies the live value to
+  // any view a later remount builds.
+  const [showAtMount] = useState(showOnEditLine);
   useEffect(() => {
     // Nothing else in the transaction: no selection, no changes, no userEvent.
     view?.dispatch({
@@ -652,8 +656,9 @@ function Surface({
         ],
         preview,
         marks,
-        // The effect above carries the real setting in once the view exists.
-        showMarks: false,
+        // The live setting, so the first frame is right; the effect above
+        // carries every later flip.
+        showMarks: showAtMount,
         raw: false,
         images: previews.of(imagePreviews(home)),
         uploads: uploads.extension,
@@ -670,6 +675,7 @@ function Surface({
     adapter,
     preview,
     marks,
+    showAtMount,
     editable,
     mountEnded,
     uploads.extension,

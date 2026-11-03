@@ -1,3 +1,4 @@
+import { StateEffect } from "@codemirror/state";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -6,6 +7,7 @@ import {
   setCaret,
   showsMarks,
 } from "../../test/markKit";
+import { mainSelectionParked } from "../parkedSelection";
 import { marksHiddenOnLine } from "./mode";
 
 afterEach(cleanupMarkViews);
@@ -30,6 +32,18 @@ describe("marksHiddenOnLine", () => {
     setCaret(view, 3);
     expect(marksHiddenOnLine(view.state, 1)).toBe(false);
     expect(marksHiddenOnLine(view.state, 2)).toBe(true);
+  });
+
+  it("follows the revealing ranges, not the selection, while main's selection is parked", () => {
+    const view = markView("a **b**", { mode: "show" });
+    setCaret(view, 3);
+    expect(marksHiddenOnLine(view.state, 1)).toBe(false);
+    // A cell is open: main's selection is stale and reveals nothing.
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(mainSelectionParked.of(true)),
+    });
+    expect(view.state.selection.main.head).toBe(3);
+    expect(marksHiddenOnLine(view.state, 1)).toBe(true);
   });
 
   it("is false in the source view, which has no hidden-mark layer", () => {
