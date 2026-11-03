@@ -113,12 +113,22 @@ describe("multi-line text without a tab (finding 8)", () => {
     );
   });
 
-  test("with an HTML table beside it, the same text is a block", () => {
+  test("a one-column HTML table beside it is still one value (round 2 E)", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, {
+      plain: "x\ny",
+      html: "<table><tr><td>x</td></tr><tr><td>y</td></tr></table>",
+    });
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1x y | 2 |\n");
+  });
+
+  test("with a two-column HTML table beside it, the same text is a block", () => {
     const main = soloMain(DOC, layers());
     const view = open(main, 0, 1);
     paste(view, {
       plain: "x\ny",
-      html: "<meta charset='utf-8'><table><tr><td>x</td></tr><tr><td>y</td></tr></table>",
+      html: "<meta charset='utf-8'><table><tr><th>x</th><th>z</th></tr><tr><td>y</td><td>w</td></tr></table>",
     });
     expect(gridTables(main.state)[0]?.rows.map((r) => r[1]?.text)).toEqual([
       "x",
@@ -221,10 +231,10 @@ describe("paste of a block", () => {
   test("a CRLF clipboard gives two rows, the trailing empty line is dropped", () => {
     const main = soloMain(DOC, layers());
     const view = open(main, 1, 0);
-    // One spreadsheet column: no tab, but an HTML table beside the text.
+    // No tab, but an HTML table of two columns beside the text.
     paste(view, {
       plain: "x\r\ny\r\n",
-      html: "<table><tr><td>x</td></tr><tr><td>y</td></tr></table>",
+      html: "<table><tr><td>x</td><td></td></tr><tr><td>y</td><td></td></tr></table>",
     });
     const table = gridTables(main.state)[0];
     expect(table?.rows.map((r) => r[0]?.text)).toEqual(["a", "x", "y"]);

@@ -27,6 +27,15 @@ export const gridLoaded = Facet.define<boolean, boolean>({
 });
 
 /**
+ * Whether the grid chunk could not be loaded and the loader gave up (three
+ * failed imports). The read-only table preview then says how to get the
+ * grid back. Provided by the loader's compartment, read by `fencePreviews`.
+ */
+export const gridUnavailable = Facet.define<boolean, boolean>({
+  combine: (values) => values.some(Boolean),
+});
+
+/**
  * The prose layers a cell editor draws with: the same ones the main view
  * gets, provided by `previewConfig` so the two never drift apart.
  */

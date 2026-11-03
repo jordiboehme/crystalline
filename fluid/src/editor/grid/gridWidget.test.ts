@@ -131,6 +131,26 @@ describe("names for a screen reader (finding 7)", () => {
     );
   });
 
+  test("a header with an image, a link and a wikilink is named by its words, and draws no image for the name (round 2 F)", () => {
+    const created = vi.spyOn(document, "createElement");
+    try {
+      const main = soloMain(
+        "| ![logo](logo.png) Boat | [Role](https://x.test) | [[crew\\|Crew list]] |\n| - | - | - |\n| 1 | 2 | 3 |\n",
+        layers(),
+      );
+      expect(grid(main).getAttribute("aria-label")).toBe(
+        "Table: logo Boat, Role, Crew list",
+      );
+      const images = created.mock.calls.filter(
+        ([tag]) => String(tag).toLowerCase() === "img",
+      ).length;
+      // The header's own drawing has one image; naming the grid adds none.
+      expect(images).toBeLessThanOrEqual(1);
+    } finally {
+      created.mockRestore();
+    }
+  });
+
   test("two tables on a page have their own names", () => {
     const main = soloMain(
       `${DOC}\n| x | y |\n| - | - |\n| 3 | 4 |\n`,

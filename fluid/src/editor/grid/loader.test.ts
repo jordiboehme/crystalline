@@ -12,7 +12,8 @@ import { parsedState } from "../../test/parse";
 import { reflectionAdapter } from "../adapter";
 import { previewConfig } from "../surface";
 import { baseExtensions, RAW_MONO } from "../setup";
-import { cellPreviewLayers, gridLoaded } from "./draws";
+import { fencePreviews } from "../fencePreviews";
+import { cellPreviewLayers, gridLoaded, gridUnavailable } from "./draws";
 import { tableGridWith } from "./loader";
 
 const TABLE = "| a | b |\n| - | - |\n| 1 | 2 |";
@@ -111,35 +112,82 @@ describe("tableGridWith", () => {
     view.destroy();
   });
 
-  it("stays quiet and keeps the preview when the import rejects", async () => {
-    const load = vi.fn(() => Promise.reject(new Error("offline")));
-    const grid = tableGridWith(load);
-    const view = mount(TABLE, grid.extension());
-    await flush();
-    expect(load).toHaveBeenCalled();
-    expect(view.state.facet(gridLoaded)).toBe(false);
-    await expect(grid.prefetch()).resolves.toBeUndefined();
-    view.destroy();
+  it("stays quiet and keeps the preview while a failed import waits", async () => {
+    vi.useFakeTimers();
+    try {
+      const load = vi.fn(() => Promise.reject(new Error("offline")));
+      const grid = tableGridWith(load);
+      const view = mount(TABLE, grid.extension());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(view.state.facet(gridLoaded)).toBe(false);
+      expect(view.state.facet(gridUnavailable)).toBe(false);
+      // An edit is no new try: the backoff decides when.
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledTimes(1);
+      view.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("asks again on the next check after a failed import (T2)", async () => {
-    let fail = true;
-    const load = vi.fn(() =>
-      fail ? Promise.reject(new Error("offline")) : Promise.resolve(chunk()),
-    );
-    const grid = tableGridWith(load);
-    const view = mount(TABLE, grid.extension());
-    await flush();
-    expect(load).toHaveBeenCalledTimes(1);
-    expect(view.state.facet(gridLoaded)).toBe(false);
-    fail = false;
-    // The next edit is the next check.
-    view.dispatch({ changes: { from: view.state.doc.length, insert: "\n" } });
-    await flush();
-    expect(load).toHaveBeenCalledTimes(2);
-    expect(view.state.facet(gridLoaded)).toBe(true);
-    expect(view.contentDOM.getAttribute("data-grid")).toBe("on");
-    view.destroy();
+  it("tries again after 5 s and then after 30 s, and loads on a later try (round 2 C)", async () => {
+    vi.useFakeTimers();
+    try {
+      let failing = 2;
+      const load = vi.fn(() => {
+        if (failing > 0) {
+          failing -= 1;
+          return Promise.reject(new Error("offline"));
+        }
+        return Promise.resolve(chunk());
+      });
+      const grid = tableGridWith(load);
+      const view = mount(TABLE, grid.extension());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(load).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(load).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(load).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(load).toHaveBeenCalledTimes(3);
+      expect(view.state.facet(gridLoaded)).toBe(true);
+      expect(view.contentDOM.getAttribute("data-grid")).toBe("on");
+      view.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up after three failures and says to reload the page", async () => {
+    vi.useFakeTimers();
+    try {
+      const load = vi.fn(() => Promise.reject(new Error("offline")));
+      const grid = tableGridWith(load);
+      const view = mount(TABLE, [grid.extension(), fencePreviews(false)]);
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect(load).toHaveBeenCalledTimes(3);
+      expect(view.state.facet(gridUnavailable)).toBe(true);
+      expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+      expect(view.dom.querySelector(".cm-table-notice")?.textContent).toBe(
+        "Reload the page to edit tables.",
+      );
+      // No more tries, also not on an edit, and a later view starts given up.
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n" } });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(load).toHaveBeenCalledTimes(3);
+      const later = mount(TABLE, grid.extension());
+      expect(later.state.facet(gridUnavailable)).toBe(true);
+      await expect(grid.prefetch()).resolves.toBeUndefined();
+      view.destroy();
+      later.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

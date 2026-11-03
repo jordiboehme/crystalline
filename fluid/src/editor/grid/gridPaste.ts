@@ -37,16 +37,35 @@ import {
 import { gridTableAt, tableIn } from "./structure";
 
 /**
+ * Whether `html` holds a table with some row of more than one cell. A table
+ * of one column, which a page also uses to lay out plain text, does not make
+ * a paste a block.
+ */
+function htmlGrid(html: string): boolean {
+  if (!/<table[\s>]/i.test(html)) return false;
+  return html
+    .split(/<tr[\s>]/i)
+    .slice(1)
+    .some((row) => {
+      const end = row.search(/<\/tr\s*>/i);
+      const cells = (end === -1 ? row : row.slice(0, end)).match(
+        /<t[dh][\s>]/gi,
+      );
+      return (cells?.length ?? 0) > 1;
+    });
+}
+
+/**
  * The rows and cells of a clipboard block; null when it is one value. A
- * block has a tab, or comes with an HTML table beside its plain text
- * (finding 8): two lines of prose are one value, typed with the line break
+ * block has a tab, or comes with an HTML table of two or more columns
+ * beside its plain text (finding 8): two lines of prose are one value, typed with the line break
  * as a space, and never overwrite the cell below.
  */
 export function blockOf(plain: string, html = ""): string[][] | null {
   if (!/[\t\r\n]/.test(plain)) return null;
   // Lines with no tab are prose with line breaks, one value, unless the
-  // clipboard also holds an HTML table (a spreadsheet's copy of one column).
-  if (!plain.includes("\t") && !/<table[\s>]/i.test(html)) return null;
+  // clipboard also holds an HTML table with a row of two or more cells.
+  if (!plain.includes("\t") && !htmlGrid(html)) return null;
   const lines = plain.replace(/\r\n?/g, "\n").split("\n");
   if (lines.length > 1 && lines.at(-1) === "") lines.pop();
   const rows = lines.map((line) => line.split("\t").map((cell) => cell.trim()));

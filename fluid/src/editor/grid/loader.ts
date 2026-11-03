@@ -8,9 +8,9 @@
  * per call would forget what the chunk brought. Until the chunk is in, nothing
  * here changes the editor, so every table keeps the read-only preview. A
  * failed import (a network blip, or a redeploy that changed the chunk's
- * hash) is asked for again on the next check, the next edit or scroll, so
- * the tables do not stay read-only for the whole session. While the network
- * is down that is a fresh `import()` per check, which fails fast.
+ * hash) is tried again after 5 seconds, then after 30. After the third
+ * failure the loader gives up: the compartment gets `gridUnavailable`, and
+ * the table preview says to reload the page.
  */
 
 import { syntaxTree } from "@codemirror/language";
@@ -19,7 +19,7 @@ import { Compartment } from "@codemirror/state";
 import type { EditorView, ViewUpdate } from "@codemirror/view";
 import { ViewPlugin } from "@codemirror/view";
 
-import { gridDraws } from "./draws";
+import { gridDraws, gridUnavailable } from "./draws";
 
 interface GridChunk {
   gridExtension: () => Extension;
@@ -45,24 +45,43 @@ function hasGridTable(state: EditorState): boolean {
   return found;
 }
 
+/** The waits before the second and the third try of a failed import. */
+export const RETRY_DELAYS_MS = [5_000, 30_000];
+
+/** What the compartment holds once the loader gave up. */
+const unavailable: Extension = gridUnavailable.of(true);
+
 /** One loader around one import; `tableGrid` below is the app's single one. */
 export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
   const compartment = new Compartment();
   let loaded: Extension | null = null;
-  let loading: Promise<Extension | null> | null = null;
+  let gaveUp = false;
+  let failures = 0;
+  let loading: Promise<Extension> | null = null;
 
-  const request = (): Promise<Extension | null> => {
-    loading ??= load().then(
+  /** One try, and the next one after its wait; the give-up when none is left. */
+  const attempt = (): Promise<Extension> =>
+    load().then(
       (chunk) => {
         loaded = chunk.gridExtension();
         return loaded;
       },
       () => {
-        // Forgotten, so the next check asks again.
-        loading = null;
-        return null;
+        const wait = RETRY_DELAYS_MS[failures];
+        failures += 1;
+        if (wait === undefined) {
+          gaveUp = true;
+          return unavailable;
+        }
+        return new Promise<void>((resolve) => {
+          setTimeout(resolve, wait);
+        }).then(attempt);
       },
     );
+
+  /** Settles once: with the grid, or with `unavailable`. Never rejects. */
+  const request = (): Promise<Extension> => {
+    loading ??= attempt();
     return loading;
   };
 
@@ -85,10 +104,6 @@ export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
         if (this.asked || !hasGridTable(this.view.state)) return;
         this.asked = true;
         void request().then((extension) => {
-          if (extension === null) {
-            this.asked = false; // the next check tries again
-            return;
-          }
           if (this.gone) return;
           this.view.dispatch({ effects: compartment.reconfigure(extension) });
         });
@@ -102,7 +117,10 @@ export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
 
   return {
     compartment,
-    extension: () => [compartment.of(loaded ?? []), watcher],
+    extension: () => [
+      compartment.of(loaded ?? (gaveUp ? unavailable : [])),
+      watcher,
+    ],
     prefetch: async () => {
       await request();
     },

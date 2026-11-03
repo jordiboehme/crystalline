@@ -21,6 +21,8 @@ import { Prec } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
+import { mainSelectionParked, parkingChanged } from "./parkedSelection";
+
 export type FloatingContext =
   /** A non-empty main selection outside tables. */
   | { kind: "text"; rect: DOMRect }
@@ -184,6 +186,9 @@ function derive(hub: Hub): FloatingContext {
       selection: !range.empty,
     };
   }
+  // Parked behind an open cell whose editor is not mounted (its table
+  // scrolled away): main's selection is stale, so no bar stands by it.
+  if (main.state.facet(mainSelectionParked) && !mainFocused(main)) return null;
   const range = main.state.selection.main;
   if (range.empty) return null;
   if (touchesTable(main.state, range.from, range.to)) return null;
@@ -281,6 +286,7 @@ function changed(update: ViewUpdate): boolean {
     update.viewportChanged ||
     update.focusChanged ||
     update.transactions.some((tr) => tr.reconfigured) ||
+    parkingChanged(update) ||
     syntaxTree(update.startState) !== syntaxTree(update.state)
   );
 }

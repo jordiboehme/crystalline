@@ -111,8 +111,14 @@ function sizeName(columns: number, rows: number): string {
 
 export function TableSizePicker({
   view,
+  allow,
 }: {
   view: EditorView | null;
+  /**
+   * Asked when the insert runs: false refuses it (the sticky bar's guard
+   * while main's selection is parked behind a table cell).
+   */
+  allow?: (view: EditorView) => boolean;
 }): ReactElement {
   const [open, setOpen] = useState(false);
   const [size, setSize] = useState<{ columns: number; rows: number }>(
@@ -146,7 +152,7 @@ export function TableSizePicker({
   };
 
   const insert = (columns: number, rows: number) => {
-    if (view) {
+    if (view && (allow?.(view) ?? true)) {
       const lines = tableSkeleton(columns, rows);
       const select: BlockSelection | null = selectToken(lines, PLACEHOLDER);
       insertBlock(view, lines, select);

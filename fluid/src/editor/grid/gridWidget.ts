@@ -199,9 +199,20 @@ function patch(root: HTMLElement, main: EditorView): void {
 
 /** A cell's text as a reader hears it: drawn, then read back as plain text. */
 function plainOf(text: string): string {
-  const el = document.createElement("span");
-  renderCellContent(text, el, {});
-  return (el.textContent ?? "").replace(/\s+/g, " ").trim();
+  // Read as text, never rendered: a header holding an image starts no fetch.
+  return text
+    .replace(/\\\|/g, "|") // a cell's escaped pipe, as in a wikilink label
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1") // an image: its alt text
+    .replace(
+      /\[\[([^\]|]*)(?:\|([^\]]*))?\]\]/g,
+      (_m, target: string, label?: string) => label ?? target,
+    ) // a wikilink: its label, else its target
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // a link: its text
+    .replace(/<[^>]*>/g, "") // inline HTML tags
+    .replace(/(\*\*|__|~~|\*|_|`)/g, "") // emphasis and code marks
+    .replace(/\\(.)/g, "$1") // escapes: the character itself
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** What a column is called: its header's text, or its number when empty. */

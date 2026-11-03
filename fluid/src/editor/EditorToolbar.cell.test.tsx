@@ -10,11 +10,14 @@
 import type { EditorView } from "@codemirror/view";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { Tooltips } from "../components/primitives";
 import { bytes, cleanupCells, soloMain } from "../test/cellKit";
 import { EditorToolbar } from "./EditorToolbar";
+import { InsertMenu } from "./InsertMenu";
+import { TableSizePicker } from "./TableSizePicker";
+import type { FloatingContext } from "./floatingContext";
 import { fencePreviews } from "./fencePreviews";
 import { floatingContextListener, openCellView } from "./floatingContext";
 import { activeCell } from "./grid/cellEditor";
@@ -154,11 +157,119 @@ describe("the edges of the rule", () => {
   });
 });
 
+describe("a torn-down cell's parked selection (round 2 A and B)", () => {
+  /** The cell's editor gone with its table scrolled away; the intent kept. */
+  function tornDown() {
+    const seen: FloatingContext[] = [];
+    const main = soloMain(DOC, [
+      gridExtension(),
+      fencePreviews(false),
+      livePreview(),
+      floatingContextListener((context) => {
+        seen.push(context);
+      }),
+    ]);
+    // A non-empty main selection outside the table, from before the cell.
+    main.dispatch({ selection: { anchor: 3, head: 7 } });
+    const ada = gridTables(main.state)[0]?.rows[1]?.[0];
+    if (!ada) throw new Error("no cell");
+    main.dispatch({
+      effects: setOpenCell.of({
+        anchor: ada.content.to,
+        head: ada.content.to,
+        focused: true,
+      }),
+    });
+    if (!hostOpenCell(main, "now")) throw new Error("not hosted");
+    mountedCell(main)?.teardown();
+    return { main, last: () => seen.at(-1) };
+  }
+
+  test("the insert verbs show off, with the screen's cellOpen false", () => {
+    const { main } = tornDown();
+    render(
+      <EditorToolbar view={main} cellOpen={false} onAttach={() => undefined} />,
+      { wrapper: Tooltips },
+    );
+    for (const name of ["Insert table", "Insert", "Attach a file", "Heading"]) {
+      expect(button(name)).toBeDisabled();
+    }
+  });
+
+  test("an attach that arrives anyway inserts nothing", async () => {
+    const { main } = tornDown();
+    const picked: File[][] = [];
+    // Drawn while main held the focus (its turn), picked after it left.
+    main.focus();
+    const { container } = render(
+      <EditorToolbar
+        view={main}
+        cellOpen={false}
+        onAttach={(files) => {
+          picked.push(files);
+        }}
+      />,
+      { wrapper: Tooltips },
+    );
+    main.contentDOM.blur();
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    await userEvent.upload(
+      input as HTMLInputElement,
+      new File(["x"], "shot.png", { type: "image/png" }),
+    );
+    expect(picked).toEqual([]);
+  });
+
+  test("no floating bar stands by main's parked selection", async () => {
+    const { last } = tornDown();
+    await vi.waitFor(() => {
+      expect(last()).toBeNull();
+    });
+  });
+});
+
+describe("the insert components' runtime guard (round 2 A)", () => {
+  test("the Insert menu refuses an entry when not allowed", async () => {
+    const main = soloMain("Done \n");
+    main.dispatch({ selection: { anchor: 5 } });
+    render(<InsertMenu view={main} allow={() => false} />, {
+      wrapper: Tooltips,
+    });
+    const user = userEvent.setup();
+    await user.click(button("Insert"));
+    await user.click(
+      await screen.findByRole("menuitem", { name: "Status label" }),
+    );
+    expect(bytes(main.state)).toBe("Done \n");
+  });
+
+  test("the table size picker refuses an insert when not allowed", async () => {
+    const main = soloMain("x\n");
+    render(<TableSizePicker view={main} allow={() => false} />, {
+      wrapper: Tooltips,
+    });
+    await userEvent.click(button("Insert table"));
+    await userEvent.click(button("2 columns by 2 rows"));
+    expect(bytes(main.state)).toBe("x\n");
+  });
+});
+
 describe("main's stale caret line while a cell is open (finding 12)", () => {
   test("the heading mark is folded while the cell is open", () => {
     const { main } = mainWithOpenCell();
     const heading = main.contentDOM.querySelector(".cm-line");
     expect(heading?.textContent).toBe("Crew");
+  });
+
+  test("main taking the focus back shows its caret line's marks (round 2 D)", async () => {
+    const { main } = mainWithOpenCell();
+    main.focus(); // Shift+Tab back in: the cell stays mounted
+    await vi.waitFor(() => {
+      expect(main.contentDOM.querySelector(".cm-line")?.textContent).toBe(
+        "## Crew",
+      );
+    });
   });
 
   test("and shows again once the cell closes", () => {
