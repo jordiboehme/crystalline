@@ -36,6 +36,13 @@ import { SELECTION_BAR_ATTR } from "./selectionBarMark";
 /** The gap between the bar and the selection it stands by, in pixels. */
 const GAP = 6;
 
+/**
+ * How long a press released on the button waits for its click, in
+ * milliseconds. On a touch screen the click can come a task or two after
+ * the pointer goes up.
+ */
+const CLICK_GRACE_MS = 250;
+
 /** The bottom of the app's sticky header, which the bar must not go under. */
 function ceiling(): number {
   const header = document.querySelector("[data-app-header]");
@@ -49,6 +56,7 @@ export function SelectionBar({
   frame,
   onPressStart,
   onPressEnd,
+  onLost,
   onComment,
   onDismiss,
 }: {
@@ -58,8 +66,10 @@ export function SelectionBar({
   frame: RefObject<HTMLElement | null>;
   /** A pointer went down on the bar. */
   onPressStart: () => void;
-  /** That press ended without a click on the bar. */
+  /** That press is over: released anywhere, taken over, or the window left. */
   onPressEnd: () => void;
+  /** A live edit took the passage away (the range collapsed). */
+  onLost: () => void;
   onComment: () => void;
   /** Escape: the bar goes until the selection changes. */
   onDismiss: () => void;
@@ -72,9 +82,11 @@ export function SelectionBar({
   );
   const dismissNow = useRef(onDismiss);
   const pressEndNow = useRef(onPressEnd);
+  const lostNow = useRef(onLost);
   useEffect(() => {
     dismissNow.current = onDismiss;
     pressEndNow.current = onPressEnd;
+    lostNow.current = onLost;
   });
   /** Bumped when the window or the page column changes size: place again. */
   const [, replace] = useReducer((n: number) => n + 1, 0);
@@ -97,25 +109,36 @@ export function SelectionBar({
     };
   }, [frame]);
 
-  // A press that comes up off the bar, or that the browser takes over, ends
-  // without a click.
+  // Every press ends when the pointer comes up, wherever that is. Up on the
+  // button, the click that follows still finds it, for a moment; up
+  // anywhere else (the bar's own padding included), taken over by the
+  // browser, or with the window left, it ends at once.
   useEffect(() => {
-    const onUp = (event: PointerEvent) => {
-      if (
-        !(event.target instanceof Node) ||
-        bar.current?.contains(event.target) !== true
-      ) {
-        pressEndNow.current();
-      }
-    };
-    const onCancel = () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const end = () => {
+      clearTimeout(timer);
+      timer = undefined;
       pressEndNow.current();
     };
+    const onUp = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        button.current?.contains(event.target) === true
+      ) {
+        clearTimeout(timer);
+        timer = setTimeout(end, CLICK_GRACE_MS);
+      } else {
+        end();
+      }
+    };
     document.addEventListener("pointerup", onUp);
-    document.addEventListener("pointercancel", onCancel);
+    document.addEventListener("pointercancel", end);
+    window.addEventListener("blur", end);
     return () => {
+      clearTimeout(timer);
       document.removeEventListener("pointerup", onUp);
-      document.removeEventListener("pointercancel", onCancel);
+      document.removeEventListener("pointercancel", end);
+      window.removeEventListener("blur", end);
     };
   }, []);
 
@@ -155,8 +178,18 @@ export function SelectionBar({
   // bar is placed in.
   useLayoutEffect(() => {
     const el = bar.current;
-    const origin = el?.offsetParent;
-    if (!el || !(origin instanceof HTMLElement)) return;
+    if (!el) return;
+    // A live edit took the words away: the range is a caret now, with
+    // nothing to stand by. The bar goes until the next selection rather
+    // than standing at the top of the window.
+    if (range.collapsed) {
+      el.style.visibility = "hidden";
+      lostNow.current();
+      return;
+    }
+    el.style.visibility = "";
+    const origin = el.offsetParent;
+    if (!(origin instanceof HTMLElement)) return;
     const from = origin.getBoundingClientRect();
     const column = (frame.current ?? origin).getBoundingClientRect();
     const all = range.getBoundingClientRect();

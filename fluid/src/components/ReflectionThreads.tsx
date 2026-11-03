@@ -1172,7 +1172,7 @@ export function ReflectionThreads({
   // The bar stands by a live selection in the page, for whoever may
   // comment, while no comment is written, the pointer is not selecting,
   // Escape did not send it away and the sheet does not cover it. A press
-  // on it keeps it there until the click, whatever the selection does.
+  // on it keeps it there until the press ends, whatever the selection does.
   const barAt =
     !mayComment || drafting !== null || sheetOpen
       ? null
@@ -1187,11 +1187,18 @@ export function ReflectionThreads({
         range={barAt}
         frame={articleRef}
         onPressStart={() => {
-          if (captured !== null && selectedAt !== null) {
-            setBarPress({ anchor: captured, range: selectedAt });
-          }
+          // Always the passage of this press, never one an earlier press kept.
+          setBarPress(
+            captured !== null && selectedAt !== null
+              ? { anchor: captured, range: selectedAt }
+              : null,
+          );
         }}
         onPressEnd={() => {
+          setBarPress(null);
+        }}
+        onLost={() => {
+          setSelectedAt(null);
           setBarPress(null);
         }}
         onComment={() => {

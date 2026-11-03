@@ -1536,7 +1536,7 @@ describe("comments on a reflection", () => {
     renderApp("/d/eng/reflection/guides/deploying.md");
     await screen.findByText("at");
     const status = screen.getByRole("status", { hidden: true });
-    expect(status).toHaveTextContent("");
+    expect(status.textContent).toBe("");
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(status).toHaveTextContent("Comment on the selection");
     await userEvent.click(screen.getByRole("button", { name: "Comment" }));
@@ -1741,7 +1741,7 @@ describe("the bar at the selection", () => {
     select(textNode("Deploys run "), textNode(" night."), 6);
     expect(bar()).toBeNull();
     // Nor is the reader told to comment.
-    expect(status).toHaveTextContent("");
+    expect(status.textContent).toBe("");
   });
 
   it("goes while a comment is written", async () => {
@@ -1907,30 +1907,95 @@ describe("the bar at the selection", () => {
   });
 
   it("says nothing of the bar while a comment is written", async () => {
+    // The status line's own clock, run by hand: no real seconds wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      const status = screen.getByRole("status", { hidden: true });
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect(status).toHaveTextContent("Comment on the selection with Alt+F10");
+      fireEvent.click(barButton());
+      // The first word goes as it always does, after a few seconds.
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(status.textContent).toBe("");
+      // Another passage while the form is open: the bar is not there.
+      const caret = textNode("Deploys run ");
+      select(caret, caret, 0);
+      select(textNode("Deploys run "), textNode("Deploys run "), 7);
+      expect(bar()).toBeNull();
+      expect(status.textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lets a press go wherever it ends, and a later press takes the passage then", async () => {
     serve([]);
     renderApp("/d/eng/reflection/guides/deploying.md");
     await screen.findByText("at");
-    const status = screen.getByRole("status", { hidden: true });
     select(textNode("Deploys run "), textNode(" night."), 6);
-    await userEvent.click(barButton());
-    // The first word goes as it always does, after a few seconds.
-    await waitFor(
-      () => {
-        expect(status).toHaveTextContent("");
-      },
-      { timeout: 6000 },
-    );
-    // Another passage while the form is open: the bar is not there.
+    const toolbar = bar() as HTMLElement;
+    // Down on the button, up on the bar's own padding: no click follows.
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    fireEvent.pointerUp(toolbar, { button: 0, isPrimary: true });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The press is over: a collapse on the page takes the bar away.
     const caret = textNode("Deploys run ");
     select(caret, caret, 0);
-    select(textNode("Deploys run "), textNode("Deploys run "), 7);
     expect(bar()).toBeNull();
-    expect(status).toHaveTextContent("");
+    // A new passage, a new press: it comments on that one.
+    select(textNode("Deploys run "), textNode("Deploys run "), 7);
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    fireEvent.pointerUp(barButton(), { button: 0, isPrimary: true });
+    fireEvent.click(barButton());
+    const form = screen.getByRole("form", { name: "New comment" });
+    expect(within(form).getByText("Deploys")).toBeVisible();
+    expect(within(form).queryByText("Deploys run **at** night")).toBeNull();
+  });
+
+  it("lets a press go when the window loses the focus", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    select(textNode("Deploys run "), textNode(" night."), 6);
+    fireEvent.pointerDown(barButton(), { button: 0, isPrimary: true });
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    const caret = textNode("Deploys run ");
+    select(caret, caret, 0);
+    expect(bar()).toBeNull();
+  });
+
+  it("goes when a live edit takes the selected words away, until the next selection", async () => {
+    serve([]);
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByText("at");
+    const words = textNode("Deploys run ");
+    select(words, words, 7);
+    expect(bar()).toBeVisible();
+    // The words go from under the selection the bar stood by.
+    act(() => {
+      words.data = "";
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(bar()).toBeNull();
+    const other = textNode(" night.");
+    select(other, other, 6);
+    expect(bar()).toBeVisible();
   });
 
   describe("where it stands", () => {
     // jsdom lays nothing out: the boxes the bar measures are lent here.
     const sel = { top: 300, bottom: 320, left: 900 };
+    // The shell's sticky header; 0 tall unless a test says otherwise.
+    const header = { bottom: 0 };
     const box = (b: {
       top?: number;
       bottom?: number;
@@ -1964,6 +2029,7 @@ describe("the bar at the selection", () => {
     const savedObserver = globalThis.ResizeObserver;
     beforeEach(() => {
       Object.assign(sel, { top: 300, bottom: 320, left: 900 });
+      header.bottom = 0;
       vi.spyOn(Range.prototype, "getBoundingClientRect").mockImplementation(
         () => box(sel),
       );
@@ -1977,6 +2043,9 @@ describe("the bar at the selection", () => {
         // The shell's frame is the window; the page column ends at 960,
         // where the gap and the threads beside it begin.
         if (this.tagName === "MAIN") return box({ left: 0, right: 1440 });
+        if (this.hasAttribute("data-app-header")) {
+          return box({ top: 0, bottom: header.bottom, left: 0, right: 1440 });
+        }
         if (this.tagName === "ARTICLE") return box({ left: 40, right: 960 });
         return box({});
       });
@@ -2031,6 +2100,28 @@ describe("the bar at the selection", () => {
       await screen.findByText("at");
       select(textNode("Deploys run "), textNode(" night."), 6);
       expect((bar() as HTMLElement).style.top).toBe("36px");
+    });
+
+    it("goes below a passage when the sticky header leaves no room above", async () => {
+      // 254 would be above the passage, but the header reaches down to 280.
+      header.bottom = 280;
+      serve([]);
+      renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect((bar() as HTMLElement).style.top).toBe("326px");
+    });
+
+    it("stops watching the page's size once it is gone", async () => {
+      serve([]);
+      const { unmount } = renderApp("/d/eng/reflection/guides/deploying.md");
+      await screen.findByText("at");
+      select(textNode("Deploys run "), textNode(" night."), 6);
+      expect(observed).not.toBeNull();
+      const removed = vi.spyOn(window, "removeEventListener");
+      unmount();
+      expect(observed).toBeNull();
+      expect(removed).toHaveBeenCalledWith("resize", expect.any(Function));
     });
 
     it("follows the text when the window or the page changes size", async () => {
