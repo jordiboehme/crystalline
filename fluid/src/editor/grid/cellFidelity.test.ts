@@ -210,49 +210,123 @@ const MAX_REFUSED = 0.05;
 /** The fewest presses the cell runs must judge: a silent refusal of all fails. */
 const CELL_FLOOR = 100;
 
+const PAIRS = new Set([
+  "Emphasis",
+  "StrongEmphasis",
+  "Strikethrough",
+  "InlineCode",
+  "Link",
+]);
+
+/** The pair nodes on line `n`, by name, with their visible characters. */
+function pairsOn(state: EditorState, n: number): CellPair[] {
+  const tree = ensureSyntaxTree(state, state.doc.length, 10_000);
+  if (!tree) throw new Error("the parse did not finish");
+  const line = state.doc.line(n);
+  const pairs: CellPair[] = [];
+  tree.iterate({
+    from: line.from,
+    to: line.to,
+    enter: (node) => {
+      if (!PAIRS.has(node.name)) return;
+      // Lezer reads any bracketed text as a Link; the page needs an address.
+      if (node.name === "Link" && !node.node.getChild("URL")) return;
+      const first = node.node.firstChild;
+      const last = node.node.lastChild;
+      const marks: [number, number][] = [];
+      for (let c = node.node.firstChild; c; c = c.nextSibling) {
+        if (/Mark$|^URL$|^LinkTitle$|^LinkLabel$/.test(c.name)) {
+          marks.push([c.from, c.to]);
+        }
+      }
+      const visible: number[] = [];
+      for (let p = first?.to ?? node.from; p < (last?.from ?? node.to); p++) {
+        if (!marks.some(([a, b]) => a <= p && p < b)) visible.push(p);
+      }
+      pairs.push({ name: node.name, visible });
+    },
+  });
+  return pairs;
+}
+
+/** A pair node of a line, by name, with its visible characters. */
+interface CellPair {
+  name: string;
+  visible: number[];
+}
+
+/**
+ * What a press did to the pairs of its line that it may not do: a pair kind
+ * gained, or pairs lost beyond those it emptied. A merge writes two pairs of
+ * one kind as one, so it may lose one pair in all, as in main.
+ */
+function pairLoss(
+  old: readonly CellPair[],
+  after: readonly CellPair[],
+  deleted: ReadonlySet<number>,
+  merged: boolean,
+): string[] {
+  const problems: string[] = [];
+  let mergeLeft = merged ? 1 : 0;
+  for (const name of PAIRS) {
+    const x = old.filter((p) => p.name === name).length;
+    const y = after.filter((p) => p.name === name).length;
+    const emptied = old.filter(
+      (p) =>
+        p.name === name &&
+        p.visible.length > 0 &&
+        p.visible.every((q) => deleted.has(q)),
+    ).length;
+    if (y > x) {
+      problems.push(`${name} ${String(x)} -> ${String(y)}`);
+    } else if (x - y > emptied) {
+      if (x - y - emptied === 1 && mergeLeft === 1) mergeLeft = 0;
+      else problems.push(`${name} ${String(x)} -> ${String(y)}`);
+    }
+  }
+  return problems;
+}
+
+describe("the cell oracle", () => {
+  /** Line 1 of `doc`, parsed as the page parses it. */
+  const parsed = (doc: string) =>
+    parsedState(EditorState.create({ doc, extensions: baseExtensions(false) }));
+
+  test("allows one merge in all, not one per kind", () => {
+    const before = "| **a** **b** *c* |";
+    const space = before.indexOf("** **") + 2;
+    const deleted = new Set([
+      space - 2,
+      space - 1,
+      space,
+      space + 1,
+      space + 2,
+    ]);
+    // The merge, and nothing else lost: allowed.
+    expect(
+      pairLoss(
+        pairsOn(parsed(before), 1),
+        pairsOn(parsed("| **ab** *c* |"), 1),
+        deleted,
+        true,
+      ),
+    ).toEqual([]);
+    // The merge that also wrote `*c` (the italic gone): one kind fails.
+    expect(
+      pairLoss(
+        pairsOn(parsed(before), 1),
+        pairsOn(parsed("| **ab** c* |"), 1),
+        deleted,
+        true,
+      ),
+    ).toHaveLength(1);
+  });
+});
+
 describe("hidden-mark properties in a cell", () => {
   beforeAll(async () => {
     await prefetchGrid();
   });
-
-  const PAIRS = new Set([
-    "Emphasis",
-    "StrongEmphasis",
-    "Strikethrough",
-    "InlineCode",
-    "Link",
-  ]);
-
-  /** The pair nodes on line `n`, by name, with their visible characters. */
-  function pairsOn(state: EditorState, n: number) {
-    const tree = ensureSyntaxTree(state, state.doc.length, 10_000);
-    if (!tree) throw new Error("the parse did not finish");
-    const line = state.doc.line(n);
-    const pairs: { name: string; visible: number[] }[] = [];
-    tree.iterate({
-      from: line.from,
-      to: line.to,
-      enter: (node) => {
-        if (!PAIRS.has(node.name)) return;
-        // Lezer reads any bracketed text as a Link; the page needs an address.
-        if (node.name === "Link" && !node.node.getChild("URL")) return;
-        const first = node.node.firstChild;
-        const last = node.node.lastChild;
-        const marks: [number, number][] = [];
-        for (let c = node.node.firstChild; c; c = c.nextSibling) {
-          if (/Mark$|^URL$|^LinkTitle$|^LinkLabel$/.test(c.name)) {
-            marks.push([c.from, c.to]);
-          }
-        }
-        const visible: number[] = [];
-        for (let p = first?.to ?? node.from; p < (last?.from ?? node.to); p++) {
-          if (!marks.some(([a, b]) => a <= p && p < b)) visible.push(p);
-        }
-        pairs.push({ name: node.name, visible });
-      },
-    });
-    return pairs;
-  }
 
   function oneLetterAdded(before: string, after: string): boolean {
     if (after.length !== before.length + 1) return false;
@@ -287,7 +361,8 @@ describe("hidden-mark properties in a cell", () => {
     ),
   ];
 
-  type Outcome = DeleteOutcome | "exact";
+  /** How a press went; `edge` is a key at the cell's edge, which takes nothing. */
+  type Outcome = DeleteOutcome | "exact" | "edge";
   interface CellRun {
     failures: string[];
     checks: number;
@@ -315,6 +390,7 @@ describe("hidden-mark properties in a cell", () => {
       moved: 0,
       merged: 0,
       refused: 0,
+      edge: 0,
     };
     /** The outcome the last deletion check named (a box the listener fills). */
     const named: { outcome: DeleteOutcome | null } = { outcome: null };
@@ -380,6 +456,15 @@ describe("hidden-mark properties in a cell", () => {
       ].sort((a, b) => a - b);
       const label = `line ${n} cell ${cell.row}/${cell.column} ${JSON.stringify(probe.state.doc.line(n).text)}`;
       const at = (pos: number) => `${label} at ${pos - from}`;
+      /** Only hidden marks lie in `a..b` (nothing, when it is empty). */
+      const marksOnly = (a: number, b: number) => {
+        for (let p = a; p < b; p++) {
+          if (show || !marks.some(([x, y]) => x <= p && p < y)) return false;
+        }
+        return true;
+      };
+      const atCellEdge = (key: string, stop: number) =>
+        key === "Backspace" ? marksOnly(from, stop) : marksOnly(stop, to);
 
       // Property 1.
       const before = changed;
@@ -440,7 +525,14 @@ describe("hidden-mark properties in a cell", () => {
             }
             continue;
           }
-          if (now() === text) continue;
+          if (now() === text) {
+            // Nothing written and nothing said: a silent refusal, unless
+            // the key had nothing to take (the cell's own edge, or only
+            // hidden marks between the caret and that edge).
+            if (atCellEdge(key, stop)) deletes.edge += 1;
+            else failures.push(`a silent ${key} ${at(stop)}`);
+            continue;
+          }
           deletes[outcome ?? "exact"] += 1;
           const deleted = removedFrom(
             start.doc.toString(),
@@ -451,24 +543,16 @@ describe("hidden-mark properties in a cell", () => {
           );
           if (!(show && touches)) {
             checks += 1;
-            const old = pairsOn(start, n);
-            const after = pairsOn(main.state, n);
-            for (const name of PAIRS) {
-              const x = old.filter((p) => p.name === name).length;
-              const y = after.filter((p) => p.name === name).length;
-              const emptied = old.filter(
-                (p) =>
-                  p.name === name &&
-                  p.visible.length > 0 &&
-                  p.visible.every((q) => deleted.has(q)),
-              ).length;
-              // A merge writes two pairs of one kind as one.
-              const merged = outcome === "merged" ? 1 : 0;
-              if (y > x || x - y > emptied + merged) {
-                failures.push(
-                  `${key} ${at(stop)}: ${name} ${x} -> ${y}, wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
-                );
-              }
+            const problems = pairLoss(
+              pairsOn(start, n),
+              pairsOn(main.state, n),
+              deleted,
+              outcome === "merged",
+            );
+            if (problems.length > 0) {
+              failures.push(
+                `${key} ${at(stop)}: ${problems.join(", ")}, wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+              );
             }
           }
           undoOnce(main);
@@ -537,7 +621,7 @@ describe("hidden-mark properties in a cell", () => {
       const judged =
         sum("exact") + sum("moved") + sum("merged") + sum("refused");
       console.info(
-        `cell deletes: ${sum("exact")} exact, ${sum("moved")} moved, ${sum("merged")} merged, ${sum("refused")} refused`,
+        `cell deletes: ${sum("exact")} exact, ${sum("moved")} moved, ${sum("merged")} merged, ${sum("refused")} refused; ${sum("edge")} at a cell edge`,
       );
       expect(judged).toBeGreaterThan(CELL_FLOOR);
       expect(sum("refused") / judged).toBeLessThanOrEqual(MAX_REFUSED);

@@ -874,6 +874,53 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     );
     expect(said).toEqual([CELL_NOT_READ, CELL_NOT_READ]);
   });
+
+  it("refuses typing over a selection, and takes typing at a caret (D17)", () => {
+    const bold = `${above}\n\n| a | b |\n| - | - |\n| label | **a** b |\n`;
+    const main = page(bold, { room });
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
+    });
+    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    if (!cell) throw new Error("no cell");
+    const view = openAt(main, cell.content.from, false).view;
+    expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
+    const said: string[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) said.push(effect.value);
+            }
+          }
+        }),
+      ),
+    });
+    // `a** b` typed over: it would leave a lone `**` before the X.
+    view.dispatch({
+      selection: { anchor: cell.content.from + 2, head: cell.content.to },
+    });
+    typeText(view, "X");
+    expect(bytes(main.state)).toBe(bold);
+    // A paste over the selection deletes it the same way.
+    view.dispatch({
+      changes: {
+        from: cell.content.from + 2,
+        to: cell.content.to,
+        insert: "Y",
+      },
+      userEvent: "input.paste",
+    });
+    expect(bytes(main.state)).toBe(bold);
+    // At a caret only the typed letter is added.
+    view.dispatch({ selection: { anchor: cell.content.to } });
+    typeText(view, "x");
+    expect(main.state.doc.lineAt(cell.content.from).text).toBe(
+      "| label | **a** bx |",
+    );
+    expect(said).toEqual([CELL_NOT_READ, CELL_NOT_READ]);
+  });
 });
 
 describe.each(ROOMS)("a shown mark deleted in a cell, $name", ({ room }) => {

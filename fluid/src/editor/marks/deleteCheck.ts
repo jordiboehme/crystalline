@@ -16,10 +16,17 @@
  * its marks too (D6, in show mode as well, where the keys are today's).
  *
  * Only Backspace, Delete and their word and line forms (`delete.backward`,
- * `delete.forward`) and a selection deleted (`delete.selection`) are
- * checked, and only the lines they touched are read again. Where a line
- * shows its marks, a key that takes one of them is left as it is: the person
- * is editing the Markdown there, and the plan keeps today's keys.
+ * `delete.forward`), a selection deleted (`delete.selection`) and a cut
+ * (`delete.cut`, D12) are checked. The check reads the paragraph or setext
+ * heading around the lines they touched, since a pair can wrap onto the next
+ * line, and never the whole document; one pass over that range answers it.
+ *
+ * Where marks show (show mode, the caret's lines), the lines the key touched
+ * decide, not the paragraph read: a key that takes a shown mark is left as
+ * it is (D9), and so is a key on shown lines that no pair reaches, even when
+ * it makes a new pair (D11). The person is editing the Markdown there, and
+ * the plan keeps today's keys. A deletion during an IME composition and an
+ * edit a table cell has judged already (`judgedElsewhere`) are left alone.
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
@@ -181,13 +188,47 @@ function merged(ranges: readonly Range[]): Range[] {
   return out;
 }
 
-/** The visible positions strictly between a pair's marks. */
-function inside(pair: Pair, marks: readonly Mark[]): number[] {
-  const out: number[] = [];
-  for (let p = pair.open.to; p < pair.close.from; p += 1) {
-    if (!inAny(marks, p)) out.push(p);
-  }
-  return out;
+/**
+ * Whether a position lies in one of `ranges`, for positions asked in order
+ * (never smaller than the one before): one pass over the ranges in all.
+ */
+function cover(ranges: readonly Range[]): (pos: number) => boolean {
+  const sorted = merged(ranges);
+  let i = 0;
+  return (pos) => {
+    while (i < sorted.length && (sorted[i]?.to ?? 0) <= pos) i += 1;
+    const range = sorted[i];
+    return range !== undefined && range.from <= pos;
+  };
+}
+
+const KIND_ORDER = [...KINDS];
+
+/**
+ * The formats of a position (how many pairs of each kind are around it),
+ * for positions asked in order: one pass over the pairs' edges in all.
+ */
+function formats(pairs: readonly Pair[]): (pos: number) => string {
+  const opens = [...pairs].sort((a, b) => a.open.to - b.open.to);
+  const closes = [...pairs].sort((a, b) => a.close.from - b.close.from);
+  const counts = KIND_ORDER.map(() => 0);
+  const bump = (kind: MarkKind, by: number) => {
+    const i = KIND_ORDER.indexOf(kind);
+    counts[i] = (counts[i] ?? 0) + by;
+  };
+  let o = 0;
+  let c = 0;
+  return (pos) => {
+    for (; o < opens.length && (opens[o]?.open.to ?? 0) <= pos; o += 1) {
+      const kind = opens[o]?.kind;
+      if (kind) bump(kind, 1);
+    }
+    for (; c < closes.length && (closes[c]?.close.from ?? 0) <= pos; c += 1) {
+      const kind = closes[c]?.kind;
+      if (kind) bump(kind, -1);
+    }
+    return counts.join(" ");
+  };
 }
 
 /** `deleted` plus the marks of every pair it leaves with nothing visible. */
@@ -195,21 +236,22 @@ function withEmptied(lines: Lines, deleted: readonly Range[]): Range[] {
   const out = [...deleted];
   for (const pair of lines.pairs) {
     if (touches(deleted, pair.open) || touches(deleted, pair.close)) continue;
-    const seen = inside(pair, lines.marks);
-    if (seen.length > 0 && seen.every((p) => inAny(deleted, p))) {
-      out.push(pair.open, pair.close);
+    // Only a pair the deletion reaches into can be left empty.
+    if (!touches(deleted, { from: pair.open.to, to: pair.close.from })) {
+      continue;
     }
+    const isMark = cover(lines.marks);
+    const isDeleted = cover(deleted);
+    let seen = false;
+    let all = true;
+    for (let p = pair.open.to; all && p < pair.close.from; p += 1) {
+      if (isMark(p)) continue;
+      seen = true;
+      if (!isDeleted(p)) all = false;
+    }
+    if (seen && all) out.push(pair.open, pair.close);
   }
   return merged(out);
-}
-
-/** The formats of position `pos`: the pairs of `pairs` around it. */
-function formatsAt(pairs: readonly Pair[], pos: number): string {
-  const kinds = pairs
-    .filter((pair) => pair.open.to <= pos && pos < pair.close.from)
-    .map((pair) => pair.kind)
-    .sort();
-  return kinds.join(" ");
 }
 
 /** `state` parsed at least to `upto`, or null when that does not fit. */
@@ -224,7 +266,8 @@ function parsedTo(state: EditorState, upto: number): EditorState | null {
  * Whether `after` (the start state with `changes`, which delete `deleted`)
  * shows every character the deletion kept with the formats it had. A pair
  * the deletion targeted (it took one of its marks, or a letter of a link
- * whose words are its label) frees the characters inside it.
+ * whose words are its label) frees the characters inside it. Null when
+ * `after` could not be parsed far enough to tell.
  */
 function readsSame(
   start: EditorState,
@@ -234,14 +277,15 @@ function readsSame(
   changes: ChangeSet,
   deleted: readonly Range[],
   after: EditorState,
-): boolean {
+): boolean | null {
   const from = start.doc.line(first).from;
   const to = start.doc.line(last).to;
   const aFrom = changes.mapPos(from, -1);
   const aTo = changes.mapPos(to, 1);
   const parsed = parsedTo(after, aTo);
-  // Not parsed far enough to tell: refused rather than written unchecked.
-  if (!parsed) return false;
+  // Not parsed far enough to tell: the caller refuses rather than writes
+  // the deletion unchecked.
+  if (!parsed) return null;
   const next = linesOf(
     parsed,
     parsed.doc.lineAt(aFrom).number,
@@ -255,15 +299,24 @@ function readsSame(
         touches(deleted, { from: pair.open.to, to: pair.close.from })),
   );
   const text = start.doc.sliceString(from, to);
+  // One sweep over the range: `p` and its image `q` only grow, so every
+  // question below is answered from a cursor, not a search (a hard-wrapped
+  // paragraph stays as cheap per character as one line).
+  const isDeleted = cover(deleted);
+  const isMark = cover(lines.marks);
+  const isFreed = cover(
+    targeted.map((pair) => ({ from: pair.open.to, to: pair.close.from })),
+  );
+  const isMarkAfter = cover(next.marks);
+  const was = formats(lines.pairs);
+  const now = formats(next.pairs);
   for (let p = from; p < to; p += 1) {
-    if (inAny(deleted, p) || inAny(lines.marks, p)) continue;
+    if (isDeleted(p) || isMark(p)) continue;
     if (isBlank(text[p - from] ?? "")) continue;
-    if (targeted.some((pair) => pair.open.to <= p && p < pair.close.from)) {
-      continue;
-    }
+    if (isFreed(p)) continue;
     const q = changes.mapPos(p, 1);
-    if (inAny(next.marks, q)) return false;
-    if (formatsAt(lines.pairs, p) !== formatsAt(next.pairs, q)) return false;
+    if (isMarkAfter(q)) return false;
+    if (was(p) !== now(q)) return false;
   }
   return true;
 }
@@ -326,33 +379,33 @@ function repairs(
       }
     }
   }
-  for (const left of free) {
-    for (const right of free) {
-      if (
-        left === right ||
-        left.kind !== right.kind ||
-        left.kind === "link" ||
-        left.close.to >= right.open.from
-      ) {
-        continue;
+  // Two pairs the deletion made touch: exactly one deleted range (they come
+  // merged) lies between the first's closer and the second's opener.
+  const byClose = new Map<number, Pair[]>();
+  const byOpen = new Map<number, Pair[]>();
+  for (const pair of free) {
+    if (pair.kind === "link") continue;
+    byClose.set(pair.close.to, [...(byClose.get(pair.close.to) ?? []), pair]);
+    byOpen.set(pair.open.from, [...(byOpen.get(pair.open.from) ?? []), pair]);
+  }
+  for (const gap of deleted) {
+    for (const left of byClose.get(gap.from) ?? []) {
+      for (const right of byOpen.get(gap.to) ?? []) {
+        if (
+          left.kind !== right.kind ||
+          doc.sliceString(left.close.from, left.close.to) !==
+            doc.sliceString(right.open.from, right.open.to)
+        ) {
+          continue;
+        }
+        out.push({
+          specs: [
+            { from: left.close.from, to: left.close.to },
+            { from: right.open.from, to: right.open.to },
+          ],
+          outcome: "merged",
+        });
       }
-      // Only what the deletion took lies between them.
-      let p = left.close.to;
-      while (p < right.open.from && inAny(deleted, p)) p += 1;
-      if (p !== right.open.from) continue;
-      if (
-        doc.sliceString(left.close.from, left.close.to) !==
-        doc.sliceString(right.open.from, right.open.to)
-      ) {
-        continue;
-      }
-      out.push({
-        specs: [
-          { from: left.close.from, to: left.close.to },
-          { from: right.open.from, to: right.open.to },
-        ],
-        outcome: "merged",
-      });
     }
   }
   return out;
@@ -463,9 +516,18 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   const lines = linesOf(start, first, last);
   // A line with no pair can still gain one (`q * a* r` without its space
   // reads italic): where marks are hidden that is checked too (D10). Where
-  // they show, such a line is left to today's keys.
-  if (lines.pairs.length === 0) {
-    for (let n = first; n <= last; n += 1) {
+  // they show, such a line is left to today's keys (D11). The lines asked
+  // about are those the key touched, not the whole paragraph read: a pair
+  // counts when it has a mark on one of them or runs across them.
+  const touchedFrom = start.doc.lineAt(firstPos).from;
+  const touchedTo = start.doc.lineAt(lastPos).to;
+  const onTouched = lines.pairs.some(
+    (pair) => pair.open.from <= touchedTo && pair.close.to >= touchedFrom,
+  );
+  if (!onTouched) {
+    const lo = start.doc.lineAt(firstPos).number;
+    const hi = start.doc.lineAt(lastPos).number;
+    for (let n = lo; n <= hi; n += 1) {
       if (!marksHiddenOnLine(start, n)) return tr;
     }
   }
@@ -497,10 +559,22 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
     ...merges,
     ...candidates.filter((c) => c.outcome !== "merged"),
   ];
-  if (
-    merges.length === 0 &&
-    readsSame(start, lines, first, last, exact, ranges, exactState)
-  ) {
+  // The exact deletion is read at most once a press. A read the parse
+  // could not finish is not kept: the next one parses further.
+  let exactReads: boolean | null = null;
+  const exactIsSame = () => {
+    exactReads ??= readsSame(
+      start,
+      lines,
+      first,
+      last,
+      exact,
+      ranges,
+      exactState,
+    );
+    return exactReads === true;
+  };
+  if (merges.length === 0 && exactIsSame()) {
     return grown ? rebuilt(tr, exact, null) : tr;
   }
   for (const repair of ordered) {
@@ -509,11 +583,11 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       ...repair.specs,
     ]);
     const trial = start.update({ changes, filter: false }).state;
-    if (readsSame(start, lines, first, last, changes, ranges, trial)) {
+    if (readsSame(start, lines, first, last, changes, ranges, trial) === true) {
       return rebuilt(tr, changes, repair.outcome, ranges, repair.moved);
     }
   }
-  if (readsSame(start, lines, first, last, exact, ranges, exactState)) {
+  if (exactIsSame()) {
     return grown ? rebuilt(tr, exact, null) : tr;
   }
   return {

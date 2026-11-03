@@ -981,15 +981,22 @@ export const CELL_NOT_READ =
  * Every delete and every command edit (a bare `input`: the format keys and
  * bar, links, popover commits) is refused, and so is a format waiting for
  * typing, with one sentence each, until the background parse has read the
- * row (D13). Plain typing stays.
+ * row (D13). Typing or a paste over a selection deletes that selection, so
+ * it is refused like a delete (D17). Typing at a caret stays, and so does a
+ * composition, which is the browser's to finish.
  */
 const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
   const cell = tr.startState.field(rangeField, false);
   if (!cell || syntaxTree(tr.startState).length >= cell.to) return tr;
+  const overSelection =
+    tr.isUserEvent("input") &&
+    !tr.isUserEvent("input.type.compose") &&
+    tr.startState.selection.ranges.some((range) => !range.empty);
   const command =
     tr.docChanged &&
     (tr.isUserEvent("delete") ||
-      tr.annotation(Transaction.userEvent) === "input");
+      tr.annotation(Transaction.userEvent) === "input" ||
+      overSelection);
   const waiting =
     (tr.startState.field(pendingFormat, false) ?? null) === null &&
     (tr.state.field(pendingFormat, false) ?? null) !== null;
@@ -1088,7 +1095,9 @@ export function mountCellEditor(
       rangeField.init(() => range),
       Prec.highest([hideOutside, cellMarks]),
       clampToCell,
-      unreadRowGuard,
+      // Lowest, so it runs before every other filter (the last listed run
+      // first): an unread row says so before a check reads its short tree.
+      Prec.lowest(unreadRowGuard),
       // Backspace and Delete over hidden marks leave every hidden escape to
       // `cellChange`, which takes such a unit whole.
       keptWhole.of(keepsEscape),

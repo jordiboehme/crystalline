@@ -19,7 +19,6 @@ Adjacent: **a**_b_, *a**b**c*, `x`**y** and ~~s~~*t*.
 Two words: **one** **two** and *one* *two*.
 Spaced: **A bold** word and **Lead-in.** text after it.
 Trailing: **bold b** word, where Backspace on `b` moves the closer.
-
 A loose star: q * a* r stays text.
 
 Wrapped: **a lead-in that wraps

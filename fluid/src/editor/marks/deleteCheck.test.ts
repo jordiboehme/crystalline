@@ -178,6 +178,35 @@ describe.each([false, true])("a new pair, room %s", (room) => {
     expect(heard.said).toEqual([CANNOT_JOIN]);
   });
 
+  it("is left to today's keys on a shown line with no pair, beside a pair on another line (D11)", () => {
+    // The paragraph holds a pair, but not on the line the key touched.
+    const below = page("x **b** y\nq * a* r", "show", room);
+    setCaret(below.view, 16);
+    keys(below.view, "Backspace");
+    expect(below.text()).toBe("x **b** y\nq *a* r");
+    expect(below.heard.outcome).toBeNull();
+    const above = page("q * a* r\nx **b** y", "show", room);
+    setCaret(above.view, 6);
+    keys(above.view, "Backspace");
+    expect(above.text()).toBe("q *a* r\nx **b** y");
+    expect(above.heard.outcome).toBeNull();
+    // Where marks are hidden the same key is refused (D10).
+    const hidden = page("x **b** y\nq * a* r", "hidden", room);
+    setCaret(hidden.view, 16);
+    keys(hidden.view, "Backspace");
+    expect(hidden.text()).toBe("x **b** y\nq * a* r");
+    expect(hidden.heard.outcome).toBe("refused");
+  });
+
+  it("is checked on a shown line that a wrapped pair spans", () => {
+    // No mark on the touched line, but a bold runs across it.
+    const { view, heard, text } = page("**b\nq * a* r\nc**", "show", room);
+    setCaret(view, 10);
+    keys(view, "Backspace");
+    expect(text()).toBe("**b\nq * a* r\nc**");
+    expect(heard.outcome).toBe("refused");
+  });
+
   it("is left to today's keys when a shown mark is deleted (D9)", () => {
     // The first backtick goes: the spans after it pair anew, as typed.
     const { view, heard, text } = page("`a` and `b`", "show", room);

@@ -617,7 +617,11 @@ function boundaryEdits(start: Probe, plan: Plan, tally: Tally): Probe {
         }
         continue;
       }
-      if (bytes(now.state) === text) continue;
+      if (bytes(now.state) === text) {
+        // Nothing written and nothing said: a silent refusal.
+        fail(tally, `a silent ${key} at ${where(from, at)}`);
+        continue;
+      }
       tally.deletes[outcome ?? "exact"] += 1;
       if (outcome === "moved") {
         // The caret shows where the exact deletion would have shown it.
@@ -1045,8 +1049,10 @@ describe.each(MODES)("property 3 pins, %s mode", (mode) => {
       expect(outcome).toBe("refused");
       expect(after).toBe(EVERYTHING);
     } else {
-      // Where the line shows its marks, a line with no pair keeps today's keys.
+      // Where the line shows its marks, a line with no pair keeps today's
+      // keys, though its paragraph holds pairs on the lines around it (D11).
       expect(outcome).toBeNull();
+      expect(after).toBe(EVERYTHING.replace("q * a* r", "q *a* r"));
     }
   });
 
