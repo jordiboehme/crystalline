@@ -211,12 +211,67 @@ function unwrap(written: string): string {
     : written;
 }
 
-/** A backslash before ASCII punctuation, as CommonMark reads one. */
-const ESCAPED = /\\([!-/:-@[-`{-~])/g;
+/**
+ * A backslash before ASCII punctuation, or a character reference, as
+ * CommonMark reads them: in one pass, so an escaped `&` starts no reference.
+ */
+const ESCAPE_OR_REFERENCE =
+  /\\([!-/:-@[-`{-~])|&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{0,31});/g;
 
-/** Text as a reader sees it: every backslash escape taken away. */
+/** The character a numeric reference names, as CommonMark decodes it. */
+function numeric(code: number): string {
+  return code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)
+    ? "\uFFFD"
+    : String.fromCodePoint(code);
+}
+
+/**
+ * A textarea in a document of its own, made once: inert (no scripts, no
+ * loads, no rendering), and its contents are read as text, never markup. The
+ * live page never sees what an address holds.
+ */
+let decoder: HTMLTextAreaElement | null = null;
+
+/** The decoder's textarea, made on first use; exported for its test. */
+export function referenceDecoder(): HTMLTextAreaElement {
+  decoder ??= document.implementation
+    .createHTMLDocument("")
+    .createElement("textarea");
+  return decoder;
+}
+
+/**
+ * The character a named reference stands for, or null for a name HTML does
+ * not know. Read through the browser's own HTML parser in an inert document,
+ * so the editor carries no table of names; a legacy name a parser matches by
+ * prefix (`&ampfoo;`) is not a reference and stays as written.
+ */
+function named(reference: string): string | null {
+  const area = referenceDecoder();
+  area.innerHTML = reference;
+  const value = area.value;
+  return value !== reference && value.length <= 2 ? value : null;
+}
+
+/**
+ * Text as a reader sees it: every backslash escape taken away and every
+ * character reference decoded, as the reading page renders it.
+ */
 function unescaped(written: string): string {
-  return written.replace(ESCAPED, "$1");
+  return written.replace(
+    ESCAPE_OR_REFERENCE,
+    (found, escaped: string | undefined, reference: string | undefined) => {
+      if (escaped !== undefined) return escaped;
+      if (reference === undefined) return found;
+      if (reference.startsWith("#x") || reference.startsWith("#X")) {
+        return numeric(parseInt(reference.slice(2), 16));
+      }
+      if (reference.startsWith("#")) {
+        return numeric(parseInt(reference.slice(1), 10));
+      }
+      return named(found) ?? found;
+    },
+  );
 }
 
 /** An `&` that would start a character reference, which a reader decodes. */

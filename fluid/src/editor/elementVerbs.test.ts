@@ -6,7 +6,7 @@
 
 import type { ChangeSpec, EditorState } from "@codemirror/state";
 import { ChangeSet } from "@codemirror/state";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { bytes, cleanupMarkViews, markView } from "../test/markKit";
 import {
@@ -15,6 +15,7 @@ import {
   linkChanges,
   linkWords,
   newLinkChanges,
+  referenceDecoder,
   unlinkChanges,
   unwikilinkChanges,
   wikilinkAt,
@@ -409,6 +410,52 @@ describe("a new link and the marks around it", () => {
       newLinkChanges(state, { from: 3, to: 4 }, { text: "", address: "v" }),
     ).toBeNull();
   });
+});
+
+describe("an address with a character reference", () => {
+  it("reads as the renderer decodes it", () => {
+    const state = stateOf("[t](a?x=1&amp;y=2)");
+    expect(linkAddress(state, 1)).toBe("a?x=1&y=2");
+    expect(linkAddress(stateOf("[t](a&#38;b&#x26;c)"), 1)).toBe("a&b&c");
+    // No reference without its semicolon, and no unknown name.
+    expect(linkAddress(stateOf("[t](a&amp-b&nosuch;c)"), 1)).toBe(
+      "a&amp-b&nosuch;c",
+    );
+  });
+
+  it("decodes in an inert document, never in the live page", () => {
+    // The textarea lives in a document of its own, never the live page.
+    expect(referenceDecoder().ownerDocument).not.toBe(document);
+    expect(referenceDecoder().isConnected).toBe(false);
+    const create = vi.spyOn(document, "createElement");
+    const state = stateOf(
+      "[t](&lt;img&#32;src=x&#32;onerror=alert(1)&gt;&lt;script&gt;x&lt;/script&gt;)",
+    );
+    create.mockClear();
+    expect(linkAddress(state, 1)).toBe(
+      "<img src=x onerror=alert(1)><script>x</script>",
+    );
+    expect(create).not.toHaveBeenCalled();
+    // The editor's own widget buffers are images; none of the address's.
+    expect(
+      document.querySelector("img[onerror], img[src='x'], script"),
+    ).toBeNull();
+  });
+
+  it("keeps an escaped ampersand as written", () => {
+    expect(linkAddress(stateOf("[t](a\\&amp;b)"), 1)).toBe("a&amp;b");
+  });
+
+  it.each(["a?x=1&y=3", "x&amp;y", "a&#38;b", "a\\&amp;b", "&lt;"])(
+    "writes %j so it reads back the same",
+    (address) => {
+      const state = stateOf("[t](a?x=1&amp;y=2)");
+      const next = state.update({
+        changes: linkChanges(state, 1, { address }) ?? [],
+      }).state;
+      expect(linkAddress(next, 1)).toBe(address);
+    },
+  );
 });
 
 describe("two elements side by side", () => {

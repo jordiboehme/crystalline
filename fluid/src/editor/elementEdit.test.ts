@@ -176,9 +176,13 @@ describe.each(MODES)("Mod-k (%s mode)", (mode) => {
   it("does nothing from the Link button in code", () => {
     const { view, heard } = listened("a `code` b", { mode });
     setCaret(view, 4);
+    const dispatch = vi.spyOn(view, "dispatch");
     linkVerb(view);
     expect(heard).toEqual([]);
     expect(bytes(view.state)).toBe("a `code` b");
+    expect(JSON.stringify(dispatch.mock.calls)).toContain(
+      "A link cannot go here.",
+    );
   });
 });
 
@@ -288,10 +292,12 @@ describe("a press on a link", () => {
     expect(head >= 1 && head < 8).toBe(false);
   });
 
-  it("asks for the popover and lets the caret in (show mode)", () => {
+  it("asks for the popover and lets the caret in (show mode)", async () => {
     const { view, heard } = listened("x\na [t](u) b", { mode: "show" });
     setCaret(view, 0);
     press(linkText(view));
+    // Asked once CodeMirror has placed the caret for the press.
+    await Promise.resolve();
     expect(last(heard)).toMatchObject({ kind: "link", at: 4 });
   });
 

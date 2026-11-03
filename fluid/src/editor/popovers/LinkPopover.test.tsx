@@ -16,6 +16,10 @@ import {
 } from "../../test/markKit";
 import { popoverPeers, popoverView } from "../../test/popoverKit";
 
+/** The one line under Address, on every page (a Reflection has no Raw). */
+const CANNOT_SAVE =
+  "This address cannot be saved. Remove its spaces or its angle brackets.";
+
 vi.mock("../../api/search", async (original) => ({
   ...(await original<typeof import("../../api/search")>()),
   fetchSearch: vi.fn(() =>
@@ -109,11 +113,85 @@ describe.each(CASES)(
       expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
       await user.keyboard("{Enter}");
       expect(bytes(view.state)).toBe("x\n[t](u)");
+      // Empty is plain to see: no reason line for it.
+      expect(screen.queryByText(CANNOT_SAVE)).toBeNull();
+    });
+
+    it("says why an address it cannot write back is not saved", async () => {
+      const user = userEvent.setup();
+      const view = popoverView("x\n[t](u)", { mode, room });
+      press(linkText());
+      await screen.findByRole("dialog", { name: "Link" });
+      const field = screen.getByRole("textbox", { name: "Address" });
+      expect(screen.queryByText(CANNOT_SAVE)).toBeNull();
+      expect(field).not.toHaveAttribute("aria-describedby");
+      await user.clear(field);
+      await user.type(field, "a b<c>");
+      const why = screen.getByText(CANNOT_SAVE);
+      expect(field).toHaveAttribute("aria-describedby", why.id);
+      expect(field).toHaveAccessibleDescription(CANNOT_SAVE);
+      expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+      await user.keyboard("{Enter}");
+      expect(bytes(view.state)).toBe("x\n[t](u)");
+    });
+
+    it("shows a character reference as the address it points to", async () => {
+      const user = userEvent.setup();
+      const view = popoverView("x\n[t](a?x=1&amp;y=2)", { mode, room });
+      press(linkText());
+      await screen.findByRole("dialog", { name: "Link" });
+      const field = screen.getByRole("textbox", { name: "Address" });
+      expect(field).toHaveValue("a?x=1&y=2");
+      await user.clear(field);
+      await user.type(field, "a?x=1&y=3{Enter}");
+      expect(bytes(view.state)).toBe("x\n[t](a?x=1&y=3)");
+      press(linkText());
+      await screen.findByRole("dialog", { name: "Link" });
+      expect(screen.getByRole("textbox", { name: "Address" })).toHaveValue(
+        "a?x=1&y=3",
+      );
     });
   },
 );
 
 describe("a peer's change while it is open", () => {
+  it("keeps a character-reference address when only the text changed", async () => {
+    const user = userEvent.setup();
+    const { local, peer, sync } = popoverPeers("x\na [t](a?x=1&amp;y=2) c");
+    press(linkText());
+    await screen.findByRole("dialog", { name: "Link" });
+    // The text changes (a peer's edit, as the popover has no text field for
+    // an existing link) and the address is left as it is.
+    peer.dispatch({
+      changes: { from: 5, to: 6, insert: "Words" },
+      userEvent: "input",
+    });
+    sync();
+    await user.click(screen.getByRole("textbox", { name: "Address" }));
+    await user.keyboard("{Enter}");
+    expect(bytes(local.state)).toBe("x\na [Words](a?x=1&amp;y=2) c");
+  });
+
+  it("cancels Open link when a peer made the address one that cannot open", async () => {
+    const { peer, sync } = popoverPeers("x\na [t](https://a.b) c");
+    press(linkText());
+    await screen.findByRole("dialog", { name: "Link" });
+    const at = bytes(peer.state).indexOf("https://a.b");
+    peer.dispatch({
+      changes: {
+        from: at,
+        to: at + "https://a.b".length,
+        insert: "javascript:x",
+      },
+      userEvent: "input",
+    });
+    sync();
+    const open = screen.getByRole("link", { name: "Open link" });
+    // `fireEvent` answers false when the click was cancelled.
+    expect(fireEvent.click(open)).toBe(false);
+    expect(open).toHaveAttribute("href", "https://a.b");
+  });
+
   it("is kept when Save finds the address untouched", async () => {
     const user = userEvent.setup();
     const { local, peer, sync } = popoverPeers("x\na [t](https://a.b) c");

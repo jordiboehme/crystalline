@@ -204,11 +204,17 @@ export function linkPressed(event: MouseEvent, view: EditorView): boolean {
   if (!edit) {
     return false;
   }
-  requestElementEdit(view, edit);
   if (marksHiddenOnLine(state, state.doc.lineAt(pos).number)) {
+    requestElementEdit(view, edit);
     event.preventDefault();
     return true;
   }
+  // CodeMirror places the caret for this press and takes the focus while
+  // doing so; the popover is asked for once it is done, so the focus it
+  // takes is not taken back.
+  queueMicrotask(() => {
+    requestElementEdit(view, edit);
+  });
   return false;
 }
 

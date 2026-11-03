@@ -23,6 +23,15 @@ import {
 } from "../elementVerbs";
 import type { PopoverBodyProps } from "./ElementPopover";
 
+/**
+ * Why Save is off for an address the editor cannot write so that it reads
+ * back as typed. The one such address is one with both a space and an angle
+ * bracket (`writtenAddress`; a line break cannot be typed in the field, and
+ * an empty field says so itself).
+ */
+const CANNOT_SAVE =
+  "This address cannot be saved. Remove its spaces or its angle brackets.";
+
 export function LinkPopover({
   view,
   edit,
@@ -39,7 +48,11 @@ export function LinkPopover({
   if (edit.kind !== "link" && edit.kind !== "new-link") return null;
   const reference = edit.kind === "link" && edit.reference;
   const atCaret = edit.kind === "new-link" && edit.range.from === edit.range.to;
-  const valid = writtenAddress(address) !== null;
+  /** Untouched: Save writes nothing and keeps what the document holds. */
+  const unchanged = existing && address === initial;
+  const valid = unchanged || writtenAddress(address) !== null;
+  /** An address typed that the editor could not read back as typed. */
+  const unwritable = !reference && !valid && address.trim() !== "";
   const openable = existing ? openableAddress(initial) : null;
 
   const save = () => {
@@ -51,7 +64,7 @@ export function LinkPopover({
     if (!valid) return;
     // Only what the person changed is written: an untouched address keeps
     // whatever the document holds now (a peer may have changed it).
-    if (existing && address === initial) {
+    if (unchanged) {
       commit(() => []);
       return;
     }
@@ -114,10 +127,19 @@ export function LinkPopover({
           readOnly={reference}
           spellCheck={false}
           autoComplete="off"
+          {...(unwritable ? { "aria-describedby": `${id}-why` } : {})}
           onChange={(event) => {
             setAddress(event.target.value);
           }}
         />
+        {unwritable && (
+          <p
+            id={`${id}-why`}
+            className="text-caption text-slate-600 dark:text-slate-300"
+          >
+            {CANNOT_SAVE}
+          </p>
+        )}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {!reference && (
