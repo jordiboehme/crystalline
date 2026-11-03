@@ -148,6 +148,8 @@ describe.each([false, true])("the Link popover (room: %s)", (room) => {
         expect(screen.queryByRole("dialog")).toBeNull();
       });
       expect(bytes(view.state)).toBe("go there");
+      // The focus goes back to the view that asked, not to the page.
+      expect(document.activeElement).toBe(view.contentDOM);
     },
   );
 
@@ -211,6 +213,22 @@ describe("the host and the keyboard", () => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
     expect(bytes(local.state)).toBe("a  b");
+    expect(document.activeElement).toBe(local.contentDOM);
+  });
+
+  it("leaves the focus where it went when it closes after the person left it", async () => {
+    const view = popoverView("go there");
+    select(view, 3, 8);
+    keys(view, "Mod-k");
+    await linkDialog();
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
   });
 });
 

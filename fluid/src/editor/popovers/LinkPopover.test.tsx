@@ -3,7 +3,7 @@
  * writes (only the span it edits, as one undo step).
  */
 
-import { cleanup, screen } from "@testing-library/react";
+import { cleanup, fireEvent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -14,7 +14,7 @@ import {
   setCaret,
   undoOnce,
 } from "../../test/markKit";
-import { popoverView } from "../../test/popoverKit";
+import { popoverPeers, popoverView } from "../../test/popoverKit";
 
 vi.mock("../../api/search", async (original) => ({
   ...(await original<typeof import("../../api/search")>()),
@@ -112,6 +112,65 @@ describe.each(CASES)(
     });
   },
 );
+
+describe("a peer's change while it is open", () => {
+  it("is kept when Save finds the address untouched", async () => {
+    const user = userEvent.setup();
+    const { local, peer, sync } = popoverPeers("x\na [t](https://a.b) c");
+    press(linkText());
+    await screen.findByRole("dialog", { name: "Link" });
+    const at = bytes(peer.state).indexOf("https://a.b");
+    peer.dispatch({
+      changes: {
+        from: at,
+        to: at + "https://a.b".length,
+        insert: "https://p.q",
+      },
+      userEvent: "input",
+    });
+    sync();
+    // The link the popover stands by is still there: Open link follows it.
+    const open = screen.getByRole("link", { name: "Open link" });
+    fireEvent.focus(open);
+    expect(open).toHaveAttribute("href", "https://p.q");
+    await user.click(screen.getByRole("textbox", { name: "Address" }));
+    await user.keyboard("{Enter}");
+    expect(bytes(local.state)).toBe("x\na [t](https://p.q) c");
+  });
+
+  it("is kept beside the field the person changed", async () => {
+    const user = userEvent.setup();
+    const { local, peer, sync } = popoverPeers("x\na [t](u) c");
+    press(linkText());
+    await screen.findByRole("dialog", { name: "Link" });
+    peer.dispatch({
+      changes: { from: 5, to: 6, insert: "Words" },
+      userEvent: "input",
+    });
+    sync();
+    const field = screen.getByRole("textbox", { name: "Address" });
+    await user.clear(field);
+    await user.type(field, "v{Enter}");
+    expect(bytes(local.state)).toBe("x\na [Words](v) c");
+  });
+
+  it("is kept for a wikilink target nobody touched", async () => {
+    const user = userEvent.setup();
+    const { local, peer, sync } = popoverPeers("x\n[[Old]]");
+    const chip = document.querySelector(".cm-wikilink");
+    if (!chip) throw new Error("no chip is drawn");
+    press(chip);
+    await screen.findByRole("dialog", { name: "Wiki link" });
+    peer.dispatch({
+      changes: { from: 4, to: 7, insert: "Peer" },
+      userEvent: "input",
+    });
+    sync();
+    await user.click(screen.getByRole("combobox", { name: "Target" }));
+    await user.keyboard("{Enter}");
+    expect(bytes(local.state)).toBe("x\n[[Peer]]");
+  });
+});
 
 describe.each(CASES)(
   "a reference link ($mode mode, room $room)",

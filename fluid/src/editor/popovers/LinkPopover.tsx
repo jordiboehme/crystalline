@@ -27,6 +27,7 @@ export function LinkPopover({
   view,
   edit,
   commit,
+  live,
 }: PopoverBodyProps): ReactElement | null {
   const id = useId();
   const existing = edit.kind === "link";
@@ -48,6 +49,12 @@ export function LinkPopover({
       return;
     }
     if (!valid) return;
+    // Only what the person changed is written: an untouched address keeps
+    // whatever the document holds now (a peer may have changed it).
+    if (existing && address === initial) {
+      commit(() => []);
+      return;
+    }
     commit((state, now) => {
       if (now.kind === "link") return linkChanges(state, now.at, { address });
       if (now.kind === "new-link") {
@@ -55,6 +62,21 @@ export function LinkPopover({
       }
       return null;
     });
+  };
+  /**
+   * Points "Open link" at the address the document holds now, which a peer
+   * may have changed since the popover opened. False when there is none to
+   * open any more.
+   */
+  const followLive = (event: { currentTarget: HTMLAnchorElement }): boolean => {
+    const now = live();
+    const href =
+      now?.kind === "link"
+        ? openableAddress(linkAddress(view.state, now.at) ?? "")
+        : null;
+    if (href === null) return false;
+    event.currentTarget.setAttribute("href", href);
+    return true;
   };
   const remove = () => {
     commit((state, now) =>
@@ -110,6 +132,11 @@ export function LinkPopover({
               target="_blank"
               rel="noopener noreferrer"
               className={BUTTON.secondary}
+              onFocus={followLive}
+              onPointerEnter={followLive}
+              onClick={(event) => {
+                if (!followLive(event)) event.preventDefault();
+              }}
             >
               Open link
             </a>

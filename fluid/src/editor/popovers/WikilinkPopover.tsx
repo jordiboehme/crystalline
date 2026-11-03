@@ -34,19 +34,25 @@ export function WikilinkPopover({
   titles,
   commit,
   close,
+  live,
 }: PopoverBodyProps): ReactElement | null {
   const id = useId();
   const navigate = useNavigate();
+  /** The route the wikilink at `at` names in the document now, or null. */
+  const hrefOf = (at: number): string | null => {
+    const link = wikilinkAt(view.state, at);
+    if (!link) return null;
+    const inner = view.state.doc.sliceString(link.from + 2, link.to - 2);
+    const resolution = view.state.facet(wikilinkResolverFacet)(inner);
+    return resolution?.kind === "resolved" ? resolution.href : null;
+  };
   const [initial] = useState(() => {
     if (edit.kind !== "wikilink") return { target: "", href: null };
     const link = wikilinkAt(view.state, edit.at);
     if (!link) return { target: "", href: null };
-    const doc = view.state.doc;
-    const inner = doc.sliceString(link.from + 2, link.to - 2);
-    const resolution = view.state.facet(wikilinkResolverFacet)(inner);
     return {
-      target: doc.sliceString(link.target.from, link.target.to),
-      href: resolution?.kind === "resolved" ? resolution.href : null,
+      target: view.state.doc.sliceString(link.target.from, link.target.to),
+      href: hrefOf(edit.at),
     };
   });
   const [value, setValue] = useState(initial.target);
@@ -83,6 +89,11 @@ export function WikilinkPopover({
 
   const save = () => {
     if (!valid) return;
+    // An untouched target keeps whatever the document holds now.
+    if (value === initial.target) {
+      commit(() => []);
+      return;
+    }
     commit((state, now) =>
       now.kind === "wikilink"
         ? wikilinkChanges(state, now.at, { target: value })
@@ -185,9 +196,12 @@ export function WikilinkPopover({
           className={BUTTON.secondary}
           disabled={href === null}
           onClick={() => {
-            if (href === null) return;
+            // The engram the chip names now: a peer may have changed it.
+            const now = live();
+            const target = now?.kind === "wikilink" ? hrefOf(now.at) : null;
+            if (target === null) return;
             close();
-            void navigate(href);
+            void navigate(target);
           }}
         >
           Open

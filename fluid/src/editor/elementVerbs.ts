@@ -211,6 +211,25 @@ function unwrap(written: string): string {
     : written;
 }
 
+/** A backslash before ASCII punctuation, as CommonMark reads one. */
+const ESCAPED = /\\([!-/:-@[-`{-~])/g;
+
+/** Text as a reader sees it: every backslash escape taken away. */
+function unescaped(written: string): string {
+  return written.replace(ESCAPED, "$1");
+}
+
+/** An `&` that would start a character reference, which a reader decodes. */
+const REFERENCE = /&(?=#?[A-Za-z0-9]+;)/g;
+
+/** The words of the link at `pos` as a reader sees them, or null. */
+export function linkWords(state: EditorState, pos: number): string | null {
+  const link = linkAt(state, pos);
+  return link
+    ? unescaped(state.doc.sliceString(link.text.from, link.text.to))
+    : null;
+}
+
 /**
  * The address of the link at `pos` as a reader follows it: an inline link's
  * own, a reference link's definition's. Empty with none; null with no link.
@@ -223,32 +242,42 @@ export function linkAddress(state: EditorState, pos: number): string | null {
   const span = link.reference
     ? (linkDefinition(state, link.label) ?? null)
     : link.address;
-  return span ? unwrap(state.doc.sliceString(span.from, span.to)) : "";
+  return span
+    ? unescaped(unwrap(state.doc.sliceString(span.from, span.to)))
+    : "";
 }
 
 /**
- * An address as it is written into `(...)`: as typed, or inside angle
- * brackets when it holds a space or a parenthesis. Null when it cannot be
- * written at all (empty, a line break, or an angle bracket that would need
- * the brackets it cannot sit in).
+ * An address as it is written into `(...)`, so that a reader follows exactly
+ * what was typed: every backslash doubled and an `&` that would start a
+ * character reference escaped; without a space its parentheses and a leading
+ * `<` escaped too, and with one inside angle brackets. Null when it cannot be
+ * written at all: empty, a line break, or a space beside an angle bracket
+ * (the parser reads no escaped angle bracket inside angle brackets).
  */
 export function writtenAddress(address: string): string | null {
   const trimmed = address.trim();
-  if (trimmed === "") {
+  if (trimmed === "" || /[\r\n]/.test(trimmed)) {
     return null;
   }
-  if (!/[\s()<>]/.test(trimmed)) {
-    return trimmed;
+  const escaped = trimmed.replace(/\\/g, "\\\\").replace(REFERENCE, "\\&");
+  if (!/\s/.test(escaped)) {
+    return escaped.replace(/[()]|^</g, (found) => `\\${found}`);
   }
-  if (/[<>\r\n]/.test(trimmed)) {
-    return null;
-  }
-  return `<${trimmed}>`;
+  return /[<>]/.test(escaped) ? null : `<${escaped}>`;
 }
 
-/** The words of a new link, with the brackets that would end it escaped. */
+/**
+ * The words of a new link as written, so that a reader sees exactly what was
+ * typed: a backslash, brackets, emphasis, code, strikethrough and angle
+ * brackets escaped, an `&` that would start a character reference, and a `^`
+ * at the start (which would make the link a footnote reference).
+ */
 function writtenText(text: string): string {
-  return text.replace(/[[\]\\]/g, (found) => `\\${found}`);
+  return text
+    .replace(/[\\[\]*_`~<>]/g, (found) => `\\${found}`)
+    .replace(REFERENCE, "\\&")
+    .replace(/^\^/, "\\^");
 }
 
 /** Gives the link at `at` the address `address`; only the address span is written. */
@@ -362,12 +391,24 @@ export function wikilinkAt(
     return null;
   }
   const line = state.doc.lineAt(pos);
+  // Two wikilinks side by side share a position: the one starting there wins
+  // over the one ending there, as `linkAt` reads links.
+  let found: RegExpExecArray | null = null;
   for (const match of line.text.matchAll(WIKILINK_ONE)) {
     const from = line.from + match.index;
     const to = from + match[0].length;
-    if (pos < from || pos > to) {
-      continue;
+    if (pos >= from && pos < to) {
+      found = match;
+      break;
     }
+    if (pos === to) {
+      found = match;
+    }
+  }
+  if (found) {
+    const match = found;
+    const from = line.from + match.index;
+    const to = from + match[0].length;
     if (touchesNotProse(state, from, to)) {
       return null;
     }

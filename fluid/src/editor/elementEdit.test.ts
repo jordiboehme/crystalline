@@ -28,6 +28,7 @@ import type { ElementEdit } from "./elementEdit";
 import {
   commitElementEdit,
   discardElementEdit,
+  CANNOT_LINK,
   elementAtCaret,
   elementEditCell,
   elementEditListener,
@@ -35,7 +36,7 @@ import {
   openElementEdit,
   requestElementEdit,
 } from "./elementEdit";
-import { linkChanges, newLinkChanges } from "./elementVerbs";
+import { linkChanges, newLinkChanges, wikilinkChanges } from "./elementVerbs";
 import { cellForwarding } from "./grid/cellEditor";
 import { marksOnEditLine } from "./marks/mode";
 import { linkPressed } from "./preview";
@@ -152,10 +153,30 @@ describe.each(MODES)("Mod-k (%s mode)", (mode) => {
     });
   });
 
-  it("asks nothing inside code and writes nothing", () => {
+  it("asks nothing inside code, writes nothing and keeps the key", () => {
     const { view, heard } = listened("a `code` b", { mode });
     setCaret(view, 4);
-    keys(view, "Mod-k");
+    const dispatch = vi.spyOn(view, "dispatch");
+    // Consumed, so the browser's own Ctrl-K does not open.
+    expect(keys(view, "Mod-k")).toBe(true);
+    expect(heard).toEqual([]);
+    expect(bytes(view.state)).toBe("a `code` b");
+    // Said, as a refused format is.
+    expect(JSON.stringify(dispatch.mock.calls)).toContain(CANNOT_LINK);
+  });
+
+  it("asks nothing across lines, writes nothing and keeps the key", () => {
+    const { view, heard } = listened("a\nb", { mode });
+    select(view, 0, 3);
+    expect(keys(view, "Mod-k")).toBe(true);
+    expect(heard).toEqual([]);
+    expect(bytes(view.state)).toBe("a\nb");
+  });
+
+  it("does nothing from the Link button in code", () => {
+    const { view, heard } = listened("a `code` b", { mode });
+    setCaret(view, 4);
+    linkVerb(view);
     expect(heard).toEqual([]);
     expect(bytes(view.state)).toBe("a `code` b");
   });
@@ -441,6 +462,68 @@ describe("a request closes without writing", () => {
     expect(last(heard)).toBeNull();
     expect(commitElementEdit(local, address("v"))).toBe(false);
     expect(bytes(local.state)).toBe("a  b");
+  });
+
+  it.each([
+    ["the link after it takes its place", "[t](u) [v](w)", 1, 0, 7, "[v](w)"],
+    [
+      "the link before it ends where it began",
+      "[a](b)[t](u)",
+      7,
+      6,
+      12,
+      "[a](b)",
+    ],
+    ["the wikilink after it takes its place", "[[A]] [[B]]", 3, 0, 6, "[[B]]"],
+    [
+      "the wikilink before it ends where it began",
+      "[[A]][[B]]",
+      7,
+      5,
+      10,
+      "[[A]]",
+    ],
+  ])("when a peer deleted it and %s", (_name, text, at, from, to, after) => {
+    const heard: Heard[] = [];
+    const { local, peer, sync } = markPeers(text, {
+      onElementEdit: (edit, view) => {
+        heard.push({ edit, view });
+      },
+    });
+    setCaret(local, at);
+    keys(local, "Shift-F10");
+    expect(last(heard)).not.toBeNull();
+    peer.dispatch({ changes: { from, to }, userEvent: "delete" });
+    sync();
+    expect(bytes(local.state)).toBe(after);
+    expect(last(heard)).toBeNull();
+    expect(
+      commitElementEdit(local, (state, edit) =>
+        edit.kind === "link"
+          ? linkChanges(state, edit.at, { address: "x" })
+          : edit.kind === "wikilink"
+            ? wikilinkChanges(state, edit.at, { target: "X" })
+            : null,
+      ),
+    ).toBe(false);
+    expect(bytes(local.state)).toBe(after);
+  });
+
+  it("when a peer deleted the selection a new link was for", () => {
+    const heard: Heard[] = [];
+    const { local, peer, sync } = markPeers("go there now", {
+      onElementEdit: (edit, view) => {
+        heard.push({ edit, view });
+      },
+    });
+    select(local, 3, 8);
+    keys(local, "Mod-k");
+    expect(last(heard)?.kind).toBe("new-link");
+    peer.dispatch({ changes: { from: 3, to: 8 }, userEvent: "delete" });
+    sync();
+    expect(last(heard)).toBeNull();
+    expect(commitElementEdit(local, newLink("https://x"))).toBe(false);
+    expect(bytes(local.state)).toBe("go  now");
   });
 
   it("follows the link when a peer types before it", () => {

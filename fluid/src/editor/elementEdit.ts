@@ -137,21 +137,54 @@ function reread(state: EditorState, edit: ElementEdit): ElementEdit | null {
   }
 }
 
-/** `edit` carried through `tr`'s changes, or null when its element went. */
+/** Where the element `edit` names spans in `state`, or null. */
+function spanOf(state: EditorState, edit: ElementEdit): Span | null {
+  switch (edit.kind) {
+    case "link":
+      return linkAt(state, edit.at);
+    case "wikilink":
+      return wikilinkAt(state, edit.at);
+    default:
+      return null;
+  }
+}
+
+/**
+ * `edit` carried through `tr`'s changes, or null when its element went. Both
+ * ends are mapped, and the element read again must start and end exactly
+ * there: a deletion that takes the element away must never leave the request
+ * standing on the link next to it.
+ */
 function mapEdit(edit: ElementEdit, tr: Transaction): ElementEdit | null {
+  const { changes } = tr;
   if (edit.kind === "new-link") {
-    const from = tr.changes.mapPos(edit.range.from, 1, MapMode.TrackDel);
-    const to = tr.changes.mapPos(edit.range.to, -1, MapMode.TrackDel);
+    const from = changes.mapPos(edit.range.from, 1, MapMode.TrackDel);
+    const to = changes.mapPos(edit.range.to, -1, MapMode.TrackDel);
     if (from === null || to === null || from > to) {
+      return null;
+    }
+    // A selection a peer deleted is gone, not a caret now.
+    if (from === to && edit.range.from !== edit.range.to) {
       return null;
     }
     return { ...edit, range: { from, to } };
   }
-  const at = tr.changes.mapPos(edit.at, 1, MapMode.TrackDel);
-  if (at === null) {
-    return null;
+  const before = spanOf(tr.startState, edit);
+  if (edit.kind === "link" || edit.kind === "wikilink") {
+    if (!before) {
+      return null;
+    }
+    const from = changes.mapPos(before.from, 1, MapMode.TrackDel);
+    const to = changes.mapPos(before.to, -1, MapMode.TrackDel);
+    if (from === null || to === null || from >= to) {
+      return null;
+    }
+    const next = reread(tr.state, { ...edit, at: from });
+    const after = next ? spanOf(tr.state, next) : null;
+    return after && after.from === from && after.to === to ? next : null;
   }
-  return reread(tr.state, { ...edit, at });
+  const at = changes.mapPos(edit.at, 1, MapMode.TrackDel);
+  return at === null ? null : { ...edit, at };
 }
 
 /** What every view a hub hears from does with one update. */
@@ -434,12 +467,15 @@ export const elementMenuKey: Extension = Prec.highest(
   ]),
 );
 
+/** Said when no link can go where Mod-k or the Link button asked for one. */
+export const CANNOT_LINK = "A link cannot go here.";
+
 /**
  * The Link verb where marks are hidden (Mod-k and the bars' Link button):
  * over a selection a new link for it; at a caret in a link that link; at a
  * caret in a word a new link for the word; else a new link at the caret.
- * False when a new link cannot go there (code, the frontmatter, an id line,
- * across lines).
+ * Where a new link cannot go (code, the frontmatter, an id line, across
+ * lines) nothing is written and `CANNOT_LINK` is announced.
  */
 export function editLink(view: EditorView): boolean {
   const { state } = view;
@@ -459,9 +495,11 @@ export function editLink(view: EditorView): boolean {
   }
   const word = range.empty ? state.wordAt(range.head) : null;
   const target = word ? { from: word.from, to: word.to } : range;
-  // The same test the commit makes, with a stand-in address.
+  // The same test the commit makes, with a stand-in address. Refused, the
+  // key is still taken (the browser's own Ctrl-K stays shut) and said.
   if (!newLinkChanges(state, target, { text: "", address: "x" })) {
-    return false;
+    view.dispatch({ effects: EditorView.announce.of(CANNOT_LINK) });
+    return true;
   }
   requestElementEdit(view, {
     kind: "new-link",

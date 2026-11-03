@@ -32,6 +32,7 @@ import {
   closeElementEdit,
   commitElementEdit,
   discardElementEdit,
+  openElementEdit,
 } from "../elementEdit";
 import type { ElementPopoverProps } from "./ElementPopoverSlot";
 import { placement } from "./placement";
@@ -55,6 +56,8 @@ export interface PopoverBodyProps {
   commit: (write: ElementWrite) => void;
   /** Closes without writing and leaves the focus where it goes. */
   close: () => void;
+  /** The request as the buffer follows it now (mapped), or null once gone. */
+  live: () => ElementEdit | null;
 }
 
 /** Marks the popover, for the "is this press inside it" test. */
@@ -74,6 +77,10 @@ function takesText(target: EventTarget): boolean {
   return (
     target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
   );
+}
+
+function isGone(view: EditorView): boolean {
+  return (view as unknown as { destroyed?: unknown }).destroyed === true;
 }
 
 const serials = new WeakMap<ElementEdit, number>();
@@ -116,30 +123,44 @@ function Open({
   titles?: ElementPopoverProps["titles"];
 }): ReactElement {
   const root = useRef<HTMLDivElement>(null);
-  /** Set by the first close of any kind, so a later one does nothing. */
-  const closed = useRef(false);
+  /**
+   * `closed` is set by the first close of any kind, so a later one does
+   * nothing; `inside` while the focus is in the popover, read by the
+   * teardown below.
+   */
+  const flags = useRef({ closed: false, inside: false });
   const { edit, view } = request;
 
   const close = () => {
-    if (closed.current) return;
-    closed.current = true;
+    if (flags.current.closed) return;
+    flags.current.closed = true;
     closeElementEdit(main);
   };
   const discard = () => {
-    if (closed.current) return;
-    closed.current = true;
+    if (flags.current.closed) return;
+    flags.current.closed = true;
     discardElementEdit(main);
   };
   const commit = (write: ElementWrite) => {
-    if (closed.current) return;
-    closed.current = true;
+    if (flags.current.closed) return;
+    flags.current.closed = true;
     commitElementEdit(main, write);
   };
 
-  // The first field takes the focus.
+  // The first field takes the focus. When the buffer closes the popover on
+  // its own (the element went, the setting or Raw flipped, the page stopped
+  // taking writes) with the focus in it, the focus goes back to the view
+  // that asked, so a keyboard user keeps their place.
   useEffect(() => {
     root.current?.querySelector<HTMLElement>("input, textarea")?.focus();
-  }, []);
+    // One object for the popover's life; its fields are read at teardown.
+    const now = flags.current;
+    return () => {
+      const { closed, inside } = now;
+      if (closed || !inside) return;
+      if (!isGone(view) && view.dom.isConnected) view.focus();
+    };
+  }, [view]);
 
   // A press anywhere outside closes it without writing.
   const closeRef = useRef(close);
@@ -185,10 +206,20 @@ function Open({
     event.stopPropagation();
     discard();
   };
+  const onFocus = () => {
+    flags.current.inside = true;
+  };
   const onBlur = (event: FocusEvent<HTMLDivElement>) => {
     const next = event.relatedTarget;
+    if (next instanceof Node && event.currentTarget.contains(next)) return;
+    flags.current.inside = false;
     // Null is the window losing the focus: the person comes back to it.
-    if (next instanceof Node && !event.currentTarget.contains(next)) close();
+    if (next instanceof Node) close();
+  };
+  /** The request as the buffer follows it now, or null once it is gone. */
+  const live = (): ElementEdit | null => {
+    const now = openElementEdit(main);
+    return now && now.view === view ? now.edit : null;
   };
   const onMouseDown = (event: MouseEvent<HTMLDivElement>) => {
     if (!takesText(event.target)) event.preventDefault();
@@ -199,6 +230,7 @@ function Open({
     edit,
     commit,
     close,
+    live,
     ...(titles !== undefined ? { titles } : {}),
   };
 
@@ -209,6 +241,7 @@ function Open({
       aria-label={nameOf(edit)}
       {...{ [POPOVER_MARK]: "" }}
       onKeyDown={onKeyDown}
+      onFocus={onFocus}
       onBlur={onBlur}
       onMouseDown={onMouseDown}
       className="absolute z-30 w-80 max-w-[calc(100vw-2rem)] rounded-md border border-slate-200 bg-white p-3 text-sm shadow-md print:hidden dark:border-slate-700 dark:bg-slate-900"

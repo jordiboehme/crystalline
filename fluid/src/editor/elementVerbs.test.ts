@@ -13,6 +13,7 @@ import {
   linkAddress,
   linkAt,
   linkChanges,
+  linkWords,
   newLinkChanges,
   unlinkChanges,
   unwikilinkChanges,
@@ -316,8 +317,71 @@ describe("the readers", () => {
   it("writes an address in angle brackets only when it needs them", () => {
     expect(writtenAddress("https://x")).toBe("https://x");
     expect(writtenAddress("a b")).toBe("<a b>");
-    expect(writtenAddress("a)b")).toBe("<a)b>");
+    // The parser reads no escaped angle bracket inside angle brackets.
     expect(writtenAddress("a>b c")).toBeNull();
+    expect(writtenAddress("a)b")).toBe("a\\)b");
+    expect(writtenAddress("a\nb")).toBeNull();
+  });
+});
+
+describe("what is written reads back as typed", () => {
+  const ADDRESSES = [
+    "https://x/a\\_b",
+    "C:\\dir\\file",
+    "my file.md",
+    "a(b)",
+    "a)b",
+    "a<b>c",
+    "<a>",
+    "a (b) c",
+    "x&amp;y",
+    "^1",
+    "[x]",
+  ];
+
+  it.each(ADDRESSES)("an address %j", (address) => {
+    const state = stateOf("[t](u)");
+    const next = state.update({
+      changes: linkChanges(state, 1, { address }) ?? [],
+    }).state;
+    expect(linkAddress(next, 1)).toBe(address);
+  });
+
+  const TEXTS = [
+    "a\\b",
+    "^1",
+    "a[b]c",
+    "a(b) c",
+    "<x>",
+    "*em* and _em_",
+    "`code`",
+    "~~s~~",
+    "x&amp;y",
+    "[[Old]]",
+  ];
+
+  it.each(TEXTS)("a new link's text %j", (text) => {
+    const state = stateOf("");
+    const next = state.update({
+      changes:
+        newLinkChanges(state, { from: 0, to: 0 }, { text, address: "u" }) ?? [],
+    }).state;
+    expect(linkAt(next, 1)).not.toBeNull();
+    expect(linkWords(next, 1)).toBe(text);
+    expect(linkAddress(next, 1)).toBe("u");
+  });
+
+  it("a new link's text that is its address", () => {
+    const state = stateOf("");
+    const next = state.update({
+      changes:
+        newLinkChanges(
+          state,
+          { from: 0, to: 0 },
+          { text: "", address: "https://x/a_b" },
+        ) ?? [],
+    }).state;
+    expect(linkWords(next, 1)).toBe("https://x/a_b");
   });
 });
 
@@ -344,5 +408,20 @@ describe("a new link and the marks around it", () => {
     expect(
       newLinkChanges(state, { from: 3, to: 4 }, { text: "", address: "v" }),
     ).toBeNull();
+  });
+});
+
+describe("two elements side by side", () => {
+  it("reads the wikilink that starts at a shared position", () => {
+    const state = stateOf("[[A]][[B]]");
+    expect(wikilinkAt(state, 5)).toMatchObject({ from: 5, to: 10 });
+    expect(apply(state, wikilinkChanges(state, 5, { target: "C" }))).toBe(
+      "[[A]][[C]]",
+    );
+  });
+
+  it("reads the link that starts at a shared position", () => {
+    const state = stateOf("[a](b)[t](u)");
+    expect(linkAt(state, 6)).toMatchObject({ from: 6, to: 12 });
   });
 });
