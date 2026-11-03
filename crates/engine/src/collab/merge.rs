@@ -1,16 +1,14 @@
 //! The external-change merge: three-way over LF text (frontmatter key by key,
-//! body line by line, see `crystalline_core::frontmatter`, and a line both
-//! sides changed once more character by character), applied into the live
-//! document as a minimal edit script. Conflict markers are never output -
-//! diffy's marked text is discarded and the room resolves instead.
+//! body line by line, see `crystalline_core::frontmatter`, and a table row
+//! both sides changed once more cell by cell), applied into the live document
+//! as a minimal edit script. Conflict markers are never output - diffy's
+//! marked text is discarded and the room resolves instead.
 //!
-//! "Character" means an extended grapheme cluster throughout: a merge or an
-//! edit script never splits a surrogate pair, a flag or a compound emoji.
-
-use std::collections::HashMap;
+//! The edit script works per extended grapheme cluster inside a changed line,
+//! so it never splits a surrogate pair, a flag or a compound emoji; the cell
+//! merge takes whole cells byte for byte.
 
 use crystalline_core::frontmatter::{MergedText, merge_text_with};
-use diffy::{ConflictStyle, MergeOptions};
 use similar::{Algorithm, DiffOp, capture_diff_slices, diff_ratio};
 use unicode_segmentation::UnicodeSegmentation;
 use yrs::{Text, TextRef, TransactionMut};
@@ -30,11 +28,11 @@ pub enum MergeOutcome {
 /// `crystalline_core::frontmatter`), so a CRLF or mixed side merges like any
 /// other. diffy's Err carries conflict-marked text - discarded.
 ///
-/// A line both sides changed (a person typing in one cell of a table row, an
-/// agent changing another cell of the same row) is merged once more per
-/// character in the body (see `body_merge`); the merge is clean only when
-/// that is. Frontmatter key blocks keep the plain line merge, so two changes
-/// to one value are a conflict rather than a value nobody wrote.
+/// A table row both sides changed (a person typing in one cell, an agent
+/// changing another cell of the same row) is merged once more cell by cell in
+/// the body (see `body_merge`); the merge is clean only when that is.
+/// Frontmatter key blocks keep the plain line merge, so two changes to one
+/// value are a conflict rather than a value nobody wrote.
 pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> MergeOutcome {
     let base = to_lf(base_file);
     let theirs = to_lf(theirs_file);
@@ -49,10 +47,15 @@ pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> Merg
     }
 }
 
-/// The length of the markers the character fallback asks diffy for. Long
-/// enough that no engram line is one by accident, and checked anyway: an
-/// input with a line that starts like a marker keeps today's conflict.
+/// The length of the marker runs no input line may start with. diffy marks
+/// a conflict with runs of 7; the cell fallback never asks for marked text,
+/// and an input or a result with a line that starts like a long run keeps
+/// the conflict all the same, so no marker can reach a document through it.
 const FALLBACK_MARKER_LEN: usize = 64;
+
+/// The most replaced lines one side may hold for the cell fallback to weigh
+/// them: the pairing check compares every replaced line with every other.
+const MAX_REPLACED_LINES: usize = 256;
 
 /// diffy's three-way line merge, its conflict-marked `Err` discarded. The
 /// frontmatter's merge.
@@ -60,65 +63,124 @@ fn line_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
     diffy::merge(base, mine, theirs).ok()
 }
 
-/// The body's merge: [`line_merge`], and when that conflicts, each
-/// conflicting hunk in which every line pairs with its own counterpart is
-/// merged again line against line, per grapheme cluster
-/// ([`grapheme_merge`]). The result is clean only when every such line
-/// merges clean; any other hunk shape (lines added, removed or moved on one
-/// side, or a cluster both sides changed) stays a conflict, as before.
+/// The body's merge: [`line_merge`], and when that conflicts, the cell
+/// fallback ([`row_merge`]). Anything the fallback does not take stays a
+/// conflict, as it was before the fallback existed.
 fn body_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
-    line_merge(base, mine, theirs).or_else(|| hunk_merge(base, mine, theirs))
+    line_merge(base, mine, theirs).or_else(|| row_merge(base, mine, theirs))
 }
 
-/// Whether the lines of `side` pair one to one with the lines of `base`:
-/// the line diff holds nothing but equal lines and runs replaced by as many
-/// lines, so line `i` of one is the counterpart of line `i` of the other.
-/// Equal line counts alone do not say that: a side that dropped the first
-/// line and added a last one has as many lines, each paired with the wrong
-/// one.
+/// The cell fallback, in three gates:
 ///
-/// A run of one line replaced by one line pairs as it stands. A longer run
-/// pairs only when position and likeness agree ([`closest_in_place`]); a run
-/// whose lines were swapped, or dropped at one end and added at the other,
-/// does not, and the hunk stays a conflict.
-fn pairs_line_for_line(base: &[&str], side: &[&str]) -> bool {
-    capture_diff_slices(Algorithm::Myers, base, side)
+/// 1. The whole text, not one hunk: neither side inserts or deletes a line
+///    anywhere, and every line a side replaced is mutually and strictly the
+///    closest to its own base line among all the lines that side replaced
+///    ([`replaces_in_place`]). A row moved, swapped, dropped or added fails
+///    here, wherever in the text the other half of the move is.
+/// 2. Table rows only: a run of lines both sides changed (diff3's conflicting
+///    hunk, lines touching counted together) is taken only when every line
+///    of it is a table row on all three sides and no delimiter row in it
+///    changed ([`table_rows`]). Any other conflicting line stays a conflict.
+/// 3. Per cell: each row of such a run is merged cell by cell
+///    ([`merge_row`]); a cell both sides changed differently is a conflict.
+fn row_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    let markers = marker_runs();
+    if [base, mine, theirs]
         .iter()
-        .all(|op| match *op {
-            DiffOp::Equal { .. } => true,
+        .flat_map(|t| t.lines())
+        .any(|line| starts_like_a_marker(line, &markers))
+    {
+        return None;
+    }
+    let b: Vec<&str> = base.split_inclusive('\n').collect();
+    let m: Vec<&str> = mine.split_inclusive('\n').collect();
+    let t: Vec<&str> = theirs.split_inclusive('\n').collect();
+    if !replaces_in_place(&b, &m) || !replaces_in_place(&b, &t) {
+        return None;
+    }
+    let kinds = [table_rows(&b), table_rows(&m), table_rows(&t)];
+    let changed = |k: usize| m[k] != b[k] || t[k] != b[k];
+    let mut merged = String::with_capacity(theirs.len());
+    let mut k = 0;
+    while k < b.len() {
+        if !changed(k) {
+            merged.push_str(b[k]);
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < b.len() && changed(k) {
+            k += 1;
+        }
+        let run = start..k;
+        let mine_moved = run.clone().any(|i| m[i] != b[i]);
+        let theirs_moved = run.clone().any(|i| t[i] != b[i]);
+        if !theirs_moved || m[run.clone()] == t[run.clone()] {
+            m[run].iter().for_each(|line| merged.push_str(line));
+            continue;
+        }
+        if !mine_moved {
+            t[run].iter().for_each(|line| merged.push_str(line));
+            continue;
+        }
+        for i in run {
+            for side in &kinds {
+                match side[i] {
+                    Row::Data => {}
+                    Row::Delimiter if m[i] == b[i] && t[i] == b[i] => {}
+                    Row::Delimiter | Row::Other => return None,
+                }
+            }
+            merged.push_str(&merge_row(b[i], m[i], t[i])?);
+        }
+    }
+    if merged
+        .lines()
+        .any(|line| starts_like_a_marker(line, &markers))
+    {
+        return None;
+    }
+    Some(merged)
+}
+
+/// Whether `side` changes `base` only by replacing lines in place: its line
+/// diff holds nothing but equal lines and runs replaced by as many lines,
+/// and every replaced line is mutually and strictly closest to its own base
+/// line among all the base lines this side replaced (similar's ratio over
+/// grapheme clusters). A tie is no evidence and fails, and so does a side
+/// replacing more than [`MAX_REPLACED_LINES`] lines.
+///
+/// Equal line counts alone do not say a side replaced in place: a side that
+/// dropped the first row and added a last one, or swapped two rows with an
+/// unchanged one between them, has as many lines, each paired with the
+/// wrong one. The likeness check sees the whole text, so the two halves of
+/// a swap are weighed together however far apart they are.
+fn replaces_in_place(base: &[&str], side: &[&str]) -> bool {
+    let mut replaced: Vec<usize> = Vec::new();
+    for op in capture_diff_slices(Algorithm::Myers, base, side) {
+        match op {
+            DiffOp::Equal { .. } => {}
             DiffOp::Replace {
                 old_index,
                 old_len,
                 new_index,
                 new_len,
-            } => {
-                old_len == new_len
-                    && (old_len == 1
-                        || closest_in_place(
-                            &base[old_index..old_index + old_len],
-                            &side[new_index..new_index + new_len],
-                        ))
+            } if old_len == new_len && old_index == new_index => {
+                replaced.extend(old_index..old_index + old_len);
             }
-            DiffOp::Delete { .. } | DiffOp::Insert { .. } => false,
-        })
-}
-
-/// Whether every line of a replaced run is mutually and strictly closest to
-/// the line at its own position on the other side: side line `i` is more
-/// like base line `i` than like any other base line of the run, and base
-/// line `i` more like side line `i` than like any other side line. Likeness
-/// is similar's ratio over grapheme clusters; a tie is no evidence, so it
-/// fails.
-fn closest_in_place(base: &[&str], side: &[&str]) -> bool {
-    let n = base.len();
-    let ratio: Vec<Vec<f32>> = base
-        .iter()
-        .map(|b| side.iter().map(|s| grapheme_ratio(b, s)).collect())
-        .collect();
-    (0..n).all(|i| {
-        (0..n)
-            .filter(|&k| k != i)
-            .all(|k| ratio[i][i] > ratio[k][i] && ratio[i][i] > ratio[i][k])
+            _ => return false,
+        }
+    }
+    if replaced.len() > MAX_REPLACED_LINES {
+        return false;
+    }
+    let likeness = |b: usize, s: usize| grapheme_ratio(base[b], side[s]);
+    replaced.iter().all(|&i| {
+        let own = likeness(i, i);
+        replaced
+            .iter()
+            .filter(|&&j| j != i)
+            .all(|&j| own > likeness(j, i) && own > likeness(i, j))
     })
 }
 
@@ -134,162 +196,152 @@ fn grapheme_ratio(a: &str, b: &str) -> f32 {
     )
 }
 
-/// The character fallback of [`line_merge`]: diffy's conflicting hunks, read
-/// from its diff3-style output with long markers, each merged per character.
-fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
-    let texts = [base, mine, theirs];
-    // diffy closes an incomplete last line with its marker unless asked for
-    // git's style, which adds a line ending the parse cannot tell from the
-    // text's own. So the sides all end in a line ending, or all get one that
-    // the result gives back; a line ending only some sides have is a line
-    // change, and the line merge's verdict on it stands.
-    let complete = |t: &str| t.is_empty() || t.ends_with('\n');
-    let added = if texts.iter().all(|t| complete(t)) {
-        false
-    } else if texts.iter().all(|t| !complete(t)) {
-        true
-    } else {
-        return None;
-    };
-    let [base, mine, theirs] = texts.map(|t| {
-        if added {
-            format!("{t}\n")
-        } else {
-            t.to_string()
-        }
-    });
-    let markers = marker_lines();
-    if [&base, &mine, &theirs]
-        .iter()
-        .flat_map(|t| t.lines())
-        .any(|line| starts_like_a_marker(line, &markers))
-    {
-        return None;
-    }
-    let marked = MergeOptions::new()
-        .set_conflict_style(ConflictStyle::Diff3)
-        .set_conflict_marker_length(FALLBACK_MARKER_LEN)
-        .merge(&base, &mine, &theirs)
-        .err()?;
-    let mut merged = resolve_marked(&marked)?;
-    if added {
-        merged.pop();
-    }
-    Some(merged)
+/// What a line is to the cell fallback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Row {
+    /// A table row holding cells.
+    Data,
+    /// A table's delimiter row (`| --- | :-: |`).
+    Delimiter,
+    /// Anything else: prose, a heading, a fenced or indented code line.
+    Other,
 }
 
-/// The four marker lines diffy writes with [`FALLBACK_MARKER_LEN`], in the
-/// order a diff3-style hunk has them: ours, original, the middle, theirs.
-fn marker_lines() -> [String; 4] {
-    let run = |c: char| c.to_string().repeat(FALLBACK_MARKER_LEN);
-    [
-        format!("{} ours\n", run('<')),
-        format!("{} original\n", run('|')),
-        format!("{}\n", run('=')),
-        format!("{} theirs\n", run('>')),
-    ]
+/// Classify each line of one text. A line is a table row when it starts or
+/// ends with an unescaped pipe, or when it belongs to a table opened by a
+/// header row and a delimiter row with as many cells (the pipeless GFM
+/// form), up to the first line without an unescaped pipe. Lines inside a
+/// fenced code block, and lines indented four spaces or more, are never
+/// rows.
+fn table_rows(lines: &[&str]) -> Vec<Row> {
+    let mut kinds = vec![Row::Other; lines.len()];
+    let mut fence: Option<char> = None;
+    let mut in_table = false;
+    for (k, line) in lines.iter().enumerate() {
+        let text = line.trim_end_matches('\n');
+        let trimmed = text.trim();
+        if let Some(c) = fence {
+            if trimmed.starts_with(&c.to_string().repeat(3)) {
+                fence = None;
+            }
+            in_table = false;
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fence = trimmed.chars().next();
+            in_table = false;
+            continue;
+        }
+        if text.starts_with("    ") || text.starts_with('\t') || !has_unescaped_pipe(trimmed) {
+            in_table = false;
+            continue;
+        }
+        let opens = lines.get(k + 1).is_some_and(|next| {
+            let next = next.trim_end_matches('\n').trim();
+            is_delimiter(next) && cells(next).len() == cells(trimmed).len()
+        });
+        in_table = in_table || opens;
+        let edged =
+            trimmed.starts_with('|') || (trimmed.ends_with('|') && !trimmed.ends_with("\\|"));
+        if in_table || edged {
+            kinds[k] = if is_delimiter(trimmed) {
+                Row::Delimiter
+            } else {
+                Row::Data
+            };
+        }
+    }
+    kinds
+}
+
+/// Whether `text` holds a pipe that is not escaped by a backslash.
+fn has_unescaped_pipe(text: &str) -> bool {
+    split_cells(text).len() > 1
+}
+
+/// The cells of a trimmed row, its edge pipes dropped.
+fn cells(trimmed: &str) -> Vec<&str> {
+    let mut parts = split_cells(trimmed);
+    if trimmed.starts_with('|') {
+        parts.remove(0);
+    }
+    if parts.len() > 1 && trimmed.ends_with('|') && !trimmed.ends_with("\\|") {
+        parts.pop();
+    }
+    parts
+}
+
+/// Whether a trimmed row is a delimiter row: every cell dashes with an
+/// optional colon at either end.
+fn is_delimiter(trimmed: &str) -> bool {
+    let parts = cells(trimmed);
+    has_unescaped_pipe(trimmed)
+        && !parts.is_empty()
+        && parts.iter().all(|cell| {
+            let cell = cell.trim();
+            let cell = cell.strip_prefix(':').unwrap_or(cell);
+            let cell = cell.strip_suffix(':').unwrap_or(cell);
+            !cell.is_empty() && cell.bytes().all(|c| c == b'-')
+        })
+}
+
+/// `text` split at every pipe not preceded by a backslash, GFM's rule for
+/// cells (inside code spans too). The pieces join back with `|` to `text`
+/// byte for byte, edge pieces included: a row written with edge pipes has
+/// an empty first and last piece, one written without them has none.
+fn split_cells(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut pieces = Vec::new();
+    let mut from = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        if byte == b'|' && (at == 0 || bytes[at - 1] != b'\\') {
+            pieces.push(&text[from..at]);
+            from = at + 1;
+        }
+    }
+    pieces.push(&text[from..]);
+    pieces
+}
+
+/// Merge one table row three ways, cell by cell. Every version must have the
+/// same number of cells and the same line ending; each cell is taken byte
+/// for byte from the side that changed it, an identical change from both
+/// sides is kept once, and a cell both sides changed differently is a
+/// conflict.
+fn merge_row(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    let ending = |line: &str| line.ends_with('\n');
+    if ending(base) != ending(mine) || ending(base) != ending(theirs) {
+        return None;
+    }
+    let [b, m, t] = [base, mine, theirs].map(|line| split_cells(line.trim_end_matches('\n')));
+    if b.len() != m.len() || b.len() != t.len() {
+        return None;
+    }
+    let mut merged = Vec::with_capacity(b.len());
+    for ((b, m), t) in b.iter().zip(&m).zip(&t) {
+        merged.push(if m == t || t == b {
+            *m
+        } else if m == b {
+            *t
+        } else {
+            return None;
+        });
+    }
+    let mut row = merged.join("|");
+    if ending(base) {
+        row.push('\n');
+    }
+    Some(row)
+}
+
+/// The four marker runs no input or merged line may start with.
+fn marker_runs() -> [String; 4] {
+    ['<', '|', '=', '>'].map(|c| c.to_string().repeat(FALLBACK_MARKER_LEN))
 }
 
 /// Whether `line` starts with one of the four marker runs.
 fn starts_like_a_marker(line: &str, markers: &[String; 4]) -> bool {
-    markers
-        .iter()
-        .any(|m| line.starts_with(&m[..FALLBACK_MARKER_LEN]))
-}
-
-/// Read diffy's diff3-style marked text and merge each hunk per character.
-/// `None` when a hunk does not pair line for line or does not merge, when
-/// the text holds no hunk at all or ends inside one, and when the result
-/// still holds a line that starts like a marker: the conflict stands.
-fn resolve_marked(marked: &str) -> Option<String> {
-    let markers = marker_lines();
-    let [open, original, middle, close] = &markers;
-    enum Part {
-        Outside,
-        Mine,
-        Base,
-        Theirs,
-    }
-    let mut part = Part::Outside;
-    let mut hunks = 0;
-    let mut hunk: [Vec<&str>; 3] = Default::default();
-    let mut merged = String::with_capacity(marked.len());
-    for line in marked.split_inclusive('\n') {
-        match part {
-            Part::Outside if line == open => part = Part::Mine,
-            Part::Outside => merged.push_str(line),
-            Part::Mine if line == original => part = Part::Base,
-            Part::Mine => hunk[1].push(line),
-            Part::Base if line == middle => part = Part::Theirs,
-            Part::Base => hunk[0].push(line),
-            Part::Theirs if line == close => {
-                let [b, m, t] = std::mem::take(&mut hunk);
-                if !pairs_line_for_line(&b, &m) || !pairs_line_for_line(&b, &t) {
-                    return None;
-                }
-                for ((b, m), t) in b.iter().zip(&m).zip(&t) {
-                    merged.push_str(&grapheme_merge(b, m, t)?);
-                }
-                hunks += 1;
-                part = Part::Outside;
-            }
-            Part::Theirs => hunk[2].push(line),
-        }
-    }
-    if !matches!(part, Part::Outside) || hunks == 0 {
-        return None;
-    }
-    if merged
-        .lines()
-        .any(|line| starts_like_a_marker(line, &markers))
-    {
-        return None;
-    }
-    Some(merged)
-}
-
-/// A three-way merge of one line per extended grapheme cluster: each cluster
-/// is interned to an id, the ids are merged by diffy one per line, and a
-/// clean result is read back. Clusters are whole tokens, so a merged line is
-/// always made of clusters one of the sides holds. The same change made by
-/// both sides at the same place is kept once, as the line merge keeps a line
-/// both sides changed alike.
-///
-/// The merged line is cut into clusters once more and must give back the
-/// clusters it was made of: clusters set side by side can join into another
-/// one (two lone regional indicators make a flag), and a merge that changes
-/// what a cluster is stays a conflict.
-fn grapheme_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
-    let mut clusters: Vec<&str> = Vec::new();
-    let mut ids: HashMap<&str, usize> = HashMap::new();
-    let [base, mine, theirs] = [base, mine, theirs].map(|text| {
-        let mut out = String::new();
-        for cluster in text.graphemes(true) {
-            let id = *ids.entry(cluster).or_insert_with(|| {
-                clusters.push(cluster);
-                clusters.len() - 1
-            });
-            out.push_str(&id.to_string());
-            out.push('\n');
-        }
-        out
-    });
-    let merged = diffy::merge(&base, &mine, &theirs).ok()?;
-    let tokens: Vec<&str> = merged
-        .lines()
-        .map(|id| {
-            id.parse::<usize>()
-                .ok()
-                .and_then(|i| clusters.get(i).copied())
-        })
-        .collect::<Option<_>>()?;
-    let line = tokens.concat();
-    keeps_clusters(&line, &tokens).then_some(line)
-}
-
-/// Whether `line` cuts into exactly `tokens` as extended grapheme clusters.
-fn keeps_clusters(line: &str, tokens: &[&str]) -> bool {
-    line.graphemes(true).eq(tokens.iter().copied())
+    markers.iter().any(|m| line.starts_with(m.as_str()))
 }
 
 /// Morph the live Y.Text into `target` with a minimal edit script, positions
@@ -496,7 +548,7 @@ mod tests {
     const FLAG_DK: &str = "\u{1F1E9}\u{1F1F0}";
 
     #[test]
-    fn two_cells_of_one_row_changed_on_each_side_merge_per_character() {
+    fn two_cells_of_one_row_changed_on_each_side_merge_per_cell() {
         let MergeOutcome::Clean(merged) = three_way("| a | b |\n", "| aX | b |\n", "| a | bY |\n")
         else {
             panic!("two cells of one row merge");
@@ -527,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn a_character_merge_needs_every_conflicting_line_to_merge() {
+    fn a_cell_merge_needs_every_conflicting_row_to_merge() {
         // The first row merges per character, the second does not: the hunk
         // is a conflict, never half merged.
         let base = "| a | b |\n| c | d |\n";
@@ -561,18 +613,26 @@ mod tests {
             three_way(&base, &mine, &theirs),
             MergeOutcome::Conflict
         ));
-        // Two flags side by side are two clusters, each its own token.
-        let base = format!("| {FLAG_DE} x {FLAG_DE} |\n");
-        let mine = format!("| {FLAG_DK} x {FLAG_DE} |\n");
-        let theirs = format!("| {FLAG_DE} x {FLAG_DK} |\n");
+        // Two flags in one cell are one cell both sides changed.
+        let base = format!("| {FLAG_DE} x {FLAG_DE} | b |\n");
+        let mine = format!("| {FLAG_DK} x {FLAG_DE} | b |\n");
+        let theirs = format!("| {FLAG_DE} x {FLAG_DK} | b |\n");
+        assert!(matches!(
+            three_way(&base, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+        // In two cells they merge, each taken byte for byte.
+        let base = format!("| {FLAG_DE} | {FLAG_DE} |\n");
+        let mine = format!("| {FLAG_DK} | {FLAG_DE} |\n");
+        let theirs = format!("| {FLAG_DE} | {FLAG_DK} |\n");
         let MergeOutcome::Clean(merged) = three_way(&base, &mine, &theirs) else {
-            panic!("separate flags merge");
+            panic!("flags in separate cells merge");
         };
-        assert_eq!(merged, format!("| {FLAG_DK} x {FLAG_DK} |\n"));
+        assert_eq!(merged, format!("| {FLAG_DK} | {FLAG_DK} |\n"));
     }
 
     #[test]
-    fn a_row_without_a_final_line_ending_merges_per_character() {
+    fn a_row_without_a_final_line_ending_merges_per_cell() {
         let MergeOutcome::Clean(merged) = three_way("| a | b |", "| aX | b |", "| a | bY |") else {
             panic!("a last row without a line ending merges");
         };
@@ -732,15 +792,111 @@ mod tests {
     #[test]
     fn a_tie_in_likeness_pairs_nothing() {
         // Both base lines are equally like both side lines: no evidence.
-        assert!(!closest_in_place(&["ab\n", "ab\n"], &["abx\n", "aby\n"]));
-        assert!(closest_in_place(
+        assert!(!replaces_in_place(&["ab\n", "ab\n"], &["abx\n", "aby\n"]));
+        assert!(replaces_in_place(
             &["| 1 | 2 |\n", "| 3 | 4 |\n"],
             &["| 1x | 2 |\n", "| 3x | 4 |\n"]
+        ));
+        // An inserted or deleted line anywhere fails the whole text.
+        assert!(!replaces_in_place(&["a\n", "b\n"], &["a\n", "b\n", "c\n"]));
+    }
+
+    #[test]
+    fn a_swap_split_by_an_unchanged_row_is_a_conflict() {
+        let base = "| 1 | aa bb |\n| 2 | aa bb |\n| 3 | aa bb |\n";
+        let mine = "| 1 | Qaa bb |\n| 2 | aa bb |\n| 3 | aa bb |\n";
+        let theirs = "| 3 | aa Ybb |\n| 2 | aa bb |\n| 1 | aa bbY |\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
         ));
     }
 
     #[test]
-    fn two_rows_both_sides_changed_in_place_still_merge_per_character() {
+    fn a_row_replaced_by_a_new_one_against_an_edit_of_it_is_a_conflict() {
+        // Mine changed cell 2, theirs changed cells 1 and 2: cell 2 changed
+        // on both sides.
+        let base = "| 1 | aa |\n| 2 | aa |\n";
+        let mine = "| 1 | Qaa |\n| 2 | aa |\n";
+        let theirs = "| 8 | ab |\n| 2 | aa |\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn only_table_rows_take_the_cell_fallback() {
+        // A prose line both sides changed stays a conflict, as in 0.30.0.
+        assert!(matches!(
+            three_way("one two three\n", "one X two three\n", "one two Y three\n"),
+            MergeOutcome::Conflict
+        ));
+        // A conflicting run that holds a prose line is not taken either.
+        assert!(matches!(
+            three_way(
+                "intro\n| a | b |\n",
+                "intro mine\n| aX | b |\n",
+                "intro\n| a | bY |\n"
+            ),
+            MergeOutcome::Conflict
+        ));
+        // A changed delimiter row inside the run is not taken.
+        assert!(matches!(
+            three_way(
+                "| a | b |\n| - | - |\n",
+                "| aX | b |\n| :- | - |\n",
+                "| a | bY |\n| - | - |\n"
+            ),
+            MergeOutcome::Conflict
+        ));
+        // A row in a fenced code block is not a table row.
+        assert!(matches!(
+            three_way(
+                "```\n| a | b |\n```\n",
+                "```\n| aX | b |\n```\n",
+                "```\n| a | bY |\n```\n"
+            ),
+            MergeOutcome::Conflict
+        ));
+        // A pipeless table, opened by its header and delimiter rows, is.
+        let MergeOutcome::Clean(merged) = three_way(
+            "a | b\n--|--\n1 | 2\n",
+            "a | b\n--|--\n1x | 2\n",
+            "a | b\n--|--\n1 | 2y\n",
+        ) else {
+            panic!("a pipeless table row merges per cell");
+        };
+        assert_eq!(merged, "a | b\n--|--\n1x | 2y\n");
+    }
+
+    #[test]
+    fn an_escaped_pipe_stays_inside_its_cell() {
+        let base = "| a \\| b | c |\n";
+        let mine = "| a \\| bX | c |\n";
+        let theirs = "| a \\| b | cY |\n";
+        let MergeOutcome::Clean(merged) = three_way(base, mine, theirs) else {
+            panic!("an escaped pipe is not a cell boundary");
+        };
+        assert_eq!(merged, "| a \\| bX | cY |\n");
+        // Splitting a cell with a new pipe changes the cell count.
+        assert!(matches!(
+            three_way(base, "| a | b | c | d |\n", theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn the_same_change_to_one_cell_from_both_sides_is_kept_once() {
+        let MergeOutcome::Clean(merged) = three_way("| a | b |\n", "| aX | bZ |\n", "| aX | b |\n")
+        else {
+            panic!("an identical cell change merges");
+        };
+        assert_eq!(merged, "| aX | bZ |\n");
+    }
+
+    #[test]
+    fn two_rows_both_sides_changed_in_place_still_merge_per_cell() {
         let base = "| 1 | 2 |\n| 3 | 4 |\n";
         let mine = "| 1x | 2 |\n| 3x | 4 |\n";
         let theirs = "| 1 | 2y |\n| 3 | 4y |\n";
@@ -748,16 +904,6 @@ mod tests {
             panic!("rows changed in place pair line for line");
         };
         assert_eq!(merged, "| 1x | 2y |\n| 3x | 4y |\n");
-    }
-
-    #[test]
-    fn a_marked_text_without_a_hunk_or_with_a_marker_left_is_never_taken() {
-        let [open, original, middle, close] = marker_lines();
-        assert_eq!(resolve_marked("| a | b |\n"), None, "no hunk was read");
-        let hunk = format!("{open}| aX | b |\n{original}| a | b |\n{middle}| a | bY |\n{close}");
-        assert_eq!(resolve_marked(&hunk).as_deref(), Some("| aX | bY |\n"));
-        let stray = format!("{}\n{hunk}", &close[..FALLBACK_MARKER_LEN]);
-        assert_eq!(resolve_marked(&stray), None, "a marker line is left over");
     }
 
     #[test]
@@ -779,12 +925,8 @@ mod tests {
     }
 
     #[test]
-    fn clusters_that_would_join_after_a_merge_are_refused() {
-        // Two lone regional indicators set side by side read as one flag.
-        let (d, e) = ("\u{1F1E9}", "\u{1F1EA}");
-        assert!(!keeps_clusters(&format!("{d}{e}"), &[d, e]));
-        assert!(keeps_clusters(&format!("{d}x{e}"), &[d, "x", e]));
-        // A lone regional indicator next to an edit survives as it was.
+    fn a_lone_regional_indicator_beside_an_edit_survives_byte_identical() {
+        let d = "\u{1F1E9}";
         let base = format!("| {d}a | b |\n");
         let mine = format!("| {d}ax | b |\n");
         let theirs = format!("| {d}a | by |\n");
@@ -792,6 +934,160 @@ mod tests {
             panic!("a lone regional indicator beside the edits merges");
         };
         assert_eq!(merged, format!("| {d}ax | by |\n"));
+    }
+
+    /// One side of the oracle below: the rows it ends with and what it did.
+    #[derive(Clone, Default)]
+    struct Moved {
+        rows: Vec<[String; 3]>,
+        edited: Vec<(String, usize)>,
+        deleted: Vec<String>,
+        added: Vec<[String; 3]>,
+        structural: bool,
+    }
+
+    fn render_rows(rows: &[[String; 3]]) -> String {
+        rows.iter()
+            .map(|[id, x, y]| format!("| {id} | {x} | {y} |\n"))
+            .collect()
+    }
+
+    /// Every side the oracle tries against a base: nothing, one edit (a
+    /// marker appended to cell 1 or 2 of a row), a deleted row, an added row,
+    /// a row replaced by a new one, two rows swapped, and each of those
+    /// moves with one edit on top.
+    fn moves(base: &[[String; 3]], mark: char, new_id: &str) -> Vec<Moved> {
+        let plain = Moved {
+            rows: base.to_vec(),
+            ..Moved::default()
+        };
+        let new_row = || {
+            [
+                new_id.to_string(),
+                format!("n{new_id}"),
+                format!("m{new_id}"),
+            ]
+        };
+        let mut moved = vec![plain.clone()];
+        for k in 0..base.len() {
+            let mut d = plain.clone();
+            let gone = d.rows.remove(k);
+            d.deleted.push(gone[0].clone());
+            d.structural = true;
+            let mut r = d.clone();
+            r.rows.insert(k, new_row());
+            r.added.push(new_row());
+            moved.push(d);
+            moved.push(r);
+        }
+        for q in 0..=base.len() {
+            let mut a = plain.clone();
+            a.rows.insert(q, new_row());
+            a.added.push(new_row());
+            a.structural = true;
+            moved.push(a);
+        }
+        for a in 0..base.len() {
+            for b in a + 1..base.len() {
+                let mut w = plain.clone();
+                w.rows.swap(a, b);
+                w.structural = true;
+                moved.push(w);
+            }
+        }
+        let mut all = Vec::new();
+        for side in moved {
+            all.push(side.clone());
+            for k in 0..side.rows.len() {
+                if side.added.iter().any(|row| row[0] == side.rows[k][0]) {
+                    continue;
+                }
+                for cell in [1, 2] {
+                    let mut e = side.clone();
+                    e.rows[k][cell].push(mark);
+                    e.edited.push((e.rows[k][0].clone(), cell));
+                    all.push(e);
+                }
+            }
+        }
+        all
+    }
+
+    /// Why a Clean result is wrong, if it is.
+    fn wrong_clean(base: &[[String; 3]], m: &Moved, t: &Moved, merged: &str) -> Option<String> {
+        for (a, b) in [(m, t), (t, m)] {
+            if a.deleted
+                .iter()
+                .any(|id| b.edited.iter().any(|(e, _)| e == id))
+            {
+                return Some("an edit of a deleted row".into());
+            }
+        }
+        if m.edited.iter().any(|e| t.edited.contains(e)) {
+            return Some("one cell edited on both sides".into());
+        }
+        let mut want: Vec<String> = Vec::new();
+        for row in base {
+            if m.deleted.contains(&row[0]) || t.deleted.contains(&row[0]) {
+                continue;
+            }
+            let mut row = row.clone();
+            for (side, mark) in [(m, 'Q'), (t, 'Y')] {
+                for (id, cell) in &side.edited {
+                    if *id == row[0] {
+                        row[*cell].push(mark);
+                    }
+                }
+            }
+            want.push(render_rows(&[row]));
+        }
+        for row in m.added.iter().chain(&t.added) {
+            want.push(render_rows(std::slice::from_ref(row)));
+        }
+        let mut got: Vec<String> = merged.split_inclusive('\n').map(str::to_string).collect();
+        want.sort();
+        got.sort();
+        (want != got).then(|| format!("rows {got:?}, wanted {want:?}"))
+    }
+
+    #[test]
+    fn the_cell_fallback_never_merges_a_move_wrong() {
+        let mut cases = 0;
+        for n in [2usize, 3] {
+            let base: Vec<[String; 3]> = (1..=n)
+                .map(|k| [k.to_string(), format!("x{k}"), format!("y{k}")])
+                .collect();
+            let text = render_rows(&base);
+            let mines = moves(&base, 'Q', "7");
+            let theirs = moves(&base, 'Y', "8");
+            for m in &mines {
+                for t in &theirs {
+                    let (ms, ts) = (render_rows(&m.rows), render_rows(&t.rows));
+                    if line_merge(&text, &ms, &ts).is_some() {
+                        continue;
+                    }
+                    cases += 1;
+                    let outcome = three_way(&text, &ms, &ts);
+                    let simple = !m.structural && !t.structural;
+                    let disjoint = !m.edited.iter().any(|e| t.edited.contains(e));
+                    match outcome {
+                        MergeOutcome::Clean(merged) => {
+                            if let Some(why) = wrong_clean(&base, m, t, &merged) {
+                                panic!("{why}\nbase {text:?}\nmine {ms:?}\ntheirs {ts:?}");
+                            }
+                        }
+                        MergeOutcome::Conflict => assert!(
+                            !(simple && disjoint),
+                            "edits of different cells merge\nbase {text:?}\nmine {ms:?}\ntheirs {ts:?}"
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(
+            cases > 1000,
+            "the oracle reached the fallback {cases} times"
+        );
     }
 
     const HARBOR: &str = "---\ntype: manifest\ntitle: Harbor\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\n---\n\n# Harbor\n\n## Scope\n\n- Engineering\n";
