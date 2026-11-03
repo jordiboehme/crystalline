@@ -61,6 +61,8 @@ import {
   setCalloutKind,
   setStatusColour,
 } from "./elementContext";
+import { openCellView } from "./floatingContext";
+import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
 import { TableSizePicker } from "./TableSizePicker";
@@ -194,14 +196,17 @@ export interface CalloutFace {
 function CalloutSegment({
   face,
   view,
+  allow,
 }: {
   face: CalloutFace;
   view: EditorView | null;
+  /** Asked when a change runs: false refuses it (main's turn or not). */
+  allow: (view: EditorView) => boolean;
 }): ReactElement {
   const word = CALLOUT_WORDS[face.callout];
   const fold = face.fold ?? (face.callout === "details" ? "closed" : null);
   const run = (edit: (v: EditorView) => boolean) => {
-    if (view) {
+    if (view && allow(view)) {
       edit(view);
     }
   };
@@ -303,9 +308,12 @@ function CalloutSegment({
 function StatusSegment({
   colour,
   view,
+  allow,
 }: {
   colour: StatusColour;
   view: EditorView | null;
+  /** Asked when a change runs: false refuses it (main's turn or not). */
+  allow: (view: EditorView) => boolean;
 }): ReactElement {
   return (
     <div role="group" aria-label="Status colour" className={TRACK}>
@@ -317,7 +325,7 @@ function StatusSegment({
           disabled={view === null}
           aria-pressed={each === colour}
           onClick={() => {
-            if (view) {
+            if (view && allow(view)) {
               setStatusColour(view, each);
             }
           }}
@@ -393,6 +401,8 @@ function ConfirmHeadingDialog({
 export function EditorToolbar({
   view: buffer,
   tableActive = false,
+  tableDrawn = false,
+  raw = false,
   imageActive = false,
   calloutActive = null,
   statusActive = null,
@@ -402,10 +412,22 @@ export function EditorToolbar({
   adapter,
   disabled = false,
   attachDisabled = false,
+  cellOpen = false,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
   tableActive?: boolean;
+  /**
+   * Whether the table grid draws the table the caret is in. A drawn table's
+   * add, delete, align and prettify verbs live in the grid's cell menu and
+   * floating actions, so the bar's table segment steps aside for it.
+   */
+  tableDrawn?: boolean;
+  /**
+   * Raw mode: the table is pipe source again and the grid is gone, so the
+   * segment is drawn whatever `tableDrawn` says.
+   */
+  raw?: boolean;
   /**
    * Whether the caret is on an attachment image right now. Drawn rather than
    * disabled, like the table segment beside it: a menu that has nothing to act
@@ -447,9 +469,28 @@ export function EditorToolbar({
    * cannot take now.
    */
   attachDisabled?: boolean;
+  /**
+   * Whether a table cell is open in the grid. Main's selection is stale
+   * then: the inline verbs (marks and links) run in the cell, and the verbs
+   * that act on main's line or insert a block there are off, as are the
+   * segments drawn from main's caret (image, table, callout, status).
+   */
+  cellOpen?: boolean;
 }): ReactElement {
   const view = disabled ? null : buffer;
   const off = view === null;
+  /**
+   * Main's selection parked behind an open cell whose editor is not mounted
+   * (its table scrolled away), with main not holding the focus: the screen's
+   * `cellOpen` is false then, but main's selection is as stale.
+   */
+  const parked =
+    view !== null &&
+    view.state.facet(mainSelectionParked) &&
+    view.dom.ownerDocument.activeElement !== view.contentDOM;
+  const cellNow = cellOpen || parked;
+  /** Off for the verbs that act on main's line or insert into main. */
+  const lineOff = off || cellNow;
   /** The heading change waiting for the person's answer, if any. */
   const [asking, setAsking] = useState<{
     level: number;
@@ -461,9 +502,36 @@ export function EditorToolbar({
    * because the menu closes before the state above has rendered.
    */
   const askingNow = useRef(false);
+  /**
+   * The view a verb acts on, read when it runs: the open cell's editor, or
+   * main, or nothing. Nothing while main's selection is parked behind an
+   * open cell whose editor is not mounted (its table scrolled away): that
+   * selection is stale, and the cell is not there to take the verb. Main
+   * holding the focus itself always means main.
+   */
+  const targetOf = (v: EditorView): EditorView | null => {
+    const cell = openCellView(v);
+    if (cell) return cell;
+    const focused = v.dom.ownerDocument.activeElement === v.contentDOM;
+    return v.state.facet(mainSelectionParked) && !focused ? null : v;
+  };
+  /** Whether a verb on main's line or caret may run now. */
+  const mainTurn = (v: EditorView): boolean => targetOf(v) === v;
+  /**
+   * A verb on main's line or main's caret. Refused unless main is the
+   * target, so a click that beats the render that turned the button off
+   * still changes nothing.
+   */
   const act = (run: (view: EditorView) => boolean) => () => {
-    if (view) {
+    if (view && targetOf(view) === view) {
       run(view);
+    }
+  };
+  /** An inline verb: in the open cell when there is one, else on main. */
+  const actInline = (run: (view: EditorView) => boolean) => () => {
+    const target = view ? targetOf(view) : null;
+    if (target) {
+      run(target);
     }
   };
   const keepSelection = (event: MouseEvent) => {
@@ -527,29 +595,29 @@ export function EditorToolbar({
           label="Bold"
           icon={Bold}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "**"))}
+          onClick={actInline((v) => toggleInline(v, "**"))}
         />
         <IconButton
           label="Italic"
           icon={Italic}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "*"))}
+          onClick={actInline((v) => toggleInline(v, "*"))}
         />
         <IconButton
           label="Strikethrough"
           icon={Strikethrough}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "~~"))}
+          onClick={actInline((v) => toggleInline(v, "~~"))}
         />
         <IconButton
           label="Inline code"
           icon={Code}
           disabled={off}
-          onClick={act((v) => toggleInline(v, "`"))}
+          onClick={actInline((v) => toggleInline(v, "`"))}
         />
         <DropdownMenu.Root>
           <DropdownMenu.Trigger asChild>
-            <IconButton label="Heading" icon={Heading} disabled={off} />
+            <IconButton label="Heading" icon={Heading} disabled={lineOff} />
           </DropdownMenu.Trigger>
           <DropdownMenu.Portal>
             <DropdownMenu.Content
@@ -574,7 +642,7 @@ export function EditorToolbar({
                   key={level}
                   className={ITEM_CLASSES}
                   onSelect={() => {
-                    if (view) {
+                    if (view && targetOf(view) === view) {
                       pickHeading(view, level);
                     }
                   }}
@@ -588,25 +656,25 @@ export function EditorToolbar({
         <IconButton
           label="Bulleted list"
           icon={List}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "- "))}
         />
         <IconButton
           label="Numbered list"
           icon={ListOrdered}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "1. ", ORDERED_ITEM))}
         />
         <IconButton
           label="Task list"
           icon={ListTodo}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "- [ ] "))}
         />
         <IconButton
           label="Blockquote"
           icon={TextQuote}
-          disabled={off}
+          disabled={lineOff}
           onClick={act((v) => toggleLinePrefix(v, "> "))}
         />
         {/* Only where the document links engrams: a Reflection page does not. */}
@@ -615,14 +683,14 @@ export function EditorToolbar({
             label="Wiki link"
             icon={Brackets}
             disabled={off}
-            onClick={act(insertWikilink)}
+            onClick={actInline(insertWikilink)}
           />
         )}
         <IconButton
           label="Link"
           icon={Link}
           disabled={off}
-          onClick={act(insertMarkdownLink)}
+          onClick={actInline(insertMarkdownLink)}
         />
         {/*
         The insert verbs are named buttons of their own, and this hairline
@@ -634,12 +702,12 @@ export function EditorToolbar({
         this bar's own icon button, so the row reads as one kind of thing
         whatever happens after the press.
       */}
-        <TableSizePicker view={view} />
+        <TableSizePicker view={lineOff ? null : view} allow={mainTurn} />
         {/*
         Every other element, as words: callouts, diagrams, blocks and inline
         elements, from the same registry as the slash menu.
       */}
-        <InsertMenu view={view} />
+        <InsertMenu view={lineOff ? null : view} allow={mainTurn} />
         {/*
         The other insert verb that asks first, and the only one whose question
         the browser asks: which file. Paste and drop reach the same flow with
@@ -647,9 +715,15 @@ export function EditorToolbar({
         the clipboard nor draggable onto the buffer.
       */}
         {onAttach && (
-          <AttachButton onAttach={onAttach} disabled={off || attachDisabled} />
+          <AttachButton
+            onAttach={(files) => {
+              // An upload inserts at main's selection: only on main's turn.
+              if (view && mainTurn(view)) onAttach(files);
+            }}
+            disabled={lineOff || attachDisabled}
+          />
         )}
-        {imageActive && (
+        {imageActive && !cellNow && (
           <>
             {/*
             The same hairline, in front of the one menu that acts on the image
@@ -709,7 +783,7 @@ export function EditorToolbar({
             </DropdownMenu.Root>
           </>
         )}
-        {tableActive && (
+        {tableActive && !cellNow && (raw || !tableDrawn) && (
           <>
             {/*
             The same hairline again, in front of the verbs that act on the
@@ -801,20 +875,20 @@ export function EditorToolbar({
             />
           </>
         )}
-        {calloutActive !== null && (
+        {calloutActive !== null && !cellNow && (
           <>
             {/*
             The same hairline, in front of what acts on the callout the caret
             is in: its kind and whether it starts open.
           */}
             <Divider />
-            <CalloutSegment face={calloutActive} view={view} />
+            <CalloutSegment face={calloutActive} view={view} allow={mainTurn} />
           </>
         )}
-        {statusActive !== null && (
+        {statusActive !== null && !cellNow && (
           <>
             <Divider />
-            <StatusSegment colour={statusActive} view={view} />
+            <StatusSegment colour={statusActive} view={view} allow={mainTurn} />
           </>
         )}
         {trailing !== undefined && (

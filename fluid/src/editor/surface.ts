@@ -18,12 +18,17 @@ import { elementContextListener } from "./elementContext";
 import { elementPreviews } from "./elementPreviews";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
+import type { FloatingContext } from "./floatingContext";
+import { floatingContextListener } from "./floatingContext";
+import { cellPreviewLayers } from "./grid/draws";
+import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
 import { richPaste } from "./richPaste";
 import { RAW_MONO, baseExtensions } from "./setup";
 import { slashCompletions } from "./slashMenu";
+import type { TableUiContext } from "./tableVerbs";
 import { tableContextListener } from "./tableVerbs";
 import { formattingKeymap } from "./toolbar";
 
@@ -67,7 +72,7 @@ export interface SurfaceOptions {
    * function and a listener added at only one site would go silent the first
    * time a session rebuilt the buffer.
    */
-  onTableContext: (inTable: boolean) => void;
+  onTableContext: (context: TableUiContext) => void;
   /**
    * Told when the caret enters or leaves an attachment image, so the format
    * bar can draw its image menu. It travels with the table listener above and
@@ -80,6 +85,12 @@ export interface SurfaceOptions {
    * segment for it. It travels with the listeners above for their reason.
    */
   onElementContext: (face: ElementFace) => void;
+  /**
+   * Told what the floating action bar stands by: a text selection, the open
+   * table cell, or nothing. It travels with the listeners above for their
+   * reason.
+   */
+  onFloatingContext: (context: FloatingContext) => void;
 }
 
 /**
@@ -96,6 +107,13 @@ export function previewConfig(
   images: Extension,
   adapter: DocumentAdapter,
 ): Extension {
+  // The prose layers the main view gets. The cell editor of the table grid
+  // draws with the same ones, read through `cellPreviewLayers`.
+  const proseLayers = [
+    elementPreviews({ sections: adapter.kind === "reflection" }),
+    livePreview(),
+    ...adapter.previewLayers,
+  ];
   return off
     ? // Raw is deliberately the source view, so the whole buffer goes back to
       // mono: the shared theme sets prose proportional, and this is the one
@@ -104,9 +122,11 @@ export function previewConfig(
     : [
         // Before the mark folding, so a callout head, a label or a formula
         // replaces its whole span over the marks folded inside it.
-        elementPreviews({ sections: adapter.kind === "reflection" }),
-        livePreview(),
-        ...adapter.previewLayers,
+        ...proseLayers,
+        cellPreviewLayers.of(proseLayers),
+        // Before the read-only previews: the grid takes over the tables it
+        // draws once its chunk is in.
+        tableGrid(),
         fencePreviews(dark),
         // A pasted screenshot is a path in the buffer and a picture on the
         // page, so the picture is drawn here too: an author placing an image
@@ -144,6 +164,10 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // And for the callout and status segments: a callout's kind is text in
     // Raw mode too.
     elementContextListener(options.onElementContext),
+    // And for the floating action bar. Outside the preview compartment: a
+    // selection is a selection in Raw mode too, and the screen decides
+    // there whether the bar draws.
+    floatingContextListener(options.onFloatingContext),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.
     options.uploads,

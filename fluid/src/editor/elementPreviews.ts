@@ -51,6 +51,7 @@ import { labelPlainWords } from "../markdown/statusText";
 import { SWATCH_CLASSES, colourOf } from "../markdown/swatch";
 import { calloutAt, calloutOf, statusOf } from "./elementContext";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parkingChanged, revealRanges } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS } from "./prose";
 
@@ -284,10 +285,13 @@ class MathWidget extends WidgetType {
   }
 }
 
-/** The line numbers any selection range touches. */
+/**
+ * The line numbers any selection range touches; none while main's selection
+ * is parked behind an open table cell.
+ */
 function activeLines(state: EditorState): Set<number> {
   const lines = new Set<number>();
-  for (const range of state.selection.ranges) {
+  for (const range of revealRanges(state)) {
     const from = state.doc.lineAt(range.from).number;
     const to = state.doc.lineAt(range.to).number;
     for (let line = from; line <= to; line += 1) {
@@ -505,7 +509,8 @@ const inlinePreviews = ViewPlugin.fromClass(
         update.docChanged ||
         update.selectionSet ||
         update.viewportChanged ||
-        parseAdvanced(update)
+        parseAdvanced(update) ||
+        parkingChanged(update)
       ) {
         this.built = buildInline(update.view);
       }
@@ -684,7 +689,7 @@ function scanBlocks(state: EditorState, sections: boolean): Scanned[] {
 function touchedKey(state: EditorState, blocks: Scanned[]): string {
   return blocks
     .map((block, index) =>
-      state.selection.ranges.some(
+      revealRanges(state).some(
         (range) => range.from <= block.to && range.to >= block.from,
       )
         ? index
@@ -737,7 +742,7 @@ function blockPreviews(sections: boolean): Extension {
         return previewsOf(tr.state, scanBlocks(tr.state, sections));
       }
       if (
-        tr.selection === undefined ||
+        (tr.selection === undefined && !parkingChanged(tr)) ||
         touchedKey(tr.state, value.blocks) === value.touched
       ) {
         return value;

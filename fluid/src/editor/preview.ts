@@ -33,6 +33,7 @@ import type { SyntaxNodeRef } from "@lezer/common";
 import { htmlCommentRanges } from "../markdown/htmlComments";
 import { isIdLine } from "../reflectionText";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { parkingChanged, revealRanges } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 
 /** The formatting marks that fold away off the active lines. */
@@ -157,10 +158,14 @@ function isFence(node: SyntaxNodeRef): boolean {
   return node.name === "CodeMark" && node.node.parent?.name === "FencedCode";
 }
 
-/** The line numbers any selection range touches. */
+/**
+ * The line numbers any selection range touches. None while a table cell is
+ * open: main's selection is stale then, and the line it sits on is not the
+ * one being edited (`mainSelectionParked`).
+ */
 function activeLines(view: EditorView): Set<number> {
   const lines = new Set<number>();
-  for (const range of view.state.selection.ranges) {
+  for (const range of revealRanges(view.state)) {
     const from = view.state.doc.lineAt(range.from).number;
     const to = view.state.doc.lineAt(range.to).number;
     for (let line = from; line <= to; line += 1) {
@@ -307,7 +312,8 @@ const previewPlugin = ViewPlugin.fromClass(
         update.docChanged ||
         update.selectionSet ||
         update.viewportChanged ||
-        parseAdvanced(update)
+        parseAdvanced(update) ||
+        parkingChanged(update)
       ) {
         this.decorations = buildDecorations(update.view);
       }

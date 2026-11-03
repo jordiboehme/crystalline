@@ -258,6 +258,7 @@ describe("richPaste", () => {
             onTableContext: () => {},
             onImageContext: () => {},
             onElementContext: () => {},
+            onFloatingContext: () => {},
           }),
         ],
       }),

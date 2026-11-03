@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../test/parse";
 import { describeMermaidError, fencePreviews } from "./fencePreviews";
+import { gridLoaded } from "./grid/draws";
 import { baseExtensions } from "./setup";
 
 vi.mock("mermaid", () => ({
@@ -178,6 +179,23 @@ describe("fence previews", () => {
     expect(table?.querySelectorAll("th").length).toBe(2);
     expect(table?.querySelectorAll("td").length).toBe(2);
     expect(table?.textContent).toContain("1");
+    view.destroy();
+  });
+
+  it.each([
+    ["no outer pipes", "a | b\n--|--\n1 | 2\n3 | 4\n"],
+    ["some outer pipes", "| a | b |\n|:--|--:|\n1 | 2\n| 3 | 4 |\n"],
+  ])("previews a table with %s, every row and cell (R23)", (_name, doc) => {
+    const view = editor(doc);
+    const table = view.dom.querySelector(".cm-table-preview table");
+    const rows = [...(table?.querySelectorAll("tr") ?? [])].map((tr) =>
+      [...tr.querySelectorAll("th, td")].map((el) => el.textContent),
+    );
+    expect(rows).toEqual([
+      ["a", "b"],
+      ["1", "2"],
+      ["3", "4"],
+    ]);
     view.destroy();
   });
 
@@ -593,5 +611,84 @@ describe("describeMermaidError", () => {
     expect(describeMermaidError(MESSAGES.flowchartMidBody, fence)).toBe(
       "Line 4: Expecting 'TAGEND', 'STR', 'MD_STR', 'UNICODE_TEXT', 'TEXT', 'TAGSTART', got 'SQS'",
     );
+  });
+});
+
+describe("the table preview and the grid", () => {
+  const TABLE = "| a | b |\n| - | - |\n| 1 | 2 |";
+
+  function withGrid(doc: string, loaded: boolean): EditorView {
+    return new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            gridLoaded.of(loaded),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+  }
+
+  it("leaves a top-level table to the grid once it is loaded", () => {
+    const view = withGrid(TABLE, true);
+    expect(view.dom.querySelector(".cm-table-preview")).toBeNull();
+    view.destroy();
+  });
+
+  it("still previews a table inside a blockquote with the grid loaded", () => {
+    const view = withGrid("> | a |\n> | - |\n> | 1 |", true);
+    expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+    view.destroy();
+  });
+
+  it("keeps every table's preview while the grid has not loaded", () => {
+    const view = withGrid(TABLE, false);
+    expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+    view.destroy();
+  });
+
+  it("keeps the preview when the lazy import never resolves", async () => {
+    const { tableGridWith } = await import("./grid/loader");
+    const grid = tableGridWith(() => new Promise(() => undefined));
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: TABLE,
+          extensions: [
+            ...baseExtensions(false),
+            grid.extension(),
+            fencePreviews(false),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+    view.destroy();
+  });
+
+  it("keeps the preview when the lazy import rejects", async () => {
+    const { tableGridWith } = await import("./grid/loader");
+    const grid = tableGridWith(() => Promise.reject(new Error("offline")));
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: TABLE,
+          extensions: [
+            ...baseExtensions(false),
+            grid.extension(),
+            fencePreviews(false),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+    view.destroy();
   });
 });

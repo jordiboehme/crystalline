@@ -45,13 +45,19 @@ function of(group: InsertAction["group"]): InsertAction[] {
 
 export function InsertMenu({
   view,
+  allow,
 }: {
   /** The buffer the entries edit; null turns the button off. */
   view: EditorView | null;
+  /**
+   * Asked when an entry runs: false refuses it (the sticky bar's guard
+   * while main's selection is parked behind a table cell).
+   */
+  allow?: (view: EditorView) => boolean;
 }): ReactElement {
   const stem = useId();
   const run = (action: InsertAction) => () => {
-    if (view) {
+    if (view && (allow?.(view) ?? true)) {
       action.run(view);
     }
   };

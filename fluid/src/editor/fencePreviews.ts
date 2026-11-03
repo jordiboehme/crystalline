@@ -32,6 +32,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
 import { mermaidConfig } from "../theme/mermaid";
+import { gridDraws, gridLoaded, gridUnavailable } from "./grid/draws";
 import { parseAdvanced } from "./parseProgress";
 
 let mermaidSequence = 0;
@@ -356,28 +357,36 @@ class MermaidPreviewWidget extends WidgetType {
  */
 class TablePreviewWidget extends WidgetType {
   readonly source: string;
+  /** Whether to say the grid could not be loaded (`gridUnavailable`). */
+  readonly unavailable: boolean;
 
-  constructor(source: string) {
+  constructor(source: string, unavailable = false) {
     super();
     this.source = source;
+    this.unavailable = unavailable;
   }
 
   override eq(other: TablePreviewWidget): boolean {
-    return other.source === this.source;
+    return (
+      other.source === this.source && other.unavailable === this.unavailable
+    );
   }
 
   override toDOM(): HTMLElement {
     const box = document.createElement("div");
     box.className = "cm-table-preview";
+    // Every line of the span is a row, with or without outer pipes (R23); a
+    // quoted table's later lines carry their quote marks inside the span.
     const rows = this.source
       .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("|"))
+      .map((line) => line.replace(/^\s*(?:>\s?)*/, "").trim())
+      .filter((line) => line !== "")
       .map((line) =>
         line
-          .replace(/^\||\|$/g, "")
-          .split("|")
-          .map((cell) => cell.trim()),
+          .replace(/^\|/, "")
+          .replace(/(?<!\\)\|$/, "")
+          .split(/(?<!\\)\|/)
+          .map((cell) => cell.trim().replaceAll("\\|", "|")),
       );
     const table = document.createElement("table");
     rows.forEach((cells, index) => {
@@ -404,6 +413,14 @@ class TablePreviewWidget extends WidgetType {
       table.appendChild(row);
     });
     box.appendChild(table);
+    if (this.unavailable) {
+      // The grid's chunk failed to load three times: one quiet line that
+      // says how to edit the table as a grid again.
+      const notice = document.createElement("div");
+      notice.className = "cm-table-notice";
+      notice.textContent = "Reload the page to edit tables.";
+      box.appendChild(notice);
+    }
     return box;
   }
 
@@ -415,6 +432,8 @@ class TablePreviewWidget extends WidgetType {
 function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
   const widgets: Range<Decoration>[] = [];
   const doc = state.doc;
+  const grid = state.facet(gridLoaded);
+  const unavailable = state.facet(gridUnavailable);
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name === "FencedCode") {
@@ -438,10 +457,16 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
           );
         }
       }
-      if (node.name === "Table") {
+      // Once the lazy grid is in, it draws (and edits) the tables it accepts;
+      // the read-only preview stays for the rest, and for every table while
+      // the chunk loads or when its import failed.
+      if (node.name === "Table" && !(grid && gridDraws(node, doc))) {
         widgets.push(
           Decoration.widget({
-            widget: new TablePreviewWidget(doc.sliceString(node.from, node.to)),
+            widget: new TablePreviewWidget(
+              doc.sliceString(node.from, node.to),
+              unavailable && !grid && gridDraws(node, doc),
+            ),
             block: true,
             side: 1,
           }).range(node.to),
@@ -454,6 +479,9 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
 
 /**
  * The previews' own chrome.
+ *
+ * `.cm-table-notice` (the line under a table preview when the grid could
+ * not be loaded) wears the same caption face.
  *
  * `.cm-mermaid-error` is a fresh class with no competing rule anywhere - not
  * a `.cm-line`, not the scroller, written by this module alone - so cascade
@@ -472,12 +500,14 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
  */
 const previewTheme = EditorView.baseTheme({
   ".cm-mermaid-preview": { padding: "0.5rem 0.75rem" },
-  ".cm-mermaid-error": {
+  ".cm-mermaid-error, .cm-table-notice": {
     color: "var(--color-slate-500)",
     fontSize: "var(--text-caption, 0.75rem)",
     lineHeight: "var(--text-caption--line-height, 1rem)",
   },
-  "&dark .cm-mermaid-error": { color: "var(--color-slate-400)" },
+  "&dark .cm-mermaid-error, &dark .cm-table-notice": {
+    color: "var(--color-slate-400)",
+  },
   ".cm-table-preview": { padding: "0.25rem 0.75rem" },
   ".cm-table-preview table": { borderCollapse: "collapse" },
   ".cm-table-preview th, .cm-table-preview td": {
@@ -492,7 +522,10 @@ export function fencePreviews(dark: boolean): Extension {
   const field = StateField.define<DecorationSet>({
     create: (state) => buildPreviews(state, dark),
     update: (value, tr) =>
-      tr.docChanged || parseAdvanced(tr)
+      tr.docChanged ||
+      parseAdvanced(tr) ||
+      tr.startState.facet(gridLoaded) !== tr.state.facet(gridLoaded) ||
+      tr.startState.facet(gridUnavailable) !== tr.state.facet(gridUnavailable)
         ? buildPreviews(tr.state, dark)
         : value,
     provide: (f) => EditorView.decorations.from(f),

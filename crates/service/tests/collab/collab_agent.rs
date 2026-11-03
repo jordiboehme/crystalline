@@ -4035,3 +4035,223 @@ async fn a_readdressing_draft_move_closes_the_movers_own_draft_room() {
     let (live, _) = moved.session.snapshot().await;
     assert!(live.contains("the owner typed this"), "{live}");
 }
+
+// --- an agent and a person in the same table row ----------------------------
+//
+// A person types in one cell of a row, an agent changes another cell of the
+// same row. Both changes end in the room and on disk, and neither side's
+// change is moved, lost or raised as a conflict.
+
+/// `alpha` with a table body, the row under test `| 1 | 2 |`.
+const TABLE_ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n| a | b |\n| - | - |\n| 1 | 2 |\n";
+
+/// [`engine_fixture`] with `alpha` holding [`TABLE_ALPHA`].
+async fn table_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let (tmp, engine, scratch) = engine_fixture(false).await;
+    std::fs::write(tmp.path().join("eng/alpha.md"), TABLE_ALPHA).unwrap();
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+/// Type `typed` into the client doc right after `after` and return the
+/// update WITHOUT sending it, the way a keystroke is still in flight while
+/// another change reaches the room.
+fn type_after_unsent(doc: &Doc, after: &str, typed: &str) -> Vec<u8> {
+    let text = doc.get_or_insert_text("content");
+    let mut txn = doc.transact_mut();
+    let current = text.get_string(&txn);
+    let at = current.find(after).expect("the anchor text is in the doc") + after.len();
+    let index = current[..at].encode_utf16().count() as u32;
+    text.insert(&mut txn, index, typed);
+    txn.encode_update_v1()
+}
+
+/// A `find_replace` of `alpha`, the shape an agent changing one cell sends.
+fn replace_edit(find: &str, content: &str) -> EditParams {
+    EditParams {
+        identifier: "alpha".to_string(),
+        domain: "eng".to_string(),
+        operation: "find_replace".to_string(),
+        find_text: Some(find.to_string()),
+        content: Some(content.to_string()),
+        ..EditParams::default()
+    }
+}
+
+/// The agent's edit composes into the live document as the characters it
+/// changed, so a keystroke the person sent at the same moment, in another
+/// cell of the same row, lands in its own cell rather than next to a deleted
+/// copy of the row.
+#[tokio::test]
+async fn an_agent_edit_merges_per_character_with_a_keystroke_in_flight_in_the_same_row() {
+    let (tmp, engine, _scratch) = table_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let in_flight = type_after_unsent(&doc, "| 1", "x");
+
+    let receipt = engine
+        .edit_engram_as(
+            &replace_edit("| 2 |", "| 2Z |"),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the edit lands");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+
+    joined
+        .session
+        .handle_frame(joined.conn, &frame_update(in_flight))
+        .await;
+    resync(&joined, &doc).await;
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.ends_with("| 1x | 2Z |\n"),
+        "both cells changed in place: {live:?}"
+    );
+    assert_eq!(client_text(&doc), live, "and the client converged");
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(on_disk.ends_with("| 1x | 2Z |\n"), "{on_disk:?}");
+}
+
+/// A file change to another cell of the row a person has unsaved typing in
+/// is absorbed by the three-way merge per character: no conflict, both
+/// changes in the room and, after its save, on disk.
+#[tokio::test]
+async fn a_file_change_to_another_cell_of_the_row_absorbs_into_unsaved_typing() {
+    use crystalline_service::collab::session::{Absorbed, RoomDoc};
+    let (tmp, engine, _scratch) = table_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let typed = type_after_unsent(&doc, "| 1", "x");
+    joined
+        .session
+        .handle_frame(joined.conn, &frame_update(typed))
+        .await;
+
+    let path = tmp.path().join("eng/alpha.md");
+    std::fs::write(&path, TABLE_ALPHA.replace("| 2 |", "| 2Z |")).unwrap();
+    let outcome = sessions
+        .absorb_doc_change("eng", &RoomDoc::Engram("alpha".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.absorbed, Absorbed::Merged, "no conflict is raised");
+    let (live, dirty) = joined.session.snapshot().await;
+    assert!(live.ends_with("| 1x | 2Z |\n"), "{live:?}");
+    assert!(dirty, "the merged typing is still the room's to save");
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.ends_with("| 1x | 2Z |\n"), "{on_disk:?}");
+}
+
+/// The body of a stale full-page write: the table as the agent read it
+/// before the person's cell edit, with the agent's own change to cell 2.
+const STALE_TABLE_BODY: &str = "# Alpha\n\n| a | b |\n| - | - |\n| 1 | 2Z |\n";
+
+fn stale_overwrite_alpha() -> Value {
+    json!({
+        "name": "write_engram",
+        "arguments": {
+            "domain": "eng",
+            "title": "Alpha",
+            "content": STALE_TABLE_BODY,
+            "overwrite": true,
+        },
+    })
+}
+
+/// **Probe, Task 11.** An agent read the page, a person then edited cell 1
+/// and the room saved it, and the agent sends a full-page `write_engram`
+/// with `overwrite: true` built from its old read while the room is still
+/// open. The write is refused: the person is still in there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_full_page_overwrite_while_the_room_is_open_is_refused() {
+    let (tmp, engine, _scratch) = table_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    publish_name(&joined, &doc, "Jordi").await;
+    let typed = type_after_unsent(&doc, "| 1", "x");
+    joined
+        .session
+        .handle_frame(joined.conn, &frame_update(typed))
+        .await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_secs(60))
+        .await;
+    let path = tmp.path().join("eng/alpha.md");
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("| 1x | 2 |")
+    );
+
+    let mut wire = Wire::to(engine.clone());
+    let answer = wire
+        .open(modern(1, "tools/call", stale_overwrite_alpha()))
+        .await;
+    assert_eq!(answer["result"]["isError"], json!(true), "{answer}");
+    assert!(refusal_of(&answer).contains("Jordi"), "{answer}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("| 1x | 2 |") && !on_disk.contains("2Z"),
+        "the saved cell edit stands: {on_disk:?}"
+    );
+}
+
+/// **Probe, Task 11, a recorded finding rather than a contract.** The same
+/// stale full-page write after the person closed the page. Nothing guards it:
+/// `write_engram` takes no checksum, so the old read replaces the file and
+/// the person's saved cell edit is reverted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_full_page_overwrite_after_the_room_closed_reverts_the_saved_cell_edit() {
+    let (tmp, engine, _scratch) = table_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let typed = type_after_unsent(&doc, "| 1", "x");
+    joined
+        .session
+        .handle_frame(joined.conn, &frame_update(typed))
+        .await;
+    assert!(joined.session.remove_conn(joined.conn).await);
+    joined.session.final_save().await;
+    sessions.dispose_if_empty(&joined.session).await;
+    let path = tmp.path().join("eng/alpha.md");
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("| 1x | 2 |")
+    );
+
+    let mut wire = Wire::to(engine.clone());
+    let answer = wire
+        .open(modern(1, "tools/call", stale_overwrite_alpha()))
+        .await;
+    assert_ne!(answer["result"]["isError"], json!(true), "{answer}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("| 1 | 2Z |") && !on_disk.contains("1x"),
+        "the old read replaced the person's saved edit: {on_disk:?}"
+    );
+}

@@ -56,6 +56,7 @@ function open(
           onTableContext: () => {},
           onImageContext: () => {},
           onElementContext: () => {},
+          onFloatingContext: () => {},
         }),
       ],
     }),

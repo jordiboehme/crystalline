@@ -335,6 +335,29 @@ describe("the table segment", () => {
     expect(screen.getByRole("button", { name: "Bold" })).not.toBeNull();
   });
 
+  test("a drawn grid hands the verbs to its own menu (Raw takes them back)", () => {
+    const { rerender } = render(
+      <EditorToolbar view={null} tableActive tableDrawn />,
+      { wrapper: Tooltips },
+    );
+    for (const name of SEGMENT) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    rerender(<EditorToolbar view={null} tableActive tableDrawn raw />);
+    for (const name of SEGMENT) {
+      expect(screen.getByRole("button", { name })).not.toBeNull();
+    }
+  });
+
+  test("a table the grid does not draw keeps the verbs", () => {
+    render(<EditorToolbar view={null} tableActive tableDrawn={false} />, {
+      wrapper: Tooltips,
+    });
+    for (const name of SEGMENT) {
+      expect(screen.getByRole("button", { name })).not.toBeNull();
+    }
+  });
+
   test("all four table-shape verbs wear a glyph of their own", () => {
     // Taste, pinned because it is invisible to every other assertion here:
     // these four differ in two dimensions at once - what they do and which

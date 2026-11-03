@@ -53,6 +53,7 @@ similar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
 url = { workspace = true }
 walkdir = { workspace = true }
 yrs = { workspace = true }

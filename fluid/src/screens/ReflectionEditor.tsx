@@ -74,13 +74,17 @@ import {
   writeDraft,
 } from "../editor/drafts";
 import { EditorToolbar } from "../editor/EditorToolbar";
+import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { FloatingContext } from "../editor/floatingContext";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
 import { imagePreviews } from "../editor/imagePreviews";
 import { readScalar } from "../editor/frontmatterFields";
 import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import type { ElementFace } from "../editor/elementContext";
+import { roomUndo } from "../editor/roomUndo";
 import { surfaceExtensions } from "../editor/surface";
+import type { TableUiContext } from "../editor/tableVerbs";
 import {
   UploadScreenContext,
   useAttachmentUploads,
@@ -605,12 +609,18 @@ function Surface({
   const adapter = useMemo(() => reflectionAdapter(), []);
   const preview = useMemo(() => new Compartment(), []);
   /** Whether the caret is in a table or on an image: the bar's context verbs. */
-  const [tableActive, setTableActive] = useState(false);
+  const [tableContext, setTableContext] = useState<TableUiContext>({
+    inTable: false,
+    drawn: false,
+  });
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
-  const extensions = useMemo(
-    () => [
+  /** What the floating action bar stands by: a selection, a cell, nothing. */
+  const [floating, setFloating] = useState<FloatingContext>(null);
+  const extensions = useMemo(() => {
+    const undoManager = new Y.UndoManager(ytext);
+    return [
       // The shared text is LF space by construction (see EngramEditor).
       EditorState.lineSeparator.of("\n"),
       ...surfaceExtensions({
@@ -619,7 +629,8 @@ function Surface({
         // The room's own undo stack replaces CodeMirror's.
         history: false,
         screen: [
-          yCollab(ytext, awareness, { undoManager: new Y.UndoManager(ytext) }),
+          yCollab(ytext, awareness, { undoManager }),
+          roomUndo.of(undoManager),
           keymap.of(yUndoManagerKeymap),
           normalizePastedEndings,
           cursorFlags,
@@ -629,24 +640,24 @@ function Surface({
         raw: false,
         images: previews.of(imagePreviews(home)),
         uploads: uploads.extension,
-        onTableContext: setTableActive,
+        onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
+        onFloatingContext: setFloating,
       }),
-    ],
-    [
-      ytext,
-      awareness,
-      resolved,
-      adapter,
-      preview,
-      editable,
-      mountEnded,
-      uploads.extension,
-      home,
-      previews,
-    ],
-  );
+    ];
+  }, [
+    ytext,
+    awareness,
+    resolved,
+    adapter,
+    preview,
+    editable,
+    mountEnded,
+    uploads.extension,
+    home,
+    previews,
+  ]);
   useEffect(() => {
     view?.dispatch({
       effects: previews.reconfigure(imagePreviews(previewHome)),
@@ -1037,7 +1048,7 @@ function Surface({
           </button>
         </aside>
       )}
-      <div>
+      <div className="relative">
         {/*
           The engram editor's format bar, in the same sticky row. Its block
           verbs know the hidden section ids through the adapter: a block
@@ -1053,7 +1064,10 @@ function Surface({
         <EditorToolbar
           bare
           view={view}
-          tableActive={tableActive}
+          tableActive={tableContext.inTable}
+          tableDrawn={tableContext.drawn}
+          raw={false}
+          cellOpen={floating?.kind === "cell"}
           imageActive={imageActive}
           calloutActive={element?.kind === "callout" ? element : null}
           statusActive={element?.kind === "status" ? element.colour : null}
@@ -1073,6 +1087,12 @@ function Surface({
               ready.focus();
             }
           }}
+        />
+        {/* The floating action bar; none once the room has ended (R17). */}
+        <FloatingBarSlot
+          main={view}
+          context={ended ? null : floating}
+          wikilinks={adapter.wikilinks}
         />
       </div>
       {collab.conflict !== null && resolving && (

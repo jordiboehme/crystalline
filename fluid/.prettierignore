@@ -23,3 +23,8 @@ src/game/world/golden/
 # Clipboard samples for rich paste, in the shape other apps write them. A real
 # capture replaces a file as it is, so prettier must not reshape them.
 src/editor/fixtures/paste/
+
+# Engram bodies whose tables the cell editor's fidelity test types into. They
+# keep the spellings people write (no padding, no edge pipes, empty cells),
+# which prettier would pad into one aligned shape.
+src/editor/fixtures/tables/

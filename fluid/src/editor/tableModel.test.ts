@@ -22,10 +22,14 @@ import { describe, expect, test } from "vitest";
 import type { SpanChange } from "./tableModel";
 import {
   addColumnAfter,
+  addColumnBefore,
+  addRowAbove,
   addRowBelow,
   columnAt,
   deleteColumn,
   deleteRow,
+  moveColumn,
+  moveRow,
   parseTable,
   prettify,
   setAlignment,
@@ -60,6 +64,16 @@ describe("parseTable", () => {
     const model = parseTable("| a \\| b | c |\n| --- | --- |\n| 1 | 2 |");
     expect(model?.columns).toBe(2);
     expect(model?.lines[0]?.cells[0]?.raw).toContain("\\|");
+  });
+
+  test("an odd backslash run escapes the pipe, an even one does not", () => {
+    const one = parseTable("| a\\|b |\n| --- |\n| 1 |");
+    expect(one?.lines[0]?.cells.map((c) => c.raw.trim())).toEqual(["a\\|b"]);
+    const two = parseTable("| a\\\\|b |\n| --- | --- |\n| 1 | 2 |");
+    expect(two?.lines[0]?.cells.map((c) => c.raw.trim())).toEqual([
+      "a\\\\",
+      "b",
+    ]);
   });
 
   test("rows without edge pipes parse", () => {
@@ -370,12 +384,14 @@ describe("tolerances the verbs inherit from the parse", () => {
     );
   });
 
-  test("a column appended past an edge-pipeless row closes it with a pipe", () => {
+  test("a column appended past an edge-pipeless row closes it only where the new cell is empty", () => {
     const span = "a | b\n--- | ---\n1 | 2";
     const model = parseTable(span);
     if (!model) throw new Error("no model");
+    // R23: the header's `Column` and the rule's dashes exist without a
+    // closing pipe; the data row's empty cell does not, so only it gains one.
     expect(apply(span, addColumnAfter(model, 1) ?? [])).toBe(
-      ["a | b | Column |", "--- | --- | --- |", "1 | 2 |  |"].join("\n"),
+      ["a | b | Column", "--- | --- | ---", "1 | 2 |  |"].join("\n"),
     );
   });
 
@@ -387,5 +403,364 @@ describe("tolerances the verbs inherit from the parse", () => {
     expect(setAlignment(model, 2, "left")).toBeNull();
     expect(addRowBelow(model, 3, "\n")).toBeNull();
     expect(deleteRow(model, 3, "\n")).toBeNull();
+  });
+});
+
+describe("insert-before and move verbs", () => {
+  const LF = "| a | b |\n| - | :-: |\n| 1 | 2 |\n| 3 | 4 |";
+
+  function modelOf(span: string) {
+    const model = parseTable(span);
+    if (!model) throw new Error("no model");
+    return model;
+  }
+
+  /** Run a verb against a document in the given spelling, through a real state. */
+  function viaState(
+    lf: string,
+    lineBreak: "\n" | "\r\n",
+    verb: (
+      model: ReturnType<typeof modelOf>,
+      separator: string,
+    ) => SpanChange[] | null,
+  ): string | null {
+    const doc = lf.replaceAll("\n", lineBreak);
+    const state = EditorState.create({
+      doc,
+      extensions: [EditorState.lineSeparator.of(lineBreak)],
+    });
+    const model = modelOf(state.doc.sliceString(0, state.doc.length));
+    const changes = verb(model, state.lineBreak);
+    if (!changes) return null;
+    return state
+      .update({
+        changes: changes.map((c) => ({
+          from: c.from,
+          to: c.to ?? c.from,
+          insert: c.insert ?? "",
+        })),
+      })
+      .state.sliceDoc();
+  }
+
+  const CASES: {
+    name: string;
+    verb: (m: ReturnType<typeof modelOf>, sep: string) => SpanChange[] | null;
+    expected: string;
+  }[] = [
+    {
+      name: "addRowAbove at the first data row",
+      verb: (m, sep) => addRowAbove(m, 2, sep),
+      expected: "| a | b |\n| - | :-: |\n|  |  |\n| 1 | 2 |\n| 3 | 4 |",
+    },
+    {
+      name: "addRowAbove in the middle",
+      verb: (m, sep) => addRowAbove(m, 3, sep),
+      expected: "| a | b |\n| - | :-: |\n| 1 | 2 |\n|  |  |\n| 3 | 4 |",
+    },
+    {
+      name: "addColumnBefore the first column",
+      verb: (m) => addColumnBefore(m, 0),
+      expected:
+        "| Column | a | b |\n| --- | - | :-: |\n|  | 1 | 2 |\n|  | 3 | 4 |",
+    },
+    {
+      name: "moveRow down",
+      verb: (m, sep) => moveRow(m, 2, 3, sep),
+      expected: "| a | b |\n| - | :-: |\n| 3 | 4 |\n| 1 | 2 |",
+    },
+    {
+      name: "moveRow up",
+      verb: (m, sep) => moveRow(m, 3, 2, sep),
+      expected: "| a | b |\n| - | :-: |\n| 3 | 4 |\n| 1 | 2 |",
+    },
+    {
+      name: "moveColumn",
+      verb: (m) => moveColumn(m, 1, 0),
+      expected: "| b | a |\n| :-: | - |\n| 2 | 1 |\n| 4 | 3 |",
+    },
+  ];
+
+  for (const c of CASES) {
+    test(`${c.name} gives the same text in LF and CRLF`, () => {
+      expect(viaState(LF, "\n", c.verb)).toBe(c.expected);
+      expect(viaState(LF, "\r\n", c.verb)).toBe(
+        c.expected.replaceAll("\n", "\r\n"),
+      );
+    });
+  }
+
+  test("nothing goes above the header or the delimiter", () => {
+    const m = modelOf(LF);
+    expect(addRowAbove(m, 1, "\n")).toBeNull();
+    expect(addRowAbove(m, 0, "\n")).toBeNull();
+    expect(addRowAbove(m, 4, "\n")).toBeNull();
+    expect(addColumnBefore(m, 2)).toBeNull();
+    expect(addColumnBefore(m, -1)).toBeNull();
+  });
+
+  test("addRowAbove is one pure insertion and keeps the indent", () => {
+    const span = "  | a |\n  | --- |\n  | 1 |";
+    const m = modelOf(span);
+    const changes = addRowAbove(m, 2, "\n") ?? [];
+    expect(changes).toHaveLength(1);
+    expect(apply(span, changes)).toBe("  | a |\n  | --- |\n  |  |\n  | 1 |");
+  });
+
+  test("addColumnBefore emits one insertion per line", () => {
+    const m = modelOf(LF);
+    const changes = addColumnBefore(m, 1) ?? [];
+    expect(changes).toHaveLength(4);
+    expect(changes.every((c) => c.to === undefined)).toBe(true);
+    expect(apply(LF, changes)).toBe(
+      "| a | Column | b |\n| - | --- | :-: |\n| 1 |  | 2 |\n| 3 |  | 4 |",
+    );
+  });
+
+  test("moves refuse the header, the delimiter and non-moves", () => {
+    const m = modelOf(LF);
+    expect(moveRow(m, 2, 1, "\n")).toBeNull();
+    expect(moveRow(m, 1, 2, "\n")).toBeNull();
+    expect(moveRow(m, 0, 2, "\n")).toBeNull();
+    expect(moveRow(m, 3, 4, "\n")).toBeNull();
+    expect(moveRow(m, 2, 2, "\n")).toBeNull();
+    expect(moveColumn(m, 0, 2)).toBeNull();
+    expect(moveColumn(m, 1, 1)).toBeNull();
+    expect(moveColumn(m, -1, 0)).toBeNull();
+  });
+
+  test("moveRow is one deletion plus one insertion of the identical line", () => {
+    const m = modelOf(LF);
+    const changes = moveRow(m, 3, 2, "\n") ?? [];
+    expect(changes).toHaveLength(2);
+    expect(changes.filter((c) => c.insert !== undefined)).toEqual([
+      { from: m.lines[2]?.start, insert: "| 3 | 4 |\n" },
+    ]);
+  });
+
+  test("moveRow in a three-row table moves the first below the last", () => {
+    const span = "| a |\n| --- |\n| 1 |\n| 2 |\n| 3 |";
+    const m = modelOf(span);
+    expect(apply(span, moveRow(m, 2, 4, "\n") ?? [])).toBe(
+      "| a |\n| --- |\n| 2 |\n| 3 |\n| 1 |",
+    );
+    expect(apply(span, moveRow(m, 4, 2, "\n") ?? [])).toBe(
+      "| a |\n| --- |\n| 3 |\n| 1 |\n| 2 |",
+    );
+  });
+
+  test("moveColumn across three columns keeps each cell and its rule", () => {
+    const span = "| a | b | c |\n| :-- | --: | :-: |\n| 1 | 2 | 3 |";
+    const m = modelOf(span);
+    expect(apply(span, moveColumn(m, 0, 2) ?? [])).toBe(
+      "| b | c | a |\n| --: | :-: | :-- |\n| 2 | 3 | 1 |",
+    );
+    expect(apply(span, moveColumn(m, 2, 0) ?? [])).toBe(
+      "| c | a | b |\n| :-: | :-- | --: |\n| 3 | 1 | 2 |",
+    );
+  });
+
+  test("moveColumn leaves a ragged row too short for the column alone", () => {
+    const span = "| a | b | c |\n| --- | --- | --- |\n| 1 |\n| 4 | 5 | 6 |";
+    const m = modelOf(span);
+    expect(apply(span, moveColumn(m, 0, 2) ?? [])).toBe(
+      "| b | c | a |\n| --- | --- | --- |\n| 1 |\n| 5 | 6 | 4 |",
+    );
+  });
+
+  test("rows without edge pipes move and gain columns without gaining pipes", () => {
+    const span = "a | b\n- | -\n1 | 2";
+    const m = modelOf(span);
+    expect(apply(span, addColumnBefore(m, 1) ?? [])).toBe(
+      "a | Column | b\n- | --- | -\n1 |  | 2",
+    );
+    // An empty cell cannot start a pipeless line, so only those lines gain
+    // the one leading pipe it needs; the header and the rule do not.
+    expect(apply(span, addColumnBefore(m, 0) ?? [])).toBe(
+      "Column | a | b\n--- | - | -\n|  | 1 | 2",
+    );
+  });
+
+  test("moveColumn on a pipeless table keeps every cell and every column", () => {
+    const span = "a | b\n- | -\n1 | 2";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 0, 1) ?? []);
+    // No cell is reformatted; the lines whose first slot would open with a
+    // blank gain one explicit leading pipe.
+    expect(out).toBe("| b|a \n| -|- \n| 2|1 ");
+    const after = parseTable(out);
+    expect(after?.columns).toBe(2);
+    expect(after?.lines.map((l) => l.cells.length)).toEqual([2, 2, 2]);
+    expect(after?.lines[0]?.cells.map((c) => c.raw)).toEqual([" b", "a"]);
+  });
+
+  test("moveColumn of an empty cell into the first slot of a pipeless line", () => {
+    const span = "x | y | z\n- | - | -\nx |  | z";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 1, 0) ?? []);
+    expect(out).toBe("| y |x | z\n| - |- | -\n|  |x | z");
+    const after = parseTable(out);
+    expect(after?.lines.map((l) => l.cells.length)).toEqual([3, 3, 3]);
+    expect(after?.lines[2]?.cells.map((c) => c.raw)).toEqual([
+      "  ",
+      "x ",
+      " z",
+    ]);
+  });
+
+  test("moveColumn of a blank-padded cell does not turn it into indent", () => {
+    const span = "a |      b | c\n- | - | -\n1 | 2 | 3";
+    const m = modelOf(span);
+    const out = apply(span, moveColumn(m, 1, 0) ?? []);
+    expect(out.split("\n")[0]).toBe("|      b |a | c");
+    expect(parseTable(out)?.lines.map((l) => l.cells.length)).toEqual([
+      3, 3, 3,
+    ]);
+    // A cell with no leading blank needs no pipe: only the reordering shows.
+    const tight = "a|b|c\n-|-|-\n1|2|3";
+    expect(apply(tight, moveColumn(modelOf(tight), 1, 0) ?? [])).toBe(
+      "b|a|c\n-|-|-\n2|1|3",
+    );
+  });
+
+  test("moveRow moves a data row of a pipeless table", () => {
+    const span = "a | b\n- | -\n1 | 2\n3 | 4";
+    const m = modelOf(span);
+    expect(apply(span, moveRow(m, 3, 2, "\n") ?? [])).toBe(
+      "a | b\n- | -\n3 | 4\n1 | 2",
+    );
+    expect(apply(span, moveRow(m, 2, 3, "\n") ?? [])).toBe(
+      "a | b\n- | -\n3 | 4\n1 | 2",
+    );
+  });
+});
+
+/**
+ * R23: a table keeps its own spelling when it grows or shrinks. A row keeps
+ * the edge pipes it has and gains one only where a cell needs it to exist: an
+ * empty first cell needs a leading pipe and an empty last cell a trailing one
+ * (GFM reads `1 | ` as a trailing pipe and ` | 2` as a leading one). Every
+ * result is checked against the parse as well as against its bytes.
+ */
+describe("the table's own spelling (R23)", () => {
+  const PIPELESS = "a | b\n--|--\n1 | 2\n3 | 4";
+  const MIXED = "| a | b |\n|:--|--:|\n1 | 2\n| 3 | 4 |";
+
+  function modelOf(span: string) {
+    const model = parseTable(span);
+    if (!model) throw new Error("no model");
+    return model;
+  }
+
+  /** Every line of `span` holds `columns` cells. */
+  function cellCounts(span: string): number[] {
+    return modelOf(span).lines.map((line) => line.cells.length);
+  }
+
+  test("a new empty row needs both edge pipes, in a pipeless table too", () => {
+    // The exception the ruling names: every cell of a new row is empty, so its
+    // first cell needs a leading pipe and its last a trailing one. ` | ` would
+    // be one cell to this parse and none to Lezer's.
+    const m = modelOf(PIPELESS);
+    const below = apply(PIPELESS, addRowBelow(m, 3, "\n") ?? []);
+    expect(below).toBe("a | b\n--|--\n1 | 2\n3 | 4\n|  |  |");
+    expect(cellCounts(below)).toEqual([2, 2, 2, 2, 2]);
+    const above = apply(PIPELESS, addRowAbove(m, 2, "\n") ?? []);
+    expect(above).toBe("a | b\n--|--\n|  |  |\n1 | 2\n3 | 4");
+    expect(cellCounts(above)).toEqual([2, 2, 2, 2, 2]);
+  });
+
+  test("a new empty row in a mixed table is the same, next to either spelling", () => {
+    const m = modelOf(MIXED);
+    expect(apply(MIXED, addRowBelow(m, 2, "\n") ?? [])).toBe(
+      "| a | b |\n|:--|--:|\n1 | 2\n|  |  |\n| 3 | 4 |",
+    );
+    expect(apply(MIXED, addRowAbove(m, 2, "\n") ?? [])).toBe(
+      "| a | b |\n|:--|--:|\n|  |  |\n1 | 2\n| 3 | 4 |",
+    );
+  });
+
+  test("a new last column keeps each row's own edge spelling", () => {
+    const pipeless = apply(
+      PIPELESS,
+      addColumnAfter(modelOf(PIPELESS), 1) ?? [],
+    );
+    expect(pipeless).toBe(
+      "a | b | Column\n--|-- | ---\n1 | 2 |  |\n3 | 4 |  |",
+    );
+    expect(cellCounts(pipeless)).toEqual([3, 3, 3, 3]);
+    const mixed = apply(MIXED, addColumnAfter(modelOf(MIXED), 1) ?? []);
+    expect(mixed).toBe(
+      "| a | b | Column |\n|:--|--:| --- |\n1 | 2 |  |\n| 3 | 4 |  |",
+    );
+    expect(cellCounts(mixed)).toEqual([3, 3, 3, 3]);
+  });
+
+  test("a new first column keeps each row's own edge spelling", () => {
+    const pipeless = apply(
+      PIPELESS,
+      addColumnBefore(modelOf(PIPELESS), 0) ?? [],
+    );
+    expect(pipeless).toBe(
+      "Column | a | b\n--- | --|--\n|  | 1 | 2\n|  | 3 | 4",
+    );
+    expect(cellCounts(pipeless)).toEqual([3, 3, 3, 3]);
+    const mixed = apply(MIXED, addColumnBefore(modelOf(MIXED), 0) ?? []);
+    expect(mixed).toBe(
+      "| Column | a | b |\n| --- |:--|--:|\n|  | 1 | 2\n|  | 3 | 4 |",
+    );
+    expect(cellCounts(mixed)).toEqual([3, 3, 3, 3]);
+  });
+
+  test("deleting down to one column writes every row with outer pipes", () => {
+    // A one-column table without pipes is no table: `a` over `--` is a
+    // paragraph and a setext heading. Every row keeps or gains both edges.
+    const first = apply(PIPELESS, deleteColumn(modelOf(PIPELESS), 0) ?? []);
+    expect(first).toBe("| b |\n|-- |\n| 2 |\n| 4 |");
+    expect(cellCounts(first)).toEqual([1, 1, 1, 1]);
+    const last = apply(PIPELESS, deleteColumn(modelOf(PIPELESS), 1) ?? []);
+    expect(last).toBe("| a |\n| --|\n| 1 |\n| 3 |");
+    expect(cellCounts(last)).toEqual([1, 1, 1, 1]);
+    const mixed = apply(MIXED, deleteColumn(modelOf(MIXED), 0) ?? []);
+    expect(mixed).toBe("| b |\n|--:|\n| 2 |\n| 4 |");
+    expect(modelOf(mixed).aligns).toEqual(["right"]);
+  });
+
+  test("deleting a column keeps a pipe that a blank new edge cell needs", () => {
+    const span = "a | b | c\n--|--|--\n1 |  | 3\n4 | 5 | 6";
+    const m = modelOf(span);
+    // Column 0 goes: the empty middle cell becomes the first, so the pipe
+    // after the deleted cell stays as that row's leading pipe.
+    const first = apply(span, deleteColumn(m, 0) ?? []);
+    expect(first).toBe(" b | c\n--|--\n|  | 3\n 5 | 6");
+    expect(cellCounts(first)).toEqual([2, 2, 2, 2]);
+    // Column 2 goes: the empty middle cell becomes the last and keeps the
+    // pipe before the deleted cell as its trailing pipe.
+    const last = apply(span, deleteColumn(m, 2) ?? []);
+    expect(last).toBe("a | b \n--|--\n1 |  |\n4 | 5 ");
+    expect(cellCounts(last)).toEqual([2, 2, 2, 2]);
+  });
+
+  test("moving an empty cell into the last slot of a pipeless row keeps it", () => {
+    const span = "x | y | z\n--|--|--\nx |  | z";
+    const out = apply(span, moveColumn(modelOf(span), 1, 2) ?? []);
+    expect(out).toBe("x | z| y \n--|--|--\nx | z|  |");
+    expect(cellCounts(out)).toEqual([3, 3, 3]);
+    expect(modelOf(out).lines[2]?.cells.map((c) => c.raw)).toEqual([
+      "x ",
+      " z",
+      "  ",
+    ]);
+  });
+
+  test("aligning the first cell of a pipeless rule adds no blank before it", () => {
+    // Three blanks of indent plus one more would make the rule indented code.
+    const span = "   a | b\n   --|--\n   1 | 2";
+    const out = apply(span, setAlignment(modelOf(span), 0, "center") ?? []);
+    expect(out).toBe("   a | b\n   :---: |--\n   1 | 2");
+    expect(modelOf(out).aligns).toEqual(["center", "none"]);
+    const last = apply(span, setAlignment(modelOf(span), 1, "right") ?? []);
+    expect(last).toBe("   a | b\n   --| ---:\n   1 | 2");
+    expect(modelOf(last).aligns).toEqual(["none", "right"]);
   });
 });

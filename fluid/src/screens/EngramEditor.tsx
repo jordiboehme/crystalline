@@ -66,6 +66,8 @@ import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
+import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { FloatingContext } from "../editor/floatingContext";
 import {
   imagePreviews,
   refreshPreviews,
@@ -74,9 +76,11 @@ import {
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
+import { roomUndo } from "../editor/roomUndo";
 import { docText, lineSeparatorFor } from "../editor/setup";
 import type { ElementFace } from "../editor/elementContext";
 import { previewConfig, surfaceExtensions } from "../editor/surface";
+import type { TableUiContext } from "../editor/tableVerbs";
 import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import {
@@ -225,11 +229,25 @@ interface EngramSurfaceOptions {
   /** Paste and drop uploads; see `SurfaceOptions`. */
   uploads: Extension;
   /** Told when the caret enters or leaves a table; see `SurfaceOptions`. */
-  onTableContext: (inTable: boolean) => void;
+  onTableContext: (context: TableUiContext) => void;
   /** Told when the caret enters or leaves an image; see `SurfaceOptions`. */
   onImageContext: (onImage: boolean) => void;
   /** Told what callout or label the caret is in; see `SurfaceOptions`. */
   onElementContext: (face: ElementFace) => void;
+  /** Told what the floating bar stands by; see `SurfaceOptions`. */
+  onFloatingContext: (context: FloatingContext) => void;
+}
+
+/**
+ * The room's binding with its undo manager, which `roomUndo` hands to the
+ * grid as the same instance `yCollab` uses.
+ */
+function roomUndoStack(room: Room): Extension[] {
+  const undoManager = new Y.UndoManager(room.ytext);
+  return [
+    yCollab(room.ytext, room.awareness, { undoManager }),
+    roomUndo.of(undoManager),
+  ];
 }
 
 /**
@@ -259,9 +277,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       screen: [
         ...(room !== null
           ? [
-              yCollab(room.ytext, room.awareness, {
-                undoManager: new Y.UndoManager(room.ytext),
-              }),
+              ...roomUndoStack(room),
               keymap.of(yUndoManagerKeymap),
               normalizePastedEndings,
               cursorFlags,
@@ -277,6 +293,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       onTableContext: options.onTableContext,
       onImageContext: options.onImageContext,
       onElementContext: options.onElementContext,
+      onFloatingContext: options.onFloatingContext,
     }),
   ];
 }
@@ -484,11 +501,16 @@ function Surface({
    * only, and the setter is React's own stable one, so this costs a render
    * per crossing rather than one per keystroke.
    */
-  const [tableActive, setTableActive] = useState(false);
+  const [tableContext, setTableContext] = useState<TableUiContext>({
+    inTable: false,
+    drawn: false,
+  });
   /** The same, for the caret sitting on an attachment image. */
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
+  /** What the floating action bar stands by: a selection, a cell, nothing. */
+  const [floating, setFloating] = useState<FloatingContext>(null);
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -616,9 +638,10 @@ function Surface({
       resolver,
       room,
       uploads: uploads.extension,
-      onTableContext: setTableActive,
+      onTableContext: setTableContext,
       onImageContext: setImageActive,
       onElementContext: setElement,
+      onFloatingContext: setFloating,
     });
 
   /**
@@ -904,9 +927,10 @@ function Surface({
         resolver: NO_RESOLUTION,
         room,
         uploads: uploads.extension,
-        onTableContext: setTableActive,
+        onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
+        onFloatingContext: setFloating,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -1333,7 +1357,7 @@ function Surface({
             }}
           />
         </div>
-        <div className="edit-column order-3 min-w-0 lg:col-start-1 lg:row-start-2">
+        <div className="edit-column relative order-3 min-w-0 lg:col-start-1 lg:row-start-2">
           {/*
               The format bar is a sticky row on the column, above the text it
               edits, and takes the live view rather than the session: what it
@@ -1348,7 +1372,10 @@ function Surface({
           <EditorToolbar
             bare
             view={view}
-            tableActive={tableActive}
+            tableActive={tableContext.inTable}
+            tableDrawn={tableContext.drawn}
+            raw={raw}
+            cellOpen={floating?.kind === "cell"}
             imageActive={imageActive}
             calloutActive={element?.kind === "callout" ? element : null}
             statusActive={element?.kind === "status" ? element.colour : null}
@@ -1390,6 +1417,16 @@ function Surface({
               setView(ready);
             }}
             onDocChanged={session.setBuffer}
+          />
+          {/*
+            The floating action bar, placed inside this column. Raw is the
+            source view: no grid to stand by, and no bar on a selection there
+            either.
+          */}
+          <FloatingBarSlot
+            main={view}
+            context={raw ? null : floating}
+            wikilinks={adapter.wikilinks}
           />
         </div>
         <EditorDetails hasHardErrors={session.hardErrors > 0}>
