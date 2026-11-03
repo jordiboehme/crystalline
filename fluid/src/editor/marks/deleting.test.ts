@@ -364,7 +364,9 @@ describe.each([
     expect(bytes(back.state)).toBe("a **bold**c");
     const forward = view("a **bold** c", 2);
     keys(forward, "Mod-Delete");
-    expect(bytes(forward.state)).toBe("a **bold** c");
+    // Only the hidden opening mark lay in reach, so the word after it goes
+    // too, and the emptied pair with it.
+    expect(bytes(forward.state)).toBe("a  c");
   });
 
   it("a selection delete that empties a pair takes both marks", () => {
@@ -392,5 +394,49 @@ describe.each([
     select(all, 1, 5);
     keys(all, "Backspace");
     expect(bytes(all.state)).toBe(" c");
+  });
+});
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])(
+  "a word delete that reaches only hidden marks goes on, $name",
+  ({ room }) => {
+    it("Mod+Delete before an opening mark takes the word and the empty pair", () => {
+      const v = markView("a **bold** c", { room });
+      setCaret(v, 2);
+      keys(v, "Mod-Delete");
+      expect(bytes(v.state)).toBe("a  c");
+    });
+
+    it("Mod+Backspace after a link's hidden address takes the link text", () => {
+      const v = markView("x [a](u)", { room });
+      setCaret(v, 8);
+      expect(caret(v)).toBe(8);
+      keys(v, "Mod-Backspace");
+      expect(bytes(v.state)).toBe("x ");
+    });
+  },
+);
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])("an escaped character goes with its backslash, $name", ({ room }) => {
+  it.each([
+    { name: "\\*", text: "a **\\*** c" },
+    { name: "\\`", text: "a **\\`** c" },
+    { name: "\\\\", text: "a **\\\\** c" },
+  ])("$name", ({ text }) => {
+    const back = markView(text, { room });
+    setCaret(back, 6);
+    expect(caret(back)).toBe(6);
+    keys(back, "Backspace");
+    expect(bytes(back.state)).toBe("a  c");
+    const forward = markView(text, { room });
+    setCaret(forward, 4);
+    keys(forward, "Delete");
+    expect(bytes(forward.state)).toBe("a  c");
   });
 });

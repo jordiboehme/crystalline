@@ -13,7 +13,14 @@
  * line being edited and in Raw today's keys and deletions run unchanged.
  */
 
-import { deleteCharBackward, deleteCharForward } from "@codemirror/commands";
+import {
+  deleteCharBackward,
+  deleteCharForward,
+  deleteGroupBackward,
+  deleteGroupForward,
+  deleteLineBoundaryBackward,
+  deleteLineBoundaryForward,
+} from "@codemirror/commands";
 import { isolateHistory } from "@codemirror/commands";
 import type {
   ChangeSpec,
@@ -303,6 +310,10 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
         atom ??
         line.from + findClusterBreak(line.text, q - line.from, true, true),
     };
+    if (atom === null && escapesNext(state, q)) {
+      // A backslash and the character it escapes go as one.
+      removal.to = q + 2;
+    }
   } else {
     const q = run ? run.from : head;
     if (q <= start) {
@@ -315,6 +326,15 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
         line.from + findClusterBreak(line.text, q - line.from, false, true),
       to: q,
     };
+    if (
+      atom === null &&
+      removal.from > line.from &&
+      escapesNext(state, removal.from - 1)
+    ) {
+      // The character is escaped: its backslash goes with it, or the
+      // backslash left behind would escape whatever comes next.
+      removal.from -= 1;
+    }
   }
   if (
     state.facet(keptWhole).some((kept) => kept(state, removal.from, removal.to))
@@ -324,6 +344,33 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
   const ranges = withEmptyPairs(marksOnLine(state, line.number), removal);
   remove(view, ranges, forward ? head : removal.from, forward);
   return true;
+}
+
+/** What a backslash escapes in Markdown: ASCII punctuation. */
+const ESCAPABLE = /^[!-/:-@[-`{-~]$/;
+
+/**
+ * Whether the character at `pos` is a backslash that escapes the one after
+ * it: a punctuation character follows, and the backslash is not itself
+ * escaped (an even run of backslashes before it).
+ */
+function escapesNext(state: EditorState, pos: number): boolean {
+  const doc = state.doc;
+  if (doc.sliceString(pos, pos + 1) !== "\\") {
+    return false;
+  }
+  if (!ESCAPABLE.test(doc.sliceString(pos + 1, pos + 2))) {
+    return false;
+  }
+  const line = doc.lineAt(pos);
+  let before = 0;
+  while (
+    pos - before - 1 >= line.from &&
+    doc.sliceString(pos - before - 1, pos - before) === "\\"
+  ) {
+    before += 1;
+  }
+  return before % 2 === 0;
 }
 
 /** The level a heading line's text has, 0 when it is none. */
@@ -374,15 +421,121 @@ function key(forward: boolean): Command {
     deleteVisible(view, forward) || guardShownHeading(view, forward);
 }
 
+/** The range a CodeMirror delete command would take from `pos`, no atoms. */
+function reach(
+  state: EditorState,
+  command: StateCommand,
+  pos: number,
+): Range | null {
+  let found: Range | null = null;
+  // A bare state on the same text: the command's own transaction would
+  // otherwise pass this buffer's filters, which keep the marks it reaches.
+  command({
+    state: State.create({
+      doc: state.doc,
+      selection: EditorSelection.cursor(pos),
+      extensions: [
+        State.languageData.of(() =>
+          state
+            .languageDataAt("wordChars", pos)
+            .map((wordChars) => ({ wordChars })),
+        ),
+      ],
+    }),
+    dispatch: (tr) => {
+      tr.changes.iterChangedRanges((from, to) => {
+        found = {
+          from: Math.min(found?.from ?? from, from),
+          to: Math.max(found?.to ?? to, to),
+        };
+      });
+    },
+  });
+  return found;
+}
+
+/**
+ * A word or line delete (`command`) that would reach only hidden marks, so
+ * the press would change nothing a person sees: it runs again from the far
+ * side of those marks, the way `group()` in `caret.ts` moves. The whole
+ * stretch is deleted as one `delete.forward` or `delete.backward`, and
+ * `keepPartnerMarks` keeps or drops the marks in it. Anywhere else the
+ * command runs as today.
+ */
+function overHidden(command: Command, forward: boolean): Command {
+  const plain = command as unknown as StateCommand;
+  return (view) => {
+    const { state } = view;
+    const { selection } = state;
+    if (
+      state.readOnly ||
+      selection.ranges.length > 1 ||
+      !selection.main.empty
+    ) {
+      return false;
+    }
+    const head = selection.main.head;
+    const line = state.doc.lineAt(head);
+    if (!marksHiddenOnLine(state, line.number)) {
+      return false;
+    }
+    const marks = marksOnLine(state, line.number);
+    const first = reach(state, plain, head);
+    if (!first || visibleBetween(first.from, first.to, [], marks)) {
+      return false;
+    }
+    // On from the far side of what it reached, while that is only marks.
+    // A line holds few marks; the bound only guards a command that stops.
+    const range = { from: first.from, to: first.to };
+    for (let step = 0; step < 64; step += 1) {
+      const again = reach(state, plain, forward ? range.to : range.from);
+      if (!again) {
+        break;
+      }
+      range.from = Math.min(range.from, again.from);
+      range.to = Math.max(range.to, again.to);
+      if (visibleBetween(range.from, range.to, [], marks)) {
+        break;
+      }
+    }
+    if (!visibleBetween(range.from, range.to, [], marks)) {
+      // Nothing visible lies that way: the key is spent.
+      return true;
+    }
+    view.dispatch({
+      changes: range,
+      selection: EditorSelection.cursor(range.from),
+      userEvent: forward ? "delete.forward" : "delete.backward",
+      scrollIntoView: true,
+    });
+    return true;
+  };
+}
+
 /**
  * Backspace and Delete. `Prec.highest`, ahead of the Markdown language's own
- * Backspace (`deleteMarkupBackward`). Mod-Backspace and Mod-Delete are not
- * bound, so the word deletes run as today.
+ * Backspace (`deleteMarkupBackward`). The word and line deletes run as today,
+ * except where they would reach only hidden marks (`overHidden`).
  */
 export const deletionKeymap: Extension = Prec.highest(
   keymap.of([
     { key: "Backspace", run: key(false) },
     { key: "Delete", run: key(true) },
+    {
+      key: "Mod-Backspace",
+      mac: "Alt-Backspace",
+      run: overHidden(deleteGroupBackward, false),
+    },
+    {
+      key: "Mod-Delete",
+      mac: "Alt-Delete",
+      run: overHidden(deleteGroupForward, true),
+    },
+    {
+      mac: "Mod-Backspace",
+      run: overHidden(deleteLineBoundaryBackward, false),
+    },
+    { mac: "Mod-Delete", run: overHidden(deleteLineBoundaryForward, true) },
   ]),
 );
 
