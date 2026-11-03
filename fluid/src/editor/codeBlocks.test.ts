@@ -6,7 +6,8 @@
  * hidden fence line.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { LanguageDescription, syntaxTree } from "@codemirror/language";
+import { languages } from "@codemirror/language-data";
 import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import { render } from "@testing-library/react";
 import { createElement } from "react";
@@ -823,5 +824,48 @@ describe("the language lookup the editor and its highlighting share", () => {
     expect(codeLanguageFor("text")).toBeNull();
     expect(codeLanguageFor("ts")?.name).toBe("TypeScript");
     expect(codeLanguageFor("")).toBeNull();
+  });
+});
+
+describe("words the old fuzzy lookup found and the exact one keeps", () => {
+  // Every name and alias of @codemirror/language-data plus common fence
+  // words, compared between the old fuzzy match and `languageOf`: these are
+  // the words the fuzzy match mapped to the right language and the exact
+  // one missed (text, plaintext and context, which it got wrong, aside).
+  it.each([
+    ["jsonc", "JSON"],
+    ["jsonl", "JSON"],
+    ["ndjson", "JSON"],
+  ])("reads %s as %s", (word, name) => {
+    expect(languageOf(word)?.name).toBe(name);
+    expect(codeLanguageFor(word)?.name).toBe(name);
+  });
+
+  it("names JSON in the header for a jsonc fence", () => {
+    const view = markView("a\n\n```jsonc\n{}\n```");
+    setCaret(view, 0);
+    expect(
+      view.contentDOM
+        .querySelector('button[aria-label^="Code language"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("Code language: JSON");
+  });
+
+  it("agrees with the old lookup on every other word", () => {
+    const common =
+      "jsonc jsonl ndjson json5 yml sh zsh shell console ps1 dockerfile makefile tsx jsx mjs cjs md html xml svg toml ini sql kt swift rb pl lua r cs c++ h hpp objc scala hs elixir ex erl vue svelte".split(
+        " ",
+      );
+    const words = new Set<string>(common);
+    for (const language of languages) {
+      words.add(language.name);
+      for (const alias of language.alias) words.add(alias);
+    }
+    const differ: string[] = [];
+    for (const word of words) {
+      const old = LanguageDescription.matchLanguageName(languages, word, true);
+      if (old?.name !== languageOf(word)?.name) differ.push(word);
+    }
+    expect(differ).toEqual([]);
   });
 });

@@ -15,6 +15,18 @@ import { languages } from "@codemirror/language-data";
 /** Words that say "plain text" and name no language. */
 const PLAIN_TEXT = new Set(["text", "plaintext", "plain", "txt"]);
 
+/**
+ * Words with no entry of their own that name a known language: what the old
+ * fuzzy match found right (`json` inside them) and the exact one would
+ * miss. `codeBlocks.test.ts` compares both lookups over every name and alias
+ * and pins this list.
+ */
+const ALSO = new Map([
+  ["jsonc", "json"],
+  ["jsonl", "json"],
+  ["ndjson", "json"],
+]);
+
 /** The language `word` names, or null for none. */
 export function languageOf(word: string | null): LanguageDescription | null {
   if (word === null || word === "") {
@@ -24,7 +36,11 @@ export function languageOf(word: string | null): LanguageDescription | null {
   if (PLAIN_TEXT.has(lower)) {
     return null;
   }
-  return LanguageDescription.matchLanguageName(languages, lower, false);
+  return LanguageDescription.matchLanguageName(
+    languages,
+    ALSO.get(lower) ?? lower,
+    false,
+  );
 }
 
 /**
