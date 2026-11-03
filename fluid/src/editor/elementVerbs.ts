@@ -10,7 +10,8 @@
  * document positions; spans are read with `doc.sliceString`.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { LanguageDescription, syntaxTree } from "@codemirror/language";
+import { languages } from "@codemirror/language-data";
 import type { ChangeSpec, EditorState } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
 
@@ -1020,4 +1021,158 @@ export function calloutMarkAt(state: EditorState, pos: number): Span | null {
   return callout === null
     ? null
     : { from: callout.markFrom, to: callout.kindTo + 1 };
+}
+
+/**
+ * A closed fence the code box draws: its whole span (the opening line's start
+ * to the closing line's end), its two fence lines and the info word.
+ */
+export interface CodeFence extends Span {
+  /** The document lines of the opening and the closing fence. */
+  open: number;
+  close: number;
+  /** The opening fence's backticks or tildes. */
+  marks: Span;
+  /**
+   * The info word: the text right after the marks up to the first space or
+   * the line end. Empty (at the marks' end) when the info starts with a space.
+   */
+  word: Span;
+  /** A tilde fence, whose info may hold a backtick. */
+  tilde: boolean;
+}
+
+/** The info words the code box leaves to other layers: Part 4's and math's. */
+const NOT_CODE_BOXES = new Set(["mermaid", "math"]);
+
+/** Whether `text` before position `upTo` holds only indentation. */
+function onlyIndent(text: string, upTo: number): boolean {
+  return /^[ \t]*$/.test(text.slice(0, upTo));
+}
+
+/**
+ * The code box of `node`, a `FencedCode`, or null when it draws none: an
+ * unclosed fence, one with no code line, one in a quote or after a list
+ * marker, one in the frontmatter, on an id line, or a mermaid or math fence.
+ */
+export function codeFenceOf(
+  state: EditorState,
+  node: SyntaxNode,
+): CodeFence | null {
+  const doc = state.doc;
+  const region = frontmatterRegion(doc);
+  if (region !== null && node.from <= region.to) {
+    return null;
+  }
+  const first = node.firstChild;
+  const last = node.lastChild;
+  if (first?.name !== "CodeMark" || last?.name !== "CodeMark") {
+    return null;
+  }
+  const openLine = doc.lineAt(first.from);
+  const closeLine = doc.lineAt(last.from);
+  // Closed, with at least one code line between the fences.
+  if (closeLine.number < openLine.number + 2) {
+    return null;
+  }
+  if (
+    !onlyIndent(openLine.text, first.from - openLine.from) ||
+    !onlyIndent(closeLine.text, last.from - closeLine.from) ||
+    closeLine.text.slice(last.to - closeLine.from).trim() !== "" ||
+    isIdLine(openLine.text) ||
+    isIdLine(closeLine.text)
+  ) {
+    return null;
+  }
+  const after = doc.sliceString(first.to, openLine.to);
+  const length = /^[^ \t]*/.exec(after)?.[0].length ?? 0;
+  const word = { from: first.to, to: first.to + length };
+  if (NOT_CODE_BOXES.has(doc.sliceString(word.from, word.to))) {
+    return null;
+  }
+  return {
+    from: openLine.from,
+    to: closeLine.to,
+    open: openLine.number,
+    close: closeLine.number,
+    marks: { from: first.from, to: first.to },
+    word,
+    tilde: doc.sliceString(first.from, first.from + 1) === "~",
+  };
+}
+
+/** The code box `pos` lies in (a fence line or a code line), or null. */
+export function codeFenceAt(state: EditorState, pos: number): CodeFence | null {
+  if (pos < 0 || pos > state.doc.length) {
+    return null;
+  }
+  const tree = syntaxTree(state);
+  for (const side of [1, -1] as const) {
+    for (
+      let node: SyntaxNode | null = tree.resolve(pos, side);
+      node;
+      node = node.parent
+    ) {
+      if (node.name === "FencedCode") {
+        const fence = codeFenceOf(state, node);
+        if (fence !== null && fence.from <= pos && pos <= fence.to) {
+          return fence;
+        }
+        break;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The language an info word names, as the editor's highlighting finds it
+ * (`matchLanguageName`, fuzzy), or null for none.
+ */
+export function languageOf(word: string | null): LanguageDescription | null {
+  return word === null || word === ""
+    ? null
+    : LanguageDescription.matchLanguageName(languages, word, true);
+}
+
+/**
+ * Writes `word` as the info word of the code box starting at `at` (`null`
+ * takes the word away, which is "Plain text"). Only the word's span is
+ * written; any further info text stays, and the fence keeps its backticks
+ * or tildes. Nothing is written when the word is already that text. Null
+ * when there is no code box
+ * starting at `at`, or `word` cannot be an info word: empty, with a space,
+ * or with a backtick in a backtick fence.
+ */
+export function languageChanges(
+  state: EditorState,
+  at: number,
+  word: string | null,
+): ChangeSpec[] | null {
+  const fence = codeFenceAt(state, at);
+  if (fence?.from !== at) {
+    return null;
+  }
+  if (
+    word !== null &&
+    (word === "" || /\s/.test(word) || (!fence.tilde && word.includes("`")))
+  ) {
+    return null;
+  }
+  if (state.doc.sliceString(fence.word.from, fence.word.to) === (word ?? "")) {
+    return [];
+  }
+  return [{ from: fence.word.from, to: fence.word.to, insert: word ?? "" }];
+}
+
+/**
+ * One line break after the closing fence of the code box starting at `at`:
+ * an empty line below it, the way out of a box that ends the document.
+ */
+export function paragraphBelowChanges(
+  state: EditorState,
+  at: number,
+): ChangeSpec[] | null {
+  const fence = codeFenceAt(state, at);
+  return fence?.from === at ? [{ from: fence.to, insert: "\n" }] : null;
 }

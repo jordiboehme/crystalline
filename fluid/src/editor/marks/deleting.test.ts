@@ -440,3 +440,66 @@ describe.each([
     expect(bytes(forward.state)).toBe("a  c");
   });
 });
+
+describe.each([
+  { name: "solo", room: false },
+  { name: "in a room", room: true },
+])("a hidden fence line is never joined, $name", ({ room }) => {
+  // a=0, ```ts=2..7, x=8, y=10, ```=12..15, b=16
+  const TEXT = "a\n```ts\nx\ny\n```\nb";
+
+  it.each([
+    ["Backspace at the first code line's start", 8, "Backspace"],
+    ["Delete at the last code line's end", 11, "Delete"],
+    ["Delete at the end of the line above", 1, "Delete"],
+    ["Backspace at the start of the line below", 16, "Backspace"],
+  ])("%s changes nothing", (_name, at, key) => {
+    const v = markView(TEXT, { room });
+    setCaret(v, at);
+    keys(v, key);
+    expect(bytes(v.state)).toBe(TEXT);
+    expect(caret(v)).toBe(at);
+  });
+
+  it("Backspace at the visible start of a bold line below changes nothing", () => {
+    const text = "a\n```ts\nx\n```\n**b**";
+    const v = markView(text, { room });
+    setCaret(v, text.indexOf("**"));
+    expect(caret(v)).toBe(text.indexOf("b**"));
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe(text);
+  });
+
+  it("Backspace inside a code line still deletes", () => {
+    const v = markView(TEXT, { room });
+    setCaret(v, 9);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a\n```ts\n\ny\n```\nb");
+  });
+});
+
+describe("a fence line the caret shows (show mode)", () => {
+  it("Backspace at the first code line's start runs today's key", () => {
+    const text = "a\n```ts\nx\ny\n```\nb";
+    const v = markView(text, { mode: "show" });
+    setCaret(v, 8);
+    expect(v.contentDOM.textContent).toContain("```ts");
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe("a\n```tsx\ny\n```\nb");
+  });
+
+  it("Backspace below a fence the caret does not show changes nothing", () => {
+    const text = "a\n```ts\nx\ny\n```\nb";
+    const v = markView(text, { mode: "show" });
+    setCaret(v, 16);
+    keys(v, "Backspace");
+    expect(bytes(v.state)).toBe(text);
+  });
+});
+
+it("Raw: Backspace at the first code line's start joins the lines, as today", () => {
+  const v = markView("a\n```ts\nx\n```", { raw: true });
+  setCaret(v, 8);
+  keys(v, "Backspace");
+  expect(bytes(v.state)).toBe("a\n```tsx\n```");
+});

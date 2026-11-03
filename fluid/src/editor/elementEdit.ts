@@ -42,6 +42,7 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 import type { LinkElement, Span } from "./elementVerbs";
 import {
   calloutMarkAt,
+  codeFenceAt,
   linkAt,
   mathAt,
   newLinkChanges,
@@ -72,7 +73,8 @@ export type ElementEdit =
   | { kind: "math"; at: number; rect: DOMRect; block: boolean }
   | { kind: "task"; at: number; rect: DOMRect }
   | { kind: "callout-kind"; at: number; rect: DOMRect }
-  | { kind: "language"; at: number; rect: DOMRect };
+  | { kind: "language"; at: number; rect: DOMRect }
+  | { kind: "code-actions"; at: number; rect: DOMRect };
 
 /**
  * A Ctrl+click on a Mac: the browser opens its context menu for it, so no
@@ -195,7 +197,11 @@ function spanAt(
     case "callout-kind":
       return calloutMarkAt(state, at);
     case "language":
-      return { from: at, to: at };
+    case "code-actions": {
+      // The whole box, so a request follows its fence and never the next one.
+      const fence = codeFenceAt(state, at);
+      return fence?.from === at ? fence : null;
+    }
   }
 }
 
@@ -218,10 +224,6 @@ function mapEdit(edit: ElementEdit, tr: Transaction): ElementEdit | null {
       return null;
     }
     return { ...edit, range: { from, to } };
-  }
-  if (edit.kind === "language") {
-    const at = changes.mapPos(edit.at, 1, MapMode.TrackDel);
-    return at === null ? null : { ...edit, at };
   }
   const before = spanAt(tr.startState, edit.kind, edit.at);
   if (!before) {
@@ -351,11 +353,21 @@ export function closeElementEdit(main: EditorView): void {
   if (hub) tell(hub, null);
 }
 
-/** Where the element `edit` names ends in `state`, or null when it is gone. */
+/**
+ * Where the element `edit` names ends in `state`, or null when it is gone.
+ * For a code box's language that is the end of its opening line, where the
+ * word is: the caret then goes into the box's first line, and the view does
+ * not scroll to the end of a long box.
+ */
 function elementEnd(state: EditorState, edit: ElementEdit): number | null {
-  return edit.kind === "new-link"
-    ? edit.range.to
-    : (spanAt(state, edit.kind, edit.at)?.to ?? null);
+  if (edit.kind === "new-link") {
+    return edit.range.to;
+  }
+  const span = spanAt(state, edit.kind, edit.at);
+  if (span === null) {
+    return null;
+  }
+  return edit.kind === "language" ? state.doc.lineAt(span.from).to : span.to;
 }
 
 /**
@@ -493,6 +505,12 @@ export function elementEditAt(
   ) {
     return { kind: "callout-kind", at: callout.from, rect: box(callout) };
   }
+  // In a code box, its actions: the language and a paragraph below.
+  const fence = codeFenceAt(state, pos);
+  if (fence) {
+    const head = state.doc.line(fence.open);
+    return { kind: "code-actions", at: fence.from, rect: box(head) };
+  }
   return null;
 }
 
@@ -515,10 +533,13 @@ export function elementAtCaret(state: EditorState): ElementEdit["kind"] | null {
     return "task";
   }
   const callout = calloutMarkAt(state, head);
-  return callout &&
+  if (
+    callout &&
     state.doc.lineAt(callout.from).number === state.doc.lineAt(head).number
-    ? "callout-kind"
-    : null;
+  ) {
+    return "callout-kind";
+  }
+  return codeFenceAt(state, head) ? "code-actions" : null;
 }
 
 /**

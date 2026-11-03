@@ -357,7 +357,8 @@ const composingWatch = ViewPlugin.define((view) => {
   };
 });
 
-function composing(state: EditorState): boolean {
+/** Whether the view showing `state` is in an IME composition. */
+export function composing(state: EditorState): boolean {
   for (const view of liveViews) {
     if (view.state === state) {
       return view.composing;

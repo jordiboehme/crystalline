@@ -10,7 +10,9 @@
  * partner survives it (`keepPartnerMarks`), so `**` is never left alone.
  *
  * All of it runs only on lines whose marks are hidden: in show mode on the
- * line being edited and in Raw today's keys and deletions run unchanged.
+ * line being edited and in Raw today's keys and deletions run unchanged. One
+ * rule holds on every line: Backspace and Delete never join a fence line the
+ * code box hides (`codeBlocks.ts`) to the line beside it.
  */
 
 import {
@@ -43,6 +45,7 @@ import type { Command } from "@codemirror/view";
 import { EditorView, keymap } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
 
+import { hiddenFenceLine } from "../codeBlocks";
 import { roomUndo } from "../roomUndo";
 import {
   atomFrom,
@@ -180,6 +183,26 @@ function remove(
 }
 
 /**
+ * Whether deleting the line break at `pos` (the start of its line for
+ * Backspace, the end for Delete) would join a fence line the code box hides
+ * to the line beside it: the first code line to the opening fence, the last
+ * to the closing one, or the lines around the box to its fences. That key is
+ * refused: it changes nothing.
+ */
+function joinsHiddenFence(
+  state: EditorState,
+  pos: number,
+  forward: boolean,
+): boolean {
+  const line = state.doc.lineAt(pos);
+  if (pos !== (forward ? line.to : line.from)) {
+    return false;
+  }
+  const next = line.number + (forward ? 1 : -1);
+  return next >= 1 && next <= state.doc.lines && hiddenFenceLine(state, next);
+}
+
+/**
  * The default delete as it would run with the caret at `pos` and no atomic
  * range in the way: the line break (or the indentation) next to a visible
  * edge, never the hidden marks between the caret and the raw edge.
@@ -190,6 +213,9 @@ function deleteAtEdge(
   forward: boolean,
 ): boolean {
   const { state } = view;
+  if (joinsHiddenFence(state, pos, forward)) {
+    return true;
+  }
   if (state.selection.main.head === pos) {
     // The raw edge already: the default key does exactly this.
     return false;
@@ -416,9 +442,26 @@ function guardShownHeading(view: EditorView, forward: boolean): boolean {
   return true;
 }
 
+/**
+ * An empty caret right beside a hidden fence line, whichever mode its own
+ * line is in: the key that would join them is spent.
+ */
+function refuseFenceJoin(view: EditorView, forward: boolean): boolean {
+  const { state } = view;
+  const { selection } = state;
+  return (
+    !state.readOnly &&
+    selection.ranges.length === 1 &&
+    selection.main.empty &&
+    joinsHiddenFence(state, selection.main.head, forward)
+  );
+}
+
 function key(forward: boolean): Command {
   return (view) =>
-    deleteVisible(view, forward) || guardShownHeading(view, forward);
+    refuseFenceJoin(view, forward) ||
+    deleteVisible(view, forward) ||
+    guardShownHeading(view, forward);
 }
 
 /** The range a CodeMirror delete command would take from `pos`, no atoms. */

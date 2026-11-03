@@ -1,10 +1,13 @@
 /**
  * The element popover host: one small `role="dialog"` named for what it
  * edits ("Link", "Wiki link", "Status label", "Formula"), or a
- * `role="menu"` for a choice ("Task state", "Callout kind"), placed under
+ * `role="menu"` for a choice ("Task state", "Callout kind", "Code
+ * language", "Code block actions"), placed under
  * the element (above it when there is no room below), with the focus on its
- * first field or on the menu's checked item. In a menu the arrow keys, Home
- * and End move between the items, and picking one commits.
+ * first field or on the menu's checked item (a menu with a filter field
+ * focuses the field). In a menu the arrow keys, Home and End move between
+ * the items (in a filter field Home and End stay the field's), and picking
+ * one commits.
  *
  * Enter or Save commits: the popover's verb runs again on the view that
  * asked, and its changes go in as one gesture there (`commitElementEdit`),
@@ -39,6 +42,7 @@ import {
 } from "../elementEdit";
 import type { ElementPopoverProps } from "./ElementPopoverSlot";
 import { CalloutKindMenu } from "./CalloutKindMenu";
+import { CodeActionsMenu, LanguageMenu } from "./LanguageMenu";
 import { LinkPopover } from "./LinkPopover";
 import { MathPopover } from "./MathPopover";
 import { placement } from "./placement";
@@ -82,6 +86,10 @@ function nameOf(edit: ElementEdit): string {
       return "Task state";
     case "callout-kind":
       return "Callout kind";
+    case "language":
+      return "Code language";
+    case "code-actions":
+      return "Code block actions";
     default:
       return "Link";
   }
@@ -89,15 +97,29 @@ function nameOf(edit: ElementEdit): string {
 
 /** Whether the popover for `edit` is a menu of choices rather than a form. */
 function isMenu(edit: ElementEdit): boolean {
-  return edit.kind === "task" || edit.kind === "callout-kind";
+  return (
+    edit.kind === "task" ||
+    edit.kind === "callout-kind" ||
+    edit.kind === "language" ||
+    edit.kind === "code-actions"
+  );
 }
 
-const MENU_ITEM = '[role="menuitemradio"]';
+const MENU_ITEM = '[role="menuitemradio"], [role="menuitem"]';
 
-/** The item the focus goes to in a menu: the checked one, else the first. */
+/** Marks a menu's filter field (`LanguageMenu`), which takes the focus first. */
+const MENU_FILTER = "data-menu-filter";
+
+/**
+ * The item the focus goes to in a menu: a filter field, else the checked
+ * item, else the first.
+ */
 function firstFocus(root: HTMLElement): HTMLElement | null {
   return (
-    root.querySelector<HTMLElement>(`${MENU_ITEM}[aria-checked="true"]`) ??
+    root.querySelector<HTMLElement>(`[${MENU_FILTER}]`) ??
+    root.querySelector<HTMLElement>(
+      '[role="menuitemradio"][aria-checked="true"]',
+    ) ??
     root.querySelector<HTMLElement>(MENU_ITEM) ??
     root.querySelector<HTMLElement>('input:not([type="radio"]), textarea')
   );
@@ -261,7 +283,15 @@ function Open({
   const menu = isMenu(edit);
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
-    if (menu && root.current && moveInMenu(root.current, event.key)) {
+    // In a filter field Home and End move its own caret.
+    const inField =
+      takesText(event.target) && (event.key === "Home" || event.key === "End");
+    if (
+      menu &&
+      !inField &&
+      root.current &&
+      moveInMenu(root.current, event.key)
+    ) {
       event.preventDefault();
       event.stopPropagation();
       return;
@@ -323,6 +353,10 @@ function Open({
         <TaskMenu {...body} />
       ) : edit.kind === "callout-kind" ? (
         <CalloutKindMenu {...body} />
+      ) : edit.kind === "language" ? (
+        <LanguageMenu {...body} />
+      ) : edit.kind === "code-actions" ? (
+        <CodeActionsMenu {...body} />
       ) : null}
     </div>
   );

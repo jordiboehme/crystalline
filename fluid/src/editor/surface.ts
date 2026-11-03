@@ -15,6 +15,7 @@ import type { EditorView } from "@codemirror/view";
 
 import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
+import { codeBlocks } from "./codeBlocks";
 import { elementContextListener } from "./elementContext";
 import type { ElementEdit } from "./elementEdit";
 import { elementEditListener } from "./elementEdit";
@@ -172,6 +173,9 @@ export function previewConfig(
         // up to the raw edge, goes over the line break.
         crossEdge,
         fencePreviews(dark),
+        // The code box: a fence's lines drawn as a box with a header, in
+        // the main view only (a table cell holds no fence).
+        codeBlocks(),
         // A pasted screenshot is a path in the buffer and a picture on the
         // page, so the picture is drawn here too: an author placing an image
         // sees what a reader will see rather than the reference to it.
