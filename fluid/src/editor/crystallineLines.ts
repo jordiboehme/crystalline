@@ -22,7 +22,7 @@ import {
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
-import { relationType } from "./relationLines";
+import { joinBullet, placeTags, relationType } from "./relationLines";
 
 // The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
 // after the dash is no bullet to the server's parser, and a category must
@@ -120,6 +120,19 @@ function buildMarks(view: EditorView): DecorationSet {
         // Hidden marks draw chips on the words; a line whose marks show (the
         // caret line in show mode, Raw) keeps the bracketed marking.
         const chips = marksHiddenOnLine(view.state, line.number);
+        // The n-th line after this one, unless it is code.
+        const lineAfter = (offset: number): string | undefined => {
+          const number = line.number + offset;
+          if (number > doc.lines) {
+            return undefined;
+          }
+          const next = doc.line(number);
+          return code.some(
+            (range) => next.from >= range.from && next.from < range.to,
+          )
+            ? undefined
+            : next.text;
+        };
         const observation = OBSERVATION_LINE.exec(line.text);
         if (observation) {
           const category = observation[1] ?? "";
@@ -135,32 +148,37 @@ function buildMarks(view: EditorView): DecorationSet {
                   start + category.length + 2,
                 ),
           );
-          const tags: { from: number; to: number }[] = chips
-            ? serverTags(line.text, observation[0].length)
-            : [...line.text.matchAll(TRAILING_TAG)].map((tag) => ({
-                from: tag.index,
-                to: tag.index + tag[0].length,
-              }));
-          for (const tag of tags) {
-            marks.push(
-              Decoration.mark({
-                class: chips ? "cm-tag-chip" : "cm-line-tag",
-              }).range(line.from + tag.from, line.from + tag.to),
-            );
+          if (chips) {
+            // The server reads tags from the joined bullet, so a wrapped
+            // observation's chips sit on whichever line holds them.
+            const bullet = joinBullet(lineAfter);
+            const found = bullet
+              ? placeTags(
+                  bullet,
+                  serverTags(bullet.content, observation[0].length - 2),
+                )
+              : [];
+            for (const tag of found) {
+              const holder = doc.line(line.number + tag.offset);
+              marks.push(
+                Decoration.mark({ class: "cm-tag-chip" }).range(
+                  holder.from + tag.from,
+                  holder.from + tag.to,
+                ),
+              );
+            }
+          } else {
+            for (const tag of line.text.matchAll(TRAILING_TAG)) {
+              marks.push(
+                Decoration.mark({ class: "cm-line-tag" }).range(
+                  line.from + tag.index,
+                  line.from + tag.index + tag[0].length,
+                ),
+              );
+            }
           }
         } else {
-          const span = relationType((offset) => {
-            const number = line.number + offset;
-            if (number > doc.lines) {
-              return undefined;
-            }
-            const next = doc.line(number);
-            return code.some(
-              (range) => next.from >= range.from && next.from < range.to,
-            )
-              ? undefined
-              : next.text;
-          });
+          const span = relationType(lineAfter);
           if (span) {
             marks.push(
               Decoration.mark({

@@ -90,7 +90,8 @@ function maskInlineCode(line: string): string {
   if (!line.includes("`")) {
     return line;
   }
-  const chars = [...line];
+  // UTF-16 offsets throughout: `codeSpans` counts the same way.
+  const chars = line.split("");
   for (const [from, to] of codeSpans(line)) {
     for (let at = from; at < to; at += 1) {
       chars[at] = " ";
@@ -200,7 +201,8 @@ function maskLinkDestinations(line: string): string {
   if (ranges.length === 0) {
     return line;
   }
-  return [...line]
+  return line
+    .split("")
     .map((char, at) =>
       ranges.some(([from, to]) => at >= from && at < to) ? " " : char,
     )
@@ -264,8 +266,8 @@ function wikiType(before: string): boolean {
   return text !== "" && !/\s/.test(text) && !/^[:[]/.test(text);
 }
 
-const lower = (char: string) =>
-  char === char.toLowerCase() && char !== char.toUpperCase();
+/** Rust's `char::is_lowercase`: the Unicode Lowercase property. */
+const lower = (char: string) => /^\p{Lowercase}$/u.test(char);
 
 /** `relative_relation_type`: narrower, so prose before a link is no type. */
 function relativeType(before: string): boolean {
@@ -273,6 +275,7 @@ function relativeType(before: string): boolean {
   if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
     return true;
   }
+  // `text` is read by code point here; every offset taken from it is not.
   const [first, ...rest] = [...text];
   return (
     first !== undefined &&
@@ -387,20 +390,29 @@ function continuesBullet(line: string): boolean {
   );
 }
 
+/** The joined text of a bullet and where each of its lines sits in it. */
+export interface Bullet {
+  /** The text after `- `, wrapped lines trimmed and joined by one space. */
+  content: string;
+  /** Where each line's text starts in `content` and in that line. */
+  parts: { offset: number; start: number; col: number; end: number }[];
+}
+
 /**
- * The type of the relation the bullet starting at `lineAt(0)` is, as a span
- * of that first line, or null. `lineAt(n)` answers the n-th line after the
- * first (undefined at the end, or inside a fence).
+ * The bullet starting at `lineAt(0)` as the server joins it (`bullet_end`,
+ * `bullet_text`), or null when that line is no bullet. `lineAt(n)` answers
+ * the n-th line after the first (undefined at the end, or inside a fence).
  */
-export function relationType(
+export function joinBullet(
   lineAt: (offset: number) => string | undefined,
-): TypeSpan | null {
+): Bullet | null {
   const line = lineAt(0);
   if (line === undefined || !line.startsWith("- ")) {
     return null;
   }
   const first = line.slice(2);
   let content = first;
+  const parts = [{ offset: 0, start: 0, col: 2, end: first.length }];
   if (!/^\[[^\]]*$/.test(first)) {
     let previous = line;
     for (let offset = 1; ; offset += 1) {
@@ -412,10 +424,39 @@ export function relationType(
       ) {
         break;
       }
-      content = `${content.trimEnd()} ${next.trim()}`;
+      const head = content.trimEnd();
+      const lead = next.length - next.trimStart().length;
+      const text = next.trim();
+      content = `${head} ${text}`;
+      const last = parts[parts.length - 1];
+      if (last) {
+        last.end = Math.min(last.end, head.length);
+      }
+      parts.push({
+        offset,
+        start: head.length + 1,
+        col: lead,
+        end: content.length,
+      });
       previous = next;
     }
   }
+  return { content, parts };
+}
+
+/**
+ * The type of the relation the bullet starting at `lineAt(0)` is, as a span
+ * of that first line, or null.
+ */
+export function relationType(
+  lineAt: (offset: number) => string | undefined,
+): TypeSpan | null {
+  const line = lineAt(0);
+  const bullet = joinBullet(lineAt);
+  if (line === undefined || !bullet) {
+    return null;
+  }
+  const { content } = bullet;
   if (readsAsCategory(content)) {
     return null;
   }
@@ -428,4 +469,37 @@ export function relationType(
   const from = 2 + lead;
   const to = from + before.trim().length;
   return to <= line.length ? { from, to } : null;
+}
+
+/** A tag's place: the line (offset from the bullet's first) and its columns. */
+export interface TagSpan {
+  offset: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * The tags of an observation bullet as `split_observation` reads them, from
+ * the joined text of its lines, mapped back to the lines that hold them.
+ * `read` is `serverTags` (it knows the tag grammar); `bodyFrom` is where the
+ * text after the category starts in the joined content.
+ */
+export function placeTags(
+  bullet: Bullet,
+  tags: { from: number; to: number }[],
+): TagSpan[] {
+  const out: TagSpan[] = [];
+  for (const tag of tags) {
+    const part = bullet.parts.find(
+      (candidate) => tag.from >= candidate.start && tag.from <= candidate.end,
+    );
+    if (part) {
+      out.push({
+        offset: part.offset,
+        from: part.col + (tag.from - part.start),
+        to: part.col + (tag.to - part.start),
+      });
+    }
+  }
+  return out;
 }

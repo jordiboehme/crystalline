@@ -46,7 +46,6 @@ import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import { Link, useLocation, useNavigate } from "react-router";
-import remarkGfm from "remark-gfm";
 
 import {
   SECTION_FLASH_CLASS,
@@ -61,26 +60,13 @@ import {
   imageStyle,
   parseImageFragment,
 } from "../editor/imageFormat";
-import {
-  CALLOUT_KINDS,
-  REVEAL_EVENT,
-  remarkCallouts,
-} from "../markdown/callouts";
+import { CALLOUT_KINDS, REVEAL_EVENT } from "../markdown/callouts";
 import type { CalloutKind, RevealDetail } from "../markdown/callouts";
-import {
-  isStatusColour,
-  remarkCrystallineDirectives,
-  remarkStatusSyntax,
-} from "../markdown/directives";
-import {
-  remarkGithubMath,
-  remarkMath,
-  remarkMathOptions,
-} from "../markdown/math";
+import { isStatusColour } from "../markdown/directives";
 import { SWATCH_CLASSES, colourOf } from "../markdown/swatch";
 import { dropHtmlComments } from "../markdown/htmlComments";
 import { keepWithNext } from "../markdown/keepWithNext";
-import { remarkTaskState } from "../markdown/taskState";
+import { remarkPipeline } from "../markdown/pipeline";
 import { printUrl } from "../printUrl";
 import { SOURCE_ATTR, spanPieces } from "../reflectionQuotes";
 import { WIKILINK, referenceState, wikilinkWords } from "../wikilinks";
@@ -1832,28 +1818,10 @@ export default function MarkdownBody({
     () => componentsFor(resolver, documentName, anchored),
     [resolver, documentName, anchored],
   );
-  // The markdown extensions, in the order they run:
-  // 1. GitHub's tables, task lists and footnotes, the base the rest reads.
-  // 2. The status label syntax (only `:status[` is a directive).
-  // 3. The transform that names the labels; it reads `shown` for the brace
-  //    text, so it runs on the tree the syntax just built.
-  // 4. Math (`$$...$$` and the ```math fence), a syntax of its own.
-  // 5. GitHub's inline math (`` $`...`$ ``), which reads the inline code
-  //    nodes the parser built and checks the `$` beside them in the source.
-  // 6. The callouts, which read the quotes the parser built and strip the
-  //    head paragraph's first line.
-  // 7. The task state (`[~]`), last: a callout's first line may hold the
-  //    words a box would be read from, so the head is cut first.
+  // The markdown extensions, in the order they run: the shared syntax
+  // (`markdown/syntax.ts`: GFM, status labels, math), then the transforms.
   const remarkPlugins = useMemo<RemarkPlugins>(
-    () => [
-      remarkGfm,
-      remarkStatusSyntax,
-      remarkCrystallineDirectives(shown),
-      [remarkMath, remarkMathOptions],
-      remarkGithubMath,
-      remarkCallouts,
-      remarkTaskState,
-    ],
+    () => remarkPipeline(shown),
     [shown],
   );
   const rehypePlugins = useMemo<RehypePlugins>(

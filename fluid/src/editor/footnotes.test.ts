@@ -18,7 +18,7 @@ import {
   setCaret,
   undoOnce,
 } from "../test/markKit";
-import { footnoteModel, footnoteScans } from "./footnotes";
+import { affects, footnoteModel, footnoteScans } from "./footnotes";
 import { markSegment } from "./marks/caret";
 
 afterEach(cleanupMarkViews);
@@ -405,5 +405,54 @@ describe("the cost", () => {
       const fresh = markView(view.state.doc.toString());
       expect(footnoteModel(view.state)).toEqual(footnoteModel(fresh.state));
     }
+  });
+});
+
+describe("the edits that can change footnotes", () => {
+  const changed = (doc: string, from: number, to: number, insert: string) => {
+    const startState = EditorState.create({ doc });
+    const tr = startState.update({ changes: { from, to, insert } });
+    return affects(tr);
+  };
+  const at = (doc: string, needle: string, shift = 0) =>
+    doc.indexOf(needle) + shift;
+
+  // Each row: a document with a block start on its second line, and an edit
+  // made after the first character of that line that creates or ends it.
+  it.each([
+    ["thematic break with underscores", "p\n___x\nq", "x", ""],
+    ["thematic break with underscores made", "p\n__x\nq", "x", "_"],
+    ["thematic break with stars", "p\n***x\nq", "x", ""],
+    ["thematic break with dashes", "p\n---x\nq", "x", ""],
+    ["thematic break with spaced dashes", "p\n- - -x\nq", "x", ""],
+    ["ATX heading", "p\n#x\nq", "x", " x"],
+    ["setext underline with equals", "Title\n==x", "x", "="],
+    ["setext underline with dashes", "Title\n--x", "x", "-"],
+    ["backtick fence", "p\n``x\nq", "x", "`"],
+    ["tilde fence", "p\n~~x\nq", "x", "~"],
+    ["display math", "p\n$x\nq", "x", "$"],
+    ["block quote", "p\n>x\nq", "x", " x"],
+    ["dash list item", "p\n-x\nq", "x", " x"],
+    ["plus list item", "p\n+x\nq", "x", " x"],
+    ["star list item", "p\n*x\nq", "x", " x"],
+    ["ordered list item with a dot", "p\n1.x\nq", "x", " x"],
+    ["ordered list item with a paren", "p\n1)x\nq", "x", " x"],
+    ["HTML block", "p\n<divx>\nq", "x", ""],
+    ["table header row", "a | bx\n--|--", "x", ""],
+    ["table delimiter row", "a | b\n-|-x", "x", ""],
+    ["table delimiter row with colons", "a | b\n:-|-x", "x", ""],
+    ["definition label", "p\n[^a]:x\nq", "x", " x"],
+  ])("%s", (_name, doc, needle, insert) => {
+    const from = at(doc, needle);
+    expect(changed(doc, from, insert === "" ? from + 1 : from, insert)).toBe(
+      true,
+    );
+  });
+
+  it("does not answer yes for a letter in plain prose", () => {
+    const doc = "p\n\nPlain prose here.\n";
+    expect(changed(doc, at(doc, "prose", 2), at(doc, "prose", 2), "x")).toBe(
+      false,
+    );
   });
 });

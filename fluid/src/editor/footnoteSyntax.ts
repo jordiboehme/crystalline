@@ -11,12 +11,10 @@
  */
 
 import type { Text } from "@codemirror/state";
-import remarkGfm from "remark-gfm";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
 
-import { remarkStatusSyntax } from "../markdown/directives";
-import { remarkMath, remarkMathOptions } from "../markdown/math";
+import { markdownSyntax } from "../markdown/syntax";
 import { frontmatterRegion } from "./frontmatterRegion";
 
 /** A drawn reference. */
@@ -52,11 +50,7 @@ interface MdNode {
   children?: MdNode[];
 }
 
-const processor = unified()
-  .use(remarkParse)
-  .use(remarkGfm)
-  .use(remarkStatusSyntax)
-  .use(remarkMath, remarkMathOptions);
+const processor = unified().use(remarkParse).use(markdownSyntax);
 
 /** `text` with its frontmatter block blanked, so offsets stay the document's. */
 function body(text: string, end: number): string {

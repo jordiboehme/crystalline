@@ -341,6 +341,10 @@ describe("relation chips follow the relations the server reads", () => {
     ["- rel [Doc](a[[x]]b.md)", "rel"],
     ["- relates_to\n  [[T]]", "relates_to"],
     ["- part_of\n  [Doc](doc.md)", "part_of"],
+    // Rust's char::is_lowercase is the Unicode Lowercase property.
+    ["- ªrel [Doc](doc.md)", "ªrel"],
+    // Offsets are UTF-16 throughout: an astral character before a mask.
+    ["- rel [\u{1F600} Doc](a[[x]]b.md)", "rel"],
     // Not relations to the server.
     ["- See [Three](chapter-3.md)", null],
     ["- uses [x](page.html)", null],
@@ -356,8 +360,32 @@ describe("relation chips follow the relations the server reads", () => {
     ["- [fact] see [[T]]", null],
     ["- uses `[x](a.md)`", null],
     ["- relates_to [[T]\n", null],
+    ["- rel[\u{1F600}]([[x]]b.html)", null],
     ["  - relates_to [[T]]", null],
   ])("%j", (doc, expected) => {
     expect(chipOf(doc)).toBe(expected);
+  });
+});
+
+describe("tag chips on a wrapped observation", () => {
+  afterEach(cleanupMarkViews);
+
+  const chips = (doc: string): string[] => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return [...view.dom.querySelectorAll(".cm-tag-chip")].map(
+      (el) => el.textContent ?? "",
+    );
+  };
+
+  it.each([
+    // The server reads the tags from the joined text: only the last run.
+    ["- [fact] a #x\n  b #y", ["#y"]],
+    ["- [fact] a\n  #x #y", ["#x", "#y"]],
+    ["- [fact] a #x\n  b #y\n  c", []],
+    ["- [fact] a\n  b #y (ctx)", ["#y"]],
+    ["- [fact] a #x\n\n  #y", ["#x"]],
+  ])("%j", (doc, expected) => {
+    expect(chips(doc)).toEqual(expected);
   });
 });

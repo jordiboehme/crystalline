@@ -166,6 +166,21 @@ describe("a long document read in a worker", () => {
     expect(worker.posts).toHaveLength(1);
   });
 
+  it("is not put off by updates that only move the caret", async () => {
+    const { worker, view } = withWorker();
+    worker.reply(0);
+    view.dispatch({
+      changes: { from: 0, insert: "[^9]" },
+      userEvent: "input.type",
+    });
+    // The pause is 120 ms; a caret move every 60 ms must not restart it.
+    for (const at of [10, 20, 30, 40]) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      view.dispatch({ selection: EditorSelection.cursor(at) });
+    }
+    expect(worker.posts).toHaveLength(2);
+  });
+
   it("ends the worker with the view and ignores a late reply", () => {
     const { worker, view } = withWorker();
     view.destroy();

@@ -102,7 +102,7 @@ interface Model extends Notes {
 const settled = StateEffect.define<{ revision: number; notes: Notes }>();
 
 const TRIGGER = /[[\]^`~<>$\\:|]/;
-const BLOCKISH = /^[ \t]*([#>*+=-]|\d+[.)])/;
+const BLOCKISH = /^[ \t]*([#>*+=_-]|\d+[.)])/;
 const BLANK = /^\s*$/;
 
 /**
@@ -113,7 +113,7 @@ const BLANK = /^\s*$/;
  * the indentation or the first characters of a line, a blank line made or
  * lost and a change over a line break.
  */
-function affects(tr: {
+export function affects(tr: {
   startState: EditorState;
   state: EditorState;
   changes: ChangeSet;
@@ -248,7 +248,12 @@ const settling = ViewPlugin.fromClass(
       if (this.flight && update.docChanged) {
         this.flight.since = this.flight.since.compose(update.changes);
       }
-      if (update.state.field(model).stale && !this.flight) {
+      // Only an edit puts the read off; a caret move must not.
+      if (
+        update.docChanged &&
+        update.state.field(model).stale &&
+        !this.flight
+      ) {
         this.later();
       }
     }
@@ -301,8 +306,14 @@ const settling = ViewPlugin.fromClass(
       }
       // No worker: the read happens a tick later, not inside this update.
       this.timer = setTimeout(() => {
-        if (this.flight?.id === flight.id) {
+        if (this.flight?.id !== flight.id) {
+          return;
+        }
+        try {
           this.deliver(read(doc));
+        } catch {
+          // A read that fails is tried again on the next edit that needs it.
+          this.flight = null;
         }
       }, 0);
     }
