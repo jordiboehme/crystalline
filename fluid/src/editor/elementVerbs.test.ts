@@ -4,6 +4,7 @@
  * is on the changed spans and the bytes they give.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import type { ChangeSpec, EditorState } from "@codemirror/state";
 import { ChangeSet } from "@codemirror/state";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -30,6 +31,7 @@ import {
   wikilinkAt,
   wikilinkChanges,
   writtenAddress,
+  writtenLabel,
 } from "./elementVerbs";
 
 afterEach(cleanupMarkViews);
@@ -612,9 +614,6 @@ describe("mathChanges", () => {
   });
 
   it.each([
-    ["$`x`$", "a`b", "backtick"],
-    ["$$x$$", "a$$b", "dollars"],
-    ["$$x$$", "a$", "dollar-edge"],
     ["$$\nx\n$$", "a\n$$\nb", "dollar-line"],
     ["```math\nx\n```", "a\n```\nb", "fence-line"],
   ])(
@@ -780,5 +779,106 @@ describe("no reader reaches an id line, a comment or the frontmatter", () => {
     const state = stateOf(text);
     expect(mathAt(state, 8)).toBeNull();
     expect(statusAt(state, 15)).toBeNull();
+  });
+});
+
+describe("fix round 1: formulas the page reads the same", () => {
+  /** Writes `formula` into the formula at `at` and reads it back. */
+  function written(text: string, at: number, formula: string) {
+    const state = stateOf(text);
+    const changes = mathChanges(state, at, { formula });
+    expect(changes).not.toBeNull();
+    const next = state.update({ changes: changes ?? [] }).state;
+    return { next, text: bytes(next), read: mathAt(next, at)?.formula };
+  }
+
+  it.each([
+    ["a $$ block in a list item", "- a\n  $$\n  x\n  $$", "  "],
+    [
+      "a $$ block in a quote in a list item",
+      "- a\n  > $$\n  > x\n  > $$",
+      "  > ",
+    ],
+  ])("keeps every new line of %s inside it", (_name, text, prefix) => {
+    const at = text.indexOf("x");
+    expect(mathAt(stateOf(text), at)?.formula).toBe("x");
+    const { next, text: after, read } = written(text, at, "x\ny");
+    expect(after).toBe(text.replace(`${prefix}x`, `${prefix}x\n${prefix}y`));
+    expect(read).toBe("x\ny");
+    // The new line is still the list item's.
+    const y = after.indexOf("y");
+    const node = syntaxTree(next).resolveInner(y, 1);
+    let inItem = false;
+    for (let n: typeof node | null = node; n; n = n.parent) {
+      if (n.name === "ListItem") inItem = true;
+    }
+    expect(inItem).toBe(true);
+  });
+
+  it.each([
+    ["$`x`$", " x\\ "],
+    ["$`x`$", " a "],
+    ["$$x$$", " x\\ "],
+    ["$$x$$", " a "],
+  ])(
+    "pads %j so the formula %j reads back with its spaces",
+    (text, formula) => {
+      const { text: after, read } = written(text, 0, formula);
+      expect(read).toBe(formula);
+      // One space more on each side, which the page takes away again.
+      expect(after).toContain(` ${formula} `);
+    },
+  );
+
+  it("reads a padded formula as the page does", () => {
+    expect(mathAt(stateOf("$` a `$"), 0)?.formula).toBe("a");
+    expect(mathAt(stateOf("$$ a $$"), 0)?.formula).toBe("a");
+    expect(mathAt(stateOf("$` a`$"), 0)?.formula).toBe(" a");
+  });
+
+  it("opens a double-backtick formula and keeps its backticks", () => {
+    const state = stateOf("$``a`b``$");
+    expect(mathAt(state, 0)).toMatchObject({ form: "code", formula: "a`b" });
+    expect(written("$``a`b``$", 0, "c").text).toBe("$``c``$");
+  });
+
+  it.each([
+    ["$`x`$", "a`b", "$``a`b``$"],
+    ["$`x`$", "`a", "$`` `a ``$"],
+    ["$``x``$", "a``b", "$```a``b```$"],
+    ["$$x$$", "a$$b", "$$$a$$b$$$"],
+    ["$$x$$", "$a", "$$ $a $$"],
+  ])(
+    "writes into %j the formula %j with the delimiters it needs",
+    (text, formula, after) => {
+      const result = written(text, 0, formula);
+      expect(result.text).toBe(after);
+      expect(result.read).toBe(formula);
+    },
+  );
+
+  it("reads no formula after an escaped dollar sign, and one after an escaped backslash", () => {
+    expect(mathAt(stateOf("a \\$`x`$"), 4)).toBeNull();
+    expect(mathAt(stateOf("a \\\\$`x`$"), 6)?.formula).toBe("x");
+  });
+});
+
+describe("fix round 1: label words from the source and back", () => {
+  it.each([
+    "a\\\\*b",
+    "a\\\\\\\\",
+    "a\\\\[b]c",
+    "a\\*",
+    "\\\\",
+    "see [t](u)",
+    "a\\]",
+    "x \\\\\\* y",
+  ])("keeps the source words %j through an untouched field", (source) => {
+    const text = `:status[${source}]{red}`;
+    const state = stateOf(text);
+    expect(statusAt(state, 0)?.to).toBe(text.length);
+    const field = statusWords(state, 0);
+    // Written as if typed: what comes back is the source as it was.
+    expect(writtenLabel(field ?? "")).toBe(source);
   });
 });

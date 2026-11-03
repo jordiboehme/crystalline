@@ -37,6 +37,7 @@ import { WIKILINK, referenceState, wikilinkWords } from "../wikilinks";
 import {
   answersElementEdits,
   elementEditAt,
+  macMenuClick,
   linksEngrams,
   requestElementEdit,
   writable,
@@ -118,7 +119,11 @@ function chipPressed(
   event: MouseEvent,
 ): void {
   const { state } = view;
-  if (event.button !== 0 || !state.facet(hiddenMarkLayerOn)) {
+  if (
+    event.button !== 0 ||
+    macMenuClick(event) ||
+    !state.facet(hiddenMarkLayerOn)
+  ) {
     return;
   }
   if (event.metaKey || event.ctrlKey) {

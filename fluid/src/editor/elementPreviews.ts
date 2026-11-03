@@ -58,11 +58,16 @@ import {
   statusOf,
 } from "./elementContext";
 import type { ElementEdit } from "./elementEdit";
-import { answersElementEdits, pressElement, writable } from "./elementEdit";
+import {
+  answersElementEdits,
+  macMenuClick,
+  pressElement,
+  writable,
+} from "./elementEdit";
 import { calloutMarkAt, mathAt, statusAt } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
 import type { MathBlock } from "./mathBlocks";
-import { mathBlocks, mathSections } from "./mathBlocks";
+import { escapedAt, mathBlocks, mathSections, unpadded } from "./mathBlocks";
 import {
   hiddenMarkLayerOn,
   markModeChanged,
@@ -114,6 +119,7 @@ function askOnPress(
   const { state } = view;
   if (
     event.button !== 0 ||
+    macMenuClick(event) ||
     !state.facet(hiddenMarkLayerOn) ||
     !writable(state) ||
     !answersElementEdits(view)
@@ -165,7 +171,7 @@ class CalloutHeadWidget extends WidgetType {
     const fold = this.fold;
     // The chevron flips the sign; a press must not also move the caret.
     const onFold = (event: ReactMouseEvent) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || macMenuClick(event.nativeEvent)) return;
       event.preventDefault();
       const { state } = view;
       if (!state.facet(hiddenMarkLayerOn) || !writable(state)) return;
@@ -545,7 +551,7 @@ function buildInline(view: EditorView): Inline {
             out.push(
               Decoration.replace({
                 widget: new MathWidget(
-                  doc.sliceString(open.to, close.from),
+                  unpadded(doc.sliceString(open.to, close.from)),
                   false,
                 ),
               }).range(ref.from, ref.to),
@@ -561,12 +567,12 @@ function buildInline(view: EditorView): Inline {
           const code = doc.sliceString(inFrom, inTo);
           const math =
             doc.sliceString(ref.from - 1, ref.from) === "$" &&
-            doc.sliceString(ref.from - 2, ref.from - 1) !== "\\" &&
+            !escapedAt(doc, ref.from - 1) &&
             doc.sliceString(ref.to, ref.to + 1) === "$";
           if (math) {
             out.push(
               Decoration.replace({
-                widget: new MathWidget(code, false),
+                widget: new MathWidget(unpadded(code), false),
               }).range(ref.from - 1, ref.to + 1),
             );
             return false;

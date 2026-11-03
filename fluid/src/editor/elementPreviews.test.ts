@@ -483,3 +483,11 @@ describe("the drawn elements ask for their editors", () => {
     cleanupMarkViews();
   });
 });
+
+describe("inline math read as the page reads it", () => {
+  it("draws a formula after an escaped backslash, and none after an escaped dollar", () => {
+    const v = editor("a \\\\$`x`$ b \\$`y`$\n\nEnd", 0, { mode: "hidden" });
+    const drawn = v.contentDOM.querySelectorAll(".cm-math-inline");
+    expect(drawn).toHaveLength(1);
+  });
+});

@@ -26,6 +26,7 @@ import { openWindow } from "../base";
 import {
   answersElementEdits,
   elementEditAt,
+  macMenuClick,
   pressElement,
   writable,
 } from "./elementEdit";
@@ -173,7 +174,11 @@ const LINK_TEXT = Decoration.mark({ class: "cm-link-text" });
  * CodeMirror from placing a caret for it.
  */
 export function linkPressed(event: MouseEvent, view: EditorView): boolean {
-  if (event.button !== 0 || !(event.target instanceof Element)) {
+  if (
+    event.button !== 0 ||
+    macMenuClick(event) ||
+    !(event.target instanceof Element)
+  ) {
     return false;
   }
   const el = event.target.closest(".cm-link-text");

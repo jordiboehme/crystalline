@@ -11,7 +11,7 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
+import type { EditorState, Text } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
 
 import { frontmatterRegion } from "./frontmatterRegion";
@@ -61,6 +61,36 @@ export function quotePrefix(text: string, depth: number): string {
 /** `text` without its first `depth` quote marks (and a space after each). */
 export function unquoted(text: string, depth: number): string {
   return text.slice(quotePrefix(text, depth).length);
+}
+
+/**
+ * Whether the character at `pos` is escaped: an odd run of backslashes
+ * stands right before it (two backslashes and a dollar sign are an escaped
+ * backslash and a dollar sign), as the reading page tests it.
+ */
+export function escapedAt(doc: Text, pos: number): boolean {
+  let run = 0;
+  while (
+    pos - run - 1 >= 0 &&
+    doc.sliceString(pos - run - 1, pos - run) === "\\"
+  ) {
+    run += 1;
+  }
+  return run % 2 === 1;
+}
+
+/**
+ * An inline formula's text as the page reads it: one space taken from each
+ * end when both ends have one and it is not all spaces, the rule CommonMark
+ * keeps for a code span and the math parser for `$$...$$`.
+ */
+export function unpadded(text: string): string {
+  return text.length >= 2 &&
+    text.startsWith(" ") &&
+    text.endsWith(" ") &&
+    text.trim() !== ""
+    ? text.slice(1, -1)
+    : text;
 }
 
 /** A page section's heading, which ends anything a section holds. */

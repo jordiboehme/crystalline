@@ -36,7 +36,11 @@ import {
 } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
 
-import { answersElementEdits, requestElementEdit } from "../elementEdit";
+import {
+  answersElementEdits,
+  macMenuClick,
+  requestElementEdit,
+} from "../elementEdit";
 import { frontmatterRegion } from "../frontmatterRegion";
 import { parkingChanged } from "../parkedSelection";
 import { parseAdvanced } from "../parseProgress";
@@ -186,11 +190,6 @@ class NotApplicableWidget extends WidgetType {
   override ignoreEvent(): boolean {
     return true;
   }
-}
-
-/** A Ctrl+click on a Mac: the browser opens the context menu for it. */
-function macMenuClick(event: MouseEvent): boolean {
-  return event.ctrlKey && /Mac/.test(navigator.platform);
 }
 
 /** The primary press, a bare click and Space or Enter on a focused box write `to` once. */

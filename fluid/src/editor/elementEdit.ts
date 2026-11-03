@@ -74,6 +74,14 @@ export type ElementEdit =
   | { kind: "callout-kind"; at: number; rect: DOMRect }
   | { kind: "language"; at: number; rect: DOMRect };
 
+/**
+ * A Ctrl+click on a Mac: the browser opens its context menu for it, so no
+ * drawn element acts on the press (no write, no popover, no new tab).
+ */
+export function macMenuClick(event: MouseEvent): boolean {
+  return event.ctrlKey && /Mac/.test(navigator.platform);
+}
+
 /** Where the element a request names starts. */
 export function editAt(edit: ElementEdit): number {
   return edit.kind === "new-link" ? edit.range.from : edit.at;

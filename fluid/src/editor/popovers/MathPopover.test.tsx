@@ -103,23 +103,17 @@ describe.each(CASES)("a formula ($mode mode, room $room)", ({ mode, room }) => {
     expect(bytes(view.state)).toBe("x\na $`x`$ b");
   });
 
-  it("says what to remove from a formula that holds its delimiter", async () => {
+  it("writes a formula that holds its delimiter so it reads back the same", async () => {
     const user = userEvent.setup();
     const view = popoverView("x\na $`x`$ b", { mode, room });
     press(drawn(".cm-math-inline"));
     await dialog();
     const field = screen.getByRole("textbox", { name: "LaTeX" });
-    expect(field).not.toHaveAttribute("aria-describedby");
     await user.type(field, "`");
-    const why = screen.getByText(
-      "This formula cannot be saved. Remove its backticks.",
-    );
-    expect(field).toHaveAttribute("aria-describedby", why.id);
-    expect(field).toHaveAccessibleDescription(
-      "This formula cannot be saved. Remove its backticks.",
-    );
-    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(field).not.toHaveAttribute("aria-describedby");
     await user.keyboard("{Enter}");
+    expect(bytes(view.state)).toBe("x\na $`` x` ``$ b");
+    undoOnce(view);
     expect(bytes(view.state)).toBe("x\na $`x`$ b");
   });
 });

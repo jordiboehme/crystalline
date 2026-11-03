@@ -22,9 +22,12 @@ import { calloutAt, statusAround, statusColourChanges } from "./elementContext";
 import { frontmatterRegion } from "./frontmatterRegion";
 import {
   SECTION_HEADING,
+  escapedAt,
   mathBlocks,
   mathSections,
   quotePrefix,
+  unpadded,
+  unquoted,
 } from "./mathBlocks";
 import { linkDefinition, marksOnLine } from "./marks/hiddenMarks";
 import { CODE_CONTEXTS } from "./prose";
@@ -568,25 +571,48 @@ export function statusAt(
 }
 
 /**
- * A label's words as the field shows them: the source, with the three
- * escapes the writer makes (`\\`, `\[`, `\]`) read back. Every other escape
- * stays as written, so the words' own Markdown is kept.
+ * A label's words as the field shows them, the inverse of `writtenLabel`.
+ * Read run by run: a run of backslashes before a bracket or the end was
+ * doubled by the writer (one more escapes the bracket), so it is halved; a
+ * run before any other character is shown as written, so the words' own
+ * Markdown (`\*`, `\\*`) is kept byte for byte.
  */
 export function statusWords(state: EditorState, pos: number): string | null {
   const status = statusAt(state, pos);
   if (status === null) {
     return null;
   }
-  return state.doc
-    .sliceString(status.words.from, status.words.to)
-    .replace(/\\([\\[\]])/g, "$1");
+  const source = state.doc.sliceString(status.words.from, status.words.to);
+  let out = "";
+  let at = 0;
+  while (at < source.length) {
+    let run = 0;
+    while (source[at + run] === "\\") run += 1;
+    const next = source[at + run];
+    if (run === 0) {
+      out += next ?? "";
+      at += 1;
+    } else if (next === undefined || next === "[" || next === "]") {
+      out += "\\".repeat(Math.floor(run / 2)) + (next ?? "");
+      at += run + 1;
+    } else {
+      out += "\\".repeat(run);
+      at += run;
+    }
+  }
+  return out;
 }
 
 /**
  * Words as they are written between `:status[` and `]`, so that the label
- * closes where the reader closes it (`labelEnd`) and reads back as typed: a
- * bracket with no partner is escaped (a pair stays, a link inside the words
- * keeps working), and a backslash before a backslash, a bracket or the end.
+ * closes where the reader closes it (`labelEnd`) and `statusWords` reads them
+ * back as typed:
+ *
+ * - a bracket with no partner is escaped; a pair stays, so a link inside the
+ *   words keeps working;
+ * - a run of backslashes before a bracket or the end is doubled;
+ * - a run before any other character is written as typed.
+ *
  * Null for words that cannot be a label: nothing but spaces, or a line break.
  */
 export function writtenLabel(words: string): string | null {
@@ -610,15 +636,21 @@ export function writtenLabel(words: string): string | null {
   for (const index of open) {
     unpaired.add(index);
   }
-  return chars
-    .map((c, index) => {
-      if (c === "\\") {
-        const next = chars[index + 1];
-        return next === undefined || "\\[]".includes(next) ? "\\\\" : c;
-      }
-      return unpaired.has(index) ? `\\${c}` : c;
-    })
-    .join("");
+  let out = "";
+  let at = 0;
+  while (at < chars.length) {
+    let run = 0;
+    while (chars[at + run] === "\\") run += 1;
+    const next = chars[at + run];
+    const bracket = next === "[" || next === "]";
+    out += "\\".repeat(next === undefined || bracket ? run * 2 : run);
+    at += run;
+    if (next !== undefined) {
+      out += bracket && unpaired.has(at) ? `\\${next}` : next;
+      at += 1;
+    }
+  }
+  return out;
 }
 
 /**
@@ -671,13 +703,21 @@ export type FormulaForm =
 export interface MathElement extends Span {
   form: FormulaForm;
   block: boolean;
-  /** The formula as the preview sets it (a block's lines without their quote marks). */
+  /**
+   * The formula as the page reads it: an inline one without the one space
+   * of padding at each end, a block's lines without what contains them.
+   */
   formula: string;
-  /** Inline: the formula's span. A block: its inner lines, or none. */
+  /** Inline: the text between the delimiters. A block: its inner lines, or none. */
   body: Span | null;
+  /** Inline: the two delimiter runs (backticks or dollar signs). */
+  delimiters: { open: Span; close: Span } | null;
   /** A block's line where an empty body is written after. */
   openLine: Span;
-  /** The quote marks a block's lines start with. */
+  /**
+   * What stands before a block's delimiter on its opening line (quote marks,
+   * a list item's indentation), which every line of the block carries.
+   */
   prefix: string;
 }
 
@@ -687,53 +727,57 @@ function inlineFormula(
   node: SyntaxNode,
 ): MathElement | null {
   const doc = state.doc;
-  if (node.name === "InlineMath") {
-    const open = node.firstChild;
-    const close = node.lastChild;
-    if (open === null || close === null || open === close) {
-      return null;
-    }
-    const body = { from: open.to, to: close.from };
-    return {
-      from: node.from,
-      to: node.to,
-      form: "inline",
-      block: false,
-      formula: doc.sliceString(body.from, body.to),
-      body,
-      openLine: body,
-      prefix: "",
-    };
-  }
-  if (node.name !== "InlineCode") {
-    return null;
-  }
   const open = node.firstChild;
   const close = node.lastChild;
-  // The form the preview and the reader set: `$` on both sides, the first
-  // one not escaped, and single backticks.
-  if (
-    open === null ||
-    close === null ||
-    open === close ||
-    open.to - open.from !== 1 ||
-    doc.sliceString(node.from - 1, node.from) !== "$" ||
-    doc.sliceString(node.from - 2, node.from - 1) === "\\" ||
-    doc.sliceString(node.to, node.to + 1) !== "$"
-  ) {
+  if (open === null || close === null || open === close) {
+    return null;
+  }
+  let from = node.from;
+  let to = node.to;
+  let form: FormulaForm = "inline";
+  if (node.name === "InlineCode") {
+    // The form the preview and the reader set: `$` on both sides, the first
+    // one not escaped, with any run of backticks.
+    if (
+      doc.sliceString(node.from - 1, node.from) !== "$" ||
+      escapedAt(doc, node.from - 1) ||
+      doc.sliceString(node.to, node.to + 1) !== "$"
+    ) {
+      return null;
+    }
+    from = node.from - 1;
+    to = node.to + 1;
+    form = "code";
+  } else if (node.name !== "InlineMath") {
     return null;
   }
   const body = { from: open.to, to: close.from };
   return {
-    from: node.from - 1,
-    to: node.to + 1,
-    form: "code",
+    from,
+    to,
+    form,
     block: false,
-    formula: doc.sliceString(body.from, body.to),
+    formula: unpadded(doc.sliceString(body.from, body.to)),
     body,
+    delimiters: {
+      open: { from: open.from, to: open.to },
+      close: { from: close.from, to: close.to },
+    },
     openLine: body,
     prefix: "",
   };
+}
+
+/** `line` without the container `prefix` of its block, read as the page reads it. */
+function inBlock(line: string, prefix: string, depth: number): string {
+  if (line.startsWith(prefix)) {
+    return line.slice(prefix.length);
+  }
+  // An empty line of the block, with its container's marks only in part.
+  if (prefix.startsWith(line) || prefix.trimEnd() === line.trimEnd()) {
+    return "";
+  }
+  return unquoted(line, depth);
 }
 
 /** The display formula whose lines hold `pos`, or null. */
@@ -754,6 +798,15 @@ function blockFormula(state: EditorState, pos: number): MathElement | null {
     return null;
   }
   const openLine = doc.line(block.open);
+  const mark = openLine.text.indexOf(block.form === "fence" ? "```" : "$$");
+  const prefix =
+    mark >= 0
+      ? openLine.text.slice(0, mark)
+      : quotePrefix(openLine.text, block.depth);
+  const lines: string[] = [];
+  for (let number = block.open + 1; number < block.close; number += 1) {
+    lines.push(inBlock(doc.line(number).text, prefix, block.depth));
+  }
   const body =
     block.close - block.open > 1
       ? {
@@ -766,10 +819,11 @@ function blockFormula(state: EditorState, pos: number): MathElement | null {
     to: block.to,
     form: block.form,
     block: true,
-    formula: block.tex,
+    formula: lines.join("\n"),
     body,
+    delimiters: null,
     openLine: { from: openLine.from, to: openLine.to },
-    prefix: quotePrefix(openLine.text, block.depth),
+    prefix,
   };
 }
 
@@ -809,21 +863,15 @@ export function mathAt(state: EditorState, pos: number): MathElement | null {
 
 /** Why a formula cannot be written in `form`, or null when it can. */
 export type FormulaRefusal =
-  | "empty"
-  | "line-break"
-  | "backtick"
-  | "dollars"
-  | "dollar-edge"
-  | "dollar-line"
-  | "fence-line"
-  | "heading-line";
+  "empty" | "line-break" | "dollar-line" | "fence-line" | "heading-line";
 
 /**
  * Why `formula` cannot be written in `form` so that it reads back as typed,
- * or null. A formula that holds its own delimiter would close early: a
- * backtick in `` $`...`$ ``, `$$` (or a `$` at an end) in `$$...$$`, a line
- * of only `$$` in a `$$` block, a line of backticks in a fence, and on a page
- * read section by section a `##` line in a `$$` block.
+ * or null. An inline formula always can (its delimiters grow and it is
+ * padded as needed, see `mathChanges`) unless it holds a line break. A block
+ * formula that holds its own delimiter would close early: a line of only
+ * `$$` in a `$$` block, a line of backticks in a fence, and on a page read
+ * section by section a `##` line outside a quote.
  */
 export function formulaRefusal(
   form: FormulaForm,
@@ -835,12 +883,7 @@ export function formulaRefusal(
     return "empty";
   }
   if (form === "code" || form === "inline") {
-    if (/[\r\n]/.test(formula)) return "line-break";
-    if (form === "code") return formula.includes("`") ? "backtick" : null;
-    if (formula.includes("$$")) return "dollars";
-    return formula.startsWith("$") || formula.endsWith("$")
-      ? "dollar-edge"
-      : null;
+    return /[\r\n]/.test(formula) ? "line-break" : null;
   }
   const lines = formula.split(/\r?\n/);
   if (form === "fence") {
@@ -858,10 +901,32 @@ export function formulaRefusal(
 }
 
 /**
- * Gives the formula at `at` the text `formula`: only the text between its
- * delimiters is written (a block's inner lines, each with the quote marks
- * the block's lines carry). Nothing for an unchanged formula; null when
- * there is none at `at` or `formulaRefusal` refuses it.
+ * The shortest run of `sign`, at least `least` long, that `formula` holds no
+ * run of exactly that length of: a delimiter that cannot close early.
+ */
+function delimiterRun(formula: string, sign: string, least: number): number {
+  const runs = new Set(
+    [...formula.matchAll(new RegExp(`\\${sign}+`, "g"))].map(
+      (found) => found[0].length,
+    ),
+  );
+  let run = least;
+  while (runs.has(run)) run += 1;
+  return run;
+}
+
+/**
+ * Gives the formula at `at` the text `formula`. Only the text between its
+ * delimiters is written, so that the page reads exactly `formula`:
+ *
+ * - inline, with one space of padding at each end when the page would take
+ *   one away or a delimiter sign would touch it, and with longer delimiters
+ *   (never shorter ones) when the formula holds a run of the current length;
+ * - a block, its inner lines, each with what stands before the block's
+ *   opening delimiter (quote marks, a list item's indentation).
+ *
+ * Nothing for an unchanged formula; null when there is none at `at` or
+ * `formulaRefusal` refuses it.
  */
 export function mathChanges(
   state: EditorState,
@@ -883,8 +948,24 @@ export function mathChanges(
   if (formula === math.formula) {
     return [];
   }
-  if (!math.block && math.body !== null) {
-    return [{ ...math.body, insert: formula }];
+  if (math.delimiters !== null && math.body !== null) {
+    const sign = math.form === "code" ? "`" : "$";
+    const { open, close } = math.delimiters;
+    const run = open.to - open.from;
+    const padded =
+      (formula.startsWith(" ") && formula.endsWith(" ")) ||
+      formula.startsWith(sign) ||
+      formula.endsWith(sign)
+        ? ` ${formula} `
+        : formula;
+    const needed = delimiterRun(formula, sign, run);
+    if (needed === run) {
+      return [{ ...math.body, insert: padded }];
+    }
+    const mark = sign.repeat(needed);
+    return [
+      { from: open.from, to: close.to, insert: `${mark}${padded}${mark}` },
+    ];
   }
   const lines = formula
     .split(/\r?\n/)

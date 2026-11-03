@@ -4,8 +4,10 @@
  * reading page's lazy `MathPart` (the text shows until KaTeX arrives, and a
  * formula KaTeX cannot read shows its message). Save or Enter (Mod-Enter in
  * the textarea) writes only the formula between its delimiters; "Remove
- * formula" takes the whole element away. A formula that would close its own
- * delimiter cannot be saved, and a line under the field says what to remove.
+ * formula" takes the whole element away. An inline formula is padded and
+ * given longer delimiters as it needs; a block formula that would close its
+ * own delimiter cannot be saved, and a line under the field says what to
+ * remove.
  */
 
 import type { ReactElement } from "react";
@@ -30,9 +32,6 @@ const MathPart = lazyPart(() => import("../../components/MathPart"));
 /** What to remove, for each formula that cannot be saved as typed. */
 const WHY: Record<Exclude<FormulaRefusal, "empty">, string> = {
   "line-break": "Remove its line breaks.",
-  backtick: "Remove its backticks.",
-  dollars: "Remove its $$ signs.",
-  "dollar-edge": "Remove the $ at its start or end.",
   "dollar-line": "Remove the line that holds only $$.",
   "fence-line": "Remove the line of backticks.",
   "heading-line": "Remove the ## at the start of its lines.",
