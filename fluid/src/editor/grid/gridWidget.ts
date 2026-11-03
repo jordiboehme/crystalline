@@ -187,10 +187,13 @@ function extrasOf(state: EditorState, cell: GridCell | undefined): CellExtras {
   return { notes, hideComments, key };
 }
 
-/** The numbers a table's references are drawn with, as one string. */
+/**
+ * The numbers a table's references are drawn with, as one string, with
+ * offsets from the table's start: an edit above the table leaves it alone.
+ */
 function notesKey(state: EditorState, table: GridTable): string {
   return footnoteRefsIn(state, table.from, table.to)
-    .map((n) => `${String(n.from)}:${String(n.number)}`)
+    .map((n) => `${String(n.from - table.from)}:${String(n.number)}`)
     .join(",");
 }
 

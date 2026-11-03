@@ -2,9 +2,8 @@
  * Runs Part 1's grid suites with the hidden-mark layer in the cell (Task 12,
  * fix round 1, F5). A wrapper test file sets the mode before its tests run
  * and imports the suite; `soloMain` and `roomMain` then give every main view
- * the layer for its cells (`cellPreviewLayers`) and the marks setting, the
- * way `previewConfig` does on the real surface. Main itself keeps no layer, as
- * the suites were written for.
+ * the hidden-mark layer, for itself and for its cells (`cellPreviewLayers`),
+ * and the marks setting, the way `previewConfig` does on the real surface.
  */
 
 import type { Extension } from "@codemirror/state";
@@ -33,8 +32,11 @@ export function runWithCellMarks(next: CellMarksMode): void {
 /** What a main view adds for the current mode: nothing when off. */
 export function cellMarksExtensions(): Extension[] {
   if (mode === "off") return [];
+  // The production shape: the layer in main as well as in its cells.
+  const layer = hiddenMarkLayer();
   return [
-    cellPreviewLayers.of([hiddenMarkLayer()]),
+    layer,
+    cellPreviewLayers.of([layer]),
     marksOnEditLine.of(mode === "show"),
   ];
 }

@@ -10,7 +10,7 @@
  */
 
 import { EditorState, StateEffect } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import type { MockInstance } from "vitest";
 import {
   afterEach,
@@ -39,11 +39,12 @@ import {
 import type { ElementEdit } from "../elementEdit";
 import { commitElementEdit, linkVerb } from "../elementEdit";
 import { fencePreviews } from "../fencePreviews";
+import { footnoteVersion } from "../footnotes";
 import { verbTarget } from "../floatingContext";
 import { hiddenMarkLayer } from "../marks";
 import { marksOnEditLine } from "../marks/mode";
 import { activeCell } from "./cellEditor";
-import { hostOpenCell } from "./gridWidget";
+import { GridWidget, gridField, hostOpenCell } from "./gridWidget";
 import { cellPreviewLayers } from "./draws";
 import { gridExtension } from "./index";
 import { prefetchGrid } from "./loader";
@@ -540,10 +541,43 @@ describe.each(MODES)("footnotes in a drawn table, %s mode", (mode) => {
   it("a long page shows the label until its read settles, then the number", async () => {
     const long = `${text}\n${"word ".repeat(1400)}\n`;
     const main = page(long, { mode });
+    // What the closed cell shows right after the update that settles the
+    // read, before any later update could redraw it (N1).
+    const atSettle: string[] = [];
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          if (
+            footnoteVersion(update.startState) !==
+              footnoteVersion(update.state) &&
+            !update.docChanged
+          ) {
+            atSettle.push(closed(main, 1, 1).textContent ?? "");
+          }
+        }),
+      ),
+    });
     expect(closed(main, 1, 1).textContent).toBe("a[^n]");
     await vi.waitFor(() => {
-      expect(closed(main, 1, 1).textContent).toBe("a1");
+      expect(atSettle).toHaveLength(1);
     });
+    expect(atSettle).toEqual(["a1"]);
+  });
+
+  it("an edit above the table does not patch it (N2)", () => {
+    const above = `Intro\n\n${text}`;
+    const main = page(above, { mode });
+    const widget = () => {
+      const it = main.state.field(gridField).iter();
+      const spec = it.value?.spec as { widget?: unknown } | undefined;
+      if (!(spec?.widget instanceof GridWidget)) throw new Error("no grid");
+      return spec.widget;
+    };
+    const before = widget();
+    expect(before.notes).not.toBe("");
+    main.dispatch({ changes: { from: 0, insert: "More " } });
+    expect(widget()).not.toBe(before);
+    expect(widget().eq(before)).toBe(true);
   });
 });
 

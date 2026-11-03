@@ -12,9 +12,10 @@ import { cellForwarding } from "./cellEditor";
 
 runWithCellMarks("hidden");
 
-test("the cells of this run carry the layer, marks hidden", () => {
+test("main and its cells carry the layer in this run, marks hidden", () => {
   const main = soloMain("| a | **b** |\n| - | - |\n", [cellForwarding]);
   const cell = openAt(main, 6, false).view;
+  expect(main.state.facet(hiddenMarkLayerOn)).toBe(true);
   expect(cell.state.facet(hiddenMarkLayerOn)).toBe(true);
   expect(cell.state.facet(marksOnEditLine)).toBe(false);
   cleanupCells();
