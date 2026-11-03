@@ -52,6 +52,8 @@ import { parsedState } from "../../test/parse";
 import { engramAdapter } from "../adapter";
 import { baseExtensions, lineSeparatorFor } from "../setup";
 import { canonical } from "../marks/caret";
+import type { DeleteOutcome } from "../marks/deleteCheck";
+import { deletionOutcome } from "../marks/deleteCheck";
 import { runsOnLine } from "../marks/hiddenMarks";
 import { hiddenMarkLayerOn, marksOnEditLine } from "../marks/mode";
 import { previewConfig } from "../surface";
@@ -199,6 +201,15 @@ describe.each(
  * (`withEdges`), written when a bare edge cell is emptied; no property here
  * types into an emptied cell, and a removal is judged by its pairs.
  */
+/**
+ * The most of the judged Backspace and Delete presses in cells that may be
+ * refused (D5), as in main (`marks/fidelity.test.ts`).
+ */
+const MAX_REFUSED = 0.05;
+
+/** The fewest presses the cell runs must judge: a silent refusal of all fails. */
+const CELL_FLOOR = 100;
+
 describe("hidden-mark properties in a cell", () => {
   beforeAll(async () => {
     await prefetchGrid();
@@ -276,175 +287,319 @@ describe("hidden-mark properties in a cell", () => {
     ),
   ];
 
-  test.each(RUNS)(
-    "$name, $mode mode, room $room",
-    { timeout: 30_000 },
-    ({ text, mode, room }) => {
-      const options: MarkViewOptions = {
-        mode: mode as "hidden" | "show",
-        room,
-        ...(!room && text.includes("\r\n")
-          ? { lineSeparator: "\r\n" as const }
-          : {}),
-      };
-      // The run boundaries, read where every mark is hidden.
-      const probe = markView(text, { ...options, mode: "hidden", room: false });
-      const main = markView(text, options);
-      let changed = 0;
-      main.dispatch({
-        effects: StateEffect.appendConfig.of(
-          EditorView.updateListener.of((update) => {
-            if (update.docChanged) changed += 1;
-          }),
-        ),
-      });
-      const show = mode === "show";
-      const failures: string[] = [];
-      let checks = 0;
-      const now = () => bytes(main.state);
-      const cells = gridTables(main.state).flatMap((table) =>
-        table.rows.flat(),
-      );
-      expect(cells.length).toBeGreaterThan(0);
-      for (const cell of cells) {
-        const { from, to } = cell.content;
-        const n = main.state.doc.lineAt(from).number;
-        const runs = runsOnLine(probe.state, n).filter(
-          (run) => run.from >= from && run.to <= to,
-        );
-        const marks = runs.flatMap((run) =>
-          run.marks.map((m): [number, number] => [m.from, m.to]),
-        );
-        const stops = [
-          ...new Set([from, to, ...runs.flatMap((r) => [r.from, r.to])]),
-        ].sort((a, b) => a - b);
-        const label = `line ${n} cell ${cell.row}/${cell.column} ${JSON.stringify(probe.state.doc.line(n).text)}`;
-        const at = (pos: number) => `${label} at ${pos - from}`;
+  type Outcome = DeleteOutcome | "exact";
+  interface CellRun {
+    failures: string[];
+    checks: number;
+    cells: number;
+    deletes: Record<Outcome, number>;
+  }
+  const kept = new Map<string, CellRun>();
 
-        // Property 1.
-        const before = changed;
-        let view = openAt(main, to, false).view;
-        for (const stop of stops) {
-          setCaret(view, stop);
-          setCaret(view, stop, "select");
-          checks += 2;
-        }
-        keys(view, "Home", "End");
+  /** One run, computed once: its test and the tally both read it. */
+  function cellRunOf(run: (typeof RUNS)[number]): CellRun {
+    const key = `${run.name}|${run.mode}|${String(run.room)}`;
+    let result = kept.get(key);
+    if (!result) {
+      result = computeRun(run);
+      kept.set(key, result);
+      cleanupCells();
+      cleanupMarkViews();
+    }
+    return result;
+  }
+
+  function computeRun({ text, mode, room }: (typeof RUNS)[number]): CellRun {
+    const deletes: Record<Outcome, number> = {
+      exact: 0,
+      moved: 0,
+      merged: 0,
+      refused: 0,
+    };
+    /** The outcome the last deletion check named (a box the listener fills). */
+    const named: { outcome: DeleteOutcome | null } = { outcome: null };
+    const heard = new WeakSet<EditorView>();
+    /** Hears the outcome a cell view's deletion check names. */
+    const hear = (view: EditorView): EditorView => {
+      if (!heard.has(view)) {
+        heard.add(view);
         view.dispatch({
-          selection: EditorSelection.range(from, to),
-          userEvent: "select.pointer",
+          effects: StateEffect.appendConfig.of(
+            EditorView.updateListener.of((update) => {
+              for (const tr of update.transactions) {
+                for (const effect of tr.effects) {
+                  if (effect.is(deletionOutcome)) named.outcome = effect.value;
+                }
+              }
+            }),
+          ),
         });
-        const was = showsMarks(main);
-        setShowMarks(main, !was);
-        setShowMarks(main, was);
-        checks += 2;
-        if (changed !== before || now() !== text) {
-          failures.push(`moving in ${label} changed the bytes`);
-        }
+      }
+      return view;
+    };
+    const options: MarkViewOptions = {
+      mode: mode as "hidden" | "show",
+      room,
+      ...(!room && text.includes("\r\n")
+        ? { lineSeparator: "\r\n" as const }
+        : {}),
+    };
+    // The run boundaries, read where every mark is hidden.
+    const probe = markView(text, { ...options, mode: "hidden", room: false });
+    const main = markView(text, options);
+    let changed = 0;
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) changed += 1;
+        }),
+      ),
+    });
+    const show = mode === "show";
+    const failures: string[] = [];
+    let checks = 0;
+    const now = () => bytes(main.state);
+    const cells = gridTables(main.state).flatMap((table) => table.rows.flat());
+    const done = (): CellRun => ({
+      failures,
+      checks,
+      cells: cells.length,
+      deletes,
+    });
+    for (const cell of cells) {
+      const { from, to } = cell.content;
+      const n = main.state.doc.lineAt(from).number;
+      const runs = runsOnLine(probe.state, n).filter(
+        (run) => run.from >= from && run.to <= to,
+      );
+      const marks = runs.flatMap((run) =>
+        run.marks.map((m): [number, number] => [m.from, m.to]),
+      );
+      const stops = [
+        ...new Set([from, to, ...runs.flatMap((r) => [r.from, r.to])]),
+      ].sort((a, b) => a - b);
+      const label = `line ${n} cell ${cell.row}/${cell.column} ${JSON.stringify(probe.state.doc.line(n).text)}`;
+      const at = (pos: number) => `${label} at ${pos - from}`;
 
-        /** The open cell's view, mounted again only when it was closed. */
-        const cellView = (pos: number) => {
-          const open = activeCell(main);
-          return open ? open.view : openAt(main, pos, false).view;
-        };
-        for (const stop of stops) {
-          // Property 2.
+      // Property 1.
+      const before = changed;
+      let view = openAt(main, to, false).view;
+      for (const stop of stops) {
+        setCaret(view, stop);
+        setCaret(view, stop, "select");
+        checks += 2;
+      }
+      keys(view, "Home", "End");
+      view.dispatch({
+        selection: EditorSelection.range(from, to),
+        userEvent: "select.pointer",
+      });
+      const was = showsMarks(main);
+      setShowMarks(main, !was);
+      setShowMarks(main, was);
+      checks += 2;
+      if (changed !== before || now() !== text) {
+        failures.push(`moving in ${label} changed the bytes`);
+      }
+
+      /** The open cell's view, mounted again only when it was closed. */
+      const cellView = (pos: number) => {
+        const open = activeCell(main);
+        return hear(open ? open.view : openAt(main, pos, false).view);
+      };
+      for (const stop of stops) {
+        // Property 2.
+        view = cellView(stop);
+        setCaret(view, stop);
+        const head = view.state.selection.main.head;
+        typeText(view, "Z");
+        checks += 1;
+        if (!oneLetterAdded(text, now())) {
+          failures.push(
+            `typing ${at(head)} wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+          );
+        }
+        undoOnce(main);
+        if (now() !== text) {
+          failures.push(`undo after typing ${at(head)}`);
+          return done();
+        }
+        // Property 3.
+        for (const key of ["Backspace", "Delete"]) {
           view = cellView(stop);
           setCaret(view, stop);
-          const head = view.state.selection.main.head;
-          typeText(view, "Z");
-          checks += 1;
-          if (!oneLetterAdded(text, now())) {
-            failures.push(
-              `typing ${at(head)} wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
-            );
+          const start = main.state;
+          named.outcome = null;
+          keys(view, key);
+          const outcome = named.outcome;
+          if (outcome === "refused") {
+            deletes.refused += 1;
+            if (now() !== text) {
+              failures.push(`a refused ${key} ${at(stop)} wrote`);
+              return done();
+            }
+            continue;
+          }
+          if (now() === text) continue;
+          deletes[outcome ?? "exact"] += 1;
+          const deleted = removedFrom(
+            start.doc.toString(),
+            main.state.doc.toString(),
+          );
+          const touches = [...deleted].some((p) =>
+            marks.some(([a, b]) => a <= p && p < b),
+          );
+          if (!(show && touches)) {
+            checks += 1;
+            const old = pairsOn(start, n);
+            const after = pairsOn(main.state, n);
+            for (const name of PAIRS) {
+              const x = old.filter((p) => p.name === name).length;
+              const y = after.filter((p) => p.name === name).length;
+              const emptied = old.filter(
+                (p) =>
+                  p.name === name &&
+                  p.visible.length > 0 &&
+                  p.visible.every((q) => deleted.has(q)),
+              ).length;
+              // A merge writes two pairs of one kind as one.
+              const merged = outcome === "merged" ? 1 : 0;
+              if (y > x || x - y > emptied + merged) {
+                failures.push(
+                  `${key} ${at(stop)}: ${name} ${x} -> ${y}, wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+                );
+              }
+            }
           }
           undoOnce(main);
           if (now() !== text) {
-            failures.push(`undo after typing ${at(head)}`);
-            return void expect(failures).toEqual([]);
-          }
-          // Property 3.
-          for (const key of ["Backspace", "Delete"]) {
-            view = cellView(stop);
-            setCaret(view, stop);
-            const start = main.state;
-            keys(view, key);
-            if (now() === text) continue;
-            const deleted = removedFrom(
-              start.doc.toString(),
-              main.state.doc.toString(),
-            );
-            const touches = [...deleted].some((p) =>
-              marks.some(([a, b]) => a <= p && p < b),
-            );
-            if (!(show && touches)) {
-              checks += 1;
-              const old = pairsOn(start, n);
-              const after = pairsOn(main.state, n);
-              for (const name of PAIRS) {
-                const x = old.filter((p) => p.name === name).length;
-                const y = after.filter((p) => p.name === name).length;
-                const emptied = old.filter(
-                  (p) =>
-                    p.name === name &&
-                    p.visible.length > 0 &&
-                    p.visible.every((q) => deleted.has(q)),
-                ).length;
-                if (y > x || x - y > emptied) {
-                  failures.push(
-                    `${key} ${at(stop)}: ${name} ${x} -> ${y}, wrote ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
-                  );
-                }
-              }
-            }
-            undoOnce(main);
-            if (now() !== text) {
-              failures.push(`undo after ${key} ${at(stop)}`);
-              return void expect(failures).toEqual([]);
-            }
+            failures.push(`undo after ${key} ${at(stop)}`);
+            return done();
           }
         }
-
-        // Property 4.
-        if (from === to) continue;
-        const bold = () => {
-          const cellView = openAt(main, to, false).view;
-          cellView.dispatch({
-            selection: EditorSelection.range(from, to),
-            userEvent: "select.pointer",
-          });
-          keys(cellView, "Mod-b");
-          return cellView;
-        };
-        const plain = !pairsOn(main.state, n).some(
-          (p) => p.name === "StrongEmphasis",
-        );
-        const once = bold();
-        checks += 1;
-        if (now() !== text) {
-          if (plain) {
-            keys(once, "Mod-b");
-            checks += 1;
-            if (now() !== text) {
-              failures.push(
-                `Mod-b twice in ${label} gave ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
-              );
-              undoOnce(main);
-            }
-          }
-          if (now() !== text) undoOnce(main);
-          if (now() !== text) {
-            failures.push(`Mod-b then undo in ${label}`);
-            return void expect(failures).toEqual([]);
-          }
-        }
-        closeCell(main, "user", "none");
       }
-      expect(failures).toEqual([]);
-      expect(checks).toBeGreaterThan(cells.length);
+
+      // Property 4.
+      if (from === to) continue;
+      const bold = () => {
+        const cellView = openAt(main, to, false).view;
+        cellView.dispatch({
+          selection: EditorSelection.range(from, to),
+          userEvent: "select.pointer",
+        });
+        keys(cellView, "Mod-b");
+        return cellView;
+      };
+      const plain = !pairsOn(main.state, n).some(
+        (p) => p.name === "StrongEmphasis",
+      );
+      const once = bold();
+      checks += 1;
+      if (now() !== text) {
+        if (plain) {
+          keys(once, "Mod-b");
+          checks += 1;
+          if (now() !== text) {
+            failures.push(
+              `Mod-b twice in ${label} gave ${JSON.stringify(main.state.doc.lineAt(from).text)}`,
+            );
+            undoOnce(main);
+          }
+        }
+        if (now() !== text) undoOnce(main);
+        if (now() !== text) {
+          failures.push(`Mod-b then undo in ${label}`);
+          return done();
+        }
+      }
+      closeCell(main, "user", "none");
+    }
+    return done();
+  }
+
+  test.each(RUNS)(
+    "$name, $mode mode, room $room",
+    { timeout: 120_000 },
+    (run) => {
+      const result = cellRunOf(run);
+      expect(result.cells).toBeGreaterThan(0);
+      expect(result.failures).toEqual([]);
+      expect(result.checks).toBeGreaterThan(result.cells);
     },
   );
+
+  test(
+    "tallies the deletes in cells, and refuses few",
+    { timeout: 120_000 },
+    () => {
+      const all = RUNS.map((run) => cellRunOf(run).deletes);
+      const sum = (key: Outcome) => all.reduce((n, each) => n + each[key], 0);
+      const judged =
+        sum("exact") + sum("moved") + sum("merged") + sum("refused");
+      console.info(
+        `cell deletes: ${sum("exact")} exact, ${sum("moved")} moved, ${sum("merged")} merged, ${sum("refused")} refused`,
+      );
+      expect(judged).toBeGreaterThan(CELL_FLOOR);
+      expect(sum("refused") / judged).toBeLessThanOrEqual(MAX_REFUSED);
+    },
+  );
+
+  describe.each(["hidden", "show"] as const)("pins, %s mode", (mode) => {
+    /** One press in a cell of a one-row table: the outcome and the row. */
+    function press(row: string, at: number, key: string) {
+      const text = `| a | b |\n| - | - |\n${row}\n`;
+      const main = markView(text, { mode });
+      const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+      if (!cell) throw new Error("no cell");
+      const pos = text.indexOf(row) + at;
+      const view = openAt(main, pos, false).view;
+      let outcome: DeleteOutcome | null = null;
+      view.dispatch({
+        effects: StateEffect.appendConfig.of(
+          EditorView.updateListener.of((update) => {
+            for (const tr of update.transactions) {
+              for (const effect of tr.effects) {
+                if (effect.is(deletionOutcome)) outcome = effect.value;
+              }
+            }
+          }),
+        ),
+      });
+      setCaret(view, pos);
+      keys(view, key);
+      return {
+        outcome: outcome as DeleteOutcome | null,
+        row: main.state.doc.lineAt(cell.content.from).text,
+        view,
+      };
+    }
+
+    test("(a) moves a mark across the space Delete leaves", () => {
+      const { outcome, row, view } = press("| x | **A b** |", 8, "Delete");
+      expect(outcome).toBe("moved");
+      expect(row).toBe("| x |  **b** |");
+      // The caret stays before the space it showed before: Z shows "Z b".
+      typeText(view, "Z");
+      expect(view.state.doc.lineAt(view.state.selection.main.head).text).toBe(
+        "| x | Z **b** |",
+      );
+    });
+
+    test("(b) merges two bold words whose space Delete takes", () => {
+      // After the closing marks: in both modes the caret stands before the space.
+      const at = 11;
+      const { outcome, row } = press("| x | **a** **b** |", at, "Delete");
+      expect(outcome).toBe("merged");
+      expect(row).toBe("| x | **ab** |");
+    });
+
+    test("(c) refuses the space after a closer that follows punctuation", () => {
+      const at = 12;
+      const { outcome, row } = press("| x | **a.** b |", at, "Delete");
+      expect(outcome).toBe("refused");
+      expect(row).toBe("| x | **a.** b |");
+    });
+  });
 });
 
 describe("one teardown path", () => {

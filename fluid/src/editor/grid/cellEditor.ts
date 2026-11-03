@@ -60,9 +60,9 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
-import { keptWhole } from "../marks/deleting";
+import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage } from "../setup";
-import { formatKeymap } from "../marks/formatting";
+import { formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
 import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
@@ -977,13 +977,23 @@ export const CELL_NOT_READ =
 /**
  * When the watchdog fired before the parse reached the row, the cell opens
  * with no marks hidden and no atoms drawn: a delete then could split a
- * label or leave a lone mark. Every delete is refused, with one sentence,
- * until the background parse has read the row.
+ * label or leave a lone mark, and a format command would wrap raw marks.
+ * Every delete and every command edit (a bare `input`: the format keys and
+ * bar, links, popover commits) is refused, and so is a format waiting for
+ * typing, with one sentence each, until the background parse has read the
+ * row (D13). Plain typing stays.
  */
 const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
-  if (!tr.docChanged || !tr.isUserEvent("delete")) return tr;
   const cell = tr.startState.field(rangeField, false);
   if (!cell || syntaxTree(tr.startState).length >= cell.to) return tr;
+  const command =
+    tr.docChanged &&
+    (tr.isUserEvent("delete") ||
+      tr.annotation(Transaction.userEvent) === "input");
+  const waiting =
+    (tr.startState.field(pendingFormat, false) ?? null) === null &&
+    (tr.state.field(pendingFormat, false) ?? null) !== null;
+  if (!command && !waiting) return tr;
   return {
     selection: tr.startState.selection,
     effects: EditorView.announce.of(CELL_NOT_READ),
@@ -1043,7 +1053,13 @@ export function mountCellEditor(
         {
           changes: tr.changes,
           effects: setOpenCell.of(own(tr.state)),
-          annotations: [fromCell.of(true), ...annotations],
+          // The cell judged its own deletion with its row's marks shown or
+          // hidden by its own caret; main would read the row as hidden.
+          annotations: [
+            fromCell.of(true),
+            judgedElsewhere.of(true),
+            ...annotations,
+          ],
           ...(userEvent === undefined ? {} : { userEvent }),
         },
         tr.startState.doc,

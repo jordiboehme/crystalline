@@ -34,7 +34,12 @@ export {
   snapRange,
   stepVisible,
 } from "./caret";
-export { deleteVisible, deletionKeymap, keepPartnerMarks } from "./deleting";
+export {
+  deleteVisible,
+  deletionKeymap,
+  judgedElsewhere,
+  keepPartnerMarks,
+} from "./deleting";
 export type { DeleteOutcome } from "./deleteCheck";
 export { CANNOT_JOIN, checkedDeletion, deletionOutcome } from "./deleteCheck";
 export type { Format, Pending } from "./formatting";

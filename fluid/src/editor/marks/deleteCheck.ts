@@ -42,6 +42,8 @@ import { EditorView } from "@codemirror/view";
 
 import type { Mark, MarkKind } from "./hiddenMarks";
 import { marksOnLine } from "./hiddenMarks";
+import { composing } from "./caret";
+import { judgedElsewhere, partnerAcrossLines } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
@@ -57,6 +59,8 @@ const CHECKED = new Set([
   "delete.backward",
   "delete.forward",
   "delete.selection",
+  // A cut removes a selection too (D12).
+  "delete.cut",
 ]);
 
 /** The formats a character can have that a deletion must keep. */
@@ -80,27 +84,75 @@ interface Lines {
   pairs: Pair[];
 }
 
-/** The marks and pairs of lines `first` to `last`, shown or hidden alike. */
+/**
+ * The marks and pairs of lines `first` to `last`, shown or hidden alike. A
+ * pair across a soft line break (its marks on two lines) is paired through
+ * the syntax node the two belong to.
+ */
 function linesOf(state: EditorState, first: number, last: number): Lines {
   const marks: Mark[] = [];
   const pairs: Pair[] = [];
+  const add = (open: Range, close: Range, kind: MarkKind) => {
+    const tail = state.doc.sliceString(close.from, close.to);
+    pairs.push({
+      kind,
+      open: { from: open.from, to: open.to },
+      close: { from: close.from, to: close.to },
+      labelled: kind === "link" && (tail === "]" || tail === "][]"),
+    });
+  };
+  const across: Mark[] = [];
   for (let n = first; n <= last; n += 1) {
     const line = marksOnLine(state, n, { always: true });
     marks.push(...line);
     for (const mark of line) {
-      if (mark.side !== "open" || mark.partner === null) continue;
+      if (mark.side !== "open" || !KINDS.has(mark.kind)) continue;
+      if (mark.partner === null) {
+        across.push(mark);
+        continue;
+      }
       const close = line[mark.partner];
-      if (!close || !KINDS.has(mark.kind)) continue;
-      const tail = state.doc.sliceString(close.from, close.to);
-      pairs.push({
-        kind: mark.kind,
-        open: { from: mark.from, to: mark.to },
-        close: { from: close.from, to: close.to },
-        labelled: mark.kind === "link" && (tail === "]" || tail === "][]"),
-      });
+      if (close) add(mark, close, mark.kind);
     }
   }
+  for (const open of across) {
+    const far = partnerAcrossLines(state, open);
+    const close = far
+      ? marks.find((mark) => mark.from === far.from && mark.side === "close")
+      : undefined;
+    if (close) add(open, close, open.kind);
+  }
   return { marks, pairs };
+}
+
+/**
+ * The lines a check reads: those the deletion touched, widened to the
+ * paragraphs around them, so a pair that wraps onto the next line is read
+ * whole. A paragraph is local; the document is never read whole.
+ */
+function blockLines(
+  state: EditorState,
+  from: number,
+  to: number,
+): { first: number; last: number } {
+  let lo = from;
+  let hi = to;
+  syntaxTree(state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (node.name === "Paragraph" || node.name.startsWith("SetextHeading")) {
+        lo = Math.min(lo, node.from);
+        hi = Math.max(hi, node.to);
+        return false;
+      }
+      return undefined;
+    },
+  });
+  return {
+    first: state.doc.lineAt(lo).number,
+    last: state.doc.lineAt(Math.min(hi, state.doc.length)).number,
+  };
 }
 
 function inAny(ranges: readonly Range[], pos: number): boolean {
@@ -188,8 +240,8 @@ function readsSame(
   const aFrom = changes.mapPos(from, -1);
   const aTo = changes.mapPos(to, 1);
   const parsed = parsedTo(after, aTo);
-  // Not parsed far enough to tell: the deletion stands as it is.
-  if (!parsed) return true;
+  // Not parsed far enough to tell: refused rather than written unchecked.
+  if (!parsed) return false;
   const next = linesOf(
     parsed,
     parsed.doc.lineAt(aFrom).number,
@@ -216,6 +268,14 @@ function readsSame(
   return true;
 }
 
+/** One repair: the changes it adds, and for a move where the space went. */
+interface Repair {
+  specs: ChangeSpec[];
+  outcome: DeleteOutcome;
+  /** The space a move takes (start positions) and where it puts it. */
+  moved?: { space: number; insert: number };
+}
+
 /**
  * The repairs to try when the exact deletion breaks a pair: for each pair
  * it left untouched, a mark moved across the space the deletion put at its
@@ -226,9 +286,9 @@ function repairs(
   start: EditorState,
   lines: Lines,
   deleted: readonly Range[],
-): { specs: ChangeSpec[]; outcome: DeleteOutcome }[] {
+): Repair[] {
   const doc = start.doc;
-  const out: { specs: ChangeSpec[]; outcome: DeleteOutcome }[] = [];
+  const out: Repair[] = [];
   const free = lines.pairs.filter(
     (pair) => !touches(deleted, pair.open) && !touches(deleted, pair.close),
   );
@@ -245,6 +305,7 @@ function repairs(
             { from: s, to: s + 1 },
           ],
           outcome: "moved",
+          moved: { space: s, insert: pair.open.from },
         });
       }
     }
@@ -260,6 +321,7 @@ function repairs(
             { from: pair.close.to, insert: char },
           ],
           outcome: "moved",
+          moved: { space: e, insert: pair.close.to },
         });
       }
     }
@@ -308,22 +370,50 @@ function carried(tr: Transaction): Annotation<unknown>[] {
   return out;
 }
 
+/**
+ * Where a position of the deletion's own result lands in `changes`: next
+ * to the moved space on the side it stood on, when a move took the space
+ * the caret touched (so typing shows where it showed), else mapped.
+ */
+function placed(
+  start: number,
+  changes: ChangeSet,
+  deleted: readonly Range[],
+  moved: Repair["moved"],
+): number {
+  if (moved) {
+    const { space, insert } = moved;
+    let before = start <= space;
+    for (let p = start; before && p < space; p += 1) {
+      if (!inAny(deleted, p)) before = false;
+    }
+    let after = start >= space + 1;
+    for (let p = space + 1; after && p < start; p += 1) {
+      if (!inAny(deleted, p)) after = false;
+    }
+    if (before) return changes.mapPos(insert, -1);
+    if (after) return changes.mapPos(insert, 1);
+  }
+  return changes.mapPos(start, -1);
+}
+
 /** `tr` rebuilt with `changes` in place of its own. */
 function rebuilt(
   tr: Transaction,
   changes: ChangeSet,
   outcome: DeleteOutcome | null,
+  deleted: readonly Range[] = [],
+  moved?: Repair["moved"],
 ): TransactionSpec {
   const back = tr.changes.invertedDesc;
   const selection = tr.newSelection;
+  const at = (pos: number) =>
+    placed(back.mapPos(pos, -1), changes, deleted, moved);
   return {
     changes,
     selection: EditorSelection.create(
       selection.ranges.map((range) =>
-        EditorSelection.range(
-          changes.mapPos(back.mapPos(range.anchor, -1), -1),
-          changes.mapPos(back.mapPos(range.head, -1), -1),
-        ),
+        EditorSelection.range(at(range.anchor), at(range.head)),
       ),
       selection.mainIndex,
     ),
@@ -350,11 +440,15 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
     !tr.docChanged ||
     event === undefined ||
     !CHECKED.has(event) ||
-    tr.annotation(Transaction.remote) !== undefined
+    tr.annotation(Transaction.remote) !== undefined ||
+    tr.annotation(judgedElsewhere) === true
   ) {
     return tr;
   }
   const start = tr.startState;
+  // An IME composition is the browser's to finish: a repair written beside
+  // it could end it (the caret normalizer leaves it alone too).
+  if (composing(start) || tr.isUserEvent("input.type.compose")) return tr;
   const deleted: Range[] = [];
   let inserts = false;
   tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
@@ -365,8 +459,7 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   if (inserts || deleted.length === 0) return tr;
   const firstPos = Math.min(...deleted.map((d) => d.from));
   const lastPos = Math.max(...deleted.map((d) => d.to));
-  const first = start.doc.lineAt(firstPos).number;
-  const last = start.doc.lineAt(lastPos).number;
+  const { first, last } = blockLines(start, firstPos, lastPos);
   const lines = linesOf(start, first, last);
   // A line with no pair can still gain one (`q * a* r` without its space
   // reads italic): where marks are hidden that is checked too (D10). Where
@@ -417,7 +510,7 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
     ]);
     const trial = start.update({ changes, filter: false }).state;
     if (readsSame(start, lines, first, last, changes, ranges, trial)) {
-      return rebuilt(tr, changes, repair.outcome);
+      return rebuilt(tr, changes, repair.outcome, ranges, repair.moved);
     }
   }
   if (readsSame(start, lines, first, last, exact, ranges, exactState)) {

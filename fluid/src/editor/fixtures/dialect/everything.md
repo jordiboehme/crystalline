@@ -18,7 +18,15 @@ Both at once: ***both***, ___both___, **_mixed_** and *__mixed__*.
 Adjacent: **a**_b_, *a**b**c*, `x`**y** and ~~s~~*t*.
 Two words: **one** **two** and *one* *two*.
 Spaced: **A bold** word and **Lead-in.** text after it.
+Trailing: **bold b** word, where Backspace on `b` moves the closer.
+
 A loose star: q * a* r stays text.
+
+Wrapped: **a lead-in that wraps
+here.** text, then **one
+more** **two** words and **A spread
+bold** end.
+
 Escaped: \*not italic\*, \*\*not bold\*\*, \_no\_, \~\~no\~\~ and \`no\`.
 Mixed escapes: **bold \* star** and *it \_ under*.
 A backslash at the end of a code span: `a\` and a double `` a`b `` span.

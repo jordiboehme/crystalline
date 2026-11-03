@@ -388,7 +388,9 @@ describe.each([
     const v = markView("**a\nb** c", { room });
     select(v, 1, 3);
     keys(v, "Backspace");
-    expect(bytes(v.state)).toBe("**\nb** c");
+    // Kept, the opening marks would stand before the line break and `b`
+    // would lose its bold, so the deletion check refuses it (D5).
+    expect(bytes(v.state)).toBe("**a\nb** c");
     // Everything between the two marks gone: the pair goes with it.
     const all = markView("**a\nb** c", { room });
     select(all, 1, 5);

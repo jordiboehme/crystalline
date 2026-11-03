@@ -19,6 +19,7 @@ import {
   keys,
   markView,
   setCaret,
+  typeText,
   undoOnce,
 } from "../../test/markKit";
 import type { DeleteOutcome } from "./deleteCheck";
@@ -183,6 +184,88 @@ describe.each([false, true])("a new pair, room %s", (room) => {
     setCaret(view, 3);
     keys(view, "Backspace");
     expect(text()).toBe("a` and `b`");
+    expect(heard.outcome).toBeNull();
+  });
+});
+
+/** A cut as the browser sends it; what reached the clipboard comes back. */
+function cut(view: EditorView): string {
+  const data = new Map<string, string>();
+  const event = new Event("cut", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      clearData: () => {
+        data.clear();
+      },
+      setData: (type: string, value: string) => data.set(type, value),
+      getData: (type: string) => data.get(type) ?? "",
+    },
+  });
+  view.contentDOM.dispatchEvent(event);
+  return data.get("text/plain") ?? "";
+}
+
+describe.each(CASES)("round 3, $mode mode, room $room", ({ mode, room }) => {
+  // In show mode the closing marks are text: the caret goes past them.
+  const past = (hidden: number, shown: number) =>
+    mode === "show" ? shown : hidden;
+
+  it("(c) across a line break is refused", () => {
+    const { view, heard, text } = page("**a\nb.** c", mode, room);
+    setCaret(view, past(8, 10));
+    keys(view, "Delete");
+    expect(text()).toBe("**a\nb.** c");
+    expect(heard.outcome).toBe("refused");
+  });
+
+  it("(a) across a line break moves the opening mark", () => {
+    const { view, heard, text } = page("**A spread\nbold**", mode, room);
+    setCaret(view, 4);
+    keys(view, "Delete");
+    expect(text()).toBe(" **spread\nbold**");
+    expect(heard.outcome).toBe("moved");
+  });
+
+  it("(b) across a line break merges the two pairs", () => {
+    const { view, heard, text } = page("**one\nmore** **two**", mode, room);
+    setCaret(view, past(12, 14));
+    keys(view, "Delete");
+    expect(text()).toBe("**one\nmoretwo**");
+    expect(heard.outcome).toBe("merged");
+  });
+
+  it("keeps the caret where it shows after a move", () => {
+    // "a " with the caret after the space: Z shows "a Z".
+    const back = page("**a b**", mode, room);
+    setCaret(back.view, 7);
+    keys(back.view, "Backspace");
+    typeText(back.view, "Z");
+    expect(back.text()).toBe("**a** Z");
+    // " bold" with the caret before the space: Z shows "Z bold".
+    const forward = page("**A bold**", mode, room);
+    setCaret(forward.view, 4);
+    keys(forward.view, "Delete");
+    typeText(forward.view, "Z");
+    expect(forward.text()).toBe("Z **bold**");
+  });
+
+  it("checks a cut the same way (D12)", () => {
+    const { view, heard, text } = page("**a.** b", mode, room);
+    view.focus();
+    view.dispatch({ selection: EditorSelection.range(8, 9) });
+    expect(cut(view)).toBe(" ");
+    expect(text()).toBe("**a.** b");
+    expect(heard.outcome).toBe("refused");
+  });
+
+  it("leaves a delete alone while a composition is active", () => {
+    const { view, heard, text } = page("**a.** b", mode, room);
+    Object.defineProperty(view, "composing", { get: () => true });
+    view.dispatch({
+      changes: { from: 8, to: 9 },
+      userEvent: "delete.forward",
+    });
+    expect(text()).toBe("**a.**b");
     expect(heard.outcome).toBeNull();
   });
 });

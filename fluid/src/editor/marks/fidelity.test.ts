@@ -74,7 +74,7 @@ import { canonical } from "./caret";
 import type { DeleteOutcome } from "./deleteCheck";
 import { deletionOutcome } from "./deleteCheck";
 import { toggleFormat } from "./formatting";
-import { linkDefinition, runsOnLine } from "./hiddenMarks";
+import { linkDefinition, marksOnLine, runsOnLine } from "./hiddenMarks";
 
 const DIALECT = import.meta.glob<string>("../fixtures/dialect/*.md", {
   query: "?raw",
@@ -155,8 +155,12 @@ const MARK_NODES = new Set([
   "LinkLabel",
 ]);
 
-/** Per test: a whole sample's run, which is many thousand edits. */
-const LONG = 60_000;
+/**
+ * Per test: a whole sample's run, which is many thousand edits. The full
+ * dialect pass takes about 15 s alone and several times that inside the
+ * parallel suite on a busy machine, so the limit is a watchdog, not a budget.
+ */
+const LONG = 180_000;
 
 afterEach(() => {
   cleanup();
@@ -262,10 +266,27 @@ function planned(state: EditorState, lines: number[], plan: Plan): number[] {
   const picked = new Set(stride(lines, LINES, plan));
   const all = new Set(lines);
   for (const n of lines) {
-    if (!state.doc.line(n).text.includes("<!--")) continue;
+    if (!state.doc.line(n).text.includes("<!--") && !wraps(state, n)) continue;
     for (const m of [n - 1, n, n + 1]) if (all.has(m)) picked.add(m);
   }
   return [...picked].sort((a, b) => a - b);
+}
+
+/** The kinds a pair can be that may wrap onto the next line. */
+const WRAPPING = new Set(["strong", "em", "strike", "code", "link"]);
+
+/**
+ * Whether line `n` holds one end of a pair whose other end is on another
+ * line: a stride over lines and boundaries would mostly miss those, so
+ * they are always taken.
+ */
+function wraps(state: EditorState, n: number): boolean {
+  return marksOnLine(state, n, { always: true }).some(
+    (mark) =>
+      (mark.side === "open" || mark.side === "close") &&
+      mark.partner === null &&
+      WRAPPING.has(mark.kind),
+  );
 }
 
 /** The lines a caret can stand on in main: every line not in a drawn table. */
@@ -292,6 +313,8 @@ function awayFrom(view: EditorView, n: number): void {
 
 interface Boundary {
   at: number;
+  /** On a line with one end of a pair that wraps: always taken. */
+  wraps: boolean;
   /** The mark ranges of its line, read with the caret off the line. */
   marks: [number, number][];
 }
@@ -306,16 +329,28 @@ function boundariesOf(view: EditorView): Boundary[] {
       run.marks.map((mark): [number, number] => [mark.from, mark.to]),
     );
     const seen = new Set<number>();
+    const wrapped = wraps(view.state, n);
     for (const run of runs) {
       for (const at of [run.from, run.to]) {
         if (!seen.has(at)) {
           seen.add(at);
-          out.push({ at, marks });
+          out.push({ at, marks, wraps: wrapped });
         }
       }
     }
   }
   return out;
+}
+
+/** How many characters of `pos`'s line a reader sees before `pos`. */
+function visibleBefore(state: EditorState, pos: number): number {
+  const line = state.doc.lineAt(pos);
+  const marks = marksOnLine(state, line.number, { always: true });
+  let count = 0;
+  for (let p = line.from; p < pos; p += 1) {
+    if (!marks.some((m) => m.from <= p && p < m.to)) count += 1;
+  }
+  return count;
 }
 
 /** `after` is `before` with exactly `letter` added at one place. */
@@ -439,6 +474,7 @@ function pairChange(
   const was = countsOf(old);
   const now = countsOf(pairsIn(after, from, Math.max(from, to + shift)));
   const problems: string[] = [];
+  let mergeLeft = 1;
   for (const name of new Set([...was.keys(), ...now.keys()])) {
     const x = was.get(name) ?? 0;
     const y = now.get(name) ?? 0;
@@ -455,9 +491,13 @@ function pairChange(
           pair.visible.every((p) => deleted.has(p))) ||
           shownMarkDeleted(pair)),
     ).length;
-    // A merge writes two pairs of one kind as one.
-    const allowed = emptied + (merged ? 1 : 0);
-    if (y > x || x - y > allowed) problems.push(`${name} ${x} -> ${y}`);
+    if (y > x) problems.push(`${name} ${x} -> ${y}`);
+    // A merge writes two pairs of one kind as one: one pair in all.
+    else if (x - y > emptied) {
+      const over = x - y - emptied;
+      if (merged && mergeLeft === 1 && over === 1) mergeLeft = 0;
+      else problems.push(`${name} ${x} -> ${y}`);
+    }
   }
   return problems.length > 0 ? problems.join(", ") : null;
 }
@@ -535,11 +575,10 @@ function boundaryEdits(start: Probe, plan: Plan, tally: Tally): Probe {
   const text = probe.sample.text;
   const show = probe.mode === "show";
   const seen = new Set<number>();
-  for (const { at: b, marks } of stride(
-    boundariesOf(probe.view),
-    BOUNDARIES,
-    plan,
-  )) {
+  const all = boundariesOf(probe.view);
+  const picked = new Set(stride(all, BOUNDARIES, plan));
+  for (const boundary of all) if (boundary.wraps) picked.add(boundary);
+  for (const { at: b, marks } of all.filter((each) => picked.has(each))) {
     const { view } = probe;
     setCaret(view, b);
     const at = view.state.selection.main.head;
@@ -580,6 +619,18 @@ function boundaryEdits(start: Probe, plan: Plan, tally: Tally): Probe {
       }
       if (bytes(now.state) === text) continue;
       tally.deletes[outcome ?? "exact"] += 1;
+      if (outcome === "moved") {
+        // The caret shows where the exact deletion would have shown it.
+        const want = visibleBefore(from, at) - (key === "Backspace" ? 1 : 0);
+        const head = now.state.selection.main.head;
+        const got = visibleBefore(now.state, head);
+        if (got !== want) {
+          fail(
+            tally,
+            `${key} at ${where(from, at)} moved a mark and left the caret at visible ${String(got)}, not ${String(want)}: ${where(now.state, head)}`,
+          );
+        }
+      }
       const deleted = removed(from, now.state);
       const touchesMark = [...deleted].some((p) =>
         marks.some(([x, y]) => x <= p && p < y),
@@ -674,22 +725,42 @@ function runAll(probe: Probe, plan: Plan): Tally {
   return tally;
 }
 
-const totals = {
-  files: new Set<string>(),
-  lines: 0,
-  checks: 0,
-  deletes: { exact: 0, moved: 0, merged: 0, refused: 0 },
-};
+interface Run {
+  tally: Tally;
+  lines: number;
+}
 
-function record(probe: Probe, tally: Tally): void {
-  if (!totals.files.has(probe.sample.name)) {
-    totals.files.add(probe.sample.name);
-    totals.lines += probe.view.state.doc.lines;
+/**
+ * Each sample's run in one mode, solo or in a room, computed once and kept:
+ * the test for that sample reads it, and so does the tally, whichever of
+ * them runs first (or alone).
+ */
+const runs = new Map<string, Run>();
+
+function runOf(sample: Sample, mode: Mode, room: boolean): Run {
+  const key = `${sample.name}|${mode}|${String(room)}`;
+  let run = runs.get(key);
+  if (!run) {
+    const probe = probeOf(sample, mode, room);
+    const lines = probe.view.state.doc.lines;
+    run = { tally: runAll(probe, planFor(sample, mode, room)), lines };
+    runs.set(key, run);
+    cleanupMarkViews();
   }
-  totals.checks += tally.checks;
-  for (const [key, value] of Object.entries(tally.deletes)) {
-    totals.deletes[key as keyof Tally["deletes"]] += value;
-  }
+  return run;
+}
+
+const SOLO: Sample[] = [...FIXTURES, ...CORPUS];
+
+function roomSamples(): Sample[] {
+  return [
+    LF,
+    ...ROOM.map((name) => {
+      const sample = CORPUS.find((each) => each.name === name);
+      if (!sample) throw new Error(`the corpus has no ${name}`);
+      return sample;
+    }),
+  ];
 }
 
 function planFor(sample: Sample, mode: Mode, room: boolean): Plan {
@@ -700,13 +771,11 @@ function planFor(sample: Sample, mode: Mode, room: boolean): Plan {
 }
 
 describe.each(MODES)("properties 1 to 4, %s mode, solo", (mode) => {
-  it.each([...FIXTURES, ...CORPUS].map((s) => [s.name, s] as const))(
+  it.each(SOLO.map((s) => [s.name, s] as const))(
     "%s",
     { timeout: LONG },
     (_name, sample) => {
-      const probe = probeOf(sample, mode, false);
-      const tally = runAll(probe, planFor(sample, mode, false));
-      record(probe, tally);
+      const { tally } = runOf(sample, mode, false);
       expect(tally.failures).toEqual([]);
       expect(tally.checks).toBeGreaterThan(0);
     },
@@ -714,21 +783,11 @@ describe.each(MODES)("properties 1 to 4, %s mode, solo", (mode) => {
 });
 
 describe.each(MODES)("properties 1 to 4, %s mode, in a room", (mode) => {
-  const samples = [
-    LF,
-    ...ROOM.map((name) => {
-      const sample = CORPUS.find((each) => each.name === name);
-      if (!sample) throw new Error(`the corpus has no ${name}`);
-      return sample;
-    }),
-  ];
-  it.each(samples.map((s) => [s.name, s] as const))(
+  it.each(roomSamples().map((s) => [s.name, s] as const))(
     "%s",
     { timeout: LONG },
     (_name, sample) => {
-      const probe = probeOf(sample, mode, true);
-      const tally = runAll(probe, planFor(sample, mode, true));
-      record(probe, tally);
+      const { tally } = runOf(sample, mode, true);
       expect(tally.failures).toEqual([]);
       expect(tally.checks).toBeGreaterThan(0);
     },
@@ -908,18 +967,47 @@ describe.each([
   },
 );
 
-it("counts what it checked, and refuses few deletions", () => {
-  // The corpus size the task report names; the runs above fill it in.
-  expect(totals.files.size).toBeGreaterThan(80);
-  const { exact, moved, merged, refused } = totals.deletes;
-  const judged = exact + moved + merged + refused;
-  console.info(
-    `fidelity corpus: ${totals.files.size} files, ${totals.lines} lines, ${totals.checks} checks; deletes: ${exact} exact, ${moved} moved, ${merged} merged, ${refused} refused`,
-  );
-  expect(judged).toBeGreaterThan(500);
-  // A check that refused every deletion would pass each case alone.
-  expect(refused / judged).toBeLessThanOrEqual(MAX_REFUSED);
-});
+it(
+  "counts what it checked, and refuses few deletions",
+  { timeout: 4 * LONG },
+  () => {
+    // Every run, read from the ones the tests above kept or computed here.
+    const totals = {
+      files: new Set<string>(),
+      lines: 0,
+      checks: 0,
+      deletes: { exact: 0, moved: 0, merged: 0, refused: 0 },
+    };
+    const all = [
+      ...MODES.flatMap((mode) =>
+        SOLO.map((sample) => ({ sample, mode, room: false })),
+      ),
+      ...MODES.flatMap((mode) =>
+        roomSamples().map((sample) => ({ sample, mode, room: true })),
+      ),
+    ];
+    for (const { sample, mode, room } of all) {
+      const run = runOf(sample, mode, room);
+      if (!totals.files.has(sample.name)) {
+        totals.files.add(sample.name);
+        totals.lines += run.lines;
+      }
+      totals.checks += run.tally.checks;
+      for (const [key, value] of Object.entries(run.tally.deletes)) {
+        totals.deletes[key as keyof Tally["deletes"]] += value;
+      }
+    }
+    expect(totals.files.size).toBeGreaterThan(80);
+    const { exact, moved, merged, refused } = totals.deletes;
+    const judged = exact + moved + merged + refused;
+    console.info(
+      `fidelity corpus: ${totals.files.size} files, ${totals.lines} lines, ${totals.checks} checks; deletes: ${exact} exact, ${moved} moved, ${merged} merged, ${refused} refused`,
+    );
+    expect(judged).toBeGreaterThan(500);
+    // A check that refused every deletion would pass each case alone.
+    expect(refused / judged).toBeLessThanOrEqual(MAX_REFUSED);
+  },
+);
 
 describe.each(MODES)("property 3 pins, %s mode", (mode) => {
   /** One press in the dialect file: the outcome and the line it leaves. */
@@ -960,6 +1048,37 @@ describe.each(MODES)("property 3 pins, %s mode", (mode) => {
       // Where the line shows its marks, a line with no pair keeps today's keys.
       expect(outcome).toBeNull();
     }
+  });
+
+  it("(c) refuses across a line break too", () => {
+    const { outcome, bytes: after } = press(
+      "wraps\nhere.** text",
+      "here.**",
+      "Delete",
+    );
+    expect(outcome).toBe("refused");
+    expect(after).toBe(EVERYTHING);
+  });
+
+  it("(a) moves a mark across a line break pair's space", () => {
+    const { outcome, bytes: after } = press(
+      "**A spread\nbold**",
+      "**",
+      "Delete",
+    );
+    expect(outcome).toBe("moved");
+    expect(after).toContain("words and  **spread\nbold** end.");
+  });
+
+  it("(b) merges a pair that wraps with the next one", () => {
+    const after = mode === "show" ? "more**" : "more";
+    const { outcome, bytes: written } = press(
+      "**one\nmore** **two**",
+      after,
+      "Delete",
+    );
+    expect(outcome).toBe("merged");
+    expect(written).toContain("**one\nmoretwo** words");
   });
 
   it("(c) refuses the space after a closer that follows punctuation", () => {

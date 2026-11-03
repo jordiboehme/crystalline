@@ -830,3 +830,60 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
     expect(main.state.doc.lineAt(cell.content.from).text).toBe("| label |  |");
   });
 });
+
+describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
+  const above = Array.from(
+    { length: 4000 },
+    (_, i) => `Paragraph ${String(i)} with **bold** text.`,
+  ).join("\n\n");
+  const text = `${above}\n\n| a | b |\n| - | - |\n| label | :status[Done]{green} |\n`;
+
+  it("refuses format commands until its row is read, and takes typing (D13)", () => {
+    const main = page(text, { room });
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
+    });
+    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    if (!cell) throw new Error("no cell");
+    const view = openAt(main, cell.content.from, false).view;
+    expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
+    const said: string[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) said.push(effect.value);
+            }
+          }
+        }),
+      ),
+    });
+    // A selection made bold: refused.
+    view.dispatch({
+      selection: { anchor: cell.content.from, head: cell.content.to },
+    });
+    keys(view, "Mod-b");
+    expect(bytes(main.state)).toBe(text);
+    // A format waiting for typing: refused too, so the letter is plain.
+    view.dispatch({ selection: { anchor: cell.content.to } });
+    keys(view, "Mod-i");
+    typeText(view, "x");
+    expect(main.state.doc.lineAt(cell.content.from).text).toBe(
+      "| label | :status[Done]{green}x |",
+    );
+    expect(said).toEqual([CELL_NOT_READ, CELL_NOT_READ]);
+  });
+});
+
+describe.each(ROOMS)("a shown mark deleted in a cell, $name", ({ room }) => {
+  it("is deleted as main deletes it (D9), not dropped by main", () => {
+    const text = "| q `a` and `b` | c |\n| - | - |\n";
+    const main = page(text, { room, mode: "show" });
+    const at = text.indexOf("`a`") + 1;
+    const cell = open(main, 0, 0, at);
+    keys(cell, "Backspace");
+    expect(line(main, 1)).toBe("| q a` and `b` | c |");
+    expect(bytes(cell.state)).toBe(bytes(main.state));
+  });
+});

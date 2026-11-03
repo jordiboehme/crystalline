@@ -163,7 +163,9 @@ function remove(
   const changes = state.changes(ranges.map(({ from, to }) => ({ from, to })));
   const userEvent = forward ? "delete.forward" : "delete.backward";
   const mapped = changes.mapPos(caretAt, -1);
-  const after = state.update({ changes, userEvent }).state;
+  // Unfiltered: the caret is placed on the text these changes make; the
+  // filters (the deletion check) map it if they rewrite them.
+  const after = state.update({ changes, userEvent, filter: false }).state;
   const spec: TransactionSpec = {
     changes,
     selection: EditorSelection.cursor(canonical(after, mapped)),
@@ -246,7 +248,11 @@ function deleteAtEdge(
   const userEvent = forward ? "delete.forward" : "delete.backward";
   const head = state.selection.main.head;
   const mapped = found.mapPos(head, forward ? 1 : -1);
-  const after = state.update({ changes: found, userEvent }).state;
+  const after = state.update({
+    changes: found,
+    userEvent,
+    filter: false,
+  }).state;
   view.dispatch({
     changes: found,
     selection: EditorSelection.cursor(canonical(after, mapped)),
@@ -582,6 +588,15 @@ export const deletionKeymap: Extension = Prec.highest(
   ]),
 );
 
+/**
+ * Marks an edit another view already judged with its own marks: a table
+ * cell's edit as the cell forwards it to main. The cell shows or hides its
+ * row's marks by its own caret, while main reads that row as hidden, so
+ * main's filters would judge it by the wrong mode (a shown backtick a cell
+ * deleted was kept by main and the edit undone).
+ */
+export const judgedElsewhere = Annotation.define<boolean>();
+
 /** The range replacements a person makes, exactly; never a bare `input`. */
 const PERSON_REPLACES = new Set([
   "input.type",
@@ -748,7 +763,8 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
     !tr.docChanged ||
     event === undefined ||
     !PERSON_REPLACES.has(event) ||
-    tr.annotation(Transaction.remote) !== undefined
+    tr.annotation(Transaction.remote) !== undefined ||
+    tr.annotation(judgedElsewhere) === true
   ) {
     return tr;
   }
