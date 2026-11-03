@@ -1,12 +1,14 @@
 //! ModernBERT, vendored from candle-transformers.
 //!
 //! This file is `candle-transformers` 0.11.0's `src/models/modernbert.rs`
-//! (504 lines), copied whole on 2026-09-21 and keeping its own upstream
-//! licence: `MIT OR Apache-2.0`, copyright the candle authors. The rest of this
-//! crate is MPL-2.0; both upstream licences permit the inclusion and
-//! this file stays under its own terms.
+//! (504 lines), copied whole on 2026-09-21 and checked against 0.11.1 on
+//! 2026-11-03 (0.11.1's file differs from 0.11.0's only by dropping
+//! `use core::f32;`, which this copy had already dropped). It keeps its own
+//! upstream licence: `MIT OR Apache-2.0`, copyright the candle authors. The
+//! rest of this crate is MPL-2.0; both upstream licences permit the inclusion
+//! and this file stays under its own terms.
 //!
-//! It is vendored because candle 0.11.0's own module cannot run
+//! It is vendored because candle 0.11.1's own module still cannot run
 //! `ibm-granite/granite-embedding-97m-multilingual-r2`, the default local
 //! embedding model: it hardcodes the gated MLP's activation as GeGLU (granite's
 //! is SwiGLU) and a `model.` tensor prefix (granite ships a bare
@@ -29,16 +31,12 @@
 //! candle release carries them: huggingface/candle#3991 for the activation and
 //! huggingface/candle#3992 for the prefix (local branches
 //! `modernbert-hidden-activation` and `modernbert-bare-checkpoint` until they
-//! merge). Four mechanical differences come on top of the two patches: the
+//! merge). Three mechanical differences come on top of the two patches: the
 //! file was run through this workspace's rustfmt (style edition 2024), which
 //! reorders the two `use` lists and nothing else; `ClassifierPooling` carries an
 //! `#[allow(clippy::upper_case_acronyms)]` because this workspace's clippy pin
-//! rejects upstream's variant names under `-D warnings`; upstream's
-//! `use core::f32;` is dropped, because Rust 1.99 deprecates the legacy
-//! `f32::MIN` and `f32::NEG_INFINITY` module constants it made the two mask
-//! helpers resolve to (without it they name the identical associated
-//! constants); and the granite config test at the bottom is ours rather than
-//! the pull request's.
+//! rejects upstream's variant names under `-D warnings`; and the granite
+//! config test at the bottom is ours rather than the pull request's.
 //!
 //! The trap, from the spike that produced this file: never add
 //! `#[serde(alias = "norm_eps")]` to `Config::layer_norm_eps`. Granite's

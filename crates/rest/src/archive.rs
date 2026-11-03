@@ -851,7 +851,7 @@ fn read_archive(bytes: &[u8]) -> Result<(Vec<Screened>, LooseFiles), ApiError> {
             });
             continue;
         }
-        // The header's uncompressed size is a CLAIM, not a bound: zip 8.6.0
+        // The header's uncompressed size is a CLAIM, not a bound: the zip crate
         // decompresses past it happily, and deflate expands up to ~1032:1, so
         // a lying header would otherwise allow multi-GiB allocations from a
         // 10 MiB body. Refuse the obvious oversize cheaply, then meter the
