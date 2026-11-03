@@ -275,6 +275,82 @@ describe("task gestures", () => {
   });
 });
 
+function press(view: EditorView, key: string): void {
+  const target = box(view);
+  target.dispatchEvent(
+    new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+  );
+  target.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
+  // The click the browser sends for Space on a checkbox.
+  if (key === " ") {
+    target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  }
+}
+
+describe("task box accessibility and input", () => {
+  it("names an open and a done box and reports their state", () => {
+    const open = box(markView("- [ ] t"));
+    expect(open.getAttribute("aria-label")).toBe("Mark task done");
+    expect((open as HTMLInputElement).checked).toBe(false);
+    const done = box(markView("- [x] t"));
+    expect(done.getAttribute("aria-label")).toBe("Mark task open");
+    expect((done as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("a right or middle press writes nothing and is not cancelled", () => {
+    for (const button of [1, 2]) {
+      const view = markView("- [ ] t");
+      const event = new MouseEvent("mousedown", {
+        bubbles: true,
+        cancelable: true,
+        button,
+      });
+      box(view).dispatchEvent(event);
+      expect(bytes(view.state)).toBe("- [ ] t");
+      expect(event.defaultPrevented).toBe(false);
+    }
+  });
+
+  for (const key of [" ", "Enter"]) {
+    it(`one ${key === " " ? "Space" : "Enter"} press writes exactly once`, () => {
+      const view = markView("- [ ] t\nz");
+      press(view, key);
+      expect(bytes(view.state)).toBe("- [x] t\nz");
+      const done = markView("- [x] t\nz");
+      press(done, key);
+      expect(bytes(done.state)).toBe("- [ ] t\nz");
+    });
+  }
+});
+
+describe("block drawing in nesting and order", () => {
+  it("draws a list inside a quote", () => {
+    const view = markView("> - a\n>   - b");
+    expect(texts(view, ".cm-list-bullet")).toEqual(["•", "◦"]);
+    expect(view.contentDOM.querySelectorAll(".cm-quote-line")).toHaveLength(2);
+    expect(view.contentDOM.textContent).toBe("•a  ◦b");
+  });
+
+  it("draws a quote inside a list item", () => {
+    const view = markView("- a\n  > q");
+    expect(texts(view, ".cm-list-bullet")).toEqual(["•"]);
+    expect(view.contentDOM.querySelectorAll(".cm-quote-line")).toHaveLength(1);
+    expect(view.contentDOM.textContent).toBe("•a  q");
+  });
+
+  it("numbers on across a blank line between items", () => {
+    const view = markView("3. a\n\n7. b\n\n9. c");
+    expect(texts(view, ".cm-list-number")).toEqual(["3.", "4.", "5."]);
+  });
+
+  it("starts a new count after a list is interrupted by another block", () => {
+    const comment = markView("1. a\n2. b\n\n<!-- c -->\n\n5. d\n6. e");
+    expect(texts(comment, ".cm-list-number")).toEqual(["1.", "2.", "5.", "6."]);
+    const rule = markView("1. a\n2. b\n\n# H\n\n4. c\n5. d");
+    expect(texts(rule, ".cm-list-number")).toEqual(["1.", "2.", "4.", "5."]);
+  });
+});
+
 describe("taskChanges", () => {
   it("writes one character of the task on the line, and nothing off a task", () => {
     const view = markView("- [ ] t\ntext\n1. [~] u");

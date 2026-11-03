@@ -182,22 +182,28 @@ class NotApplicableWidget extends WidgetType {
   }
 }
 
-/** Mousedown, a bare click and Space or Enter on a focused box write `to`. */
+/** The primary press, a bare click and Space or Enter on a focused box write `to` once. */
 function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
-  let pressed = false;
+  // A press that already wrote must not write again when the browser then
+  // sends its click (after a mouse press, or on the keyup of Space).
+  let handled = false;
   const flip = () => {
-    // The press must not also move the selection into the hidden marker.
     writeTask(view, view.posAtDOM(box), to);
   };
   box.addEventListener("mousedown", (event) => {
+    // Only the primary button flips; a right click is the task menu's.
+    if (event.button !== 0) {
+      return;
+    }
+    // The press must not also move the selection into the hidden marker.
     event.preventDefault();
-    pressed = true;
+    handled = true;
     flip();
   });
   box.addEventListener("click", (event) => {
     event.preventDefault();
-    if (pressed) {
-      pressed = false;
+    if (handled) {
+      handled = false;
       return;
     }
     flip();
@@ -205,8 +211,17 @@ function flipOn(box: HTMLElement, view: EditorView, to: TaskState): void {
   box.addEventListener("keydown", (event) => {
     if (event.key === " " || event.key === "Enter") {
       event.preventDefault();
-      flip();
+      if (!event.repeat) {
+        handled = true;
+        flip();
+      }
     }
+  });
+  box.addEventListener("keyup", () => {
+    // The click of Space arrives right after the keyup; drop the flag after.
+    setTimeout(() => {
+      handled = false;
+    }, 0);
   });
 }
 
