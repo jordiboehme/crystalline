@@ -291,7 +291,7 @@ async fn browse_read_and_the_routing_block_mark_the_callers_unwritable_domains()
         identifier: "note".into(),
         domain: Some(domain.into()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     };
     for (domain, expected) in [("eng", true), ("archive", true), ("agents-bot", false)] {
         let browsed = engine.browse_domain(&browse(domain), &bot).await.unwrap();
@@ -389,7 +389,7 @@ async fn a_mark_that_cannot_be_decided_leaves_the_read_standing() {
                 identifier: "note".into(),
                 domain: Some("eng".into()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &scope,
         )

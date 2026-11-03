@@ -33,9 +33,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { problemDetail } from "../api/client";
 import type { AssetHome, AttachmentRow } from "../api/files";
-import { assetRefsIn, engramAssetHome } from "../editor/imageFormat";
+import { assetRefsIn } from "../editor/imageFormat";
 import { formatBytes } from "../format";
 import { BUTTON, Chip, FOCUS_RING, IconButton, RAIL_LABEL } from "./primitives";
+import { useEngramAssetHome } from "./useEngramAssetHome";
 
 export interface AttachmentsSectionProps {
   /** The domain the paths are relative to. */
@@ -123,10 +124,13 @@ export function AttachmentsSection({
   onMove,
   onRemoved,
 }: AttachmentsSectionProps) {
-  const home = useMemo(
-    () => givenHome ?? engramAssetHome(domain),
-    [givenHome, domain],
+  // The domain's own files carry their current bytes in their addresses
+  // (`useEngramAssetHome`); a given home brings its own.
+  const engramHome = useEngramAssetHome(
+    givenHome === undefined ? domain : undefined,
+    body,
   );
+  const home = (givenHome ?? engramHome) as AssetHome;
   const referenced = useMemo(
     () => assetRefsIn(body, home.resolve),
     [body, home],

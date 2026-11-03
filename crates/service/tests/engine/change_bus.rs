@@ -135,9 +135,11 @@ fn engram_of(change: &Change) -> &EngramChanged {
 
 fn write_params(title: &str, overwrite: bool) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: "the body".to_string(),
+        content: Some("the body".to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),
@@ -1535,7 +1537,7 @@ async fn a_new_engram_binds_a_waiting_link_in_another_domain_and_announces_it_bo
                 identifier: "guide".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1585,7 +1587,7 @@ async fn a_draft_write_binds_nothing_elsewhere_body(store: Arc<Mutex<dyn Store>>
                 identifier: "guide".to_string(),
                 domain: Some("oak".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1606,7 +1608,7 @@ async fn guide_resolved(engine: &Engine) -> serde_json::Value {
                 identifier: "guide".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1683,7 +1685,7 @@ async fn a_save_that_retitles_binds_a_waiting_link_in_another_domain_body(
                 identifier: "runbook".to_string(),
                 domain: Some("oak".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1788,3 +1790,112 @@ both_backends!(
     a_restore_binds_a_waiting_link_in_another_domain,
     a_restore_binds_a_waiting_link_in_another_domain_body
 );
+
+fn ada() -> Scope {
+    Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    }
+}
+
+/// The smallest bytes the attachment allowlist accepts as a png.
+fn png(tail: u8) -> Vec<u8> {
+    vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, tail]
+}
+
+#[tokio::test]
+async fn attachment_events_announce_one_files_event_per_write_replace_and_delete() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .attachment_write_joined("notes", "assets/a.png", png(1), &ada(), None, false)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let added = engram_of(&heard[0]);
+    assert_eq!(added.kind, ChangeKind::Files);
+    assert_eq!(added.domain, "notes");
+    assert_eq!(added.path, "assets/a.png");
+    assert_eq!(added.permalink, "assets/a.png");
+    assert_eq!(added.actor.as_deref(), Some("ada"));
+    assert_eq!(added.draft_of, None);
+
+    engine
+        .attachment_write_joined("notes", "assets/a.png", png(2), &ada(), None, false)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Files);
+    assert_eq!(engram_of(&heard[0]).path, "assets/a.png");
+
+    engine
+        .attachment_delete_joined("notes", "assets/a.png", &ada(), None)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    let gone = engram_of(&heard[0]);
+    assert_eq!(gone.kind, ChangeKind::Files);
+    assert_eq!(gone.path, "assets/a.png");
+    assert_eq!(gone.actor.as_deref(), Some("ada"));
+}
+
+#[tokio::test]
+async fn attachment_events_come_from_delete_engram_on_an_assets_identifier_too() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    engine
+        .attachment_write_joined("notes", "assets/b.png", png(1), &ada(), None, false)
+        .await
+        .unwrap();
+    let mut rx = engine.changes().subscribe();
+    engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "assets/b.png".to_string(),
+                domain: "notes".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &ada(),
+        )
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Files);
+    assert_eq!(engram_of(&heard[0]).path, "assets/b.png");
+}
+
+#[tokio::test]
+async fn attachment_events_stay_silent_for_a_draft_in_a_review_mode_domain() {
+    let (_tmp, engine, _scratch) = engine_fixture(true).await;
+    let mut rx = engine.changes().subscribe();
+    let written = engine
+        .attachment_write_joined("notes", "assets/c.png", png(1), &ada(), None, false)
+        .await
+        .unwrap();
+    assert!(written.draft);
+    assert!(drain(&mut rx).is_empty());
+    let draft = engine
+        .attachment_delete_joined("notes", "assets/c.png", &ada(), None)
+        .await
+        .unwrap();
+    assert!(draft);
+    assert!(drain(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn attachment_events_are_not_repeated_by_the_sync_walker() {
+    let (_tmp, engine, _scratch) = engine_fixture(false).await;
+    let mut rx = engine.changes().subscribe();
+    engine
+        .attachment_write_joined("notes", "assets/d.png", png(1), &ada(), None, false)
+        .await
+        .unwrap();
+    engine.sync(None).await.unwrap();
+    let heard = drain(&mut rx);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Files);
+}

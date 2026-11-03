@@ -183,9 +183,11 @@ impl Fixture {
     /// view at all, which is the state every test here starts from.
     async fn draft(&self, account: &str, title: &str, body: &str) -> String {
         let params = crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "team".to_string(),
             title: title.to_string(),
-            content: body.to_string(),
+            content: Some(body.to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["team".to_string()],
@@ -1261,7 +1263,7 @@ fn read_as(identifier: &str) -> crystalline_service::params::ReadParams {
         identifier: identifier.to_string(),
         domain: Some("team".to_string()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     }
 }
 
@@ -1271,9 +1273,11 @@ async fn draft_in(f: &Fixture, account: &str, folder: &str, title: &str, body: &
         .engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: title.to_string(),
-                content: body.to_string(),
+                content: Some(body.to_string()),
                 folder: Some(folder.to_string()),
                 engram_type: None,
                 tags: vec!["team".to_string()],
@@ -1450,9 +1454,11 @@ async fn the_join_refusal_names_the_permalink() {
         .engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: "Plan".to_string(),
-                content: "What alice would change.".to_string(),
+                content: Some("What alice would change.".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec!["team".to_string()],

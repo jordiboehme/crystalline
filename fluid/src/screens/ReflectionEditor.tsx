@@ -33,8 +33,8 @@ import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import type { AssetHome } from "../api/files";
+import { changedVersions } from "../api/assetVersions";
 import {
-  changedVersions,
   fetchReflection,
   fetchReflectionAssets,
   reflectionAssetHome,

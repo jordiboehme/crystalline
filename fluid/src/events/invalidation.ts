@@ -19,6 +19,7 @@ import { SYNC_SUMMARY_KEY, sharePlanKey, syncStatusKey } from "../api/admin";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { engramDetailKey } from "../api/engram";
+import { attachmentsKey } from "../api/files";
 import { domainEngramsRoot } from "../api/engrams";
 import type {
   ChangeEvent,
@@ -54,6 +55,13 @@ function domainRows(domain: string): QueryKey[] {
 }
 
 export function keysForEngram(change: EngramChange): QueryKey[] {
+  // An attachment write, replace or delete: `permalink` and `path` are the
+  // file's (`assets/<file>`), not an engram's, so no engram detail, graph or
+  // tree row is touched. The listing is what the pictures read their version
+  // from, and the sync card counts the changed file.
+  if (change.kind === "files") {
+    return [attachmentsKey(change.domain), syncStatusKey(change.domain)];
+  }
   const keys: QueryKey[] = [
     engramDetailKey(change.domain, change.permalink),
     graphPrefix(change.domain, change.permalink),

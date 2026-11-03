@@ -144,9 +144,10 @@ pub struct CtlState {
     pub origin_rule: OriginRule,
 }
 
-/// The route. The JSON API's body ceiling ([`crate::rest::MAX_BODY_BYTES`])
-/// is applied by `handle` itself, after the bearer check, rather than by a
-/// body-limit layer in front of an extractor that would read the body first.
+/// The route. The tool body ceiling ([`crate::rest::MAX_TOOL_BODY_BYTES`],
+/// room for a 10 MiB file as base64) is applied by `handle` itself, after the
+/// bearer check, rather than by a body-limit layer in front of an extractor
+/// that would read the body first.
 pub fn route(state: CtlState) -> axum::Router {
     axum::Router::new()
         .route(CTL_PATH, axum::routing::post(handle))
@@ -163,7 +164,7 @@ async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Body) -
         Bearer::Account(identity) => identity,
         Bearer::Refused(response) | Bearer::Unavailable(response) => return response,
     };
-    let body = match axum::body::to_bytes(body, crate::rest::MAX_BODY_BYTES).await {
+    let body = match axum::body::to_bytes(body, crate::rest::MAX_TOOL_BODY_BYTES).await {
         Ok(body) => body,
         Err(e) => return axum::Json(envelope_err(format!("invalid body: {e}"))).into_response(),
     };
@@ -263,6 +264,9 @@ async fn remote_status(
         .unwrap_or_default();
     Ok(json!({
         "version": crystalline_core::VERSION,
+        // What this server can do that an older one cannot, for a client that
+        // must not send such a call to a server without it.
+        "capabilities": [crystalline_remote::AGENT_FILES_CAPABILITY],
         "read_only": engine.read_only(),
         "account": identity.name,
         "admin": identity.admin,

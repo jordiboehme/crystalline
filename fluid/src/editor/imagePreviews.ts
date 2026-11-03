@@ -24,7 +24,7 @@
 
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension, Range } from "@codemirror/state";
-import { StateField } from "@codemirror/state";
+import { StateEffect, StateField } from "@codemirror/state";
 import type { DecorationSet } from "@codemirror/view";
 import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 
@@ -155,15 +155,55 @@ const previewTheme = EditorView.baseTheme({
 });
 
 /**
+ * The files of each domain whose bytes changed since the editor first listed
+ * them, path to sha256, read by {@link imagePreviews} for a domain it is
+ * handed. One map per domain, updated in place by {@link setPreviewVersions}
+ * so a preview extension built earlier sees the update.
+ */
+const previewVersions = new Map<string, Map<string, string>>();
+
+/** The map behind a domain's previews, created on first use. */
+function versionsOf(domain: string): Map<string, string> {
+  let found = previewVersions.get(domain);
+  if (found === undefined) {
+    found = new Map();
+    previewVersions.set(domain, found);
+  }
+  return found;
+}
+
+/**
+ * Tells the previews of `domain` which files changed on disk since the
+ * editor first listed them; send {@link refreshPreviews} to the view after
+ * it so the pictures are drawn anew. An empty map forgets them.
+ */
+export function setPreviewVersions(
+  domain: string,
+  versions: ReadonlyMap<string, string>,
+): void {
+  const live = versionsOf(domain);
+  live.clear();
+  for (const [path, sha] of versions) live.set(path, sha);
+}
+
+/** Rebuilds every preview, for when {@link setPreviewVersions} changed. */
+export const refreshPreviews = StateEffect.define<null>();
+
+/**
  * Inline previews of the attachment images a document references: a domain's
  * engram files when handed a domain, or whatever the resolver resolves.
  */
 export function imagePreviews(source: string | AssetResolver): Extension {
-  const assets = typeof source === "string" ? engramAssetHome(source) : source;
+  const assets =
+    typeof source === "string"
+      ? engramAssetHome(source, versionsOf(source))
+      : source;
   const field = StateField.define<DecorationSet>({
     create: (state) => buildPreviews(state, assets),
     update: (value, tr) =>
-      tr.docChanged || parseAdvanced(tr)
+      tr.docChanged ||
+      parseAdvanced(tr) ||
+      tr.effects.some((effect) => effect.is(refreshPreviews))
         ? buildPreviews(tr.state, assets)
         : value,
     provide: (f) => EditorView.decorations.from(f),

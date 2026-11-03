@@ -43,6 +43,20 @@ describe("the invalidation table", () => {
     expect(has(keys, ["domains"])).toBe(false);
   });
 
+  it("a files event reaches the attachment listing and treats assets/... as no engram page", () => {
+    const keys = keysForEngram(
+      change({
+        kind: "files",
+        permalink: "assets/a.png",
+        path: "assets/a.png",
+      }),
+    );
+    expect(has(keys, ["attachments", "eng"])).toBe(true);
+    expect(has(keys, ["engram", "eng", "assets/a.png"])).toBe(false);
+    expect(has(keys, ["graph", "eng", "assets/a.png"])).toBe(false);
+    expect(has(keys, ["domain-tree", "eng"])).toBe(false);
+  });
+
   it("a move also reaches the old permalink's detail and graph", () => {
     const keys = keysForEngram(
       change({

@@ -190,7 +190,8 @@ const EVOLVE_PROMPT: &str = include_str!("automation/evolve-prompt.md");
 /// exactly these, and a runner passes the same list to its harness (Claude
 /// Code's `--disallowedTools`). Two more rules are parameters, not tools,
 /// so they live in the prompts only: the `write_reflection` action
-/// `delete_asset` and `write_engram` with `overwrite: true`.
+/// `delete_asset`, `write_asset` with `overwrite: true` and `write_engram`
+/// with `overwrite: true` (which covers an attachment replace too).
 pub const HEADLESS_DISALLOWED_TOOLS: &[&str] = &[
     "delete_engram",
     "move_engram",
@@ -425,6 +426,7 @@ mod tests {
             assert_eq!(named, HEADLESS_DISALLOWED_TOOLS, "{lp}");
             for needle in [
                 "`write_reflection` action `delete_asset`",
+                "`write_reflection` action `write_asset` with `overwrite: true`",
                 "`write_engram` with `overwrite: true`",
             ] {
                 assert!(params.contains(needle), "{lp} does not forbid {needle}");

@@ -946,7 +946,7 @@ test.describe.serial("the Reflection journeys", () => {
     const article = page.locator("main article").first();
     await expect(article).toContainText("Old harbor diagram");
     await expect(article).toContainText(
-      "This file is not in the Reflection. A curator copies it into the Reflection's files.",
+      "This file is not in the Reflection. A curator or an agent copies it into the Reflection's files.",
     );
     await expect(
       page.getByRole("img", { name: "Old harbor diagram" }),

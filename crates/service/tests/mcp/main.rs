@@ -19,4 +19,5 @@ mod mcp_read_only;
 mod mcp_rename_question;
 mod mcp_skills;
 mod mcp_subscriptions;
+mod mcp_uploads;
 mod stub;

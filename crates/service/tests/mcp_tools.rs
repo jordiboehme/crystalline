@@ -2856,6 +2856,61 @@ async fn tool_descriptions_teach_the_miss_hint() {
     );
 }
 
+/// The file verbs are findable: each description carries the keywords an
+/// agent searches for, and none still claims only a person adds files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_the_file_verbs() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let text = |name: &str| -> String {
+        tools
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} present"))
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .to_string()
+    };
+    let write = text("write_engram");
+    for needle in ["upload", "attachment", "base64", "overwrite", "assets/"] {
+        assert!(write.contains(needle), "write_engram lacks {needle}");
+    }
+    let read = text("read_engram");
+    for needle in ["download", "assets/", "base64"] {
+        assert!(read.contains(needle), "read_engram lacks {needle}");
+    }
+    let write_reflection = text("write_reflection");
+    for needle in ["write_asset", "upload", "overwrite", "curate"] {
+        assert!(
+            write_reflection.contains(needle),
+            "write_reflection lacks {needle}"
+        );
+    }
+    assert!(
+        !write_reflection.contains("which a person does"),
+        "write_reflection still says only a person copies files"
+    );
+    let read_reflection = text("read_reflection");
+    for needle in ["download", "assets/"] {
+        assert!(
+            read_reflection.contains(needle),
+            "read_reflection lacks {needle}"
+        );
+    }
+    let evolve = text("evolve_engrams");
+    assert!(
+        !evolve.contains("a file a human added"),
+        "evolve_engrams still says only a human adds files"
+    );
+    assert!(
+        evolve.contains("attachment"),
+        "evolve keeps the orphan finding"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_filter_only_and_text_fallback() {
     let h = Harness::new(&["eng"]).await;
@@ -7862,9 +7917,11 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
     h.engine.set_provider(Arc::new(support::TopicEmbedder));
     h.engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "lab".to_string(),
             title: "Retry secrets".to_string(),
-            content: RETRY.to_string(),
+            content: Some(RETRY.to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["t".to_string()],

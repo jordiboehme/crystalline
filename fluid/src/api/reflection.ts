@@ -10,9 +10,9 @@
  * Reflection after a write.
  */
 
-import type { QueryClient } from "@tanstack/react-query";
 import { useQuery } from "@tanstack/react-query";
 
+import { versionedUrl } from "./assetVersions";
 import { API_BASE, api, encodePermalink, encodeSegment } from "./client";
 import {
   type AssetHome,
@@ -868,52 +868,7 @@ export async function moveReflectionAsset(
 
 /** Said when a page links an engram attachment (proposal; see the B9 plan, open question 4). */
 export const ENGRAM_FILE =
-  "This file is not in the Reflection. A curator copies it into the Reflection's files.";
-
-/** How much of a file's sha256 its URL carries: enough to tell versions apart. */
-const VERSION_CHARS = 12;
-
-/**
- * The first sha256 this document saw for each Reflection file, by
- * `<domain>\0<path>`. One per QueryClient: one per open document in the app,
- * and a fresh one per test.
- */
-const baselines = new WeakMap<QueryClient, Map<string, string>>();
-
-/**
- * Path to sha256 for every file whose bytes changed since this document
- * first listed it, for {@link reflectionAssetHome}. A file seen for the first
- * time sets its baseline and is left out, so its address stays plain: the
- * image drawn before the listing landed is not fetched a second time under
- * another URL. The page and the editor share the baseline through the
- * QueryClient, so a file replaced on one page is drawn anew on the next.
- *
- * The rare race: the plain image loads, then somebody replaces the file
- * before this document's first listing arrives. The baseline is then the
- * new sha, and the old picture stays until a reload.
- */
-export function changedVersions(
-  queryClient: QueryClient,
-  domain: string,
-  rows: readonly AttachmentRow[] | undefined,
-): ReadonlyMap<string, string> {
-  let seen = baselines.get(queryClient);
-  if (seen === undefined) {
-    seen = new Map();
-    baselines.set(queryClient, seen);
-  }
-  const changed = new Map<string, string>();
-  for (const row of rows ?? []) {
-    const key = `${domain}\u0000${row.path}`;
-    const first = seen.get(key);
-    if (first === undefined) {
-      seen.set(key, row.sha256);
-    } else if (first !== row.sha256) {
-      changed.set(row.path, row.sha256);
-    }
-  }
-  return changed;
-}
+  "This file is not in the Reflection. A curator or an agent copies it into the Reflection's files.";
 
 /**
  * The Reflection's file store for the page at `pagePath`: its listing, the
@@ -938,11 +893,10 @@ export function reflectionAssetHome(
     // Only the URL carries it; `linkTo` and `resolve` never do, so no
     // document is ever written with it.
     url: (path) => {
-      const sha = versions?.get(path);
-      const plain = reflectionAssetUrl(domain, path);
-      return sha === undefined || sha === ""
-        ? plain
-        : `${plain}?v=${encodeURIComponent(sha.slice(0, VERSION_CHARS))}`;
+      return versionedUrl(
+        reflectionAssetUrl(domain, path),
+        versions?.get(path),
+      );
     },
     resolve: (target) => {
       const r = reflectionTargetOf(target, pagePath);

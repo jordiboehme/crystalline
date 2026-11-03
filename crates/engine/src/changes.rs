@@ -47,7 +47,8 @@ pub const COLLAPSE_THRESHOLD: usize = 32;
 /// the watcher finds every engine write of one again a moment later.
 pub const DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
 
-/// What happened to the engram: the four things the sync engine counts.
+/// What happened to the engram: the four things the sync engine counts, and
+/// `files` for an attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -55,6 +56,12 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Moved,
+    /// An attachment under `assets/` was written, replaced or deleted. The
+    /// event's `path` and `permalink` both carry the attachment path
+    /// (`assets/a.png`) and it has no checksum, so a reader redraws the file
+    /// whatever happened to it. Announced by the engine, never by the sync
+    /// walker.
+    Files,
 }
 
 impl From<crystalline_index::PathChangeKind> for ChangeKind {

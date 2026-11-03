@@ -132,7 +132,7 @@ pub fn refuse_engram_attachments(source: &str, reflection_path: &str) -> Result<
     let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
     let suggestion = relative_to(reflection_path, &format!("{ASSETS_PREFIX}{name}"));
     Err(format!(
-        "a reflection cannot embed an engram attachment ({}); copy the file into reflections/assets/ and link it from there, for example {suggestion}",
+        "a reflection cannot embed an engram attachment ({}); copy the file into reflections/assets/ and link it from there, for example {suggestion} (read it with read_engram, then write it with write_reflection action write_asset; to copy a picture, read it with include_images: false, then write_asset with that base64)",
         found.join(", ")
     ))
 }
@@ -221,6 +221,10 @@ mod tests {
         assert!(
             err.contains("reflections/assets/") && err.contains("for example assets/shot.png"),
             "says where to copy it and the link it would have: {err}"
+        );
+        assert!(
+            err.contains("read_engram") && err.contains("write_asset"),
+            "tells the agent how to copy the file: {err}"
         );
         assert!(
             refuse_engram_attachments("```\n![x](../assets/shot.png)\n```\n", "a.md").is_ok(),

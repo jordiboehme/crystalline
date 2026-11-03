@@ -1806,9 +1806,11 @@ mod tests {
 
     fn a_note(title: &str) -> crate::params::WriteParams {
         crate::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "notes".to_string(),
             title: title.to_string(),
-            content: format!("the body of {title}, long enough to make a chunk"),
+            content: Some(format!("the body of {title}, long enough to make a chunk")),
             folder: None,
             engram_type: None,
             tags: Vec::new(),

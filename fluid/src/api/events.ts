@@ -7,13 +7,14 @@
 
 import { asObject, asString } from "./json";
 
-export type ChangeKind = "added" | "modified" | "deleted" | "moved";
+export type ChangeKind = "added" | "modified" | "deleted" | "moved" | "files";
 
 const KINDS: ReadonlySet<string> = new Set([
   "added",
   "modified",
   "deleted",
   "moved",
+  "files",
 ]);
 
 export interface EngramChange {

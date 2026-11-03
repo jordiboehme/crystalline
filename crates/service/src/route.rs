@@ -411,24 +411,61 @@ pub async fn routed(
                 return Some(Err(RouteError::Local(EngineError::ReadOnly.into())));
             }
             let forwarded = forwarded_args(args, &names, false);
-            let limit = if tool == crate::EVOLVE_TOOL_NAME {
+            let transfer = file_transfer(tool, args);
+            // A forwarded sweep and a file transfer get the long ctl limit:
+            // a sweep runs long on the server, and a full-size file over a
+            // slow uplink outlasts ten seconds (the proxy allows two minutes).
+            let own = if tool == crate::EVOLVE_TOOL_NAME || transfer.is_some() {
                 CTL_TIMEOUT
             } else {
                 ONE_DOMAIN_LIMIT
             };
-            let own = limit;
             let limit = deadline.map_or(own, |d| d.min(own));
+            // Running out of time on one file says nothing about the source,
+            // so a file transfer never opens the down window (as
+            // `Connection::file_within`); a refused connection still counts.
+            let budget = if transfer.is_some() {
+                crystalline_remote::Budget::Cut
+            } else {
+                crystalline_remote::Budget::of(limit, own)
+            };
+            let started = std::time::Instant::now();
+            if let Some(transfer) = transfer {
+                // An older server ignores the fields that make this a file;
+                // with a title beside them it would write an engram instead.
+                // The status question has a short cut of its own, taken from
+                // the transfer's limit, and its timeout refuses the transfer
+                // without marking the source down.
+                let asked = limit.min(ONE_DOMAIN_LIMIT);
+                match sources
+                    .takes_agent_files(&source, asked, crystalline_remote::Budget::Cut)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let url = sources
+                            .source_url(&source)
+                            .filter(|url| !url.is_empty())
+                            .unwrap_or_else(|| source.clone());
+                        return Some(Err(RouteError::Refused(older_server_sentence(
+                            &url, transfer,
+                        ))));
+                    }
+                    Err(failure) => {
+                        return Some(Err(RouteError::Source {
+                            source,
+                            domain,
+                            failure: within(failure, asked),
+                        }));
+                    }
+                }
+            }
+            let left = limit.saturating_sub(started.elapsed());
             // A caller's shorter budget running out says nothing about the
-            // source, so it never opens the down window (Budget::Cut).
+            // source, so it never opens the down window (Budget::Cut), and
+            // neither does a file transfer's.
             let answer = sources
-                .forward_as(
-                    &source,
-                    tool,
-                    forwarded,
-                    agent,
-                    limit,
-                    crystalline_remote::Budget::of(limit, own),
-                )
+                .forward_as(&source, tool, forwarded, agent, left, budget)
                 .await;
             Some(match answer {
                 Ok(mut value) => {
@@ -460,6 +497,46 @@ pub async fn routed(
             )
         }
     }
+}
+
+/// Which way a file moves in a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transfer {
+    /// An agent sends a file: `write_engram` with `path`, `write_reflection`
+    /// `write_asset`.
+    Upload,
+    /// An agent reads a file by its `assets/` path.
+    Download,
+}
+
+/// Whether this call moves a file, and which way. Only the cases an older
+/// server would misread: the write verbs with the fields that make them
+/// uploads, and the read verbs on an `assets/` path.
+fn file_transfer(tool: &str, args: &Value) -> Option<Transfer> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    match tool {
+        "write_engram" if args.get("path").is_some_and(|p| !p.is_null()) => Some(Transfer::Upload),
+        "write_reflection" if text("action") == Some("write_asset") => Some(Transfer::Upload),
+        "read_engram" => text("identifier")
+            .and_then(crate::engine::attachment_identifier)
+            .map(|_| Transfer::Download),
+        "read_reflection" if args.get("query").is_none_or(Value::is_null) => text("path")
+            .and_then(crate::engine::attachment_identifier)
+            .map(|_| Transfer::Download),
+        _ => None,
+    }
+}
+
+/// What an agent reads when the server behind its call predates agent files.
+fn older_server_sentence(url: &str, transfer: Transfer) -> String {
+    let what = match transfer {
+        Transfer::Upload => "take files from agents",
+        Transfer::Download => "hand files to agents",
+    };
+    format!(
+        "The server at {url} runs an older Crystalline that cannot {what} yet; update it to {} or later.",
+        crystalline_remote::AGENT_FILES_RELEASE
+    )
 }
 
 /// One file of a mounted domain, as its server answered it.
