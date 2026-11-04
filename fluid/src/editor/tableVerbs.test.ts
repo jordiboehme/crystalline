@@ -680,7 +680,9 @@ describe("every verb on tables without outer pipes (R23)", () => {
     ).toBe(true);
     const tables: [number, number][] = [];
     let rows = 0;
-    syntaxTree(state).iterate({
+    // The whole parse: a verb's own transaction parses for 20 ms of wall
+    // clock, and on a loaded machine its tree stops short of the table.
+    syntaxTree(parsedState(state)).iterate({
       enter: (node) => {
         if (node.name === "Table") tables.push([node.from, node.to]);
         if (node.name === "TableRow") rows += 1;

@@ -111,8 +111,17 @@ function places(state: EditorState, at: number, text: string): Place[] {
   if (/[\r\n]/.test(text)) {
     // Text that breaks the line is never split across a run (D55): it goes
     // whole to the run's far side, after a closing run, or before the
-    // formats an opening run holds (after a line's block marks).
-    if (run.marks.some((mark) => mark.side === "close") && run.to !== at) {
+    // formats an opening run holds (after a line's block marks). A run that
+    // closes one format and opens the next (`**a***b*`) is tried between
+    // the two first, so each keeps its pair (D61).
+    const closing = run.marks.filter((mark) => mark.side === "close");
+    if (closing.length > 0 && run.marks.some((mark) => mark.side === "open")) {
+      const between = Math.max(...closing.map((mark) => mark.to));
+      if (between !== at && between !== run.to) {
+        out.push({ pieces: [{ at: between, insert: text }] });
+      }
+    }
+    if (closing.length > 0 && run.to !== at) {
       out.push({ pieces: [{ at: run.to, insert: text }] });
     }
     const format = run.marks.find((mark) => mark.side === "open");

@@ -63,6 +63,7 @@ import {
 import { linkVerb } from "./elementEdit";
 import { verbTarget } from "./floatingContext";
 import type { Format } from "./marks/formatting";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
@@ -205,6 +206,7 @@ function CalloutSegment({
   const fold = face.fold ?? (face.callout === "details" ? "closed" : null);
   const run = (edit: (v: EditorView) => boolean) => {
     if (view && allow(view)) {
+      judgeBeforeCommand(view);
       edit(view);
     }
   };
@@ -523,6 +525,7 @@ export function EditorToolbar({
    */
   const act = (run: (view: EditorView) => boolean) => () => {
     if (view && verbTarget(view) === view) {
+      judgeBeforeCommand(view);
       run(view);
     }
   };
@@ -530,6 +533,7 @@ export function EditorToolbar({
   const actInline = (run: (view: EditorView) => boolean) => () => {
     const target = view ? verbTarget(view) : null;
     if (target) {
+      judgeBeforeCommand(target);
       run(target);
     }
   };
@@ -621,6 +625,7 @@ export function EditorToolbar({
           keepsFocus={() => askingNow.current}
           onPick={(level) => {
             if (view && verbTarget(view) === view) {
+              judgeBeforeCommand(view);
               pickHeading(view, level);
             }
           }}
@@ -690,7 +695,10 @@ export function EditorToolbar({
           <AttachButton
             onAttach={(files) => {
               // An upload inserts at main's selection: only on main's turn.
-              if (view && mainTurn(view)) onAttach(files);
+              if (view && mainTurn(view)) {
+                judgeBeforeCommand(view);
+                onAttach(files);
+              }
             }}
             disabled={lineOff || attachDisabled}
           />

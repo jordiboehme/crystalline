@@ -81,6 +81,7 @@ import {
   DeleteRowIcon,
 } from "./tableIcons";
 import type { Format } from "./marks/formatting";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { toggleFormat } from "./marks/formatting";
 import { insertWikilink } from "./toolbar";
 
@@ -455,6 +456,8 @@ export default function FloatingBar({
             ? { "aria-pressed": formats.has(item.format) }
             : {})}
           onClick={() => {
+            // From outside the editor's DOM: a waiting composition first (D60).
+            judgeBeforeCommand(verbTarget(main) ?? main);
             item.run(main);
             // The view Alt+F10 came from may be gone now (a verb that
             // landed in another cell): Escape later returns to the target.

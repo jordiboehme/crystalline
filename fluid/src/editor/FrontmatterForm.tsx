@@ -47,6 +47,7 @@ import {
   writeTagList,
   writeText,
 } from "./frontmatterFields";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { docText } from "./setup";
 
 export interface FrontmatterFormProps {
@@ -117,6 +118,8 @@ export function FrontmatterForm({
     if (!view) {
       return;
     }
+    // From outside the editor's DOM: a waiting composition first (D60).
+    judgeBeforeCommand(view);
     // The live text, read here and handed to the caller, rather than the `doc`
     // prop. The prop is React state and can be one transaction behind the
     // document inside a nested event turn: the toolbar calls `view.focus()`,

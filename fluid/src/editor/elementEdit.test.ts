@@ -835,3 +835,38 @@ describe.each([false, true])(
     });
   },
 );
+
+/**
+ * A popover's commit while a composition waits to be judged (D60). The
+ * popover is outside the editor's DOM, so no capture listener hears it: the
+ * commit judges the composition first, in a step that joins the
+ * composition's undo step, and the request maps through that correction.
+ */
+describe.each([false, true])(
+  "a commit while a composition waits (room: %s, D60)",
+  (room) => {
+    it("writes at the mapped place, and one undo takes only the commit", () => {
+      const text = "**a.** b [t](https://a.b)";
+      const { view } = listened(text, { room });
+      setCaret(view, text.indexOf("[t]") + 1);
+      keys(view, "Mod-k");
+      // A composed deletion of the space after the bold, from an IME.
+      const composing = { on: true };
+      Object.defineProperty(view, "composing", {
+        configurable: true,
+        get: () => composing.on,
+      });
+      view.dispatch({
+        changes: { from: 6, to: 7 },
+        selection: EditorSelection.cursor(6),
+        userEvent: "input.type.compose.start",
+      });
+      composing.on = false;
+      expect(bytes(view.state)).toBe("**a.**b [t](https://a.b)");
+      expect(commitElementEdit(view, address("https://c.d"))).toBe(true);
+      expect(bytes(view.state)).toBe("**a.** b [t](https://c.d)");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(text);
+    });
+  },
+);

@@ -216,3 +216,28 @@ describe.each(
     expect(bytes(view.state)).toBe(text);
   });
 });
+
+/**
+ * Enter between two formats that touch (D61): the run there closes one
+ * format and opens the next. The line break goes between the two, so each
+ * keeps its pair.
+ */
+describe.each([false, true])(
+  "Enter between touching formats, room %s",
+  (room) => {
+    it.each([
+      ["**a***b*", "a", "**a**\n*b*"],
+      ["**a**_b_", "a", "**a**\n_b_"],
+      ["*a***b**", "a", "*a*\n**b**"],
+      ["**a***b*", "b", "**a**\n*b*"],
+    ])("%s, Enter at %s's edge", (text, letter, want) => {
+      const view = markView(text, { room });
+      const at = text.indexOf(letter);
+      setCaret(view, letter === "a" ? at + 1 : at);
+      keys(view, "Enter");
+      expect(bytes(view.state)).toBe(want);
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(text);
+    });
+  },
+);

@@ -55,6 +55,7 @@ import {
   markModeChanged,
   marksHiddenOnLine,
 } from "./marks/mode";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { roomUndo } from "./roomUndo";
 import { insertMarkdownLink } from "./toolbar";
 
@@ -382,6 +383,10 @@ export function commitElementEdit(
   main: EditorView,
   write: (state: EditorState, edit: ElementEdit) => ChangeSpec[] | null,
 ): boolean {
+  // A popover's commit comes from outside the editor's DOM: a waiting
+  // composition is judged first, and the request maps through it (D60).
+  const asked = openElementEdit(main);
+  if (asked && !isDestroyed(asked.view)) judgeBeforeCommand(asked.view);
   const request = openElementEdit(main);
   closeElementEdit(main);
   if (!request || isDestroyed(request.view)) {
@@ -641,6 +646,7 @@ export function editLink(view: EditorView): boolean {
  * the layer, a surface with no popover host) `insertMarkdownLink`.
  */
 export function linkVerb(view: EditorView): boolean {
+  judgeBeforeCommand(view);
   if (!view.state.facet(hiddenMarkLayerOn) || !answersElementEdits(view)) {
     return insertMarkdownLink(view);
   }

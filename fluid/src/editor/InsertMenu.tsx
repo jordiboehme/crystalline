@@ -27,6 +27,7 @@ import {
 import { FOCUS_RING } from "../components/primitives";
 import type { InsertAction } from "./inserts";
 import { INSERT_ACTIONS } from "./inserts";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 
 /** The registry entries the bar shows as controls of their own. */
 const OWN_CONTROLS = new Set(["table", "task"]);
@@ -58,6 +59,7 @@ export function InsertMenu({
   const stem = useId();
   const run = (action: InsertAction) => () => {
     if (view && (allow?.(view) ?? true)) {
+      judgeBeforeCommand(view);
       action.run(view);
     }
   };

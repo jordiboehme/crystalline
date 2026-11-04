@@ -38,6 +38,7 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { mainSelectionParked } from "../parkedSelection";
 import { composing } from "./caret";
+import { commandJudge } from "./commandJudge";
 import { carried, deletionOutcome, judgeDeletion, placed } from "./deleteCheck";
 import { judgedElsewhere } from "./deleting";
 import { pendingFormat, setPending, typedPlan } from "./formatting";
@@ -48,6 +49,8 @@ import { PARSE_BUDGET, deadlineIn } from "./parse";
 interface CompositionLog {
   start: EditorState;
   changes: ChangeSet;
+  /** The selection the composition's last change left. */
+  selection: EditorSelection;
 }
 
 /** Ends the log: the composition was judged, or is not to be. */
@@ -82,8 +85,16 @@ const compositionLog = StateField.define<CompositionLog | null>({
         return log;
       }
       return log
-        ? { start: log.start, changes: log.changes.compose(tr.changes) }
-        : { start: tr.startState, changes: tr.changes };
+        ? {
+            start: log.start,
+            changes: log.changes.compose(tr.changes),
+            selection: tr.newSelection,
+          }
+        : {
+            start: tr.startState,
+            changes: tr.changes,
+            selection: tr.newSelection,
+          };
     }
     if (log === null || !tr.docChanged) {
       return log;
@@ -91,7 +102,11 @@ const compositionLog = StateField.define<CompositionLog | null>({
     // The last composed change can come as plain typing just after the
     // composition ended: it is part of what is judged.
     if (local && tr.isUserEvent("input.type")) {
-      return { start: log.start, changes: log.changes.compose(tr.changes) };
+      return {
+        start: log.start,
+        changes: log.changes.compose(tr.changes),
+        selection: tr.newSelection,
+      };
     }
     // A peer's edit, or any other change: this composition goes unjudged.
     return null;
@@ -334,33 +349,72 @@ function correctionOf(now: EditorState): Correction | null {
   };
 }
 
+/** The part of CodeMirror's DOM observer the judge reads. Internal. */
+interface DomObserver {
+  delayedFlush: number;
+  delayedAndroidKey: unknown;
+}
+
+/**
+ * Whether CodeMirror holds DOM changes it has not read yet. Chrome for
+ * Android below 126 (no EditContext) delays the flush after
+ * `compositionend` to the next animation frame, and the last composed text
+ * waits there. A dispatch before that flush makes CodeMirror throw the
+ * waiting changes away and draw over them, so the text is lost (D59).
+ */
+function domPending(view: EditorView): boolean {
+  const observer = (view as unknown as { observer?: DomObserver }).observer;
+  if (!observer) return false;
+  // Only what CodeMirror itself holds back. Records its observer has not
+  // delivered yet are not asked for: taking them would keep them from the
+  // flush that reads them.
+  return observer.delayedFlush >= 0 || Boolean(observer.delayedAndroidKey);
+}
+
 /**
  * Judges the composition the view's log holds, once it is over: writes the
- * correction, or just ends the log. Never from inside an update.
+ * correction, or just ends the log. Never from inside an update, and never
+ * while CodeMirror holds DOM changes it has not read (D59): the log then
+ * waits, and the settle timer or the next key judges it.
  */
 export function judgeComposition(view: EditorView): void {
-  if (view.composing || view.compositionStarted) {
+  if (view.composing || view.compositionStarted || domPending(view)) {
     return;
   }
+  const log = view.state.field(compositionLog, false) ?? null;
   const fix = correctionOf(view.state);
   if (fix === null) {
     return;
   }
-  if (fix.changes.empty && fix.caret === null) {
+  // A selection the person made after the composition stays theirs,
+  // mapped through the correction (D51): a toolbar command right after
+  // acts on it (D60).
+  const moved =
+    log !== null && !view.state.selection.eq(log.selection)
+      ? view.state.selection.map(fix.changes)
+      : null;
+  if (fix.changes.empty && (fix.caret === null || moved !== null)) {
     view.dispatch({ effects: fix.effects });
     return;
   }
+  const selection =
+    moved ?? (fix.caret === null ? null : EditorSelection.cursor(fix.caret));
   view.dispatch({
     changes: fix.changes,
-    ...(fix.caret === null
-      ? {}
-      : { selection: EditorSelection.cursor(fix.caret) }),
+    ...(selection === null ? {} : { selection }),
     effects: fix.effects,
     // Joins the composition's undo step, solo and in a room.
     userEvent: "input.type",
     annotations: judgedElsewhere.of(true),
     scrollIntoView: true,
   });
+}
+
+/** A waiting composition, judged before a command from outside (D60). */
+function judgeWaiting(view: EditorView): void {
+  if ((view.state.field(compositionLog, false) ?? null) !== null) {
+    judgeComposition(view);
+  }
 }
 
 /**
@@ -431,7 +485,12 @@ const settle = ViewPlugin.fromClass(
 
     /** Judges a waiting composition before CodeMirror hears the event. */
     readonly first = (): void => {
-      if ((this.view.state.field(compositionLog, false) ?? null) !== null) {
+      if (
+        (this.view.state.field(compositionLog, false) ?? null) !== null &&
+        // Changes CodeMirror has not read yet: the settle timer judges once
+        // they are in (D59).
+        !domPending(this.view)
+      ) {
         this.cancel();
         judgeComposition(this.view);
       }
@@ -453,6 +512,11 @@ const settle = ViewPlugin.fromClass(
       this.cancel();
       this.timer = setTimeout(() => {
         this.timer = null;
+        if (domPending(this.view)) {
+          // The last composed change is still on its way in (D59).
+          this.schedule(SETTLE_MS);
+          return;
+        }
         judgeComposition(this.view);
       }, ms);
     }
@@ -520,4 +584,8 @@ export const judgeBeforeKey = Prec.highest(
 );
 
 /** What the hidden-mark layer installs for compositions. */
-export const compositionCheck: Extension = [compositionLog, settle];
+export const compositionCheck: Extension = [
+  compositionLog,
+  settle,
+  commandJudge.of(judgeWaiting),
+];

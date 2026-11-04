@@ -42,6 +42,7 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { linkKey, plainLinkKey } from "../elementEdit";
 import { verbTarget } from "../floatingContext";
+import { judgeBeforeCommand } from "./commandJudge";
 import { isIdLineAt } from "../hiddenIdLines";
 import { mainSelectionParked, parkingChanged } from "../parkedSelection";
 import { roomUndo } from "../roomUndo";
@@ -694,6 +695,7 @@ function formatSelection(view: EditorView, format: Format): void {
  * that is not writable takes nothing.
  */
 export function toggleFormat(view: EditorView, format: Format): boolean {
+  judgeBeforeCommand(view);
   if (!writable(view.state)) {
     return true;
   }

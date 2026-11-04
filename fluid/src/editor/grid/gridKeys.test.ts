@@ -4,7 +4,7 @@
  * the open cell (`openCellField`), the document bytes and where the focus is.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -28,7 +28,7 @@ import {
 } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { activeCell } from "./cellEditor";
-import { hostOpenCell } from "./gridWidget";
+import { GridWidget, gridField, hostOpenCell } from "./gridWidget";
 import { gridExtension } from "./index";
 import type { CloseReason } from "./openCell";
 import {
@@ -1006,6 +1006,180 @@ describe("an undo in a cell whose parse fell short (D54)", () => {
     // The state's own tree stopped short, as on a busy machine.
     expect(syntaxTree(main.state).length).toBeLessThan(main.state.doc.length);
     expect(bytes(main.state)).toBe(`${above}\n\n${DOC}`);
+    expectOpen(main, 1, 1);
+  });
+});
+
+/** The tables the grid draws now, read off its decorations. */
+function drawn(main: EditorView): { from: number; to: number }[] {
+  const out: { from: number; to: number }[] = [];
+  for (let at = main.state.field(gridField).iter(); at.value; at.next()) {
+    const { widget } = at.value.spec as { widget?: unknown };
+    if (widget instanceof GridWidget) {
+      out.push({ from: widget.table.from, to: widget.table.to });
+    }
+  }
+  return out;
+}
+
+/** About `kb` kB of prose and lists, ending in a blank line. */
+function prose(kb: number, open = ""): string {
+  let text = open;
+  for (let i = 0; text.length < kb * 1024; i += 1) {
+    text += `Paragraph ${String(i)} with **bold** and *it*.\n\n- item ${String(i)}\n\n`;
+  }
+  return text;
+}
+
+/**
+ * The cell stays open: the intent still names it, focused. jsdom draws only
+ * the top of a long page, so the table is out of view and its editor is
+ * not mounted (the intent remounts it when the table comes back).
+ */
+function expectIntent(main: EditorView, row: number, column: number): void {
+  expect(where(main)).toEqual([row, column]);
+  expect(main.state.field(openCellField)?.focused).toBe(true);
+}
+
+/** Runs `act` with a clock that jumps a second at every look (D54). */
+function onJumpingClock<T>(act: () => T): T {
+  const now = Date.now.bind(Date);
+  let ahead = 0;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+    ahead += 1_000;
+    return now() + ahead;
+  });
+  try {
+    return act();
+  } finally {
+    clock.mockRestore();
+  }
+}
+
+/** The background parse catches up, and its tree reaches the state. */
+function catchUp(main: EditorView): void {
+  ensureSyntaxTree(main.state, main.state.doc.length, 30_000);
+  main.dispatch({});
+  expect(syntaxTree(main.state).length).toBe(main.state.doc.length);
+}
+
+/**
+ * A large paste above a drawn table (D58). The grid used to parse to the
+ * end of the table it drew with no time limit, inside the transaction: a
+ * whole parse of the pasted text, for the person and for every peer in a
+ * room. Now a change outside every drawn table parses nothing: the tables
+ * are read again at their mapped places, and drawn from the tree once the
+ * background parse reaches them. A clock that jumps a second at every look
+ * makes each timed parse one step, so the test does not depend on the load.
+ */
+describe("a large paste above a drawn table (D58)", () => {
+  const big = prose(60);
+  const table = DOC.indexOf("| a |");
+
+  test("parses nothing past the paste, and keeps the table and its open cell", () => {
+    const main = solo();
+    open(main, 1, 1);
+    const fresh = onJumpingClock(() => {
+      main.dispatch({
+        changes: { from: 0, insert: big },
+        userEvent: "input.paste",
+      });
+      // No parse reached the table: neither the state's own nor the shared.
+      return ensureSyntaxTree(main.state, big.length + table, 0);
+    });
+    expect(fresh).toBeNull();
+    expect(bytes(main.state)).toBe(big + DOC);
+    expect(drawn(main)).toEqual([
+      {
+        from: big.length + table,
+        to: big.length + DOC.indexOf("| 2 |") + "| 2 |".length,
+      },
+    ]);
+    expectIntent(main, 1, 1);
+    catchUp(main);
+    expect(drawn(main)).toEqual(
+      gridTables(main.state).map(({ from, to }) => ({ from, to })),
+    );
+    expectIntent(main, 1, 1);
+  });
+
+  test("a peer's paste in a room parses nothing past it either", () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    open(main, 1, 1);
+    const fresh = onJumpingClock(() => {
+      rtext.insert(0, big);
+      return ensureSyntaxTree(main.state, big.length + table, 0);
+    });
+    expect(fresh).toBeNull();
+    expect(bytes(main.state)).toBe(big + DOC);
+    expect(drawn(main)).toHaveLength(1);
+    expectIntent(main, 1, 1);
+    catchUp(main);
+    expectIntent(main, 1, 1);
+  });
+
+  test("a table the tree reads as code is never carried", () => {
+    const main = solo();
+    open(main, 1, 1);
+    onJumpingClock(() => {
+      main.dispatch({
+        changes: { from: 0, insert: prose(60, "```\n") },
+        userEvent: "input.paste",
+      });
+    });
+    // An open fence runs to the end in one parse step: the tree reaches
+    // the table as code, and the grid draws it no more.
+    expect(syntaxTree(main.state).length).toBe(main.state.doc.length);
+    expect(drawn(main)).toEqual([]);
+    expect(main.state.field(openCellField)).toBeNull();
+  });
+
+  test("a change in a drawn table parses with a bound, and keeps the table when that falls short", () => {
+    const main = solo();
+    open(main, 1, 1);
+    const fresh = onJumpingClock(() => {
+      // Above the table, then in it: the parse of the paste is still owed.
+      main.dispatch({ changes: { from: 0, insert: big } });
+      const end = big.length + DOC.indexOf("| 2 |") + 3;
+      main.dispatch({ changes: { from: end, insert: "x" } });
+      return ensureSyntaxTree(main.state, big.length + table, 0);
+    });
+    expect(fresh).toBeNull();
+    expect(bytes(main.state)).toBe(big + DOC.replace("| 2 |", "| 2x |"));
+    expectIntent(main, 1, 1);
+    // Read again from the text at its mapped place: the new cell text shows.
+    expect(drawn(main)).toEqual([
+      {
+        from: big.length + table,
+        to: big.length + DOC.indexOf("| 2 |") + "| 2x |".length,
+      },
+    ]);
+    catchUp(main);
+    expectIntent(main, 1, 1);
+    expect(drawn(main)).toEqual(
+      gridTables(main.state).map(({ from, to }) => ({ from, to })),
+    );
+  });
+});
+
+describe("a peer's paste above a table in view (D58)", () => {
+  test("keeps the cell editor mounted while the tree is short", () => {
+    const { main, rtext } = roomMain(DOC, layers());
+    open(main, 1, 1);
+    const fresh = onJumpingClock(() => {
+      rtext.insert(0, prose(0.3));
+      return ensureSyntaxTree(main.state, main.state.doc.length, 0);
+    });
+    // The tree stops short of the table, and the cell is read from the
+    // table the grid carried.
+    expect(fresh).toBeNull();
+    expect(syntaxTree(main.state).length).toBeLessThan(
+      main.state.doc.length - DOC.length,
+    );
+    expectOpen(main, 1, 1);
+    typeIn({ view: cellView(main), destroy: () => undefined }, "x");
+    expect(bytes(main.state)).toBe(prose(0.3) + DOC.replace("| 2 |", "| 2x |"));
+    catchUp(main);
     expectOpen(main, 1, 1);
   });
 });

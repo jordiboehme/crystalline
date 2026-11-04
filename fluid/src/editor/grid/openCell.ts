@@ -26,7 +26,7 @@ import { EditorView } from "@codemirror/view";
 import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
 
-import type { GridCell } from "./structure";
+import type { GridCell, GridTable } from "./structure";
 import { cellAt, gridTableAt } from "./structure";
 
 /**
@@ -37,6 +37,15 @@ import { cellAt, gridTableAt } from "./structure";
 export const cellMain = Facet.define<EditorView, EditorView | null>({
   combine: (values) => values[0] ?? null,
 });
+
+/**
+ * The tables the grid draws in a state. Past where the parse reaches, the
+ * grid keeps the tables it drew, read again at their mapped places (D58),
+ * and the open cell is read from those until the tree reaches them. The
+ * grid provides it; it lives here so this module need not import the grid.
+ */
+export const drawnGridTables =
+  Facet.define<(state: EditorState) => readonly GridTable[]>();
 
 /** Main views running a search command sent from a focused cell. */
 const searchingFromCell = new WeakSet<EditorView>();
@@ -98,9 +107,21 @@ function cellAtHead(
     syntaxTree(state).length >= line.to
       ? syntaxTree(state)
       : ensureSyntaxTree(state, line.to, 0);
-  if (!tree || tree.length < line.to) return undefined;
+  if (!tree || tree.length < line.to) return drawnCellAt(state, head);
   const table = gridTableAt(state, head, tree);
   return table ? cellAt(table, head) : null;
+}
+
+/**
+ * The cell holding `head` in a table the grid still draws from its own
+ * lines while the parse has not reached it (D58), or `undefined`: not known.
+ */
+function drawnCellAt(state: EditorState, head: number): GridCell | undefined {
+  for (const read of state.facet(drawnGridTables)) {
+    const table = read(state).find((t) => t.from <= head && head <= t.to);
+    if (table) return cellAt(table, head) ?? undefined;
+  }
+  return undefined;
 }
 
 function clampTo(pos: number, cell: GridCell): number {

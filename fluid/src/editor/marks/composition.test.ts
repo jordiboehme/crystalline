@@ -34,7 +34,7 @@ import {
 import { prefetchGrid } from "../grid/loader";
 import { gridTables } from "../grid/structure";
 import { CANNOT_JOIN } from "./deleteCheck";
-import { formatsAt } from "./formatting";
+import { formatsAt, toggleFormat } from "./formatting";
 
 beforeAll(async () => {
   await prefetchGrid();
@@ -510,6 +510,99 @@ describe.each([false, true])(
       expect(bytes(view.state)).toBe("ab**cd**");
       undoOnce(view);
       expect(bytes(view.state)).toBe("ab");
+    });
+  },
+);
+
+/** CodeMirror's DOM observer, which a test reaches as the view does. */
+interface Observer {
+  flushSoon(): void;
+  delayedFlush: number;
+}
+
+/**
+ * The last composed letter as Chrome for Android below 126 delivers it: the
+ * browser wrote it into the DOM, and CodeMirror holds the flush for the
+ * next animation frame (`flushSoon` in its `compositionend` observer).
+ */
+function heldInDom(view: EditorView, letter: string): void {
+  const walker = document.createTreeWalker(
+    view.contentDOM,
+    NodeFilter.SHOW_TEXT,
+  );
+  let last: Text | null = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    last = node as Text;
+  }
+  if (!last) throw new Error("no text in the content");
+  last.data += letter;
+  const observer = (view as unknown as { observer: Observer }).observer;
+  observer.flushSoon();
+  expect(observer.delayedFlush).toBeGreaterThanOrEqual(0);
+}
+
+describe.each([false, true])(
+  "a composed letter CodeMirror has not flushed yet, room %s (D59)",
+  (room) => {
+    it("is not lost to a tap in that frame", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "c");
+      keyboard.end(false);
+      heldInDom(view, "d");
+      // A tap: the touch first, which CodeMirror's own press handling
+      // leaves alone, then the mouse event the browser makes of it.
+      const touch = new Event("touchstart", { bubbles: true });
+      Object.defineProperty(touch, "targetTouches", { value: [] });
+      view.contentDOM.dispatchEvent(touch);
+      view.contentDOM.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+      vi.advanceTimersByTime(100);
+      expect(bytes(view.state)).toBe("ab**cd**");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe("ab");
+    });
+
+    it("is not lost to the next composition starting in that frame", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "c");
+      keyboard.end(false);
+      heldInDom(view, "d");
+      keyboard.start();
+      vi.advanceTimersByTime(100);
+      keyboard.end();
+      expect(bytes(view.state)).toBe("ab**cd**");
+    });
+  },
+);
+
+describe.each([false, true])(
+  "a toolbar command in the window, room %s (D60)",
+  (room) => {
+    it("judges the composition first, keeps the selection, and one undo takes only the command", () => {
+      const view = markView("**a.** b c", { room });
+      setCaret(view, 7);
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(6, 7, "");
+      keyboard.end(false);
+      // The person selects `c`, then presses Italic on the toolbar: no DOM
+      // event on the editor announces it.
+      const end = view.state.doc.length;
+      view.dispatch({ selection: EditorSelection.range(end - 1, end) });
+      toggleFormat(view, "em");
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("**a.** b *c*");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe("**a.** b c");
     });
   },
 );

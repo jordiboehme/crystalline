@@ -28,6 +28,7 @@ import type { StatusColour } from "../markdown/directives";
 import { statusColour } from "../markdown/directives";
 import { isIdLine } from "../reflectionText";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { roomUndo } from "./roomUndo";
 import { clearOfFoldedFrontmatter } from "./toolbar";
 
@@ -444,6 +445,7 @@ export function setStatusColour(
   colour: StatusColour,
   at?: number,
 ): boolean {
+  judgeBeforeCommand(view);
   const pos = verbAt(view, at);
   return (
     pos !== null &&
