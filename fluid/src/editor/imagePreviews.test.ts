@@ -86,7 +86,17 @@ function nth(view: EditorView, index = 0): HTMLElement {
   return el;
 }
 
+/** A press and its release on `el`, as a click is; answers the press. */
 function press(el: Element, init: MouseEventInit = {}): MouseEvent {
+  const event = down(el, init);
+  el.dispatchEvent(
+    new MouseEvent("mouseup", { bubbles: true, button: 0, ...init }),
+  );
+  return event;
+}
+
+/** A press on `el` alone, not released yet. */
+function down(el: Element, init: MouseEventInit = {}): MouseEvent {
   const event = new MouseEvent("mousedown", {
     bubbles: true,
     cancelable: true,
@@ -301,6 +311,31 @@ describe("a picture in place of its reference", () => {
     expect(view.state.selection.main.head).toBe(20);
     // The press keeps its default, so a drag can still start from it.
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("is selected when the press is released, never while it is held", () => {
+    // Chrome starts no drag from a press whose selection changes while it
+    // is held (the smoke's experiments), so the press selects on release.
+    const view = editor("a ![x](assets/a.png) b");
+    const event = down(nth(view));
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.state.selection.main.empty).toBe(true);
+    document.body.dispatchEvent(
+      new MouseEvent("mouseup", { bubbles: true, button: 0 }),
+    );
+    expect(view.state.selection.main.from).toBe(2);
+    expect(view.state.selection.main.to).toBe(20);
+  });
+
+  it("selects nothing on release when the press became a drag", () => {
+    const view = editor("a ![x](assets/a.png) b");
+    const picture = nth(view);
+    down(picture);
+    picture.dispatchEvent(
+      new Event("dragstart", { bubbles: true, cancelable: true }),
+    );
+    picture.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    expect(view.state.selection.main.empty).toBe(true);
   });
 
   it("is selected whole by a press on its image", () => {

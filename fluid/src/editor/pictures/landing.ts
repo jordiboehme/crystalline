@@ -16,6 +16,7 @@
 
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Line } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 
 import { frontmatterHidden } from "../frontmatterFold";
 import { frontmatterRegion } from "../frontmatterRegion";
@@ -72,16 +73,14 @@ function textFenceEnd(state: EditorState, line: Line): Line | null {
   return open === null ? null : doc.line(doc.lines);
 }
 
-/**
- * The last line of the block holding `line`, read from the text alone where
- * the tree does not reach: a fence to its closing line (blank lines inside it
- * included), anything else to the line before the next blank line or the
- * next fence. Null for a blank line outside a fence.
- */
-function textBlockEnd(state: EditorState, line: Line): Line | null {
-  const fence = textFenceEnd(state, line);
-  if (fence !== null) return fence;
-  if (blank(line)) return null;
+/** A list item's first line: a bullet or a number, then a space or nothing. */
+const LIST_ITEM = /^ {0,3}(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)/;
+
+/** An indented line: below a list item, more of that item. */
+const INDENTED = /^(?: {2}|\t)/;
+
+/** The last line of the run of non-blank lines `line` is in, before a fence. */
+function runEnd(state: EditorState, line: Line): Line {
   let last = line;
   while (last.number < state.doc.lines) {
     const next = state.doc.line(last.number + 1);
@@ -89,6 +88,67 @@ function textBlockEnd(state: EditorState, line: Line): Line | null {
     last = next;
   }
   return last;
+}
+
+/** The first line of the run of non-blank lines `line` is in, after a fence. */
+function runStart(state: EditorState, line: Line): Line {
+  let first = line;
+  while (first.number > 1) {
+    const above = state.doc.line(first.number - 1);
+    if (blank(above) || fenceMarker(above.text) !== null) break;
+    first = above;
+  }
+  return first;
+}
+
+/**
+ * Whether the run of non-blank lines `line` is in belongs to a list: it
+ * starts with a list item, or it is indented and the run above it (past the
+ * blank lines between) belongs to one.
+ */
+function inTextList(state: EditorState, line: Line): boolean {
+  for (let run = runStart(state, line); ;) {
+    if (LIST_ITEM.test(run.text)) return true;
+    if (!INDENTED.test(run.text) || fenceMarker(run.text) !== null) {
+      return false;
+    }
+    let above = run.number - 1;
+    while (above >= 1 && blank(state.doc.line(above))) above -= 1;
+    if (above < 1 || above === run.number - 1) return false;
+    run = runStart(state, state.doc.line(above));
+  }
+}
+
+/**
+ * The last line of the block holding `line`, read from the text alone where
+ * the tree does not reach: a fence to its closing line (blank lines inside it
+ * included), a list to its last item (the blank lines between the items of
+ * a loose list included, P19), anything else to the line before the next
+ * blank line or the next fence. Null for a blank line outside a fence.
+ */
+function textBlockEnd(state: EditorState, line: Line): Line | null {
+  const fence = textFenceEnd(state, line);
+  if (fence !== null) return fence;
+  if (blank(line)) return null;
+  let last = runEnd(state, line);
+  if (!inTextList(state, line)) return last;
+  // A loose list goes on past a blank line while the next text is another
+  // item or more of the last one.
+  const { doc } = state;
+  for (;;) {
+    let next = last.number + 1;
+    if (next > doc.lines || !blank(doc.line(next))) return last;
+    while (next <= doc.lines && blank(doc.line(next))) next += 1;
+    if (next > doc.lines) return last;
+    const text = doc.line(next).text;
+    if (
+      fenceMarker(text) !== null ||
+      !(LIST_ITEM.test(text) || INDENTED.test(text))
+    ) {
+      return last;
+    }
+    last = runEnd(state, doc.line(next));
+  }
 }
 
 /**
@@ -171,4 +231,32 @@ export function dropLanding(state: EditorState, pos: number): Landing | null {
     };
   }
   return { line: last.number, pos: last.to, caret: last.to };
+}
+
+/** Where a drag or drop event points: its client coordinates. */
+interface Pointed {
+  clientX: number;
+  clientY: number;
+}
+
+/**
+ * The document position a drag or drop event points at: the closest one, as
+ * CodeMirror's own drop asks, so a drop below the last line still names it.
+ * Null for an event with no coordinates (a synthetic one).
+ */
+export function dropPosition(view: EditorView, event: Pointed): number | null {
+  if (!Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) {
+    return null;
+  }
+  return view.posAtCoords({ x: event.clientX, y: event.clientY }, false);
+}
+
+/**
+ * Where a block dropped at the event's point lands. The one reading of the
+ * pointer the drop line, a file drop and a picture move all share, so the
+ * line is drawn exactly where the block then goes.
+ */
+export function landingAt(view: EditorView, event: Pointed): Landing | null {
+  const at = dropPosition(view, event);
+  return at === null ? null : dropLanding(view.state, at);
 }

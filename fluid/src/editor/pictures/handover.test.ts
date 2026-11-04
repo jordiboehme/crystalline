@@ -51,6 +51,7 @@ function images(view: EditorView): HTMLImageElement[] {
   ];
 }
 
+/** A press and its release on `el`, as a click is; answers the press. */
 function press(el: Element): MouseEvent {
   const event = new MouseEvent("mousedown", {
     bubbles: true,
@@ -58,6 +59,7 @@ function press(el: Element): MouseEvent {
     button: 0,
   });
   el.dispatchEvent(event);
+  el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
   return event;
 }
 

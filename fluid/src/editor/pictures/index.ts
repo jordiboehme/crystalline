@@ -1,14 +1,16 @@
 /**
  * The lazy picture tools chunk, loaded by `loader.ts`: the keys around a
- * picture (`selectKeys`). The drop line, the drag-move and the resize
- * handles join here.
+ * picture (`selectKeys`), the drop line (`dropLine`) and moving a picture by
+ * dragging it (`dragMove`). The resize handles join here.
  */
 
 import type { Extension } from "@codemirror/state";
 
+import { dragMove } from "./dragMove";
+import { dropLine } from "./dropLine";
 import { selectKeys } from "./selectKeys";
 
 /** Everything the tools add to a main view. */
 export function pictureToolsExtension(): Extension {
-  return [selectKeys];
+  return [selectKeys, dropLine, dragMove];
 }

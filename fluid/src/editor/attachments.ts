@@ -17,7 +17,7 @@
  */
 
 import type { Extension } from "@codemirror/state";
-import { StateEffect, StateField } from "@codemirror/state";
+import { MapMode, StateEffect, StateField } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
 import { ApiProblem, problemDetail } from "../api/client";
@@ -30,7 +30,8 @@ import {
   isImageAttachment,
 } from "../api/files";
 import { engramAssetHome } from "./imageFormat";
-import { insertBlock } from "./toolbar";
+import { dropLanding, dropPosition } from "./pictures/landing";
+import { blockInsertion, insertBlock } from "./toolbar";
 
 /** Said when a file arrives at a buffer whose session has ended. */
 const SESSION_ENDED = "The session ended, so the file was not added.";
@@ -80,6 +81,30 @@ const placeCaret = StateEffect.define<null>();
 
 /** The user events that mean the person put the caret somewhere. */
 const CARET_EVENTS = ["select", "input", "delete", "move", "undo", "redo"];
+
+/**
+ * Where the last drop of files lands (`dropLanding`'s end of the block),
+ * mapped through the edits since, until the upload's reference goes in.
+ * The reference is written there rather than at the caret: the caret the
+ * drop sets cannot rest on every block's last line (a code box hides its
+ * closing fence line and steps a caret off it), and the drop line promised
+ * this place. A place of the person's own after the drop (a click, typing)
+ * wins, and so does the caret where a peer deleted the place.
+ */
+const setDropPlace = StateEffect.define<number | null>();
+
+const dropPlace = StateField.define<number | null>({
+  create: () => null,
+  update: (place, tr) => {
+    for (const effect of tr.effects) {
+      if (effect.is(setDropPlace)) return effect.value;
+    }
+    if (place === null || CARET_EVENTS.some((event) => tr.isUserEvent(event))) {
+      return null;
+    }
+    return tr.changes.mapPos(place, 1, MapMode.TrackDel);
+  },
+});
 
 /**
  * Whether the person has placed a caret or made a selection in this buffer
@@ -315,7 +340,7 @@ export async function uploadAttachments(
           `Uploaded to ${stored.join(", ")}, but the screen was closed before the link was added. Add the link when you edit again.`,
         );
       } else if (
-        !(atEnd ? appendBlock(view, lines) : insertBlock(view, lines))
+        !(atEnd ? appendBlock(view, lines) : placeBlock(view, lines))
       ) {
         inserted = 0;
         problems.push(
@@ -328,6 +353,29 @@ export async function uploadAttachments(
     onError(problems.join(" "), unlinked ? "unlinked" : undefined);
   }
   return inserted;
+}
+
+/**
+ * Put `lines` below the block the last drop of files named, when that
+ * place still stands, and otherwise below the caret's line (`insertBlock`).
+ */
+function placeBlock(view: EditorView, lines: readonly string[]): boolean {
+  const place = view.state.field(dropPlace, false) ?? null;
+  if (place === null) {
+    return insertBlock(view, lines);
+  }
+  const { change, start } = blockInsertion(
+    view.state,
+    view.state.doc.lineAt(place),
+    lines,
+  );
+  view.dispatch({
+    changes: change,
+    selection: { anchor: start + (lines[0]?.length ?? 0) },
+    userEvent: "input",
+  });
+  view.focus();
+  return true;
 }
 
 /**
@@ -367,7 +415,7 @@ function appendBlock(view: EditorView, lines: readonly string[]): boolean {
  * a browser fires no `drop` at all unless the dragover was prevented.
  */
 export function attachmentUploads(onFiles: (files: File[]) => void): Extension {
-  return [caretPlaced, handlers(onFiles)];
+  return [caretPlaced, dropPlace, handlers(onFiles)];
 }
 
 function handlers(onFiles: (files: File[]) => void): Extension {
@@ -379,13 +427,18 @@ function handlers(onFiles: (files: File[]) => void): Extension {
         return false;
       }
       event.preventDefault();
-      // A paste goes where the caret is, so the caret counts as chosen.
-      view.dispatch({ effects: placeCaret.of(null) });
+      // A paste goes where the caret is, so the caret counts as chosen,
+      // and a drop's place from before no longer stands.
+      view.dispatch({ effects: [placeCaret.of(null), setDropPlace.of(null)] });
       onFiles(files);
       return true;
     },
     dragover(event) {
-      if (transferFiles(event.dataTransfer).length > 0) {
+      // During a dragover Chromium lists no files yet, only the type.
+      if (
+        transferFiles(event.dataTransfer).length > 0 ||
+        Array.from(event.dataTransfer?.types ?? []).includes("Files")
+      ) {
         event.preventDefault();
       }
       return false;
@@ -401,18 +454,23 @@ function handlers(onFiles: (files: File[]) => void): Extension {
       if (view.state.readOnly) {
         return true;
       }
-      // Where it was dropped is where it belongs: the caret moves there first,
-      // so the reference lands under the pointer rather than wherever the
-      // caret happened to be left. A synthetic drop carrying no coordinates
-      // leaves the caret where it is instead of asking about a point that is
-      // not on the screen.
-      const at =
-        Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
-          ? view.posAtCoords({ x: event.clientX, y: event.clientY })
-          : null;
+      // Where it was dropped is where it belongs: the caret moves first to
+      // where the drop line marked, below the whole block under the pointer
+      // (`dropLanding`), so the reference lands there rather than wherever
+      // the caret happened to be left, and never inside a table or a
+      // paragraph. Where no block takes it, the caret goes to the point
+      // itself. A synthetic drop carrying no coordinates leaves the caret
+      // where it is instead of asking about a point that is not on the
+      // screen. `select.drop` moves the caret without opening a table cell.
+      // The reference itself is written at the landing (`dropPlace`).
+      const at = dropPosition(view, event);
+      const landing = at === null ? null : dropLanding(view.state, at);
+      const anchor = landing?.caret ?? at;
       view.dispatch({
-        ...(at === null ? {} : { selection: { anchor: at } }),
-        effects: placeCaret.of(null),
+        ...(anchor === null
+          ? {}
+          : { selection: { anchor }, userEvent: "select.drop" }),
+        effects: [placeCaret.of(null), setDropPlace.of(landing?.pos ?? null)],
       });
       onFiles(files);
       return true;

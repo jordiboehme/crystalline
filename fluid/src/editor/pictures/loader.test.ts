@@ -162,6 +162,9 @@ describe("pictureToolsWith", () => {
           button: 0,
         }),
       );
+      box?.dispatchEvent(
+        new MouseEvent("mouseup", { bubbles: true, button: 0 }),
+      );
       expect(view.state.selection.main.from).toBe(2);
       expect(view.state.selection.main.to).toBe(20);
       await expect(loader.prefetch()).resolves.toBeUndefined();

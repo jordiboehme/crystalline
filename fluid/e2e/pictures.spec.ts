@@ -1,0 +1,328 @@
+/**
+ * Pictures in the editor, in a real browser against a real daemon.
+ *
+ * What jsdom cannot answer here: that a real press on a picture selects
+ * exactly its reference and the browser's own selection does not move it
+ * afterwards (the press keeps its default, so a drag can start), and that a
+ * real drag of a picture shows the drop line and moves the picture below
+ * the block it is dropped on, once, with nothing left behind.
+ *
+ * Every journey makes its own engram through the REST API and reads the file
+ * back through it. The picture points at a file the domain does not hold, so
+ * it is drawn as its alt text and a sentence: the wrapper a press and a drag
+ * act on is the same either way. Shares the daemon, the fixture domain and
+ * the accounts `run-smoke.sh` sets up; run it the same way (`bash
+ * fluid/e2e/run-smoke.sh e2e/pictures.spec.ts`).
+ */
+
+import type { BrowserContext, Locator, Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+
+const USER = process.env.FLUID_E2E_USER ?? "smoke";
+const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
+const DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
+const BASE_PATH = process.env.FLUID_E2E_BASE_PATH ?? "";
+
+const SOURCE = "Engram source";
+const SETTING = "Show Markdown marks on the line I edit";
+const PICTURE = "![harbor](assets/e2e/harbor-missing.png)";
+const BODY = `# Picture moves\n\nIntro ${PICTURE} words.\n\nSecond paragraph.\n\nThird paragraph.\n\nThe end.\n`;
+
+async function signIn(page: Page): Promise<void> {
+  await page.goto("./");
+  await expect(page).toHaveURL((url) => url.pathname === `${BASE_PATH}/login`);
+  await page.getByLabel("Name", { exact: true }).fill(USER);
+  await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
+  await page.getByRole("button", { name: "Log in" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Home", level: 1 }),
+  ).toBeVisible();
+}
+
+/** The session's CSRF token, which a write through `page.request` echoes. */
+async function csrf(page: Page): Promise<string> {
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  return ((await me.json()) as { csrf: string }).csrf;
+}
+
+/** The engrams this file made, deleted after each test. */
+const made: string[] = [];
+
+let unique = 0;
+
+/** Makes an engram holding `body` and returns its permalink. */
+async function createEngram(page: Page, body: string): Promise<string> {
+  unique += 1;
+  const response = await page.request.post(
+    `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams`,
+    {
+      headers: { "X-CSRF-Token": await csrf(page) },
+      data: {
+        title: `Picture moves ${String(Date.now())}${String(unique)}`,
+        content: body,
+        tags: ["pictures"],
+      },
+    },
+  );
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const { permalink } = (await response.json()) as { permalink: string };
+  made.push(permalink);
+  return permalink;
+}
+
+test.afterEach(async ({ page }) => {
+  if (made.length === 0) return;
+  if (page.url().startsWith("http")) await page.goto("./");
+  else await signIn(page);
+  const token = await csrf(page);
+  for (const permalink of made.splice(0)) {
+    const at = `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams/${permalink}`;
+    await expect
+      .poll(
+        async () => {
+          const detail = await page.request.get(at);
+          const etag = detail.headers()["etag"] ?? "";
+          const removed = await page.request.delete(at, {
+            headers: { "X-CSRF-Token": token, "If-Match": etag },
+          });
+          return removed.status();
+        },
+        { timeout: 15_000 },
+      )
+      .toBeLessThan(300);
+  }
+});
+
+/** The engram's body as the daemon holds it now: the file after its frontmatter. */
+async function bodyOnDisk(page: Page, permalink: string): Promise<string> {
+  const response = await page.request.get(
+    `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams/${permalink}`,
+  );
+  const file = ((await response.json()) as { content: string }).content;
+  const match = /^---\n[\s\S]*?\n---\n\n?/.exec(file);
+  return match ? file.slice(match[0].length) : file;
+}
+
+/** Saves the solo surface when it has a Save button; a room saves itself. */
+async function settle(page: Page): Promise<void> {
+  const save = page.getByRole("button", { name: "Save", exact: true });
+  if ((await save.count()) > 0 && (await save.isEnabled())) await save.click();
+}
+
+/**
+ * The CodeMirror view behind a content element, through the field
+ * `EditorView.findFromDOM` reads (as `hidden-marks.spec.ts` explains), as
+ * `window.fluidView(label)`.
+ */
+async function installViewHandle(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    (window as unknown as { fluidView: (label: string) => unknown }).fluidView =
+      (label: string) => {
+        const el = document.querySelector(`.cm-content[aria-label="${label}"]`);
+        return (
+          (el as unknown as { cmTile?: { root?: { view?: unknown } } } | null)
+            ?.cmTile?.root?.view ?? null
+        );
+      };
+  });
+}
+
+interface Held {
+  doc: string;
+  from: number;
+  to: number;
+}
+
+/** The editor's text and its main selection. Read only. */
+function held(page: Page): Promise<Held> {
+  return page.evaluate((name) => {
+    type View = {
+      state: {
+        doc: { toString(): string };
+        selection: { main: { from: number; to: number } };
+      };
+    };
+    const view = (
+      window as unknown as { fluidView?: (label: string) => View | null }
+    ).fluidView?.(name);
+    if (!view) throw new Error(`no editor view for ${name}`);
+    return {
+      doc: view.state.doc.toString(),
+      from: view.state.selection.main.from,
+      to: view.state.selection.main.to,
+    };
+  }, SOURCE);
+}
+
+/** Opens the editor on the engram and answers its source and its picture. */
+async function edit(
+  page: Page,
+  permalink: string,
+): Promise<{ source: Locator; picture: Locator }> {
+  await page.goto(`d/${DOMAIN}/e/${permalink}`);
+  await page.getByRole("link", { name: "Edit" }).click();
+  const source = page.getByRole("textbox", { name: SOURCE });
+  await expect(source).toBeVisible();
+  await expect(source).toContainText("Third paragraph.");
+  const picture = source.locator(".cm-picture").first();
+  await expect(picture).toBeVisible();
+  return { source, picture };
+}
+
+/** The middle of an element, in page coordinates. */
+async function middleOf(target: Locator): Promise<{ x: number; y: number }> {
+  const box = await target.boundingBox();
+  if (!box) throw new Error("not drawn");
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+test.describe("pictures", () => {
+  test.beforeEach(async ({ page, context }) => {
+    await installViewHandle(context);
+    await signIn(page);
+  });
+
+  test("a press on a picture selects exactly its reference, and the selection stays", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, BODY);
+    const { picture } = await edit(page, permalink);
+    const at = await middleOf(picture);
+    await page.mouse.click(at.x, at.y);
+    const { doc } = await held(page);
+    const from = doc.indexOf(PICTURE);
+    expect(from).toBeGreaterThan(0);
+    await expect
+      .poll(async () => {
+        const now = await held(page);
+        return [now.from, now.to];
+      })
+      .toEqual([from, from + PICTURE.length]);
+    await expect(picture).toHaveClass(/cm-picture-selected/);
+    // The browser's own selection settles after the press: the selection
+    // CodeMirror then reads from it must still be the picture.
+    await page.waitForTimeout(300);
+    const after = await held(page);
+    expect([after.from, after.to]).toEqual([from, from + PICTURE.length]);
+    await expect(picture).toHaveClass(/cm-picture-selected/);
+  });
+
+  test("a picture dragged onto a later paragraph moves below it, once, and shows the drop line", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, BODY);
+    const { source, picture } = await edit(page, permalink);
+    // One gesture from a picture nobody selected.
+    await dragOnto(page, picture, paragraph(source, "Third paragraph."));
+    await expectMoved(page, permalink);
+  });
+
+  test("a picture clicked and then dragged moves the same way", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, BODY);
+    const { source, picture } = await edit(page, permalink);
+    const at = await middleOf(picture);
+    await page.mouse.click(at.x, at.y);
+    await expect(picture).toHaveClass(/cm-picture-selected/);
+    // From a press inside the selection the browser drags the selection.
+    await dragOnto(page, picture, paragraph(source, "Third paragraph."));
+    await expectMoved(page, permalink);
+  });
+
+  test("with the marks shown on the edited line, a held press leaves the picture in place", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, BODY);
+    expect(await flipSetting(page)).toBe(true);
+    try {
+      const { picture } = await edit(page, permalink);
+      const before = await held(page);
+      await page.evaluate(() => {
+        (window as unknown as { pressed: Element | null }).pressed =
+          document.querySelector(".cm-picture");
+      });
+      const at = await middleOf(picture);
+      await page.mouse.move(at.x, at.y);
+      await page.mouse.down();
+      await page.waitForTimeout(300);
+      // Nothing moved under the pointer while the press is held: the caret
+      // stayed off the picture's line and the picture is the same element.
+      const during = await held(page);
+      expect([during.from, during.to]).toEqual([before.from, before.to]);
+      expect(
+        await page.evaluate(
+          () =>
+            (window as unknown as { pressed: Element | null }).pressed ===
+            document.querySelector(".cm-picture"),
+        ),
+      ).toBe(true);
+      await page.mouse.up();
+      const from = during.doc.indexOf(PICTURE);
+      await expect
+        .poll(async () => {
+          const now = await held(page);
+          return [now.from, now.to];
+        })
+        .toEqual([from, from + PICTURE.length]);
+    } finally {
+      expect(await flipSetting(page)).toBe(false);
+    }
+  });
+});
+
+/** A drawn line of the editor, by the text it shows. */
+function paragraph(source: Locator, text: string): Locator {
+  return source.locator(":scope > .cm-line").filter({ hasText: text }).first();
+}
+
+/**
+ * Drags `from` with the mouse onto the middle of `onto`, checking that the
+ * drop line is drawn while the pointer is there and gone after the drop.
+ */
+async function dragOnto(page: Page, from: Locator, onto: Locator) {
+  const start = await middleOf(from);
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + 8, start.y + 8, { steps: 4 });
+  const target = await middleOf(onto);
+  await page.mouse.move(target.x, target.y, { steps: 12 });
+  await expect(page.locator(".cm-drop-line")).toHaveCount(1);
+  await page.mouse.up();
+  await expect(page.locator(".cm-drop-line")).toHaveCount(0);
+}
+
+/** The page after the picture moved below the third paragraph. */
+const MOVED = `# Picture moves\n\nIntro  words.\n\nSecond paragraph.\n\nThird paragraph.\n\n${PICTURE}\n\n\nThe end.\n`;
+
+/** The editor and then the file hold the moved page, the picture once and selected. */
+async function expectMoved(page: Page, permalink: string): Promise<void> {
+  await expect
+    .poll(async () => (await held(page)).doc.endsWith(MOVED))
+    .toBe(true);
+  const { doc, from, to } = await held(page);
+  expect(doc.split(PICTURE)).toHaveLength(2);
+  const at = doc.indexOf(PICTURE);
+  expect([from, to]).toEqual([at, at + PICTURE.length]);
+  await expect
+    .poll(
+      async () => {
+        await settle(page);
+        return bodyOnDisk(page, permalink);
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(MOVED);
+}
+
+/** Flips the "show marks on the line I edit" setting; answers whether it is on. */
+async function flipSetting(page: Page): Promise<boolean> {
+  await page.locator("header button.avatar").click();
+  const item = page.getByRole("menuitemcheckbox", { name: SETTING });
+  await expect(item).toBeVisible();
+  await item.click();
+  const on = (await item.getAttribute("aria-checked")) === "true";
+  await page.keyboard.press("Escape");
+  await expect(item).toHaveCount(0);
+  return on;
+}

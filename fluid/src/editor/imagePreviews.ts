@@ -303,10 +303,29 @@ function pressedPicture(
 }
 
 /**
- * A plain press on a picture selects it whole. Native listeners on
- * `contentDOM`, because the widget keeps its events from CodeMirror's own
- * handlers. The press keeps its default, which a drag of the wrapper needs;
- * a drag that starts on a handle is cancelled (the handles resize).
+ * The picture a drawn `.cm-picture` element of `view` shows, read from the
+ * text as it is now, or null. For a drag that starts on one (`dragMove`).
+ */
+export function pictureOfElement(
+  view: EditorView,
+  box: HTMLElement,
+): PictureRef | null {
+  return pressedPicture(
+    view,
+    box,
+    picturesIn(view.state).filter((ref) => !ref.inCell),
+  );
+}
+
+/**
+ * A plain press on a picture selects it whole, when it is released. Native
+ * listeners on `contentDOM` (the release on the document, so one just off
+ * the picture counts), because the widget keeps its events from
+ * CodeMirror's own handlers. The press keeps its default, which a drag of
+ * the wrapper needs, and nothing changes while it is held: Chrome starts no
+ * drag from a press whose selection changed under it, so a press that turns
+ * into a drag selects nothing here (the drag selects the picture itself). A
+ * drag that starts on a handle is cancelled (the handles resize).
  */
 function pointerPlugin(field: StateField<Drawn>): Extension {
   return ViewPlugin.fromClass(
@@ -314,8 +333,11 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
       readonly view: EditorView;
       /** Whether the last press began on a handle. */
       onHandle = false;
+      /** The picture a press held now selects when it is released. */
+      pending: PictureRef | null = null;
 
       readonly mousedown = (event: MouseEvent): void => {
+        this.pending = null;
         const target = event.target;
         if (!(target instanceof Element)) {
           return;
@@ -344,6 +366,20 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         if (!ref || ref.inLink) {
           return;
         }
+        this.pending = ref;
+      };
+
+      readonly mouseup = (): void => {
+        const ref = this.pending;
+        this.pending = null;
+        if (ref === null) {
+          return;
+        }
+        // Read again: the text may have changed while the press was held.
+        const now = pictureAt(this.view.state, ref.from + 1);
+        if (now?.from !== ref.from || now.to !== ref.to) {
+          return;
+        }
         this.view.dispatch({
           selection: { anchor: ref.from, head: ref.to },
           userEvent: "select.pointer",
@@ -352,6 +388,8 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
       };
 
       readonly dragstart = (event: DragEvent): void => {
+        // The press became a drag: it selects nothing on release.
+        this.pending = null;
         // A browser names the draggable wrapper as the target, so the press
         // says whether the drag began on a handle.
         const target = event.target;
@@ -368,11 +406,16 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         this.view = view;
         view.contentDOM.addEventListener("mousedown", this.mousedown);
         view.contentDOM.addEventListener("dragstart", this.dragstart);
+        view.contentDOM.ownerDocument.addEventListener("mouseup", this.mouseup);
       }
 
       destroy() {
         this.view.contentDOM.removeEventListener("mousedown", this.mousedown);
         this.view.contentDOM.removeEventListener("dragstart", this.dragstart);
+        this.view.contentDOM.ownerDocument.removeEventListener(
+          "mouseup",
+          this.mouseup,
+        );
       }
     },
   );

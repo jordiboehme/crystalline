@@ -55,6 +55,8 @@ export interface MarkViewOptions {
    * (`imagePreviews(...)`). Left out, none: the view draws no pictures.
    */
   images?: Extension;
+  /** The paste and drop upload handlers (`attachmentUploads`). Left out, none. */
+  uploads?: Extension;
 }
 
 const views = new Set<EditorView>();
@@ -125,7 +127,7 @@ export function markView(
           preview,
           raw: options.raw ?? false,
           images: options.images ?? [],
-          uploads: [],
+          uploads: options.uploads ?? [],
           onTableContext: () => {},
           onImageContext: () => {},
           onElementContext: () => {},

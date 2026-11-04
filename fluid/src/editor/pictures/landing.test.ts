@@ -23,7 +23,7 @@ import { drawnGridTables } from "../grid/draws";
 import { hiddenIdLines } from "../hiddenIdLines";
 import { baseExtensions, docText, lineSeparatorFor } from "../setup";
 import { insertBlock } from "../toolbar";
-import { dropLanding } from "./landing";
+import { dropLanding, dropPosition, landingAt } from "./landing";
 
 const PICTURE = "![x](assets/p.png)";
 
@@ -302,5 +302,86 @@ describe("dropLanding past a short parse", () => {
       pos: last.to,
       caret: last.to,
     });
+  });
+
+  it("reads a loose list the tree has not reached to its end (P19)", () => {
+    const doc = `${PREFIX}\n\n- a\n\n- b\n\n  more of b\n\n1. c\n\nend\n`;
+    const state = shortState(doc);
+    const first = doc.indexOf("- a");
+    expect(syntaxTree(state).length).toBeLessThan(first);
+    const last = state.doc.lineAt(doc.indexOf("1. c"));
+    const landing = { line: last.number, pos: last.to, caret: last.to };
+    for (const at of [
+      first,
+      doc.indexOf("- b"),
+      doc.indexOf("more of b"),
+      // The blank line between two items.
+      first + 4,
+    ]) {
+      expect(dropLanding(state, at), String(at)).toEqual(landing);
+    }
+    // The paragraph after the list is a block of its own.
+    const end = state.doc.lineAt(doc.indexOf("end"));
+    expect(dropLanding(state, end.from)?.line).toBe(end.number);
+  });
+
+  it("reads a loose list the tree stops inside to its end (P19)", () => {
+    const doc = `${Array.from({ length: 6000 }, (_, i) => `- item ${String(i)}`).join("\n\n")}\n\nend\n`;
+    const state = shortState(doc);
+    const tree = syntaxTree(state);
+    expect(tree.length).toBeGreaterThan(state.doc.line(1).to);
+    expect(tree.length).toBeLessThan(doc.indexOf("- item 5999"));
+    const last = state.doc.lineAt(doc.indexOf("- item 5999"));
+    expect(dropLanding(state, 0)).toEqual({
+      line: last.number,
+      pos: last.to,
+      caret: last.to,
+    });
+  });
+
+  it("does not read a fence after a loose list into the list", () => {
+    const doc = `${PREFIX}\n\n- a\n\n- b\n\n\`\`\`\n- c\n\`\`\`\n`;
+    const state = shortState(doc);
+    const b = state.doc.lineAt(doc.indexOf("- b"));
+    expect(dropLanding(state, doc.indexOf("- a"))).toEqual({
+      line: b.number,
+      pos: b.to,
+      caret: b.to,
+    });
+  });
+});
+
+describe("landingAt", () => {
+  function pointed(doc: string, pos: number) {
+    const target = new EditorView({
+      state: stateOf(doc),
+      parent: document.body,
+    });
+    view = target;
+    const posAtCoords = vi.spyOn(target, "posAtCoords").mockReturnValue(pos);
+    return { target, posAtCoords };
+  }
+
+  it("asks for the closest position, so a drop below the last line lands", () => {
+    const doc = "one\n\ntwo";
+    const { target, posAtCoords } = pointed(doc, doc.length);
+    expect(landingAt(target, { clientX: 4, clientY: 9 })).toEqual({
+      line: 3,
+      pos: doc.length,
+      caret: doc.length,
+    });
+    expect(posAtCoords).toHaveBeenCalledWith({ x: 4, y: 9 }, false);
+    expect(dropPosition(target, { clientX: 4, clientY: 9 })).toBe(doc.length);
+  });
+
+  it("answers null for an event with no coordinates", () => {
+    const { target, posAtCoords } = pointed("one\n", 0);
+    const event = new Event("drop") as unknown as {
+      clientX: number;
+      clientY: number;
+    };
+    expect(landingAt(target, event)).toBeNull();
+    expect(dropPosition(target, event)).toBeNull();
+    expect(posAtCoords).not.toHaveBeenCalled();
   });
 });
