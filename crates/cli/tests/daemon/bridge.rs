@@ -478,7 +478,7 @@ fn doctor_names_the_variable_a_task_started_daemon_did_not_get() {
 
 /// The note a too old Claude Desktop extension launcher gets in the
 /// onboarding instructions (`LAUNCHER_NOTE` in the service crate's bridge).
-const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to install the newest Claude Desktop extension from https://github.com/jordiboehme/crystalline/releases/latest.";
+const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to run `crystalline install claude-desktop` in a terminal, then confirm the install dialog in Claude Desktop.";
 
 /// Stop the daemon the `serve` task seam started under `home`.
 fn stop_daemon(home: &Path) {

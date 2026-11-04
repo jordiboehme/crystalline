@@ -161,6 +161,10 @@ pub const RESERVED_VARS: &[&str] = &[
     crystalline_index::ACCELERATION_ENV,
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",
+    // The Claude Desktop extension's manifest sets it for its launcher, which
+    // drops it before it starts `crystalline mcp`. Reserved so a hand run
+    // with it set logs no warning.
+    crystalline_core::desktop_extension::BINARY_ENV,
     "CRYSTALLINE_TEST_POSTGRES_URL",
     // The CLI's token-store seam (`crystalline::cmd::test_token_store_dir`):
     // it points a `connect github` at a plain file under a tempdir so the

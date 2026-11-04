@@ -47,9 +47,10 @@ const SHAPING_NAMES: &[&str] = &[
 const SHAPING_PREFIXES: &[&str] = &[crate::overlay::DOMAIN_ENV_PREFIX, "CRYSTALLINE_REMOTE_"];
 
 /// Variables only a client reads for itself: the install channel marker, the
-/// Claude Desktop launcher's version and the Apple Silicon acceleration
-/// switch.
+/// Claude Desktop launcher's version, the binary path the extension pins for
+/// its launcher and the Apple Silicon acceleration switch.
 const CLIENT_ONLY: &[&str] = &[
+    crystalline_core::desktop_extension::BINARY_ENV,
     crate::overlay::CHANNEL_ENV,
     crate::overlay::LAUNCHER_VERSION_ENV,
     crystalline_index::ACCELERATION_ENV,
@@ -297,6 +298,7 @@ mod tests {
             "CRYSTALLINE_TEST_NO_KEYCHAIN",
             "CRYSTALLINE_CHANNEL",
             "CRYSTALLINE_LAUNCHER_VERSION",
+            "CRYSTALLINE_BINARY",
             "CRYSTALLINE_ACCELERATION",
             "CRYSTALLINE_NOT_A_SETTING",
             "PATH",

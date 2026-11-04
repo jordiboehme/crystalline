@@ -318,12 +318,13 @@ pub async fn run_mcp(
 /// numeric triple. Raised only when a launcher fix matters: the launcher hands
 /// every message to the installed binary, so users update Crystalline, not the
 /// extension, and this is how the binary says when the extension itself needs
-/// an update.
+/// an update. After a raise the user runs `crystalline install claude-desktop`,
+/// which builds a launcher of this binary's own version.
 pub const MINIMUM_LAUNCHER: (u32, u32, u32) = (0, 24, 0);
 
 /// The line the bridge adds to the onboarding instructions when the launcher
 /// that started it is older than [`MINIMUM_LAUNCHER`].
-const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to install the newest Claude Desktop extension from https://github.com/jordiboehme/crystalline/releases/latest.";
+const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to run `crystalline install claude-desktop` in a terminal, then confirm the install dialog in Claude Desktop.";
 
 /// The numeric triple of a launcher version such as `0.25.1` or
 /// `0.26.0-rc.1`, read like the launcher's own `parseVersion`: a pre-release

@@ -83,6 +83,117 @@ test("a candidate whose version cannot be read is skipped", () => {
   assert.equal(found.kind, "missing");
 });
 
+const PINNED = "/Users/a/.cargo/bin/crystalline";
+const BREW = "/opt/homebrew/bin/crystalline";
+
+test("the pinned binary is tried first on both platforms", () => {
+  assert.deepEqual(shim.candidates("darwin", { CRYSTALLINE_BINARY: PINNED, PATH: "" }).slice(0, 3), [
+    PINNED,
+    BREW,
+    "/usr/local/bin/crystalline",
+  ]);
+  const win = shim.candidates("win32", {
+    CRYSTALLINE_BINARY: "C:\\Tools\\crystalline.exe",
+    ProgramFiles: "C:\\Program Files",
+  });
+  assert.deepEqual(win, ["C:\\Tools\\crystalline.exe", "C:\\Program Files\\Crystalline\\bin\\crystalline.exe"]);
+});
+
+test("a pinned path that is not absolute is ignored", () => {
+  assert.deepEqual(shim.candidates("darwin", { CRYSTALLINE_BINARY: "crystalline", PATH: "" }), [
+    BREW,
+    "/usr/local/bin/crystalline",
+  ]);
+  assert.equal(shim.candidates("win32", { CRYSTALLINE_BINARY: "tools\\crystalline.exe", PATH: "" }).length, 0);
+});
+
+test("a pinned binary that is gone falls back to the search", () => {
+  const found = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([BREW]),
+    runVersion: versions({ [BREW]: "crystalline 0.30.0" }),
+  });
+  assert.deepEqual(found, { kind: "ok", path: BREW, version: "0.30.0" });
+});
+
+test("a pinned binary that does not start falls back to the search", () => {
+  const found = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([PINNED, BREW]),
+    runVersion: versions({ [BREW]: "crystalline 0.30.0" }),
+  });
+  assert.equal(found.path, BREW);
+});
+
+test("a good pinned binary wins over the search", () => {
+  const found = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([PINNED, BREW]),
+    runVersion: versions({ [PINNED]: "crystalline 0.31.0", [BREW]: "crystalline 0.30.0" }),
+  });
+  assert.equal(found.path, PINNED);
+});
+
+test("a pinned binary that is too old does not win over a good one on the search path", () => {
+  const found = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([PINNED, BREW]),
+    runVersion: versions({ [PINNED]: "crystalline 0.20.0", [BREW]: "crystalline 0.30.0" }),
+  });
+  assert.deepEqual(found, { kind: "ok", path: BREW, version: "0.30.0" });
+});
+
+test("old is answered when every binary found is too old", () => {
+  const found = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([PINNED, BREW]),
+    runVersion: versions({ [PINNED]: "crystalline 0.20.0", [BREW]: "crystalline 0.21.0" }),
+  });
+  assert.deepEqual(found, { kind: "old", path: PINNED, version: "0.20.0" });
+});
+
+test("a pinned binary that is gone with nothing else found names the command", () => {
+  const outcome = shim.findBinary({
+    platform: "darwin",
+    env: { CRYSTALLINE_BINARY: PINNED, PATH: "" },
+    isFile: files([]),
+    runVersion: () => null,
+  });
+  assert.deepEqual(outcome, { kind: "gone", path: PINNED });
+  for (const platform of ["darwin", "win32"]) {
+    const gone = shim.notice(outcome, platform, "0.32.0");
+    const reason = `the Crystalline at ${PINNED} that this extension was built for is gone`;
+    assert.equal(
+      gone.instructions,
+      `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to install Crystalline again, then run \`crystalline install claude-desktop\` in a terminal and confirm the dialog in Claude Desktop. Call the status tool for the full details to relay.`,
+    );
+    assert.equal(
+      gone.fix,
+      "Install Crystalline again, then run `crystalline install claude-desktop` and confirm the dialog in Claude Desktop.",
+    );
+    assert.equal(gone.payload.reason, reason);
+    assert.equal(gone.payload.found_path, PINNED);
+  }
+});
+
+test("without a pinned path nothing found is still missing", () => {
+  const outcome = shim.findBinary({ platform: "darwin", env: { PATH: "" }, isFile: files([]), runVersion: () => null });
+  assert.deepEqual(outcome, { kind: "missing" });
+});
+
+test("the child does not see the pinned path", () => {
+  const env = shim.childEnv({ CRYSTALLINE_BINARY: "/x", A: "1" }, "0.32.0");
+  assert.equal("CRYSTALLINE_BINARY" in env, false);
+  assert.equal(env.A, "1");
+  assert.equal(env.CRYSTALLINE_CHANNEL, "desktop");
+  assert.equal(env.CRYSTALLINE_LAUNCHER_VERSION, "0.32.0");
+});
+
 const unix = { skip: process.platform === "win32" && "the fixtures run through a shebang" };
 
 test("the version check reads the first line of a real run", unix, () => {
@@ -148,7 +259,11 @@ test("too old names both versions and the update", () => {
 });
 
 test("no sentence carries an em or en dash", () => {
-  for (const outcome of [{ kind: "missing" }, { kind: "old", path: "/p", version: "0.1.0" }]) {
+  for (const outcome of [
+    { kind: "missing" },
+    { kind: "old", path: "/p", version: "0.1.0" },
+    { kind: "gone", path: "/p" },
+  ]) {
     for (const platform of ["darwin", "win32"]) {
       const note = shim.notice(outcome, platform, "0.24.0");
       const text = note.instructions + note.fix + JSON.stringify(note.payload);
