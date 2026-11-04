@@ -464,7 +464,13 @@ pub async fn routed(
             // a server older than the release that takes it would ignore
             // `expected_checksum` and write last-write-wins. One that names
             // no version is refused the same way rather than trusted.
+            //
+            // The status question's time is not taken from the write: once it
+            // is answered the write gets its own full limit, as if it had been
+            // sent at once. A caller's own deadline still bounds both.
+            let mut gate_spent = std::time::Duration::ZERO;
             if guards_a_write(tool, args) {
+                let asked_at = std::time::Instant::now();
                 let asked = limit
                     .saturating_sub(started.elapsed())
                     .min(ONE_DOMAIN_LIMIT);
@@ -478,7 +484,12 @@ pub async fn routed(
                                 v,
                                 crystalline_remote::WRITE_CHECKSUM_RELEASE,
                             )
-                        }) => {}
+                        }) =>
+                    {
+                        if deadline.is_none() {
+                            gate_spent = asked_at.elapsed();
+                        }
+                    }
                     Ok(version) => {
                         let url = sources
                             .source_url(&source)
@@ -498,7 +509,7 @@ pub async fn routed(
                     }
                 }
             }
-            let left = limit.saturating_sub(started.elapsed());
+            let left = limit.saturating_sub(started.elapsed().saturating_sub(gate_spent));
             // A caller's shorter budget running out says nothing about the
             // source, so it never opens the down window (Budget::Cut), and
             // neither does a file transfer's.

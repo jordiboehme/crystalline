@@ -4343,6 +4343,54 @@ fn guarded_overwrite(token: &str) -> WriteParams {
     }
 }
 
+/// A person who types after a guarded overwrite was checked against the
+/// room's text, and before it composes, moves the text the token named. The
+/// compose is refused under the room's own lock and the write is a stale
+/// conflict: the typing stays and nothing of the replacement lands. A compose
+/// sent without the checked text as its base would write over the typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_between_a_guarded_overwrites_check_and_its_compose_refuses_it() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed before the read").await;
+    let token = read_checksum(&engine).await;
+
+    let (entered, release) = engine.hold_next_live_compose_until();
+    let writing = {
+        let engine = engine.clone();
+        let token = token.clone();
+        tokio::spawn(async move { engine.write_engram(&guarded_overwrite(&token)).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the write passed its check and reached the compose");
+    append_line(&joined, &doc, "typed inside the window").await;
+    release.notify_one();
+
+    let refused = writing
+        .await
+        .unwrap()
+        .expect_err("the text the token named moved");
+    assert!(
+        matches!(&refused, crystalline_service::engine::EngineError::Conflict(m)
+            if m.starts_with("stale edit:") && m.contains("re-read")),
+        "{refused:?}"
+    );
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.contains("typed inside the window") && !live.contains(REPLACEMENT),
+        "the room keeps the typing: {live:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "nothing reached the file"
+    );
+}
+
 /// An overwrite of a page open in the editor is checked against the text the
 /// room holds, which is what a read of it handed out: the token of the
 /// person's unsaved text lets the replacement compose into the room, and a

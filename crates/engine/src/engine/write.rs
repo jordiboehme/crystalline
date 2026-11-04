@@ -2437,7 +2437,7 @@ fn refuse_stale_replacement(
 ) -> Result<()> {
     let Some(current) = current else {
         return Err(EngineError::Conflict(format!(
-            "stale edit: the engram '{permalink}' in domain '{domain}' is gone since it was read \
+            "the engram '{permalink}' in domain '{domain}' was deleted or moved after you read it \
              (expected {expected}). Nothing was written. Re-read it, or write it without \
              expected_checksum to create it"
         )));

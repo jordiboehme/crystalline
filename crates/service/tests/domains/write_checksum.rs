@@ -223,7 +223,10 @@ async fn a_checksum_for_an_engram_that_is_gone_is_a_conflict_and_creates_nothing
             .await;
         match result {
             Err(EngineError::Conflict(message)) => {
-                assert!(message.contains("gone"), "{message}");
+                assert!(
+                    message.contains("was deleted or moved after you read it"),
+                    "{message}"
+                );
             }
             other => panic!("overwrite={overwrite}: expected a conflict, got {other:?}"),
         }
@@ -325,8 +328,17 @@ async fn of_two_overwrites_from_one_read_the_second_is_refused() {
     };
     let first = spawn("plan from writer one");
     let second = spawn("plan from writer two");
-    // Both reach the lock before it is let go.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Both reach the lock before it is let go: each writer holds its own
+    // handle on the lock once it waits on it, beside this test's handle and
+    // the held guard's.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while Arc::strong_count(&lock) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writers never reached the lock"
+        );
+        tokio::task::yield_now().await;
+    }
     drop(held);
     let results = [first.await.unwrap(), second.await.unwrap()];
     let landed: Vec<usize> = (0..2).filter(|i| results[*i].is_ok()).collect();
@@ -401,7 +413,10 @@ async fn a_virtual_overwrite_is_guarded_by_the_rows_checksum() {
         .write_engram(&guarded("notes", "Plan", "- [decision] back #eng", &fresh))
         .await
     {
-        Err(EngineError::Conflict(message)) => assert!(message.contains("gone"), "{message}"),
+        Err(EngineError::Conflict(message)) => assert!(
+            message.contains("was deleted or moved after you read it"),
+            "{message}"
+        ),
         other => panic!("expected a conflict, got {other:?}"),
     }
 }
@@ -476,4 +491,58 @@ async fn a_draft_overwrite_is_guarded_by_the_callers_own_view() {
         base,
         "the folder still says what the team reviewed"
     );
+}
+
+/// In a domain that reviews changes, an engram whose file is gone from this
+/// disk (deleted by hand, not synced yet) still has its index row, so a read
+/// answers the row. A guarded overwrite would start a draft from that row,
+/// which holds the body only, so it is refused in the words a guarded edit
+/// gets there, not as an engram that was deleted.
+#[tokio::test]
+async fn a_draft_overwrite_of_an_engram_whose_file_is_off_this_disk_is_refused_as_an_edit_is() {
+    let f = file_fixture(true).await;
+    let alice = alice();
+    std::fs::remove_file(f.dir.join("plan.md")).unwrap();
+    let token = checksum_of(&f.engine, "eng", "plan", &alice).await;
+
+    let refused = f
+        .engine
+        .write_engram_as(
+            &guarded("eng", "Plan", "- [decision] alice's draft #eng", &token),
+            None,
+            &alice,
+        )
+        .await
+        .expect_err("no draft can start without the file");
+    let edit = f
+        .engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "plan".to_string(),
+                domain: "eng".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] alice's edit #eng".to_string()),
+                key: None,
+                value: None,
+                values: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: Some(token.clone()),
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .expect_err("the edit is refused the same way");
+    assert!(
+        refused.to_string().contains("is not on this disk"),
+        "{refused}"
+    );
+    assert_eq!(refused.to_string(), edit.to_string());
+    assert!(!f.dir.join("plan.md").exists(), "nothing was written");
 }
