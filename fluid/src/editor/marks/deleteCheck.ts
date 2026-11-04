@@ -58,6 +58,7 @@ import { composing } from "./caret";
 import { droppable, judgedElsewhere } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
 import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import type { Deadline } from "./parse";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
 export const CANNOT_JOIN = "This text cannot be joined here.";
@@ -323,7 +324,7 @@ export function readsSame(
   changes: ChangeSet,
   deleted: readonly Range[],
   after: EditorState,
-  deadline: number,
+  deadline: Deadline,
   shown?: readonly Range[],
   keepMarks = false,
 ): boolean | null {
@@ -569,7 +570,7 @@ const LOADING: Judgement = { outcome: "refused", said: PAGE_LOADING };
 export function judgeDeletion(
   state: EditorState,
   changes: ChangeSet,
-  deadline: number,
+  deadline: Deadline,
 ): Judgement {
   const deleted: Range[] = [];
   changes.iterChanges((fromA, toA) => {
@@ -582,6 +583,9 @@ export function judgeDeletion(
   // each trial reparses only the lines it changed.
   const touched = parsedTo(state, state.doc.lineAt(lastPos).to, deadline);
   if (!touched) return LOADING;
+  // A key that takes only a fence's marks is the person editing the
+  // Markdown, as with shown marks (D45): the lines below may read anew.
+  if (takesOnlyFenceMarks(touched, deleted)) return { outcome: "unchecked" };
   const { first, last: reached } = blockLines(touched, firstPos, lastPos);
   const start = parsedTo(touched, touched.doc.line(reached).to, deadline);
   if (!start) return LOADING;
@@ -694,6 +698,12 @@ export function judgeDeletion(
     );
     if (reads === null) timedOut = true;
     if (reads === true) {
+      // A move is a repair of the exact deletion: it never stands in for an
+      // exact read that ran out of time (D52). A merge always wins.
+      if (repair.outcome !== "merged") {
+        exactIsSame();
+        if (exactReads === null) return LOADING;
+      }
       return {
         outcome: repair.outcome as "moved" | "merged",
         changes: repaired,
@@ -758,6 +768,30 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       );
   }
 });
+
+/** Whether every character `deleted` takes is a fence's backtick or tilde. */
+function takesOnlyFenceMarks(
+  state: EditorState,
+  deleted: readonly Range[],
+): boolean {
+  const marks: Range[] = [];
+  for (const range of deleted) {
+    walkTree(syntaxTree(state), range.from, range.to, (node) => {
+      if (node.name === "CodeMark" && node.node.parent?.name === "FencedCode") {
+        marks.push({ from: node.from, to: node.to });
+      }
+      return undefined;
+    });
+  }
+  if (marks.length === 0) return false;
+  const isMark = cover(marks);
+  for (const range of merged(deleted)) {
+    for (let p = range.from; p < range.to; p += 1) {
+      if (!isMark(p)) return false;
+    }
+  }
+  return true;
+}
 
 /**
  * Whether every character `deleted` takes is a mark on a line that shows

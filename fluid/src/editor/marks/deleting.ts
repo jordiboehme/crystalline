@@ -58,6 +58,7 @@ import {
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
+import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 
 type HeadingQuestion = (
   state: EditorState,
@@ -344,12 +345,23 @@ function blockRule(view: EditorView, start: number): boolean {
  * hidden escape in a cell.
  */
 export function deleteVisible(view: EditorView, forward: boolean): boolean {
-  const { state } = view;
-  const { selection } = state;
-  if (state.readOnly || selection.ranges.length > 1 || !selection.main.empty) {
+  const { selection } = view.state;
+  if (
+    view.state.readOnly ||
+    selection.ranges.length > 1 ||
+    !selection.main.empty
+  ) {
     return false;
   }
   const head = selection.main.head;
+  // The marks are read off a tree that reaches the line (D35): a tree cut
+  // short by a busy page would show a hidden mark as a letter to delete.
+  const state =
+    parsedTo(
+      view.state,
+      view.state.doc.lineAt(head).to,
+      deadlineIn(PARSE_BUDGET.key),
+    ) ?? view.state;
   const line = state.doc.lineAt(head);
   if (!marksHiddenOnLine(state, line.number)) {
     return false;

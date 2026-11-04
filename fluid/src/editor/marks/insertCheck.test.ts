@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   bytes,
   caret,
+  keys,
   cleanupMarkViews,
   markPeers,
   markView,
@@ -103,6 +104,20 @@ describe.each([false, true])("an insert at a mark edge, room %s", (room) => {
     expect(bytes(view.state)).toBe("a **b**** c");
   });
 
+  it("pastes lines after bold: the pairs keep, the lines go after the marks (D49)", () => {
+    const lines = markView("a **bold** c", { room });
+    setCaret(lines, 10);
+    paste(lines, "x\n\ny");
+    expect(bytes(lines.state)).toBe("a **bold**x\n\ny c");
+    // A line copied with its line break, as a triple click takes it.
+    const line = markView("a **bold** c", { room });
+    setCaret(line, 10);
+    paste(line, "word\n");
+    expect(bytes(line.state)).toBe("a **boldword**\n c");
+    undoOnce(line);
+    expect(bytes(line.state)).toBe("a **bold** c");
+  });
+
   it("leaves a paste that breaks nothing as it is", () => {
     const view = markView("a **bold** c", { room });
     setCaret(view, 6);
@@ -132,3 +147,24 @@ describe("an insert in a room with two peers", () => {
     expect(bytes(peer.state)).toBe("**a.** b");
   });
 });
+
+describe.each([false, true])(
+  "Enter at the end of a bold line, room %s",
+  (room) => {
+    it("puts the line break after the closing marks", () => {
+      const view = markView("ab**cd**", { room });
+      setCaret(view, 8);
+      keys(view, "Enter");
+      expect(bytes(view.state)).toBe("ab**cd**\n");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe("ab**cd**");
+    });
+
+    it("keeps a bold that a line break inside it splits, as the page reads it", () => {
+      const view = markView("**ab cd**", { room });
+      setCaret(view, 5);
+      keys(view, "Enter");
+      expect(bytes(view.state)).toBe("**ab \ncd**");
+    });
+  },
+);

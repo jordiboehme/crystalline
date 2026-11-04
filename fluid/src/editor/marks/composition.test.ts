@@ -63,12 +63,16 @@ function ime(view: EditorView) {
   });
   let first = true;
   return {
+    /**
+     * Starts one in CodeMirror's order: its own observer marks the view as
+     * composing before any plugin hears the event.
+     */
     start() {
+      state.on = true;
+      first = true;
       view.contentDOM.dispatchEvent(
         new Event("compositionstart", { bubbles: true }),
       );
-      state.on = true;
-      first = true;
     },
     /** One composed change, the caret after its text. */
     change(from: number, to: number, insert: string) {
@@ -288,3 +292,118 @@ describe("a composition in a table cell", () => {
     );
   });
 });
+
+/**
+ * The person acts in the 60 ms after a composition, before it is judged
+ * (D47, D48, D50, D51): the composition is judged first, on the state before
+ * the action, and the action follows.
+ */
+describe.each([false, true])(
+  "an action in the settle window, room %s",
+  (room) => {
+    it("judges a composed deletion before the Backspace that follows it", () => {
+      const view = markView("**a.** bc", { room });
+      const said = hear(view);
+      setCaret(view, 7);
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(6, 7, "");
+      keyboard.end(false);
+      keys(view, "Backspace");
+      vi.advanceTimersByTime(60);
+      // The space comes back first, with the caret after it, so the
+      // Backspace is judged on that text: refused, as on a desktop (D5 (c)).
+      expect(bytes(view.state)).toBe("**a.** bc");
+      expect(said.filter((each) => each === CANNOT_JOIN)).toHaveLength(2);
+    });
+
+    it("writes Bold around the composed word before an Enter that follows it", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "cd");
+      keyboard.end(false);
+      keys(view, "Enter");
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("ab**cd**\n");
+    });
+
+    it("keeps Bold for a Korean syllable whose space comes with the commit", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "\ud55c");
+      keyboard.end(false);
+      // The key that commits the syllable types the space too, as plain input.
+      typeText(view, " ");
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("ab**\ud55c** ");
+      keyboard.start();
+      keyboard.change(8, 8, "\uad6d");
+      keyboard.end();
+      expect(bytes(view.state)).toBe("ab**\ud55c** **\uad6d**");
+    });
+
+    it("judges the last composition before the next one begins (CodeMirror's event order)", () => {
+      const view = markView("**a.** b", { room });
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(6, 7, "");
+      keyboard.end(false);
+      expect(view.compositionStarted).toBe(false);
+      keyboard.start();
+      expect(view.compositionStarted).toBe(true);
+      // The new composition types after the `b` the person sees.
+      keyboard.change(7, 7, "x");
+      keyboard.end();
+      expect(bytes(view.state)).toBe("**a.** bx");
+    });
+
+    it("keeps a caret the person moved before the judge ran", () => {
+      const view = markView("xyz ab", { room });
+      setCaret(view, 6);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(6, 6, "cd");
+      keyboard.end(false);
+      setCaret(view, 1);
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("xyz ab**cd**");
+      expect(caret(view)).toBe(1);
+    });
+  },
+);
+
+describe.each([false, true])(
+  "a composition beside a Reflection id line (D33), room %s",
+  (room) => {
+    const ID = "<!-- r:7f3a9c2e -->";
+
+    it("refuses a composed deletion on the line below the id and keeps the id line", () => {
+      const text = `## Night\n${ID}\n**a.** b\n`;
+      const view = markView(text, { room, adapter: "reflection" });
+      const at = text.indexOf(" b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(at, at + 1, "");
+      keyboard.end();
+      expect(bytes(view.state)).toBe(text);
+    });
+
+    it("never joins the line below onto the id line", () => {
+      const text = `## Night\n${ID}\nText\n`;
+      const view = markView(text, { room, adapter: "reflection" });
+      const at = text.indexOf("\nText");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(at, at + 1, "");
+      keyboard.end();
+      expect(bytes(view.state)).toContain(`\n${ID}\n`);
+    });
+  },
+);

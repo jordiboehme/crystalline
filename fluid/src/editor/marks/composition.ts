@@ -27,15 +27,18 @@
 import type { ChangeSet, EditorState, Extension } from "@codemirror/state";
 import {
   EditorSelection,
+  EditorState as State,
+  Prec,
   StateEffect,
   StateField,
   Transaction,
 } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
-import { EditorView, ViewPlugin } from "@codemirror/view";
+import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { mainSelectionParked } from "../parkedSelection";
-import { deletionOutcome, judgeDeletion, placed } from "./deleteCheck";
+import { composing } from "./caret";
+import { carried, deletionOutcome, judgeDeletion, placed } from "./deleteCheck";
 import { judgedElsewhere } from "./deleting";
 import { pendingFormat, setPending, typedPlan } from "./formatting";
 import { judgeInsert } from "./insertCheck";
@@ -50,12 +53,21 @@ interface CompositionLog {
 /** Ends the log: the composition was judged, or is not to be. */
 const endLog = StateEffect.define<null>();
 
+/**
+ * Starts a log anew: a composition began while the last one waited to be
+ * judged, so the last one was judged first, in the same transaction (D50).
+ */
+const beginLog = StateEffect.define<CompositionLog>();
+
 /** How long after `compositionend` the last composed change may arrive. */
 const SETTLE_MS = 60;
 
 const compositionLog = StateField.define<CompositionLog | null>({
   create: () => null,
   update(log, tr) {
+    for (const effect of tr.effects) {
+      if (effect.is(beginLog)) return effect.value;
+    }
     if (tr.effects.some((effect) => effect.is(endLog))) {
       return null;
     }
@@ -187,19 +199,7 @@ function wanted(start: EditorState, now: EditorState, log: CompositionLog) {
     }
   }
   if (removed.from === removed.to) {
-    const at =
-      start.selection.main.empty && start.selection.main.head === net.from
-        ? start
-        : start.update({ selection: EditorSelection.cursor(net.from) }).state;
-    const plan = typedPlan(at, net.from, text, deadlineIn(PARSE_BUDGET.typing));
-    if (!plan) {
-      return null;
-    }
-    return {
-      changes: start.changes({ from: plan.at, insert: plan.insert }),
-      caret: plan.caret,
-      effects: [setPending.of(plan.pending)],
-    };
+    return typedWanted(start, net.from, text);
   }
   const judged = judgeInsert(
     start,
@@ -213,18 +213,79 @@ function wanted(start: EditorState, now: EditorState, log: CompositionLog) {
 }
 
 /**
- * Judges the composition the view's log holds, once it is over: writes the
- * correction, or just ends the log. Never from inside an update.
+ * Text composed at a caret, by the typing rules on the state from before
+ * the composition. Whitespace at its end (the space a Korean keyboard types
+ * with the key that commits a syllable) is typed after the rest, so it goes
+ * outside the marks of a format that waits, as it does when typed after a
+ * pause (D48).
  */
-export function judgeComposition(view: EditorView): void {
-  if (view.composing || view.compositionStarted) {
-    return;
+function typedWanted(
+  start: EditorState,
+  from: number,
+  text: string,
+): Wanted | null {
+  const deadline = deadlineIn(PARSE_BUDGET.typing);
+  const at =
+    start.selection.main.empty && start.selection.main.head === from
+      ? start
+      : start.update({ selection: EditorSelection.cursor(from) }).state;
+  const core = text.replace(/\s+$/, "");
+  const tail = text.slice(core.length);
+  if (core === "" || tail === "") {
+    const plan = typedPlan(at, from, text, deadline);
+    return plan
+      ? {
+          changes: start.changes({ from: plan.at, insert: plan.insert }),
+          caret: plan.caret,
+          effects: [setPending.of(plan.pending)],
+        }
+      : null;
   }
-  const log = view.state.field(compositionLog, false) ?? null;
+  const first = typedPlan(at, from, core, deadline);
+  const firstChanges = start.changes(
+    first ? { from: first.at, insert: first.insert } : { from, insert: core },
+  );
+  const caret = first ? first.caret : from + core.length;
+  const mid = start.update({
+    changes: firstChanges,
+    selection: EditorSelection.cursor(caret),
+    effects: setPending.of(first ? first.pending : null),
+    filter: false,
+  }).state;
+  const second = typedPlan(mid, caret, tail, deadline);
+  const secondChanges = mid.changes(
+    second
+      ? { from: second.at, insert: second.insert }
+      : { from: caret, insert: tail },
+  );
+  if (!first && !second) {
+    return null;
+  }
+  return {
+    changes: firstChanges.compose(secondChanges),
+    caret: second ? second.caret : caret + tail.length,
+    effects: [setPending.of(second ? second.pending : null)],
+  };
+}
+
+/** The correction a log asks for, as a change of the state now. */
+interface Correction {
+  changes: ChangeSet;
+  /** The caret the judges plan, or null to keep the caret as it maps. */
+  caret: number | null;
+  effects: StateEffect<unknown>[];
+}
+
+/**
+ * What the composition `now`'s log holds asks for, on `now`: the change from
+ * the text now to the text the judges want, the caret they plan and what is
+ * said, with the log ended. Null when no log is open.
+ */
+function correctionOf(now: EditorState): Correction | null {
+  const log = now.field(compositionLog, false) ?? null;
   if (log === null) {
-    return;
+    return null;
   }
-  const now = view.state;
   const want: Wanted | null = wanted(log.start, now, log);
   const effects: StateEffect<unknown>[] = [endLog.of(null)];
   if (want === null || want.changes === null) {
@@ -232,8 +293,7 @@ export function judgeComposition(view: EditorView): void {
       // A format that waited through the composition and was not written.
       effects.push(setPending.of(null));
     }
-    view.dispatch({ effects });
-    return;
+    return { changes: now.changes([]), caret: null, effects };
   }
   const target = want.changes.apply(log.start.doc);
   // The correction: the one stretch where the text now and the text wanted
@@ -256,7 +316,7 @@ export function judgeComposition(view: EditorView): void {
   ) {
     tail += 1;
   }
-  const changes =
+  const changes = now.changes(
     head === current.length && head === goal.length
       ? []
       : [
@@ -265,18 +325,114 @@ export function judgeComposition(view: EditorView): void {
             to: current.length - tail,
             insert: goal.slice(head, goal.length - tail),
           },
-        ];
-  const caret = Math.min(want.caret ?? head, goal.length);
-  view.dispatch({
+        ],
+  );
+  return {
     changes,
-    selection: EditorSelection.cursor(caret),
+    caret: Math.min(want.caret ?? head, goal.length),
     effects: [...effects, ...want.effects],
+  };
+}
+
+/**
+ * Judges the composition the view's log holds, once it is over: writes the
+ * correction, or just ends the log. Never from inside an update.
+ */
+export function judgeComposition(view: EditorView): void {
+  if (view.composing || view.compositionStarted) {
+    return;
+  }
+  const fix = correctionOf(view.state);
+  if (fix === null) {
+    return;
+  }
+  if (fix.changes.empty && fix.caret === null) {
+    view.dispatch({ effects: fix.effects });
+    return;
+  }
+  view.dispatch({
+    changes: fix.changes,
+    ...(fix.caret === null
+      ? {}
+      : { selection: EditorSelection.cursor(fix.caret) }),
+    effects: fix.effects,
     // Joins the composition's undo step, solo and in a room.
     userEvent: "input.type",
     annotations: judgedElsewhere.of(true),
     scrollIntoView: true,
   });
 }
+
+/**
+ * The person's next action while a composition waits to be judged (a key,
+ * a paste, a click, a new composition): the composition is judged first, on
+ * the state before the action, in the same transaction (D47, D50). The
+ * action follows, mapped through the correction, with the selection it set
+ * (a caret the person moved stays where they put it, D51). Plain typing is
+ * part of the composition (CodeMirror can deliver the last composed change
+ * that way), and a peer's change ends the log unjudged (the D33 limit).
+ *
+ * Listed after the deletion and insert checks, so it runs after them: they
+ * judge the action itself, and this one only puts the composition's
+ * correction in front of it.
+ */
+export const judgeFirst: Extension = State.transactionFilter.of((tr) => {
+  const start = tr.startState;
+  if ((start.field(compositionLog, false) ?? null) === null) {
+    return tr;
+  }
+  const event = tr.annotation(Transaction.userEvent);
+  const next = tr.isUserEvent("input.type.compose.start");
+  if (
+    event === undefined ||
+    tr.annotation(judgedElsewhere) === true ||
+    tr.annotation(Transaction.remote) !== undefined ||
+    (!next &&
+      (tr.isUserEvent("input.type") ||
+        composing(start) ||
+        (!tr.docChanged && tr.selection === undefined)))
+  ) {
+    return tr;
+  }
+  const fix = correctionOf(start);
+  if (fix === null) {
+    return tr;
+  }
+  const rest = tr.changes.map(fix.changes);
+  const effects = StateEffect.mapEffects(
+    StateEffect.mapEffects(tr.effects, tr.changes.invertedDesc),
+    fix.changes,
+  );
+  const selection = tr.selection
+    ? tr.newSelection.map(tr.changes.invertedDesc).map(fix.changes).map(rest)
+    : fix.caret === null
+      ? undefined
+      : EditorSelection.cursor(fix.caret).map(rest);
+  const after: EditorState | null = next
+    ? start.update({
+        changes: fix.changes,
+        ...(fix.caret === null
+          ? {}
+          : { selection: EditorSelection.cursor(fix.caret) }),
+        effects: fix.effects,
+        filter: false,
+      }).state
+    : null;
+  return [
+    { changes: fix.changes, effects: fix.effects },
+    {
+      changes: rest,
+      ...(selection ? { selection } : {}),
+      effects: [
+        ...StateEffect.mapEffects(effects, rest),
+        ...(after ? [beginLog.of({ start: after, changes: rest })] : []),
+      ],
+      annotations: carried(tr),
+      scrollIntoView: tr.scrollIntoView,
+      sequential: true,
+    },
+  ];
+});
 
 const settle = ViewPlugin.fromClass(
   class {
@@ -314,20 +470,6 @@ const settle = ViewPlugin.fromClass(
         (update.state.field(compositionLog, false) ?? null) !== null
       ) {
         this.schedule(SETTLE_MS);
-        return;
-      }
-      // A change that is not the composition's, after it ended: judge the
-      // composition first, as soon as this update is over.
-      if (
-        this.timer !== null &&
-        update.transactions.some(
-          (tr) =>
-            (tr.docChanged || tr.selection !== undefined) &&
-            !tr.isUserEvent("input.type") &&
-            tr.annotation(judgedElsewhere) !== true,
-        )
-      ) {
-        this.schedule(0);
       }
     }
 
@@ -341,15 +483,32 @@ const settle = ViewPlugin.fromClass(
         // The last composed change may come up to 50 ms after the event.
         this.schedule(SETTLE_MS);
       },
-      compositionstart() {
-        // A new composition: the last one is judged before it begins.
-        if (this.timer !== null) {
-          this.cancel();
-          judgeComposition(this.view);
-        }
-      },
     },
   },
+);
+
+/**
+ * A key pressed while a composition waits to be judged: the composition is
+ * judged first, so the key's own command reads the text as the judges want
+ * it (a Backspace takes the letter the person sees, D47). Keys an IME still
+ * handles (a composition under way) are left alone. First in the layer:
+ * CodeMirror runs a key's `any` bindings in the order the keymaps came.
+ */
+export const judgeBeforeKey = Prec.highest(
+  keymap.of([
+    {
+      any: (view, event) => {
+        if (
+          !event.isComposing &&
+          event.keyCode !== 229 &&
+          (view.state.field(compositionLog, false) ?? null) !== null
+        ) {
+          judgeComposition(view);
+        }
+        return false;
+      },
+    },
+  ]),
 );
 
 /** What the hidden-mark layer installs for compositions. */

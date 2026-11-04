@@ -15,7 +15,7 @@ import { elementMenuKey } from "../elementEdit";
 import { hiddenMarkDrawing, linkClicks } from "../preview";
 import { blockDrawing, listEnter, taskKeymap } from "./blocks";
 import { caretKeymap, caretNormalizer } from "./caret";
-import { compositionCheck } from "./composition";
+import { compositionCheck, judgeBeforeKey, judgeFirst } from "./composition";
 import { checkedDeletion } from "./deleteCheck";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
 import { formatting } from "./formatting";
@@ -70,6 +70,9 @@ export interface HiddenMarkOptions {
 
 export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
   return [
+    // Before every key binding: a composition waiting to be judged is
+    // judged before the key runs.
+    judgeBeforeKey,
     hiddenMarkLayerOn.of(true),
     hiddenMarkDrawing,
     // A press on a link's words, and Shift+F10 on the element at the caret,
@@ -88,9 +91,11 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
     compositionCheck,
     // Filters run last-listed first: a range deletion is rewritten to keep
     // its partner marks, then checked against the text it leaves (repaired
-    // or refused), and an insert against the pairs around it (I2), before
-    // the caret it leaves is normalized.
+    // or refused), and an insert against the pairs around it (I2); then a
+    // composition that waits to be judged is judged in front of the action
+    // (D47), before the caret it leaves is normalized.
     caretNormalizer,
+    judgeFirst,
     checkedDeletion,
     checkedInsert,
     keepPartnerMarks,

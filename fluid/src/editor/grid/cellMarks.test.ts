@@ -44,6 +44,7 @@ import { fencePreviews } from "../fencePreviews";
 import { footnoteVersion } from "../footnotes";
 import { verbTarget } from "../floatingContext";
 import { hiddenMarkLayer } from "../marks";
+import { deletionOutcome } from "../marks/deleteCheck";
 import { marksOnEditLine } from "../marks/mode";
 import { editorHighlight } from "../setup";
 import { CELL_NOT_READ, activeCell, cellParseBudget } from "./cellEditor";
@@ -826,12 +827,14 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
     const view = openAt(main, cell.content.from, false).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
     const said: string[] = [];
+    const named: string[] = [];
     view.dispatch({
       effects: StateEffect.appendConfig.of(
         EditorView.updateListener.of((update) => {
           for (const tr of update.transactions) {
             for (const effect of tr.effects) {
               if (effect.is(EditorView.announce)) said.push(effect.value);
+              if (effect.is(deletionOutcome)) named.push(effect.value);
             }
           }
         }),
@@ -840,6 +843,8 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
     keys(view, "Delete");
     expect(bytes(main.state)).toBe(text);
     expect(said).toEqual([CELL_NOT_READ]);
+    // Named as a refusal, as the deletion check names its own.
+    expect(named).toEqual(["refused"]);
     // The background parse arrives: the label is a pill again, taken whole.
     ensureSyntaxTree(view.state, view.state.doc.length, 30_000);
     view.dispatch({});

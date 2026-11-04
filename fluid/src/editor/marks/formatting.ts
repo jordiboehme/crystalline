@@ -52,6 +52,7 @@ import type { Mark, MarkRun } from "./hiddenMarks";
 import { marksOnLine, runsOf } from "./hiddenMarks";
 import { hiddenMarkLayerOn, marksHiddenOnLine } from "./mode";
 import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import type { Deadline } from "./parse";
 
 export type Format = "strong" | "em" | "strike" | "code";
 
@@ -541,7 +542,7 @@ function readsAsAsked(
   reach: { from: number; to: number },
   format: Format,
   removing: boolean,
-  deadline: number,
+  deadline: Deadline,
 ): boolean | null {
   const trial = parsedTo(
     state.update({ changes, filter: false }).state,
@@ -974,7 +975,7 @@ function trialOf(
   state: EditorState,
   plan: Plan,
   lineTo: number,
-  deadline: number,
+  deadline: Deadline,
 ): EditorState | null {
   return parsedTo(
     state.update({
@@ -1031,7 +1032,7 @@ export function typedPlan(
   begin: EditorState,
   from: number,
   text: string,
-  deadline: number,
+  deadline: Deadline,
 ): TypedPlan | null {
   if (
     text.length === 0 ||

@@ -136,3 +136,49 @@ describe("one parse bound per press (D35)", () => {
     expect(slow.said).toContain(PAGE_LOADING);
   });
 });
+
+describe("a slow press on a page that is parsed already (D52)", () => {
+  it("is never refused for time spent outside parsing", () => {
+    clock.step = 0;
+    const view = markView(TEXT);
+    const said: string[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) said.push(effect.value);
+            }
+          }
+        }),
+      ),
+    });
+    expect(syntaxTree(view.state).length).toBe(TEXT.length);
+    // After "bold" on a line in the middle of the page.
+    const line = view.state.doc.line(5001);
+    const at = line.from + line.text.indexOf("bold") + 4;
+    view.dispatch({ selection: EditorSelection.cursor(at) });
+    // Every look at the clock takes 30 ms: the press's scans and reads alone
+    // would use up a 150 ms bound many times over.
+    press(view, "Backspace", 30);
+    expect(said).not.toContain(PAGE_LOADING);
+    expect(view.state.doc.line(5001).text).toBe(
+      line.text.replace("**bold**", "**bol**"),
+    );
+  });
+});
+
+describe("a key on a line past a short parse (D35)", () => {
+  it("reads the line's marks before it deletes, so a hidden mark is never taken as a letter", () => {
+    const text = `${TEXT}\n\na [lk](u)`;
+    clock.step = STOPPED;
+    const view = markView(text, { parsed: false });
+    expect(syntaxTree(view.state).length).toBeLessThan(text.length / 2);
+    view.dispatch({ selection: EditorSelection.cursor(text.length) });
+    // A frozen clock: every parse may take as long as it needs.
+    clock.step = 0;
+    keys(view, "Backspace");
+    clock.step = STOPPED;
+    expect(bytes(view.state).endsWith("a [l](u)")).toBe(true);
+  });
+});

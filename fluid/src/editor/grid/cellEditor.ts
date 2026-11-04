@@ -64,6 +64,7 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
+import { deletionOutcome } from "../marks/deleteCheck";
 import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage, editorHighlight } from "../setup";
 import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
@@ -1013,7 +1014,11 @@ const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
   if (!command && !waiting) return tr;
   return {
     selection: tr.startState.selection,
-    effects: EditorView.announce.of(CELL_NOT_READ),
+    effects: [
+      EditorView.announce.of(CELL_NOT_READ),
+      // A refused delete is named as the deletion check names its own.
+      ...(tr.isUserEvent("delete") ? [deletionOutcome.of("refused")] : []),
+    ],
   };
 });
 

@@ -342,22 +342,27 @@ describe.each(CASES)("round 3, $mode mode, room $room", ({ mode, room }) => {
 describe.each(CASES)(
   "a delete on a fence line (M2), $mode mode, room $room",
   ({ mode, room }) => {
-    it("refuses to turn an unclosed fence's code into bold text", () => {
+    it("refuses a delete that takes a fence mark and a letter, when the code would turn bold", () => {
       const { view, heard, text } = page("```math\nx^2 **y**", mode, room);
-      setCaret(view, 2);
-      keys(view, "Delete");
+      // "`m": the last backtick and the first letter of the info word.
+      view.dispatch({ selection: EditorSelection.range(4, 6) });
+      keys(view, "Backspace");
       expect(text()).toBe("```math\nx^2 **y**");
       expect(heard.outcome).toBe("refused");
       expect(heard.said).toContain(CANNOT_JOIN);
     });
 
-    it("refuses to turn a closed fence's code into bold text", () => {
-      // In a quote, where no code box hides the fence lines.
-      const { view, heard, text } = page("> ```\n> x **y**\n> ```", mode, room);
-      setCaret(view, 4);
+    it("lets a key that takes only a fence mark through, whatever follows (D45)", () => {
+      const { view, heard, text } = page("```math\nx^2 **y**", mode, room);
+      setCaret(view, 2);
       keys(view, "Delete");
-      expect(text()).toBe("> ```\n> x **y**\n> ```");
-      expect(heard.outcome).toBe("refused");
+      expect(text()).toBe("``math\nx^2 **y**");
+      expect(heard.outcome).toBeNull();
+      // In a quote, where no code box hides the fence lines.
+      const closed = page("> ```\n> x **y**\n> ```", mode, room);
+      setCaret(closed.view, 4);
+      keys(closed.view, "Delete");
+      expect(closed.text()).toBe("> ``\n> x **y**\n> ```");
     });
 
     it("lets a fence line change when no code line would read differently", () => {
@@ -369,17 +374,16 @@ describe.each(CASES)(
   },
 );
 
-describe("a fence typed by hand and taken back (M2 as ruled, D42)", () => {
-  it("refuses the Backspace that would bring the text below back, and one undo does", () => {
+describe("a fence typed by hand and taken back (D45)", () => {
+  it("lets the Backspace that brings the text below back through", () => {
     const { view, heard, text } = page("a\n\n**b** c", "hidden", false);
     setCaret(view, 4);
     typeText(view, "```");
     expect(text()).toBe("a\n```\n**b** c");
     keys(view, "Backspace");
-    // The text below the fence would turn bold again: refused (D10).
-    expect(text()).toBe("a\n```\n**b** c");
-    expect(heard.outcome).toBe("refused");
-    undoOnce(view);
+    expect(text()).toBe("a\n``\n**b** c");
+    expect(heard.outcome).toBeNull();
+    keys(view, "Backspace", "Backspace");
     expect(text()).toBe("a\n\n**b** c");
   });
 });

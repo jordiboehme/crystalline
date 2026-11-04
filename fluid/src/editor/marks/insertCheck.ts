@@ -1,7 +1,8 @@
 /**
  * An insert the person makes beside hidden marks is checked like a deletion
- * (D5, I2): a paste, a drop, a completion, and typing over a selection (D17
- * treats it as a delete with text put in). `formatInput` handles typing at a
+ * (D5, I2): a paste, a drop, a completion, typing over a selection (D17
+ * treats it as a delete with text put in) and Enter, which at the end of a
+ * bold line would otherwise split its closing marks onto the next line. `formatInput` handles typing at a
  * caret; CodeMirror's paste never reaches an input handler, so this filter
  * is the place for the rest.
  *
@@ -42,6 +43,7 @@ import { droppable, judgedElsewhere } from "./deleting";
 import { runAt } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
 import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import type { Deadline } from "./parse";
 
 /** The inserts judged here; typing only when it replaces a selection. */
 const CHECKED = new Set([
@@ -50,6 +52,8 @@ const CHECKED = new Set([
   "move.drop",
   "input.complete",
   "input.type",
+  // Enter: a line break put in (CodeMirror's newline commands, `listEnter`).
+  "input",
 ]);
 
 /** One place to try: the pieces the text goes in as, in document order. */
@@ -161,9 +165,8 @@ export function judgeInsert(
   begin: EditorState,
   deletions: readonly Range[],
   insert: { from: number; to: number; text: string },
-  deadline: number,
+  deadline: Deadline,
 ): InsertJudgement | null {
-  if (/[\r\n]/.test(insert.text)) return null;
   const start = parsedTo(begin, begin.doc.lineAt(insert.to).to, deadline);
   // Short of time: written as it landed, never refused.
   if (!start) return null;
@@ -254,6 +257,8 @@ export const checkedInsert: Extension = State.transactionFilter.of((tr) => {
   if (inserts !== 1 || !found) return tr;
   // Typing at a caret is `formatInput`'s; here only over a selection.
   if (event === "input.type" && found.from === found.to) return tr;
+  // A bare `input` is judged only when it breaks the line (Enter).
+  if (event === "input" && !/[\r\n]/.test(found.text)) return tr;
   const judged = judgeInsert(
     tr.startState,
     deletions,

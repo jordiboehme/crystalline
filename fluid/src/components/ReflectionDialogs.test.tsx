@@ -105,7 +105,14 @@ beforeEach(() => {
 // The editor's screen is a lazy part: its first import compiles the whole
 // editor, which on a loaded machine takes longer than a `findByRole` waits
 // (D37). It is loaded here, once, so a test that opens it waits for the
-// screen, not for the compile.
+// screen, not for the compile. The mock makes that first load slow on every
+// machine (4 s, past the typing before the wait and the 1 s it waits), so a
+// test that opened the screen without this would fail here too.
+vi.mock("../screens/ReflectionEditor", async (importOriginal) => {
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+  return importOriginal();
+});
+
 beforeAll(async () => {
   await import("../screens/ReflectionEditor");
 }, 120_000);
