@@ -265,14 +265,16 @@ pub enum RemoteFailure {
         /// How long it waited.
         after: Duration,
     },
-    /// A write went out and no answer came: the limit ran out, or the
-    /// connection broke, after the connect had finished. The server may have
-    /// done the write or not. Not a failure of the source (it took the
-    /// connection), so it never opens the down window, whatever the
-    /// [`Budget`]. A failure of the connect itself (name, TCP, TLS) never
-    /// sent anything and stays [`RemoteFailure::TimedOut`] or
-    /// [`RemoteFailure::Unreachable`]. Boxed, so every error that carries a
-    /// failure stays small.
+    /// A write went out and no answer came: the limit ran out, the
+    /// connection broke after the connect had finished, or a gateway
+    /// answered 504 or 502 ([`Silence`]). The server may have done the write
+    /// or not. It does not open the down window, whatever the [`Budget`]
+    /// (the server took the connection), except for a gateway's 502, which
+    /// marks the source down with the gateway's own sentence
+    /// ([`RemoteFailure::down_mark`]). A failure of the connect itself (name,
+    /// TCP, TLS) never sent anything and stays [`RemoteFailure::TimedOut`]
+    /// or [`RemoteFailure::Unreachable`]. Boxed, so every error that carries
+    /// a failure stays small.
     Unanswered(Box<UnansweredWrite>),
 }
 
@@ -288,6 +290,25 @@ impl RemoteFailure {
     pub fn server_text(&self) -> Option<&str> {
         match self {
             RemoteFailure::Status { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+
+    /// The failure the down window records for this one, when it opens the
+    /// window: an unreachable or timed-out source as it is, and a write a
+    /// gateway answered with `502` as the gateway's plain sentence, so a
+    /// later call inside the window is never told about a write it did not
+    /// send.
+    pub fn down_mark(&self) -> Option<RemoteFailure> {
+        match self {
+            failure if failure.is_unreachable() => Some(failure.clone()),
+            RemoteFailure::Unanswered(write) if write.silence == Silence::Gateway(502) => {
+                Some(RemoteFailure::Unreachable {
+                    source: write.source.clone(),
+                    url: write.url.clone(),
+                    detail: gateway_detail(502),
+                })
+            }
             _ => None,
         }
     }
@@ -338,15 +359,26 @@ impl std::fmt::Display for RemoteFailure {
             ),
             RemoteFailure::Unanswered(write) => {
                 let (source, url, check) = (&write.source, &write.url, &write.check);
-                match write.after {
-                    Some(after) => write!(
+                match write.silence {
+                    Silence::Waited(after) => write!(
                         f,
                         "{source} ({url}) did not answer within {}. {check}",
                         seconds(after)
                     ),
-                    None => write!(
+                    Silence::BrokeOff => write!(
                         f,
                         "{source} ({url}) broke off the connection before it answered. {check}"
+                    ),
+                    Silence::Gateway(status) if status == GATEWAY_TIMEOUT => write!(
+                        f,
+                        "{source} ({url}) did not answer in time: its gateway answered {}. {check}",
+                        status_text(status)
+                    ),
+                    Silence::Gateway(status) => write!(
+                        f,
+                        "{source} ({url}) broke off before it answered: its gateway answered {}. \
+                         {check}",
+                        status_text(status)
                     ),
                 }
             }
@@ -363,12 +395,44 @@ pub struct UnansweredWrite {
     pub source: String,
     /// The server.
     pub url: String,
-    /// How long it waited, when the limit ran out; `None` when the
-    /// connection broke first.
-    pub after: Option<Duration>,
+    /// How the answer failed to come.
+    pub silence: Silence,
     /// What may have happened and how to check, for the tool that was
     /// called.
     pub check: String,
+}
+
+/// How a write's answer failed to come ([`UnansweredWrite`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Silence {
+    /// The limit ran out after this long.
+    Waited(Duration),
+    /// The connection broke while the request went out or while its answer
+    /// was awaited.
+    BrokeOff,
+    /// A gateway in front of the server answered with this status: `504`
+    /// (it passed the write on and the server did not answer it in time) or
+    /// `502` (the connection to the server broke).
+    Gateway(u16),
+}
+
+/// The status a gateway answers when the server behind it did not answer in
+/// time.
+const GATEWAY_TIMEOUT: u16 = 504;
+
+/// `504 Gateway Timeout`: a status with its reason, as a person reads it.
+fn status_text(status: u16) -> String {
+    reqwest::StatusCode::from_u16(status)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| status.to_string())
+}
+
+/// What a gateway's `502`, `503` or `504` says about the server behind it.
+fn gateway_detail(status: u16) -> String {
+    format!(
+        "its gateway answered {}, so the server behind it is down",
+        status_text(status)
+    )
 }
 
 /// `3 s`, `0.7 s`: a deadline as a person reads it.
@@ -589,7 +653,11 @@ impl Peer {
                 RemoteFailure::Unanswered(Box::new(UnansweredWrite {
                     source: self.source.clone(),
                     url: self.url.clone(),
-                    after: e.is_timeout().then_some(limit),
+                    silence: if e.is_timeout() {
+                        Silence::Waited(limit)
+                    } else {
+                        Silence::BrokeOff
+                    },
                     check: check.to_string(),
                 }))
             }
@@ -609,8 +677,32 @@ impl Peer {
         matches!(status.as_u16(), 502..=504).then(|| RemoteFailure::Unreachable {
             source: self.source.clone(),
             url: self.url.clone(),
-            detail: format!("its gateway answered {status}, so the server behind it is down"),
+            detail: gateway_detail(status.as_u16()),
         })
+    }
+
+    /// A gateway's answer to a request that changes data, `check` being what
+    /// the caller reads about it. A `504` (the gateway passed the request on
+    /// and the server did not answer in time) and a `502` (the connection
+    /// behind the gateway broke) may have left the change done. A `503` (no
+    /// server behind the gateway, nothing passed on) and every read are
+    /// [`Peer::gateway`].
+    fn sent_gateway(
+        &self,
+        status: reqwest::StatusCode,
+        check: Option<&str>,
+    ) -> Option<RemoteFailure> {
+        match (check, status.as_u16()) {
+            (Some(check), code @ (502 | 504)) => {
+                Some(RemoteFailure::Unanswered(Box::new(UnansweredWrite {
+                    source: self.source.clone(),
+                    url: self.url.clone(),
+                    silence: Silence::Gateway(code),
+                    check: check.to_string(),
+                })))
+            }
+            _ => self.gateway(status),
+        }
     }
 }
 
@@ -836,9 +928,9 @@ impl Connection {
     /// server cannot erase a mark another call just set.
     pub(crate) fn note<T>(&self, result: &Result<T, RemoteFailure>) {
         if let Err(failure) = result
-            && failure.is_unreachable()
+            && let Some(mark) = failure.down_mark()
         {
-            self.health.mark_down(&self.source.key(), failure);
+            self.health.mark_down(&self.source.key(), &mark);
             self.drop_pool();
         }
     }
@@ -1185,7 +1277,7 @@ impl Connection {
             .await
             .map_err(|e| peer.sent_failure(&e, limit, check.as_deref()))?;
         let status = response.status();
-        if let Some(down) = peer.gateway(status) {
+        if let Some(down) = peer.sent_gateway(status, check.as_deref()) {
             return Err(down);
         }
         self.answered();
@@ -1690,19 +1782,19 @@ mod tests {
     /// A loopback server that reads each request whole, its body included,
     /// and then never answers, holding the connection open.
     async fn silent_after_the_body() -> String {
-        after_the_body(true).await
+        after_the_body("", true).await
     }
 
     /// A loopback server that reads each request whole, its body included,
     /// and then drops the connection without an answer.
     async fn dropping_after_the_body() -> String {
-        after_the_body(false).await
+        after_the_body("", false).await
     }
 
-    /// Reads each request whole, then holds the connection (`hold`) or drops
-    /// it, never answering.
-    async fn after_the_body(hold: bool) -> String {
-        use tokio::io::AsyncReadExt;
+    /// Reads each request whole, writes `answer` (nothing, a whole answer or
+    /// the start of one), then holds the connection (`hold`) or drops it.
+    async fn after_the_body(answer: &'static str, hold: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -1730,7 +1822,9 @@ mod tests {
                             }
                         }
                     }
-                    // The whole request is in; no answer ever goes out.
+                    // The whole request is in; `answer` is all that goes out.
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                    let _ = socket.flush().await;
                     if hold {
                         std::future::pending::<()>().await;
                     }
@@ -1786,8 +1880,8 @@ mod tests {
             failed.to_string(),
             format!(
                 "acme ({url}) did not answer within 0.3 s. The file may or may not be written. \
-                 Read assets/shot.png to check its sha256, or upload the same file again: the \
-                 same bytes are accepted."
+                 Read assets/shot.png with read_engram to check its sha256, or upload the same \
+                 file again: the same bytes are accepted."
             )
         );
         assert!(!failed.to_string().contains(UNREACHABLE_WORDS));
@@ -1835,8 +1929,8 @@ mod tests {
             failed.to_string(),
             format!(
                 "acme ({url}) broke off the connection before it answered. The file may or may \
-                 not be written. Read assets/shot.png to check its sha256, or upload the same \
-                 file again: the same bytes are accepted."
+                 not be written. Read assets/shot.png with read_engram to check its sha256, or \
+                 upload the same file again: the same bytes are accepted."
             )
         );
         assert!(!failed.to_string().contains(UNREACHABLE_WORDS));
@@ -1862,8 +1956,8 @@ mod tests {
             failed.to_string(),
             format!(
                 "acme ({url}) did not answer within 0.3 s. The run may or may not be recorded. \
-                 Run crystalline evolve status to see whether a run is still going before you \
-                 record it again."
+                 Run crystalline evolve status: the run still shows as running while it is not \
+                 recorded."
             )
         );
         assert_eq!(connection.down(), None);
@@ -1878,6 +1972,120 @@ mod tests {
             .unwrap_err();
         assert!(matches!(read, RemoteFailure::TimedOut { .. }), "{read:?}");
         assert!(connection.down().is_some());
+    }
+
+    /// A gateway that answers 504 passed the write on and the server behind
+    /// it did not answer in time: it may have happened, and the source stays
+    /// up. A 502 says the same to the caller but still opens the down window,
+    /// with the gateway's plain sentence for every call that follows.
+    #[tokio::test]
+    async fn a_gateway_answer_to_a_write_says_it_may_have_happened() {
+        for (status, said, down) in [
+            (
+                "504 Gateway Timeout",
+                "did not answer in time: its gateway answered 504 Gateway Timeout",
+                false,
+            ),
+            (
+                "502 Bad Gateway",
+                "broke off before it answered: its gateway answered 502 Bad Gateway",
+                true,
+            ),
+        ] {
+            let head: &'static str = Box::leak(
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .into_boxed_str(),
+            );
+            for (args, check) in [
+                (
+                    json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                            "base64": "aGVsbG8=" }),
+                    "The file may or may not be written. Read assets/shot.png with read_engram \
+                     to check its sha256, or upload the same file again: the same bytes are \
+                     accepted.",
+                ),
+                (
+                    json!({ "domain": "open", "title": "Night deploys", "content": "x" }),
+                    "The engram may or may not be written. Read 'Night deploys' with \
+                     read_engram to see whether it holds your text before you write it again.",
+                ),
+            ] {
+                let url = after_the_body(head, false).await;
+                let connection = signed_in(&url);
+                let failed = write(&connection, args, Duration::from_secs(3)).await;
+                assert_eq!(
+                    failed.to_string(),
+                    format!("acme ({url}) {said}. {check}"),
+                    "{status}"
+                );
+                match connection.down() {
+                    Some(mark) if down => {
+                        assert!(mark.to_string().contains(UNREACHABLE_WORDS), "{mark}");
+                        assert!(!mark.to_string().contains("may or may not"), "{mark}");
+                    }
+                    None if !down => {}
+                    other => panic!("{status}: down window {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A read through a gateway that answers 504 keeps today's sentence and
+    /// opens the down window.
+    #[tokio::test]
+    async fn a_gateway_timeout_on_a_read_still_cannot_be_reached() {
+        let url = after_the_body(
+            "HTTP/1.1 504 Gateway Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            false,
+        )
+        .await;
+        let connection = signed_in(&url);
+        let failed = connection
+            .tool_within_as(
+                "read_engram",
+                json!({ "identifier": "x", "domain": "open" }),
+                &ForwardedAgent { client: None },
+                Duration::from_secs(3),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, RemoteFailure::Unreachable { .. }),
+            "{failed:?}"
+        );
+        assert!(
+            failed.to_string().contains("gateway answered 504"),
+            "{failed}"
+        );
+        assert!(connection.down().is_some());
+    }
+
+    /// The answer's headers came and its body did not: on a write that is
+    /// the same unknown result, whether the body stalls or breaks off.
+    #[tokio::test]
+    async fn a_write_whose_answer_body_failed_may_have_happened() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"v\":1";
+        for (hold, said) in [
+            (true, "did not answer within 0.5 s"),
+            (false, "broke off the connection before it answered"),
+        ] {
+            let url = after_the_body(head, hold).await;
+            let connection = signed_in(&url);
+            let failed = write(
+                &connection,
+                json!({ "domain": "open", "title": "Night deploys", "content": "x" }),
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(
+                failed.to_string().starts_with(&format!(
+                    "acme ({url}) {said}. The engram may or may not be written."
+                )),
+                "{failed}"
+            );
+            assert_eq!(connection.down(), None);
+        }
     }
 
     /// A read that timed out is still a source that does not answer: it says

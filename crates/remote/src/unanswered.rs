@@ -40,13 +40,16 @@ pub(crate) fn unanswered_check(request: &Value) -> Option<String> {
             "The lease may or may not be released. Run {status} to see whether a run is still \
              going."
         ),
+        // The runner records and shares by itself (and tries a record
+        // again); what a person can do is look.
         "automation_run_record" => format!(
-            "The run may or may not be recorded. Run {status} to see whether a run is still \
-             going before you record it again."
+            "The run may or may not be recorded. Run {status}: the run still shows as running \
+             while it is not recorded."
         ),
-        "automation_share" => "The changes may or may not be shared. Look for the run's pull \
-                               request before you share them again."
-            .to_string(),
+        "automation_share" => {
+            "The changes may or may not be shared. Look for the run's pull request on GitHub."
+                .to_string()
+        }
         _ => return None,
     })
 }
@@ -63,7 +66,7 @@ fn unanswered_write(tool: &str, args: &Value) -> Option<String> {
     let page = || text("path").unwrap_or("the page");
     Some(match tool {
         "write_engram" => match (text("path"), text("title")) {
-            (Some(path), _) => upload(path, ""),
+            (Some(path), _) => upload(path, " with read_engram"),
             (None, Some(title)) => format!(
                 "The engram may or may not be written. Read '{title}' with read_engram to see \
                  whether it holds your text before you write it again."
@@ -83,15 +86,29 @@ fn unanswered_write(tool: &str, args: &Value) -> Option<String> {
                           read_engram at its old and its new place to see where it is before \
                           you move it again."
             .to_string(),
-        "split_engram" => "The split may or may not have happened. Read the engram with \
-                           read_engram: a split_into relation means it was split. If you split \
-                           it again, pass the checksum you read as expected_checksum."
-            .to_string(),
+        // The source may carry a split_into from an earlier split, so the
+        // new title is what tells this one apart.
+        "split_engram" => {
+            let relation = match text("title") {
+                Some(title) => format!("a split_into relation to '{title}'"),
+                None => "a new split_into relation".to_string(),
+            };
+            format!(
+                "The split may or may not have happened. Read the engram with read_engram: \
+                 {relation} means it was split. If you split it again, pass the checksum you \
+                 read as expected_checksum."
+            )
+        }
         "write_reflection" => match text("action").unwrap_or("write") {
             "write_asset" => upload(page(), " with read_reflection"),
             "move" | "move_asset" => format!(
                 "The move may or may not have happened. Read the Reflection with \
                  read_reflection to see where {} is before you move it again.",
+                page()
+            ),
+            "settle" => format!(
+                "The settle may or may not have happened. Read {} with read_reflection: a \
+                 settled item no longer shows in reflect.",
                 page()
             ),
             "delete" | "delete_asset" => format!(
@@ -106,6 +123,8 @@ fn unanswered_write(tool: &str, args: &Value) -> Option<String> {
                 page()
             ),
         },
+        // A listing only reads.
+        "discuss" if text("action") == Some("list") => return None,
         "discuss" => "The change to the discussion may or may not have happened. Read the page \
                       with read_reflection and look at its threads before you try again, so \
                       nothing is posted twice."
@@ -147,13 +166,12 @@ mod tests {
             ),
             (
                 "automation_run_record",
-                "The run may or may not be recorded. Run crystalline reflect status to see \
-                 whether a run is still going before you record it again.",
+                "The run may or may not be recorded. Run crystalline reflect status: the run \
+                 still shows as running while it is not recorded.",
             ),
             (
                 "automation_share",
-                "The changes may or may not be shared. Look for the run's pull request before \
-                 you share them again.",
+                "The changes may or may not be shared. Look for the run's pull request on GitHub.",
             ),
         ] {
             let request = json!({ "v": 1, "cmd": cmd, "loop": "reflect", "domain": "ops" });
@@ -169,6 +187,38 @@ mod tests {
     }
 
     #[test]
+    fn a_discussion_listing_is_a_read() {
+        let list = json!({ "domain": "ops", "action": "list", "path": "guides/deploy.md" });
+        assert_eq!(unanswered_write("discuss", &list), None);
+        let open = json!({ "domain": "ops", "action": "open", "path": "guides/deploy.md" });
+        assert!(unanswered_write("discuss", &open).is_some());
+        assert!(unanswered_write("discuss", &json!({ "domain": "ops" })).is_some());
+    }
+
+    #[test]
+    fn a_split_names_the_new_title_and_a_settle_says_what_settled_means() {
+        assert_eq!(
+            unanswered_write(
+                "split_engram",
+                &json!({ "domain": "ops", "identifier": "deploy", "title": "Night deploys" })
+            )
+            .unwrap(),
+            "The split may or may not have happened. Read the engram with read_engram: a \
+             split_into relation to 'Night deploys' means it was split. If you split it again, \
+             pass the checksum you read as expected_checksum."
+        );
+        assert_eq!(
+            unanswered_write(
+                "write_reflection",
+                &json!({ "domain": "ops", "action": "settle", "path": "guides/deploy.md" })
+            )
+            .unwrap(),
+            "The settle may or may not have happened. Read guides/deploy.md with \
+             read_reflection: a settled item no longer shows in reflect."
+        );
+    }
+
+    #[test]
     fn an_upload_names_its_path_and_says_a_retry_is_safe() {
         assert_eq!(
             unanswered_write(
@@ -176,8 +226,8 @@ mod tests {
                 &json!({ "domain": "ops", "title": "Shot", "path": "assets/shot.png" })
             )
             .unwrap(),
-            "The file may or may not be written. Read assets/shot.png to check its sha256, or \
-             upload the same file again: the same bytes are accepted."
+            "The file may or may not be written. Read assets/shot.png with read_engram to check \
+             its sha256, or upload the same file again: the same bytes are accepted."
         );
         assert_eq!(
             unanswered_write(

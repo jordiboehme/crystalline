@@ -70,7 +70,7 @@ pub use provider::{
 pub use server_client::{
     AGENT_FILES_CAPABILITY, AGENT_FILES_RELEASE, Budget, CONNECT_TIMEOUT, CTL_TIMEOUT, Connection,
     CtlAnswer, DOWN_WINDOW, FILE_ANSWER_CAP, FILE_COMMAND, ForwardedAgent, Health, INVALID_KIND,
-    ONE_DOMAIN_LIMIT, RemoteFailure, UnansweredWrite, WRITE_CHECKSUM_RELEASE, form_body,
+    ONE_DOMAIN_LIMIT, RemoteFailure, Silence, UnansweredWrite, WRITE_CHECKSUM_RELEASE, form_body,
     http_client, seconds, settle_refreshes, version_at_least, warm_http_client,
     warm_http_client_within,
 };

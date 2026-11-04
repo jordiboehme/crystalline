@@ -766,7 +766,9 @@ fn within(failure: RemoteFailure, limit: Duration) -> RemoteFailure {
             after: limit,
         },
         RemoteFailure::Unanswered(mut write) => {
-            write.after = write.after.map(|_| limit);
+            if let crystalline_remote::Silence::Waited(after) = &mut write.silence {
+                *after = limit;
+            }
             RemoteFailure::Unanswered(write)
         }
         other => other,
@@ -1088,8 +1090,9 @@ mod tests {
     /// that is unavailable.
     #[test]
     fn a_write_never_answered_says_it_may_have_happened() {
-        let check = "The file may or may not be written. Read assets/shot.png to check its \
-                     sha256, or upload the same file again: the same bytes are accepted.";
+        let check = "The file may or may not be written. Read assets/shot.png with read_engram \
+                     to check its sha256, or upload the same file again: the same bytes are \
+                     accepted.";
         let text = RouteError::Source {
             source: "acme".into(),
             domain: "open".into(),
@@ -1097,7 +1100,7 @@ mod tests {
                 RemoteFailure::Unanswered(Box::new(crystalline_remote::UnansweredWrite {
                     source: "acme".into(),
                     url: "https://crystalline.acme.test".into(),
-                    after: Some(Duration::from_millis(119_870)),
+                    silence: crystalline_remote::Silence::Waited(Duration::from_millis(119_870)),
                     check: check.into(),
                 })),
                 CTL_TIMEOUT,

@@ -140,7 +140,7 @@ flowchart LR
     D -->|volume| I[Index]
 ```
 
-The bundled nginx config carries its own dedicated location for the collab WebSocket, `/api/v1/collab/`, with the Upgrade and Connection headers the plain `/api/` block does not send. Anyone who replaces the Fluid image's nginx config with their own has to carry that block over, or the upgrade never reaches the daemon and the editor runs solo-only with nothing on screen to explain why. The config also raises `client_max_body_size` to 10 MiB to match the daemon's own limit, and a replacement config that leaves nginx's 1 MiB default in place turns every save and every archive import of a larger engram into a proxy refusal. The archive routes get a second, larger directive of their own, in a regex location matching `^/api/v1/domains/[^/]+/archive`: a domain export is re-imported as one zip with its `assets/` attachments inside it, so those two paths accept 64 MiB where everything else keeps 10 MiB, exactly as the daemon does. A replacement config that carries the server-level directive over but not that location refuses an archive the same deployment produced, which reads on screen like a Fluid bug rather than a proxy one. The remote tool route gets an exact location too, `= /api/v1/ctl` with 15 MiB: a file an agent on a connected machine uploads travels as base64 in that body (13,981,016 bytes for a 10 MiB file), and the daemon takes 15 MiB on that route. A replacement config without it refuses a full-size upload with a proxy error the agent cannot read. The GitHub App's webhook gets an exact location of its own too, `= /api/v1/github/webhook` with 25 MiB, the most GitHub sends in one delivery and what the daemon takes on that route. A replacement config without it refuses a large delivery, and the access change it carried then waits for the five minute cache. The same template turns proxy buffering off in its `/api/` location, for the change stream the web UI keeps open (see [Web UI from the daemon](#web-ui-from-the-daemon)); a replacement config that leaves buffering on gives a page that never follows a change.
+The bundled nginx config carries its own dedicated location for the collab WebSocket, `/api/v1/collab/`, with the Upgrade and Connection headers the plain `/api/` block does not send. Anyone who replaces the Fluid image's nginx config with their own has to carry that block over, or the upgrade never reaches the daemon and the editor runs solo-only with nothing on screen to explain why. The config also raises `client_max_body_size` to 10 MiB to match the daemon's own limit, and a replacement config that leaves nginx's 1 MiB default in place turns every save and every archive import of a larger engram into a proxy refusal. The archive routes get a second, larger directive of their own, in a regex location matching `^/api/v1/domains/[^/]+/archive`: a domain export is re-imported as one zip with its `assets/` attachments inside it, so those two paths accept 64 MiB where everything else keeps 10 MiB, exactly as the daemon does. A replacement config that carries the server-level directive over but not that location refuses an archive the same deployment produced, which reads on screen like a Fluid bug rather than a proxy one. The remote tool route gets an exact location too, `= /api/v1/ctl` with 15 MiB: a file an agent on a connected machine uploads travels as base64 in that body (13,981,016 bytes for a 10 MiB file), and the daemon takes 15 MiB on that route. A replacement config without it refuses a full-size upload with a proxy error the agent cannot read. That location also waits 180 s for the daemon, longer than the 120 s a connected machine waits for a forwarded call: a shorter proxy timeout cuts off a slow upload. The GitHub App's webhook gets an exact location of its own too, `= /api/v1/github/webhook` with 25 MiB, the most GitHub sends in one delivery and what the daemon takes on that route. A replacement config without it refuses a large delivery, and the access change it carried then waits for the five minute cache. The same template turns proxy buffering off in its `/api/` location, for the change stream the web UI keeps open (see [Web UI from the daemon](#web-ui-from-the-daemon)); a replacement config that leaves buffering on gives a page that never follows a change.
 
 Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are three ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
 
@@ -783,9 +783,20 @@ server {
 
     # A file an agent uploads travels as base64 in the body of an MCP call
     # (served at the prefix itself and below it) and of a remote tool call,
-    # so those two paths take 15m where the rest keeps 10m.
-    location = /crystalline { client_max_body_size 15m; proxy_pass http://127.0.0.1:7411; }
-    location /crystalline/  { client_max_body_size 15m; proxy_pass http://127.0.0.1:7411; }
+    # so those two paths take 15m where the rest keeps 10m. A connected
+    # machine waits up to 120 s for an upload, so the proxy waits longer.
+    location = /crystalline {
+        client_max_body_size 15m;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+        proxy_pass http://127.0.0.1:7411;
+    }
+    location /crystalline/ {
+        client_max_body_size 15m;
+        proxy_read_timeout 180s;
+        proxy_send_timeout 180s;
+        proxy_pass http://127.0.0.1:7411;
+    }
 
     location /crystalline/api/v1/collab/ {
         proxy_set_header Host $http_host;
@@ -801,6 +812,8 @@ server {
     location = /.well-known/oauth-authorization-server/crystalline { proxy_pass http://127.0.0.1:7411; }
 }
 ```
+
+Keep the read and send timeouts above 120 s, the time a connected machine waits for a forwarded call. A shorter proxy timeout (nginx's default is 60 s) cuts off a slow upload, and the agent then cannot know whether the file was written.
 
 nginx, stripping the path: give each `proxy_pass` of the first two locations a trailing slash, `proxy_pass http://127.0.0.1:7411/;`. Leave the two well-known locations as they are, since they are at the host root already, and keep the collab location's `proxy_pass` without a URI. Know the cost: with a URI after the address nginx forwards a decoded and normalized path, so a permalink holding an escaped `%2F` or `%25` reaches the daemon meaning something else. The pass-through form has no such problem. The three other requirements of [Web UI from the daemon](#web-ui-from-the-daemon) stay: `Origin` untouched, the WebSocket upgrade for `/crystalline/api/v1/collab/`, and `client_max_body_size` raised (64 MiB for the archive paths, as in [Team server with Fluid](#team-server-with-fluid)). A plain `location /crystalline/` without the exact `location = /crystalline` answers the bare path with a redirect, which is why both are there.
 
