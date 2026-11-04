@@ -95,15 +95,21 @@ export function imageNodeAt(
   state: EditorState,
   pos: number,
 ): SyntaxNode | null {
-  const tree = syntaxTree(state);
-  for (const side of [-1, 1] as const) {
-    let node: SyntaxNode | null = tree.resolveInner(pos, side);
-    while (node !== null) {
-      if (node.name === "Image") {
-        return node;
-      }
-      node = node.parent;
+  return imageNodeOn(state, pos, -1) ?? imageNodeOn(state, pos, 1);
+}
+
+/** The innermost enclosing `Image` node at `pos`, looking to one side. */
+function imageNodeOn(
+  state: EditorState,
+  pos: number,
+  side: -1 | 1,
+): SyntaxNode | null {
+  let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, side);
+  while (node !== null) {
+    if (node.name === "Image") {
+      return node;
     }
+    node = node.parent;
   }
   return null;
 }
@@ -224,11 +230,16 @@ export function picturesIn(
 
 /** The picture whose span holds `pos`, either end included, or null. */
 export function pictureAt(state: EditorState, pos: number): PictureRef | null {
-  const node = imageNodeAt(state, pos);
-  if (node === null) {
-    return null;
+  const resolver = state.facet(pictureAssets);
+  const math = mathRegions(state);
+  // At a junction of two images, the left one may stay text (reference
+  // style, math): then the right one is the picture.
+  for (const side of [-1, 1] as const) {
+    const node = imageNodeOn(state, pos, side);
+    const ref = node === null ? null : classify(state, node, resolver, math);
+    if (ref !== null) return ref;
   }
-  return classify(state, node, state.facet(pictureAssets), mathRegions(state));
+  return null;
 }
 
 /** The picture the main selection covers exactly, or null. */

@@ -20,6 +20,7 @@ import type { EditorState, Line } from "@codemirror/state";
 import { frontmatterHidden } from "../frontmatterFold";
 import { frontmatterRegion } from "../frontmatterRegion";
 import { drawnGridTables } from "../grid/draws";
+import { closesFence, fenceMarker } from "../imageFormat";
 import { isIdLineAt } from "../hiddenIdLines";
 
 /** Where a block dropped at a position goes. */
@@ -50,14 +51,42 @@ function drawnTableEnd(state: EditorState, line: Line): Line | null {
   return null;
 }
 
-/** `line`, then every non-blank line right below it: a block read from text alone. */
-function textBlockEnd(state: EditorState, line: Line): Line {
+/**
+ * The closing line of the fence `line` opens or sits in, read from the text
+ * (the core's fence rule, as `eachLiveLine` applies it), or null when `line`
+ * is outside every fence. An unclosed fence runs to the last line.
+ */
+function textFenceEnd(state: EditorState, line: Line): Line | null {
+  const { doc } = state;
+  let open: { char: string; count: number } | null = null;
+  for (let number = 1; number <= doc.lines; number += 1) {
+    const text = doc.line(number).text;
+    if (open === null) {
+      open = fenceMarker(text);
+      if (open === null && number >= line.number) return null;
+    } else if (closesFence(open, text)) {
+      if (number >= line.number) return doc.line(number);
+      open = null;
+    }
+  }
+  return open === null ? null : doc.line(doc.lines);
+}
+
+/**
+ * The last line of the block holding `line`, read from the text alone where
+ * the tree does not reach: a fence to its closing line (blank lines inside it
+ * included), anything else to the line before the next blank line or the
+ * next fence. Null for a blank line outside a fence.
+ */
+function textBlockEnd(state: EditorState, line: Line): Line | null {
+  const fence = textFenceEnd(state, line);
+  if (fence !== null) return fence;
+  if (blank(line)) return null;
   let last = line;
-  while (
-    last.number < state.doc.lines &&
-    !blank(state.doc.line(last.number + 1))
-  ) {
-    last = state.doc.line(last.number + 1);
+  while (last.number < state.doc.lines) {
+    const next = state.doc.line(last.number + 1);
+    if (blank(next) || fenceMarker(next.text) !== null) break;
+    last = next;
   }
   return last;
 }
@@ -65,12 +94,12 @@ function textBlockEnd(state: EditorState, line: Line): Line {
 /**
  * The last line of the top-level block holding `line`, or null when no
  * block holds it (a blank line between blocks). Where the tree stops short
- * of the block, its end is read from the text: the next blank line.
+ * of the block, its end is read from the text ({@link textBlockEnd}).
  */
 function treeBlockEnd(state: EditorState, line: Line): Line | null {
   const tree = syntaxTree(state);
   if (tree.length < line.to) {
-    return blank(line) ? null : textBlockEnd(state, line);
+    return textBlockEnd(state, line);
   }
   let node = tree.resolveInner(line.from, 1);
   while (node.parent !== null && node.parent.parent !== null) {
@@ -80,8 +109,10 @@ function treeBlockEnd(state: EditorState, line: Line): Line | null {
     return null;
   }
   const last = state.doc.lineAt(node.to);
-  return node.to >= tree.length && tree.length < state.doc.length
-    ? textBlockEnd(state, last)
+  // The last block a short tree holds may go on past it: a list the parse
+  // stopped inside ends at its last parsed item, a little before the tree.
+  return node.nextSibling === null && tree.length < state.doc.length
+    ? (textBlockEnd(state, last) ?? last)
     : last;
 }
 

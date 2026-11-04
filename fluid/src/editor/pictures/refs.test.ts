@@ -224,6 +224,13 @@ describe("pictureAt and selectedPicture", () => {
     expect(pictureAt(state, 1)).toBeNull();
   });
 
+  it("finds the picture on the right of a junction when the left one is text", () => {
+    const junction = "![a][r]![x](assets/a.png)\n\n[r]: assets/b.png\n";
+    const state = stateOf(junction);
+    const at = junction.indexOf("![x]");
+    expect(pictureAt(state, at)?.from).toBe(at);
+  });
+
   it("is the picture only when the selection is exactly its span", () => {
     const at = (anchor: number, head: number) =>
       selectedPicture(

@@ -8,17 +8,20 @@
  * pass by agreeing with it.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { bytes } from "../../test/cellKit";
 
 import { parsedState } from "../../test/parse";
 import { frontmatterFold } from "../frontmatterFold";
 import type { GridTable } from "../grid/structure";
 import { drawnGridTables } from "../grid/draws";
 import { hiddenIdLines } from "../hiddenIdLines";
-import { baseExtensions, docText } from "../setup";
+import { baseExtensions, docText, lineSeparatorFor } from "../setup";
 import { insertBlock } from "../toolbar";
 import { dropLanding } from "./landing";
 
@@ -191,5 +194,113 @@ describe("dropLanding", () => {
   it("reads frontmatter that is not folded as text", () => {
     const doc = "---\ntitle: T\n---\n\nBody\n";
     expect(dropLanding(stateOf(doc), doc.indexOf("Body"))?.line).toBe(5);
+  });
+});
+
+describe("dropLanding in a CRLF document", () => {
+  it("answers the LF positions and the upload keeps the CRLF bytes", () => {
+    const lf = "**a\nb**\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nend\n";
+    const crlf = lf.replace(/\n/g, "\r\n");
+    const state = parsedState(
+      EditorState.create({
+        doc: crlf,
+        extensions: [...lineSeparatorFor(crlf), ...baseExtensions(false)],
+      }),
+    );
+    const lfState = stateOf(lf);
+    const table = lf.indexOf("| a");
+    expect(dropLanding(state, 1)).toEqual(dropLanding(lfState, 1));
+    expect(dropLanding(state, 1)).toEqual({ line: 2, pos: 7, caret: 7 });
+    const landing = dropLanding(state, table);
+    expect(landing).toEqual(dropLanding(lfState, table));
+    expect(landing?.line).toBe(6);
+    view = new EditorView({
+      state: state.update({
+        selection: EditorSelection.cursor(landing?.caret ?? 0),
+      }).state,
+      parent: document.body,
+    });
+    insertBlock(view, [PICTURE]);
+    expect(bytes(view.state)).toBe(
+      `**a\r\nb**\r\n\r\n| a | b |\r\n| --- | --- |\r\n| 1 | 2 |\r\n\r\n${PICTURE}\r\n\r\n\r\nend\r\n`,
+    );
+  });
+});
+
+describe("dropLanding past a short parse", () => {
+  // A clock that jumps a second at every look stops the first parse of a new
+  // state almost at once, as a long page's first parse stops (Part 2's
+  // parse tests do the same).
+  beforeEach(() => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1e6;
+      return now;
+    });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const PREFIX = Array.from(
+    { length: 3000 },
+    (_, i) => `Paragraph ${String(i)} of the long page.`,
+  ).join("\n\n");
+
+  function shortState(doc: string): EditorState {
+    const state = EditorState.create({
+      doc,
+      extensions: [
+        EditorState.lineSeparator.of("\n"),
+        ...baseExtensions(false),
+      ],
+    });
+    expect(syntaxTree(state).length).toBeLessThan(doc.length);
+    return state;
+  }
+
+  it("lands a fence the tree has not reached after its closing line", () => {
+    const doc = `${PREFIX}\n\n\`\`\`\ncode\n\nmore\n\`\`\`\n\nend\n`;
+    const state = shortState(doc);
+    const open = doc.indexOf("```");
+    expect(syntaxTree(state).length).toBeLessThan(open);
+    const close = state.doc.lineAt(doc.lastIndexOf("```"));
+    for (const at of [open, doc.indexOf("code"), doc.indexOf("\n\nmore") + 1]) {
+      expect(dropLanding(state, at), String(at)).toEqual({
+        line: close.number,
+        pos: close.to,
+        caret: close.to,
+      });
+    }
+  });
+
+  it("lands a paragraph the tree has not reached after its last line", () => {
+    const doc = `${PREFIX}\n\n**a\nb**\n\`\`\`\nx\n\`\`\`\n`;
+    const state = shortState(doc);
+    const at = doc.indexOf("**a");
+    expect(syntaxTree(state).length).toBeLessThan(at);
+    const last = state.doc.lineAt(doc.indexOf("b**"));
+    // The paragraph ends at the fence that interrupts it.
+    expect(dropLanding(state, at)).toEqual({
+      line: last.number,
+      pos: last.to,
+      caret: last.to,
+    });
+  });
+
+  it("reads the end of a list the tree stops inside from the text", () => {
+    // The parse stops after the first item, and the list node then ends
+    // there, a little before the tree does.
+    const doc = `${Array.from({ length: 6000 }, (_, i) => `- item ${String(i)}`).join("\n")}\n\nend\n`;
+    const state = shortState(doc);
+    const tree = syntaxTree(state);
+    expect(tree.length).toBeGreaterThan(state.doc.line(1).to);
+    expect(tree.length).toBeLessThan(state.doc.line(3).from);
+    const last = state.doc.line(6000);
+    expect(dropLanding(state, 0)).toEqual({
+      line: 6000,
+      pos: last.to,
+      caret: last.to,
+    });
   });
 });
