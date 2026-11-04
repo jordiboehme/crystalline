@@ -28,7 +28,7 @@ A `crystalline` command that runs inside Claude Desktop, for example from Claude
 
 ## What the command builds
 
-The command builds a small extension on your computer and writes it to `crystalline.mcpb` in the `claude-desktop` folder of Crystalline's state folder. The extension carries no Crystalline. It runs the first crystalline on your `PATH` (or the one you started the command with, when `PATH` has none), and the command prints which one. When that one has moved, the extension falls back to its own search. From 0.18.0 on, a new extension installs over the one from an older release. An extension from before 0.18.0 has another id, so Claude Desktop keeps it as a second Crystalline beside the new one. Remove the older one in Settings > Extensions.
+The command builds a small extension on your computer and writes it to `crystalline.mcpb` in the `claude-desktop` folder of Crystalline's state folder. The extension carries no Crystalline. It runs the first crystalline on your `PATH` (or the one you started the command with, when `PATH` has none), and the command prints which one. When that one has moved, the extension falls back to its own search. A new extension installs over the one from an older release. Only an extension from 0.7.3 to 0.17.x has another id, so Claude Desktop keeps it as a second Crystalline beside the new one. Remove the older one in Settings > Extensions.
 
 Crystalline cannot see what Claude Desktop has installed. It only remembers what it did last. So each run builds the extension again and opens it again.
 

@@ -247,9 +247,11 @@ jobs:
 
           # It carries the binary, executable: validate and the version check
           # read only the manifest, so a stage without the binary would pass.
+          # mcpb stores the permission bits only, with no file type, so
+          # zipinfo prints '?rwxr-xr-x' for it; the first character is either.
           mode=$( (unzip -Z "$f" server/crystalline 2>/dev/null || true) | awk 'NR==1 {print $1}')
           case "$mode" in
-            -rwx*) ;;
+            ?rwx*) ;;
             *) echo "::error::$f holds no executable server/crystalline (mode '${mode:-missing}')"; exit 1 ;;
           esac
 

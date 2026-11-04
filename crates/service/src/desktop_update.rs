@@ -118,22 +118,49 @@ pub(crate) fn answer_ctl(req: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{DESKTOP_OFFER_COMMAND} needs the launcher version"))?;
     let bridge = req.get("version").and_then(Value::as_str);
-    let answer = if bridge != Some(VERSION)
-        || !desktop_os()
-        || !desktop_offer::is_newer(VERSION, launcher)
+    let answer = match daemon_decision(bridge, launcher, desktop_os(), desktop_offer::recorded_now)
     {
-        "nothing"
-    } else {
-        match desktop_offer::recorded_now() {
-            Some(Offered::Already) => "already",
-            Some(_) => "nothing",
-            None => {
-                offer_on_thread(launcher.to_string());
-                "started"
-            }
+        Decision::Nothing => "nothing",
+        Decision::Already => "already",
+        Decision::Start => {
+            offer_on_thread(launcher.to_string());
+            "started"
         }
     };
     Ok(json!({ "offer": answer }))
+}
+
+/// What the daemon does with a `desktop_offer` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Answer `nothing`.
+    Nothing,
+    /// Answer `already`.
+    Already,
+    /// Start the offer and answer `started`.
+    Start,
+}
+
+/// The daemon's decision, without the state folder: `bridge` is the
+/// version the bridge sent, `launcher` its extension's, `desktop_os`
+/// whether Claude Desktop runs here, and `recorded` what the record says
+/// ([`desktop_offer::recorded_now`]). The record is asked only when the
+/// versions and the system allow an offer, so a test can hand in a lookup
+/// that panics.
+fn daemon_decision(
+    bridge: Option<&str>,
+    launcher: &str,
+    desktop_os: bool,
+    recorded: impl FnOnce() -> Option<Offered>,
+) -> Decision {
+    if bridge != Some(VERSION) || !desktop_os || !desktop_offer::is_newer(VERSION, launcher) {
+        return Decision::Nothing;
+    }
+    match recorded() {
+        Some(Offered::Already) => Decision::Already,
+        Some(_) => Decision::Nothing,
+        None => Decision::Start,
+    }
 }
 
 /// The `desktop_offer` request a packaged bridge sends for `launcher`.
@@ -157,12 +184,23 @@ fn offer_request(launcher: &str) -> Value {
 /// that is when an earlier offer worked. `false` when no older extension
 /// started this process.
 pub(crate) fn offer_for_bridge(launcher: Option<&str>, packaged: bool) -> bool {
-    offer_for_bridge_with(launcher, packaged, crate::client::ctl_if_running_passive)
+    offer_for_bridge_with(
+        launcher,
+        packaged,
+        crate::client::ctl_if_running_passive,
+        desktop_offer::offered_already,
+    )
 }
 
-/// [`offer_for_bridge`] with the way the request reaches the daemon given,
-/// so a test can hand in one that never answers and reaches no daemon.
-fn offer_for_bridge_with<F, Fut>(launcher: Option<&str>, packaged: bool, send: F) -> bool
+/// [`offer_for_bridge`] with the way the request reaches the daemon and the
+/// record lookup given, so a test can hand in a sender that never answers
+/// and reaches no daemon, and a lookup that reads no state folder.
+fn offer_for_bridge_with<F, Fut>(
+    launcher: Option<&str>,
+    packaged: bool,
+    send: F,
+    offered_already: impl FnOnce() -> bool,
+) -> bool
 where
     F: FnOnce(Value) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Option<Value>>> + Send + 'static,
@@ -188,7 +226,7 @@ where
             }
         });
     }
-    desktop_offer::offered_already()
+    offered_already()
 }
 
 #[cfg(test)]
@@ -223,36 +261,54 @@ mod tests {
         );
     }
 
+    /// Only the missing launcher version is checked through `answer_ctl`
+    /// itself: that answer comes before any decision, so it reaches neither
+    /// the record nor an opener.
     #[test]
     fn the_daemon_needs_the_launcher_version() {
         assert_eq!(
             answer_ctl(&json!({ "v": 1, "cmd": DESKTOP_OFFER_COMMAND })),
             Err("desktop_offer needs the launcher version".to_string())
         );
-        assert_eq!(
-            answer_ctl(
-                &json!({ "v": 1, "cmd": DESKTOP_OFFER_COMMAND, "launcher": VERSION, "version": VERSION })
-            ),
-            Ok(json!({ "offer": "nothing" })),
-            "an extension of this version gets nothing"
-        );
+    }
+
+    /// A record lookup for a decision that must not read the record.
+    fn unread() -> Option<Offered> {
+        panic!("the record is not read for this decision")
     }
 
     /// The daemon builds at its own version, so it offers only to a bridge
-    /// of that version. These answers come before the record is read, so
-    /// the test touches no state.
+    /// of that version, and only for an older extension on macOS or
+    /// Windows. None of these reads the record.
     #[test]
     fn the_daemon_offers_only_to_a_bridge_of_its_own_version() {
-        for bridge in [json!("0.0.1"), json!("999.0.0"), Value::Null] {
-            let mut req = offer_request("0.1.0");
-            req["version"] = bridge.clone();
+        for bridge in [Some("0.0.1"), Some("999.0.0"), None] {
             assert_eq!(
-                answer_ctl(&req),
-                Ok(json!({ "offer": "nothing" })),
-                "{bridge}"
+                daemon_decision(bridge, "0.1.0", true, unread),
+                Decision::Nothing,
+                "{bridge:?}"
             );
         }
+        assert_eq!(
+            daemon_decision(Some(VERSION), VERSION, true, unread),
+            Decision::Nothing,
+            "an extension of this version"
+        );
+        assert_eq!(
+            daemon_decision(Some(VERSION), "0.1.0", false, unread),
+            Decision::Nothing,
+            "not macOS or Windows"
+        );
         assert_eq!(offer_request("0.1.0")["version"], VERSION);
+    }
+
+    #[test]
+    fn the_record_decides_once_the_versions_allow_an_offer() {
+        let due =
+            |recorded: Option<Offered>| daemon_decision(Some(VERSION), "0.1.0", true, || recorded);
+        assert_eq!(due(None), Decision::Start);
+        assert_eq!(due(Some(Offered::Already)), Decision::Already);
+        assert_eq!(due(Some(Offered::Nothing)), Decision::Nothing, "no record");
     }
 
     /// The bridge sends the request and returns at once, even when nothing
@@ -261,19 +317,28 @@ mod tests {
     async fn the_bridge_never_waits_for_the_daemon() {
         let (sent, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let started = std::time::Instant::now();
-        let _ = offer_for_bridge_with(Some("0.1.0"), true, move |request| {
-            sent.send(request).unwrap();
-            // A daemon that never answers.
-            std::future::pending::<anyhow::Result<Option<Value>>>()
-        });
+        let offered = offer_for_bridge_with(
+            Some("0.1.0"),
+            true,
+            move |request| {
+                sent.send(request).unwrap();
+                // A daemon that never answers.
+                std::future::pending::<anyhow::Result<Option<Value>>>()
+            },
+            || true,
+        );
+        assert!(offered, "the note follows the record lookup");
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
         let request = seen.recv().await.expect("the request went out");
         assert_eq!(request, offer_request("0.1.0"));
 
         let never = |_| async { panic!("only a packaged bridge asks the daemon") };
-        let _ = offer_for_bridge_with(Some("0.1.0"), false, never);
+        assert!(!offer_for_bridge_with(Some("0.1.0"), false, never, || {
+            false
+        }));
+        let unread = || panic!("no older extension, no record lookup");
         assert!(
-            !offer_for_bridge_with(None, true, never),
+            !offer_for_bridge_with(None, true, never, unread),
             "no older extension"
         );
     }
