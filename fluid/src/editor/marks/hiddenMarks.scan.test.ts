@@ -32,6 +32,7 @@ import {
   treeWalkWork,
 } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
+import { parsedState } from "../../test/parse";
 
 afterEach(cleanupMarkViews);
 
@@ -172,7 +173,7 @@ function referenceMarksOnLine(
     );
   };
 
-  syntaxTree(state).iterate({
+  syntaxTree(parsedState(state)).iterate({
     from: at.from,
     to: at.to,
     enter: (ref) => {
@@ -426,7 +427,7 @@ const KINDS = new Set<MarkKind>(["strong", "em", "strike", "code", "link"]);
 /** The paragraphs and other top blocks, as line ranges. */
 function blocks(state: EditorState): { first: number; last: number }[] {
   const out: { first: number; last: number }[] = [];
-  const top = syntaxTree(state).topNode;
+  const top = syntaxTree(parsedState(state)).topNode;
   for (let node = top.firstChild; node; node = node.nextSibling) {
     out.push({
       first: state.doc.lineAt(node.from).number,
@@ -446,7 +447,7 @@ function compare(state: EditorState, where: string): number {
     for (let n = 1; n <= lines; n += 1) {
       const want = referenceMarksOnLine(state, n, options);
       const at = `${where}, line ${String(n)}, always ${String(always)}`;
-      expect(marksOnLine(state, n, options), at).toEqual(want);
+      expect(marksOnLine(parsedState(state), n, options), at).toEqual(want);
       expect(whole.lines[n - 1], `${at}, whole page`).toEqual(want);
       checked += want.length;
     }

@@ -139,7 +139,7 @@ describe.each(
       extensions: [...lineSeparatorFor(text), ...baseExtensions(false)],
     }),
   );
-  const cells = gridTables(probe).flatMap((table, t) =>
+  const cells = gridTables(parsedState(probe)).flatMap((table, t) =>
     table.rows.flatMap((row) => row.map((cell) => [t, cell.row, cell.column])),
   );
 
@@ -153,7 +153,7 @@ describe.each(
       ]);
       expect(main.state.facet(cellPreviewLayers).length).toBeGreaterThan(0);
       const before = main.state;
-      const cell = gridTables(before)[t]?.rows[row]?.[column];
+      const cell = gridTables(parsedState(before))[t]?.rows[row]?.[column];
       if (!cell) throw new Error("cell vanished");
       const at = cell.content.to;
       const editor = openAt(main, at, false);
@@ -435,7 +435,9 @@ describe("hidden-mark properties in a cell", () => {
     const failures: string[] = [];
     let checks = 0;
     const now = () => bytes(main.state);
-    const cells = gridTables(main.state).flatMap((table) => table.rows.flat());
+    const cells = gridTables(parsedState(main.state)).flatMap((table) =>
+      table.rows.flat(),
+    );
     const done = (): CellRun => ({
       failures,
       checks,
@@ -445,7 +447,7 @@ describe("hidden-mark properties in a cell", () => {
     for (const cell of cells) {
       const { from, to } = cell.content;
       const n = main.state.doc.lineAt(from).number;
-      const runs = runsOnLine(probe.state, n).filter(
+      const runs = runsOnLine(parsedState(probe.state), n).filter(
         (run) => run.from >= from && run.to <= to,
       );
       const marks = runs.flatMap((run) =>
@@ -633,7 +635,7 @@ describe("hidden-mark properties in a cell", () => {
     function press(row: string, at: number, key: string) {
       const text = `| a | b |\n| - | - |\n${row}\n`;
       const main = markView(text, { mode });
-      const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+      const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
       if (!cell) throw new Error("no cell");
       const pos = text.indexOf(row) + at;
       const view = openAt(main, pos, false).view;

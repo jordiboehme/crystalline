@@ -54,6 +54,7 @@ import { gridExtension } from "./index";
 import { prefetchGrid } from "./loader";
 import { openCellField, openCellRange, setOpenCell } from "./openCell";
 import { gridTables } from "./structure";
+import { parsedState } from "../../test/parse";
 
 const DOC = "| a | **b** |\n| - | - |\n| 1 | 2 |\n";
 /** The `**b**` cell's content, and inside it the `b`. */
@@ -112,7 +113,7 @@ function open(
   column: number,
   where: "start" | "end" | number = "end",
 ): EditorView {
-  const cell = gridTables(main.state)[0]?.rows[row]?.[column];
+  const cell = gridTables(parsedState(main.state))[0]?.rows[row]?.[column];
   if (!cell) throw new Error(`no cell ${String(row)}/${String(column)}`);
   const at =
     where === "start"
@@ -805,7 +806,7 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
 
   it("draws its marks and atoms the moment it opens", () => {
     const main = page(text, { room });
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from, false).view;
     expect(syntaxTree(view.state).length).toBeGreaterThanOrEqual(
@@ -822,7 +823,7 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
     main.dispatch({
       effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
     });
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from, false).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
@@ -865,7 +866,7 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     main.dispatch({
       effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
     });
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from, false).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
@@ -903,7 +904,7 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     main.dispatch({
       effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
     });
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from, false).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
@@ -952,7 +953,7 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     main.dispatch({
       effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
     });
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from + 4, false).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);

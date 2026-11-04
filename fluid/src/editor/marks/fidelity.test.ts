@@ -75,6 +75,7 @@ import type { DeleteOutcome } from "./deleteCheck";
 import { deletionOutcome } from "./deleteCheck";
 import { toggleFormat } from "./formatting";
 import { linkDefinition, marksOnLine, runsOnLine } from "./hiddenMarks";
+import { parsedState } from "../../test/parse";
 
 const DIALECT = import.meta.glob<string>("../fixtures/dialect/*.md", {
   query: "?raw",
@@ -281,7 +282,7 @@ const WRAPPING = new Set(["strong", "em", "strike", "code", "link"]);
  * they are always taken.
  */
 function wraps(state: EditorState, n: number): boolean {
-  return marksOnLine(state, n, { always: true }).some(
+  return marksOnLine(parsedState(state), n, { always: true }).some(
     (mark) =>
       (mark.side === "open" || mark.side === "close") &&
       mark.partner === null &&
@@ -292,7 +293,7 @@ function wraps(state: EditorState, n: number): boolean {
 /** The lines a caret can stand on in main: every line not in a drawn table. */
 function textLines(state: EditorState): number[] {
   const skip = new Set<number>();
-  for (const table of gridTables(state)) {
+  for (const table of gridTables(parsedState(state))) {
     const first = state.doc.lineAt(table.from).number;
     const last = state.doc.lineAt(table.to).number;
     for (let n = first; n <= last; n++) skip.add(n);
@@ -324,7 +325,7 @@ function boundariesOf(view: EditorView): Boundary[] {
   const out: Boundary[] = [];
   for (const n of textLines(view.state)) {
     awayFrom(view, n);
-    const runs = runsOnLine(view.state, n);
+    const runs = runsOnLine(parsedState(view.state), n);
     const marks = runs.flatMap((run) =>
       run.marks.map((mark): [number, number] => [mark.from, mark.to]),
     );
@@ -345,7 +346,7 @@ function boundariesOf(view: EditorView): Boundary[] {
 /** How many characters of `pos`'s line a reader sees before `pos`. */
 function visibleBefore(state: EditorState, pos: number): number {
   const line = state.doc.lineAt(pos);
-  const marks = marksOnLine(state, line.number, { always: true });
+  const marks = marksOnLine(parsedState(state), line.number, { always: true });
   let count = 0;
   for (let p = line.from; p < pos; p += 1) {
     if (!marks.some((m) => m.from <= p && p < m.to)) count += 1;
@@ -538,7 +539,7 @@ function moving(probe: Probe, plan: Plan, tally: Tally): void {
     awayFrom(view, n);
     const line = view.state.doc.line(n);
     const stops = new Set([line.from, line.to]);
-    for (const run of runsOnLine(view.state, n)) {
+    for (const run of runsOnLine(parsedState(view.state), n)) {
       stops.add(run.from);
       stops.add(run.to);
     }
@@ -855,9 +856,9 @@ function shapesOf(
   const shapes = new Set<string>();
   for (const edit of edits) {
     if (edit.kind === "math") {
-      shapes.add(`math ${mathAt(state, edit.at)?.form ?? "?"}`);
+      shapes.add(`math ${mathAt(parsedState(state), edit.at)?.form ?? "?"}`);
     } else if (edit.kind === "language") {
-      const fence = codeFenceAt(state, edit.at);
+      const fence = codeFenceAt(parsedState(state), edit.at);
       const head = state.doc.lineAt(edit.at).text;
       const word = fence
         ? state.doc.sliceString(fence.word.from, fence.word.to)

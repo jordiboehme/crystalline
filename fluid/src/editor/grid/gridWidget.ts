@@ -663,9 +663,30 @@ function drawnTables(value: DecorationSet): GridTable[] {
   return out;
 }
 
+/**
+ * Whether the line holding `pos` reads as something other than a table row
+ * to the page: indented four columns or more (code), or opening a list
+ * item or a quote, where the grid draws no table either (`gridDraws`).
+ */
+function notATableLine(doc: Text, pos: number): boolean {
+  const line = doc.lineAt(pos);
+  let column = 0;
+  let at = 0;
+  while (at < line.text.length && /[ \t]/.test(line.text[at] ?? "")) {
+    column += line.text[at] === "\t" ? 4 - (column % 4) : 1;
+    at += 1;
+  }
+  if (column >= 4) return true;
+  return /^(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)|^>/.test(line.text.slice(at));
+}
+
 /** `table` read again from `doc` over `from` to `to`, or null if no table. */
 function readAgain(doc: Text, from: number, to: number): GridTable | null {
-  if (from >= to || parseTable(doc.sliceString(from, to)) === null) {
+  if (
+    from >= to ||
+    notATableLine(doc, from) ||
+    parseTable(doc.sliceString(from, to)) === null
+  ) {
     return null;
   }
   return tableIn(doc, from, to);

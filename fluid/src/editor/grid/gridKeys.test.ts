@@ -38,6 +38,7 @@ import {
   setOpenCell,
 } from "./openCell";
 import { gridTables } from "./structure";
+import { parsedState } from "../../test/parse";
 
 /** Lines: 1 Intro, 2 blank, 3-5 the table, 6 blank, 7 Outro, 8 empty. */
 const DOC = "Intro\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nOutro\n";
@@ -78,7 +79,7 @@ function cellEl(main: EditorView, row: number, column: number): HTMLElement {
 
 /** The table's cell at `row` and `column`, from the current state. */
 function cellAt(main: EditorView, row: number, column: number) {
-  const cell = gridTables(main.state)[0]?.rows[row]?.[column];
+  const cell = gridTables(parsedState(main.state))[0]?.rows[row]?.[column];
   if (!cell) throw new Error(`no cell ${String(row)}/${String(column)}`);
   return cell;
 }
@@ -180,7 +181,7 @@ describe("in a cell: Tab and Shift+Tab", () => {
     const main = solo();
     open(main, 1, 1);
     expect(press(cellView(main), "Tab")).toBe(true);
-    expect(gridTables(main.state)[0]?.rows.length).toBe(3);
+    expect(gridTables(parsedState(main.state))[0]?.rows.length).toBe(3);
     expectOpen(main, 2, 0);
     expect(bytes(main.state)).toBe(
       "Intro\n\n| a | b |\n| - | - |\n| 1 | 2 |\n|  |  |\n\nOutro\n",
@@ -295,7 +296,7 @@ describe("in a room, the added row is its own undo step (R14, R15)", () => {
     expectOpen(main, 2, 0);
     expect(main.hasFocus).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("no table");
     const state = remoteAwareness.getStates().get(awareness.clientID) as
       { cursor?: { anchor: unknown; head: unknown } | null } | undefined;
@@ -523,9 +524,9 @@ describe.each(PIPELESS_FIXTURES)("keys without outer pipes: $name", (f) => {
     // A new row's cells are empty, and an empty edge cell needs its edge
     // pipe to exist: the one place R23 adds pipes a table did not have.
     expect(bytes(main.state)).toBe(withTable(f, [...f.lines, "|  |  |"]));
-    expect(gridTables(main.state)[0]?.rows.map((r) => r.length)).toEqual([
-      2, 2, 2, 2,
-    ]);
+    expect(
+      gridTables(parsedState(main.state))[0]?.rows.map((r) => r.length),
+    ).toEqual([2, 2, 2, 2]);
     const editor = activeCell(main);
     if (!editor) throw new Error("no cell editor mounted");
     typeIn(editor, "5");
@@ -651,7 +652,7 @@ describe("grid navigation", () => {
     const el = navOn(main, 1, 1);
     keyOn(el, "|", { shiftKey: true });
     expect(bytes(main.state)).toBe(WIDE.replace("| 2 |", "| \\| |"));
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(3);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(3);
   });
 
   test("a chord is not a printable character", () => {
@@ -712,7 +713,9 @@ describe("grid navigation", () => {
         lines[2] = line;
         expect(bytes(main.state)).toBe(withTable(f, lines));
         expect(
-          gridTables(main.state)[0]?.rows.map((row) => row.map((c) => c.text)),
+          gridTables(parsedState(main.state))[0]?.rows.map((row) =>
+            row.map((c) => c.text),
+          ),
         ).toEqual([
           ["a", "b"],
           column === 0 ? ["", "2"] : ["1", ""],
@@ -902,7 +905,7 @@ describe("read-only (R17)", () => {
     // The frozen buffer closed the cell; its old view runs no grid key.
     expect(press(view, "Tab")).toBe(false);
     expect(bytes(main.state)).toBe(DOC);
-    expect(gridTables(main.state)[0]?.rows.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows.length).toBe(2);
   });
 
   test("the main view's entry keys open nothing", () => {
@@ -1098,7 +1101,7 @@ describe("a large paste above a drawn table (D58)", () => {
     expectIntent(main, 1, 1);
     catchUp(main);
     expect(drawn(main)).toEqual(
-      gridTables(main.state).map(({ from, to }) => ({ from, to })),
+      gridTables(parsedState(main.state)).map(({ from, to }) => ({ from, to })),
     );
     expectIntent(main, 1, 1);
   });
@@ -1157,7 +1160,7 @@ describe("a large paste above a drawn table (D58)", () => {
     catchUp(main);
     expectIntent(main, 1, 1);
     expect(drawn(main)).toEqual(
-      gridTables(main.state).map(({ from, to }) => ({ from, to })),
+      gridTables(parsedState(main.state)).map(({ from, to }) => ({ from, to })),
     );
   });
 });
@@ -1181,5 +1184,100 @@ describe("a peer's paste above a table in view (D58)", () => {
     expect(bytes(main.state)).toBe(prose(0.3) + DOC.replace("| 2 |", "| 2x |"));
     catchUp(main);
     expectOpen(main, 1, 1);
+  });
+});
+
+/**
+ * The open cell and the grid read the same tree in one update (R4-1). A
+ * small paste that ends in an open fence above a table in view: the state's
+ * own tree stops short, and the grid draws the table it carried. The open
+ * cell used to take one more parse step of its own, read the fence to the
+ * end and close, while the cell editor stayed mounted and took typing.
+ */
+describe("a small paste with an open fence above a table in view (R4-1)", () => {
+  test("keeps the open cell and the grid in step", () => {
+    const main = solo();
+    open(main, 1, 1);
+    const paste = "Para one.\n\nPara two **b**.\n\n```\n";
+    onJumpingClock(() => {
+      main.dispatch({
+        changes: { from: 0, insert: paste },
+        userEvent: "input.paste",
+      });
+    });
+    expect(syntaxTree(main.state).length).toBeLessThan(paste.length);
+    // The grid draws the table, so the cell is open in it and mounted.
+    expect(drawn(main)).toHaveLength(1);
+    expectOpen(main, 1, 1);
+    // Once the tree reads the fence, both let go together.
+    catchUp(main);
+    expect(drawn(main)).toEqual([]);
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(activeCell(main)).toBeNull();
+  });
+});
+
+/**
+ * A table read again from its lines is refused where the tree would not
+ * draw one (R4-2): a header line turned into a list item or a quote, or
+ * indented into code.
+ */
+describe("a carried table the page no longer reads as a table (R4-2)", () => {
+  const big = prose(60);
+  test.each([
+    ["a list item", "- "],
+    ["an ordered list item", "1. "],
+    ["a quote", "> "],
+    ["indented code", "    "],
+  ])("is not drawn once its header line becomes %s", (_name, lead) => {
+    const main = solo();
+    open(main, 1, 1);
+    onJumpingClock(() => {
+      main.dispatch({
+        changes: { from: 0, insert: big },
+        userEvent: "input.paste",
+      });
+    });
+    expect(drawn(main)).toHaveLength(1);
+    const text = main.state.doc.toString();
+    const rows = ["| a | b |", "| - | - |", "| 1 | 2 |"].map((row) =>
+      text.indexOf(row),
+    );
+    onJumpingClock(() => {
+      main.dispatch({
+        changes:
+          lead === "    "
+            ? rows.map((at) => ({ from: at, insert: lead }))
+            : { from: rows[0] ?? 0, insert: lead },
+        userEvent: "input",
+      });
+    });
+    expect(syntaxTree(main.state).length).toBeLessThan(main.state.doc.length);
+    expect(drawn(main)).toEqual([]);
+  });
+});
+
+/**
+ * A peer empties the last cell of a row without outer pipes while the tree
+ * is short (R10 with D58). The table the grid carries is read again from
+ * the new text, where the row has no last cell any more: the open cell is
+ * gone at once, as when the tree reaches it, not kept until the parse
+ * catches up.
+ */
+describe("a cell a peer takes away while the tree is short", () => {
+  test("closes as gone at once", async () => {
+    const table = "a | b\n--|--\n1 | 2\n";
+    const { main, rtext } = roomMain(`${prose(0.3)}${table}`, layers());
+    open(main, 1, 1);
+    const heard = vi.fn<(reason: CloseReason) => void>();
+    onCellClosed(main, heard);
+    const at = rtext.toJSON().lastIndexOf("2");
+    onJumpingClock(() => {
+      rtext.delete(at, 1);
+    });
+    expect(syntaxTree(main.state).length).toBeLessThan(at);
+    await flush();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(main.state.field(openCellField)).toBeNull();
   });
 });

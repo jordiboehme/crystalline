@@ -15,7 +15,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AssetResolver } from "../api/files";
 import { ThemeProvider } from "../theme/ThemeProvider";
@@ -38,6 +38,14 @@ vi.mock("@panzoom/panzoom", () => ({
 }));
 
 const DOMAIN = "eng";
+
+// The body that draws the text is a lazy part (D37's pattern): its first
+// import compiles the renderer, which on a loaded machine outlasts the wait
+// in `renderMarkdown`. It is loaded once here, so a test waits for the text,
+// not for the compile.
+beforeAll(async () => {
+  await import("./MarkdownBody");
+}, 120_000);
 
 /** The renderer is a lazy seam: nothing is on screen until its chunk lands. */
 async function renderMarkdown(source: string, domain?: string) {

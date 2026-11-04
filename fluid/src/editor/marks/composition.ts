@@ -351,7 +351,7 @@ function correctionOf(now: EditorState): Correction | null {
 
 /** The part of CodeMirror's DOM observer the judge reads. Internal. */
 interface DomObserver {
-  delayedFlush: number;
+  delayedFlush: unknown;
   delayedAndroidKey: unknown;
 }
 
@@ -362,13 +362,19 @@ interface DomObserver {
  * waits there. A dispatch before that flush makes CodeMirror throw the
  * waiting changes away and draw over them, so the text is lost (D59).
  */
-function domPending(view: EditorView): boolean {
+export function domPending(view: EditorView): boolean {
   const observer = (view as unknown as { observer?: DomObserver }).observer;
   if (!observer) return false;
   // Only what CodeMirror itself holds back. Records its observer has not
   // delivered yet are not asked for: taking them would keep them from the
   // flush that reads them.
-  return observer.delayedFlush >= 0 || Boolean(observer.delayedAndroidKey);
+  // A number only: `null >= 0` is true, and a CodeMirror that kept null for
+  // "no delayed flush" would hold every judge back for good (R4-3).
+  const { delayedFlush } = observer;
+  return (
+    (typeof delayedFlush === "number" && delayedFlush >= 0) ||
+    Boolean(observer.delayedAndroidKey)
+  );
 }
 
 /**

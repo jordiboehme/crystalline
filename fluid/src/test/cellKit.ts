@@ -131,7 +131,7 @@ export function cellOf(
   row: number,
   column: number,
 ): GridCell {
-  const table = gridTables(main.state)[0];
+  const table = gridTables(parsedState(main.state))[0];
   const cell = table?.rows[row]?.[column];
   if (!cell) throw new Error(`no cell ${row}/${column}`);
   return cell;

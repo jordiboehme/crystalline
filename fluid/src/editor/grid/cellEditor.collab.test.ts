@@ -28,6 +28,7 @@ import {
   openCellField,
   openCellRange,
 } from "./openCell";
+import { parsedState } from "../../test/parse";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
 const TWO_ROWS = "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n";
@@ -139,7 +140,7 @@ describe("cell editor under co-editing", () => {
     expect(document.activeElement).toBe(main.contentDOM);
     // Any later update of main publishes its caret while it has focus.
     main.dispatch({ selection: main.state.selection });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("the header table is gone");
     const cursor = (
       remoteAwareness.getStates().get(local.clientID) as
@@ -339,7 +340,7 @@ describe("cell editor under co-editing", () => {
       const merged = f.text.replace(f.lines.join("\n"), lines.join("\n"));
       expect(rtext.toJSON()).toBe(merged);
       expect(main.state.doc.toString()).toBe(merged);
-      const table = gridTables(main.state)[0];
+      const table = gridTables(parsedState(main.state))[0];
       expect(table?.rows[1]?.map((c) => c.text)).toEqual(["", "", "2"]);
       expect(table?.model.columns).toBe(2);
       // The local cell stays open on one of the two empty cells of row 1:

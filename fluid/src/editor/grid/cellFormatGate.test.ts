@@ -32,6 +32,7 @@ import {
 import { CELL_NOT_READ, cellParseBudget } from "./cellEditor";
 import { prefetchGrid } from "./loader";
 import { gridTables } from "./structure";
+import { parsedState } from "../../test/parse";
 
 /**
  * While set, the clock jumps a second at every look, as on a machine too
@@ -82,7 +83,7 @@ describe.each(ROOMS)(
       main.dispatch({
         effects: StateEffect.appendConfig.of(cellParseBudget.of(0)),
       });
-      const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+      const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
       if (!cell) throw new Error("no cell");
       const view = openAt(main, cell.content.from, false).view;
       expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);

@@ -26,6 +26,7 @@ import { EditorView } from "@codemirror/view";
 import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
 
+import { parseAdvanced } from "../parseProgress";
 import type { GridCell, GridTable } from "./structure";
 import { cellAt, gridTableAt } from "./structure";
 
@@ -101,25 +102,30 @@ function cellAtHead(
   ) {
     line = state.doc.line(line.number + 1);
   }
-  // A state's own tree may stop short after a change while the parse it
-  // shares already went on (the grid asked for it): read that one then.
-  const tree =
-    syntaxTree(state).length >= line.to
-      ? syntaxTree(state)
-      : ensureSyntaxTree(state, line.to, 0);
-  if (!tree || tree.length < line.to) return drawnCellAt(state, head);
+  // The state's own tree, as the grid reads it in the same update. Short
+  // of the table, the cell is read from the tables the grid draws (D58),
+  // never from a parse step of its own: that could read text the grid
+  // still draws as a table as code, and close a cell the grid keeps (R4-1).
+  const tree = syntaxTree(state);
+  if (tree.length < line.to) return drawnCellAt(state, head);
   const table = gridTableAt(state, head, tree);
   return table ? cellAt(table, head) : null;
 }
 
 /**
  * The cell holding `head` in a table the grid still draws from its own
- * lines while the parse has not reached it (D58), or `undefined`: not known.
+ * lines while the parse has not reached it (D58). That table is read again
+ * from the current text on every change, so a head in it with no cell (a
+ * peer emptied a last cell without a pipe after it, R10) is gone, as the
+ * tree will say. `undefined` when no drawn table holds `head`: not known.
  */
-function drawnCellAt(state: EditorState, head: number): GridCell | undefined {
+function drawnCellAt(
+  state: EditorState,
+  head: number,
+): GridCell | null | undefined {
   for (const read of state.facet(drawnGridTables)) {
     const table = read(state).find((t) => t.from <= head && head <= t.to);
-    if (table) return cellAt(table, head) ?? undefined;
+    if (table) return cellAt(table, head);
   }
   return undefined;
 }
@@ -219,7 +225,9 @@ export const openCellField = StateField.define<OpenCell | null>({
     }
     if (next === null) return null;
     if (!set) {
-      if (!tr.docChanged) return value;
+      // A parse that moved on can read the cell's table as gone (R4-1).
+      if (!tr.docChanged)
+        return parseAdvanced(tr) ? settle(tr.state, next) : value;
       const before = cellAtHead(tr.startState, next.head);
       if (before && closingDeleted(tr.startState, before, tr.changes)) {
         return null;

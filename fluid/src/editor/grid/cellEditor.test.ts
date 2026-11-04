@@ -115,7 +115,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
         expect(cell.view.contentDOM.textContent).toBe(
           `${f.cells[row ?? 0]?.[column ?? 0] ?? ""}x|y`,
         );
-        const table = gridTables(main.state)[0];
+        const table = gridTables(parsedState(main.state))[0];
         expect(table?.rows.map((r) => r.length)).toEqual([2, 2, 2]);
         expect(table?.rows[row ?? 0]?.[column ?? 0]?.text).toBe(
           `${f.cells[row ?? 0]?.[column ?? 0] ?? ""}x\\|y`,
@@ -422,7 +422,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     const { main, cell } = open("|A|B|\n|-|-|\n|1|2|\n");
     typeIn(cell, "\\");
     expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|1\\\\|2|\n");
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("1\\");
     // Backspace over the visible backslash removes the pair.
     expect(press(cell.view, "Backspace")).toBe(true);
@@ -433,7 +433,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     const { main, cell } = open("|A|B|\n|-|-|\n|a\\b|2|\n");
     expect(press(cell.view, "Backspace")).toBe(true);
     expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|a\\\\|2|\n");
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("a\\");
   });
 
@@ -443,7 +443,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     const cell = openAt(main, content.from + 2);
     typeIn(cell, "|");
     expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| x\\\\\\|y | 2 |\n");
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("x\\|y");
   });
 
@@ -454,7 +454,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(cell.view.contentDOM.textContent).toBe("a\\x|b");
     expect(press(cell.view, "Backspace")).toBe(true);
     expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| a\\\\\\|b | 2 |\n");
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("a\\|b");
   });
 
@@ -476,7 +476,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(bytes(main.state)).toBe(
       "| a | b |\n| - | - |\n| x\\\\Z\\|y | 2 |\n",
     );
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("x\\Z|y");
   });
 
@@ -485,7 +485,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     typeIn(cell, "\\");
     typeIn(cell, "U");
     expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|C:\\\\U|2|\n");
-    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(gridTables(parsedState(main.state))[0]?.rows[1]?.length).toBe(2);
     expect(cell.view.contentDOM.textContent).toBe("C:\\U");
   });
 

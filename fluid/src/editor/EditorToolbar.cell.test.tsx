@@ -29,6 +29,7 @@ import { gridTables } from "./grid/structure";
 import { formatStateListener, hiddenMarkLayer } from "./marks";
 import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
+import { parsedState } from "../test/parse";
 
 /** The hidden-mark layer in show mode: these tests pin a touched line's marks. */
 const showModeMarks = [hiddenMarkLayer(), marksOnEditLine.of(true)];
@@ -49,7 +50,7 @@ function mainWithOpenCell(): { main: EditorView; cell: EditorView } {
     floatingContextListener(() => undefined),
   ]);
   main.dispatch({ selection: { anchor: 4 } }); // inside "## Crew"
-  const ada = gridTables(main.state)[0]?.rows[1]?.[0];
+  const ada = gridTables(parsedState(main.state))[0]?.rows[1]?.[0];
   if (!ada) throw new Error("no cell");
   main.dispatch({
     effects: setOpenCell.of({
@@ -183,7 +184,7 @@ describe("a torn-down cell's parked selection (round 2 A and B)", () => {
     ]);
     // A non-empty main selection outside the table, from before the cell.
     main.dispatch({ selection: { anchor: 3, head: 7 } });
-    const ada = gridTables(main.state)[0]?.rows[1]?.[0];
+    const ada = gridTables(parsedState(main.state))[0]?.rows[1]?.[0];
     if (!ada) throw new Error("no cell");
     main.dispatch({
       effects: setOpenCell.of({
@@ -315,7 +316,7 @@ describe("the pressed format buttons with a cell open (C8)", () => {
     ]);
     // Main's caret in the bold word, from before the cell.
     main.dispatch({ selection: { anchor: 4 } });
-    const ada = gridTables(main.state)[0]?.rows[1]?.[0];
+    const ada = gridTables(parsedState(main.state))[0]?.rows[1]?.[0];
     if (!ada) throw new Error("no cell");
     main.dispatch({
       effects: setOpenCell.of({

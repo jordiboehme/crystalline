@@ -211,7 +211,7 @@ describe("peers' carets in static cells", () => {
 describe.each(PIPELESS_FIXTURES)("presence without outer pipes: $name", (f) => {
   test("a peer's caret at either end of each cell is drawn in that cell", () => {
     const { main, rtext, remoteAwareness } = roomMain(f.text, layers());
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("no table");
     for (const row of table.rows) {
       for (const cell of row) {

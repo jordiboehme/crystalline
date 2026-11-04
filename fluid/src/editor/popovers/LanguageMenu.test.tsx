@@ -67,8 +67,18 @@ function moreButton(view: EditorView): HTMLElement {
   return el;
 }
 
+/**
+ * The language menu once it is ready: drawn, and its first field given the
+ * focus by the popover's effect, which runs after the menu is in the page.
+ * On a loaded machine a read between the two found the focus still on the
+ * buffer.
+ */
 async function languageMenu(): Promise<HTMLElement> {
-  return screen.findByRole("menu", { name: "Code language" });
+  const menu = await screen.findByRole("menu", { name: "Code language" });
+  await waitFor(() => {
+    expect(menu.contains(document.activeElement)).toBe(true);
+  });
+  return menu;
 }
 
 async function actionsMenu(): Promise<HTMLElement> {

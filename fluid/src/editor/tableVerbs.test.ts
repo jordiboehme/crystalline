@@ -79,7 +79,7 @@ function editor(
 describe("tableContextAt", () => {
   test("resolves the cell under the caret", () => {
     const v = editor(DOC, IN_TABLE);
-    const context = tableContextAt(v.state);
+    const context = tableContextAt(parsedState(v.state));
     expect(context).not.toBeNull();
     expect(context?.row).toBe(2);
     expect(context?.column).toBe(0);
@@ -87,9 +87,9 @@ describe("tableContextAt", () => {
 
   test("prose, fences and a pipe line inside a fence are not tables", () => {
     const v = editor(DOC, 2);
-    expect(tableContextAt(v.state)).toBeNull();
+    expect(tableContextAt(parsedState(v.state))).toBeNull();
     const fenced = editor("```text\n| a | b |\n|---|---|\n```\n", 12);
-    expect(tableContextAt(fenced.state)).toBeNull();
+    expect(tableContextAt(parsedState(fenced.state))).toBeNull();
   });
 
   test("the caret at the table's FIRST character is in the table", () => {
@@ -98,7 +98,7 @@ describe("tableContextAt", () => {
     // retry finds it. A side -1-only implementation passes every interior
     // test and fails this ordinary Home-key caret position.
     const v = editor(DOC, DOC.indexOf("| a"));
-    const context = tableContextAt(v.state);
+    const context = tableContextAt(parsedState(v.state));
     expect(context).not.toBeNull();
     expect(context?.row).toBe(0);
     expect(context?.column).toBe(0);
@@ -108,12 +108,12 @@ describe("tableContextAt", () => {
     // Side -1 carries this edge; one position further (the next line's
     // start) is the null case the prose test above already covers.
     const v = editor(DOC, DOC.indexOf("| 1 | 2 |") + "| 1 | 2 |".length);
-    expect(tableContextAt(v.state)).not.toBeNull();
+    expect(tableContextAt(parsedState(v.state))).not.toBeNull();
   });
 
   test("the delimiter row is row 1, and it is not a row to delete", () => {
     const v = editor(DOC, DOC.indexOf("| --- ") + 2);
-    expect(tableContextAt(v.state)?.row).toBe(1);
+    expect(tableContextAt(parsedState(v.state))?.row).toBe(1);
     // The rule is structure, not content: deleting it would stop the table
     // being a table, so the verb refuses rather than obliging.
     expect(tableDeleteRow(v)).toBe(false);
@@ -147,7 +147,7 @@ describe("tableContextAt", () => {
     // report column 1 - so the whole table is refused instead.
     const doc = "> | a | b |\n| --- | --- |\n> | 1 | 2 |\n";
     const v = editor(doc, doc.indexOf("| 1") + 3);
-    expect(tableContextAt(v.state)).toBeNull();
+    expect(tableContextAt(parsedState(v.state))).toBeNull();
     expect(tableAddColumnAfter(v)).toBe(false);
     expect(tablePrettify(v)).toBe(false);
     expect(docText(v.state)).toBe(doc);
@@ -168,7 +168,7 @@ describe("tableContextAt", () => {
 
     const bare = "abc | def\n--- | ---\nbar | baz\n";
     const v = editor(bare, bare.indexOf("bar") + 1);
-    expect(tableContextAt(v.state)?.column).toBe(0);
+    expect(tableContextAt(parsedState(v.state))?.column).toBe(0);
     expect(tableAddColumnAfter(v)).toBe(true);
     expect(docText(v.state)).toBe(
       "abc | Column | def\n--- | --- | ---\nbar |  | baz\n",

@@ -30,6 +30,7 @@ import {
   pendingFormat,
   toggleFormat,
 } from "./formatting";
+import { parsedState } from "../../test/parse";
 
 afterEach(cleanupMarkViews);
 
@@ -158,7 +159,7 @@ describe.each([
       const v = view(WRAPPED);
       expect(formatsOf(v, 4)).toEqual(["strong"]);
       expect(formatsOf(v, 6)).toEqual(["strong"]);
-      expect([...formatsAt(v.state, 5)]).toEqual(["strong"]);
+      expect([...formatsAt(parsedState(v.state), 5)]).toEqual(["strong"]);
     });
 
     it("Bold on a word inside it takes the bold off that word only", () => {
@@ -255,7 +256,7 @@ describe.each([
       setCaret(v, 2);
       toggleFormat(v, "strong");
       expect(bytes(v.state)).toBe("ab");
-      expect(formatsAt(v.state, 2).has("strong")).toBe(true);
+      expect(formatsAt(parsedState(v.state), 2).has("strong")).toBe(true);
     });
 
     it("a blur forgets what waits", async () => {
@@ -363,9 +364,9 @@ describe.each([
       const v = view("");
       typeText(v, "- ");
       expect(bytes(v.state)).toBe("- ");
-      expect(marksOnLine(v.state, 1).map((mark) => mark.kind)).toContain(
-        "list",
-      );
+      expect(
+        marksOnLine(parsedState(v.state), 1).map((mark) => mark.kind),
+      ).toContain("list");
     });
   });
 });
@@ -382,7 +383,7 @@ describe.each([
     typeText(v, "c");
     expect(bytes(v.state)).toBe("ab**c**");
     // The marks show on the caret's line.
-    expect(marksOnLine(v.state, 1)).toEqual([]);
+    expect(marksOnLine(parsedState(v.state), 1)).toEqual([]);
     expect(caret(v)).toBe(5);
   });
 

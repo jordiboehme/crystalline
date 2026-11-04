@@ -11,6 +11,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { cellForwarding } from "../editor/grid/cellEditor";
 import { gridTables } from "../editor/grid/structure";
 import { cleanupCells, openAt, soloMain } from "./cellKit";
+import { parsedState } from "./parse";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -32,7 +33,7 @@ const TEXT = [
 
 test("opens a cell after an edit whose parse ran out of time", () => {
   const main = soloMain(TEXT, [cellForwarding]);
-  const cell = gridTables(main.state)[0]?.rows[1]?.[0];
+  const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[0];
   if (!cell) throw new Error("no cell");
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));

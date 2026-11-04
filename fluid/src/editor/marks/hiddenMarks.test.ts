@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanupMarkViews, markView, setCaret } from "../../test/markKit";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, runsOnLine } from "./hiddenMarks";
+import { parsedState } from "../../test/parse";
 
 afterEach(cleanupMarkViews);
 
@@ -157,7 +158,7 @@ function check(c: Case, mode: Mode, shift: number, doc: string) {
   setCaret(view, line.from);
   const expected =
     mode === "hidden" ? c.hidden : (c.show ?? ([] satisfies Spelled[]));
-  expect(spelled(marksOnLine(view.state, c.line))).toEqual(
+  expect(spelled(marksOnLine(parsedState(view.state), c.line))).toEqual(
     expected.map(([from, to, kind, side]) => [
       from + shift,
       to + shift,
@@ -183,7 +184,7 @@ describe("marksOnLine", () => {
 
   it("pairs the two marks of a bold word with each other", () => {
     const view = markView("a **bold** c");
-    const marks = marksOnLine(view.state, 1);
+    const marks = marksOnLine(parsedState(view.state), 1);
     expect(marks.map((mark) => mark.partner)).toEqual([1, 0]);
   });
 
@@ -193,7 +194,7 @@ describe("marksOnLine", () => {
       adapter: "reflection",
     });
     setCaret(view, 1);
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [2, 12, "comment", "whole"],
     ]);
     expect(view.contentDOM.textContent).not.toContain("c -->");
@@ -202,28 +203,28 @@ describe("marksOnLine", () => {
 
   it("finds nothing in the source view", () => {
     const view = markView("a **bold** c", { raw: true });
-    expect(marksOnLine(view.state, 1)).toEqual([]);
+    expect(marksOnLine(parsedState(view.state), 1)).toEqual([]);
   });
 
   it("keeps a mark of a pair on its own line", () => {
     const view = markView("a **b\nc** d");
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [2, 4, "strong", "open"],
     ]);
-    expect(spelled(marksOnLine(view.state, 2))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 2))).toEqual([
       [7, 9, "strong", "close"],
     ]);
-    expect(marksOnLine(view.state, 1)[0]?.partner).toBeNull();
+    expect(marksOnLine(parsedState(view.state), 1)[0]?.partner).toBeNull();
   });
 
   it("takes an undefined [label] as text", () => {
     const view = markView("a [label] b");
-    expect(marksOnLine(view.state, 1)).toEqual([]);
+    expect(marksOnLine(parsedState(view.state), 1)).toEqual([]);
   });
 
   it("folds an image's brackets and address, keeping its alt text", () => {
     const view = markView("![alt](p.png)");
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [0, 2, "link", "open"],
       [5, 13, "link", "close"],
     ]);
@@ -231,7 +232,7 @@ describe("marksOnLine", () => {
 
   it("folds an autolink's angle brackets", () => {
     const view = markView("<https://x.y>");
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [0, 1, "link", "open"],
       [12, 13, "link", "close"],
     ]);
@@ -239,7 +240,7 @@ describe("marksOnLine", () => {
 
   it("folds a heading's closing run", () => {
     const view = markView("## Title ##");
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [0, 3, "heading", "prefix"],
       [9, 11, "heading", "close"],
     ]);
@@ -247,11 +248,11 @@ describe("marksOnLine", () => {
 
   it("folds strikethrough and the not-applicable box", () => {
     const view = markView("~~gone~~\n\n- [~] skipped");
-    expect(spelled(marksOnLine(view.state, 1))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 1))).toEqual([
       [0, 2, "strike", "open"],
       [6, 8, "strike", "close"],
     ]);
-    expect(spelled(marksOnLine(view.state, 3))).toEqual([
+    expect(spelled(marksOnLine(parsedState(view.state), 3))).toEqual([
       [10, 12, "list", "prefix"],
       [12, 16, "task", "prefix"],
     ]);
@@ -259,8 +260,8 @@ describe("marksOnLine", () => {
 
   it("leaves the frontmatter alone", () => {
     const view = markView("---\ntitle: **x**\n---\n\n**y**");
-    expect(marksOnLine(view.state, 2)).toEqual([]);
-    expect(marksOnLine(view.state, 5)).toHaveLength(2);
+    expect(marksOnLine(parsedState(view.state), 2)).toEqual([]);
+    expect(marksOnLine(parsedState(view.state), 5)).toHaveLength(2);
   });
 });
 
@@ -289,7 +290,9 @@ describe("show mode, on a line the caret does not touch", () => {
     it(`folds ${c.name}`, () => {
       const view = markView(c.doc, { mode: "show" });
       setCaret(view, view.state.doc.length);
-      expect(spelled(marksOnLine(view.state, c.line))).toEqual(c.hidden);
+      expect(spelled(marksOnLine(parsedState(view.state), c.line))).toEqual(
+        c.hidden,
+      );
     });
   }
 });
@@ -297,7 +300,9 @@ describe("show mode, on a line the caret does not touch", () => {
 describe("runsOnLine and runAt", () => {
   it("gives each hidden mark of a bold word its own run", () => {
     const view = markView("a **bold** c");
-    expect(runsOnLine(view.state, 1).map((run) => [run.from, run.to])).toEqual([
+    expect(
+      runsOnLine(parsedState(view.state), 1).map((run) => [run.from, run.to]),
+    ).toEqual([
       [2, 4],
       [8, 10],
     ]);
@@ -305,7 +310,7 @@ describe("runsOnLine and runAt", () => {
 
   it("joins touching marks into one run", () => {
     const view = markView("- [ ] task");
-    const runs = runsOnLine(view.state, 1);
+    const runs = runsOnLine(parsedState(view.state), 1);
     expect(runs.map((run) => [run.from, run.to, run.marks.length])).toEqual([
       [0, 6, 2],
     ]);
@@ -313,16 +318,16 @@ describe("runsOnLine and runAt", () => {
 
   it("finds the run at either edge of it and none between runs", () => {
     const view = markView("a **bold** c");
-    expect(runAt(view.state, 2)?.from).toBe(2);
-    expect(runAt(view.state, 4)?.to).toBe(4);
-    expect(runAt(view.state, 6)).toBeNull();
-    expect(runAt(view.state, 10)?.from).toBe(8);
+    expect(runAt(parsedState(view.state), 2)?.from).toBe(2);
+    expect(runAt(parsedState(view.state), 4)?.to).toBe(4);
+    expect(runAt(parsedState(view.state), 6)).toBeNull();
+    expect(runAt(parsedState(view.state), 10)?.from).toBe(8);
   });
 
   it("finds no run in show mode on the caret line", () => {
     const view = markView("a **bold** c", { mode: "show" });
     setCaret(view, 6);
-    expect(runsOnLine(view.state, 1)).toEqual([]);
-    expect(runAt(view.state, 2)).toBeNull();
+    expect(runsOnLine(parsedState(view.state), 1)).toEqual([]);
+    expect(runAt(parsedState(view.state), 2)).toBeNull();
   });
 });

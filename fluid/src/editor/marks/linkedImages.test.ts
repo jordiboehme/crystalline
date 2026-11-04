@@ -36,7 +36,10 @@ const LINKED = "a [![alt](src)](href) b";
 
 /** The marks of line 1 as `[from, to)` pairs. */
 function spans(view: EditorView, line = 1): [number, number][] {
-  return marksOnLine(view.state, line).map((mark) => [mark.from, mark.to]);
+  return marksOnLine(parsedState(view.state), line).map((mark) => [
+    mark.from,
+    mark.to,
+  ]);
 }
 
 /** Where the caret stops after each press of `key`, `times` times. */
@@ -112,7 +115,7 @@ describe("a linked image (D39)", () => {
 
   it("opens the outer link's popover, and a new address keeps the image", () => {
     const view = markView(LINKED);
-    const link = linkAt(view.state, 6);
+    const link = linkAt(parsedState(view.state), 6);
     expect(link).toMatchObject({
       from: 2,
       to: 21,
@@ -162,7 +165,7 @@ describe("brackets around a link (D39)", () => {
   it("leaves [[Target]] to the wikilink chip", () => {
     const view = markView("see [[Target]] here");
     expect(spans(view)).toEqual([]);
-    expect(linkAt(view.state, 8)).toBeNull();
+    expect(linkAt(parsedState(view.state), 8)).toBeNull();
   });
 });
 

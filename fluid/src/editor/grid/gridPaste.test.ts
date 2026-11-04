@@ -18,6 +18,7 @@ import { gridExtension } from "./index";
 import { openCellField, openCellRange, setOpenCell } from "./openCell";
 import { gridTables } from "./structure";
 import { cellForwarding } from "./cellEditor";
+import { parsedState } from "../../test/parse";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
 
@@ -38,7 +39,7 @@ function layers(): Extension[] {
 }
 
 function open(main: EditorView, row: number, column: number): EditorView {
-  const cell = gridTables(main.state)[0]?.rows[row]?.[column];
+  const cell = gridTables(parsedState(main.state))[0]?.rows[row]?.[column];
   if (!cell) throw new Error("no cell");
   const pos = cell.content.to;
   main.dispatch({
@@ -162,10 +163,9 @@ describe("multi-line text without a tab (finding 8)", () => {
       plain: "x\ny",
       html: "<meta charset='utf-8'><table><tr><th>x</th><th>z</th></tr><tr><td>y</td><td>w</td></tr></table>",
     });
-    expect(gridTables(main.state)[0]?.rows.map((r) => r[1]?.text)).toEqual([
-      "x",
-      "y",
-    ]);
+    expect(
+      gridTables(parsedState(main.state))[0]?.rows.map((r) => r[1]?.text),
+    ).toEqual(["x", "y"]);
   });
 
   test("other HTML does not make it a block", () => {
@@ -247,14 +247,14 @@ describe("paste of a block", () => {
     paste(view, { plain: "x\ty\nz\tw" });
     const text = bytes(main.state);
     expect(text).toBe("| a | b |\n| - | - |\n| x | y |\n| z | w |\n");
-    expect(gridTables(main.state)[0]?.rows).toHaveLength(3);
+    expect(gridTables(parsedState(main.state))[0]?.rows).toHaveLength(3);
   });
 
   test("adds a column for a wide block", () => {
     const main = soloMain(DOC, layers());
     const view = open(main, 1, 0);
     paste(view, { plain: "x\ty\tz" });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.model.columns).toBe(3);
     expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y", "z"]);
     expect(table?.rows[0]?.map((c) => c.text)).toEqual(["a", "b", "Column"]);
@@ -268,7 +268,7 @@ describe("paste of a block", () => {
       plain: "x\r\ny\r\n",
       html: "<table><tr><td>x</td><td></td></tr><tr><td>y</td><td></td></tr></table>",
     });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows.map((r) => r[0]?.text)).toEqual(["a", "x", "y"]);
   });
 
@@ -276,7 +276,7 @@ describe("paste of a block", () => {
     const main = soloMain(DOC, layers());
     const view = open(main, 1, 0);
     paste(view, { plain: "p|q\tr\\" });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows[1]?.map((c) => c.text)).toEqual(["p\\|q", "r\\"]);
     expect(table?.model.columns).toBe(2);
   });
@@ -362,7 +362,7 @@ describe.each(PIPELESS_FIXTURES)("paste without outer pipes: $name", (f) => {
     const view = open(main, 1, 0);
     paste(view, { plain: "p\tq\tr\ns\tt\tu\nv\tw\tx" });
     expect(bytes(main.state)).toBe(withTable(f, GROWN[f.name] ?? []));
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows.map((row) => row.map((c) => c.text))).toEqual([
       ["a", "b", "Column"],
       ["p", "q", "r"],
@@ -378,7 +378,7 @@ describe.each(PIPELESS_FIXTURES)("paste without outer pipes: $name", (f) => {
     const main = soloMain(f.text, layers());
     const view = open(main, 1, 0);
     paste(view, { plain: "\tq\ns\t" });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows.map((row) => row.map((c) => c.text))).toEqual([
       ["a", "b"],
       ["", "q"],
@@ -396,7 +396,7 @@ describe("ragged rows, CRLF and the undo landing", () => {
     const main = soloMain("| a | b |\n| - | - |\n| 1 |\n", layers());
     const view = open(main, 1, 0);
     paste(view, { plain: "x\ty" });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y"]);
     expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| x | y |\n");
   });
@@ -406,7 +406,7 @@ describe("ragged rows, CRLF and the undo landing", () => {
     const main = soloMain(doc, layers());
     const view = open(main, 1, 0);
     paste(view, { plain: "x\ty\tz" });
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y", "z"]);
     expect(bytes(main.state)).not.toContain("||");
     undo(main, activeCell(main)?.view ?? view);

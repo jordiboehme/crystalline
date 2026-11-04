@@ -422,7 +422,7 @@ describe("the category, as the server reads it (M1)", () => {
     const line = doc.split("\n")[0] ?? "";
     expect(observationCategory(line)).toEqual(span);
     const view = markView(`x\n${doc}`);
-    const categories = marksOnLine(view.state, 2).filter(
+    const categories = marksOnLine(parsedState(view.state), 2).filter(
       (mark) => mark.kind === "category",
     );
     expect(categories.map((mark) => [mark.from - 2, mark.to - 2])).toEqual(

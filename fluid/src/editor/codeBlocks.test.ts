@@ -44,6 +44,7 @@ import {
 import { cellForwarding } from "./grid/cellEditor";
 import { codeLanguageFor, languageOf } from "./codeLanguage";
 import { toggleLinePrefix } from "./toolbar";
+import { parsedState } from "../test/parse";
 
 afterEach(() => {
   cleanupMarkViews();
@@ -267,7 +268,7 @@ describe.each([
       ),
     ).toBe(true);
     expect(bytes(view.state)).toBe(text.replace("```ts", "```python"));
-    const below = paragraphBelowChanges(view.state, lineStart);
+    const below = paragraphBelowChanges(parsedState(view.state), lineStart);
     expect(below).not.toBeNull();
   });
 });
@@ -575,13 +576,13 @@ describe("the language word writer", () => {
       if (after === null) throw new Error("no change");
       const view = markView(after);
       // The editor: the parser's info and the header's word.
-      const info = codeFenceAt(view.state, 0);
+      const info = codeFenceAt(parsedState(view.state), 0);
       const editorWord = info
         ? view.state.doc.sliceString(info.word.from, info.word.to)
         : "";
       expect(editorWord === "" ? null : editorWord).toBe(read);
       let parsed: string | null = null;
-      syntaxTree(view.state).iterate({
+      syntaxTree(parsedState(view.state)).iterate({
         enter: (node) => {
           // The parser's info is the whole info string; its first word is
           // what the highlighting looks up.
@@ -649,17 +650,20 @@ describe("the language word writer", () => {
     const view = markView("a\n\n```ts\nx\n```\n\n```mermaid\ng\n```");
     expect(languageChanges(view.state, 4, "python")).toBeNull();
     expect(languageChanges(view.state, 0, "python")).toBeNull();
-    expect(codeFenceAt(view.state, 20)).toBeNull();
-    expect(codeFenceAt(view.state, 9)).toMatchObject({ from: 3, to: 14 });
+    expect(codeFenceAt(parsedState(view.state), 20)).toBeNull();
+    expect(codeFenceAt(parsedState(view.state), 9)).toMatchObject({
+      from: 3,
+      to: 14,
+    });
   });
 });
 
 describe("Add a paragraph below", () => {
   it("puts one line break after the closing fence", () => {
-    expect(apply("```\nx\n```", (s) => paragraphBelowChanges(s, 0))).toBe(
-      "```\nx\n```\n",
-    );
-    expect(apply(DOC, (s) => paragraphBelowChanges(s, 3))).toBe(
+    expect(
+      apply("```\nx\n```", (s) => paragraphBelowChanges(parsedState(s), 0)),
+    ).toBe("```\nx\n```\n");
+    expect(apply(DOC, (s) => paragraphBelowChanges(parsedState(s), 3))).toBe(
       "a\n\n```ts\nx\n```\n\n\nb",
     );
   });

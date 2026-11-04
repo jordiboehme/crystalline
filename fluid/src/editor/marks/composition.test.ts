@@ -33,8 +33,10 @@ import {
 } from "../../test/markKit";
 import { prefetchGrid } from "../grid/loader";
 import { gridTables } from "../grid/structure";
+import { domPending } from "./composition";
 import { CANNOT_JOIN } from "./deleteCheck";
 import { formatsAt, toggleFormat } from "./formatting";
+import { parsedState } from "../../test/parse";
 
 beforeAll(async () => {
   await prefetchGrid();
@@ -150,7 +152,7 @@ describe.each(CASES)(
       keyboard.change(2, 3, "cd");
       // Nothing is written beside the composition while it runs.
       expect(bytes(view.state)).toBe("abcd");
-      expect(formatsAt(view.state, 2).has("strong")).toBe(true);
+      expect(formatsAt(parsedState(view.state), 2).has("strong")).toBe(true);
       keyboard.end();
       expect(bytes(view.state)).toBe("ab**cd**");
       expect(caret(view)).toBe(6);
@@ -291,7 +293,7 @@ describe("a composition a peer's edit interrupts", () => {
 describe("a composition in a table cell", () => {
   it("is judged by the cell, with the cell's marks", () => {
     const main = markView("| a | b |\n| - | - |\n| x | **a.** b |\n");
-    const cell = gridTables(main.state)[0]?.rows[1]?.[1];
+    const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const view = openAt(main, cell.content.from, false).view;
     const space = cell.content.from + 6;
@@ -606,3 +608,23 @@ describe.each([false, true])(
     });
   },
 );
+
+describe("an observer that says null for no delayed flush (R4-3)", () => {
+  /** A view stand-in with only the observer fields the guard reads. */
+  const withObserver = (observer: Record<string, unknown>) =>
+    ({ observer }) as unknown as EditorView;
+
+  it("is not read as a flush held back", () => {
+    expect(domPending(withObserver({ delayedFlush: null }))).toBe(false);
+    expect(domPending(withObserver({ delayedFlush: undefined }))).toBe(false);
+    expect(domPending(withObserver({ delayedFlush: -1 }))).toBe(false);
+  });
+
+  it("still reads a held flush and a held Android key", () => {
+    expect(domPending(withObserver({ delayedFlush: 3 }))).toBe(true);
+    expect(domPending(withObserver({ delayedFlush: 0 }))).toBe(true);
+    expect(
+      domPending(withObserver({ delayedFlush: null, delayedAndroidKey: {} })),
+    ).toBe(true);
+  });
+});

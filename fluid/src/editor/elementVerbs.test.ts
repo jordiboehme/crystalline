@@ -33,6 +33,7 @@ import {
   writtenAddress,
   writtenLabel,
 } from "./elementVerbs";
+import { parsedState } from "../test/parse";
 
 afterEach(cleanupMarkViews);
 
@@ -295,7 +296,7 @@ describe("unwikilinkChanges", () => {
 describe("the readers", () => {
   it("reads an inline link", () => {
     const state = stateOf("a [t](u) b");
-    expect(linkAt(state, 3)).toMatchObject({
+    expect(linkAt(parsedState(state), 3)).toMatchObject({
       from: 2,
       to: 8,
       text: { from: 3, to: 4 },
@@ -307,7 +308,7 @@ describe("the readers", () => {
 
   it("reads a reference link and its definition's address", () => {
     const state = stateOf("[t][r]\n\n[r]: https://x");
-    expect(linkAt(state, 1)).toMatchObject({
+    expect(linkAt(parsedState(state), 1)).toMatchObject({
       text: { from: 1, to: 2 },
       address: null,
       reference: true,
@@ -378,7 +379,7 @@ describe("what is written reads back as typed", () => {
       changes:
         newLinkChanges(state, { from: 0, to: 0 }, { text, address: "u" }) ?? [],
     }).state;
-    expect(linkAt(next, 1)).not.toBeNull();
+    expect(linkAt(parsedState(next), 1)).not.toBeNull();
     expect(linkWords(next, 1)).toBe(text);
     expect(linkAddress(next, 1)).toBe("u");
   });
@@ -480,7 +481,7 @@ describe("two elements side by side", () => {
 
   it("reads the link that starts at a shared position", () => {
     const state = stateOf("[a](b)[t](u)");
-    expect(linkAt(state, 6)).toMatchObject({ from: 6, to: 12 });
+    expect(linkAt(parsedState(state), 6)).toMatchObject({ from: 6, to: 12 });
   });
 });
 
@@ -546,7 +547,7 @@ describe("statusChanges", () => {
       changes: statusChanges(state, 2, { words }) ?? [],
     }).state;
     expect(statusWords(next, 2)).toBe(words);
-    const label = statusAt(next, 2);
+    const label = statusAt(parsedState(next), 2);
     expect(label?.from).toBe(2);
     expect(bytes(next).slice(label?.to ?? 0)).toBe(" tail");
     expect(label?.colour).toBe("green");
@@ -580,7 +581,10 @@ describe("mathChanges", () => {
 
   it("replaces the inner lines of a dollar block", () => {
     const state = stateOf("$$\na\n$$");
-    expect(mathAt(state, 0)).toMatchObject({ block: true, formula: "a" });
+    expect(mathAt(parsedState(state), 0)).toMatchObject({
+      block: true,
+      formula: "a",
+    });
     expect(apply(state, mathChanges(state, 0, { formula: "b" }))).toBe(
       "$$\nb\n$$",
     );
@@ -620,7 +624,7 @@ describe("mathChanges", () => {
     "refuses a formula that holds its own delimiter (%j, %j)",
     (text, formula, why) => {
       const state = stateOf(text);
-      const math = mathAt(state, 0);
+      const math = mathAt(parsedState(state), 0);
       expect(math).not.toBeNull();
       expect(formulaRefusal(math!.form, formula)).toBe(why);
       expect(mathChanges(state, 0, { formula })).toBeNull();
@@ -640,7 +644,7 @@ describe("mathChanges", () => {
       const next = state.update({
         changes: mathChanges(state, 0, { formula }) ?? [],
       }).state;
-      expect(mathAt(next, 0)?.formula).toBe(formula);
+      expect(mathAt(parsedState(next), 0)?.formula).toBe(formula);
     },
   );
 
@@ -660,7 +664,7 @@ describe("mathChanges", () => {
 describe("the task and callout readers", () => {
   it("reads the box of the task line", () => {
     const state = stateOf("- [ ] t");
-    expect(taskAt(state, 6)).toEqual({ from: 2, to: 5 });
+    expect(taskAt(parsedState(state), 6)).toEqual({ from: 2, to: 5 });
     expect(taskAt(stateOf("- t"), 2)).toBeNull();
   });
 
@@ -684,12 +688,15 @@ describe("the task and callout readers", () => {
 describe("two status labels and formulas side by side", () => {
   it("reads the label that starts at a shared position", () => {
     const state = stateOf(":status[a]:status[b]");
-    expect(statusAt(state, 10)).toMatchObject({ from: 10, to: 20 });
+    expect(statusAt(parsedState(state), 10)).toMatchObject({
+      from: 10,
+      to: 20,
+    });
   });
 
   it("reads the formula that starts at a shared position", () => {
     const state = stateOf("$`a`$$`b`$");
-    expect(mathAt(state, 5)).toMatchObject({ from: 5, to: 10 });
+    expect(mathAt(parsedState(state), 5)).toMatchObject({ from: 5, to: 10 });
   });
 });
 
@@ -732,7 +739,7 @@ describe("the formula verbs at the edges", () => {
   ])("refuses a ## line in %s on a Reflection page", (_name, text) => {
     const state = stateOf(text, "reflection");
     const at = text.indexOf("x");
-    const math = mathAt(state, at);
+    const math = mathAt(parsedState(state), at);
     expect(math).not.toBeNull();
     expect(formulaRefusal(math!.form, "y\n## z", true)).toBe("heading-line");
     expect(mathChanges(state, at, { formula: "y\n## z" })).toBeNull();
@@ -750,7 +757,7 @@ describe("the formula verbs at the edges", () => {
       changes: mathChanges(state, at, { formula: "y\n## z" }) ?? [],
     }).state;
     expect(bytes(next)).toBe("a\n\n> $$\n> y\n> ## z\n> $$\n");
-    expect(mathAt(next, at)?.formula).toBe("y\n## z");
+    expect(mathAt(parsedState(next), at)?.formula).toBe("y\n## z");
   });
 });
 
@@ -758,12 +765,14 @@ describe("no reader reaches an id line, a comment or the frontmatter", () => {
   it("reads nothing from a Reflection id line", () => {
     const text = "## A :status[x] $`y`$\n<!-- r:0a1b -->\n- [ ] t\n";
     const state = stateOf(text, "reflection");
-    expect(statusAt(state, text.indexOf(":status") + 1)).not.toBeNull();
+    expect(
+      statusAt(parsedState(state), text.indexOf(":status") + 1),
+    ).not.toBeNull();
     const id = text.indexOf("<!--");
     for (let at = id; at <= id + 15; at += 1) {
-      expect(statusAt(state, at)).toBeNull();
-      expect(mathAt(state, at)).toBeNull();
-      expect(taskAt(state, at)).toBeNull();
+      expect(statusAt(parsedState(state), at)).toBeNull();
+      expect(mathAt(parsedState(state), at)).toBeNull();
+      expect(taskAt(parsedState(state), at)).toBeNull();
       expect(statusChanges(state, at, { words: "z" })).toBeNull();
       expect(mathChanges(state, at, { formula: "z" })).toBeNull();
     }
@@ -777,8 +786,8 @@ describe("no reader reaches an id line, a comment or the frontmatter", () => {
   it("reads no formula or label in the frontmatter", () => {
     const text = "---\na: $$x$$ :status[b]\n---\nc";
     const state = stateOf(text);
-    expect(mathAt(state, 8)).toBeNull();
-    expect(statusAt(state, 15)).toBeNull();
+    expect(mathAt(parsedState(state), 8)).toBeNull();
+    expect(statusAt(parsedState(state), 15)).toBeNull();
   });
 });
 
@@ -789,7 +798,11 @@ describe("fix round 1: formulas the page reads the same", () => {
     const changes = mathChanges(state, at, { formula });
     expect(changes).not.toBeNull();
     const next = state.update({ changes: changes ?? [] }).state;
-    return { next, text: bytes(next), read: mathAt(next, at)?.formula };
+    return {
+      next,
+      text: bytes(next),
+      read: mathAt(parsedState(next), at)?.formula,
+    };
   }
 
   it.each([
@@ -807,7 +820,7 @@ describe("fix round 1: formulas the page reads the same", () => {
     expect(read).toBe("x\ny");
     // The new line is still the list item's.
     const y = after.indexOf("y");
-    const node = syntaxTree(next).resolveInner(y, 1);
+    const node = syntaxTree(parsedState(next)).resolveInner(y, 1);
     let inItem = false;
     for (let n: typeof node | null = node; n; n = n.parent) {
       if (n.name === "ListItem") inItem = true;
@@ -838,7 +851,10 @@ describe("fix round 1: formulas the page reads the same", () => {
 
   it("opens a double-backtick formula and keeps its backticks", () => {
     const state = stateOf("$``a`b``$");
-    expect(mathAt(state, 0)).toMatchObject({ form: "code", formula: "a`b" });
+    expect(mathAt(parsedState(state), 0)).toMatchObject({
+      form: "code",
+      formula: "a`b",
+    });
     expect(written("$``a`b``$", 0, "c").text).toBe("$``c``$");
   });
 
@@ -876,7 +892,7 @@ describe("fix round 1: label words from the source and back", () => {
   ])("keeps the source words %j through an untouched field", (source) => {
     const text = `:status[${source}]{red}`;
     const state = stateOf(text);
-    expect(statusAt(state, 0)?.to).toBe(text.length);
+    expect(statusAt(parsedState(state), 0)?.to).toBe(text.length);
     const field = statusWords(state, 0);
     // Written as if typed: what comes back is the source as it was.
     expect(writtenLabel(field ?? "")).toBe(source);
@@ -890,7 +906,10 @@ describe("a math fence in a list item (I6)", () => {
   ])("reads its formula and keeps its indent, %s", (_name, text) => {
     const state = stateOf(text);
     const at = text.indexOf("x^2");
-    expect(mathAt(state, at)).toMatchObject({ block: true, formula: "x^2" });
+    expect(mathAt(parsedState(state), at)).toMatchObject({
+      block: true,
+      formula: "x^2",
+    });
     expect(apply(state, mathChanges(state, at, { formula: "a\nb" }))).toBe(
       text.replace("  x^2", "  a\n  b"),
     );

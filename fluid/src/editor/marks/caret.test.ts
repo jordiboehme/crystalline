@@ -27,6 +27,7 @@ import { mainSelectionParked } from "../parkedSelection";
 import { prefetchGrid } from "../grid/loader";
 import { canonical, snapRange, stepVisible } from "./caret";
 import { runsOnLine } from "./hiddenMarks";
+import { parsedState } from "../../test/parse";
 
 afterEach(cleanupMarkViews);
 
@@ -315,7 +316,7 @@ describe("caret moves change no byte", () => {
     const doc = v.state.doc;
     const marked: number[] = [];
     for (let n = 1; n <= doc.lines; n += 1) {
-      if (runsOnLine(v.state, n).length > 0) {
+      if (runsOnLine(parsedState(v.state), n).length > 0) {
         marked.push(n);
       }
     }

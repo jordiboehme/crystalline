@@ -18,6 +18,7 @@ import { hostOpenCell } from "./gridWidget";
 import { gridExtension } from "./index";
 import { setOpenCell } from "./openCell";
 import { gridTables } from "./structure";
+import { parsedState } from "../../test/parse";
 
 vi.mock("../tableModel", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../tableModel")>();
@@ -57,7 +58,7 @@ function layers(): Extension[] {
 }
 
 function open(main: EditorView, row: number, column: number): EditorView {
-  const cell = gridTables(main.state)[0]?.rows[row]?.[column];
+  const cell = gridTables(parsedState(main.state))[0]?.rows[row]?.[column];
   if (!cell) throw new Error("no cell");
   main.dispatch({
     effects: setOpenCell.of({

@@ -42,6 +42,7 @@ import { GridWidget, gridField } from "./gridWidget";
 import { gridExtension } from "./index";
 import { openCellField, openCellRange } from "./openCell";
 import { gridTables } from "./structure";
+import { parsedState } from "../../test/parse";
 
 const DOC = "| a | b |\n| - | - |\n| 12 | 2 |\n\nafter 2\n";
 
@@ -130,7 +131,7 @@ function enterInPanel(main: EditorView): void {
 }
 
 function shape(state: EditorState): number[] {
-  return gridTables(state).flatMap((table) =>
+  return gridTables(parsedState(state)).flatMap((table) =>
     table.rows.map((row) => row.length),
   );
 }
@@ -303,7 +304,7 @@ describe("replacing inside cells (R20)", () => {
     const main = soloMain(text, layers());
     query(main, "2", "x\\");
     replaceAll(main);
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows.map((row) => row.length)).toEqual([2, 2, 2]);
     expect(table?.rows[1]?.map((cell) => cell.text)).toEqual([
       "x\\\\",
@@ -319,7 +320,7 @@ describe("replacing inside cells (R20)", () => {
     replaceAll(main);
     // A lone `\` before the closing pipe would escape it and merge the
     // cell with what follows: it is stored doubled, an even run.
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     expect(table?.rows.map((row) => row.length)).toEqual([1, 1]);
     expect(table?.rows[1]?.[0]?.text).toBe("x\\\\");
   });
@@ -354,7 +355,9 @@ describe.each(PIPELESS_FIXTURES)("search without outer pipes: $name", (f) => {
     lines[3] = lines[3]?.replace(hit, "a\\|b") ?? "";
     expect(bytes(main.state)).toBe(withTable(f, lines));
     expect(shape(main.state)).toEqual([2, 2, 2]);
-    expect(gridTables(main.state)[0]?.rows[2]?.[column]?.text).toBe("a\\|b");
+    expect(
+      gridTables(parsedState(main.state))[0]?.rows[2]?.[column]?.text,
+    ).toBe("a\\|b");
   });
 });
 
@@ -382,7 +385,9 @@ describe.each(PIPELESS_FIXTURES)(
       lines[2] = line;
       expect(bytes(main.state)).toBe(withTable(f, lines));
       expect(shape(main.state)).toEqual([2, 2, 2]);
-      expect(gridTables(main.state)[0]?.rows[1]?.[column]?.text).toBe(by);
+      expect(
+        gridTables(parsedState(main.state))[0]?.rows[1]?.[column]?.text,
+      ).toBe(by);
     });
 
     test("replaceAll that empties a bare cell is one undo step", () => {
@@ -532,7 +537,7 @@ describe("main's caret never left in a table", () => {
       expect(activeCell(main)?.view.hasFocus).toBe(true);
     });
     await flush();
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("no table");
     const state = remoteAwareness.getStates().get(awareness.clientID) as
       { cursor?: { anchor: unknown; head: unknown } | null } | undefined;
@@ -598,7 +603,7 @@ describe("read-only (R17)", () => {
     openPanel(main);
     findNext(main);
     main.focus();
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("no table");
     await vi.waitFor(() => {
       expect(main.state.selection.main.head).toBe(DOC.indexOf("\nafter"));
@@ -647,7 +652,7 @@ describe("read-only (R17)", () => {
     const end = DOC.indexOf("\n\nafter") + 1;
     main.dispatch({ changes: { from: end, insert: "| 3 | 4 |\n" } });
     await flush();
-    expect(gridTables(main.state)[0]?.rows).toHaveLength(3);
+    expect(gridTables(parsedState(main.state))[0]?.rows).toHaveLength(3);
     expect(cellEl(main, 1, 0).classList.contains("cm-grid-hit")).toBe(true);
   });
 });
