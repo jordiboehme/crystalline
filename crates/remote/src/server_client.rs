@@ -60,11 +60,13 @@
 //!   for a new sign-in: an OAuth `invalid_grant` or `invalid_client` from the
 //!   token endpoint, or a `401` that a refresh cannot cure.
 //! - **A write that went out and got no answer may have happened.** A
-//!   forwarded write whose overall limit ran out after the connect finished
-//!   is [`RemoteFailure::Unanswered`]: the agent reads that the write may or
-//!   may not have happened and how to check, and the source stays up (it
-//!   took the connection; it is slow). A connect that timed out never sent
-//!   anything and stays [`RemoteFailure::TimedOut`].
+//!   forwarded write (a tool call or an automation verb that changes data)
+//!   that fails after the connect finished, on the overall limit or a broken
+//!   connection, is [`RemoteFailure::Unanswered`]: the caller reads that the
+//!   write may or may not have happened and how to check, and the source
+//!   stays up (it took the connection). A connect that failed never sent
+//!   anything and stays [`RemoteFailure::TimedOut`] or
+//!   [`RemoteFailure::Unreachable`].
 //! - **A source that failed is down for a short window** ([`DOWN_WINDOW`]).
 //!   While it lasts every call answers the recorded failure at once without
 //!   touching the network; the first call after it tries again, and the first
@@ -239,12 +241,13 @@ pub enum RemoteFailure {
         /// How long it waited.
         after: Duration,
     },
-    /// A write went out and its answer did not come within the limit: the
-    /// connect had finished, so the server may have done the write or not.
-    /// Not a failure of the source (it took the connection; it is slow), so
-    /// it never opens the down window, whatever the [`Budget`]. A timeout
-    /// before the request went out (name, TCP, TLS) stays
-    /// [`RemoteFailure::TimedOut`]. Boxed, so every error that carries a
+    /// A write went out and no answer came: the limit ran out, or the
+    /// connection broke, after the connect had finished. The server may have
+    /// done the write or not. Not a failure of the source (it took the
+    /// connection), so it never opens the down window, whatever the
+    /// [`Budget`]. A failure of the connect itself (name, TCP, TLS) never
+    /// sent anything and stays [`RemoteFailure::TimedOut`] or
+    /// [`RemoteFailure::Unreachable`]. Boxed, so every error that carries a
     /// failure stays small.
     Unanswered(Box<UnansweredWrite>),
 }
@@ -309,29 +312,36 @@ impl std::fmt::Display for RemoteFailure {
                 "{source} ({url}) {UNREACHABLE_WORDS}: it did not answer within {} ({NETWORK_HINT})",
                 seconds(*after)
             ),
-            RemoteFailure::Unanswered(write) => write!(
-                f,
-                "{} ({}) did not answer within {}. {}",
-                write.source,
-                write.url,
-                seconds(write.after),
-                write.check
-            ),
+            RemoteFailure::Unanswered(write) => {
+                let (source, url, check) = (&write.source, &write.url, &write.check);
+                match write.after {
+                    Some(after) => write!(
+                        f,
+                        "{source} ({url}) did not answer within {}. {check}",
+                        seconds(after)
+                    ),
+                    None => write!(
+                        f,
+                        "{source} ({url}) broke off the connection before it answered. {check}"
+                    ),
+                }
+            }
         }
     }
 }
 
 impl std::error::Error for RemoteFailure {}
 
-/// A write that went out with no answer in time ([`RemoteFailure::Unanswered`]).
+/// A write that went out with no answer ([`RemoteFailure::Unanswered`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnansweredWrite {
     /// The source's name.
     pub source: String,
     /// The server.
     pub url: String,
-    /// How long it waited.
-    pub after: Duration,
+    /// How long it waited, when the limit ran out; `None` when the
+    /// connection broke first.
+    pub after: Option<Duration>,
     /// What may have happened and how to check, for the tool that was
     /// called.
     pub check: String,
@@ -536,12 +546,14 @@ impl Peer {
         }
     }
 
-    /// A transport error on a request that went out as `check`'s write. A
-    /// timeout of the request's overall limit fires only once the connector
-    /// returned (the connect has a timer of its own, which reads as a
-    /// connect error), so the write may have reached the server: it says so
-    /// and how to check. Anything else, and every request that is not a
-    /// write, is [`Peer::failure`].
+    /// A transport error on a request that changes data, `check` being what
+    /// the caller reads about it. Every failure after the connect (the
+    /// overall limit running out, a connection that broke while the request
+    /// went out or while its answer was awaited) may have left the change
+    /// done, so it says so and how to check. The connect has a timer of its
+    /// own and its failures read as connect errors (name, TCP, TLS): those
+    /// never sent anything and stay [`Peer::failure`], as does every request
+    /// that only reads.
     fn sent_failure(
         &self,
         e: &reqwest::Error,
@@ -549,11 +561,11 @@ impl Peer {
         check: Option<&str>,
     ) -> RemoteFailure {
         match check {
-            Some(check) if e.is_timeout() && !e.is_connect() => {
+            Some(check) if !e.is_connect() && !e.is_builder() => {
                 RemoteFailure::Unanswered(Box::new(UnansweredWrite {
                     source: self.source.clone(),
                     url: self.url.clone(),
-                    after: limit,
+                    after: e.is_timeout().then_some(limit),
                     check: check.to_string(),
                 }))
             }
@@ -1119,18 +1131,9 @@ impl Connection {
                 after: limit,
             });
         }
-        // A forwarded write that timed out after it went out may have been
-        // done; what the agent checks depends on the tool.
-        let check = match request.get("cmd").and_then(Value::as_str) {
-            Some("tool") => crate::unanswered::unanswered_write(
-                request
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                request.get("args").unwrap_or(&Value::Null),
-            ),
-            _ => None,
-        };
+        // A request that changes data and got no answer after it went out
+        // may have been done; what the caller checks depends on the request.
+        let check = crate::unanswered::unanswered_check(request);
         let response = self
             .http()
             .post(format!("{}{}", self.source.url, crate::CTL_PATH))
@@ -1647,6 +1650,18 @@ mod tests {
     /// A loopback server that reads each request whole, its body included,
     /// and then never answers, holding the connection open.
     async fn silent_after_the_body() -> String {
+        after_the_body(true).await
+    }
+
+    /// A loopback server that reads each request whole, its body included,
+    /// and then drops the connection without an answer.
+    async fn dropping_after_the_body() -> String {
+        after_the_body(false).await
+    }
+
+    /// Reads each request whole, then holds the connection (`hold`) or drops
+    /// it, never answering.
+    async fn after_the_body(hold: bool) -> String {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1676,7 +1691,9 @@ mod tests {
                         }
                     }
                     // The whole request is in; no answer ever goes out.
-                    std::future::pending::<()>().await;
+                    if hold {
+                        std::future::pending::<()>().await;
+                    }
                     drop(socket);
                 });
             }
@@ -1758,6 +1775,69 @@ mod tests {
             )
         );
         assert_eq!(connection.down(), None);
+    }
+
+    /// A write whose connection broke after the request went out may have
+    /// been done too: it says so, never "cannot be reached", and the source
+    /// stays up.
+    #[tokio::test]
+    async fn a_write_whose_connection_broke_after_sending_may_have_been_written() {
+        let url = dropping_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                    "base64": "aGVsbG8=" }),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) broke off the connection before it answered. The file may or may \
+                 not be written. Read assets/shot.png to check its sha256, or upload the same \
+                 file again: the same bytes are accepted."
+            )
+        );
+        assert!(!failed.to_string().contains(UNREACHABLE_WORDS));
+        assert_eq!(connection.down(), None);
+    }
+
+    /// An automation verb that changes data gets the same treatment; one
+    /// that only reads keeps its old failure.
+    #[tokio::test]
+    async fn an_automation_write_never_answered_may_have_happened() {
+        let url = silent_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = connection
+            .ctl_within_as(
+                json!({ "v": 1, "cmd": "automation_run_record", "loop": "evolve",
+                        "domain": "open", "token": "t", "report": {} }),
+                Duration::from_millis(300),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) did not answer within 0.3 s. The run may or may not be recorded. \
+                 Run crystalline evolve status to see whether a run is still going before you \
+                 record it again."
+            )
+        );
+        assert_eq!(connection.down(), None);
+
+        let read = connection
+            .ctl_within_as(
+                json!({ "v": 1, "cmd": "automation_status", "loop": "evolve" }),
+                Duration::from_millis(300),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(read, RemoteFailure::TimedOut { .. }), "{read:?}");
+        assert!(connection.down().is_some());
     }
 
     /// A read that timed out is still a source that does not answer: it says

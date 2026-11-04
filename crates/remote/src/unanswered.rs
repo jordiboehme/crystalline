@@ -10,10 +10,51 @@
 
 use serde_json::Value;
 
+/// The check for one ctl request when it changes something on the server
+/// and its answer never came: a forwarded tool call ([`unanswered_write`])
+/// or an automation verb that changes data. `None` for a request that only
+/// reads.
+pub(crate) fn unanswered_check(request: &Value) -> Option<String> {
+    let text = |key: &str| request.get(key).and_then(Value::as_str);
+    let cmd = text("cmd")?;
+    if cmd == "tool" {
+        return unanswered_write(
+            text("tool").unwrap_or_default(),
+            request.get("args").unwrap_or(&Value::Null),
+        );
+    }
+    // The loop as the CLI names it: `crystalline reflect status`.
+    let status = format!(
+        "crystalline {} status",
+        text("loop").filter(|l| !l.is_empty()).unwrap_or("reflect")
+    );
+    Some(match cmd {
+        "automation_lease_take" => format!(
+            "The lease may or may not be taken. Run {status} to see whether a run is going \
+             before you start one again."
+        ),
+        "automation_lease_renew" => {
+            "The lease may or may not be renewed. The next renew tries again.".to_string()
+        }
+        "automation_lease_release" => format!(
+            "The lease may or may not be released. Run {status} to see whether a run is still \
+             going."
+        ),
+        "automation_run_record" => format!(
+            "The run may or may not be recorded. Run {status} to see whether a run is still \
+             going before you record it again."
+        ),
+        "automation_share" => "The changes may or may not be shared. Look for the run's pull \
+                               request before you share them again."
+            .to_string(),
+        _ => return None,
+    })
+}
+
 /// The check for `tool` called with `args`, when the call changes something
 /// on the server and its answer never came: what may have happened, and how
 /// to find out. `None` for a tool that only reads.
-pub(crate) fn unanswered_write(tool: &str, args: &Value) -> Option<String> {
+fn unanswered_write(tool: &str, args: &Value) -> Option<String> {
     let text = |key: &str| {
         args.get(key)
             .and_then(Value::as_str)
@@ -86,6 +127,46 @@ fn upload(path: &str, reader: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn every_automation_write_gets_a_check_and_its_reads_get_none() {
+        for (cmd, said) in [
+            (
+                "automation_lease_take",
+                "The lease may or may not be taken. Run crystalline reflect status to see \
+                 whether a run is going before you start one again.",
+            ),
+            (
+                "automation_lease_renew",
+                "The lease may or may not be renewed. The next renew tries again.",
+            ),
+            (
+                "automation_lease_release",
+                "The lease may or may not be released. Run crystalline reflect status to see \
+                 whether a run is still going.",
+            ),
+            (
+                "automation_run_record",
+                "The run may or may not be recorded. Run crystalline reflect status to see \
+                 whether a run is still going before you record it again.",
+            ),
+            (
+                "automation_share",
+                "The changes may or may not be shared. Look for the run's pull request before \
+                 you share them again.",
+            ),
+        ] {
+            let request = json!({ "v": 1, "cmd": cmd, "loop": "reflect", "domain": "ops" });
+            assert_eq!(unanswered_check(&request).as_deref(), Some(said), "{cmd}");
+        }
+        for read in ["automation_status", "automation_runs", "status", "file"] {
+            let request = json!({ "v": 1, "cmd": read, "loop": "reflect" });
+            assert_eq!(unanswered_check(&request), None, "{read}");
+        }
+        let tool = json!({ "v": 1, "cmd": "tool", "tool": "delete_engram",
+            "args": { "identifier": "x" } });
+        assert!(unanswered_check(&tool).unwrap().starts_with("The delete"));
+    }
 
     #[test]
     fn an_upload_names_its_path_and_says_a_retry_is_safe() {

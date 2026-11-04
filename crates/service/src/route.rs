@@ -692,7 +692,7 @@ fn within(failure: RemoteFailure, limit: Duration) -> RemoteFailure {
             after: limit,
         },
         RemoteFailure::Unanswered(mut write) => {
-            write.after = limit;
+            write.after = write.after.map(|_| limit);
             RemoteFailure::Unanswered(write)
         }
         other => other,
@@ -1023,7 +1023,7 @@ mod tests {
                 RemoteFailure::Unanswered(Box::new(crystalline_remote::UnansweredWrite {
                     source: "acme".into(),
                     url: "https://crystalline.acme.test".into(),
-                    after: Duration::from_millis(119_870),
+                    after: Some(Duration::from_millis(119_870)),
                     check: check.into(),
                 })),
                 CTL_TIMEOUT,
