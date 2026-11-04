@@ -407,6 +407,8 @@ export default function FloatingBar({
     if (!target.hasAttribute("data-roving")) return; // inside the Align menu
     // The alt field's keys edit its text; only its edges go on (P13).
     if (target instanceof HTMLInputElement) {
+      // A key an input method's composition takes is not the bar's.
+      if (event.nativeEvent.isComposing || event.keyCode === 229) return;
       const start = target.selectionStart;
       const end = target.selectionEnd;
       const length = target.value.length;

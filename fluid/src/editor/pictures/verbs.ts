@@ -168,8 +168,8 @@ export function setPictureWidth(
  * Changes the alt text to read `next`: one change to the part that differs,
  * escaped where it has to be (`altEdit`). The same words dispatch nothing
  * (false). With `select` false the selection is left where it is (mapped
- * through the change): the bar writes a typed alt text when it closes,
- * after the selection may have moved on.
+ * through the change) and the view does not scroll: the bar writes a typed
+ * alt text when it closes, after the selection may have moved on.
  */
 export function setPictureAlt(
   view: EditorView,
@@ -197,7 +197,8 @@ export function setPictureAlt(
         }
       : {}),
     userEvent: "input.alt",
-    scrollIntoView: true,
+    // A write that leaves the selection alone does not scroll to it either.
+    scrollIntoView: select,
   });
 }
 

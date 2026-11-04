@@ -1,7 +1,7 @@
 /**
- * The nine glyphs the image-format menu and the picture options are built
- * from: the trigger, the four placements, the three width presets and the
- * original size.
+ * The ten glyphs the image-format menu and the picture options are built
+ * from: the trigger, the four placements, the three width presets, the
+ * original size and the removal.
  *
  * Drawn here rather than taken from the icon set, for the reason the table
  * glyphs and the paperclip are: they stand in the same row at the same 24-unit
@@ -117,6 +117,19 @@ const IMAGE_ORIGINAL: Shape[] = [
   { kind: "path", d: "M14.5 11v2" },
   { kind: "circle", cx: 12, cy: 11.25, r: 0.6, filled: true },
   { kind: "circle", cx: 12, cy: 12.75, r: 0.6, filled: true },
+];
+
+/**
+ * Remove: a bin with its lid and two lines down it. Drawn here rather than
+ * taken from the icon set, so the bar's chunk needs no shared icon chunk of
+ * its own, and so it stands at the family's own weight beside the others.
+ */
+const IMAGE_REMOVE: Shape[] = [
+  { kind: "path", d: "M5 7h14" },
+  { kind: "path", d: "M10 7V5h4v2" },
+  { kind: "path", d: "M7 7l1 12h8l1-12" },
+  { kind: "path", d: "M10.5 10.5v5" },
+  { kind: "path", d: "M13.5 10.5v5" },
 ];
 
 interface GlyphProps {
@@ -238,4 +251,9 @@ export function ImageWidth75Icon(props: GlyphProps): ReactElement {
 /** The picture at its own size, read as one to one. */
 export function ImageOriginalIcon(props: GlyphProps): ReactElement {
   return <Glyph name="image-original" shapes={IMAGE_ORIGINAL} {...props} />;
+}
+
+/** Remove the picture. */
+export function ImageRemoveIcon(props: GlyphProps): ReactElement {
+  return <Glyph name="image-remove" shapes={IMAGE_REMOVE} {...props} />;
 }

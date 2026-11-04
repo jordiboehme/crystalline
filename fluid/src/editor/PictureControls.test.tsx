@@ -5,7 +5,9 @@
  * and every view reads a full parse (`markView`).
  */
 
-import type { EditorView } from "@codemirror/view";
+import { Transaction } from "@codemirror/state";
+import type { TransactionSpec } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import type { MockInstance } from "vitest";
@@ -175,6 +177,10 @@ describe("the picture buttons", () => {
       const from = await selectPicture(h, ref);
       h.show();
       const want = expected(START, (twin) => verb(twin, from + 1));
+      // The keyboard path: the button holds the focus when it is pressed.
+      act(() => {
+        control(name).focus();
+      });
       fireEvent.click(control(name));
       expect(bytes(h.main.state)).toBe(want);
       expect(want).not.toBe(START);
@@ -536,6 +542,9 @@ describe("the alt text field", () => {
       DOC.replace(PICTURE, "![Chart 2](assets/c.png#w=25%)"),
     );
     expect(undoSteps(h.main)).toBe(2);
+    // The alt went first: one undo takes back the size and keeps the alt.
+    undoOnce(h.main);
+    expect(bytes(h.main.state)).toBe(DOC.replace("![Chart]", "![Chart 2]"));
   });
 });
 
@@ -579,4 +588,212 @@ describe("a picture that is not attached", () => {
     fireEvent.keyDown(field, { key: "Enter" });
     expect(bytes(h.main.state)).toBe(doc.replace("![Map]", "![Old map]"));
   });
+});
+
+/** Every transaction `view` dispatches from now on. */
+function dispatched(view: EditorView): Transaction[] {
+  const seen: Transaction[] = [];
+  const own = view.dispatch.bind(view);
+  view.dispatch = ((...specs: (TransactionSpec | Transaction)[]) => {
+    const [first] = specs;
+    const tr =
+      first instanceof Transaction
+        ? first
+        : view.state.update(...(specs as TransactionSpec[]));
+    seen.push(tr);
+    own(tr);
+  }) as EditorView["dispatch"];
+  return seen;
+}
+
+function peerHarness(doc: string): {
+  h: Harness;
+  peer: EditorView;
+  sync: () => void;
+} {
+  let peers: ReturnType<typeof markPeers> | null = null;
+  const h = harness(doc, (options) => {
+    peers = markPeers(doc, options);
+    return peers.local;
+  });
+  if (peers === null) throw new Error("no peers");
+  const { peer, sync } = peers as ReturnType<typeof markPeers>;
+  return { h, peer, sync };
+}
+
+describe("round 1", () => {
+  test("a peer typing before the picture keeps the buttons and the focus", async () => {
+    const { h, peer, sync } = peerHarness(DOC);
+    await selectPicture(h);
+    h.show();
+    act(() => {
+      control("Small").focus();
+    });
+    peer.dispatch({ changes: { from: 0, insert: "Very " } });
+    act(() => {
+      sync();
+    });
+    expect(control("Small")).toHaveFocus();
+    await vi.waitFor(() => {
+      expect(h.context()).toMatchObject({ kind: "image", from: 13 });
+    });
+    expect(control("Small")).toHaveFocus();
+    expect(altField().value).toBe("Chart");
+  });
+
+  test("alt typed while a peer changes it: the last writer wins (P42)", async () => {
+    const { h, peer, sync } = peerHarness(DOC);
+    const from = await selectPicture(h);
+    h.show();
+    const field = altField();
+    act(() => {
+      field.focus();
+    });
+    fireEvent.change(field, { target: { value: "Chart 2" } });
+    peer.dispatch({
+      changes: { from: from + 2, to: from + 7, insert: "Graph" },
+    });
+    act(() => {
+      sync();
+    });
+    // The field keeps what is being typed.
+    expect(field.value).toBe("Chart 2");
+    fireEvent.keyDown(field, { key: "Enter" });
+    act(() => {
+      sync();
+    });
+    const want = DOC.replace("![Chart]", "![Chart 2]");
+    expect(bytes(h.main.state)).toBe(want);
+    expect(bytes(peer.state)).toBe(want);
+  });
+
+  test("a commit on close does not scroll", async () => {
+    const h = harness();
+    await selectPicture(h);
+    h.show();
+    const field = altField();
+    act(() => {
+      field.focus();
+    });
+    fireEvent.change(field, { target: { value: "Chart 2" } });
+    const seen = dispatched(h.main);
+    act(() => {
+      h.main.focus();
+    });
+    expect(bytes(h.main.state)).toBe(DOC.replace("![Chart]", "![Chart 2]"));
+    const written = seen.filter((tr) => tr.docChanged);
+    expect(written).toHaveLength(1);
+    expect(written[0]?.scrollIntoView).toBe(false);
+  });
+
+  test("the bar that moves to another picture acts on that one", async () => {
+    const doc = "![a](assets/a.png) and ![b](assets/b.png)\n";
+    const h = harness(doc);
+    await selectPicture(h, "![a](assets/a.png)");
+    h.show();
+    const at = doc.indexOf("![b]");
+    h.main.dispatch({
+      selection: { anchor: at, head: at + "![b](assets/b.png)".length },
+    });
+    await vi.waitFor(() => {
+      expect(h.context()).toMatchObject({ kind: "image", from: at });
+    });
+    expect(altField().value).toBe("b");
+    fireEvent.click(control("Small"));
+    expect(bytes(h.main.state)).toBe(
+      "![a](assets/a.png) and ![b](assets/b.png#w=25%)\n",
+    );
+  });
+
+  test("a typed alt goes to its own picture when the bar moves on", async () => {
+    const doc = "![a](assets/a.png) and ![b](assets/b.png)\n";
+    const h = harness(doc);
+    await selectPicture(h, "![a](assets/a.png)");
+    h.show();
+    const field = altField();
+    act(() => {
+      field.focus();
+    });
+    fireEvent.change(field, { target: { value: "a2" } });
+    const at = doc.indexOf("![b]");
+    // The selection moves with the focus left in the field (a command).
+    h.main.dispatch({
+      selection: { anchor: at, head: at + "![b](assets/b.png)".length },
+    });
+    await vi.waitFor(() => {
+      expect(bytes(h.main.state)).toBe(
+        "![a2](assets/a.png) and ![b](assets/b.png)\n",
+      );
+    });
+    expect(altField().value).toBe("b");
+  });
+
+  test("a refused Remove picture says why", async () => {
+    const broken = "**a.**![x](assets/p.png)b\n";
+    const h = harness(broken);
+    await selectPicture(h, "![x](assets/p.png)");
+    h.show();
+    const seen = dispatched(h.main);
+    fireEvent.click(control("Remove picture"));
+    expect(bytes(h.main.state)).toBe(broken);
+    const said = seen.flatMap((tr) =>
+      tr.effects.filter((e) => e.is(EditorView.announce)).map((e) => e.value),
+    );
+    expect(said).toEqual(["This text cannot be joined here."]);
+  });
+
+  test("Small and Medium are not pressed on a full picture with a width", async () => {
+    const ref = "![C](assets/c.png#full,w=25%)";
+    const h = harness(`${ref}\n`);
+    await selectPicture(h, ref);
+    h.show();
+    expect(control("Small")).toHaveAttribute("aria-pressed", "false");
+    expect(control("Full width")).toHaveAttribute("aria-pressed", "true");
+    const half = "![C](assets/c.png#full,w=50%)";
+    h.main.dispatch({
+      changes: { from: 0, to: ref.length, insert: half },
+      selection: { anchor: 0, head: half.length },
+    });
+    await vi.waitFor(() => {
+      expect(control("Medium")).toHaveAttribute("aria-pressed", "false");
+    });
+    expect(control("Full width")).toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("the arrows cross only at a collapsed edge, not with text selected", async () => {
+    const h = harness();
+    await selectPicture(h);
+    h.show();
+    const field = altField();
+    act(() => {
+      field.focus();
+    });
+    field.setSelectionRange(0, 3);
+    fireEvent.keyDown(field, { key: "ArrowLeft" });
+    expect(field).toHaveFocus();
+    field.setSelectionRange(2, field.value.length);
+    fireEvent.keyDown(field, { key: "ArrowRight" });
+    expect(field).toHaveFocus();
+  });
+
+  for (const composing of [{ isComposing: true }, { keyCode: 229 }] as const) {
+    test(`Enter and Escape leave a composition alone (${Object.keys(composing)[0] ?? ""})`, async () => {
+      const h = harness();
+      await selectPicture(h);
+      h.show();
+      const field = altField();
+      act(() => {
+        field.focus();
+      });
+      fireEvent.change(field, { target: { value: "Chart 2" } });
+      fireEvent.keyDown(field, { key: "Enter", ...composing });
+      expect(bytes(h.main.state)).toBe(DOC);
+      expect(field).toHaveFocus();
+      fireEvent.keyDown(field, { key: "Escape", ...composing });
+      expect(field).toHaveFocus();
+      expect(field.value).toBe("Chart 2");
+      fireEvent.keyDown(field, { key: "Enter" });
+      expect(bytes(h.main.state)).toBe(DOC.replace("![Chart]", "![Chart 2]"));
+    });
+  }
 });

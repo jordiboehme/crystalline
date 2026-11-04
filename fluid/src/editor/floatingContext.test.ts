@@ -312,6 +312,42 @@ describe("the picture context", () => {
   });
 });
 
+describe("the picture context, round 1", () => {
+  test("a picture in a table cell gets no picture context", async () => {
+    const doc = "| a | b |\n| - | - |\n| ![C](assets/c.png) | 2 |\n";
+    const { main, last, seen } = setup(doc, [imagePreviews("eng")]);
+    const from = doc.indexOf("![C]");
+    main.dispatch({
+      selection: { anchor: from, head: from + "![C](assets/c.png)".length },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(seen.some((context) => context?.kind === "image")).toBe(false);
+    expect(last()).toBeNull();
+  });
+
+  test("a picture that stops being an attachment reports formattable false", async () => {
+    const attached = "![C](assets/abcdefghijklm.png)";
+    const external = "![C](https://e.org/abcdef.png)";
+    expect(external.length).toBe(attached.length);
+    const doc = `${attached}\n`;
+    const { main, last } = setup(doc, [imagePreviews("eng")]);
+    main.dispatch({ selection: { anchor: 0, head: attached.length } });
+    await vi.waitFor(() => {
+      expect(last()).toMatchObject({ kind: "image", formattable: true });
+    });
+    main.dispatch({
+      changes: {
+        from: 5,
+        to: attached.length - 1,
+        insert: external.slice(5, -1),
+      },
+    });
+    await vi.waitFor(() => {
+      expect(last()).toMatchObject({ kind: "image", formattable: false });
+    });
+  });
+});
+
 describe("watchDocChanges", () => {
   test("hands every change of main to a watcher until it stops", () => {
     const { main } = setup();

@@ -27,7 +27,6 @@
 
 import { MapMode } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { Trash2 } from "lucide-react";
 import type { KeyboardEvent as ReactKeyboardEvent, ReactElement } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -41,6 +40,7 @@ import {
   ImageFloatRightIcon,
   ImageFullIcon,
   ImageOriginalIcon,
+  ImageRemoveIcon,
   ImageWidth25Icon,
   ImageWidth50Icon,
 } from "./imageIcons";
@@ -155,6 +155,13 @@ export function PictureControls({
 }): ReactElement {
   /** Bumped on every change of main's text, so the bar draws what it says now. */
   const [, setTick] = useState(0);
+  /**
+   * Where the controls read their picture: the field's place, which follows
+   * a change at once, or null once it is gone. The context follows a change
+   * only on the next measure, and a render in between must not swap the
+   * buttons out (and the focus with them).
+   */
+  const [drawnAt, setDrawnAt] = useState<number | null>(context.from);
   /** The alt text being typed, or null while the field shows the picture's. */
   const [draft, setDraft] = useState<string | null>(null);
   const typed = useRef<string | null>(null);
@@ -167,17 +174,29 @@ export function PictureControls({
    * Writes a changed field to its picture, once, if the picture is still
    * there. The selection is left as it is: a close may have moved it on.
    */
-  const commit = useCallback(() => {
+  const write = useCallback(
+    (next: string, at: Place | null) => {
+      if (at === null || isDestroyed(main)) return;
+      const ref = pictureAt(main.state, at.from + 1);
+      if (ref?.from !== at.from || ref.to !== at.to) return;
+      setPictureAlt(main, next, at.from + 1, false);
+    },
+    [main],
+  );
+
+  /** Takes the typed alt text out of the field, or null when none is. */
+  const take = useCallback((): string | null => {
     const next = typed.current;
-    if (next === null) return;
+    if (next === null) return null;
     typed.current = null;
     if (mounted.current) setDraft(null);
-    const at = place.current;
-    if (at === null || isDestroyed(main)) return;
-    const ref = pictureAt(main.state, at.from + 1);
-    if (ref?.from !== at.from || ref.to !== at.to) return;
-    setPictureAlt(main, next, at.from + 1, false);
-  }, [main]);
+    return next;
+  }, []);
+
+  const commit = useCallback(() => {
+    const next = take();
+    if (next !== null) write(next, place.current);
+  }, [take, write]);
 
   // The field's picture, followed through every change of the text.
   useEffect(() => {
@@ -199,7 +218,10 @@ export function PictureControls({
               : { from, to, text: main.state.sliceDoc(from, to) };
         }
       }
-      if (mounted.current) setTick((n) => n + 1);
+      if (mounted.current) {
+        setDrawnAt(place.current?.from ?? null);
+        setTick((n) => n + 1);
+      }
     });
     return () => {
       mounted.current = false;
@@ -220,13 +242,22 @@ export function PictureControls({
   useEffect(() => {
     const at = place.current;
     if (at?.from === contextFrom && at.to === contextTo) return;
-    commit();
+    // Written after React's run, as a close is, to the picture it was
+    // typed for.
+    const next = take();
+    if (next !== null) {
+      queueMicrotask(() => {
+        write(next, at);
+      });
+    }
     place.current = {
       from: contextFrom,
       to: contextTo,
       text: main.state.sliceDoc(contextFrom, contextTo),
     };
-  }, [main, contextFrom, contextTo, commit]);
+    // Drawn from the new place.
+    setDrawnAt(contextFrom);
+  }, [main, contextFrom, contextTo, take, write]);
 
   /** Runs `verb` on the picture, a typed alt text written first. */
   const run = (verb: (view: EditorView, pos: number) => boolean) => {
@@ -235,8 +266,9 @@ export function PictureControls({
     main.focus();
   };
 
-  const ref = pictureAt(main.state, context.from + 1);
-  const picture = ref?.from === context.from ? ref : null;
+  const here = drawnAt ?? context.from;
+  const ref = pictureAt(main.state, here + 1);
+  const picture = ref?.from === here ? ref : null;
   const format = picture?.format ?? null;
   const shown =
     picture === null
@@ -244,6 +276,9 @@ export function PictureControls({
       : altDisplay(main.state.sliceDoc(picture.altFrom, picture.altTo));
 
   const onFieldKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    // A key that confirms or cancels an input method's composition is the
+    // composition's.
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") {
       event.preventDefault();
       event.stopPropagation();
@@ -310,7 +345,7 @@ export function PictureControls({
       />
       <IconButton
         label={REMOVE}
-        icon={Trash2}
+        icon={ImageRemoveIcon}
         onClick={() => {
           run(removePicture);
         }}
