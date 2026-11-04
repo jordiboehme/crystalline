@@ -341,6 +341,13 @@ describe("the drop line", () => {
     fireDrag(box, "dragend", transfer);
   });
 
+  it("is not drawn for a file in a view without the upload handlers", () => {
+    // No uploads, so no drop would take the file: no line either (N2).
+    const { view } = build(DOC, 1, { uploads: [] });
+    fileOver(view);
+    expect(dropLineOf(view)).toBeNull();
+  });
+
   it("is not drawn on a page that takes no writes", () => {
     const { view } = build(DOC, 1);
     view.dispatch({
