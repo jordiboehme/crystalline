@@ -276,20 +276,48 @@ pub fn files(bundle: Bundle<'_>, version: &str) -> Vec<(&'static str, Vec<u8>)> 
     files
 }
 
+/// Where the Desktop-only bundle carries the `crystalline` binary. The
+/// caller stages it; [`pack`] writes this one entry executable.
+pub const BINARY_ENTRY: &str = "server/crystalline";
+
 /// A zip of `files`, each `(path inside the zip, bytes)` in the given order.
-/// Every entry is deflated and dated `zip::DateTime::default()` with mode
-/// 0o644, so the same files always give the same bytes.
+/// Every entry is deflated and dated `zip::DateTime::default()`, so the same
+/// files always give the same bytes. Every entry gets mode 0o644, except
+/// [`BINARY_ENTRY`], which gets 0o755 so Claude Desktop can start it.
+///
+/// A path must stay inside the zip: an empty, absolute or drive-letter path,
+/// or one with an empty, `.` or `..` part (split on `/` and `\`), is
+/// refused with [`std::io::ErrorKind::InvalidInput`] and nothing is written.
 pub fn pack(files: &[(&str, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
+    for (path, _) in files {
+        if !stays_inside(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("the zip entry {path:?} is not a relative path inside the zip"),
+            ));
+        }
+    }
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
-        .last_modified_time(zip::DateTime::default())
-        .unix_permissions(0o644);
+        .last_modified_time(zip::DateTime::default());
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     for (path, content) in files {
-        writer.start_file(*path, options)?;
+        let mode = if *path == BINARY_ENTRY { 0o755 } else { 0o644 };
+        writer.start_file(*path, options.unix_permissions(mode))?;
         writer.write_all(content)?;
     }
     Ok(writer.finish()?.into_inner())
+}
+
+/// Whether `path` names a file inside a zip: relative, with no drive letter
+/// and no empty, `.` or `..` part.
+fn stays_inside(path: &str) -> bool {
+    let drive = path.as_bytes().get(1) == Some(&b':');
+    !path.is_empty()
+        && !drive
+        && path
+            .split(['/', '\\'])
+            .all(|part| !matches!(part, "" | "." | ".."))
 }
 
 /// The zip Claude Desktop takes as a skill upload: one folder named after the
@@ -366,7 +394,6 @@ mod tests {
         let config = &m["server"]["mcp_config"];
         assert_eq!(config["command"], "node");
         assert_eq!(config["args"], json!(["${__dirname}/server/shim.js"]));
-        assert_eq!(config["env"], json!({ BINARY_ENV: PINNED }));
         assert_eq!(config["env"], json!({ "CRYSTALLINE_BINARY": PINNED }));
         assert_eq!(m["compatibility"]["platforms"], json!(["darwin", "win32"]));
         assert!(m["compatibility"].get("runtimes").is_none());
@@ -478,6 +505,48 @@ mod tests {
             assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
             assert_eq!(entry.unix_mode().map(|m| m & 0o777), Some(0o644));
         }
+    }
+
+    #[test]
+    fn the_staged_binary_is_packed_executable() {
+        let mut staged = files(Bundle::DesktopOnly, "9.9.9");
+        staged.push((BINARY_ENTRY, b"#!/bin/sh\n".to_vec()));
+        let bytes = pack(&staged).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let modes: Vec<(String, Option<u32>)> = (0..archive.len())
+            .map(|i| {
+                let entry = archive.by_index(i).unwrap();
+                (
+                    entry.name().unwrap().to_string(),
+                    entry.unix_mode().map(|m| m & 0o777),
+                )
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            [
+                ("manifest.json".to_string(), Some(0o644)),
+                ("icon.png".to_string(), Some(0o644)),
+                ("server/crystalline".to_string(), Some(0o755)),
+            ]
+        );
+    }
+
+    #[test]
+    fn packing_refuses_a_path_outside_the_zip() {
+        for path in [
+            "/etc/passwd",
+            "\\server\\share",
+            "C:/Windows/evil.dll",
+            "../evil.txt",
+            "server/../../evil.txt",
+            "server\\..\\evil.txt",
+            "",
+        ] {
+            let err = pack(&[(path, b"x".to_vec())]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{path:?}");
+        }
+        assert!(pack(&[("server/shim.js", b"x".to_vec())]).is_ok());
     }
 
     #[test]
