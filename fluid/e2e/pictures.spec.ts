@@ -15,6 +15,8 @@
  * fluid/e2e/run-smoke.sh e2e/pictures.spec.ts`).
  */
 
+import { readFileSync } from "node:fs";
+
 import type { BrowserContext, Locator, Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
@@ -252,6 +254,71 @@ test.describe("pictures", () => {
         { timeout: 20_000 },
       )
       .toBe(moved);
+  });
+
+  test("dragging a corner handle writes the width once, in percent, on release", async ({
+    page,
+  }) => {
+    const path = `assets/e2e/handle-${String(Date.now())}.png`;
+    const token = await csrf(page);
+    const bytes = readFileSync(
+      new URL(
+        "./fixtures/reflection-domain/assets/old-harbor.png",
+        import.meta.url,
+      ),
+    );
+    const files = `${BASE_PATH}/api/v1/domains/${DOMAIN}/files/${path}`;
+    const put = await page.request.put(files, {
+      headers: { "X-CSRF-Token": token, "Content-Type": "image/png" },
+      data: bytes,
+    });
+    expect(put.ok(), await put.text()).toBeTruthy();
+    try {
+      const reference = `![harbor](${path})`;
+      const permalink = await createEngram(
+        page,
+        `# Picture moves\n\nIntro ${reference} words.\n\nSecond paragraph.\n\nThird paragraph.\n\nThe end.\n`,
+      );
+      const { picture } = await edit(page, permalink);
+      await expect(picture.locator("img")).toBeVisible();
+      const at = await middleOf(picture);
+      await page.mouse.click(at.x, at.y);
+      await expect(picture).toHaveClass(/cm-picture-selected/);
+      const handle = picture.locator(".cm-picture-handle[data-corner=se]");
+      await expect(handle).toBeVisible();
+      const grip = await middleOf(handle);
+      const before = await held(page);
+      await page.mouse.move(grip.x, grip.y);
+      await page.mouse.down();
+      await page.mouse.move(grip.x + 100, grip.y + 10, { steps: 10 });
+      await page.mouse.move(grip.x + 200, grip.y + 20, { steps: 10 });
+      // Held: the image grew, nothing was written.
+      const grown = await picture.locator("img").boundingBox();
+      expect(grown?.width ?? 0).toBeGreaterThan(150);
+      expect((await held(page)).doc).toBe(before.doc);
+      await page.mouse.up();
+      await expect
+        .poll(async () => (await held(page)).doc)
+        .toMatch(/!\[harbor\]\([^)]*#[^)]*w=\d+%\)/);
+      const { doc } = await held(page);
+      const written = Number(/w=(\d+)%/.exec(doc)?.[1]);
+      expect(written).toBeGreaterThanOrEqual(10);
+      expect(written).toBeLessThanOrEqual(100);
+      expect(doc.split("w=")).toHaveLength(2);
+      // The picture stays selected and the page keeps one reference.
+      await expect(picture).toHaveClass(/cm-picture-selected/);
+      await expect
+        .poll(
+          async () => {
+            await settle(page);
+            return bodyOnDisk(page, permalink);
+          },
+          { timeout: 20_000 },
+        )
+        .toMatch(/w=\d+%/);
+    } finally {
+      await page.request.delete(files, { headers: { "X-CSRF-Token": token } });
+    }
   });
 
   test("with the marks shown, a held press on the block picture under the edited line leaves it in place (P25)", async ({

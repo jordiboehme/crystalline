@@ -64,6 +64,36 @@ const CORNERS = ["nw", "ne", "sw", "se"] as const;
 /** The events a widget hands to the editor: a file dragged over or dropped. */
 const DRAG_EVENTS = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
+/**
+ * Puts the handles on the corners of the image's own box. The wrapper can be
+ * wider than the image (a centered or floated one), so the corners are read
+ * from where the image stands in it. Before the image has a box the handles
+ * stay at the wrapper's corners (the stylesheet).
+ */
+function placeHandles(box: HTMLElement): void {
+  const image = box.querySelector("img");
+  if (!image || image.offsetWidth === 0 || image.offsetHeight === 0) {
+    return;
+  }
+  for (const handle of box.querySelectorAll<HTMLElement>(
+    ".cm-picture-handle",
+  )) {
+    const corner = handle.dataset["corner"] ?? "";
+    const left =
+      image.offsetLeft + (corner.endsWith("e") ? image.offsetWidth : 0);
+    const top =
+      image.offsetTop + (corner.startsWith("s") ? image.offsetHeight : 0);
+    handle.style.left = `${String(left)}px`;
+    handle.style.top = `${String(top)}px`;
+    handle.style.right = "auto";
+    handle.style.bottom = "auto";
+    handle.style.transform = "translate(-50%, -50%)";
+  }
+}
+
+/** The images whose box the handles already follow. */
+const followed = new WeakSet<HTMLImageElement>();
+
 /** The widget that last drew each picture element, for `updateDOM`. */
 const drawnBy = new WeakMap<HTMLElement, PictureWidget>();
 
@@ -202,6 +232,19 @@ class PictureWidget extends WidgetType {
         handle.setAttribute("aria-hidden", "true");
         handle.setAttribute("draggable", "false");
         box.appendChild(handle);
+      }
+      placeHandles(box);
+      if (image && !followed.has(image)) {
+        // The image's box moves with its load, the column and a resize.
+        followed.add(image);
+        image.addEventListener("load", () => {
+          placeHandles(box);
+        });
+        if (typeof ResizeObserver !== "undefined") {
+          new ResizeObserver(() => {
+            placeHandles(box);
+          }).observe(image);
+        }
       }
     }
   }
@@ -474,6 +517,13 @@ const previewTheme = EditorView.baseTheme({
     background: "var(--color-accent-600)",
     border: "1px solid white",
     borderRadius: "1px",
+    touchAction: "none",
+  },
+  ".cm-picture-handle[data-corner=nw], .cm-picture-handle[data-corner=se]": {
+    cursor: "nwse-resize",
+  },
+  ".cm-picture-handle[data-corner=ne], .cm-picture-handle[data-corner=sw]": {
+    cursor: "nesw-resize",
   },
   ".cm-picture-handle[data-corner=nw]": { top: "-0.25rem", left: "-0.25rem" },
   ".cm-picture-handle[data-corner=ne]": { top: "-0.25rem", right: "-0.25rem" },
