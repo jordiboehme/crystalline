@@ -22,7 +22,13 @@
  * Neither asserts a timing: load would make that flaky.
  */
 
-import type { Browser, CDPSession, Locator, Page } from "@playwright/test";
+import type {
+  Browser,
+  BrowserContext,
+  CDPSession,
+  Locator,
+  Page,
+} from "@playwright/test";
 import { devices, expect, test } from "@playwright/test";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -244,20 +250,53 @@ interface Held {
 }
 
 /**
- * Reads the editor's state through CodeMirror's own handle on its content
- * element. Read only: nothing here writes.
+ * The one place this spec reaches a CodeMirror view from the page.
+ * `EditorView.findFromDOM` is the public way, but the page does not expose the
+ * `EditorView` class, so this reads the field `findFromDOM` itself reads: the
+ * content element's `cmTile`, whose `root.view` is the view. Checked against
+ * @codemirror/view 6.43.15; a bump that renames it fails every `held` call at
+ * once with "no editor view". Installed on every context this file uses,
+ * as `window.fluidView(label)`.
  */
+async function installViewHandle(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    (window as unknown as { fluidView: (label: string) => unknown }).fluidView =
+      (label: string) => {
+        const el = document.querySelector(`.cm-content[aria-label="${label}"]`);
+        return (
+          (el as unknown as { cmTile?: { root?: { view?: unknown } } } | null)
+            ?.cmTile?.root?.view ?? null
+        );
+      };
+  });
+}
+
+/** A new context with the view handle, for tests that need more than one. */
+async function newContext(
+  browser: Browser,
+  options: Parameters<Browser["newContext"]>[0] = {},
+): Promise<BrowserContext> {
+  const context = await browser.newContext(options);
+  await installViewHandle(context);
+  return context;
+}
+
+test.beforeEach(async ({ context }) => {
+  await installViewHandle(context);
+});
+
+/** Reads the editor's text and main selection. Read only: nothing writes. */
 function held(page: Page, label: string = SOURCE): Promise<Held> {
   return page.evaluate((name) => {
-    const el = document.querySelector(`.cm-content[aria-label="${name}"]`);
     type View = {
       state: {
         doc: { toString(): string };
         selection: { main: { anchor: number; head: number } };
       };
     };
-    const view = (el as unknown as { cmTile?: { root?: { view?: View } } })
-      ?.cmTile?.root?.view;
+    const view = (
+      window as unknown as { fluidView?: (label: string) => View | null }
+    ).fluidView?.(name);
     if (!view) throw new Error(`no editor view for ${name}`);
     return {
       doc: view.state.doc.toString(),
@@ -277,6 +316,31 @@ function weightOf(target: Locator, word: string): Promise<number> {
       }
     }
     return 0;
+  }, word);
+}
+
+/**
+ * How many elements around the text `word` (up to `target`) draw their own
+ * underline: one is a single line, two is a doubled one.
+ */
+function underlines(target: Locator, word: string): Promise<number> {
+  return target.evaluate((root, w) => {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!(node.textContent ?? "").includes(w)) continue;
+      let count = 0;
+      for (
+        let el = node.parentElement;
+        el && root.contains(el);
+        el = el.parentElement
+      ) {
+        if (getComputedStyle(el).textDecorationLine.includes("underline")) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+    return -1;
   }, word);
 }
 
@@ -470,6 +534,7 @@ test.describe("hidden marks", () => {
     // still not inside the link.
     const within = (head: number) =>
       head > start && head < start + moved.length;
+    const afterCommit = (await held(page)).doc;
     await words.click();
     await expect(dialog).toBeVisible();
     expect(within((await held(page)).head)).toBe(false);
@@ -487,7 +552,8 @@ test.describe("hidden marks", () => {
     await expect(dialog).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
-    expect(await fileOf(page, permalink).then(bodyOf)).toBe(body);
+    // Neither Escape nor the setting wrote anything.
+    expect((await held(page)).doc).toBe(afterCommit);
   });
 
   test("a status pill's colour picked with Enter changes only the colour word", async ({
@@ -501,12 +567,14 @@ test.describe("hidden marks", () => {
     await expect(dialog.getByLabel("Label")).toHaveValue("Open");
     await shot(page, "04-status-popover.png");
 
-    // A click on a colour writes nothing yet; Enter on the radio saves.
+    // A click on a colour writes nothing yet (the editor's text is as it
+    // was); Enter on the radio saves.
+    const before = (await held(page)).doc;
     const blue = dialog.getByRole("radio", { name: "blue" });
     await blue.click();
     await expect(blue).toBeFocused();
-    await page.waitForTimeout(500);
-    expect(bodyOf(await fileOf(page, permalink))).toBe(BUOY);
+    await expect(blue).toBeChecked();
+    expect((await held(page)).doc).toBe(before);
     await page.keyboard.press("Enter");
     await expect(dialog).toHaveCount(0);
 
@@ -523,7 +591,7 @@ test.describe("hidden marks", () => {
   }) => {
     const permalink = await createEngram(page, titled("Marks Task"));
     const source = await edit(page, permalink);
-    const boxes = source.locator(".cm-task-toggle");
+    const boxes = source.getByRole("checkbox", { name: "Mark task done" });
     await expect(boxes).toHaveCount(2);
 
     // Journey 5: a click marks it done, the menu marks it not applicable.
@@ -532,7 +600,9 @@ test.describe("hidden marks", () => {
       b.includes("- [x] Paint"),
     );
     expect(body).toBe(BUOY.replace("- [ ] Paint", "- [x] Paint"));
-    await boxes.first().click({ button: "right" });
+    await source
+      .getByRole("checkbox", { name: "Mark task open" })
+      .click({ button: "right" });
     const menu = page.getByRole("menu", { name: "Task state" });
     await expect(menu).toBeVisible();
     await shot(page, "06-task-menu.png");
@@ -545,17 +615,22 @@ test.describe("hidden marks", () => {
 
     // Space on the other box writes once: done, and still done a moment
     // later (not flipped back by the click the browser sends on keyup).
-    const bell = source
-      .locator(".cm-line")
-      .filter({ hasText: "Check the bell" })
-      .locator(".cm-task-toggle");
+    const bell = line(source, "Check the bell").getByRole("checkbox", {
+      name: "Mark task done",
+    });
     await bell.focus();
     await page.keyboard.press("Space");
-    await bodySatisfies(page, permalink, (b) =>
+    // The editor's own text, read at once and again a second later, so a
+    // flip back from the click the browser sends on keyup would show.
+    const doneBell = (doc: string) =>
+      doc.includes("- [x] Check the bell") &&
+      !doc.includes("- [ ] Check the bell");
+    await expect.poll(async () => doneBell((await held(page)).doc)).toBe(true);
+    await page.waitForTimeout(1000);
+    expect(doneBell((await held(page)).doc)).toBe(true);
+    body = await bodySatisfies(page, permalink, (b) =>
       b.includes("- [x] Check the bell"),
     );
-    await page.waitForTimeout(1000);
-    body = bodyOf(await fileOf(page, permalink));
     expect(body).toBe(
       BUOY.replace("- [ ] Paint", "- [~] Paint").replace(
         "- [ ] Check the bell",
@@ -593,6 +668,7 @@ test.describe("hidden marks", () => {
   }) => {
     const permalink = await createEngram(page, titled("Marks Setting"));
     const source = await edit(page, permalink);
+    const opened = (await held(page)).doc;
     await shot(page, "01-hidden.png");
     expect(await settingIsOn(page)).toBe(false);
     expect(await flipSetting(page)).toBe(true);
@@ -623,7 +699,8 @@ test.describe("hidden marks", () => {
     await expect(line(source, /A (\*\*)?bold/)).toHaveText(
       "A bold word and a chart to follow.",
     );
-    expect(bodyOf(await fileOf(page, permalink))).toBe(BUOY);
+    // Showing and hiding marks wrote nothing.
+    expect((await held(page)).doc).toBe(opened);
   });
 
   test("Raw shows the source with every mark", async ({ page }) => {
@@ -646,33 +723,50 @@ test.describe("hidden marks", () => {
     }
   });
 
-  test("a Mac Ctrl+click on a task box opens the menu, a callout head press places no caret", async ({
-    browser,
+  test("a Ctrl+click on a task box on a Mac opens the menu and does not flip the box", async ({
+    page,
   }) => {
-    // The Mac reading of a Ctrl+click is the platform's, so the page is told
-    // it runs on one whatever this run's host is.
-    const context = await browser.newContext();
-    await context.addInitScript(() => {
-      Object.defineProperty(Navigator.prototype, "platform", {
-        get: () => "MacIntel",
-      });
-    });
-    const page = await context.newPage();
-    await signIn(page);
+    // Only Chromium's Mac build turns a Ctrl+click into a context menu
+    // press, so this step runs on a Mac host only. The right click below
+    // covers the menu path on every host.
+    test.skip(
+      process.platform !== "darwin",
+      "a Ctrl+click is a context menu press only on a Mac",
+    );
     const permalink = await createEngram(page, titled("Marks Mac"));
     const source = await edit(page, permalink);
-
+    const before = (await held(page)).doc;
     await source
-      .locator(".cm-task-toggle")
+      .getByRole("checkbox", { name: "Mark task done" })
       .first()
       .click({ modifiers: ["Control"] });
     const menu = page.getByRole("menu", { name: "Task state" });
     await expect(menu).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(menu).toHaveCount(0);
-    await page.waitForTimeout(500);
-    expect(bodyOf(await fileOf(page, permalink))).toBe(BUOY);
-    await expect(source.locator(".cm-task-toggle").first()).not.toBeChecked();
+    expect((await held(page)).doc).toBe(before);
+    await expect(
+      source.getByRole("checkbox", { name: "Mark task done" }).first(),
+    ).not.toBeChecked();
+  });
+
+  test("a right click on a task box opens the menu, a callout head press places no caret", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, titled("Marks Menu"));
+    const source = await edit(page, permalink);
+
+    // A right click opens the menu and flips nothing.
+    const opened = (await held(page)).doc;
+    await source
+      .getByRole("checkbox", { name: "Mark task done" })
+      .first()
+      .click({ button: "right" });
+    const menu = page.getByRole("menu", { name: "Task state" });
+    await expect(menu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    expect((await held(page)).doc).toBe(opened);
 
     // A press on the callout's kind button opens its menu and leaves the
     // caret where it was.
@@ -692,7 +786,6 @@ test.describe("hidden marks", () => {
       b.includes("> [!NOTE]- Pilot notes"),
     );
     expect((await held(page)).head).toBe(before.head);
-    await context.close();
   });
 
   test("a long document's footnotes are numbered in the worker and an edit renumbers them", async ({
@@ -786,22 +879,37 @@ test.describe("hidden marks", () => {
     expect(copied["text/html"]).toContain('data-crystalline-copy="1"');
     expect(copied["text/html"]).toContain("<strong>bold</strong>");
     expect(copied["text/html"]).toContain('href="https://example.com/chart"');
+    // The paste over the selection collapses it to the end of the pasted
+    // line, and the text is byte for byte what it was.
+    const beforePaste = await held(page);
+    const lineEnd = Math.max(beforePaste.anchor, beforePaste.head);
     await page.keyboard.press("ControlOrMeta+v");
-    await page.waitForTimeout(500);
-    expect((await held(page)).doc).toContain(`\n${sourceLine}\n`);
+    await expect
+      .poll(async () => {
+        const now = await held(page);
+        return now.anchor === now.head && now.head === lineEnd;
+      })
+      .toBe(true);
+    expect((await held(page)).doc).toBe(beforePaste.doc);
 
     // Cut, then paste back: the same bytes again.
     await selectLine();
+    const beforeCut = (await held(page)).doc;
     await page.keyboard.press("ControlOrMeta+x");
     await expect(boldLine).toHaveCount(0);
     copied = await clipboard();
     expect(copied["text/plain"]).toBe(sourceLine);
     expect(copied["text/html"]).toContain('data-crystalline-copy="1"');
+    expect((await held(page)).doc).not.toContain(sourceLine);
+    // The cut is saved first (the room saves after a pause), so the file
+    // check after the paste reads a save the paste made.
+    await bodySatisfies(page, permalink, (b) => !b.includes(sourceLine));
     await page.keyboard.press("ControlOrMeta+v");
     await expect(line(source, "A bold word and a chart")).toHaveText(
       "A bold word and a chart to follow.",
     );
-    await page.waitForTimeout(1000);
+    expect((await held(page)).doc).toBe(beforeCut);
+    // And the file: the save of the paste brings the same bytes back.
     const body = await bodySatisfies(page, permalink, (b) => b === BUOY);
     expect(body).toBe(BUOY);
   });
@@ -809,61 +917,66 @@ test.describe("hidden marks", () => {
   test("two browsers: one presses Mod-b and types while the other types beside it", async ({
     browser,
   }) => {
-    const contextA = await browser.newContext();
-    const contextB = await browser.newContext();
-    const pageA = await contextA.newPage();
-    const pageB = await contextB.newPage();
-    await signIn(pageA);
-    await signIn(pageB, PEER, PEER_PASSWORD);
-    const permalink = await createEngram(pageA, titled("Marks Room"));
-    const sourceA = await edit(pageA, permalink);
-    const sourceB = await edit(pageB, permalink);
+    const contextA = await newContext(browser);
+    const contextB = await newContext(browser);
+    try {
+      const pageA = await contextA.newPage();
+      const pageB = await contextB.newPage();
+      await signIn(pageA);
+      await signIn(pageB, PEER, PEER_PASSWORD);
+      const permalink = await createEngram(pageA, titled("Marks Room"));
+      const sourceA = await edit(pageA, permalink);
+      const sourceB = await edit(pageB, permalink);
 
-    // A's caret right after "one", B's at the end of the same line.
-    await clickBeside(line(sourceA, "Watch list"), "one", "after");
-    await clickBeside(line(sourceB, "Watch list"), "two", "after");
-    await expect(pageA.locator(".cm-ySelectionCaret")).not.toHaveCount(0);
-    await expect(pageB.locator(".cm-ySelectionCaret")).not.toHaveCount(0);
+      // A's caret right after "one", B's at the end of the same line.
+      await clickBeside(line(sourceA, "Watch list"), "one", "after");
+      await clickBeside(line(sourceB, "Watch list"), "two", "after");
+      await expect(pageA.locator(".cm-ySelectionCaret")).not.toHaveCount(0);
+      await expect(pageB.locator(".cm-ySelectionCaret")).not.toHaveCount(0);
 
-    // A presses Mod-b with no selection (a pending bold), B types, and only
-    // then A types: B's change arriving must not drop A's pending bold.
-    // Each side's text, read from its editor (the drawn line also carries
-    // the other person's caret label).
-    const watchOf = async (page: Page) =>
-      (await held(page)).doc.split("\n").find((l) => l.startsWith("Watch"));
-    await pageA.keyboard.type(" ");
-    await expect.poll(() => watchOf(pageB)).toBe("Watch list: one  two");
-    await pageA.keyboard.press("ControlOrMeta+b");
-    await pageB.keyboard.type(" bravo");
-    await expect.poll(() => watchOf(pageA)).toBe("Watch list: one  two bravo");
-    await pageA.keyboard.type("alpha");
-
-    for (const page of [pageA, pageB]) {
+      // A presses Mod-b with no selection (a pending bold), B types, and only
+      // then A types: B's change arriving must not drop A's pending bold.
+      // Each side's text, read from its editor (the drawn line also carries
+      // the other person's caret label).
+      const watchOf = async (page: Page) =>
+        (await held(page)).doc.split("\n").find((l) => l.startsWith("Watch"));
+      await pageA.keyboard.type(" ");
+      await expect.poll(() => watchOf(pageB)).toBe("Watch list: one  two");
+      await pageA.keyboard.press("ControlOrMeta+b");
+      await pageB.keyboard.type(" bravo");
       await expect
-        .poll(() => watchOf(page))
-        .toBe("Watch list: one **alpha** two bravo");
-    }
-    expect(await weightOf(line(sourceB, "Watch list"), "alpha")).toBe(
-      await weightOf(line(sourceA, "Watch list"), "alpha"),
-    );
-    expect(
-      await weightOf(line(sourceA, "Watch list"), "alpha"),
-    ).toBeGreaterThanOrEqual(600);
-    expect((await held(pageA)).doc).toBe((await held(pageB)).doc);
+        .poll(() => watchOf(pageA))
+        .toBe("Watch list: one  two bravo");
+      await pageA.keyboard.type("alpha");
 
-    const body = await bodySatisfies(
-      pageA,
-      permalink,
-      (b) => b.includes("bravo") && b.includes("alpha"),
-    );
-    expect(body).toBe(
-      BUOY.replace(
-        "Watch list: one two",
-        "Watch list: one **alpha** two bravo",
-      ),
-    );
-    await contextA.close();
-    await contextB.close();
+      for (const page of [pageA, pageB]) {
+        await expect
+          .poll(() => watchOf(page))
+          .toBe("Watch list: one **alpha** two bravo");
+      }
+      expect(await weightOf(line(sourceB, "Watch list"), "alpha")).toBe(
+        await weightOf(line(sourceA, "Watch list"), "alpha"),
+      );
+      expect(
+        await weightOf(line(sourceA, "Watch list"), "alpha"),
+      ).toBeGreaterThanOrEqual(600);
+      expect((await held(pageA)).doc).toBe((await held(pageB)).doc);
+
+      const body = await bodySatisfies(
+        pageA,
+        permalink,
+        (b) => b.includes("bravo") && b.includes("alpha"),
+      );
+      expect(body).toBe(
+        BUOY.replace(
+          "Watch list: one two",
+          "Watch list: one **alpha** two bravo",
+        ),
+      );
+    } finally {
+      await contextA.close();
+      await contextB.close();
+    }
   });
 
   test("an open table cell draws its bold word bold with the marks hidden", async ({
@@ -895,6 +1008,37 @@ test.describe("hidden marks", () => {
     await page.keyboard.press("End");
     await page.keyboard.type("ern");
     await bodySatisfies(page, table, (b) => b.includes("| **Northern** |"));
+  });
+
+  test("a link in an open table cell is underlined as often as one in prose", async ({
+    page,
+  }) => {
+    const table = await createEngram(
+      page,
+      titled("Marks Cell Link"),
+      [
+        "# Buoy Marks",
+        "",
+        "See the [Chart](https://example.com/c) here.",
+        "",
+        "| Buoy | Colour |",
+        "| --- | --- |",
+        "| [Chart](https://example.com/c) | blue |",
+        "",
+      ].join("\n"),
+    );
+    const source = await edit(page, table);
+    await page
+      .locator('.cm-grid [aria-rowindex="2"][aria-colindex="1"]')
+      .click();
+    const open = page.locator(".cm-grid .cm-content[contenteditable=true]");
+    await expect(open).toBeFocused();
+    await expect(open).toHaveText("Chart");
+    await shot(page, "10-table-cell-link.png");
+    const inCell = await underlines(open, "Chart");
+    const inProse = await underlines(line(source, "See the"), "Chart");
+    expect(inProse).toBeGreaterThanOrEqual(1);
+    expect(inCell).toBe(inProse);
   });
 
   test("in a Reflection page the bold and link journeys work and no comment or id shows", async ({
@@ -977,6 +1121,7 @@ test.describe("hidden marks", () => {
 
       // With the setting on, the line being edited shows its marks, and still
       // no comment and no id shows, not even beside the heading.
+      const typed = (await held(page, PAGE_SOURCE)).doc;
       expect(await flipSetting(page)).toBe(true);
       await clickBeside(line(source, /^#* ?Watch$/), "Watch", "after");
       await expect(line(source, /^#* ?Watch$/)).toHaveText("## Watch");
@@ -998,7 +1143,8 @@ test.describe("hidden marks", () => {
         "**bolder**",
       );
       await nothingHidden();
-      expect(bodyOf(await pageSource())).toBe(bodyOf(saved));
+      // The walk and the setting wrote nothing.
+      expect((await held(page, PAGE_SOURCE)).doc).toBe(typed);
     } finally {
       await page.goto(`d/${REFLECTION_DOMAIN}/reflection`);
       const removed = await page.request.delete(api, {
@@ -1123,10 +1269,10 @@ async function typingCost(
   count: number,
 ): Promise<object> {
   await page.evaluate((label) => {
-    const el = document.querySelector(`.cm-content[aria-label="${label}"]`);
     type View = { dispatch: (...args: unknown[]) => void };
-    const view = (el as unknown as { cmTile: { root: { view: View } } }).cmTile
-      .root.view;
+    const view = (
+      window as unknown as { fluidView: (l: string) => View }
+    ).fluidView(label);
     const w = window as unknown as {
       fluidDispatch: number[][];
       fluidSlow: { name: string; duration: number; processing: number }[];
@@ -1343,13 +1489,13 @@ test.describe("hidden marks measurements", () => {
     // The row's place in the editor's text (which holds the frontmatter too).
     const at = await page.evaluate(
       ([label, needle]) => {
-        const el = document.querySelector(`.cm-content[aria-label="${label}"]`);
         type View = {
           state: { doc: { toString(): string } };
           dispatch: (spec: object) => void;
         };
-        const view = (el as unknown as { cmTile: { root: { view: View } } })
-          .cmTile.root.view;
+        const view = (
+          window as unknown as { fluidView: (l: string) => View }
+        ).fluidView(label);
         const pos = view.state.doc.toString().indexOf(needle);
         view.dispatch({ selection: { anchor: pos }, scrollIntoView: true });
         return pos;
@@ -1398,139 +1544,146 @@ test.describe("hidden marks measurements", () => {
   test("how often the Android composition guard turns off the delete check", async ({
     browser,
   }) => {
-    const context = await browser.newContext({ ...devices["Pixel 7"] });
-    const page = await context.newPage();
-    await signIn(page);
-    const permalink = await createEngram(page, titled("Marks Android"));
-    const source = await edit(page, permalink);
-    // Every dispatch that shortens the text is a deletion. CodeMirror hands
-    // its DOM reads to `dispatch` as specs (with `userEvent`) or as
-    // transactions; both are read here, and whether the view was composing
-    // when it came.
-    await page.evaluate((label) => {
-      const el = document.querySelector(`.cm-content[aria-label="${label}"]`);
-      type View = {
-        composing: boolean;
-        state: { doc: { length: number } };
-        dispatch: (...args: unknown[]) => void;
-      };
-      const view = (el as unknown as { cmTile: { root: { view: View } } })
-        .cmTile.root.view;
-      const tally = {
-        deletes: 0,
-        whileComposing: 0,
-        composeEvents: 0,
-        checkedEvents: 0,
-        events: [] as string[],
-      };
-      (window as unknown as { fluidTally: typeof tally }).fluidTally = tally;
-      const known = ["input.type.compose", "delete.backward", "delete"];
-      const eventOf = (arg: unknown): string => {
-        const spec = arg as {
-          userEvent?: string;
-          isUserEvent?: (e: string) => boolean;
+    const context = await newContext(browser, { ...devices["Pixel 7"] });
+    try {
+      const page = await context.newPage();
+      await signIn(page);
+      const permalink = await createEngram(page, titled("Marks Android"));
+      const source = await edit(page, permalink);
+      // Every dispatch that shortens the text is a deletion. CodeMirror hands
+      // its DOM reads to `dispatch` as specs (with `userEvent`) or as
+      // transactions; both are read here, and whether the view was composing
+      // when it came.
+      await page.evaluate((label) => {
+        type View = {
+          composing: boolean;
+          state: { doc: { length: number } };
+          dispatch: (...args: unknown[]) => void;
         };
-        if (typeof spec.userEvent === "string") return spec.userEvent;
-        if (typeof spec.isUserEvent === "function") {
-          return known.find((e) => spec.isUserEvent?.(e)) ?? "";
-        }
-        return "";
-      };
-      const dispatch = view.dispatch.bind(view);
-      view.dispatch = (...args: unknown[]) => {
-        const before = view.state.doc.length;
-        const composing = view.composing;
-        dispatch(...args);
-        if (view.state.doc.length >= before) return;
-        const event = eventOf(args[0]);
-        tally.deletes += 1;
-        tally.events.push(`${event || "?"}${composing ? " (composing)" : ""}`);
-        if (event === "input.type.compose") tally.composeEvents += 1;
-        if (composing || event === "input.type.compose") {
-          tally.whileComposing += 1;
-        } else if (event.startsWith("delete")) {
-          tally.checkedEvents += 1;
-        }
-      };
-    }, SOURCE);
-    const cdp: CDPSession = await context.newCDPSession(page);
-    await clickBeside(line(source, "Watch list"), "two", "after");
+        const view = (
+          window as unknown as { fluidView: (l: string) => View }
+        ).fluidView(label);
+        const tally = {
+          deletes: 0,
+          whileComposing: 0,
+          composeEvents: 0,
+          checkedEvents: 0,
+          events: [] as string[],
+        };
+        (window as unknown as { fluidTally: typeof tally }).fluidTally = tally;
+        const known = ["input.type.compose", "delete.backward", "delete"];
+        const eventOf = (arg: unknown): string => {
+          const spec = arg as {
+            userEvent?: string;
+            isUserEvent?: (e: string) => boolean;
+          };
+          if (typeof spec.userEvent === "string") return spec.userEvent;
+          if (typeof spec.isUserEvent === "function") {
+            return known.find((e) => spec.isUserEvent?.(e)) ?? "";
+          }
+          return "";
+        };
+        const dispatch = view.dispatch.bind(view);
+        view.dispatch = (...args: unknown[]) => {
+          const before = view.state.doc.length;
+          const composing = view.composing;
+          dispatch(...args);
+          if (view.state.doc.length >= before) return;
+          const event = eventOf(args[0]);
+          tally.deletes += 1;
+          tally.events.push(
+            `${event || "?"}${composing ? " (composing)" : ""}`,
+          );
+          if (event === "input.type.compose") tally.composeEvents += 1;
+          if (composing || event === "input.type.compose") {
+            tally.whileComposing += 1;
+          } else if (event.startsWith("delete")) {
+            tally.checkedEvents += 1;
+          }
+        };
+      }, SOURCE);
+      const cdp: CDPSession = await context.newCDPSession(page);
+      await clickBeside(line(source, "Watch list"), "two", "after");
 
-    // At two places (the end of a plain line, and right after a bold word):
-    // a word composed letter by letter, two letters taken back inside the
-    // composition (as a phone keyboard does), then committed; then two
-    // Backspaces outside any composition.
-    const places: [string, string][] = [
-      ["Watch list", "two"],
-      ["word and a chart", "bold"],
-    ];
-    for (const [text, word] of places) {
-      await clickBeside(line(source, text), word, "after");
+      // At two places (the end of a plain line, and right after a bold word):
+      // a word composed letter by letter, two letters taken back inside the
+      // composition (as a phone keyboard does), then committed; then two
+      // Backspaces outside any composition.
+      const places: [string, string][] = [
+        ["Watch list", "two"],
+        ["word and a chart", "bold"],
+      ];
+      for (const [text, word] of places) {
+        await clickBeside(line(source, text), word, "after");
+        await expect(source).toBeFocused();
+        await page.waitForTimeout(300);
+        const typed = " harbour";
+        for (let i = 1; i <= typed.length; i += 1) {
+          await cdp.send("Input.imeSetComposition", {
+            text: typed.slice(0, i),
+            selectionStart: i,
+            selectionEnd: i,
+          });
+        }
+        for (const n of [typed.length - 1, typed.length - 2]) {
+          await cdp.send("Input.imeSetComposition", {
+            text: typed.slice(0, n),
+            selectionStart: n,
+            selectionEnd: n,
+          });
+        }
+        await cdp.send("Input.insertText", { text: typed.slice(0, -2) });
+        await page.waitForTimeout(300);
+        await page.keyboard.press("Backspace");
+        await page.keyboard.press("Backspace");
+        await page.waitForTimeout(300);
+      }
+      // As a phone keyboard usually types after a word: the space committed on
+      // its own, then the next word composed and committed, right after the
+      // bold "red".
+      await clickBeside(line(source, "Second buoy is"), "red", "after");
       await expect(source).toBeFocused();
       await page.waitForTimeout(300);
-      const typed = " harbour";
-      for (let i = 1; i <= typed.length; i += 1) {
+      await cdp.send("Input.insertText", { text: " " });
+      for (const part of ["s", "se", "sea"]) {
         await cdp.send("Input.imeSetComposition", {
-          text: typed.slice(0, i),
-          selectionStart: i,
-          selectionEnd: i,
+          text: part,
+          selectionStart: part.length,
+          selectionEnd: part.length,
         });
       }
-      for (const n of [typed.length - 1, typed.length - 2]) {
-        await cdp.send("Input.imeSetComposition", {
-          text: typed.slice(0, n),
-          selectionStart: n,
-          selectionEnd: n,
-        });
-      }
-      await cdp.send("Input.insertText", { text: typed.slice(0, -2) });
+      await cdp.send("Input.insertText", { text: "sea" });
       await page.waitForTimeout(300);
-      await page.keyboard.press("Backspace");
-      await page.keyboard.press("Backspace");
-      await page.waitForTimeout(300);
-    }
-    // As a phone keyboard usually types after a word: the space committed on
-    // its own, then the next word composed and committed, right after the
-    // bold "red".
-    await clickBeside(line(source, "Second buoy is"), "red", "after");
-    await expect(source).toBeFocused();
-    await page.waitForTimeout(300);
-    await cdp.send("Input.insertText", { text: " " });
-    for (const part of ["s", "se", "sea"]) {
-      await cdp.send("Input.imeSetComposition", {
-        text: part,
-        selectionStart: part.length,
-        selectionEnd: part.length,
+      const spaceThenCompose =
+        (await held(page)).doc
+          .split("\n")
+          .find((l) => l.includes("Second buoy")) ?? "";
+      const tally = await page.evaluate(
+        () =>
+          (
+            window as unknown as {
+              fluidTally: {
+                deletes: number;
+                whileComposing: number;
+                composeEvents: number;
+                checkedEvents: number;
+                events: string[];
+              };
+            }
+          ).fluidTally,
+      );
+      const doc = (await held(page)).doc;
+      record("android composition", {
+        ...tally,
+        lines: doc
+          .split("\n")
+          .filter(
+            (l) => l.startsWith("Watch list") || l.includes("word and a"),
+          ),
+        spaceThenCompose,
       });
+    } finally {
+      await context.close();
     }
-    await cdp.send("Input.insertText", { text: "sea" });
-    await page.waitForTimeout(300);
-    const spaceThenCompose =
-      (await held(page)).doc
-        .split("\n")
-        .find((l) => l.includes("Second buoy")) ?? "";
-    const tally = await page.evaluate(
-      () =>
-        (
-          window as unknown as {
-            fluidTally: {
-              deletes: number;
-              whileComposing: number;
-              composeEvents: number;
-              checkedEvents: number;
-              events: string[];
-            };
-          }
-        ).fluidTally,
-    );
-    const doc = (await held(page)).doc;
-    record("android composition", {
-      ...tally,
-      lines: doc
-        .split("\n")
-        .filter((l) => l.startsWith("Watch list") || l.includes("word and a")),
-      spaceThenCompose,
-    });
-    await context.close();
   });
 });
