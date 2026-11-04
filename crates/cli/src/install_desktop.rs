@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crystalline_core::CommandSpelling;
 use crystalline_core::desktop_extension::{Bundle, files, pack, shim_sha256};
 
-use crate::desktop_record::{self, ExtensionRecord};
+use crate::desktop_record::{self, DesktopRecord, ExtensionRecord};
 use crate::harness_command::resolve_program;
 
 /// The Crystalline version this binary builds the extension for.
@@ -77,11 +77,12 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
     }
 
     let record_path = desktop_record::record_path()?;
-    // A record this binary cannot read is no record: it is rewritten whole.
-    let mut record = desktop_record::load(&record_path)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // A record this binary cannot read is no record: it is rewritten whole,
+    // and the report says so once the new one is written.
+    let (mut record, unreadable) = match desktop_record::load(&record_path) {
+        Ok(found) => (found.unwrap_or_default(), None),
+        Err(reason) => (DesktopRecord::default(), Some(reason)),
+    };
     let mut notices = Vec::new();
     let mut extension = None;
 
@@ -102,7 +103,8 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
             VERSION,
         ))
         .context("could not pack the Claude Desktop extension")?;
-        desktop_record::write_replacing(&file, &zip)?;
+        desktop_record::write_replacing(&file, &zip)
+            .with_context(|| format!("could not write {}", file.display()))?;
         let built = BuiltExtension {
             file: file.display().to_string(),
             binary: resolved.program,
@@ -120,8 +122,21 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
         extension = Some(built);
     }
 
+    // The extension is built by now, so a record that cannot be saved is a
+    // notice and the run still exits 0: the person can install the file.
     if extension.is_some() {
-        desktop_record::save(&record_path, &record)?;
+        match desktop_record::save(&record_path, &record) {
+            Ok(()) => notices.extend(unreadable.map(|reason| {
+                format!(
+                    "{} could not be read ({reason}), so it was written fresh.",
+                    record_path.display()
+                )
+            })),
+            Err(e) => notices.push(format!(
+                "Crystalline could not remember this build in {} ({e}), so doctor and uninstall will not know about it.",
+                record_path.display()
+            )),
+        }
     }
 
     if json {

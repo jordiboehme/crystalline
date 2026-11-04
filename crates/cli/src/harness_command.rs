@@ -62,13 +62,29 @@ pub(crate) fn resolve_program(
         });
         return ResolvedProgram { program, warning };
     }
-    let program = std::env::current_exe()
+    fallback(who, std::env::current_exe().ok())
+}
+
+/// This binary's own path (`exe`), for when PATH holds no crystalline. The
+/// warning names `who`, and also says so when the path sits in a versioned
+/// folder an upgrade may move.
+fn fallback(who: &str, exe: Option<PathBuf>) -> ResolvedProgram {
+    let program = exe
+        .as_ref()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "crystalline".to_string());
-    let warning = Some(format!(
+        .unwrap_or_else(|| "crystalline".to_string());
+    let mut warning = format!(
         "crystalline is not on your PATH, so {who} gets this binary's own path ({program})"
-    ));
-    ResolvedProgram { program, warning }
+    );
+    if exe.as_deref().is_some_and(in_versioned_folder) {
+        warning.push_str(
+            ". That path sits in a versioned folder, so an upgrade may move it. Put a stable link such as /opt/homebrew/bin on your PATH.",
+        );
+    }
+    ResolvedProgram {
+        program,
+        warning: Some(warning),
+    }
 }
 
 /// The file name the binary has on this platform.
@@ -376,6 +392,33 @@ mod tests {
             warning.contains("so Kiro gets this binary's own path"),
             "{warning}"
         );
+    }
+
+    /// Every target that falls back to this binary's own path hears when
+    /// that path is a versioned one.
+    #[test]
+    fn the_own_path_fallback_warns_about_a_versioned_folder() {
+        for who in ["Cursor", "Kiro", "Claude Desktop"] {
+            let cellar = PathBuf::from("/opt/homebrew/Cellar/crystalline/0.31.0/bin/crystalline");
+            let got = fallback(who, Some(cellar.clone()));
+            assert_eq!(got.program, cellar.display().to_string());
+            assert_eq!(
+                got.warning.unwrap(),
+                format!(
+                    "crystalline is not on your PATH, so {who} gets this binary's own path ({}). That path sits in a versioned folder, so an upgrade may move it. Put a stable link such as /opt/homebrew/bin on your PATH.",
+                    cellar.display()
+                )
+            );
+            let plain = PathBuf::from("/Users/jo/.cargo/bin/crystalline");
+            let got = fallback(who, Some(plain.clone()));
+            assert_eq!(
+                got.warning.unwrap(),
+                format!(
+                    "crystalline is not on your PATH, so {who} gets this binary's own path ({})",
+                    plain.display()
+                )
+            );
+        }
     }
 
     #[test]

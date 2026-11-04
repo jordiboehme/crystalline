@@ -87,19 +87,20 @@ pub(crate) fn bundle_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Load the record. A missing file is `None`; an unreadable file, bad JSON
-/// or an unknown format is an error the caller treats as no record.
+/// or an unknown format is an error the caller treats as no record. The
+/// error is the reason only, without the path, so a caller can put it in a
+/// sentence that names the path itself.
 pub(crate) fn load(path: &Path) -> anyhow::Result<Option<DesktopRecord>> {
     let bytes = match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => anyhow::bail!("could not read {}: {e}", path.display()),
+        Err(e) => anyhow::bail!("{e}"),
         Ok(bytes) => bytes,
     };
-    let record: DesktopRecord = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("{} is not a valid record: {e}", path.display()))?;
+    let record: DesktopRecord =
+        serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("it is not valid JSON: {e}"))?;
     if record.format != FORMAT {
         anyhow::bail!(
-            "{} carries unknown record format {}",
-            path.display(),
+            "it has record format {}, which this crystalline does not know",
             record.format
         );
     }
@@ -108,29 +109,34 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Option<DesktopRecord>> {
 
 /// Write the record to `<path>.partial`, then rename it over `path`, so a
 /// reader never sees half a file. Pretty JSON with a trailing newline.
-pub(crate) fn save(path: &Path, record: &DesktopRecord) -> anyhow::Result<()> {
-    let mut text = serde_json::to_string_pretty(record)?;
+/// The error is the plain I/O error, without the path.
+pub(crate) fn save(path: &Path, record: &DesktopRecord) -> std::io::Result<()> {
+    let mut text = serde_json::to_string_pretty(record).map_err(std::io::Error::other)?;
     text.push('\n');
     write_replacing(path, text.as_bytes())
 }
 
 /// Write `bytes` to `<path>.partial` and rename it over `path`, creating the
-/// parent folder first.
-pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// parent folder first. When the write or the rename fails, the partial
+/// file is removed again; the error is the plain I/O error, without the
+/// path.
+pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("could not create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)?;
     }
+    let partial = partial_path(path);
+    let written = std::fs::write(&partial, bytes).and_then(|()| std::fs::rename(&partial, path));
+    if written.is_err() && partial.is_file() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    written
+}
+
+/// `<path>.partial`.
+fn partial_path(path: &Path) -> PathBuf {
     let mut partial = path.as_os_str().to_owned();
     partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    std::fs::write(&partial, bytes)
-        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", partial.display()))?;
-    if let Err(e) = std::fs::rename(&partial, path) {
-        let _ = std::fs::remove_file(&partial);
-        anyhow::bail!("could not write {}: {e}", path.display());
-    }
-    Ok(())
+    PathBuf::from(partial)
 }
 
 #[cfg(test)]
@@ -170,6 +176,19 @@ mod tests {
         assert!(!partial.exists(), "no partial file is left");
     }
 
+    /// A rename that fails (the target is a folder that holds a file) leaves
+    /// no partial file behind and keeps the target as it was.
+    #[test]
+    fn a_failed_desktop_record_write_leaves_no_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-desktop.json");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), "x").unwrap();
+        assert!(save(&path, &sample()).is_err());
+        assert!(!partial_path(&path).exists(), "the partial file is removed");
+        assert!(path.join("keep").is_file());
+    }
+
     #[test]
     fn a_missing_desktop_record_is_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -181,9 +200,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude-desktop.json");
         std::fs::write(&path, r#"{"format": 2}"#).unwrap();
-        assert!(load(&path).is_err());
+        let reason = load(&path).unwrap_err().to_string();
+        assert_eq!(
+            reason,
+            "it has record format 2, which this crystalline does not know"
+        );
         std::fs::write(&path, "not json").unwrap();
-        assert!(load(&path).is_err());
+        let reason = load(&path).unwrap_err().to_string();
+        assert!(reason.starts_with("it is not valid JSON: "), "{reason}");
     }
 
     #[test]

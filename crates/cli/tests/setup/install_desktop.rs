@@ -324,3 +324,100 @@ fn skip_mcp_keeps_the_recorded_extension() {
     assert_eq!(s.record()["extension"], before);
     assert!(!stdout(&assert).contains("Built the Claude Desktop extension"));
 }
+
+/// Homebrew's `/opt/homebrew/bin/crystalline` is a link into the Cellar.
+/// The link is pinned, never its target, so an upgrade does not break it.
+#[cfg(unix)]
+#[test]
+fn a_linked_crystalline_on_path_is_pinned_as_the_link() {
+    let s = Setup::new();
+    let cellar = s.home.path().join("Cellar/crystalline/0.31.0/bin");
+    fake_binary(&cellar);
+    let linked = s.home.path().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(cellar.join(BINARY_NAME), linked.join(BINARY_NAME)).unwrap();
+    let assert = s
+        .install(&std::env::join_paths([&linked]).unwrap())
+        .assert()
+        .success();
+    let link = linked.join(BINARY_NAME).display().to_string();
+    assert_eq!(pinned(&s.bundle()), link, "the path is not resolved");
+    assert_eq!(s.record()["extension"]["binary"], link);
+    assert!(!stdout(&assert).contains("versioned folder"));
+}
+
+/// The extension is built even when its record cannot be saved: the report
+/// still says where it is and how to install it, and names what is lost.
+#[test]
+fn a_record_that_cannot_be_saved_still_reports_the_build() {
+    let s = Setup::new();
+    // A folder where the record's partial file goes makes the save fail.
+    let blocker = s.state().join("claude-desktop.json.partial");
+    std::fs::create_dir_all(blocker.join("in-the-way")).unwrap();
+    let assert = s.install(&s.path_env()).assert().success();
+    let out = stdout(&assert);
+    assert!(s.bundle().is_file());
+    assert!(!s.record_file().exists());
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("Built the Claude Desktop extension"),
+        "{out}"
+    );
+    assert!(
+        lines[2].starts_with("To install it, open Claude Desktop"),
+        "{out}"
+    );
+    let notice = format!(
+        "Crystalline could not remember this build in {} (",
+        s.record_file().display()
+    );
+    assert!(lines[3].starts_with(&notice), "{out}");
+    assert!(
+        lines[3].ends_with("), so doctor and uninstall will not know about it."),
+        "{out}"
+    );
+    assert_eq!(lines[4], FOOTER);
+
+    let assert = s.install(&s.path_env()).arg("--json").assert().success();
+    let report: serde_json::Value = serde_json::from_str(stdout(&assert).trim()).unwrap();
+    assert_eq!(
+        report["extension"]["file"],
+        s.bundle().display().to_string()
+    );
+    let notices = report["notices"].as_array().unwrap();
+    assert_eq!(notices.len(), 1, "{report}");
+    assert!(
+        notices[0].as_str().unwrap().starts_with(&notice),
+        "{report}"
+    );
+}
+
+/// A record this crystalline cannot read (bad JSON, or a newer format) is
+/// written fresh, and the report says so.
+#[test]
+fn an_unreadable_record_is_written_fresh_and_said_so() {
+    for (content, reason) in [
+        ("not json", "it is not valid JSON: "),
+        (
+            r#"{"format": 2}"#,
+            "it has record format 2, which this crystalline does not know",
+        ),
+    ] {
+        let s = Setup::new();
+        std::fs::create_dir_all(s.state()).unwrap();
+        std::fs::write(s.record_file(), content).unwrap();
+        let assert = s.install(&s.path_env()).assert().success();
+        let out = stdout(&assert);
+        let start = format!("{} could not be read ({reason}", s.record_file().display());
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(&start))
+            .unwrap_or_else(|| panic!("{content}: {out}"));
+        assert!(line.ends_with("), so it was written fresh."), "{line}");
+        assert_eq!(s.record()["format"], 1);
+        assert_eq!(s.record()["extension"]["opened"], false);
+        // The next run reads it again and says nothing more.
+        let again = stdout(&s.install(&s.path_env()).assert().success());
+        assert!(!again.contains("could not be read"), "{again}");
+    }
+}
