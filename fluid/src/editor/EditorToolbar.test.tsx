@@ -17,7 +17,7 @@ import { EditorView } from "@codemirror/view";
 import type { RenderResult } from "@testing-library/react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { ATTACHMENT_ACCEPT } from "../api/files";
 import { Tooltips } from "../components/primitives";
@@ -975,6 +975,19 @@ describe("the pressed format buttons", () => {
         result.rerender(ui(now));
       });
     };
+    // Focused, as the buffer is when a person has clicked into it before
+    // they press a format button (the bar keeps that focus on mousedown).
+    // It is also what keeps the caret where a test puts it. jsdom collapses
+    // the DOM selection to the start of an element it focuses, and
+    // CodeMirror puts it back only when the selectionchange arrives within
+    // 200 ms of `Date.now()` after the focus. If the button focused the
+    // view, a loaded machine missed that window: the caret jumped to 0 and
+    // the waiting format went with it. The caret a test sets after this is
+    // written to the DOM by a focused view, so that late selectionchange
+    // reads it back unchanged.
+    act(() => {
+      v.focus();
+    });
     return v;
   }
 
@@ -1017,6 +1030,28 @@ describe("the pressed format buttons", () => {
       typeText(v, "c");
     });
     expect(docText(v.state)).toBe("ab**c**");
+  });
+
+  test("Bold with no selection keeps waiting when the selection news comes late", async () => {
+    // A loaded machine, the same every run: the clock jumps a second on each
+    // read, so every selectionchange arrives long after the 200 ms
+    // CodeMirror allows after a focus.
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
+    try {
+      const v = pressedBar("ab");
+      act(() => {
+        setCaret(v, 2);
+      });
+      await press("Bold");
+      expect(pressed("Bold")).toBe("true");
+      act(() => {
+        typeText(v, "c");
+      });
+      expect(docText(v.state)).toBe("ab**c**");
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   test("Bold on a selection formats the visible characters", async () => {

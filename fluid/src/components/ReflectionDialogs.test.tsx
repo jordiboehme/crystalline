@@ -547,6 +547,43 @@ describe("after a create, move or delete", () => {
     });
   });
 
+  it("focuses the heading after Close even when the moved page is drawn only after it", async () => {
+    // The page at the new path answers only once Close was pressed: on a
+    // loaded machine its read can lose that race, and the heading it draws
+    // must still take focus when it comes.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    serve("edit", {
+      ...MOVED,
+      "/domains/eng/reflection/move": () => ({
+        from: "guides/a.md",
+        to: "howto/a.md",
+        links_rewritten: 0,
+        threads_moved: true,
+        links_failed: [{ path: "guides/b.md", reason: "it is open in a room" }],
+      }),
+      "/domains/eng/reflections/howto/a.md": async () => {
+        await held;
+        return PAGE("howto/a.md");
+      },
+    });
+    renderApp("/d/eng/reflection/guides/a.md");
+    await move("howto/a.md");
+    const close = await screen.findByRole("button", { name: "Close" });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(close);
+    });
+    await userEvent.click(close);
+    expect(screen.queryByRole("heading", { name: "A", level: 1 })).toBeNull();
+    release();
+    const heading = await screen.findByRole("heading", { name: "A", level: 1 });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+  });
+
   it("closes the move dialog when the route changes under it", async () => {
     let go: (to: string) => void = () => undefined;
     function Capture() {
@@ -589,6 +626,14 @@ describe("after a create, move or delete", () => {
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).toBeNull();
     });
+    // The dialog's unmount runs its close handler a task later; a route
+    // change is not the person pressing Close, so nothing sends them back.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(screen.getByTestId("at")).toHaveTextContent(
+      "/d/eng/reflection/guides/a.md",
+    );
   });
 });
 
