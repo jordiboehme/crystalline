@@ -376,7 +376,7 @@ impl std::fmt::Display for RemoteFailure {
                     ),
                     Silence::Gateway(status) => write!(
                         f,
-                        "{source} ({url}) broke off before it answered: its gateway answered {}. \
+                        "{source} ({url}) gave no answer: its gateway answered {}. \
                          {check}",
                         status_text(status)
                     ),
@@ -1988,7 +1988,7 @@ mod tests {
             ),
             (
                 "502 Bad Gateway",
-                "broke off before it answered: its gateway answered 502 Bad Gateway",
+                "gave no answer: its gateway answered 502 Bad Gateway",
                 true,
             ),
         ] {
