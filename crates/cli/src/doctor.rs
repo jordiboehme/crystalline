@@ -796,9 +796,13 @@ fn assess_desktop(
     doctor
 }
 
-/// Ask a binary for its version, giving up after a few seconds. `None` when
-/// it does not answer in the form `<name> <version>`.
-fn binary_version(binary: &Path) -> Option<String> {
+/// How long doctor waits for the pinned binary's `--version`.
+const VERSION_PROBE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask a binary for its version, giving up after `limit`. `None` when it
+/// does not answer in the form `<name> <version>`. Its output is read while
+/// it runs, so a child that prints a lot cannot block on a full pipe.
+fn binary_version(binary: &Path, limit: std::time::Duration) -> Option<String> {
     let mut child = std::process::Command::new(binary)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -806,21 +810,40 @@ fn binary_version(binary: &Path) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child.try_wait().ok()? {
-            Some(status) if status.success() => break,
-            Some(_) => return None,
-            None if std::time::Instant::now() >= deadline => {
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        // Keep only the start; the rest is drained so the child never blocks.
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = std::io::Read::read(&mut stdout, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if text.len() < 4096 {
+                text.extend_from_slice(&chunk[..n]);
+            }
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break false;
             }
-            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => break false,
         }
+    };
+    // A killed child's own children may still hold the pipe open, so the
+    // reader is only waited for when the child exited by itself.
+    if !ok {
+        return None;
     }
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).ok()?;
+    let text = reader.join().ok()?;
     let version = text.lines().next()?.split_whitespace().last()?.to_string();
     crystalline_core::version::version_at_least(&version, "0.0.0").then_some(version)
 }
@@ -829,7 +852,13 @@ fn binary_version(binary: &Path) -> Option<String> {
 /// record: the person never installed the extension.
 fn check_claude_desktop() -> Option<ClaudeDesktopDoctor> {
     let path = crystalline_core::desktop_record::record_path().ok()?;
-    match crystalline_core::desktop_record::load(&path) {
+    check_claude_desktop_at(&path, VERSION_PROBE_LIMIT)
+}
+
+/// [`check_claude_desktop`] for the record at `path`, with the version
+/// probe limited to `limit`.
+fn check_claude_desktop_at(path: &Path, limit: std::time::Duration) -> Option<ClaudeDesktopDoctor> {
+    match crystalline_core::desktop_record::load(path) {
         Ok(None) => None,
         Err(reason) => Some(ClaudeDesktopDoctor {
             record_path: path.display().to_string(),
@@ -841,7 +870,7 @@ fn check_claude_desktop() -> Option<ClaudeDesktopDoctor> {
             doctor.record_path = path.display().to_string();
             if let Some(ext) = &record.extension {
                 if !doctor.binary_missing {
-                    doctor.binary_version = binary_version(Path::new(&ext.binary));
+                    doctor.binary_version = binary_version(Path::new(&ext.binary), limit);
                     doctor.binary_older = doctor.binary_version.as_deref().is_some_and(|v| {
                         !crystalline_core::version::version_at_least(v, env!("CARGO_PKG_VERSION"))
                     });
@@ -7678,6 +7707,162 @@ mod tests {
         assert!(!render_human(&report).contains("claude desktop"));
         let json = serde_json::to_value(&report).unwrap();
         assert!(json.get("claude_desktop").is_none());
+    }
+
+    // ---- Claude Desktop checks against the disk (stub binaries) ----
+
+    #[cfg(unix)]
+    fn stub(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("crystalline");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    /// A record file in `dir` pinning `binary` and a complete bundle.
+    #[cfg(unix)]
+    fn planted(dir: &Path, binary: &str, bundle: Option<&[u8]>) -> std::path::PathBuf {
+        let mut record = desktop_record("0.30.0");
+        let file = dir.join("crystalline.mcpb");
+        {
+            let ext = record.extension.as_mut().unwrap();
+            ext.binary = binary.to_string();
+            ext.file = file.display().to_string();
+        }
+        match bundle {
+            Some(bytes) => std::fs::write(&file, bytes).unwrap(),
+            None => {
+                use crystalline_core::desktop_extension::{Bundle, files, pack};
+                let whole = pack(&files(
+                    Bundle::Hollow {
+                        binary: Some(binary),
+                    },
+                    "0.30.0",
+                ))
+                .unwrap();
+                std::fs::write(&file, whole).unwrap();
+            }
+        }
+        let path = dir.join("claude-desktop.json");
+        crystalline_core::desktop_record::save(&path, &record).unwrap();
+        path
+    }
+
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_printing_an_older_version_gets_the_older_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "echo 'crystalline 0.1.0'");
+        let record = planted(dir.path(), &bin, None);
+        let d = check_claude_desktop_at(&record, LIMIT).unwrap();
+        assert_eq!(d.binary_version.as_deref(), Some("0.1.0"));
+        assert!(d.binary_older);
+        let mut out = String::new();
+        render_claude_desktop(&mut out, &d);
+        assert!(out.contains(&format!(
+            "  [warning] {bin} runs Crystalline 0.1.0, which is older than this one. Run: crystalline install claude-desktop"
+        )), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_printing_this_or_a_newer_version_gets_no_older_warning() {
+        for version in [env!("CARGO_PKG_VERSION"), "99.0.0"] {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = stub(dir.path(), &format!("echo 'crystalline {version}'"));
+            let record = planted(dir.path(), &bin, None);
+            let d = check_claude_desktop_at(&record, LIMIT).unwrap();
+            assert_eq!(d.binary_version.as_deref(), Some(version));
+            assert!(!d.binary_older);
+            assert_eq!(d.bundle, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_sleeps_past_the_limit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "sleep 30");
+        let record = planted(dir.path(), &bin, None);
+        let started = std::time::Instant::now();
+        let d = check_claude_desktop_at(&record, std::time::Duration::from_millis(200)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(d.binary_version, None);
+        assert!(!d.binary_older);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_floods_its_output_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(
+            dir.path(),
+            "echo 'crystalline 0.1.0'; yes x | head -c 1000000",
+        );
+        let started = std::time::Instant::now();
+        let version = binary_version(Path::new(&bin), std::time::Duration::from_secs(30));
+        assert_eq!(version.as_deref(), Some("0.1.0"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bundle_is_checked_against_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "echo 'crystalline 99.0.0'");
+        // Missing: the planted file is removed again.
+        let record = planted(dir.path(), &bin, None);
+        std::fs::remove_file(dir.path().join("crystalline.mcpb")).unwrap();
+        let d = check_claude_desktop_at(&record, LIMIT).unwrap();
+        assert_eq!(d.bundle.as_deref(), Some("missing"));
+        let file = dir.path().join("crystalline.mcpb").display().to_string();
+        let mut out = String::new();
+        render_claude_desktop(&mut out, &d);
+        assert!(out.contains(&format!(
+            "  [warning] the extension file {file} is gone. Run: crystalline install claude-desktop"
+        )), "{out}");
+        // Incomplete: a truncated zip.
+        planted(dir.path(), &bin, None);
+        let whole = std::fs::read(dir.path().join("crystalline.mcpb")).unwrap();
+        let record = planted(dir.path(), &bin, Some(&whole[..whole.len() / 2]));
+        let d = check_claude_desktop_at(&record, LIMIT).unwrap();
+        assert_eq!(d.bundle.as_deref(), Some("incomplete"));
+        let mut out = String::new();
+        render_claude_desktop(&mut out, &d);
+        assert!(out.contains(&format!(
+            "  [warning] the extension file {file} is not a complete extension. Run: crystalline install claude-desktop"
+        )), "{out}");
+    }
+
+    #[test]
+    fn an_unreadable_record_is_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-desktop.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        let d = check_claude_desktop_at(&path, LIMIT).unwrap();
+        let reason = d.record_error.clone().unwrap();
+        assert!(reason.contains("it is not valid JSON"), "{reason}");
+        let mut out = String::new();
+        render_claude_desktop(&mut out, &d);
+        assert!(out.contains(&format!(
+            "  [warning] the record could not be read: {reason}. Run: crystalline install claude-desktop"
+        )), "{out}");
+    }
+
+    #[test]
+    fn the_cellar_and_pending_warnings_have_their_exact_text() {
+        let mut record = desktop_record("0.1.0");
+        record.offered = None;
+        record.extension.as_mut().unwrap().binary =
+            "/opt/homebrew/Cellar/crystalline/0.1.0/bin/crystalline".to_string();
+        let d = assess_desktop(&record, |_| true);
+        let mut out = String::new();
+        render_claude_desktop(&mut out, &d);
+        assert!(out.contains("  [warning] /opt/homebrew/Cellar/crystalline/0.1.0/bin/crystalline sits in a versioned Homebrew folder that an upgrade removes. Put a stable crystalline first on PATH, for example /opt/homebrew/bin. Then run: crystalline install claude-desktop"), "{out}");
+        assert!(out.contains("  [warning] the extension is for Crystalline 0.1.0, and no update was offered to Claude Desktop yet. It is offered the next time Claude Desktop starts Crystalline. Or run: crystalline install claude-desktop"), "{out}");
     }
 
     fn orphan(name: &str, engrams: i64, age_days: Option<i64>) -> OrphanedDomainDoctor {

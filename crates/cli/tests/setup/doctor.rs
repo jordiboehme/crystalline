@@ -3658,3 +3658,44 @@ fn doctor_reports_the_claude_desktop_record() {
     assert_eq!(text.status.code(), without.status.code());
     assert!(!String::from_utf8_lossy(&without.stdout).contains("claude desktop"));
 }
+
+#[cfg(unix)]
+#[test]
+fn doctor_runs_the_pinned_stub_binary_and_reports_its_old_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let state = crate::common::isolated_state_dir(home.path());
+    std::fs::create_dir_all(&state).unwrap();
+    let stub = home.path().join("crystalline");
+    std::fs::write(&stub, "#!/bin/sh\necho 'crystalline 0.1.0'\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let record = json!({
+        "format": 1,
+        "extension": {
+            "version": "0.30.0",
+            "binary": stub.display().to_string(),
+            "shim_sha256": "0",
+            "file": state.join("claude-desktop/crystalline.mcpb").display().to_string(),
+            "built_at": "2026-11-04T10:00:00Z",
+            "opened": true
+        }
+    });
+    std::fs::write(
+        state.join("claude-desktop.json"),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let mut cmd = crate::common::crystalline();
+    crate::common::isolate(&mut cmd, home.path());
+    let out = cmd
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+        .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["claude_desktop"]["binary_version"], "0.1.0");
+    assert_eq!(report["claude_desktop"]["binary_older"], true);
+    assert_eq!(report["claude_desktop"]["binary_missing"], false);
+    assert_eq!(report["claude_desktop"]["bundle"], "missing");
+}
