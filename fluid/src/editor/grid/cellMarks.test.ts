@@ -10,6 +10,7 @@
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { tags } from "@lezer/highlight";
 import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { MockInstance } from "vitest";
@@ -44,6 +45,7 @@ import { footnoteVersion } from "../footnotes";
 import { verbTarget } from "../floatingContext";
 import { hiddenMarkLayer } from "../marks";
 import { marksOnEditLine } from "../marks/mode";
+import { editorHighlight } from "../setup";
 import { CELL_NOT_READ, activeCell, cellParseBudget } from "./cellEditor";
 import { GridWidget, gridField, hostOpenCell } from "./gridWidget";
 import { cellPreviewLayers } from "./draws";
@@ -227,6 +229,21 @@ describe.each(ROOMS)("a bold cell in hidden mode, $name", ({ room }) => {
     // One press from the end of `b` is the cell's visible start.
     expect(caret(cell)).toBe(B_FROM + 2);
     expect(place(main)).toEqual([0, 1]);
+  });
+
+  it("draws the bold word bold, as main does, with its marks hidden", () => {
+    // The marks are gone, so the weight is the only sign of the format.
+    const main = page(DOC, { room });
+    const cell = open(main, 0, 1);
+    const strong = editorHighlight.style([tags.strong]);
+    expect(strong).not.toBeNull();
+    const walker = document.createTreeWalker(
+      cell.contentDOM,
+      NodeFilter.SHOW_TEXT,
+    );
+    let drawn: Node | null = walker.nextNode();
+    while (drawn && drawn.textContent !== "b") drawn = walker.nextNode();
+    expect(drawn?.parentElement?.closest(`.${String(strong)}`)).toBeTruthy();
   });
 
   it("types inside the marks and Backspace takes the pair with the last letter", () => {

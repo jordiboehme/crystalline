@@ -32,7 +32,11 @@ import {
   isolateHistory,
   undo as historyUndo,
 } from "@codemirror/commands";
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import {
+  ensureSyntaxTree,
+  syntaxHighlighting,
+  syntaxTree,
+} from "@codemirror/language";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
@@ -61,7 +65,7 @@ import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
 import { judgedElsewhere, keptWhole } from "../marks/deleting";
-import { documentLanguage } from "../setup";
+import { documentLanguage, editorHighlight } from "../setup";
 import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
 import { roomUndo } from "../roomUndo";
@@ -1131,6 +1135,9 @@ export function mountCellEditor(
       ]),
       cellPresence,
       documentLanguage,
+      // The formats drawn as main draws them (bold, italic, code, links):
+      // with the marks hidden, the style is the only sign of a format.
+      syntaxHighlighting(editorHighlight),
       // The cell's content is the segment the hidden-mark layer's caret,
       // delete and format rules stay inside; outside it, the line.
       markSegment.of((state, pos) => {
