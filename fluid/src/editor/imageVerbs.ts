@@ -23,36 +23,14 @@ import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { EditorView as View, ViewPlugin } from "@codemirror/view";
-import type { SyntaxNode } from "@lezer/common";
 
 import type { ImageAlign, ImageFormat, ImageRef } from "./imageFormat";
 import { buildImageTarget, imageRefsIn } from "./imageFormat";
+import { imageNodeAt } from "./pictures/refs";
 import { clearOfFoldedFrontmatter } from "./toolbar";
 
 /** One attachment image the caret is on, in document terms. */
 export type ImageContext = ImageRef;
-
-/**
- * The innermost enclosing `Image` node at `pos`, or null.
- *
- * Both sides are tried, for the reason `tableVerbs` states: a position is a
- * gap BETWEEN two characters, and at the reference's first character only a
- * look to the right finds it while one position past its last only a look to
- * the left does.
- */
-function imageNodeAt(state: EditorState, pos: number): SyntaxNode | null {
-  const tree = syntaxTree(state);
-  for (const side of [-1, 1] as const) {
-    let node: SyntaxNode | null = tree.resolveInner(pos, side);
-    while (node !== null) {
-      if (node.name === "Image") {
-        return node;
-      }
-      node = node.parent;
-    }
-  }
-  return null;
-}
 
 /**
  * The attachment image the caret sits on, or null.

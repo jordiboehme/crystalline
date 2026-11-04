@@ -49,6 +49,7 @@ import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
+import { drawnGridTables } from "./draws";
 import {
   disposeChrome,
   mapChromeMenus,
@@ -58,7 +59,6 @@ import {
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import { cellPaste } from "./gridPaste";
 import {
-  drawnGridTables,
   gridWritable,
   mountedCell,
   onCellClosed,

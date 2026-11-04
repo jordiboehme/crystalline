@@ -520,6 +520,41 @@ export const MERMAID_SKELETON = [
 ] as const;
 
 /**
+ * The text `insertBlock` writes below `line` and where the block's first line
+ * then begins, for a caller that puts a block below a line itself (a picture
+ * moved to a drop landing): the same lead, separator and position arithmetic,
+ * so the two can never place a block differently. `start` is in positions of
+ * the document after the change.
+ */
+export function blockInsertion(
+  state: EditorState,
+  line: Line,
+  lines: readonly string[],
+): { change: { from: number; insert: string }; start: number } {
+  return placeBlock(state, line, lines, 0);
+}
+
+/**
+ * {@link blockInsertion} with `removed` characters of `line` taken away in
+ * the same transaction (the slash menu's `/query`), which the line is read
+ * without.
+ */
+function placeBlock(
+  state: EditorState,
+  line: Line,
+  lines: readonly string[],
+  removed: number,
+): { change: { from: number; insert: string }; start: number } {
+  const separator = state.lineBreak;
+  const lead = line.length - removed === 0 ? "" : separator + separator;
+  const block = `${lead}${lines.join(separator)}${separator}`;
+  // Where the block's first line begins: past the cursor's line and past the
+  // lead's breaks, which are two positions when the lead is there at all.
+  const start = line.to - removed + (lead === "" ? 0 : 2);
+  return { change: { from: line.to, insert: block }, start };
+}
+
+/**
  * Drop a block below the line the cursor is on, never into the middle of it:
  * a table or a fence has to start its own line to parse at all.
  *
@@ -561,14 +596,9 @@ export function insertBlock(
   }
   // Read AFTER the guard: it may have moved the caret out of the block.
   const { state } = view;
-  const separator = state.lineBreak;
   const line = state.doc.lineAt(state.selection.main.head);
   const removed = replace === undefined ? 0 : replace.to - replace.from;
-  const lead = line.length - removed === 0 ? "" : separator + separator;
-  const block = `${lead}${lines.join(separator)}${separator}`;
-  // Where the block's first line begins: past the cursor's line and past the
-  // lead's breaks, which are two positions when the lead is there at all.
-  const start = line.to - removed + (lead === "" ? 0 : 2);
+  const { change, start } = placeBlock(state, line, lines, removed);
   const startOf = (index: number) =>
     start +
     lines
@@ -584,7 +614,7 @@ export function insertBlock(
   view.dispatch({
     changes: [
       ...(replace === undefined ? [] : [{ ...replace, insert: "" }]),
-      { from: line.to, insert: block },
+      change,
     ],
     selection,
     userEvent: "input",

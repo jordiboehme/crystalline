@@ -601,3 +601,43 @@ export function imageRefsIn(
   });
   return refs;
 }
+
+/**
+ * One inline `![alt](target)` reference, whatever it points at. Offsets are
+ * relative to the text handed in, as {@link ImageRef}'s are.
+ */
+export interface ImageSpan {
+  /** The whole `![alt](target)` span. */
+  from: number;
+  to: number;
+  /** The target token alone, as written. */
+  targetFrom: number;
+  targetTo: number;
+  /** The token as written: fragment, `./` and percent escapes included. */
+  token: string;
+}
+
+/**
+ * Every inline image reference in this text, attachment or not, in the order
+ * written: the same scanner ({@link lineRefs}) and fence rule
+ * ({@link eachLiveLine}) {@link imageRefsIn} reads, without its question of
+ * what the target is. The picture model classifies these tokens itself.
+ */
+export function imageSpansIn(text: string): ImageSpan[] {
+  const spans: ImageSpan[] = [];
+  eachLiveLine(text, (line, offset) => {
+    for (const ref of lineRefs(line)) {
+      if (!ref.image) {
+        continue;
+      }
+      spans.push({
+        from: offset + ref.from,
+        to: offset + ref.to,
+        targetFrom: offset + ref.targetFrom,
+        targetTo: offset + ref.targetTo,
+        token: ref.token,
+      });
+    }
+  });
+  return spans;
+}

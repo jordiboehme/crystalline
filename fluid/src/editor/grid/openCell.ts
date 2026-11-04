@@ -27,7 +27,8 @@ import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
 
 import { parseAdvanced } from "../parseProgress";
-import type { GridCell, GridTable } from "./structure";
+import { drawnGridTables } from "./draws";
+import type { GridCell } from "./structure";
 import { cellAt, gridTableAt } from "./structure";
 
 /**
@@ -38,15 +39,6 @@ import { cellAt, gridTableAt } from "./structure";
 export const cellMain = Facet.define<EditorView, EditorView | null>({
   combine: (values) => values[0] ?? null,
 });
-
-/**
- * The tables the grid draws in a state. Past where the parse reaches, the
- * grid keeps the tables it drew, read again at their mapped places (D58),
- * and the open cell is read from those until the tree reaches them. The
- * grid provides it; it lives here so this module need not import the grid.
- */
-export const drawnGridTables =
-  Facet.define<(state: EditorState) => readonly GridTable[]>();
 
 /** Main views running a search command sent from a focused cell. */
 const searchingFromCell = new WeakSet<EditorView>();
