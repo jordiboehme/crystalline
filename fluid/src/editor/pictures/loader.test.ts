@@ -198,6 +198,19 @@ describe("pictureToolsWith", () => {
     expect(load).toHaveBeenCalledTimes(1);
   });
 
+  it("gives the tools to a view built before the load once a picture arrives", async () => {
+    const loader = pictureToolsWith(() => Promise.resolve(chunk()));
+    const view = mount("plain text", loader.extension());
+    await loader.prefetch();
+    await flush();
+    expect(tools(view)).toBeNull();
+    view.dispatch({ changes: { from: 0, insert: "x" } });
+    view.dispatch({ changes: { from: 0, insert: "![x](assets/p.png) " } });
+    parsedView(view);
+    await flush();
+    expect(tools(view)).toBe("on");
+  });
+
   it("walks no tree once the tools are in", async () => {
     const loader = pictureToolsWith(() => Promise.resolve(chunk()));
     await loader.prefetch();

@@ -118,9 +118,10 @@ export function pictureToolsWith(
       check(): void {
         if (this.asked) return;
         if (loaded !== null) {
-          // The compartment already holds the tools (a view built after the
-          // load, mostly after the mount prefetch): nothing to ask, no walk.
-          this.asked = true;
+          // The chunk is in: no walk. A view built after the load already
+          // holds the tools; one built before it gets them now, from the
+          // settled load (a no-op reconfigure for the first kind).
+          this.ask();
           return;
         }
         if (hasImage(this.view.state)) this.ask();
