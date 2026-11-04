@@ -64,6 +64,12 @@ pub fn missing_from(source: &str, failure: &RemoteFailure) -> Missing {
         RemoteFailure::Unreachable { .. } => {
             "cannot be reached right now (check the VPN or the network)".to_string()
         }
+        // Only a write ends this way, and a fan-out only reads; kept a
+        // fixed sentence all the same.
+        RemoteFailure::Unanswered(write) => format!(
+            "did not answer within {}, so what it was asked to change may or may not have happened",
+            seconds(write.after)
+        ),
         RemoteFailure::SignInAgain { url } => {
             format!("needs a new sign-in (run crystalline connect {url} again)")
         }
