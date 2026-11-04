@@ -132,3 +132,22 @@ fn binary_and_pack_are_refused_for_the_desktop_only_bundle() {
         "{err}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn install_claude_desktop_is_refused_on_linux() {
+    let home = tempfile::tempdir().unwrap();
+    let assert = bin(home.path())
+        .args(["install", "claude-desktop", "--no-open", "--skip-skills"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr
+            .contains("Claude Desktop is not available on Linux, so there is nothing to install."),
+        "{stderr}"
+    );
+    let state = crate::common::isolated_state_dir(home.path());
+    assert!(!state.join("claude-desktop.json").exists());
+    assert!(!state.join("claude-desktop").exists());
+}

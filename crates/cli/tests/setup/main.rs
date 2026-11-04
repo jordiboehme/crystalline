@@ -27,6 +27,9 @@ mod harness_install;
 mod hook;
 #[cfg(unix)]
 mod install;
+// The open seam is read only in debug builds, so a release test build would open the real Claude Desktop.
+#[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
+mod install_desktop;
 mod kept;
 mod prompt;
 #[cfg(unix)]

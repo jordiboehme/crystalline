@@ -18,6 +18,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 mod automation;
 mod cmd;
 mod desktop_bundle;
+mod desktop_record;
 mod desktop_state;
 mod doctor;
 mod harness_command;
@@ -25,6 +26,7 @@ mod harness_files;
 mod hook;
 mod hook_dialect;
 mod install;
+mod install_desktop;
 mod install_profile;
 mod kept;
 mod mcp_json;
@@ -205,15 +207,21 @@ enum Command {
         /// MCP server per user.
         #[arg(long)]
         project: bool,
-        /// Skip registering the MCP server.
+        /// Skip registering the MCP server (for claude-desktop: the
+        /// extension).
         #[arg(long)]
         skip_mcp: bool,
         /// Skip installing the SessionStart, Stop and UserPromptSubmit hooks.
         #[arg(long)]
         skip_hooks: bool,
-        /// Skip copying the topical skills.
+        /// Skip copying the topical skills (for claude-desktop: the
+        /// crystalline-intelligence skill).
         #[arg(long)]
         skip_skills: bool,
+        /// claude-desktop only: write the extension and print where to
+        /// install it, without opening Claude Desktop.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Reverse `crystalline install` for a harness: deregister the MCP server,
     /// remove the managed hooks and drop the copied skills, leaving every
@@ -2101,10 +2109,11 @@ enum OutputFormat {
     Github,
 }
 
-/// Which harness `install`/`uninstall` targets, as a clap `ValueEnum`. Mirrors
+/// Which target `install`/`uninstall` acts on, as a clap `ValueEnum`. Mirrors
 /// [`HarnessKind`] variant for variant, with identical spellings and doc
 /// comments, so the derived help text and invalid-value error read exactly
-/// as they did before the harness model moved to `crystalline-core`.
+/// as they did before the harness model moved to `crystalline-core`, plus
+/// `claude-desktop`, which is not a harness kind.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum HarnessArg {
     /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
@@ -2130,18 +2139,25 @@ enum HarnessArg {
     /// Qwen Code: MCP and a SessionStart hook in ~/.qwen/settings.json,
     /// skills under ~/.qwen/skills.
     Qwen,
+    /// Claude Desktop (macOS and Windows): build an extension that runs this
+    /// crystalline, open it in Claude Desktop and save the
+    /// crystalline-intelligence skill for upload.
+    ClaudeDesktop,
 }
 
-impl From<HarnessArg> for HarnessKind {
-    fn from(arg: HarnessArg) -> HarnessKind {
-        match arg {
-            HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
-            HarnessArg::Codex => HarnessKind::Codex,
-            HarnessArg::Copilot => HarnessKind::Copilot,
-            HarnessArg::Cursor => HarnessKind::Cursor,
-            HarnessArg::Kiro => HarnessKind::Kiro,
-            HarnessArg::Gemini => HarnessKind::Gemini,
-            HarnessArg::Qwen => HarnessKind::Qwen,
+impl HarnessArg {
+    /// The harness kind this target is, `None` for `claude-desktop`, which
+    /// has its own install flow.
+    fn harness(self) -> Option<HarnessKind> {
+        match self {
+            HarnessArg::ClaudeCode => Some(HarnessKind::ClaudeCode),
+            HarnessArg::Codex => Some(HarnessKind::Codex),
+            HarnessArg::Copilot => Some(HarnessKind::Copilot),
+            HarnessArg::Cursor => Some(HarnessKind::Cursor),
+            HarnessArg::Kiro => Some(HarnessKind::Kiro),
+            HarnessArg::Gemini => Some(HarnessKind::Gemini),
+            HarnessArg::Qwen => Some(HarnessKind::Qwen),
+            HarnessArg::ClaudeDesktop => None,
         }
     }
 }
@@ -2312,21 +2328,44 @@ fn run() -> anyhow::Result<()> {
             skip_mcp,
             skip_hooks,
             skip_skills,
-        }) => install::run_install(
-            install::InstallOptions {
-                harness: harness.into(),
-                project,
-                skip_mcp,
-                skip_hooks,
-                skip_skills,
-            },
-            cli.json,
-        ),
+            no_open,
+        }) => match harness.harness() {
+            None => {
+                if project {
+                    anyhow::bail!(install_desktop::PROJECT_REFUSAL);
+                }
+                if skip_hooks {
+                    anyhow::bail!(install_desktop::SKIP_HOOKS_REFUSAL);
+                }
+                install_desktop::run_install(
+                    install_desktop::DesktopInstallOptions {
+                        skip_extension: skip_mcp,
+                        skip_skill: skip_skills,
+                        open: !no_open,
+                    },
+                    cli.json,
+                )
+            }
+            Some(_) if no_open => anyhow::bail!("--no-open applies only to claude-desktop."),
+            Some(harness) => install::run_install(
+                install::InstallOptions {
+                    harness,
+                    project,
+                    skip_mcp,
+                    skip_hooks,
+                    skip_skills,
+                },
+                cli.json,
+            ),
+        },
         Some(Command::Uninstall {
             harness,
             project,
             force,
-        }) => install::run_uninstall(harness.into(), project, force, cli.json),
+        }) => match harness.harness() {
+            None => anyhow::bail!("uninstall does not support claude-desktop yet."),
+            Some(harness) => install::run_uninstall(harness, project, force, cli.json),
+        },
         Some(Command::Origin { command }) => {
             on_runtime(move || run_origin(command, cli.db, cli.json))
         }

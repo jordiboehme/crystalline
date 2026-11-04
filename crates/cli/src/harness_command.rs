@@ -29,9 +29,10 @@ pub(crate) struct ResolvedProgram {
 /// `crystalline` and never canonicalized, so a link such as
 /// `/opt/homebrew/bin/crystalline` survives an upgrade. With nothing on PATH
 /// it falls back to this binary's own path, with a warning that names
-/// `harness`. `path_env: None` means no PATH.
+/// `who`, the display name of what gets the path. `path_env: None` means no
+/// PATH.
 pub(crate) fn resolve_program(
-    harness: HarnessKind,
+    who: &str,
     spelling: CommandSpelling,
     path_env: Option<&OsStr>,
     keep: Option<&str>,
@@ -65,8 +66,7 @@ pub(crate) fn resolve_program(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "crystalline".to_string());
     let warning = Some(format!(
-        "crystalline is not on your PATH, so {} gets this binary's own path ({program})",
-        harness.display_name()
+        "crystalline is not on your PATH, so {who} gets this binary's own path ({program})"
     ));
     ResolvedProgram { program, warning }
 }
@@ -323,7 +323,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, bin.join("crystalline")).unwrap();
         let path = std::env::join_paths([tmp.path().join("empty"), bin.clone()]).unwrap();
         let got = resolve_program(
-            HarnessKind::Cursor,
+            "Cursor",
             CommandSpelling::AbsolutePathEntry,
             Some(&path),
             None,
@@ -332,7 +332,7 @@ mod tests {
         assert!(got.warning.is_none());
         let cellar = real.parent().unwrap().as_os_str().to_owned();
         let got = resolve_program(
-            HarnessKind::Cursor,
+            "Cursor",
             CommandSpelling::AbsolutePathEntry,
             Some(&cellar),
             None,
@@ -340,13 +340,7 @@ mod tests {
         assert_eq!(got.program, real.display().to_string());
         assert!(got.warning.unwrap().contains("versioned folder"));
         assert_eq!(
-            resolve_program(
-                HarnessKind::Cursor,
-                CommandSpelling::Bare,
-                Some(&path),
-                None
-            )
-            .program,
+            resolve_program("Cursor", CommandSpelling::Bare, Some(&path), None).program,
             "crystalline"
         );
     }
@@ -359,7 +353,7 @@ mod tests {
         let kept = tmp.path().join("bin/crystalline");
         exe(&kept);
         let got = resolve_program(
-            HarnessKind::Kiro,
+            "Kiro",
             CommandSpelling::AbsolutePathEntry,
             Some(std::ffi::OsStr::new("")),
             Some(kept.to_str().unwrap()),
@@ -367,7 +361,7 @@ mod tests {
         assert_eq!(got.program, kept.display().to_string());
         let gone = tmp.path().join("gone/crystalline");
         let got = resolve_program(
-            HarnessKind::Kiro,
+            "Kiro",
             CommandSpelling::AbsolutePathEntry,
             Some(std::ffi::OsStr::new("")),
             Some(gone.to_str().unwrap()),
@@ -416,7 +410,7 @@ mod tests {
         exe(&bin.join("crystalline"));
         let path = std::env::join_paths([plain, bin.clone()]).unwrap();
         let got = resolve_program(
-            HarnessKind::Cursor,
+            "Cursor",
             CommandSpelling::AbsolutePathEntry,
             Some(&path),
             None,
