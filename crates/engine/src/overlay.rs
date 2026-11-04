@@ -180,6 +180,11 @@ pub const RESERVED_VARS: &[&str] = &[
     // test run that sets them logs a warning.
     "CRYSTALLINE_TEST_PACKAGE",
     "CRYSTALLINE_TEST_DAEMON_TASK",
+    // The CLI's debug-build open seam (`desktop_open::TEST_DESKTOP_OPEN_ENV`
+    // in the crystalline crate): `install claude-desktop` records or refuses
+    // the open instead of opening Claude Desktop. Read straight from the
+    // environment, so reserved for the same reason.
+    "CRYSTALLINE_TEST_DESKTOP_OPEN",
     // `crystalline_remote::token`'s boolean kill switch
     // (`refuse_real_keychain`): set, it refuses the real OS keychain
     // backend everywhere in that module and falls back to the file store at

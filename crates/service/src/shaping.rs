@@ -295,6 +295,7 @@ mod tests {
         }
         for name in [
             "CRYSTALLINE_TEST_DAEMON_TASK",
+            "CRYSTALLINE_TEST_DESKTOP_OPEN",
             "CRYSTALLINE_TEST_NO_KEYCHAIN",
             "CRYSTALLINE_CHANNEL",
             "CRYSTALLINE_LAUNCHER_VERSION",

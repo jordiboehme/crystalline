@@ -2,9 +2,11 @@
 //! this machine, pins the crystalline found on PATH and is recorded in
 //! `<state_dir>/claude-desktop.json`.
 //!
-//! Every run passes `--skip-skills` (the skill step has its own tests) and
-//! `--no-open`, and every child gets a PATH of its own, so the developer's
-//! own crystalline is never the one pinned.
+//! Every run passes `--skip-skills` (the skill step has its own tests), and
+//! every child gets a PATH of its own, so the developer's own crystalline is
+//! never the one pinned. Most runs pass `--no-open`; the ones that open go
+//! through the debug build's open seam (`CRYSTALLINE_TEST_DESKTOP_OPEN`,
+//! `fail` in the isolation environment), so no test opens Claude Desktop.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -60,6 +62,21 @@ impl Setup {
         cmd.env("PATH", path)
             .args(["install", "claude-desktop", "--no-open", "--skip-skills"]);
         cmd
+    }
+
+    /// `crystalline install claude-desktop --skip-skills` with PATH set to
+    /// `path`: it opens the extension through the test seam `seam`.
+    fn install_opening(&self, path: &OsString, seam: &str) -> Command {
+        let mut cmd = crate::common::crystalline();
+        crate::common::isolate(&mut cmd, self.home.path());
+        cmd.env("PATH", path)
+            .env("CRYSTALLINE_TEST_DESKTOP_OPEN", seam)
+            .args(["install", "claude-desktop", "--skip-skills"]);
+        cmd
+    }
+
+    fn open_log(&self) -> PathBuf {
+        self.home.path().join("open.log")
     }
 
     fn path_env(&self) -> OsString {
@@ -420,4 +437,101 @@ fn an_unreadable_record_is_written_fresh_and_said_so() {
         let again = stdout(&s.install(&s.path_env()).assert().success());
         assert!(!again.contains("could not be read"), "{again}");
     }
+}
+
+const NO_OPEN_LINE: &str = "To install it, open Claude Desktop, go to Settings > Extensions > Advanced settings > Install Extension... and pick this file.";
+
+const OPENED_LINE: &str = "Claude Desktop shows its install dialog. Confirm it there.";
+
+#[test]
+fn the_extension_is_opened_in_claude_desktop() {
+    let s = Setup::new();
+    let seam = format!("log:{}", s.open_log().display());
+    let assert = s.install_opening(&s.path_env(), &seam).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(s.open_log()).unwrap(),
+        format!("open {}\n", s.bundle().display())
+    );
+    assert_eq!(s.record()["extension"]["opened"], true);
+    let out = stdout(&assert);
+    assert!(out.contains(OPENED_LINE), "{out}");
+    assert!(!out.contains(NO_OPEN_LINE), "{out}");
+    assert!(!out.contains("Could not open"), "{out}");
+
+    let assert = s
+        .install_opening(&s.path_env(), &seam)
+        .arg("--json")
+        .assert()
+        .success();
+    let report: serde_json::Value = serde_json::from_str(stdout(&assert).trim()).unwrap();
+    assert_eq!(report["extension"]["opened"], true);
+    assert!(report["extension"]["open_error"].is_null(), "{report}");
+}
+
+#[test]
+fn a_failed_open_prints_the_path_and_the_steps() {
+    let s = Setup::new();
+    // The isolation environment's own value.
+    let assert = s.install_opening(&s.path_env(), "fail").assert().success();
+    assert!(s.bundle().is_file());
+    assert_eq!(s.record()["extension"]["opened"], false);
+    let out = stdout(&assert);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[2], "Could not open Claude Desktop: the test seam refused it.",
+        "{out}"
+    );
+    assert_eq!(lines[3], NO_OPEN_LINE, "{out}");
+    let explorer = "You can also double-click the file in File Explorer.";
+    if cfg!(windows) {
+        assert_eq!(lines[4], explorer, "{out}");
+    } else {
+        assert!(!out.contains(explorer), "{out}");
+    }
+    assert!(!out.contains(OPENED_LINE), "{out}");
+    assert_eq!(lines[lines.len() - 1], FOOTER);
+
+    let assert = s
+        .install_opening(&s.path_env(), "fail")
+        .arg("--json")
+        .assert()
+        .success();
+    let report: serde_json::Value = serde_json::from_str(stdout(&assert).trim()).unwrap();
+    assert_eq!(report["extension"]["opened"], false);
+    assert_eq!(
+        report["extension"]["open_error"],
+        "the test seam refused it"
+    );
+}
+
+#[test]
+fn the_isolation_environment_refuses_the_open() {
+    let s = Setup::new();
+    let mut cmd = crate::common::crystalline();
+    crate::common::isolate(&mut cmd, s.home.path());
+    let assert = cmd
+        .env("PATH", s.path_env())
+        .args(["install", "claude-desktop", "--skip-skills"])
+        .assert()
+        .success();
+    assert!(
+        stdout(&assert).contains("Could not open Claude Desktop: the test seam refused it."),
+        "the seam is set to fail unless a test says otherwise"
+    );
+}
+
+#[test]
+fn no_open_never_calls_the_opener() {
+    let s = Setup::new();
+    let seam = format!("log:{}", s.open_log().display());
+    let assert = s
+        .install_opening(&s.path_env(), &seam)
+        .arg("--no-open")
+        .assert()
+        .success();
+    assert!(!s.open_log().exists());
+    assert_eq!(s.record()["extension"]["opened"], false);
+    let out = stdout(&assert);
+    assert!(out.contains(NO_OPEN_LINE), "{out}");
+    assert!(!out.contains("Could not open"), "{out}");
 }

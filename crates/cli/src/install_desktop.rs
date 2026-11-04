@@ -9,6 +9,8 @@
 //! `resolve_program` finds on PATH (or this binary) pinned in its manifest.
 //! It is written to `<state_dir>/claude-desktop/crystalline.mcpb` and
 //! remembered in `<state_dir>/claude-desktop.json` (`desktop_record.rs`).
+//! Unless `--no-open` is given, the file is then handed to Claude Desktop
+//! (`desktop_open.rs`), which shows its install dialog.
 //!
 //! Crystalline cannot see what Claude Desktop installed, so every run builds
 //! the extension again and the record says only what this command did last.
@@ -33,6 +35,12 @@ pub(crate) const INSTALL_ROUTE: &str =
 const FOOTER: &str =
     "Crystalline cannot see what Claude Desktop has installed. It only remembers what it did last.";
 
+/// What a run says when Claude Desktop opened the extension.
+const OPENED: &str = "Claude Desktop shows its install dialog. Confirm it there.";
+
+/// The extra step on Windows when the open failed.
+const DOUBLE_CLICK: &str = "You can also double-click the file in File Explorer.";
+
 /// The refusal off macOS and Windows.
 const LINUX_REFUSAL: &str =
     "Claude Desktop is not available on Linux, so there is nothing to install.";
@@ -55,7 +63,6 @@ pub(crate) struct DesktopInstallOptions {
     /// Do not save the skill (`--skip-skills`).
     pub skip_skill: bool,
     /// Hand the extension to Claude Desktop (no `--no-open`).
-    #[expect(dead_code, reason = "the opener that reads it is not written yet")]
     pub open: bool,
 }
 
@@ -105,11 +112,18 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
         .context("could not pack the Claude Desktop extension")?;
         desktop_record::write_replacing(&file, &zip)
             .with_context(|| format!("could not write {}", file.display()))?;
+        let open_error = if opts.open {
+            crate::desktop_open::for_this_process()
+                .open_extension(&file)
+                .err()
+        } else {
+            None
+        };
         let built = BuiltExtension {
             file: file.display().to_string(),
             binary: resolved.program,
-            opened: false,
-            open_error: None,
+            opened: opts.open && open_error.is_none(),
+            open_error,
         };
         record.extension = Some(ExtensionRecord {
             version: VERSION.to_string(),
@@ -172,10 +186,20 @@ fn report_text(extension: Option<&BuiltExtension>, notices: &[String]) -> String
             e.file
         ));
         out.push_str(&format!("It runs {}.\n", e.binary));
-        if !e.opened {
+        if e.opened {
+            out.push_str(OPENED);
+            out.push('\n');
+        } else {
+            if let Some(error) = &e.open_error {
+                out.push_str(&format!("Could not open Claude Desktop: {error}.\n"));
+            }
             out.push_str(&format!(
                 "To install it, open Claude Desktop, go to {INSTALL_ROUTE} and pick this file.\n"
             ));
+            if e.open_error.is_some() && cfg!(windows) {
+                out.push_str(DOUBLE_CLICK);
+                out.push('\n');
+            }
         }
     }
     for notice in notices {

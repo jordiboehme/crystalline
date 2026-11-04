@@ -18,6 +18,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 mod automation;
 mod cmd;
 mod desktop_bundle;
+mod desktop_open;
 mod desktop_record;
 mod desktop_state;
 mod doctor;

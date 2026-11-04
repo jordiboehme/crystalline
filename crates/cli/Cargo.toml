@@ -98,6 +98,11 @@ tracing-subscriber = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+# `desktop_open.rs` hands the Claude Desktop extension to the shell
+# (ShellExecuteW, with COM set up first for a shell-extension handler).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 # `tests/setup/desktop_bundle.rs` reads back the .mcpb the command packs.
 zip = { workspace = true }
