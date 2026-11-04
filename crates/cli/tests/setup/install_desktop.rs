@@ -845,3 +845,124 @@ fn a_skill_that_cannot_be_saved_fails_a_skill_only_run() {
     );
     assert!(!s.open_log().exists());
 }
+
+const NO_RECORD_LINE: &str =
+    "Crystalline has no record of a Claude Desktop install on this computer.";
+const REMOVE_LINE: &str = "Crystalline cannot remove the extension from Claude Desktop. Remove it there: Settings > Extensions, then Crystalline.";
+const SKILL_STAYS_LINE: &str =
+    "The skill stays in Claude Desktop until you delete it under Customize > Skills.";
+
+impl Setup {
+    fn uninstall(&self) -> Command {
+        let mut cmd = crate::common::crystalline();
+        crate::common::isolate(&mut cmd, self.home.path());
+        cmd.env("PATH", self.path_env())
+            .args(["uninstall", "claude-desktop"]);
+        cmd
+    }
+}
+
+#[test]
+fn uninstall_removes_the_file_and_the_record_and_says_where_to_finish() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    s.install_with_skill().assert().success();
+    let zip = s.downloads().join("crystalline-intelligence.zip");
+    assert!(zip.is_file());
+    let bundle = s.bundle();
+    let mut previous = bundle.as_os_str().to_owned();
+    previous.push(".previous");
+    let mut partial = bundle.as_os_str().to_owned();
+    partial.push(".partial");
+    std::fs::write(&previous, "old").unwrap();
+    std::fs::write(&partial, "half").unwrap();
+    let lock = s.state().join("claude-desktop.offer.lock");
+    std::fs::write(&lock, "").unwrap();
+    let record_partial = s.state().join("claude-desktop.json.partial");
+    std::fs::write(&record_partial, "{").unwrap();
+
+    let assert = s.uninstall().assert().success();
+    let out = stdout(&assert);
+    assert_eq!(
+        out,
+        format!(
+            "Removed the built extension ({}) and Crystalline's record of it.\n{REMOVE_LINE}\n{SKILL_STAYS_LINE}\n",
+            bundle.display()
+        )
+    );
+    assert!(!bundle.exists());
+    assert!(!bundle.parent().unwrap().exists(), "empty folder is gone");
+    assert!(!s.record_file().exists());
+    assert!(!Path::new(&previous).exists());
+    assert!(!Path::new(&partial).exists());
+    assert!(!lock.exists());
+    assert!(!record_partial.exists());
+    assert!(zip.is_file(), "the skill zip stays");
+}
+
+#[test]
+fn uninstall_keeps_a_folder_that_is_not_empty() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    let other = s.bundle().parent().unwrap().join("other.txt");
+    std::fs::write(&other, "mine").unwrap();
+    s.uninstall().assert().success();
+    assert!(!s.bundle().exists());
+    assert!(other.is_file());
+}
+
+#[test]
+fn uninstall_without_a_record_says_so() {
+    let s = Setup::new();
+    let assert = s.uninstall().assert().success();
+    assert_eq!(
+        stdout(&assert),
+        format!("{NO_RECORD_LINE}\n{REMOVE_LINE}\n{SKILL_STAYS_LINE}\n")
+    );
+}
+
+#[test]
+fn uninstall_json_reports_what_was_removed() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    let assert = s.uninstall().arg("--json").assert().success();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&assert)).unwrap();
+    assert_eq!(v["target"], "claude-desktop");
+    assert_eq!(v["removed_file"], s.bundle().display().to_string());
+    assert_eq!(v["removed_record"], true);
+    let assert = s.uninstall().arg("--json").assert().success();
+    let v: serde_json::Value = serde_json::from_str(&stdout(&assert)).unwrap();
+    assert!(v["removed_file"].is_null());
+    assert_eq!(v["removed_record"], false);
+}
+
+#[test]
+fn uninstall_refuses_project_and_force() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    let cases: [(&str, &str); 2] = [
+        (
+            "--project",
+            "--project does not apply to claude-desktop: Claude Desktop extensions are per user.",
+        ),
+        ("--force", "--force does not apply to claude-desktop."),
+    ];
+    for (flag, error) in cases {
+        let assert = s.uninstall().arg(flag).assert().failure();
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains(error), "{flag}: {stderr}");
+        assert!(s.bundle().is_file(), "{flag} removed nothing");
+        assert!(s.record_file().is_file(), "{flag} removed nothing");
+    }
+}
+
+#[test]
+fn uninstall_leaves_the_install_receipt_alone() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    let receipt = s.state().join("installs.json");
+    let planted = b"{\"installs\": [ ]}\n".to_vec();
+    std::fs::write(&receipt, &planted).unwrap();
+    s.uninstall().assert().success();
+    assert_eq!(std::fs::read(&receipt).unwrap(), planted);
+}

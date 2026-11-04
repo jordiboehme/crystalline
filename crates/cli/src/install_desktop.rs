@@ -74,6 +74,12 @@ pub(crate) const SKIP_HOOKS_REFUSAL: &str =
 /// The refusal of `--skip-mcp` with `--skip-skills`.
 const NOTHING_TO_INSTALL: &str = "--skip-mcp and --skip-skills together leave nothing to install.";
 
+/// The refusal of `uninstall --force`.
+pub(crate) const FORCE_REFUSAL: &str = "--force does not apply to claude-desktop.";
+
+/// Where a person removes an extension in Claude Desktop.
+const REMOVE_ROUTE: &str = "Settings > Extensions";
+
 /// The steps `install claude-desktop` takes.
 pub(crate) struct DesktopInstallOptions {
     /// Do not build the extension (`--skip-mcp`).
@@ -159,6 +165,75 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
         );
     }
     Ok(())
+}
+
+/// Run `crystalline uninstall claude-desktop`: delete the built extension,
+/// its leftovers and Crystalline's record, then say where to finish in
+/// Claude Desktop. The skill zip is left alone, and so is the install
+/// receipt (Claude Desktop is not in it).
+pub(crate) fn run_uninstall(json: bool) -> anyhow::Result<()> {
+    if !cfg!(any(target_os = "macos", windows)) {
+        anyhow::bail!(LINUX_REFUSAL);
+    }
+    let bundle = desktop_record::bundle_path()?;
+    let record_path = desktop_record::record_path()?;
+
+    let removed_file = remove_if_there(&bundle)?.then(|| bundle.display().to_string());
+    for leftover in [
+        with_suffix(&bundle, ".previous"),
+        with_suffix(&bundle, ".partial"),
+        with_suffix(&record_path, ".partial"),
+        crystalline_service::desktop_offer::lock_path()?,
+    ] {
+        remove_if_there(&leftover)?;
+    }
+    let removed_record = remove_if_there(&record_path)?;
+    // The folder goes only when nothing else is in it.
+    if let Some(folder) = bundle.parent() {
+        let _ = std::fs::remove_dir(folder);
+    }
+
+    if json {
+        println!(
+            "{}",
+            json!({
+                "target": "claude-desktop",
+                "removed_file": removed_file,
+                "removed_record": removed_record,
+            })
+        );
+        return Ok(());
+    }
+    match &removed_file {
+        Some(file) => {
+            println!("Removed the built extension ({file}) and Crystalline's record of it.")
+        }
+        None if removed_record => {
+            println!("Removed Crystalline's record of the Claude Desktop install.")
+        }
+        None => println!("Crystalline has no record of a Claude Desktop install on this computer."),
+    }
+    println!(
+        "Crystalline cannot remove the extension from Claude Desktop. Remove it there: {REMOVE_ROUTE}, then Crystalline."
+    );
+    println!("The skill stays in Claude Desktop until you delete it under {SKILLS_ROUTE}.");
+    Ok(())
+}
+
+/// `path` with `suffix` appended to its last component.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Delete a file; whether there was one.
+fn remove_if_there(path: &Path) -> anyhow::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => anyhow::bail!("Could not remove {}: {e}", path.display()),
+    }
 }
 
 /// [`SavedSkill::status`] when the zip was written (or an identical one was

@@ -2363,7 +2363,15 @@ fn run() -> anyhow::Result<()> {
             project,
             force,
         }) => match harness.harness() {
-            None => anyhow::bail!("uninstall does not support claude-desktop yet."),
+            None => {
+                if project {
+                    anyhow::bail!(install_desktop::PROJECT_REFUSAL);
+                }
+                if force {
+                    anyhow::bail!(install_desktop::FORCE_REFUSAL);
+                }
+                install_desktop::run_uninstall(cli.json)
+            }
             Some(harness) => install::run_uninstall(harness, project, force, cli.json),
         },
         Some(Command::Origin { command }) => {
