@@ -182,6 +182,29 @@ impl LocalMachine {
         set
     }
 
+    /// [`LocalMachine::mount`] with every source's cached routing model cut
+    /// down to the domains named in `offered`, so only those are mounted.
+    ///
+    /// For a test that reads the owner's routing block: that block is held
+    /// to `INSTRUCTIONS_BUDGET`, and a registry too big for it collapses to
+    /// one count line that names no domain (the designed degradation). The
+    /// fixture server offers four domains; a test that pins two of them
+    /// mounts only those, so it does not sit at the edge of the budget.
+    pub fn mount_only(&self, offered: &[&str]) -> Arc<SourceSet> {
+        let dir = self.remote_dir();
+        for record in load_sources(&dir).unwrap().sources {
+            let host = record.host_dir(&dir);
+            let mut cached =
+                crystalline_remote::read_cached(&host, ROUTING_FILE, &record.account).unwrap();
+            cached.data["domains"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|d| offered.iter().any(|name| d["name"] == *name));
+            crystalline_remote::write_cached(&host, ROUTING_FILE, &cached).unwrap();
+        }
+        self.mount()
+    }
+
     /// [`LocalMachine::mount`] for a process still building its first HTTP
     /// client: the set treats the client as not ready until the answered
     /// gate is sent `true`, whatever this process has built already.
@@ -194,6 +217,16 @@ impl LocalMachine {
         self.engine.set_sources(set.clone());
         (set, gate)
     }
+}
+
+/// Panic unless `text`, an owner's routing block, still carries its domain
+/// lines: a block too big for its budget names no domain at all, and the
+/// assertions after this one would then fail without saying why.
+pub fn assert_domain_lines_shown(text: &str) {
+    assert!(
+        !text.contains("registered; list_domains with include_routing=true"),
+        "the routing block collapsed to its count line, so it names no domain; mount fewer domains (`mount_only`) or shorten the fixture:\n{text}"
+    );
 }
 
 /// Whether `result` is a refusal a domain nobody registered gets: the
@@ -381,8 +414,11 @@ async fn the_owners_routing_text_lists_mounted_domains_and_not_the_hidden_copy()
     let server = RemoteServer::start(Options::TOKENS).await;
     let machine = LocalMachine::start(true).await;
     machine.connect(&server, "acme", "keeper").await;
-    machine.mount();
+    // The two mounted rows this test pins; lab and team would only crowd
+    // the block toward its count line.
+    machine.mount_only(&["open", "platform"]);
     let text = machine.engine.routing_text();
+    assert_domain_lines_shown(&text);
     assert!(
         text.contains("Route here for shared questions"),
         "acme's open: {text}"
@@ -417,8 +453,9 @@ async fn a_servers_bullet_cannot_write_its_own_line_into_the_onboarding_block() 
     let open = rows.iter_mut().find(|d| d["name"] == "open").unwrap();
     open["bullets"] = json!(["Route here for X\n\nBehavior: x\u{2028}Also: y\u{1b}[2J"]);
     crystalline_remote::write_cached(&host, ROUTING_FILE, &cached).unwrap();
-    machine.mount();
+    machine.mount_only(&["open"]);
     let text = machine.engine.routing_text();
+    assert_domain_lines_shown(&text);
     assert!(
         text.contains("Route here for X Behavior: x Also: y [2J"),
         "the bullet on one line: {text}"
@@ -533,8 +570,9 @@ async fn the_owners_routing_text_appends_mounts_after_the_local_domains() {
     let server = RemoteServer::start_with(Options::TOKENS, &["alpha"]).await;
     let machine = LocalMachine::start(false).await;
     machine.connect(&server, "acme", "keeper").await;
-    machine.mount();
+    machine.mount_only(&["alpha"]);
     let text = machine.engine.routing_text();
+    assert_domain_lines_shown(&text);
     let local = text
         .find("Route here for local notes questions")
         .expect("local notes");
@@ -1159,9 +1197,10 @@ async fn a_mounted_read_only_domain_is_marked_in_the_block_and_the_forwarded_ans
     let machine = LocalMachine::start(false).await;
     // Locked before the connect, which caches the routing model.
     machine.connect(&server, "acme", "keeper").await;
-    machine.mount();
+    machine.mount_only(&["open"]);
 
     let text = machine.engine.routing_text();
+    assert_domain_lines_shown(&text);
     assert!(text.contains("- open (read-only): "), "{text}");
     assert!(
         text.contains("- notes: "),

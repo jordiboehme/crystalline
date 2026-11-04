@@ -2,8 +2,10 @@
 //! this machine, pins the crystalline found on PATH and is recorded in
 //! `<state_dir>/claude-desktop.json`.
 //!
-//! Every run passes `--skip-skills` (the skill step has its own tests), and
-//! every child gets a PATH of its own, so the developer's own crystalline is
+//! Every run passes `--skip-skills` except the skill step's own tests at the
+//! end, which save the crystalline-intelligence zip into a temp Downloads
+//! folder (or the state folder) and reveal it through the same seam. Every
+//! child gets a PATH of its own, so the developer's own crystalline is
 //! never the one pinned. Most runs pass `--no-open`; the ones that open go
 //! through the debug build's open seam (`CRYSTALLINE_TEST_DESKTOP_OPEN`,
 //! `fail` in the isolation environment), so no test opens Claude Desktop.
@@ -543,4 +545,303 @@ fn no_open_never_calls_the_opener() {
     let out = stdout(&assert);
     assert!(out.contains(NO_OPEN_LINE), "{out}");
     assert!(!out.contains("Could not open"), "{out}");
+}
+
+// --- the crystalline-intelligence skill ---------------------------------
+
+const SKILL_ROUTE_LINE: &str =
+    "Upload it in Claude Desktop under Customize > Skills and turn it on. Do not unpack the zip.";
+
+const OLD_SKILL_LINE: &str = "If you uploaded the older crystalline-memory skill, delete it there.";
+
+/// The shipped skill's `SKILL.md`, as the zip must carry it.
+fn skill_text() -> String {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/crystalline-intelligence/SKILL.md"),
+    )
+    .unwrap()
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl Setup {
+    /// The person's Downloads folder under the temp home: `HOME` and
+    /// `USERPROFILE` both point at it in the isolation environment.
+    fn downloads(&self) -> PathBuf {
+        self.home.path().join("Downloads")
+    }
+
+    /// `crystalline install claude-desktop` with the skill step, opening and
+    /// revealing through the logging seam.
+    fn install_with_skill(&self) -> Command {
+        let mut cmd = crate::common::crystalline();
+        crate::common::isolate(&mut cmd, self.home.path());
+        cmd.env("PATH", self.path_env())
+            .env(
+                "CRYSTALLINE_TEST_DESKTOP_OPEN",
+                format!("log:{}", self.open_log().display()),
+            )
+            .args(["install", "claude-desktop"]);
+        cmd
+    }
+
+    fn open_lines(&self) -> Vec<String> {
+        std::fs::read_to_string(self.open_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn zips(&self, dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".zip"))
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+#[test]
+fn the_skill_is_saved_to_downloads_and_revealed() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let assert = s.install_with_skill().assert().success();
+    let zip = s.downloads().join("crystalline-intelligence.zip");
+    assert_eq!(
+        String::from_utf8(entry(&zip, "crystalline-intelligence/SKILL.md")).unwrap(),
+        skill_text()
+    );
+    assert_eq!(
+        s.open_lines(),
+        vec![
+            format!("open {}", s.bundle().display()),
+            format!("reveal {}", zip.display()),
+        ]
+    );
+    let skill = &s.record()["skill"];
+    assert_eq!(skill["name"], "crystalline-intelligence");
+    assert_eq!(skill["sha256"], sha256(skill_text().as_bytes()));
+    assert_eq!(skill["file"], zip.display().to_string());
+    chrono::DateTime::parse_from_rfc3339(skill["saved_at"].as_str().unwrap())
+        .expect("saved_at is RFC 3339");
+
+    let out = stdout(&assert);
+    let lines: Vec<&str> = out.lines().collect();
+    let saved = format!(
+        "Saved the crystalline-intelligence skill: {}",
+        zip.display()
+    );
+    let at = lines
+        .iter()
+        .position(|l| *l == saved)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(lines[at + 1], SKILL_ROUTE_LINE, "{out}");
+    assert_eq!(lines[at + 2], OLD_SKILL_LINE, "{out}");
+    assert!(
+        lines[..at].contains(&OPENED_LINE),
+        "the extension lines come first:\n{out}"
+    );
+    assert_eq!(lines[lines.len() - 1], FOOTER);
+}
+
+#[test]
+fn an_existing_zip_is_never_overwritten() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let planted = s.downloads().join("crystalline-intelligence.zip");
+    std::fs::write(&planted, b"someone else's zip").unwrap();
+    let assert = s.install_with_skill().assert().success();
+    assert_eq!(std::fs::read(&planted).unwrap(), b"someone else's zip");
+    let zip = s.downloads().join("crystalline-intelligence 1.zip");
+    assert_eq!(
+        String::from_utf8(entry(&zip, "crystalline-intelligence/SKILL.md")).unwrap(),
+        skill_text()
+    );
+    assert_eq!(s.record()["skill"]["file"], zip.display().to_string());
+    assert!(
+        stdout(&assert).contains(&format!(
+            "Saved the crystalline-intelligence skill: {}",
+            zip.display()
+        )),
+        "{}",
+        stdout(&assert)
+    );
+}
+
+#[test]
+fn an_unchanged_skill_is_not_saved_twice() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    s.install_with_skill().assert().success();
+    let zip = s.downloads().join("crystalline-intelligence.zip");
+    let first = s.record()["skill"].clone();
+    std::fs::remove_file(s.open_log()).unwrap();
+
+    let assert = s.install_with_skill().assert().success();
+    assert_eq!(s.zips(&s.downloads()), vec!["crystalline-intelligence.zip"]);
+    assert_eq!(
+        s.open_lines(),
+        vec![format!("open {}", s.bundle().display())],
+        "the extension is opened again, the zip is not shown again"
+    );
+    assert_eq!(
+        s.record()["skill"],
+        first,
+        "the record keeps the first save"
+    );
+    let out = stdout(&assert);
+    assert!(
+        out.contains(&format!(
+            "The crystalline-intelligence skill has not changed since you saved it: {}\n",
+            zip.display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("Saved the"), "{out}");
+    assert!(!out.contains(SKILL_ROUTE_LINE), "{out}");
+
+    let assert = s.install_with_skill().arg("--json").assert().success();
+    let report: serde_json::Value = serde_json::from_str(stdout(&assert).trim()).unwrap();
+    assert_eq!(report["skill"]["status"], "unchanged", "{report}");
+    assert_eq!(report["skill"]["file"], zip.display().to_string());
+    assert_eq!(report["skill"]["name"], "crystalline-intelligence");
+}
+
+/// A recorded zip that is gone is saved again, and shown again.
+#[test]
+fn a_deleted_zip_is_saved_again() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    s.install_with_skill().assert().success();
+    let zip = s.downloads().join("crystalline-intelligence.zip");
+    std::fs::remove_file(&zip).unwrap();
+    std::fs::remove_file(s.open_log()).unwrap();
+    let assert = s.install_with_skill().arg("--json").assert().success();
+    assert!(zip.is_file());
+    assert_eq!(s.open_lines()[1], format!("reveal {}", zip.display()));
+    let report: serde_json::Value = serde_json::from_str(stdout(&assert).trim()).unwrap();
+    assert_eq!(report["skill"]["status"], "saved", "{report}");
+    assert_eq!(report["skill"]["revealed"], true, "{report}");
+}
+
+#[test]
+fn without_a_downloads_folder_the_zip_goes_to_the_state_folder() {
+    let s = Setup::new();
+    let assert = s.install_with_skill().assert().success();
+    assert!(!s.downloads().exists(), "no Downloads folder is made");
+    let zip = s
+        .state()
+        .join("claude-desktop")
+        .join("crystalline-intelligence.zip");
+    assert_eq!(
+        String::from_utf8(entry(&zip, "crystalline-intelligence/SKILL.md")).unwrap(),
+        skill_text()
+    );
+    assert_eq!(s.record()["skill"]["file"], zip.display().to_string());
+    let out = stdout(&assert);
+    assert!(
+        out.contains(&format!(
+            "Saved the crystalline-intelligence skill: {}\n",
+            zip.display()
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn skip_skills_leaves_the_skill_alone() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let assert = s
+        .install_with_skill()
+        .arg("--skip-skills")
+        .assert()
+        .success();
+    assert!(s.zips(&s.downloads()).is_empty());
+    assert!(s.zips(s.bundle().parent().unwrap()).is_empty());
+    let record = s.record();
+    assert!(record.get("skill").is_none_or(|v| v.is_null()), "{record}");
+    assert!(
+        !s.open_lines().iter().any(|l| l.starts_with("reveal ")),
+        "{:?}",
+        s.open_lines()
+    );
+    assert!(!stdout(&assert).contains("skill"), "{}", stdout(&assert));
+}
+
+/// A refused reveal is one notice; the zip is saved and the run succeeds.
+#[test]
+fn a_failed_reveal_is_one_notice() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let assert = s
+        .install_with_skill()
+        .env("CRYSTALLINE_TEST_DESKTOP_OPEN", "fail")
+        .assert()
+        .success();
+    assert!(s.downloads().join("crystalline-intelligence.zip").is_file());
+    let out = stdout(&assert);
+    let notice = "Could not show the file: the test seam refused it.";
+    assert_eq!(out.matches(notice).count(), 1, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[lines.len() - 2], notice, "{out}");
+    assert_eq!(lines[lines.len() - 1], FOOTER);
+}
+
+/// `--no-open` hands nothing to Claude Desktop and shows nothing in the file
+/// manager: the zip is saved and its path printed.
+#[test]
+fn no_open_saves_the_skill_without_showing_it() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let assert = s.install_with_skill().arg("--no-open").assert().success();
+    assert!(s.downloads().join("crystalline-intelligence.zip").is_file());
+    assert!(!s.open_log().exists(), "{:?}", s.open_lines());
+    assert!(stdout(&assert).contains(SKILL_ROUTE_LINE));
+}
+
+/// `--skip-mcp` saves the skill alone and remembers it.
+#[test]
+fn skip_mcp_saves_only_the_skill() {
+    let s = Setup::new();
+    std::fs::create_dir_all(s.downloads()).unwrap();
+    let assert = s.install_with_skill().arg("--skip-mcp").assert().success();
+    assert!(!s.bundle().exists());
+    let zip = s.downloads().join("crystalline-intelligence.zip");
+    assert!(zip.is_file());
+    assert_eq!(s.open_lines(), vec![format!("reveal {}", zip.display())]);
+    assert!(s.record()["extension"].is_null(), "{}", s.record());
+    assert_eq!(s.record()["skill"]["file"], zip.display().to_string());
+    let out = stdout(&assert);
+    assert!(
+        out.starts_with("Saved the crystalline-intelligence skill: "),
+        "{out}"
+    );
+}
+
+/// A skill that cannot be saved anywhere fails a run that had nothing else
+/// to do.
+#[test]
+fn a_skill_that_cannot_be_saved_fails_a_skill_only_run() {
+    let s = Setup::new();
+    // No Downloads folder, and a file where the state folder's
+    // claude-desktop folder goes.
+    std::fs::create_dir_all(s.state()).unwrap();
+    std::fs::write(s.state().join("claude-desktop"), "in the way").unwrap();
+    let assert = s.install_with_skill().arg("--skip-mcp").assert().failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("Could not save the crystalline-intelligence skill: "),
+        "{stderr}"
+    );
+    assert!(!s.open_log().exists());
 }

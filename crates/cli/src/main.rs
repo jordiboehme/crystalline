@@ -217,8 +217,9 @@ enum Command {
         /// crystalline-intelligence skill).
         #[arg(long)]
         skip_skills: bool,
-        /// claude-desktop only: write the extension and print where to
-        /// install it, without opening Claude Desktop.
+        /// claude-desktop only: write the extension and the skill zip and
+        /// print where to install them, without opening Claude Desktop or
+        /// showing the zip in Finder or File Explorer.
         #[arg(long)]
         no_open: bool,
     },
@@ -6597,6 +6598,7 @@ mod tests {
             domains: Vec::new(),
             warnings: Vec::new(),
             read_only: false,
+            skills_tool: true,
         };
         let plain = crystalline_core::render_json(&output);
         let stale = vec!["Note: a".to_string(), "Note: b".to_string()];

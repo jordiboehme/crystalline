@@ -926,15 +926,22 @@ async fn instructions_via_discover_gated(
     version: ProtocolVersion,
     gate: HarnessGate,
 ) -> String {
+    instructions_via_discover_from(
+        McpServer::new(h.engine.clone()).with_harness_gate(gate),
+        version,
+    )
+    .await
+}
+
+/// The instructions `server` hands a modern peer in its `server/discover`
+/// answer, whichever transport it was built for.
+async fn instructions_via_discover_from(server: McpServer, version: ProtocolVersion) -> String {
     use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
 
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     // The discover chooses no lifecycle (rmcp 3.5.1), so the server half is
     // never waited on here: it is kept alive until the text is read.
-    let server = ServedSession::spawn(
-        McpServer::new(h.engine.clone()).with_harness_gate(gate),
-        server_io,
-    );
+    let server = ServedSession::spawn(server, server_io);
     let client = ClientConfig::default()
         .serve_with_lifecycle(
             client_io,
@@ -1037,4 +1044,84 @@ async fn a_client_that_never_discovers_can_still_pull_the_block() {
         listed.contains("Route here for eng questions"),
         "list_domains with include_routing carries the same routing text:\n{listed}"
     );
+}
+
+/// **The full block tells the agent to read the `skills` tool, by every path
+/// it arrives through.** Claude Desktop has no skill folder Crystalline can
+/// write into, so this sentence is how it gets the current playbooks with
+/// every upgrade: stdio `initialize`, stdio `server/discover`, the HTTP
+/// handshake's counted block and the HTTP `server/discover` all carry it.
+///
+/// The short blocks a harness with Crystalline's session hook gets do not:
+/// that harness has the skills as files. Nor does a server whose
+/// `skills.serve` is `false`, which lists no skills tool to point at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_full_block_points_at_the_skills_tool_by_every_path() {
+    let hint = crystalline_core::prompt::SKILLS_HINT;
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let newest = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
+        .last()
+        .unwrap()
+        .clone();
+
+    let (client, _server) = h.connect_as(false, ServedTransport::Stdio).await;
+    let stdio_initialize = instructions(&client);
+    drop(client);
+    let (client, _server) = h.connect_as(false, ServedTransport::Http).await;
+    let http_initialize = instructions(&client);
+    drop(client);
+    let stdio_discover = instructions_via_discover(&h, newest.clone()).await;
+    let http_discover =
+        instructions_via_discover_from(McpServer::new_http(h.engine.clone()), newest.clone()).await;
+    for (path, text) in [
+        ("stdio initialize", &stdio_initialize),
+        ("stdio discover", &stdio_discover),
+        ("http initialize", &http_initialize),
+        ("http discover", &http_discover),
+    ] {
+        assert!(
+            text.contains("Behavior:"),
+            "{path} is a full block:\n{text}"
+        );
+        assert!(text.contains(hint), "{path} names the skills tool:\n{text}");
+    }
+
+    let hooked = |verified| HarnessGate {
+        hook_installed: true,
+        onboarding_verified: verified,
+        unattended: false,
+        run_domain: None,
+    };
+    for verified in [true, false] {
+        let (client, _server) = h.connect_gated(hooked(verified)).await;
+        let text = instructions(&client);
+        drop(client);
+        let by_discover =
+            instructions_via_discover_gated(&h, newest.clone(), hooked(verified)).await;
+        for text in [text, by_discover] {
+            assert!(
+                !text.contains("skills"),
+                "verified={verified}: a harness with the session hook has the skills as files:\n{text}"
+            );
+        }
+    }
+
+    let off = Harness::build_with(
+        &[("eng", &["Route here for eng questions"])],
+        &[],
+        false,
+        Some("false"),
+    )
+    .await;
+    let (client, _server) = off.connect_as(false, ServedTransport::Stdio).await;
+    let text = instructions(&client);
+    drop(client);
+    let by_discover = instructions_via_discover(&off, newest).await;
+    for text in [text, by_discover] {
+        assert!(text.contains("Behavior:"), "still the full block:\n{text}");
+        assert!(
+            !text.contains("skills"),
+            "skills.serve=false lists no skills tool to point at:\n{text}"
+        );
+    }
 }

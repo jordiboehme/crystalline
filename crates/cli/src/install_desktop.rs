@@ -14,12 +14,25 @@
 //! Unless `--no-open` is given, the file is then handed to Claude Desktop
 //! (`crystalline_service::desktop_open`), which shows its install dialog.
 //!
+//! Then the crystalline-intelligence skill is saved as a zip for Claude
+//! Desktop's skill upload: into the person's Downloads folder, or the state
+//! folder beside the extension when there is none, never over a file that
+//! is already there. Unless `--no-open` is given, the zip is shown in Finder
+//! or File Explorer. A skill that has not changed since the last save is not
+//! saved again. The routing text the server sends tells the agent to read
+//! the `skills` tool as well, so Claude Desktop gets the current playbooks
+//! even when no skill was uploaded.
+//!
 //! Crystalline cannot see what Claude Desktop installed, so every run builds
 //! the extension again and the record says only what this command did last.
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use serde_json::{Value, json};
 
-use crystalline_core::desktop_record::{self, DesktopRecord};
+use crystalline_core::desktop_extension::{sha256_hex, skill_zip};
+use crystalline_core::desktop_record::{self, DesktopRecord, SkillRecord};
 use crystalline_service::desktop_offer::{BuiltExtension, build_extension};
 use crystalline_service::desktop_open;
 
@@ -29,6 +42,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Where Claude Desktop installs an extension from a file.
 pub(crate) const INSTALL_ROUTE: &str =
     "Settings > Extensions > Advanced settings > Install Extension...";
+
+/// Where Claude Desktop takes a skill upload.
+pub(crate) const SKILLS_ROUTE: &str = "Customize > Skills";
+
+/// The skill a run saves for Claude Desktop, which is also the zip's name.
+const SKILL_NAME: &str = "crystalline-intelligence";
 
 /// The last line of every human run.
 const FOOTER: &str =
@@ -83,17 +102,37 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
     };
     let mut notices = Vec::new();
     let mut extension = None;
+    let opener = opts.open.then(desktop_open::for_this_process);
 
     if !opts.skip_extension {
-        let opener = opts.open.then(desktop_open::for_this_process);
         let built = build_extension(&mut record, None, opener.as_deref())?;
         notices.extend(built.warning.clone());
         extension = Some(built);
     }
 
-    // The extension is built by now, so a record that cannot be saved is a
-    // notice and the run still exits 0: the person can install the file.
-    if extension.is_some() {
+    let mut skill = None;
+    if !opts.skip_skill {
+        match save_skill(&mut record, opener.as_deref()) {
+            Ok(saved) => {
+                notices.extend(
+                    saved
+                        .reveal_error
+                        .as_ref()
+                        .map(|error| format!("Could not show the file: {error}.")),
+                );
+                skill = Some(saved);
+            }
+            // Nothing else was done, so the run fails.
+            Err(e) if extension.is_none() => return Err(e),
+            Err(e) => notices.push(format!("{e}.")),
+        }
+    }
+
+    // The extension is built (or the skill saved) by now, so a record that
+    // cannot be saved is a notice and the run still exits 0: the person can
+    // install the file.
+    let changed = extension.is_some() || skill.as_ref().is_some_and(|s| s.status == SAVED);
+    if changed {
         match desktop_record::save(&record_path, &record) {
             Ok(()) => notices.extend(unreadable.map(|reason| {
                 format!(
@@ -109,15 +148,156 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
     }
 
     if json {
-        println!("{}", report_json(extension.as_ref(), &notices));
+        println!(
+            "{}",
+            report_json(extension.as_ref(), skill.as_ref(), &notices)
+        );
     } else {
-        print!("{}", report_text(extension.as_ref(), &notices));
+        print!(
+            "{}",
+            report_text(extension.as_ref(), skill.as_ref(), &notices)
+        );
     }
     Ok(())
 }
 
+/// [`SavedSkill::status`] when the zip was written (or an identical one was
+/// found) this run.
+const SAVED: &str = "saved";
+
+/// [`SavedSkill::status`] when the recorded zip still holds this skill.
+const UNCHANGED: &str = "unchanged";
+
+/// What the skill step did.
+struct SavedSkill {
+    /// The zip, written or found.
+    file: PathBuf,
+    /// [`SAVED`] or [`UNCHANGED`].
+    status: &'static str,
+    /// Whether the zip was shown in Finder or File Explorer.
+    revealed: bool,
+    /// Why showing it failed, when it did.
+    reveal_error: Option<String>,
+}
+
+/// Save the crystalline-intelligence skill as a zip and remember it in
+/// `record`, unless the recorded zip still holds this skill. A saved zip is
+/// shown through `opener` (none with `--no-open`); a failed show is the
+/// caller's notice, never an error.
+fn save_skill(
+    record: &mut DesktopRecord,
+    opener: Option<&dyn desktop_open::DesktopOpener>,
+) -> anyhow::Result<SavedSkill> {
+    let asset = crystalline_core::skill(SKILL_NAME)
+        .ok_or_else(|| anyhow::anyhow!("this crystalline ships no {SKILL_NAME} skill"))?;
+    let sha256 = sha256_hex(asset.content.as_bytes());
+    if let Some(known) = &record.skill
+        && known.sha256 == sha256
+        && Path::new(&known.file).is_file()
+    {
+        return Ok(SavedSkill {
+            file: PathBuf::from(&known.file),
+            status: UNCHANGED,
+            revealed: false,
+            reveal_error: None,
+        });
+    }
+
+    let bytes = skill_zip(asset)?;
+    let state = desktop_record::bundle_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("the state folder has no parent"))?;
+    let written = match downloads_dir() {
+        Some(downloads) => skill_target(&downloads, &bytes).or_else(|_| {
+            std::fs::create_dir_all(&state)?;
+            skill_target(&state, &bytes)
+        }),
+        None => std::fs::create_dir_all(&state).and_then(|()| skill_target(&state, &bytes)),
+    };
+    let (file, _reused) =
+        written.map_err(|e| anyhow::anyhow!("Could not save the {SKILL_NAME} skill: {e}"))?;
+
+    record.skill = Some(SkillRecord {
+        name: SKILL_NAME.to_string(),
+        sha256,
+        file: file.display().to_string(),
+        saved_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    let shown = opener.map(|opener| opener.reveal(&file));
+    Ok(SavedSkill {
+        file,
+        status: SAVED,
+        revealed: matches!(shown, Some(Ok(()))),
+        reveal_error: shown.and_then(Result::err),
+    })
+}
+
+/// The person's Downloads folder: `$HOME/Downloads` on macOS,
+/// `%USERPROFILE%\Downloads` on Windows. `None` when the variable is unset
+/// or the folder does not exist. No known-folder lookup, so a test can point
+/// it elsewhere through the environment.
+fn downloads_dir() -> Option<PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    if home.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(home).join("Downloads");
+    dir.is_dir().then_some(dir)
+}
+
+/// How many names [`skill_target`] tries before it gives up.
+const TARGET_LIMIT: usize = 1000;
+
+/// The first of `crystalline-intelligence.zip`, `crystalline-intelligence
+/// 1.zip`, `crystalline-intelligence 2.zip` and so on in `dir` that either
+/// does not exist (it is written, created new) or holds exactly `bytes` (it
+/// is reused; the flag says so). A file that is already there is never
+/// overwritten.
+fn skill_target(dir: &Path, bytes: &[u8]) -> std::io::Result<(PathBuf, bool)> {
+    for n in 0..TARGET_LIMIT {
+        let name = match n {
+            0 => format!("{SKILL_NAME}.zip"),
+            n => format!("{SKILL_NAME} {n}.zip"),
+        };
+        let path = dir.join(name);
+        match std::fs::read(&path) {
+            Ok(found) if found == bytes => return Ok((path, true)),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // A folder or an unreadable file by that name: not ours to touch.
+            Err(_) if path.exists() => continue,
+            Err(e) => return Err(e),
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            // Someone made it since the read: try the next name.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        return Ok((path, false));
+    }
+    Err(std::io::Error::other(format!(
+        "{TARGET_LIMIT} files named {SKILL_NAME} are already in {}",
+        dir.display()
+    )))
+}
+
 /// The one JSON object `--json` prints.
-fn report_json(extension: Option<&BuiltExtension>, notices: &[String]) -> Value {
+fn report_json(
+    extension: Option<&BuiltExtension>,
+    skill: Option<&SavedSkill>,
+    notices: &[String],
+) -> Value {
     json!({
         "target": "claude-desktop",
         "version": VERSION,
@@ -127,13 +307,22 @@ fn report_json(extension: Option<&BuiltExtension>, notices: &[String]) -> Value 
             "opened": e.opened,
             "open_error": e.open_error,
         })),
-        "skill": Value::Null,
+        "skill": skill.map(|s| json!({
+            "name": SKILL_NAME,
+            "file": s.file.display().to_string(),
+            "status": s.status,
+            "revealed": s.revealed,
+        })),
         "notices": notices,
     })
 }
 
 /// The human report, one line each, the footer last.
-fn report_text(extension: Option<&BuiltExtension>, notices: &[String]) -> String {
+fn report_text(
+    extension: Option<&BuiltExtension>,
+    skill: Option<&SavedSkill>,
+    notices: &[String],
+) -> String {
     let mut out = String::new();
     if let Some(e) = extension {
         out.push_str(&format!(
@@ -157,6 +346,20 @@ fn report_text(extension: Option<&BuiltExtension>, notices: &[String]) -> String
             }
         }
     }
+    if let Some(s) = skill {
+        let file = s.file.display();
+        if s.status == UNCHANGED {
+            out.push_str(&format!(
+                "The {SKILL_NAME} skill has not changed since you saved it: {file}\n"
+            ));
+        } else {
+            out.push_str(&format!("Saved the {SKILL_NAME} skill: {file}\n"));
+            out.push_str(&format!(
+                "Upload it in Claude Desktop under {SKILLS_ROUTE} and turn it on. Do not unpack the zip.\n"
+            ));
+            out.push_str("If you uploaded the older crystalline-memory skill, delete it there.\n");
+        }
+    }
     for notice in notices {
         out.push_str(notice);
         out.push('\n');
@@ -164,4 +367,47 @@ fn report_text(extension: Option<&BuiltExtension>, notices: &[String]) -> String
     out.push_str(FOOTER);
     out.push('\n');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_free_name_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, reused) = skill_target(dir.path(), b"zip").unwrap();
+        assert_eq!(path, dir.path().join("crystalline-intelligence.zip"));
+        assert!(!reused);
+        assert_eq!(std::fs::read(&path).unwrap(), b"zip");
+    }
+
+    #[test]
+    fn a_file_with_the_same_bytes_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("crystalline-intelligence.zip"), b"other").unwrap();
+        std::fs::write(dir.path().join("crystalline-intelligence 1.zip"), b"zip").unwrap();
+        let (path, reused) = skill_target(dir.path(), b"zip").unwrap();
+        assert_eq!(path, dir.path().join("crystalline-intelligence 1.zip"));
+        assert!(reused);
+        assert_eq!(
+            std::fs::read(dir.path().join("crystalline-intelligence.zip")).unwrap(),
+            b"other"
+        );
+    }
+
+    #[test]
+    fn a_folder_by_the_name_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("crystalline-intelligence.zip")).unwrap();
+        let (path, reused) = skill_target(dir.path(), b"zip").unwrap();
+        assert_eq!(path, dir.path().join("crystalline-intelligence 1.zip"));
+        assert!(!reused);
+    }
+
+    #[test]
+    fn a_missing_folder_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(skill_target(&dir.path().join("gone"), b"zip").is_err());
+    }
 }
