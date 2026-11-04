@@ -274,13 +274,14 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                // Both are bounded waits on the daemon; side by side, so the
-                // worst case is one timeout, not two.
-                let (update_offered, split) = tokio::join!(
-                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged),
-                    split_note_here(),
+                // Never waits for the offer: inside a package the request
+                // to the daemon goes out on a task of its own.
+                let update_offered =
+                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged);
+                let note = onboarding_note(
+                    launcher_note_from_env(update_offered),
+                    split_note_here().await,
                 );
-                let note = onboarding_note(launcher_note_from_env(update_offered), split);
                 return pump_stdio(
                     stream,
                     stdin,

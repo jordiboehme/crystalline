@@ -8,7 +8,7 @@ The Claude Desktop extension connects Claude Desktop to the Crystalline on your 
 2. Run `crystalline install claude-desktop` in a terminal.
 3. Claude Desktop shows an install dialog. Confirm it there.
 
-If you do not want the command to open Claude Desktop, add `--no-open`. Then open Claude Desktop, go to Settings > Extensions > Advanced settings > Install Extension... and pick the file the command printed.
+If you do not want the command to open Claude Desktop, add `--no-open`. It then also does not show the skill zip in Finder. Open Claude Desktop, go to Settings > Extensions > Advanced settings > Install Extension... and pick the file the command printed.
 
 Do you use only Claude Desktop, and neither Claude Code nor the `crystalline` command? Then take `crystalline-claude-desktop-only-v<version>-macos.mcpb` instead. It carries Crystalline inside and needs nothing else. Its daemon runs while Claude Desktop is open and stops five seconds after it quits. To update it, install the newer bundle over the old one.
 
@@ -18,7 +18,7 @@ Do you use only Claude Desktop, and neither Claude Code nor the `crystalline` co
 2. Run `crystalline install claude-desktop` in a terminal.
 3. Claude Desktop shows an install dialog. Confirm it there.
 
-On Windows the command may not be able to open the file in Claude Desktop. Then it prints the path and the steps: open Claude Desktop, go to Settings > Extensions > Advanced settings > Install Extension... and pick the file. You can also double-click the file in File Explorer.
+With `--no-open` the command does not open Claude Desktop and does not show the skill zip in File Explorer. On Windows the command may also not be able to open the file in Claude Desktop. Then it prints the path and the steps: open Claude Desktop, go to Settings > Extensions > Advanced settings > Install Extension... and pick the file. You can also double-click the file in File Explorer.
 
 Claude Desktop runs its extensions inside its own app package. So the extension never runs the Crystalline knowledge stack itself: it connects to the daemon outside the package. The MSI registers a Windows task, `\Crystalline\Daemon`, for all users. It starts the daemon when you sign in. Inside Claude Desktop's package, `crystalline mcp` only connects to that daemon and never starts one itself. If the task is missing (it was deleted, or the MSI could not register it), run `crystalline doctor --fix` in a terminal. It registers a task for your user, but only for the crystalline the MSI installed in its default folder, `Program Files\Crystalline\bin`. For a copy anywhere else it reports the task and registers none. Install the MSI, or run it again, to get the task. When the machine-wide task is broken, `--fix` asks for an administrator instead of fixing it. For details, run `crystalline doctor`.
 
@@ -28,13 +28,15 @@ A `crystalline` command that runs inside Claude Desktop, for example from Claude
 
 ## What the command builds
 
-The command builds a small extension on your computer and writes it to `crystalline.mcpb` in the `claude-desktop` folder of Crystalline's state folder. The extension carries no Crystalline. It runs the crystalline the command was started from and falls back to the one it finds when that has moved. If you have an extension from an older release, the new one installs over it.
+The command builds a small extension on your computer and writes it to `crystalline.mcpb` in the `claude-desktop` folder of Crystalline's state folder. The extension carries no Crystalline. It runs the first crystalline on your `PATH` (or the one you started the command with, when `PATH` has none), and the command prints which one. When that one has moved, the extension falls back to its own search. From 0.18.0 on, a new extension installs over the one from an older release. An extension from before 0.18.0 has another id, so Claude Desktop keeps it as a second Crystalline beside the new one. Remove the older one in Settings > Extensions.
 
 Crystalline cannot see what Claude Desktop has installed. It only remembers what it did last. So each run builds the extension again and opens it again.
 
 ## Updating
 
-You do not need to update the extension when you update Crystalline (`brew upgrade crystalline` on macOS, the newest MSI on Windows). The extension uses the new version. If the extension itself ever needs an update, your agent or `crystalline doctor` tells you. Then run `crystalline install claude-desktop` again.
+When you update Crystalline (`brew upgrade crystalline` on macOS, the newest MSI on Windows), the extension uses the new version at once. Crystalline also builds the extension again for the new version. The next time Claude Desktop starts the extension, Claude Desktop shows a dialog to update it. Confirm it there. On Windows the daemon opens the dialog, because Claude Desktop's own package may not write the file.
+
+Crystalline asks once per version. If you said no, or no dialog came, run `crystalline install claude-desktop` in a terminal. `crystalline doctor` says when an update for this version was not offered yet. Without a record from `crystalline install claude-desktop` (an extension you downloaded, for example), nothing is offered: run the command once.
 
 The Desktop-only bundle is different: it carries Crystalline, so to update it, install the newer bundle over the old one.
 

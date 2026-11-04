@@ -939,7 +939,7 @@ fn render_claude_desktop(out: &mut String, d: &ClaudeDesktopDoctor) {
         if d.update_pending {
             let _ = writeln!(
                 out,
-                "  [warning] the extension is for Crystalline {}, and no update was offered to Claude Desktop yet. It is offered the next time Claude Desktop starts Crystalline. Or run: crystalline install claude-desktop",
+                "  [warning] the extension is for Crystalline {}, and no update was offered to Claude Desktop yet. It is offered when Claude Desktop next starts the extension. Or run: crystalline install claude-desktop",
                 ext.version
             );
         }
@@ -7862,7 +7862,7 @@ mod tests {
         let mut out = String::new();
         render_claude_desktop(&mut out, &d);
         assert!(out.contains("  [warning] /opt/homebrew/Cellar/crystalline/0.1.0/bin/crystalline sits in a versioned Homebrew folder that an upgrade removes. Put a stable crystalline first on PATH, for example /opt/homebrew/bin. Then run: crystalline install claude-desktop"), "{out}");
-        assert!(out.contains("  [warning] the extension is for Crystalline 0.1.0, and no update was offered to Claude Desktop yet. It is offered the next time Claude Desktop starts Crystalline. Or run: crystalline install claude-desktop"), "{out}");
+        assert!(out.contains("  [warning] the extension is for Crystalline 0.1.0, and no update was offered to Claude Desktop yet. It is offered when Claude Desktop next starts the extension. Or run: crystalline install claude-desktop"), "{out}");
     }
 
     fn orphan(name: &str, engrams: i64, age_days: Option<i64>) -> OrphanedDomainDoctor {

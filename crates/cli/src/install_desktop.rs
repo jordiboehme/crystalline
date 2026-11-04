@@ -99,6 +99,12 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
         anyhow::bail!(NOTHING_TO_INSTALL);
     }
 
+    // The offer lock first, so an update offer cannot put its old bundle
+    // back over this build or write the record beside it. Held to the end.
+    let Some(_lock) = crystalline_service::desktop_offer::take_lock()? else {
+        anyhow::bail!(crystalline_service::desktop_offer::BUSY_REFUSAL);
+    };
+
     let record_path = desktop_record::record_path()?;
     // A record this binary cannot read is no record: it is rewritten whole,
     // and the report says so once the new one is written.
@@ -181,24 +187,9 @@ pub(crate) fn run_uninstall(json: bool) -> anyhow::Result<()> {
     // The offer lock first, so an update offer cannot write the record and
     // the extension back while they are being deleted.
     let lock_file = crystalline_service::desktop_offer::lock_path()?;
-    if let Some(parent) = lock_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_file)
-        .map_err(|e| anyhow::anyhow!("Could not open {}: {e}", lock_file.display()))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            anyhow::bail!("An update offer is running right now. Try again in a moment.")
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            anyhow::bail!("Could not lock {}: {e}", lock_file.display())
-        }
-    }
+    let Some(lock) = crystalline_service::desktop_offer::take_lock()? else {
+        anyhow::bail!(crystalline_service::desktop_offer::BUSY_REFUSAL);
+    };
 
     // Read before the record goes: it knows where the skill zip was left.
     let skill_zip = desktop_record::load(&record_path)

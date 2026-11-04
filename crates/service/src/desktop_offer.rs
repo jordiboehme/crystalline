@@ -176,6 +176,35 @@ pub fn lock_path() -> anyhow::Result<PathBuf> {
     Ok(crystalline_core::config::state_dir()?.join("claude-desktop.offer.lock"))
 }
 
+/// Take the offer lock at [`lock_path`]: `None` when another process (or
+/// another handle in this one) holds it. The lock is held until the file
+/// drops. `install claude-desktop` and `uninstall claude-desktop` take it
+/// too, so they never run while an offer writes the bundle and the record.
+pub fn take_lock() -> anyhow::Result<Option<std::fs::File>> {
+    let lock_file = lock_path()?;
+    if let Some(parent) = lock_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_file)
+        .with_context(|| format!("could not open {}", lock_file.display()))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("could not lock {}", lock_file.display()))
+        }
+    }
+}
+
+/// What `install` and `uninstall claude-desktop` say when an update offer
+/// holds the lock.
+pub const BUSY_REFUSAL: &str = "An update offer is running right now. Try again in a moment.";
+
 /// Offer the update for an extension of version `launcher`: when this
 /// binary is newer, a record of an extension exists and this version was
 /// not offered yet, build the extension at this version (keeping the
@@ -195,24 +224,9 @@ pub fn offer_update(launcher: &str, opener: &dyn DesktopOpener) -> anyhow::Resul
         return Ok(answer);
     }
 
-    let lock_file = lock_path()?;
-    if let Some(parent) = lock_file.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_file)
-        .with_context(|| format!("could not open {}", lock_file.display()))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(Offered::Busy),
-        Err(std::fs::TryLockError::Error(e)) => {
-            return Err(e).with_context(|| format!("could not lock {}", lock_file.display()));
-        }
-    }
+    let Some(lock) = take_lock()? else {
+        return Ok(Offered::Busy);
+    };
     // The lock is held until `lock` drops at the end of this call.
 
     // Another offer may have finished between the first look and the lock.

@@ -1003,6 +1003,31 @@ fn uninstall_with_only_a_record_says_so() {
 }
 
 #[test]
+fn install_while_an_update_offer_runs_writes_nothing() {
+    let s = Setup::new();
+    let lock_path = s.state().join("claude-desktop.offer.lock");
+    std::fs::create_dir_all(s.state()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    let assert = s.install(&s.path_env()).assert().failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("An update offer is running right now. Try again in a moment."),
+        "{stderr}"
+    );
+    assert!(!s.bundle().exists(), "no extension is built");
+    assert!(!s.record_file().exists(), "no record is written");
+    drop(lock);
+    s.install(&s.path_env()).assert().success();
+    assert!(s.bundle().is_file());
+}
+
+#[test]
 fn uninstall_while_an_update_offer_runs_deletes_nothing() {
     let s = Setup::new();
     s.install(&s.path_env()).assert().success();

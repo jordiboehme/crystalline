@@ -245,6 +245,14 @@ jobs:
           got=$(unzip -p "$f" manifest.json | jq -r .version)
           [ "$got" = "$version" ] || { echo "::error::$f says version $got, expected $version"; exit 1; }
 
+          # It carries the binary, executable: validate and the version check
+          # read only the manifest, so a stage without the binary would pass.
+          mode=$( (unzip -Z "$f" server/crystalline 2>/dev/null || true) | awk 'NR==1 {print $1}')
+          case "$mode" in
+            -rwx*) ;;
+            *) echo "::error::$f holds no executable server/crystalline (mode '${mode:-missing}')"; exit 1 ;;
+          esac
+
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

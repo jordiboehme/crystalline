@@ -499,6 +499,12 @@ fn discover() -> Value {
 
 /// The instructions of the answer to `opener` from a bridge started by a
 /// launcher of `version` on the `desktop` channel.
+///
+/// Not gated to debug builds, unlike the `desktop_offer` tests below: an old
+/// launcher on the `desktop` channel makes the bridge offer the extension
+/// update, and that stops only because this fresh home has no Claude Desktop
+/// record. Never plant a record here, or a release test build reaches the
+/// real opener.
 fn launcher_instructions(version: &str, opener: Value) -> String {
     let home = short_home();
     let mut bridge = Bridge::start_with(
@@ -610,6 +616,16 @@ mod desktop_offer {
     /// The instructions a packaged bridge with an old launcher and the open
     /// seam `seam` answers `initialize` with.
     fn instructions(home: &Path, seam: &str) -> String {
+        let (bridge, instructions) = opened(home, seam);
+        bridge.finish();
+        instructions
+    }
+
+    /// A packaged bridge with an old launcher and the open seam `seam`,
+    /// still open, and the instructions it answered `initialize` with. The
+    /// bridge sends `desktop_offer` without waiting for the answer, so a
+    /// test that waits for the offer keeps the bridge open meanwhile.
+    fn opened(home: &Path, seam: &str) -> (Bridge, String) {
         let mut bridge = Bridge::start_with(
             home,
             "serve",
@@ -619,11 +635,11 @@ mod desktop_offer {
             ],
         );
         let answer = bridge.ask(initialize());
-        bridge.finish();
-        answer["result"]["instructions"]
+        let instructions = answer["result"]["instructions"]
             .as_str()
             .unwrap_or_else(|| panic!("no instructions: {answer}"))
-            .to_string()
+            .to_string();
+        (bridge, instructions)
     }
 
     #[test]
@@ -634,7 +650,7 @@ mod desktop_offer {
         let log = home.path().join("open.log");
         let seam = format!("log:{}", log.display());
 
-        let first = instructions(home.path(), &seam);
+        let (bridge, first) = opened(home.path(), &seam);
         assert!(
             first.ends_with(&format!("\n\n{LAUNCHER_NOTE}")),
             "an offer still in flight is not called offered: {first}"
@@ -642,6 +658,7 @@ mod desktop_offer {
         wait_until("the offered version in the record", || {
             record(home.path())["offered"] == VERSION
         });
+        bridge.finish();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             format!("open {}\n", bundle(home.path()).display()),
@@ -668,12 +685,13 @@ mod desktop_offer {
         // The daemon logs to nothing here, so the seam says when it refused.
         let refused = home.path().join("refused.log");
         let seam = format!("refuse:{}", refused.display());
-        let first = instructions(home.path(), &seam);
+        let (bridge, first) = opened(home.path(), &seam);
         assert!(first.ends_with(&format!("\n\n{LAUNCHER_NOTE}")), "{first}");
         wait_until("the refused open", || refused.exists());
         wait_until("the old bundle back in its place", || {
             std::fs::read_to_string(bundle(home.path())).is_ok_and(|text| text == OLD_BUNDLE)
         });
+        bridge.finish();
         let aside = bundle(home.path()).with_extension("mcpb.previous");
         assert!(!aside.exists(), "nothing is left aside");
         assert_eq!(std::fs::read(record_file(home.path())).unwrap(), before);
