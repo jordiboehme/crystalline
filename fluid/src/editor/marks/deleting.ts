@@ -708,11 +708,15 @@ export function partnerAcrossLines(
   return { from: other.from, to: other.to };
 }
 
-/** The hidden marks of every line from `from`'s to `to`'s. */
+/**
+ * The hidden marks of every line from `from`'s to `to`'s, a drawn picture's
+ * marks among them, so a picture inside a pair is judged as Part 2 judges an
+ * image (never an empty pair, `droppable`).
+ */
 function marksBetween(state: EditorState, from: number, to: number): Mark[] {
   const first = state.doc.lineAt(from).number;
   const last = state.doc.lineAt(to).number;
-  return scanMarks(state, first, last).lines.flat();
+  return scanMarks(state, first, last, { pictures: true }).lines.flat();
 }
 
 /**

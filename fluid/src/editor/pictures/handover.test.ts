@@ -397,3 +397,68 @@ describe("a picture in a table", () => {
     expect(spans(view.state)).toContainEqual([14, 16]);
   });
 });
+
+describe("a deletion that covers a whole drawn picture next to a mark", () => {
+  const CASES: [string, number, number, string][] = [
+    ["~~![x](assets/p.png)~~ `c`", 0, 20, "~~![x](assets/p.png)~~ `c`"],
+    ["a [![x](assets/p.png)](https://h) b", 0, 21, "[](https://h) b"],
+    ["*a ![x](assets/p.png) b*", 0, 23, "**"],
+  ];
+
+  it.each(
+    CASES.flatMap((c) => [false, true].map((room) => [...c, room] as const)),
+  )(
+    "judges %s from %i to %i as Part 2 does, giving %s (room %s)",
+    (doc, from, to, after, room) => {
+      for (const images of [imagePreviews("eng"), []]) {
+        const view = markView(doc, { images, room });
+        view.dispatch({ selection: EditorSelection.range(from, to) });
+        keys(view, "Backspace");
+        expect(bytes(view.state)).toBe(after);
+      }
+    },
+  );
+
+  const DOCS = [
+    "~~![x](assets/p.png)~~ `c`",
+    "a [![x](assets/p.png)](https://h) b",
+    "*a ![x](assets/p.png) b*",
+    "**a**![x](assets/p.png)**b**",
+    "x ![](assets/p.png) *y*",
+  ];
+
+  // The delete check's own judgement, as a transaction reaches it: a key
+  // over a range that cuts into a picture first takes the picture whole (it
+  // is one atom), which is the picture layer's rule, not the check's.
+  it.each(DOCS)(
+    "judges every range of %s as without the picture layer",
+    (doc) => {
+      const views = [imagePreviews("eng"), []].map((images) =>
+        markView(doc, { images }),
+      );
+      const starts = views.map((view) => view.state);
+      const differ: string[] = [];
+      for (let from = 0; from < doc.length; from += 1) {
+        for (let to = from + 1; to <= doc.length; to += 1) {
+          for (const userEvent of ["delete.selection", "delete.cut"]) {
+            const [drawnBytes, plainBytes] = views.map((view, i) => {
+              const start = starts[i];
+              if (!start) throw new Error("no start state");
+              view.setState(start);
+              view.dispatch({
+                changes: { from, to },
+                selection: { anchor: from },
+                userEvent,
+              });
+              return bytes(view.state);
+            });
+            if (drawnBytes !== plainBytes) {
+              differ.push(`${String(from)}-${String(to)} ${userEvent}`);
+            }
+          }
+        }
+      }
+      expect(differ).toEqual([]);
+    },
+  );
+});
