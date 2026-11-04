@@ -94,6 +94,8 @@ import {
   selectionAnchor,
 } from "../reflectionQuotes";
 import { PageOutline } from "./PageOutline";
+import { SelectionBar } from "./SelectionBar";
+import { SELECTION_BAR_ATTR } from "./selectionBarMark";
 import type { SectionText } from "../reflectionText";
 import { TOP_SECTION, locateQuote } from "../reflectionText";
 import {
@@ -686,6 +688,24 @@ export function ReflectionThreads({
   const [showResolved, setShowResolved] = useState(false);
   const [blockingOnly, setBlockingOnly] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
+  // The page's selection while it is live in the page (not collapsed, not
+  // gone elsewhere), as a range of its own: the bar at the selection stands
+  // by it and measures it again when the text moves. Unlike `captured`, a
+  // caret outside the page takes it away.
+  const [selectedAt, setSelectedAt] = useState<Range | null>(null);
+  // A press on the bar in progress, with the passage it stood by: a touch
+  // can collapse the selection in the page before the click lands, and the
+  // click must still comment on that passage.
+  const [barPress, setBarPress] = useState<{
+    anchor: SelectionAnchor;
+    range: Range;
+  } | null>(null);
+  // Whether the pointer button went down on the page and is still down: a
+  // drag selection, which the bar must not stand in the way of.
+  const [pointerDown, setPointerDown] = useState(false);
+  // The passage Escape sent the bar away from, by value: the key coming up
+  // reads the same selection again, as a new object.
+  const [dismissed, setDismissed] = useState<string | null>(null);
   const [store] = useState(() => new Map<string, unknown>());
   const kept = useMemo(
     () => ({ store, page: `${domain}/${path}` }),
@@ -694,9 +714,9 @@ export function ReflectionThreads({
   const commentKey = `${kept.page}\n${COMMENT_KEY}`;
   const commentLabelKey = `${kept.page}\n${COMMENT_LABEL_KEY}`;
   const [said, say] = useSaid(4000);
-  // Whether a selection was captured a moment ago, so the Comment button is
+  // Whether the bar was announced for the passage captured now, so it is
   // announced once per selection, not at every change of it.
-  const hadCapture = useRef(false);
+  const announced = useRef(false);
   // The thread a comment just opened, focused once the page lists it.
   const focusNew = useRef<string | null>(null);
   const commentButton = useRef<HTMLButtonElement | null>(null);
@@ -768,15 +788,21 @@ export function ReflectionThreads({
       if (root === null || selection === null || selection.rangeCount === 0) {
         return;
       }
+      // Alt+F10 put the focus in the bar at the selection: whatever the
+      // browser does to the selection then, the passage stays the one the
+      // bar stands by.
+      if (document.activeElement?.closest(`[${SELECTION_BAR_ATTR}]`)) {
+        return;
+      }
       const range = selection.getRangeAt(0);
       if (!root.contains(range.commonAncestorContainer)) {
+        setSelectedAt(null);
         // Text selected elsewhere (a thread card) replaces the page's
         // passage; a caret or typing in a field leaves it alone.
         const typing =
           document.activeElement instanceof HTMLInputElement ||
           document.activeElement instanceof HTMLTextAreaElement;
         if (!range.collapsed && !typing) {
-          hadCapture.current = false;
           setCaptured(null);
         }
         return;
@@ -784,16 +810,8 @@ export function ReflectionThreads({
       const next = range.collapsed
         ? null
         : selectionAnchor(root, range, sections);
-      if (next !== null && !hadCapture.current) {
-        // Below `xl` the button is in the sheet, not beside the page.
-        say(
-          column
-            ? "Comment on the selection"
-            : "Comment on the selection from the threads",
-        );
-      }
-      hadCapture.current = next !== null;
       setCaptured(next);
+      setSelectedAt(next === null ? null : range.cloneRange());
     };
     // A keyboard or pointer selection is read again when the key or the
     // button comes up: Chrome can leave the last steps of a fast Shift+Arrow
@@ -807,7 +825,56 @@ export function ReflectionThreads({
       document.removeEventListener("keyup", read);
       document.removeEventListener("pointerup", read);
     };
-  }, [articleRef, sections, say, column]);
+  }, [articleRef, sections]);
+
+  // The pointer button on the page: while it is down the reader is
+  // selecting, and the bar waits. A press that comes up ends an Escape held
+  // for the last passage; a touch scroll the browser takes over ends in a
+  // cancel, which picked nothing.
+  useEffect(() => {
+    const root = articleRef.current;
+    if (root === null) {
+      return;
+    }
+    let pressed = false;
+    const onDown = (event: PointerEvent) => {
+      if (event.isPrimary === false || event.button !== 0) {
+        return;
+      }
+      pressed = true;
+      setPointerDown(true);
+    };
+    const onUp = (event: PointerEvent) => {
+      if (!pressed || event.isPrimary === false) {
+        return;
+      }
+      pressed = false;
+      setPointerDown(false);
+      setDismissed(null);
+    };
+    const onCancel = (event: PointerEvent) => {
+      if (!pressed || event.isPrimary === false) {
+        return;
+      }
+      pressed = false;
+      setPointerDown(false);
+    };
+    root.addEventListener("pointerdown", onDown);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onCancel);
+    return () => {
+      root.removeEventListener("pointerdown", onDown);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onCancel);
+    };
+  }, [articleRef]);
+
+  // An Escape holds only for the passage it was pressed on. Set during
+  // render, React's pattern for state that follows other state.
+  const capturedKey = captured === null ? null : passageKey(captured);
+  if (dismissed !== null && dismissed !== capturedKey) {
+    setDismissed(null);
+  }
 
   const resolved = useQuery({
     queryKey: reflectionThreadsKey(domain, path, "resolved"),
@@ -1087,7 +1154,6 @@ export function ReflectionThreads({
       // The new thread must be listed to take the keyboard.
       setBlockingOnly(false);
       say("Comment posted.");
-      hadCapture.current = false;
       backToComment.current = true;
       setDrafting(null);
       setCaptured(null);
@@ -1095,6 +1161,77 @@ export function ReflectionThreads({
       void refresh();
     },
   });
+
+  // The column's Comment button and the bar at the selection: a comment on
+  // what is selected now, or on what was when the selection was last heard.
+  const startComment = (pressed: SelectionAnchor | null = null) => {
+    comment.reset();
+    setDrafting(selectionNow() ?? captured ?? pressed);
+  };
+
+  // The bar stands by a live selection in the page, for whoever may
+  // comment, while no comment is written, the pointer is not selecting,
+  // Escape did not send it away and the sheet does not cover it. A press
+  // on it keeps it there until the press ends, whatever the selection does.
+  const barAt =
+    !mayComment || drafting !== null || sheetOpen
+      ? null
+      : barPress !== null
+        ? barPress.range
+        : captured !== null && !pointerDown && dismissed === null
+          ? selectedAt
+          : null;
+  const bar =
+    barAt === null ? null : (
+      <SelectionBar
+        range={barAt}
+        frame={articleRef}
+        onPressStart={() => {
+          // Always the passage of this press, never one an earlier press kept.
+          setBarPress(
+            captured !== null && selectedAt !== null
+              ? { anchor: captured, range: selectedAt }
+              : null,
+          );
+        }}
+        onPressEnd={() => {
+          setBarPress(null);
+        }}
+        onLost={() => {
+          setSelectedAt(null);
+          setBarPress(null);
+        }}
+        onComment={() => {
+          startComment(barPress?.anchor ?? null);
+          setBarPress(null);
+          // Below `xl` the form is in the sheet.
+          if (!column) {
+            setSheetOpen(true);
+          }
+        }}
+        onDismiss={() => {
+          setDismissed(capturedKey);
+        }}
+      />
+    );
+  const barShown = barAt !== null;
+  // Said once per selection, and only while the bar is there to be used:
+  // not to a reader who may not comment, not while a comment is written.
+  useEffect(() => {
+    if (captured === null) {
+      announced.current = false;
+      return;
+    }
+    if (barShown && !announced.current) {
+      announced.current = true;
+      // Below `xl` the column's button is in the sheet.
+      say(
+        column
+          ? "Comment on the selection with Alt+F10"
+          : "Comment on the selection with Alt+F10 or from the threads",
+      );
+    }
+  }, [barShown, captured, column, say]);
 
   // A thread a resolve or reopen moves is drawn elsewhere: focus waits on
   // the column's heading rather than on a control that is gone.
@@ -1218,8 +1355,7 @@ export function ReflectionThreads({
               event.preventDefault();
             }}
             onClick={() => {
-              comment.reset();
-              setDrafting(selectionNow() ?? captured);
+              startComment();
             }}
             className={`flex items-center gap-2.5 rounded-[10px] border border-accent-300 bg-accent-50 px-3 py-2.5 text-left text-[13px] font-medium text-accent-800 hover:bg-accent-100 dark:border-accent-700 dark:bg-accent-400/10 dark:text-accent-200 dark:hover:bg-accent-400/20 ${FOCUS_RING}`}
           >
@@ -1338,6 +1474,7 @@ export function ReflectionThreads({
           {status}
           {body}
         </aside>
+        {bar}
       </Kept.Provider>
     );
   }
@@ -1347,6 +1484,7 @@ export function ReflectionThreads({
   return (
     <Kept.Provider value={kept}>
       {!sheetOpen && status}
+      {bar}
       <Dialog.Root open={sheetOpen} onOpenChange={setSheetOpen}>
         {/*
           A plain button rather than radix's trigger, whose code would land in
@@ -1408,6 +1546,15 @@ export function ReflectionThreads({
       </Dialog.Root>
     </Kept.Provider>
   );
+}
+
+/** A passage by value: its section, quote and occurrence. */
+function passageKey(anchor: SelectionAnchor): string {
+  return JSON.stringify([
+    anchor.section,
+    anchor.quote ?? null,
+    anchor.occurrence ?? null,
+  ]);
 }
 
 /** Where the comment in progress is kept while the sheet is shut. */

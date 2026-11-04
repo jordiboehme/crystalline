@@ -539,6 +539,75 @@ test.describe.serial("the Reflection journeys", () => {
     await expect(added).toHaveCount(0);
   });
 
+  test("a reader comments from the bar at the selected text", async ({
+    page,
+  }) => {
+    await signIn(page, USER, PASSWORD);
+    await page.goto(WELCOME);
+    const passage = page.getByText(
+      "Deploys run at night, after the batch window.",
+    );
+    await expect(passage).toBeVisible();
+    const phrase = "after the batch window";
+    await passage.evaluate((el, words) => {
+      const text = el.firstChild?.firstChild ?? el.firstChild;
+      if (text === null || text === undefined) {
+        throw new Error("no text node");
+      }
+      const start = (text.textContent ?? "").indexOf(words);
+      const range = document.createRange();
+      range.setStart(text, start);
+      range.setEnd(text, start + words.length);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }, phrase);
+    // The bar stands just above the passage, not over it.
+    const bar = page.getByRole("toolbar", { name: "Selection actions" });
+    await expect(bar).toBeVisible();
+    const barBox = await bar.boundingBox();
+    const textBox = await passage.boundingBox();
+    expect(barBox).not.toBeNull();
+    expect(textBox).not.toBeNull();
+    expect((barBox?.y ?? 0) + (barBox?.height ?? 0)).toBeLessThanOrEqual(
+      textBox?.y ?? 0,
+    );
+    // Inside the page column: never over the threads beside it.
+    const columnBox = await page
+      .locator("article", { has: passage })
+      .boundingBox();
+    const threadsBox = await page
+      .getByRole("complementary", { name: "Threads" })
+      .boundingBox();
+    expect((barBox?.x ?? 0) + (barBox?.width ?? 0)).toBeLessThanOrEqual(
+      (columnBox?.x ?? 0) + (columnBox?.width ?? 0),
+    );
+    expect((barBox?.x ?? 0) + (barBox?.width ?? 0)).toBeLessThan(
+      threadsBox?.x ?? 0,
+    );
+    await bar
+      .getByRole("button", { name: "Comment on selection", exact: true })
+      .click();
+    const form = page.getByRole("form", { name: "New comment" });
+    await expect(form).toContainText(phrase);
+    const field = form.getByRole("textbox", { name: "Your comment" });
+    await expect(field).toBeFocused();
+    await expect(bar).toHaveCount(0);
+    await field.fill("Is the window fixed?");
+    await form.getByRole("button", { name: "Comment", exact: true }).click();
+    const added = page
+      .getByRole("complementary", { name: "Threads" })
+      .getByRole("article", { name: "Thread on Night deploys" })
+      .filter({ hasText: "Is the window fixed?" });
+    await expect(added).toContainText(phrase);
+
+    // Resolved again, so the journeys after this one see one open thread.
+    await added.getByRole("button", { name: "Resolve", exact: true }).click();
+    await added.getByRole("textbox", { name: "Outcome" }).fill("Answered.");
+    await added.getByRole("button", { name: "Resolve", exact: true }).click();
+    await expect(added).toHaveCount(0);
+  });
+
   test("a reader labels a comment from the menu or by typing, and filters to blocking threads", async ({
     page,
   }) => {

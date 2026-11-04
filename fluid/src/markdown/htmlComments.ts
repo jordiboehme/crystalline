@@ -28,9 +28,20 @@ export function htmlCommentRanges(
   }));
 }
 
-/** `value` without its comments; what is left of the raw HTML stays as is. */
+/**
+ * `value` without its comments; what is left of the raw HTML stays as is.
+ * The removal runs until nothing changes, because taking one comment out can
+ * join the text around it into a new one: `<!-<!-- x -->- y -->` leaves
+ * `<!-- y -->` after one pass.
+ */
 export function withoutHtmlComments(value: string): string {
-  return value.replace(COMMENT, "");
+  let previous: string;
+  let current = value;
+  do {
+    previous = current;
+    current = current.replace(COMMENT, "");
+  } while (current !== previous);
+  return current;
 }
 
 interface Node {

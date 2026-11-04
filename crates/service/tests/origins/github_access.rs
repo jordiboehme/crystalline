@@ -107,11 +107,24 @@ fn collaborators(forge: &Forge, repo: &str, people: &[(u64, &str, &str)]) {
     );
 }
 
+/// Forgets what the governor learned of `acme/kb` before the test set the
+/// forge up. Building the governor in [`setup`] warms it up: a lookup of
+/// `acme/kb` starts at once, and on a multi-thread runtime, or across an
+/// await, it can store the listing from before the test's own
+/// collaborators, fresh for minutes. A lookup still in flight when this
+/// lands is not stored, so the next question asks the forge again.
+fn forget_warm_up(eng: &Engine) {
+    eng.invalidate_github_access(crystalline_service::engine::Invalidate::Repo(
+        "acme/kb".to_string(),
+    ));
+}
+
 #[tokio::test]
 async fn the_open_tier_follows_the_agent_identity_link() {
     let tmp = tempfile::tempdir().unwrap();
     let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
     collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "write")]);
+    forget_warm_up(&eng);
     let open_tier = Scope::Anonymous;
     // Inside an MCP request, as the server runs every tool call.
     as_mcp_call(async {
@@ -165,6 +178,7 @@ async fn the_open_tier_never_writes_a_governed_domain_without_an_agent_identity(
     let (forge, eng, auth) = setup(tmp.path(), None).await;
     collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "admin")]);
     forge.public.lock().unwrap().insert("acme/kb".to_string());
+    forget_warm_up(&eng);
     let open_tier = Scope::Anonymous;
     // A shared domain on a public repository: anonymous reads it.
     assert_eq!(
@@ -209,6 +223,7 @@ async fn an_mcp_token_agent_follows_its_account() {
         "acme/kb",
         &[(ADA_ID, "ada-gh", "write"), (AGENT_ID, "agent-gh", "read")],
     );
+    forget_warm_up(&eng);
     // An agent with an MCP token is resolved to its account, so it is the
     // account's own GitHub role that counts, never `github.agent_identity`.
     let ada = Scope::User {
@@ -295,6 +310,7 @@ async fn a_web_visitor_never_acts_as_the_agent_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
     collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "admin")]);
+    forget_warm_up(&eng);
     auth.set_domain_visibility("kb", true, "ada").await.unwrap();
     let anonymous = Scope::Anonymous;
     assert!(eng.hidden_for(&anonymous).await.unwrap().contains("kb"));
@@ -511,6 +527,7 @@ async fn an_admin_agent_identity_gets_only_its_github_role() {
         .await
         .unwrap();
     collaborators(&forge, "acme/kb", &[(777, "root-gh", "read")]);
+    forget_warm_up(&eng);
     let open_tier = Scope::Anonymous;
     as_mcp_call(async {
         assert_eq!(
@@ -566,6 +583,7 @@ async fn a_tool_call_runs_as_an_mcp_request() {
     let tmp = tempfile::tempdir().unwrap();
     let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
     collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "read")]);
+    forget_warm_up(&eng);
     auth.set_domain_visibility("kb", true, "ada").await.unwrap();
     // Outside an MCP request the anonymous caller does not see it.
     assert!(

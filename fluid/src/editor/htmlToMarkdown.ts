@@ -505,20 +505,41 @@ function service(): TurndownService {
 /**
  * One table cell. The plugin's own rule escapes a pipe and then doubles every
  * backslash, which breaks the row at the pipe and doubles turndown's own
- * escapes; this escapes the pipe once.
+ * escapes; this escapes each pipe once, by what comes before it.
  */
 function tableCell(content: string, node: TurndownService.Node): string {
   const el = node as HTMLElement;
   const index = el.parentElement
     ? Array.prototype.indexOf.call(el.parentElement.children, el)
     : 0;
-  let text = content.replace(/\s+/g, " ").trim().replace(/\|/g, "\\|");
+  let text = escapeCellPipes(content.replace(/\s+/g, " ").trim());
   text = text.padEnd(3, " ");
   const span = Math.max(
     1,
     Number.parseInt(el.getAttribute("colspan") ?? "1", 10) || 1,
   );
   return `${index === 0 ? "| " : " "}${text} |${"   |".repeat(span - 1)}`;
+}
+
+/**
+ * The pipes in a cell, escaped so that none of them ends the cell.
+ *
+ * A table row is split before any inline parsing, and the split reads a
+ * backslash as an escape of the next backslash or pipe. So a pipe ends the
+ * cell when an even run of backslashes (or none) comes before it, and
+ * escaping it means one more backslash. Escaping every backslash first, as
+ * for plain text, would double turndown's own escapes: the text in `content`
+ * is escaped already (`escapeText` doubles every backslash in it), so its
+ * runs are always even. An odd run comes only from text turndown does not
+ * escape, a code span: there `\|` already keeps the cell whole, but the
+ * parser then drops that backslash from the code, so the run gets two more
+ * and the code reads back with its backslash (doubled; a code span in a table
+ * cannot hold a backslash right before a pipe, see mdast-util-gfm-table).
+ */
+function escapeCellPipes(text: string): string {
+  return text.replace(/(\\*)\|/g, (_pipe: string, run: string) =>
+    run.length % 2 === 0 ? `${run}\\|` : `${run}\\\\|`,
+  );
 }
 
 /**

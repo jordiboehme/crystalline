@@ -295,7 +295,7 @@ describe("an instance with no accounts yet", () => {
     // unreliably, and the flip that fills this one also moves focus into the
     // login form. So it waits there, empty, from the first paint.
     await screen.findByLabelText("Confirm password");
-    expect(screen.getByRole("status")).toHaveTextContent("");
+    expect(screen.getByRole("status").textContent).toBe("");
   });
 
   it("adds nothing to the login screen of an instance that is set up", async () => {

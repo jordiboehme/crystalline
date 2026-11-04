@@ -898,7 +898,7 @@ describe("section anchors", () => {
     const region = screen.getByRole("status", {
       name: "Section link result",
     });
-    expect(region).toHaveTextContent("");
+    expect(region.textContent).toBe("");
 
     vi.useFakeTimers();
     try {
@@ -919,7 +919,7 @@ describe("section anchors", () => {
       act(() => {
         vi.advanceTimersByTime(2000);
       });
-      expect(region).toHaveTextContent("");
+      expect(region.textContent).toBe("");
       expect(container.querySelector("#auth-tokens")).not.toHaveTextContent(
         "Link copied",
       );
