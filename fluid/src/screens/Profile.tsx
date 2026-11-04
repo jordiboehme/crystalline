@@ -251,6 +251,37 @@ const LINK_ERRORS: Record<string, string> = {
     "Your GitHub account could not be linked. Try again, or ask an admin to check the GitHub App.",
 };
 
+/**
+ * What a person who is not an admin learns when a link cannot start because
+ * of the GitHub App's setup, by the `reason` the refusal carries. The words
+ * name no command and no setting; an admin gets the server's sentence, which
+ * names both.
+ */
+const START_REASONS: Record<string, string> = {
+  no_client_secret:
+    "The GitHub App on this instance has no client secret yet, so it cannot link accounts. Ask an admin to add it.",
+  no_public_url:
+    "This instance does not know its public address yet, so GitHub cannot send you back. Ask an admin to set it.",
+  app_unusable:
+    "The GitHub App on this instance is set up but cannot be used right now. Ask an admin to check its settings.",
+  keychain:
+    "This instance cannot read the GitHub App's stored keys right now. Ask an admin to check the server.",
+  no_app: "This instance has no GitHub App yet. Ask an admin to set one up.",
+};
+
+/** What a non-admin reads when the start's refusal has no reason this app knows. */
+const START_FALLBACK = "Ask an admin to check the GitHub App.";
+
+/** The non-admin sentence for a setup refusal of the link's start. */
+function startRefusal(problem: ApiProblem): string {
+  const reason = problem.extensions.reason;
+  const text =
+    typeof reason === "string" && Object.hasOwn(START_REASONS, reason)
+      ? START_REASONS[reason]
+      : undefined;
+  return text ?? START_FALLBACK;
+}
+
 /** The landing's notice, read once from the address the callback sent. */
 function landingNotice(params: URLSearchParams): Notice | null {
   const code = params.get("github_error");
@@ -345,18 +376,23 @@ function GithubLinkPanel({
       navigateTo(authorizeUrl);
     },
     onError: (error: Error) => {
-      // A 409 or 422 is the App's setup (no public url, no client secret, an
-      // App that cannot be used), and the server's sentence names the admin
-      // command that fixes it. An admin gets those words; anyone else gets
-      // who to ask.
+      // A refusal with a `reason`, or a 409 or 422, is the App's setup (no
+      // App, no public url, no client secret, an App that cannot be used,
+      // a keychain that cannot be read), and the server's sentence names the
+      // admin command that fixes it. An admin gets those words; anyone else
+      // gets the cause in plain words, read from the `reason`, and who to
+      // ask. An App that cannot be used answers 500, so the `reason` alone
+      // decides there.
       const setup =
         error instanceof ApiProblem &&
-        (error.status === 409 || error.status === 422);
+        (error.status === 409 ||
+          error.status === 422 ||
+          typeof error.extensions.reason === "string");
       setNotice({
         kind: "problem",
         text:
           setup && capabilities.role !== "admin"
-            ? "Ask an admin to check the GitHub App."
+            ? startRefusal(error)
             : problemDetail(error),
       });
     },

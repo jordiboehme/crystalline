@@ -491,10 +491,22 @@ pub fn marker_names_host(marker: &str, api_url: Option<&str>) -> bool {
 /// read (a locked keychain is not a bad key), else the App credential
 /// error.
 pub(crate) fn app_refusal(detail: String) -> EngineError {
+    app_refusal_with_reason(detail).1
+}
+
+/// [`app_refusal`], with the link setup reason it stands for: the keychain
+/// while it cannot be read, else an App that cannot be used.
+pub(crate) fn app_refusal_with_reason(
+    detail: String,
+) -> (super::github::LinkSetupReason, EngineError) {
+    use super::github::LinkSetupReason;
     if detail == KEYCHAIN_REFUSAL {
-        EngineError::Conflict(detail)
+        (LinkSetupReason::Keychain, EngineError::Conflict(detail))
     } else {
-        RemoteError::AppCredential(detail).into()
+        (
+            LinkSetupReason::AppUnusable,
+            RemoteError::AppCredential(detail).into(),
+        )
     }
 }
 

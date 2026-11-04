@@ -1586,6 +1586,127 @@ describe("the GitHub App link card", () => {
     },
   );
 
+  const REASONS: [string, string][] = [
+    [
+      "no_client_secret",
+      "The GitHub App on this instance has no client secret yet, so it cannot link accounts. Ask an admin to add it.",
+    ],
+    [
+      "no_public_url",
+      "This instance does not know its public address yet, so GitHub cannot send you back. Ask an admin to set it.",
+    ],
+    [
+      "app_unusable",
+      "The GitHub App on this instance is set up but cannot be used right now. Ask an admin to check its settings.",
+    ],
+    [
+      "keychain",
+      "This instance cannot read the GitHub App's stored keys right now. Ask an admin to check the server.",
+    ],
+    [
+      "no_app",
+      "This instance has no GitHub App yet. Ask an admin to set one up.",
+    ],
+  ];
+
+  it.each(
+    (["viewer", "editor"] as const).flatMap((role) =>
+      REASONS.map(([reason, text]) => [role, reason, text] as const),
+    ),
+  )(
+    "tells a %s why the start is refused for %s",
+    async (role, reason, text) => {
+      serveAs(role, {
+        "/me/github-link": () => linkView(),
+        "/me/github-link/start": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "an admin adds it with: crystalline github app set",
+            { reason },
+          );
+        },
+      });
+      renderApp("/profile");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect GitHub" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(text);
+      expect(
+        screen.queryByText(/crystalline github app set/),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("tells a viewer about an unusable App on the 500 it answers", async () => {
+    serveAs("viewer", {
+      "/me/github-link": () => linkView(),
+      "/me/github-link/start": () => {
+        throw new ApiProblem(
+          500,
+          "internal error",
+          "The GitHub App credential is unusable: check the private key",
+          { reason: "app_unusable" },
+        );
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Connect GitHub" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The GitHub App on this instance is set up but cannot be used right now. Ask an admin to check its settings.",
+    );
+  });
+
+  it.each([["something_new"], [7]])(
+    "falls back to who to ask for an unknown reason %s",
+    async (reason) => {
+      serveAs("editor", {
+        "/me/github-link": () => linkView(),
+        "/me/github-link/start": () => {
+          throw new ApiProblem(409, "conflict", "the server's words", {
+            reason,
+          });
+        },
+      });
+      renderApp("/profile");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect GitHub" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Ask an admin to check the GitHub App.",
+      );
+    },
+  );
+
+  it("shows an admin the server's own fix even with a reason", async () => {
+    serveAs("admin", {
+      "/me/github-link": () => linkView(),
+      "/me/github-link/start": () => {
+        throw new ApiProblem(
+          409,
+          "conflict",
+          "an admin adds it with: crystalline github app set",
+          { reason: "no_client_secret" },
+        );
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Connect GitHub" }),
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "an admin adds it with: crystalline github app set",
+    );
+    expect(alert).not.toHaveTextContent(/no client secret yet/);
+  });
+
   it("shows an admin the server's own fix when the start is refused", async () => {
     serveAs("admin", {
       "/me/github-link": () => linkView(),

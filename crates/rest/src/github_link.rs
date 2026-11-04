@@ -47,6 +47,7 @@ use super::auth::{Identity, no_store};
 use super::github_settings::GithubPendingView;
 use super::pending::{PENDING_TTL, PendingRecord, PendingStore, StateMiss};
 use super::{ApiError, ApiQuery, ProblemDetail, RestState, refuse_read_only};
+use crate::engine::LinkSetupReason;
 use crate::engine::{EngineError, GithubLinkView, GithubUnlink};
 
 /// Where GitHub sends the browser back to, under `/api/v1`. Registered as the
@@ -263,16 +264,29 @@ pub async fn status(
         (
             status = 409,
             description = "`service.public_url` is not set, so there is no \
-                           callback address to give GitHub, or the GitHub App \
-                           has no client secret, so a code cannot be \
-                           exchanged. The detail names the fix.",
+                           callback address to give GitHub (`reason` \
+                           `no_public_url`), or the GitHub App has no client \
+                           secret, so a code cannot be exchanged \
+                           (`no_client_secret`). The detail names the fix; \
+                           `reason` names the cause for a person who cannot \
+                           apply it.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 422,
-            description = "No GitHub App is configured on this instance, or \
-                           it cannot be used. The detail names the fix.",
+            description = "No GitHub App is configured on this instance \
+                           (`reason` `no_app`), or the keychain that holds \
+                           it cannot be read (`keychain`). The detail names \
+                           the fix.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The GitHub App is configured and cannot be used \
+                           (`reason` `app_unusable`). The detail names the \
+                           fix.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -305,10 +319,20 @@ pub async fn start(
 /// GitHub's authorize url.
 fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiError> {
     refuse_read_only(state)?;
-    let app = state.engine.github_link_app()?;
+    let app = state
+        .engine
+        .github_link_app_explained()
+        .map_err(|refusal| {
+            let error = ApiError::from(refusal.error);
+            match refusal.reason {
+                Some(reason) => error.reason(reason),
+                None => error,
+            }
+        })?;
     let credentials = app.credentials();
     if credentials.client_secret.is_none() {
-        return Err(ApiError::conflict(crate::engine::NO_CLIENT_SECRET_TO_LINK));
+        return Err(ApiError::conflict(crate::engine::NO_CLIENT_SECRET_TO_LINK)
+            .reason(LinkSetupReason::NoClientSecret));
     }
     let config = state.engine.config();
     let Some(public) = crate::settings::public_base(&config) else {
@@ -316,7 +340,8 @@ fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiErro
             "linking GitHub from the browser needs service.public_url: GitHub sends the browser \
              back to <service.public_url>/api/v1/github/link/callback, which must also be the \
              GitHub App's callback url",
-        ));
+        )
+        .reason(LinkSetupReason::NoPublicUrl));
     };
     let redirect_uri = public.join(&format!("/api/v1{CALLBACK_PATH}"));
     let flow_state = new_state();

@@ -1830,6 +1830,7 @@ fn gone() -> ApiError {
         token_required: None,
         retry_after: None,
         home_url: None,
+        reason: None,
     }
 }
 
