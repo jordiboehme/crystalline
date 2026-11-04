@@ -1756,3 +1756,84 @@ async fn a_forwarded_reflect_skips_a_read_only_domain_and_names_an_unreadable_on
     );
     assert!(all.get("missing").is_none(), "{all}");
 }
+
+/// A forwarded write the server took and did not answer in time reaches the
+/// agent through the router as "may or may not", with the tool's check, and
+/// the source stays up: the next call still asks it.
+#[tokio::test]
+async fn a_forwarded_write_that_got_no_answer_says_it_may_have_happened() {
+    let machine = LocalMachine::start(false).await;
+    let app = axum::Router::new().route(
+        "/api/v1/ctl",
+        axum::routing::post(|| async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            axum::Json(json!({ "v": 1, "ok": true, "data": {} }))
+        }),
+    );
+    let url = connect_fake(&machine, "slow", "drafts", app).await;
+    machine.mount();
+    let who = agent();
+    let write = || {
+        run_tool_routed(
+            &machine.engine,
+            "write_engram",
+            json!({ "domain": "drafts", "title": "Night deploys", "content": "- [fact] x" }),
+            &who,
+            Some(Duration::from_millis(500)),
+        )
+    };
+    let failure = write().await.unwrap_err().to_string();
+    assert_eq!(
+        failure,
+        format!(
+            "slow ({url}) did not answer within 0.5 s. The engram may or may not be written. \
+             Read 'Night deploys' with read_engram to see whether it holds your text before you \
+             write it again."
+        )
+    );
+    // Not marked down: the second call waits for the server again rather
+    // than answering a recorded failure at once.
+    let started = Instant::now();
+    let again = write().await.unwrap_err().to_string();
+    assert!(started.elapsed() >= Duration::from_millis(400), "{again}");
+    assert!(again.contains("may or may not"), "{again}");
+}
+
+/// A gateway that answers 504 to a forwarded write says the same through
+/// the router; the same 504 to a read keeps the down sentence.
+#[tokio::test]
+async fn a_gateway_timeout_on_a_forwarded_write_says_it_may_have_happened() {
+    let machine = LocalMachine::start(false).await;
+    let app = axum::Router::new().route(
+        "/api/v1/ctl",
+        axum::routing::post(|| async { axum::http::StatusCode::GATEWAY_TIMEOUT }),
+    );
+    let url = connect_fake(&machine, "gated", "gated", app).await;
+    machine.mount();
+    let failure = call(
+        &machine,
+        "write_engram",
+        json!({ "domain": "gated", "title": "Night deploys", "content": "- [fact] x" }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(
+        failure,
+        format!(
+            "gated ({url}) did not answer in time: its gateway answered 504 Gateway Timeout. The \
+             engram may or may not be written. Read 'Night deploys' with read_engram to see \
+             whether it holds your text before you write it again."
+        )
+    );
+    let read = call(
+        &machine,
+        "read_engram",
+        json!({ "identifier": "x", "domain": "gated" }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(read.contains("cannot be reached right now"), "{read}");
+    assert!(read.contains("gateway answered 504"), "{read}");
+}

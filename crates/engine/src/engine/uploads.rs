@@ -123,7 +123,9 @@ impl Engine {
     /// file then follows it into the draft owner's files.
     ///
     /// The receipt is `{domain, path, mime, size, sha256, created}` with
-    /// `draft: true` when the file landed in an overlay.
+    /// `draft: true` when the file landed in an overlay, and
+    /// `unchanged: true` when the path already showed exactly these bytes
+    /// and nothing was written.
     pub async fn upload_attachment(
         &self,
         p: &WriteParams,
@@ -167,6 +169,9 @@ impl Engine {
         if written.draft {
             receipt["draft"] = json!(true);
         }
+        if written.unchanged {
+            receipt["unchanged"] = json!(true);
+        }
         Ok(receipt)
     }
 
@@ -174,7 +179,8 @@ impl Engine {
     /// as the REST upload does. `overwrite` false only creates (a file at the
     /// path is refused, for a curator too); true replaces, which needs
     /// curate. The receipt is `{domain, path, mime, size, sha256, created}`,
-    /// `path` inside `reflections/`.
+    /// `path` inside `reflections/`, with `unchanged: true` when the path
+    /// already held exactly these bytes and nothing was written.
     pub(super) async fn write_reflection_asset(
         &self,
         p: &WriteReflectionParams,
@@ -188,14 +194,18 @@ impl Engine {
             self.reflection_asset_create(&p.domain, &p.path, bytes, caller)
                 .await?
         };
-        Ok(json!({
+        let mut receipt = json!({
             "domain": p.domain,
             "path": written.row.path,
             "mime": written.row.mime,
             "size": written.row.size,
             "sha256": written.row.sha256,
             "created": written.created,
-        }))
+        });
+        if written.unchanged {
+            receipt["unchanged"] = json!(true);
+        }
+        Ok(receipt)
     }
 }
 

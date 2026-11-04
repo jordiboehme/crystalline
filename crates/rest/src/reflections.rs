@@ -1466,6 +1466,13 @@ pub struct UploadedReflectionAsset {
     pub sha256: String,
     /// Whether the path held no file before.
     pub created: bool,
+    /// Present and true when the path already held exactly these bytes, so
+    /// nothing was written. Uploading the same bytes to a path that already
+    /// holds them succeeds this way, also with `If-None-Match: *`, so a retry
+    /// after a timeout is safe. Absent on every other upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub unchanged: Option<bool>,
 }
 
 /// What `POST /domains/{domain}/reflection/move-asset` takes.
@@ -1612,9 +1619,13 @@ pub async fn asset_read(
                    allowlist decides the mime. The path rules, the allowlist \
                    and the 10 MiB ceiling are the engram attachments' own. \
                    With `If-None-Match: *` the upload only creates: a path \
-                   that already holds a file is refused with 412, for a \
-                   curator too, so two people cannot replace each other's \
-                   upload by accident.",
+                   that already holds different bytes is refused with 412, \
+                   for a curator too, so two people cannot replace each \
+                   other's upload by accident. Uploading the same bytes to a \
+                   path that already holds them answers 200 with \
+                   `unchanged: true` and writes nothing, with \
+                   `If-None-Match: *` or without, so a retry after a timeout \
+                   is safe.",
     params(
         ("domain" = String, Path, description = "The domain."),
         ("path" = String, Path, description = "Where to store it, under \
@@ -1623,9 +1634,10 @@ pub async fn asset_read(
         (
             "If-None-Match" = Option<String>,
             Header,
-            description = "`*` to only create: a path that already holds a \
-                           file is refused with 412 and left as it is. Any \
-                           other value is 422.",
+            description = "`*` to only create: a path that already holds \
+                           different bytes is refused with 412 and left as it \
+                           is; the same bytes answer 200 with `unchanged: \
+                           true`. Any other value is 422.",
         ),
     ),
     request_body(
@@ -1636,7 +1648,9 @@ pub async fn asset_read(
     responses(
         (
             status = 200,
-            description = "Stored. `path` is inside `reflections/`.",
+            description = "Stored. `path` is inside `reflections/`; \
+                           `unchanged: true` when the path already held \
+                           exactly these bytes.",
             body = UploadedReflectionAsset,
         ),
         (
@@ -1673,8 +1687,9 @@ pub async fn asset_read(
         ),
         (
             status = 412,
-            description = "`If-None-Match: *` and the path already holds a \
-                           file; nothing was stored. Pick another name.",
+            description = "`If-None-Match: *` and the path already holds \
+                           different bytes; nothing was stored. Pick another \
+                           name.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1723,6 +1738,7 @@ pub async fn asset_write(
         size: written.row.size,
         sha256: written.row.sha256,
         created: written.created,
+        unchanged: written.unchanged.then_some(true),
     }))
 }
 

@@ -20,6 +20,9 @@ pub struct WrittenReflectionAsset {
     pub row: AttachmentRow,
     /// Whether the path held no file before.
     pub created: bool,
+    /// Whether the path already held exactly these bytes, so nothing was
+    /// written.
+    pub unchanged: bool,
 }
 
 impl Engine {
@@ -104,17 +107,21 @@ impl Engine {
         let written: WrittenAsset = self
             .asset_write_in(AssetHome::Reflection, domain, path, bytes, replace)
             .await?;
-        // The stored spelling, the one the file listing answers.
-        self.announce_reflection(
-            domain,
-            &written.row.path,
-            ReflectionChangeKind::Files,
-            None,
-            change_label(&caller.scope),
-        );
+        // The stored spelling, the one the file listing answers. The same
+        // bytes again changed nothing, so there is nothing to announce.
+        if !written.unchanged {
+            self.announce_reflection(
+                domain,
+                &written.row.path,
+                ReflectionChangeKind::Files,
+                None,
+                change_label(&caller.scope),
+            );
+        }
         Ok(WrittenReflectionAsset {
             row: written.row,
             created: written.created,
+            unchanged: written.unchanged,
         })
     }
 

@@ -2505,6 +2505,13 @@ export type UploadedAttachment = {
      * Byte length as stored.
      */
     size: number;
+    /**
+     * Present and true when the path already held exactly these bytes, so
+     * nothing was written. Uploading the same bytes to a path that already
+     * holds them succeeds this way, also with `If-None-Match: *`, so a retry
+     * after a timeout is safe. Absent on every other upload.
+     */
+    unchanged?: boolean | null;
 };
 
 /**
@@ -2533,6 +2540,13 @@ export type UploadedReflectionAsset = {
      * Byte length as stored.
      */
     size: number;
+    /**
+     * Present and true when the path already held exactly these bytes, so
+     * nothing was written. Uploading the same bytes to a path that already
+     * holds them succeeds this way, also with `If-None-Match: *`, so a retry
+     * after a timeout is safe. Absent on every other upload.
+     */
+    unchanged?: boolean | null;
 };
 
 /**
@@ -4371,7 +4385,7 @@ export type WriteAttachmentData = {
          */
         'X-Crystalline-Join'?: string | null;
         /**
-         * `*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.
+         * `*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.
          */
         'If-None-Match'?: string | null;
     };
@@ -4411,7 +4425,7 @@ export type WriteAttachmentErrors = {
      */
     409: ProblemDetail;
     /**
-     * `If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.
+     * `If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.
      */
     412: ProblemDetail;
     /**
@@ -4428,7 +4442,7 @@ export type WriteAttachmentError = WriteAttachmentErrors[keyof WriteAttachmentEr
 
 export type WriteAttachmentResponses = {
     /**
-     * Stored. The path to reference it by, its mime, its size and its checksum.
+     * Stored. The path to reference it by, its mime, its size and its checksum; `unchanged: true` when the path already held exactly these bytes.
      */
     200: UploadedAttachment;
 };
@@ -5333,7 +5347,7 @@ export type WriteReflectionAssetData = {
     body: string;
     headers?: {
         /**
-         * `*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.
+         * `*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.
          */
         'If-None-Match'?: string | null;
     };
@@ -5369,7 +5383,7 @@ export type WriteReflectionAssetErrors = {
      */
     409: ProblemDetail;
     /**
-     * `If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.
+     * `If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.
      */
     412: ProblemDetail;
     /**
@@ -5386,7 +5400,7 @@ export type WriteReflectionAssetError = WriteReflectionAssetErrors[keyof WriteRe
 
 export type WriteReflectionAssetResponses = {
     /**
-     * Stored. `path` is inside `reflections/`.
+     * Stored. `path` is inside `reflections/`; `unchanged: true` when the path already held exactly these bytes.
      */
     200: UploadedReflectionAsset;
 };

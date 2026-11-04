@@ -245,6 +245,12 @@ impl std::fmt::Display for RouteError {
                     &format!("it did not answer within {}", seconds(*after))
                 )
             ),
+            // A write that went out and was never answered: what may have
+            // happened and how to check, in the source's own sentence.
+            RouteError::Source {
+                failure: failure @ RemoteFailure::Unanswered(_),
+                ..
+            } => write!(f, "{failure}"),
             // The source was never asked: this process was still starting,
             // so nothing about the source failed.
             RouteError::Source {
@@ -759,6 +765,12 @@ fn within(failure: RemoteFailure, limit: Duration) -> RemoteFailure {
             url,
             after: limit,
         },
+        RemoteFailure::Unanswered(mut write) => {
+            if let crystalline_remote::Silence::Waited(after) = &mut write.silence {
+                *after = limit;
+            }
+            RemoteFailure::Unanswered(write)
+        }
         other => other,
     }
 }
@@ -1071,5 +1083,33 @@ mod tests {
              'open' comes from acme; ask again and the next call reaches it"
         );
         assert!(!text.contains("not available until"), "{text}");
+    }
+
+    /// A write that went out and was never answered reads as the source's
+    /// sentence alone, with the call's whole limit, and never as a source
+    /// that is unavailable.
+    #[test]
+    fn a_write_never_answered_says_it_may_have_happened() {
+        let check = "The file may or may not be written. Read assets/shot.png with read_engram \
+                     to check its sha256, or upload the same file again: the same bytes are \
+                     accepted.";
+        let text = RouteError::Source {
+            source: "acme".into(),
+            domain: "open".into(),
+            failure: within(
+                RemoteFailure::Unanswered(Box::new(crystalline_remote::UnansweredWrite {
+                    source: "acme".into(),
+                    url: "https://crystalline.acme.test".into(),
+                    silence: crystalline_remote::Silence::Waited(Duration::from_millis(119_870)),
+                    check: check.into(),
+                })),
+                CTL_TIMEOUT,
+            ),
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            format!("acme (https://crystalline.acme.test) did not answer within 120 s. {check}")
+        );
     }
 }
