@@ -46,6 +46,7 @@ import { EditorView, keymap } from "@codemirror/view";
 import { syntaxTree } from "@codemirror/language";
 
 import { hiddenFenceLine } from "../codeBlocks";
+import { inMathRegion, mathRegions } from "../mathBlocks";
 import { roomUndo } from "../roomUndo";
 import {
   atomFrom,
@@ -113,11 +114,40 @@ function visibleBetween(
   return false;
 }
 
+/** Whether `mark` opens an image (`![`), whose pair is never dropped (D40). */
+export function opensImage(state: EditorState, mark: Range): boolean {
+  return state.doc.sliceString(mark.from, mark.from + 2) === "![";
+}
+
+/**
+ * Whether a pair whose inside is `[from, to)` may be dropped as empty: an
+ * image never is, and neither is a pair that holds one, such as the link
+ * around a linked image (D40). The image's marks stay, so it is not empty.
+ */
+export function droppable(
+  state: EditorState,
+  open: Range,
+  from: number,
+  to: number,
+  marks: readonly Range[],
+): boolean {
+  if (opensImage(state, open)) {
+    return false;
+  }
+  return !marks.some(
+    (mark) => mark.from >= from && mark.to <= to && opensImage(state, mark),
+  );
+}
+
 /**
  * `removal` plus every pair on the line it leaves with no visible character
  * between its marks.
  */
-function withEmptyPairs(marks: readonly Mark[], removal: Range): Range[] {
+function withEmptyPairs(
+  state: EditorState,
+  marks: readonly Mark[],
+  removal: Range,
+): Range[] {
   const removed: Range[] = [removal];
   for (const mark of marks) {
     if (mark.side !== "open" || mark.partner === null) {
@@ -125,6 +155,9 @@ function withEmptyPairs(marks: readonly Mark[], removal: Range): Range[] {
     }
     const close = marks[mark.partner];
     if (!close || mark.to > removal.from || removal.to > close.from) {
+      continue;
+    }
+    if (!droppable(state, mark, mark.to, close.from, marks)) {
       continue;
     }
     if (!visibleBetween(mark.to, close.from, [removal], marks)) {
@@ -373,7 +406,11 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
   ) {
     return false;
   }
-  const ranges = withEmptyPairs(marksOnLine(state, line.number), removal);
+  const ranges = withEmptyPairs(
+    state,
+    marksOnLine(state, line.number),
+    removal,
+  );
   remove(view, ranges, forward ? head : removal.from, forward);
   return true;
 }
@@ -389,6 +426,10 @@ const ESCAPABLE = /^[!-/:-@[-`{-~]$/;
 function escapesNext(state: EditorState, pos: number): boolean {
   const doc = state.doc;
   if (doc.sliceString(pos, pos + 1) !== "\\") {
+    return false;
+  }
+  // In `$$` math a backslash is LaTeX, not a Markdown escape (D41).
+  if (inMathRegion(mathRegions(state), pos)) {
     return false;
   }
   if (!ESCAPABLE.test(doc.sliceString(pos + 1, pos + 2))) {
@@ -757,15 +798,13 @@ function markFate(
         (d) => d.from < close.from && open.to < d.to,
       );
       const typed = inserts.some((at) => open.to <= at && at <= close.from);
+      const between =
+        touched && !typed ? marksBetween(state, open.to, close.from) : [];
       if (
         touched &&
         !typed &&
-        !visibleBetween(
-          open.to,
-          close.from,
-          deleted,
-          marksBetween(state, open.to, close.from),
-        )
+        droppable(state, open, open.to, close.from, between) &&
+        !visibleBetween(open.to, close.from, deleted, between)
       ) {
         dropped.push(open, close);
       }

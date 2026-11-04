@@ -147,11 +147,16 @@ function readLink(state: EditorState, node: SyntaxNode): LinkElement | null {
   if (words.startsWith("^")) {
     return null;
   }
-  // `[[Target]]`: the wikilink's, never a Markdown link.
-  if (char(state, node.from - 1) === "[" && char(state, node.to) === "]") {
+  const after = close.nextSibling;
+  // `[[Target]]`: the wikilink's, never a Markdown link. Only a bare bracket
+  // link: `[[t](u)]` is a link inside literal brackets (D39).
+  if (
+    after === null &&
+    char(state, node.from - 1) === "[" &&
+    char(state, node.to) === "]"
+  ) {
     return null;
   }
-  const after = close.nextSibling;
   if (after?.name === "LinkMark" && char(state, after.from) === "(") {
     const url = node.getChild("URL");
     return {
@@ -203,7 +208,9 @@ export function linkAt(state: EditorState, pos: number): LinkElement | null {
       node;
       node = node.parent
     ) {
-      if (node.name === "Image") {
+      // An image is no link, unless it is a link's words: then the link
+      // around it is the one at `pos` (`[![alt](src)](href)`).
+      if (node.name === "Image" && node.parent?.name !== "Link") {
         return null;
       }
       if (node.name === "Link") {

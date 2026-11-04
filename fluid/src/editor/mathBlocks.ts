@@ -13,7 +13,7 @@
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Text } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
-import type { SyntaxNode } from "@lezer/common";
+import type { SyntaxNode, Tree } from "@lezer/common";
 
 import { fenceInfo } from "./fenceInfo";
 import { frontmatterRegion } from "./frontmatterRegion";
@@ -118,13 +118,20 @@ export function mathFence(
   const first = doc.line(info.open);
   const last = doc.line(info.close);
   const depth = quoteDepth(first.text);
-  const lines: string[] = [];
+  const quoted: string[] = [];
   for (let number = first.number; number <= last.number; number += 1) {
-    lines.push(unquoted(doc.line(number).text, depth));
+    quoted.push(unquoted(doc.line(number).text, depth));
   }
-  // A fence that does not start its line (one in a list item) stays
-  // source: its block would have to start mid-line.
+  // The fence's own indentation (a list item's): taken from every line, as
+  // CommonMark takes it from a fence's content lines.
   const marks = doc.sliceString(info.marks.from, info.marks.to);
+  const indent = /^[ \t]*/.exec(quoted[0] ?? "")?.[0].length ?? 0;
+  const lines = quoted.map((text) => {
+    const lead = /^[ \t]*/.exec(text)?.[0].length ?? 0;
+    return text.slice(Math.min(lead, indent));
+  });
+  // A fence that follows a list marker on its line stays source: its
+  // block would have to start mid-line.
   const fence = (lines[0] ?? "").startsWith(marks)
     ? [lines.join("\n"), lines.slice(1, -1).join("\n")]
     : null;
@@ -157,8 +164,74 @@ export function mathBlocks(
   state: EditorState,
   sections = state.facet(mathSections),
 ): MathBlock[] {
+  return readMath(state, sections).blocks;
+}
+
+/** A stretch of the document the page reads as formula source. */
+export interface MathRegion {
+  from: number;
+  to: number;
+}
+
+/** Whether `doc` holds `$$` anywhere, read chunk by chunk. */
+function holdsDollars(doc: Text): boolean {
+  let last = "";
+  for (const iter = doc.iter(); !iter.next().done;) {
+    const chunk = iter.value;
+    if ((last + chunk).includes("$$")) {
+      return true;
+    }
+    last = chunk.slice(-1);
+  }
+  return false;
+}
+
+const regionCache = new WeakMap<Tree, Map<boolean, MathRegion[]>>();
+
+/**
+ * The stretches of `$$` math the page reads as formula source, which hold
+ * no Markdown marks (D41): every closed `$$` block, and an unclosed `$$`
+ * from its line to where the page ends it (the document's end, the end of
+ * the quote it opened in, or on a page read section by section the next
+ * section heading). Math fences are code to the parser already. Read once
+ * per parse tree.
+ */
+export function mathRegions(
+  state: EditorState,
+  sections = state.facet(mathSections),
+): MathRegion[] {
+  const tree = syntaxTree(state);
+  let cached = regionCache.get(tree);
+  const hit = cached?.get(sections);
+  if (hit) {
+    return hit;
+  }
+  const regions = holdsDollars(state.doc)
+    ? readMath(state, sections).regions
+    : [];
+  if (!cached) {
+    cached = new Map();
+    regionCache.set(tree, cached);
+  }
+  cached.set(sections, regions);
+  return regions;
+}
+
+/** Whether `pos` lies in one of `regions`. */
+export function inMathRegion(
+  regions: readonly MathRegion[],
+  pos: number,
+): boolean {
+  return regions.some((region) => region.from <= pos && pos <= region.to);
+}
+
+function readMath(
+  state: EditorState,
+  sections: boolean,
+): { blocks: MathBlock[]; regions: MathRegion[] } {
   const doc = state.doc;
   const blocks: MathBlock[] = [];
+  const regions: MathRegion[] = [];
   const code: { from: number; to: number }[] = [];
   syntaxTree(state).iterate({
     enter: (node) => {
@@ -180,6 +253,16 @@ export function mathBlocks(
   const inCode = (pos: number) =>
     pos <= fmEnd || code.some((range) => pos >= range.from && pos <= range.to);
   let open: { number: number; depth: number } | null = null;
+  // An unclosed `$$` the page ends before line `number`.
+  const unclosed = (number: number) => {
+    if (open !== null && number - 1 >= open.number) {
+      regions.push({
+        from: doc.line(open.number).from,
+        to: doc.line(number - 1).to,
+      });
+    }
+    open = null;
+  };
   for (let number = 1; number <= doc.lines; number += 1) {
     const line = doc.line(number);
     if (inCode(line.from)) {
@@ -189,7 +272,7 @@ export function mathBlocks(
     const rest = unquoted(line.text, depth);
     if (open !== null && depth < open.depth) {
       // The quote the block opened in has ended.
-      open = null;
+      unclosed(number);
     }
     if (
       open !== null &&
@@ -197,7 +280,7 @@ export function mathBlocks(
       depth === 0 &&
       SECTION_HEADING.test(rest)
     ) {
-      open = null;
+      unclosed(number);
       continue;
     }
     if (rest.trim() !== "$$") {
@@ -224,7 +307,10 @@ export function mathBlocks(
       close: number,
       depth,
     });
+    regions.push({ from: doc.line(open.number).from, to: line.to });
     open = null;
   }
-  return blocks;
+  // Still open at the end: the page reads the rest as the formula.
+  unclosed(doc.lines + 1);
+  return { blocks, regions };
 }

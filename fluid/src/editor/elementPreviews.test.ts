@@ -491,3 +491,18 @@ describe("inline math read as the page reads it", () => {
     expect(drawn).toHaveLength(1);
   });
 });
+
+describe("a math fence in a list item (I6)", () => {
+  it.each([
+    ["after a blank line", "- item\n\n  ```math\n  x^2\n  ```\n\nEnd\n"],
+    ["right under the item", "- item\n  ```math\n  x^2\n  ```\n\nEnd\n"],
+  ])("sets it as display math, %s", async (_name, doc) => {
+    const v = editor(doc, doc.length);
+    await waitFor(() => {
+      expect(
+        v.dom.querySelectorAll(".cm-math-block .katex-display"),
+      ).toHaveLength(1);
+    });
+    expect(v.dom.querySelector(".cm-code-box")).toBeNull();
+  });
+});

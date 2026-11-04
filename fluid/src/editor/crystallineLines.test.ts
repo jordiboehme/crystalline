@@ -15,10 +15,11 @@ import {
 } from "../test/markKit";
 import { parsedState } from "../test/parse";
 import {
-  OBSERVATION_LINE,
   crystallineCompletions,
   crystallineLines,
+  observationCategory,
 } from "./crystallineLines";
+import { marksOnLine } from "./marks/hiddenMarks";
 import { baseExtensions } from "./setup";
 
 const DOC =
@@ -191,18 +192,18 @@ describe("completion stays out of code and frontmatter", () => {
 
 describe("task lines", () => {
   it("never reads a task box as an observation category", () => {
-    expect(OBSERVATION_LINE.test("- [x] done ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [X] done ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [~] skipped ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [ ] open ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [fact] x ")).toBe(true);
-    expect(OBSERVATION_LINE.test("- [xy] x ")).toBe(true);
+    expect(observationCategory("- [x] done ")).toBeNull();
+    expect(observationCategory("- [X] done ")).toBeNull();
+    expect(observationCategory("- [~] skipped ")).toBeNull();
+    expect(observationCategory("- [ ] open ")).toBeNull();
+    expect(observationCategory("- [fact] x ")).not.toBeNull();
+    expect(observationCategory("- [xy] x ")).not.toBeNull();
   });
 
   it("never reads a footnote reference as an observation category", () => {
-    expect(OBSERVATION_LINE.test("- [^1] the source")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [^note] more")).toBe(false);
-    expect(OBSERVATION_LINE.exec("- [a^b] x")?.[1]).toBe("a^b");
+    expect(observationCategory("- [^1] the source")).toBeNull();
+    expect(observationCategory("- [^note] more")).toBeNull();
+    expect(observationCategory("- [a^b] x")).toEqual({ from: 2, to: 7 });
   });
 });
 
@@ -387,5 +388,54 @@ describe("tag chips on a wrapped observation", () => {
     ["- [fact] a #x\n\n  #y", ["#x"]],
   ])("%j", (doc, expected) => {
     expect(chips(doc)).toEqual(expected);
+  });
+});
+
+/**
+ * The category as the server's `split_category` (crates/core/src/parse.rs)
+ * reads it, on a zero-indent `- ` bullet: the nine rows of the final review's
+ * table (Must-cover 4). The bracket span is in line offsets, or null.
+ */
+describe("the category, as the server reads it (M1)", () => {
+  afterEach(cleanupMarkViews);
+
+  const ROWS: [string, string, { from: number; to: number } | null][] = [
+    ["a category and text", "- [decision] text", { from: 2, to: 12 }],
+    ["a category with a space", "- [a b] x", { from: 2, to: 7 }],
+    ["a category before a tab", "- [a]\tx", { from: 2, to: 5 }],
+    ["a done box before text", "- [x]text", null],
+    ["an open box", "- [ ] x", null],
+    ["a footnote reference", "- [^1] x", null],
+    ["a category right before text", "- [decision]text", { from: 2, to: 12 }],
+    ["a category that starts with a space", "- [ a] x", { from: 2, to: 6 }],
+    ["a category at the line end", "- [a]", { from: 2, to: 5 }],
+    [
+      "a category before a wrapped line",
+      "- [decision]\n  wraps",
+      { from: 2, to: 12 },
+    ],
+    ["a category before a colon", "- [a]: x", { from: 2, to: 5 }],
+    ["a bracket inside the category", "- [a[b] x", null],
+  ];
+
+  it.each(ROWS)("%s", (_name, doc, span) => {
+    const line = doc.split("\n")[0] ?? "";
+    expect(observationCategory(line)).toEqual(span);
+    const view = markView(`x\n${doc}`);
+    const categories = marksOnLine(view.state, 2).filter(
+      (mark) => mark.kind === "category",
+    );
+    expect(categories.map((mark) => [mark.from - 2, mark.to - 2])).toEqual(
+      span
+        ? [
+            [span.from, span.from + 1],
+            [span.to - 1, span.to],
+          ]
+        : [],
+    );
+    const chip = view.contentDOM.querySelector(".cm-category-chip");
+    expect(chip?.textContent ?? null).toBe(
+      span ? line.slice(span.from + 1, span.to - 1) : null,
+    );
   });
 });

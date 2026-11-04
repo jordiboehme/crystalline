@@ -20,7 +20,12 @@
 import { syntaxTree } from "@codemirror/language";
 import type { Extension, Range } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
-import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
+import {
+  Decoration,
+  EditorView,
+  ViewPlugin,
+  WidgetType,
+} from "@codemirror/view";
 
 import { openWindow } from "../base";
 import {
@@ -33,13 +38,34 @@ import {
 import { linkAddress, linkAt, openableAddress } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
 import type { MarkKind } from "./marks/hiddenMarks";
-import { marksOnLine } from "./marks/hiddenMarks";
+import { scanMarks } from "./marks/hiddenMarks";
 import { markModeChanged, marksOnEditLine } from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 
 /** The marks `marks/blocks.ts` draws in their place. */
 const BLOCK_MARKS = new Set<MarkKind>(["list", "task", "quote"]);
+
+/**
+ * An image with no alt text where its marks are hidden: a small box with the
+ * width of a letter, so a caret on either side of it is a place of its own.
+ * The picture itself is drawn under the line (`imagePreviews.ts`).
+ */
+class ImageAtomWidget extends WidgetType {
+  override eq(): boolean {
+    return true;
+  }
+
+  toDOM(): HTMLElement {
+    const box = document.createElement("span");
+    box.className = "cm-image-atom";
+    box.setAttribute("role", "img");
+    box.setAttribute("aria-label", "Image");
+    return box;
+  }
+}
+
+const IMAGE_ATOM = Decoration.replace({ widget: new ImageAtomWidget() });
 
 /**
  * The hidden marks of the visible lines, from the model (`marks/hiddenMarks.ts`):
@@ -56,11 +82,16 @@ function buildDecorations(view: EditorView): DecorationSet {
     let number = Math.max(doc.lineAt(from).number, drawnTo + 1);
     const last = doc.lineAt(to).number;
     for (; number <= last; number += 1) {
-      for (const mark of marksOnLine(state, number)) {
+      const scan = scanMarks(state, number, number);
+      for (const mark of scan.lines[0] ?? []) {
         if (BLOCK_MARKS.has(mark.kind)) {
           continue;
         }
         decorations.push(Decoration.replace({}).range(mark.from, mark.to));
+      }
+      // An image with no alt text: one piece a caret steps over (D40).
+      for (const atom of scan.atoms[0] ?? []) {
+        decorations.push(IMAGE_ATOM.range(atom.from, atom.to));
       }
     }
     drawnTo = last;
@@ -137,6 +168,16 @@ const frontmatterTint = ViewPlugin.fromClass(
 
 const previewTheme = EditorView.baseTheme({
   ".cm-frontmatter": { color: "var(--color-slate-500)", fontSize: "0.85em" },
+  ".cm-image-atom": {
+    display: "inline-block",
+    width: "0.8em",
+    height: "0.8em",
+    margin: "0 0.1em",
+    verticalAlign: "-0.05em",
+    border: "1px solid currentColor",
+    borderRadius: "2px",
+    opacity: "0.45",
+  },
 });
 
 /** The words of every Markdown link in sight, marked as the place a press opens it. */

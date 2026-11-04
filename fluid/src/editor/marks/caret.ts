@@ -32,7 +32,7 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { mainSelectionParked } from "../parkedSelection";
 import type { MarkKind, MarkRun } from "./hiddenMarks";
-import { runAt, runsOnLine } from "./hiddenMarks";
+import { atomsOnLine, runAt, runsOnLine } from "./hiddenMarks";
 
 /** A stretch a caret stays inside: a line, or a table cell's content. */
 export interface Segment {
@@ -100,6 +100,14 @@ function canonicalIn(state: EditorState, pos: number, run: MarkRun): number {
 
 /** The one position of the drawn caret place `pos` is in. */
 export function canonical(state: EditorState, pos: number): number {
+  // Inside an image with no alt text: after it, as a key that empties the
+  // alt text leaves the caret after the picture.
+  const line = state.doc.lineAt(pos);
+  for (const atom of atomsOnLine(state, line.number)) {
+    if (atom.from < pos && pos < atom.to) {
+      return atom.to;
+    }
+  }
   const run = runAt(state, pos);
   return run ? canonicalIn(state, pos, run) : pos;
 }

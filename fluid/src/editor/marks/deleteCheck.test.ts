@@ -338,3 +338,48 @@ describe.each(CASES)("round 3, $mode mode, room $room", ({ mode, room }) => {
     expect(heard.outcome).toBeNull();
   });
 });
+
+describe.each(CASES)(
+  "a delete on a fence line (M2), $mode mode, room $room",
+  ({ mode, room }) => {
+    it("refuses to turn an unclosed fence's code into bold text", () => {
+      const { view, heard, text } = page("```math\nx^2 **y**", mode, room);
+      setCaret(view, 2);
+      keys(view, "Delete");
+      expect(text()).toBe("```math\nx^2 **y**");
+      expect(heard.outcome).toBe("refused");
+      expect(heard.said).toContain(CANNOT_JOIN);
+    });
+
+    it("refuses to turn a closed fence's code into bold text", () => {
+      // In a quote, where no code box hides the fence lines.
+      const { view, heard, text } = page("> ```\n> x **y**\n> ```", mode, room);
+      setCaret(view, 4);
+      keys(view, "Delete");
+      expect(text()).toBe("> ```\n> x **y**\n> ```");
+      expect(heard.outcome).toBe("refused");
+    });
+
+    it("lets a fence line change when no code line would read differently", () => {
+      const { view, text } = page("> ```\n> plain words\n> ```", mode, room);
+      setCaret(view, 4);
+      keys(view, "Delete");
+      expect(text()).toBe("> ``\n> plain words\n> ```");
+    });
+  },
+);
+
+describe("a fence typed by hand and taken back (M2 as ruled, D42)", () => {
+  it("refuses the Backspace that would bring the text below back, and one undo does", () => {
+    const { view, heard, text } = page("a\n\n**b** c", "hidden", false);
+    setCaret(view, 4);
+    typeText(view, "```");
+    expect(text()).toBe("a\n```\n**b** c");
+    keys(view, "Backspace");
+    // The text below the fence would turn bold again: refused (D10).
+    expect(text()).toBe("a\n```\n**b** c");
+    expect(heard.outcome).toBe("refused");
+    undoOnce(view);
+    expect(text()).toBe("a\n\n**b** c");
+  });
+});

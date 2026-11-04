@@ -882,3 +882,17 @@ describe("fix round 1: label words from the source and back", () => {
     expect(writtenLabel(field ?? "")).toBe(source);
   });
 });
+
+describe("a math fence in a list item (I6)", () => {
+  it.each([
+    ["after a blank line", "- item\n\n  ```math\n  x^2\n  ```"],
+    ["right under the item", "- item\n  ```math\n  x^2\n  ```"],
+  ])("reads its formula and keeps its indent, %s", (_name, text) => {
+    const state = stateOf(text);
+    const at = text.indexOf("x^2");
+    expect(mathAt(state, at)).toMatchObject({ block: true, formula: "x^2" });
+    expect(apply(state, mathChanges(state, at, { formula: "a\nb" }))).toBe(
+      text.replace("  x^2", "  a\n  b"),
+    );
+  });
+});

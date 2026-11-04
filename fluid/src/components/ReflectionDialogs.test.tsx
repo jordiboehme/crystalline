@@ -3,7 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 import {
@@ -101,6 +101,14 @@ function body(path: string, method: string): unknown {
 beforeEach(() => {
   apiMock.mockReset();
 });
+
+// The editor's screen is a lazy part: its first import compiles the whole
+// editor, which on a loaded machine takes longer than a `findByRole` waits
+// (D37). It is loaded here, once, so a test that opens it waits for the
+// screen, not for the compile.
+beforeAll(async () => {
+  await import("../screens/ReflectionEditor");
+}, 120_000);
 
 describe("newPagePath", () => {
   it("names a page after its title, in the folder given", () => {

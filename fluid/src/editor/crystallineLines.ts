@@ -22,18 +22,32 @@ import {
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
-import { joinBullet, placeTags, relationType } from "./relationLines";
+import {
+  joinBullet,
+  placeTags,
+  relationType,
+  splitCategory,
+} from "./relationLines";
 
-// The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
-// after the dash is no bullet to the server's parser, and a category must
-// follow the dash directly. A relation's type is read by `relationLines.ts`,
-// a port of `parse_relation`, which trims the words before the target.
-//
-// A task box is never a category: `[x]`, `[X]` and `[~]` (and `[ ]`, which
-// the first character class already refuses) are a task line, as the core
-// reads them. A bracket that opens with `^` is a footnote reference
-// (`- [^1] text`), never a category, as `split_category` (parse.rs) reads it.
-export const OBSERVATION_LINE = /^- \[(?![ xX~]\])([^\]\s^][^\]]*)\]\s/;
+/**
+ * The bracket span `[from, to)` of an observation line's category, in line
+ * offsets, or null: `split_category` (parse.rs, `splitCategory` here) on the
+ * content after the literal "- " `top_level_bullet` strips. Not "-\s+": a
+ * tab after the dash is no bullet to the server's parser, and a nested or
+ * indented bullet is no observation. A task box (`[ ]`, `[x]`, `[X]`,
+ * `[~]`) and a footnote reference (`- [^1] text`) are never a category; a
+ * category may start with a space and may end the line, as on the server.
+ */
+export function observationCategory(
+  text: string,
+): { from: number; to: number } | null {
+  if (!text.startsWith("- ")) {
+    return null;
+  }
+  const span = splitCategory(text.slice(2));
+  return span ? { from: span.from + 2, to: span.to + 2 } : null;
+}
+
 const TRAILING_TAG = /#[\w-]+/g;
 
 /** `is_hashtag` (parse.rs): `#` and then one or more of A-Z a-z 0-9 `_` `-` `/`. */
@@ -133,20 +147,17 @@ function buildMarks(view: EditorView): DecorationSet {
             ? undefined
             : next.text;
         };
-        const observation = OBSERVATION_LINE.exec(line.text);
+        const observation = observationCategory(line.text);
         if (observation) {
-          const category = observation[1] ?? "";
-          const start = line.from + line.text.indexOf("[");
+          const start = line.from + observation.from;
+          const end = line.from + observation.to;
           marks.push(
             chips
               ? Decoration.mark({ class: "cm-category-chip" }).range(
                   start + 1,
-                  start + 1 + category.length,
+                  end - 1,
                 )
-              : Decoration.mark({ class: "cm-obs-category" }).range(
-                  start,
-                  start + category.length + 2,
-                ),
+              : Decoration.mark({ class: "cm-obs-category" }).range(start, end),
           );
           if (chips) {
             // The server reads tags from the joined bullet, so a wrapped
@@ -155,7 +166,7 @@ function buildMarks(view: EditorView): DecorationSet {
             const found = bullet
               ? placeTags(
                   bullet,
-                  serverTags(bullet.content, observation[0].length - 2),
+                  serverTags(bullet.content, observation.to - 2),
                 )
               : [];
             for (const tag of found) {

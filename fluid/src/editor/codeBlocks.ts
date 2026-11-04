@@ -64,6 +64,11 @@ import { parseAdvanced } from "./parseProgress";
 
 /** The name the header shows for an info word. */
 export function languageName(word: string | null): string {
+  // A math fence the formula layer does not draw (an empty one) is still a
+  // formula, never "Plain text".
+  if (word === "math") {
+    return "Math";
+  }
   return languageOf(word)?.name ?? "Plain text";
 }
 

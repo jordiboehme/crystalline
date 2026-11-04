@@ -19,7 +19,8 @@ import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { isIdLine } from "../../reflectionText";
 import { cleanupMarkViews, markView } from "../../test/markKit";
 import { repoMarkdown } from "../../test/repoMarkdown";
-import { OBSERVATION_LINE } from "../crystallineLines";
+import { observationCategory } from "../crystallineLines";
+import { inMathRegion, mathRegions } from "../mathBlocks";
 import { frontmatterRegion } from "../frontmatterRegion";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { partnerAcrossLines } from "./deleting";
@@ -115,7 +116,9 @@ function referenceMarksOnLine(
   const isDefined = (label: string) =>
     linkDefinition(state, label) !== undefined;
 
-  const category = hidden ? OBSERVATION_LINE.exec(at.text) : null;
+  // `$$` math the page draws: only its quote marks are read (D41).
+  const inMath = inMathRegion(mathRegions(state), at.from);
+  const category = hidden && !inMath ? observationCategory(at.text) : null;
 
   const link = (node: SyntaxNode) => {
     const open = node.firstChild;
@@ -135,11 +138,17 @@ function referenceMarksOnLine(
     if (!image && text.startsWith("^")) {
       return;
     }
-    // `[[Target]]`: the wikilink chip's, never a link.
-    if (char(node.from - 1) === "[" && char(node.to) === "]") {
+    const after = close.nextSibling;
+    // `[[Target]]`: the wikilink chip's, never a link (a bare bracket link
+    // only, D39).
+    if (
+      !image &&
+      after === null &&
+      char(node.from - 1) === "[" &&
+      char(node.to) === "]"
+    ) {
       return;
     }
-    const after = close.nextSibling;
     let end = close.to;
     if (after?.name === "LinkMark" && char(after.from) === "(") {
       end = node.to;
@@ -183,6 +192,9 @@ function referenceMarksOnLine(
         return false;
       }
       if (!hidden) {
+        return;
+      }
+      if (inMath && name !== "QuoteMark") {
         return;
       }
       if (NO_MARKS.has(name)) {
@@ -285,8 +297,8 @@ function referenceMarksOnLine(
   });
 
   if (category && !inCode) {
-    const open = at.from + at.text.indexOf("[");
-    const close = open + (category[1] ?? "").length + 1;
+    const open = at.from + category.from;
+    const close = at.from + category.to - 1;
     taken.add(open);
     // The link the parser read over these brackets, if any, is dropped.
     for (let index = drafts.length - 1; index >= 0; index -= 1) {

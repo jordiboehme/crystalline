@@ -34,7 +34,7 @@
  * edit a table cell has judged already (`judgedElsewhere`) are left alone.
  */
 
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { syntaxTree } from "@codemirror/language";
 import type {
   ChangeSet,
   ChangeSpec,
@@ -55,8 +55,9 @@ import { EditorView } from "@codemirror/view";
 import type { Mark, MarkKind } from "./hiddenMarks";
 import { scanMarks, walkTree } from "./hiddenMarks";
 import { composing } from "./caret";
-import { judgedElsewhere } from "./deleting";
+import { droppable, judgedElsewhere } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
+import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
 export const CANNOT_JOIN = "This text cannot be joined here.";
@@ -86,12 +87,12 @@ export const checkWork = { positions: 0, reads: 0 };
 /** The formats a character can have that a deletion must keep. */
 const KINDS = new Set<MarkKind>(["strong", "em", "strike", "code", "link"]);
 
-interface Range {
+export interface Range {
   from: number;
   to: number;
 }
 
-interface Pair {
+export interface Pair {
   kind: MarkKind;
   open: Range;
   close: Range;
@@ -99,7 +100,7 @@ interface Pair {
   labelled: boolean;
 }
 
-interface Lines {
+export interface Lines {
   marks: Mark[];
   pairs: Pair[];
 }
@@ -109,7 +110,11 @@ interface Lines {
  * one walk over the tree. A pair across a soft line break (its marks on two
  * lines) is paired through the syntax node the two belong to.
  */
-function linesOf(state: EditorState, first: number, last: number): Lines {
+export function linesOf(
+  state: EditorState,
+  first: number,
+  last: number,
+): Lines {
   const marks: Mark[] = [];
   const pairs: Pair[] = [];
   const add = (open: Range, close: Range, kind: MarkKind) => {
@@ -154,9 +159,12 @@ function linesOf(state: EditorState, first: number, last: number): Lines {
 /**
  * The lines a check reads: those the deletion touched, widened to the
  * paragraphs around them, so a pair that wraps onto the next line is read
- * whole. A paragraph is local; the document is never read whole.
+ * whole. A paragraph is local; the document is never read whole. A deletion
+ * that takes a character of a fence's marks reads the whole fence (to the
+ * document's end for an unclosed one): its code lines may read as text after
+ * it (M2, D10).
  */
-function blockLines(
+export function blockLines(
   state: EditorState,
   from: number,
   to: number,
@@ -167,6 +175,15 @@ function blockLines(
     if (node.name === "Paragraph" || node.name.startsWith("SetextHeading")) {
       lo = Math.min(lo, node.from);
       hi = Math.max(hi, node.to);
+      return false;
+    }
+    if (node.name === "FencedCode") {
+      const fence = node.node;
+      const marks = fence.getChildren("CodeMark");
+      if (marks.some((mark) => mark.from < to && from < mark.to)) {
+        lo = Math.min(lo, fence.from);
+        hi = Math.max(hi, fence.to);
+      }
       return false;
     }
     return undefined;
@@ -189,7 +206,7 @@ function isBlank(char: string): boolean {
   return char === "" || /\s/.test(char);
 }
 
-function merged(ranges: readonly Range[]): Range[] {
+export function merged(ranges: readonly Range[]): Range[] {
   const sorted = [...ranges].sort((a, b) => a.from - b.from);
   const out: Range[] = [];
   for (const range of sorted) {
@@ -246,11 +263,23 @@ function formats(pairs: readonly Pair[]): (pos: number) => string {
   };
 }
 
-/** `deleted` plus the marks of every pair it leaves with nothing visible. */
-function withEmptied(lines: Lines, deleted: readonly Range[]): Range[] {
+/**
+ * `deleted` plus the marks of every pair it leaves with nothing visible. An
+ * image, and a pair holding one, is never empty (D40).
+ */
+function withEmptied(
+  start: EditorState,
+  lines: Lines,
+  deleted: readonly Range[],
+): Range[] {
   const out = [...deleted];
   for (const pair of lines.pairs) {
     if (touches(deleted, pair.open) || touches(deleted, pair.close)) continue;
+    if (
+      !droppable(start, pair.open, pair.open.to, pair.close.from, lines.marks)
+    ) {
+      continue;
+    }
     // Only a pair the deletion reaches into can be left empty.
     if (!touches(deleted, { from: pair.open.to, to: pair.close.from })) {
       continue;
@@ -270,14 +299,6 @@ function withEmptied(lines: Lines, deleted: readonly Range[]): Range[] {
   return merged(out);
 }
 
-/** `state` parsed at least to `upto`, or null when that does not fit. */
-function parsedTo(state: EditorState, upto: number): EditorState | null {
-  if (syntaxTree(state).length >= upto) return state;
-  ensureSyntaxTree(state, upto, 50);
-  const settled = state.update({}).state;
-  return syntaxTree(settled).length >= upto ? settled : null;
-}
-
 /**
  * Whether `after` (the start state with `changes`, which delete `deleted`)
  * shows every character the deletion kept with the formats it had. A pair
@@ -289,8 +310,12 @@ function parsedTo(state: EditorState, upto: number): EditorState | null {
  * the other lines are judged, and no pair frees them: where the marks show
  * the person edits the Markdown (D9, D11), but a line whose marks are
  * hidden keeps its formats (D23).
+ *
+ * With `keepMarks`, every mark the change did not delete must still be a
+ * mark after it: an insert (`insertCheck.ts`) can break a pair without
+ * changing a visible character, its marks turning into page text.
  */
-function readsSame(
+export function readsSame(
   start: EditorState,
   lines: Lines,
   first: number,
@@ -298,14 +323,16 @@ function readsSame(
   changes: ChangeSet,
   deleted: readonly Range[],
   after: EditorState,
+  deadline: number,
   shown?: readonly Range[],
+  keepMarks = false,
 ): boolean | null {
   const from = start.doc.line(first).from;
   const to = start.doc.line(last).to;
   const aFrom = changes.mapPos(from, -1);
   const aTo = changes.mapPos(to, 1);
   checkWork.reads += 1;
-  const parsed = parsedTo(after, aTo);
+  const parsed = parsedTo(after, aTo, deadline);
   // Not parsed far enough to tell: the caller refuses rather than writes
   // the deletion unchecked.
   if (!parsed) return null;
@@ -338,6 +365,10 @@ function readsSame(
   const now = formats(next.pairs);
   for (let p = from; p < to; p += 1) {
     checkWork.positions += 1;
+    if (keepMarks && !isDeleted(p) && isMark(p)) {
+      if (!isMarkAfter(changes.mapPos(p, 1))) return false;
+      continue;
+    }
     if (isDeleted(p) || isMark(p) || isShown(p)) continue;
     if (isBlank(text[p - from] ?? "")) continue;
     if (isFreed(p)) continue;
@@ -439,7 +470,7 @@ function repairs(
 }
 
 /** The annotations a rebuilt deletion carries over from the one it replaces. */
-function carried(tr: Transaction): Annotation<unknown>[] {
+export function carried(tr: Transaction): Annotation<unknown>[] {
   const out: Annotation<unknown>[] = [];
   const event = tr.annotation(Transaction.userEvent);
   if (event !== undefined) out.push(Transaction.userEvent.of(event));
@@ -455,7 +486,7 @@ function carried(tr: Transaction): Annotation<unknown>[] {
  * to the moved space on the side it stood on, when a move took the space
  * the caret touched (so typing shows where it showed), else mapped.
  */
-function placed(
+export function placed(
   start: number,
   changes: ChangeSet,
   deleted: readonly Range[],
@@ -510,36 +541,51 @@ function rebuilt(
 }
 
 /**
- * The check (D5). Listed before `keepPartnerMarks` in the layer, so it runs
- * after that filter (filters run last listed first) and judges the deletion
- * as it will land.
+ * How a deletion was judged (D5): left alone (where the person edits the
+ * Markdown itself, D9, D11, D25), exact (with `changes` when emptied pairs
+ * went too, D6), repaired, or refused with what the page says.
  */
-export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
-  const event = tr.annotation(Transaction.userEvent);
-  if (
-    !tr.docChanged ||
-    event === undefined ||
-    !CHECKED.has(event) ||
-    tr.annotation(Transaction.remote) !== undefined ||
-    tr.annotation(judgedElsewhere) === true
-  ) {
-    return tr;
-  }
-  const start = tr.startState;
-  // An IME composition is the browser's to finish: a repair written beside
-  // it could end it (the caret normalizer leaves it alone too).
-  if (composing(start) || tr.isUserEvent("input.type.compose")) return tr;
+export type Judgement =
+  | { outcome: "unchecked" }
+  | { outcome: "exact"; changes: ChangeSet | null }
+  | {
+      outcome: "moved" | "merged";
+      changes: ChangeSet;
+      ranges: Range[];
+      moved?: Repair["moved"];
+    }
+  | { outcome: "refused"; said: string };
+
+/** A refusal for want of a parse before the deadline (D35). */
+const LOADING: Judgement = { outcome: "refused", said: PAGE_LOADING };
+
+/**
+ * The judge (D5), pure: `changes`, a deletion on `state`, judged against the
+ * text it leaves, within `deadline` for every parse it reads. Shared by the
+ * filter below and by the check at a composition's end (`composition.ts`),
+ * so the shown-line rules (D9, D11, D23, D25, D28), the empty-pair drop (D6)
+ * and the repair order are one.
+ */
+export function judgeDeletion(
+  state: EditorState,
+  changes: ChangeSet,
+  deadline: number,
+): Judgement {
   const deleted: Range[] = [];
-  let inserts = false;
-  tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+  changes.iterChanges((fromA, toA) => {
     if (fromA < toA) deleted.push({ from: fromA, to: toA });
-    if (inserted.length > 0) inserts = true;
   });
-  // A replacement is not a deletion to judge; neither is nothing removed.
-  if (inserts || deleted.length === 0) return tr;
+  if (deleted.length === 0) return { outcome: "unchecked" };
   const firstPos = Math.min(...deleted.map((d) => d.from));
   const lastPos = Math.max(...deleted.map((d) => d.to));
-  const { first, last } = blockLines(start, firstPos, lastPos);
+  // The start state parsed first (D35), to the paragraph the check reads, so
+  // each trial reparses only the lines it changed.
+  const touched = parsedTo(state, state.doc.lineAt(lastPos).to, deadline);
+  if (!touched) return LOADING;
+  const { first, last: reached } = blockLines(touched, firstPos, lastPos);
+  const start = parsedTo(touched, touched.doc.line(reached).to, deadline);
+  if (!start) return LOADING;
+  const { last } = blockLines(start, firstPos, lastPos);
   const lines = linesOf(start, first, last);
   // A line with no pair can still gain one (`q * a* r` without its space
   // reads italic): where marks are hidden that is checked too (D10). Where
@@ -564,8 +610,9 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   // may pair anew, also where a partner is on a line whose marks are hidden
   // (D9, D25). A key that takes a normal character too is judged (D28).
   if (takesOnlyShownMarks(start, lines, deleted)) {
-    return tr;
+    return { outcome: "unchecked" };
   }
+  const asked = merged(deleted);
   if (shownTouched) {
     // Today's keys, for the formats of the lines that show their marks. A
     // pair a key that takes no mark makes or breaks must leave every line
@@ -577,28 +624,29 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       const line = start.doc.line(n);
       shown.push({ from: line.from, to: line.to + 1 });
     }
-    if (shown.length === last - first + 1) return tr;
+    if (shown.length === last - first + 1) return { outcome: "unchecked" };
     const unseen = readsSame(
       start,
       lines,
       first,
       last,
-      tr.changes,
-      merged(deleted),
-      tr.state,
+      changes,
+      asked,
+      start.update({ changes, filter: false }).state,
+      deadline,
       shown,
     );
-    return unseen === true ? tr : refusal(start);
+    if (unseen === null) return LOADING;
+    return unseen
+      ? { outcome: "unchecked" }
+      : { outcome: "refused", said: CANNOT_JOIN };
   }
-  const asked = merged(deleted);
-  const ranges = withEmptied(lines, asked);
+  const ranges = withEmptied(start, lines, asked);
   const grown =
     ranges.length !== asked.length ||
     ranges.some((r, i) => r.from !== asked[i]?.from || r.to !== asked[i]?.to);
-  const exact = grown ? start.changes(ranges) : tr.changes;
-  const exactState = grown
-    ? start.update({ changes: exact, filter: false }).state
-    : tr.state;
+  const exact = grown ? start.changes(ranges) : changes;
+  const exactState = start.update({ changes: exact, filter: false }).state;
   const candidates = repairs(start, lines, ranges);
   // Two pairs of one kind the deletion made touch are always written as one
   // (`**a****b**` reads as bold, but nobody writes it that way).
@@ -607,6 +655,8 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
     ...merges,
     ...candidates.filter((c) => c.outcome !== "merged"),
   ];
+  // Whether any read ran out of time: then a refusal says the page loads.
+  let timedOut = false;
   // The exact deletion is read at most once a press. A read the parse
   // could not finish is not kept: the next one parses further.
   let exactReads: boolean | null = null;
@@ -619,26 +669,94 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
       exact,
       ranges,
       exactState,
+      deadline,
     );
+    if (exactReads === null) timedOut = true;
     return exactReads === true;
   };
-  if (merges.length === 0 && exactIsSame()) {
-    return grown ? rebuilt(tr, exact, null) : tr;
-  }
+  const asIs: Judgement = { outcome: "exact", changes: grown ? exact : null };
+  if (merges.length === 0 && exactIsSame()) return asIs;
   for (const repair of ordered) {
-    const changes = start.changes([
+    const repaired = start.changes([
       ...ranges.map(({ from, to }) => ({ from, to })),
       ...repair.specs,
     ]);
-    const trial = start.update({ changes, filter: false }).state;
-    if (readsSame(start, lines, first, last, changes, ranges, trial) === true) {
-      return rebuilt(tr, changes, repair.outcome, ranges, repair.moved);
+    const trial = start.update({ changes: repaired, filter: false }).state;
+    const reads = readsSame(
+      start,
+      lines,
+      first,
+      last,
+      repaired,
+      ranges,
+      trial,
+      deadline,
+    );
+    if (reads === null) timedOut = true;
+    if (reads === true) {
+      return {
+        outcome: repair.outcome as "moved" | "merged",
+        changes: repaired,
+        ranges,
+        ...(repair.moved ? { moved: repair.moved } : {}),
+      };
     }
   }
-  if (exactIsSame()) {
-    return grown ? rebuilt(tr, exact, null) : tr;
+  if (exactIsSame()) return asIs;
+  return timedOut ? LOADING : { outcome: "refused", said: CANNOT_JOIN };
+}
+
+/** The bound of one press of `event` (D35). */
+function budgetOf(event: string): number {
+  return event === "delete.selection" || event === "delete.cut"
+    ? PARSE_BUDGET.gesture
+    : PARSE_BUDGET.key;
+}
+
+/**
+ * The check (D5). Listed before `keepPartnerMarks` in the layer, so it runs
+ * after that filter (filters run last listed first) and judges the deletion
+ * as it will land.
+ */
+export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
+  const event = tr.annotation(Transaction.userEvent);
+  if (
+    !tr.docChanged ||
+    event === undefined ||
+    !CHECKED.has(event) ||
+    tr.annotation(Transaction.remote) !== undefined ||
+    tr.annotation(judgedElsewhere) === true
+  ) {
+    return tr;
   }
-  return refusal(start);
+  const start = tr.startState;
+  // An IME composition is the browser's to finish: a repair written beside
+  // it could end it (the caret normalizer leaves it alone too). It is
+  // judged when it ends (`composition.ts`).
+  if (composing(start) || tr.isUserEvent("input.type.compose")) return tr;
+  let inserts = false;
+  tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+    if (inserted.length > 0) inserts = true;
+  });
+  // A replacement is not a deletion to judge.
+  if (inserts) return tr;
+  const judged = judgeDeletion(start, tr.changes, deadlineIn(budgetOf(event)));
+  switch (judged.outcome) {
+    case "unchecked":
+      return tr;
+    case "exact":
+      return judged.changes ? rebuilt(tr, judged.changes, null) : tr;
+    case "refused":
+      return refusal(start, judged.said);
+    default:
+      return rebuilt(
+        tr,
+        judged.changes,
+        judged.outcome,
+        judged.ranges,
+        judged.moved,
+      );
+  }
 });
 
 /**
@@ -667,12 +785,9 @@ function takesOnlyShownMarks(
 }
 
 /** A refused deletion: the bytes stay and the page says so. */
-function refusal(start: EditorState): TransactionSpec {
+function refusal(start: EditorState, said = CANNOT_JOIN): TransactionSpec {
   return {
     selection: start.selection,
-    effects: [
-      EditorView.announce.of(CANNOT_JOIN),
-      deletionOutcome.of("refused"),
-    ],
+    effects: [EditorView.announce.of(said), deletionOutcome.of("refused")],
   };
 }

@@ -142,6 +142,26 @@ describe.each(MODES)("the code box (%s mode)", (mode) => {
     );
   });
 
+  it("names Math for an empty math fence, never Plain text (I6)", () => {
+    const view = markView("a\n\n```math\n\n```", { mode });
+    setCaret(view, 0);
+    expect(languageButton(view).getAttribute("aria-label")).toBe(
+      "Code language: Math",
+    );
+  });
+
+  it.each([
+    ["after a blank line", "- item\n\n  ```math\n  x^2\n  ```"],
+    ["right under the item", "- item\n  ```math\n  x^2\n  ```"],
+  ])(
+    "draws no code box for a math fence in a list item, %s (I6)",
+    (_n, text) => {
+      const view = markView(text, { mode });
+      setCaret(view, 0);
+      expect(header(view)).toBeNull();
+    },
+  );
+
   it("reads the word after spaces, as CommonMark does", () => {
     const view = markView("a\n\n```  ts\nx\n```", { mode });
     setCaret(view, 0);

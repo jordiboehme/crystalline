@@ -26,7 +26,7 @@
  */
 
 import { isolateHistory } from "@codemirror/commands";
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension } from "@codemirror/state";
 import {
   ChangeSet,
@@ -46,11 +46,12 @@ import { isIdLineAt } from "../hiddenIdLines";
 import { mainSelectionParked, parkingChanged } from "../parkedSelection";
 import { roomUndo } from "../roomUndo";
 import { clearOfFoldedFrontmatter, toggleInline } from "../toolbar";
-import { canonical, snapRange } from "./caret";
+import { canonical, composing, snapRange } from "./caret";
 import { partnerAcrossLines } from "./deleting";
 import type { Mark, MarkRun } from "./hiddenMarks";
 import { marksOnLine, runsOf } from "./hiddenMarks";
 import { hiddenMarkLayerOn, marksHiddenOnLine } from "./mode";
+import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 
 export type Format = "strong" | "em" | "strike" | "code";
 
@@ -279,7 +280,8 @@ export interface Pending {
   off: Format[];
 }
 
-const setPending = StateEffect.define<Pending | null>();
+/** Sets what waits at the caret; a composition's end sets it too. */
+export const setPending = StateEffect.define<Pending | null>();
 
 /**
  * What Bold or Italic with no selection left at the caret. It maps through
@@ -297,6 +299,12 @@ export const pendingFormat = StateField.define<Pending | null>({
     }
     if (value === null || tr.reconfigured) {
       return null;
+    }
+    // An IME composition types the text the format waits for: the format
+    // stays where it was, and the composition's end writes it (I3, D34).
+    if (tr.isUserEvent("input.type.compose") || composing(tr.startState)) {
+      const pos = tr.changes.mapPos(value.pos, -1);
+      return pos === value.pos ? value : { ...value, pos };
     }
     if (tr.docChanged && tr.annotation(Transaction.userEvent) !== undefined) {
       return null;
@@ -515,16 +523,6 @@ function pieceChanges(
   return { changes: [...out.values()], picked, reach };
 }
 
-/** `state` with its parse reaching `upto`, or null when it does not. */
-function parsedTo(state: EditorState, upto: number): EditorState | null {
-  if (syntaxTree(state).length >= upto) {
-    return state;
-  }
-  ensureSyntaxTree(state, upto, 50);
-  const settled = state.update({}).state;
-  return syntaxTree(settled).length >= upto ? settled : null;
-}
-
 function sameFormats(a: ReadonlySet<Format>, b: ReadonlySet<Format>): boolean {
   return a.size === b.size && [...a].every((format) => b.has(format));
 }
@@ -533,7 +531,8 @@ function sameFormats(a: ReadonlySet<Format>, b: ReadonlySet<Format>): boolean {
  * Whether the lines from `reach.from`'s to `reach.to`'s, parsed again with
  * `changes`, read as asked: the same visible characters, the `picked`
  * characters with `format` given or taken, every other character with the
- * formats it had.
+ * formats it had. Null when the result could not be parsed that far before
+ * `deadline`.
  */
 function readsAsAsked(
   state: EditorState,
@@ -542,13 +541,15 @@ function readsAsAsked(
   reach: { from: number; to: number },
   format: Format,
   removing: boolean,
-): boolean {
+  deadline: number,
+): boolean | null {
   const trial = parsedTo(
     state.update({ changes, filter: false }).state,
     changes.mapPos(state.doc.lineAt(reach.to).to, 1),
+    deadline,
   );
   if (!trial) {
-    return false;
+    return null;
   }
   const first = state.doc.lineAt(reach.from).number;
   const last = state.doc.lineAt(reach.to).number;
@@ -578,12 +579,23 @@ function readsAsAsked(
   return true;
 }
 
-function refuse(view: EditorView): void {
-  view.dispatch({ effects: EditorView.announce.of(CANNOT_FORMAT) });
+function refuse(view: EditorView, said = CANNOT_FORMAT): void {
+  view.dispatch({ effects: EditorView.announce.of(said) });
 }
 
 function formatSelection(view: EditorView, format: Format): void {
-  const { state } = view;
+  // One bound for the whole press (D35): the start state is parsed first, to
+  // the selection's last line, so the trial reparses only what it changed.
+  const deadline = deadlineIn(PARSE_BUDGET.command);
+  const state = parsedTo(
+    view.state,
+    view.state.doc.lineAt(view.state.selection.main.to).to,
+    deadline,
+  );
+  if (!state) {
+    refuse(view, PAGE_LOADING);
+    return;
+  }
   const range = snapRange(state, state.selection.main);
   const pieces: Piece[] = [];
   const first = state.doc.lineAt(range.from).number;
@@ -641,8 +653,17 @@ function formatSelection(view: EditorView, format: Format): void {
     from: Math.min(...edits.map((edit) => edit.reach.from)),
     to: Math.max(...edits.map((edit) => edit.reach.to)),
   };
-  if (!readsAsAsked(state, changes, picked, reach, format, removing)) {
-    refuse(view);
+  const reads = readsAsAsked(
+    state,
+    changes,
+    picked,
+    reach,
+    format,
+    removing,
+    deadline,
+  );
+  if (reads !== true) {
+    refuse(view, reads === null ? PAGE_LOADING : CANNOT_FORMAT);
     return;
   }
   const from = changes.mapPos(range.from, 1);
@@ -953,6 +974,7 @@ function trialOf(
   state: EditorState,
   plan: Plan,
   lineTo: number,
+  deadline: number,
 ): EditorState | null {
   return parsedTo(
     state.update({
@@ -960,6 +982,7 @@ function trialOf(
       filter: false,
     }).state,
     lineTo + plan.insert.length,
+    deadline,
   );
 }
 
@@ -988,33 +1011,48 @@ function closedBy(
   return out;
 }
 
-function typed(
-  view: EditorView,
+/** Where typed text goes, the caret after it and what waits there. */
+export interface TypedPlan {
+  at: number;
+  insert: string;
+  /** The caret in the result. */
+  caret: number;
+  pending: Pending | null;
+}
+
+/**
+ * Where `text`, typed at `from` on `begin` (its caret there), goes by the
+ * typing rules (rule 1 with a format waiting, the continue rules, rule 4's
+ * places), or null for the default insert as it stands. Shared by typing at
+ * a caret and by a composition's end (`composition.ts`), which plans the
+ * committed text on the state from before it began.
+ */
+export function typedPlan(
+  begin: EditorState,
   from: number,
-  to: number,
   text: string,
-): boolean {
-  const { state } = view;
+  deadline: number,
+): TypedPlan | null {
   if (
-    from !== to ||
-    view.composing ||
-    view.compositionStarted ||
     text.length === 0 ||
     /[\r\n]/.test(text) ||
-    state.selection.ranges.length !== 1 ||
-    !state.selection.main.empty ||
-    state.facet(mainSelectionParked) ||
-    !writable(state)
+    begin.selection.ranges.length !== 1 ||
+    !begin.selection.main.empty ||
+    begin.facet(mainSelectionParked) ||
+    !writable(begin)
   ) {
-    return false;
+    return null;
   }
+  // The start state parsed to the line first (D35), so a trial reparses
+  // only the line it changed. Short of time, the line reads as it stands.
+  const state = parsedTo(begin, begin.doc.lineAt(from).to, deadline) ?? begin;
   const number = state.doc.lineAt(from).number;
   const hidden = marksHiddenOnLine(state, number);
   const place = canonical(state, from);
   // The text lands at the caret's own drawn place, or this is not typing at
   // the caret.
   if (place !== canonical(state, state.selection.main.head)) {
-    return false;
+    return null;
   }
   const pending = state.field(pendingFormat, false) ?? null;
   const space = /^\s+$/.test(text);
@@ -1039,7 +1077,7 @@ function typed(
     // Rule 4 for the default insert at a run's edge, rule 3 for a mark
     // character; anything else is the default insert as it stands.
     if (!hidden || (!runHere && !formatChars)) {
-      return false;
+      return null;
     }
     plan = plain(place, text, runHere !== undefined);
   }
@@ -1054,7 +1092,7 @@ function typed(
   let chosen: Plan | null = null;
   let trial: EditorState | null = null;
   for (const candidate of candidates) {
-    const next = trialOf(state, candidate, model.to);
+    const next = trialOf(state, candidate, model.to, deadline);
     if (
       !candidate.verify ||
       MARK_CHARS.test(text) ||
@@ -1067,7 +1105,7 @@ function typed(
   }
   if (!chosen) {
     chosen = plain(place, text, false);
-    trial = trialOf(state, chosen, model.to);
+    trial = trialOf(state, chosen, model.to, deadline);
   }
   const typedAt = chosen.at + chosen.offset + text.length;
   const caretAt = trial ? canonical(trial, typedAt) : typedAt;
@@ -1091,12 +1129,38 @@ function typed(
     next === null &&
     pending === null
   ) {
+    return null;
+  }
+  return {
+    at: chosen.at,
+    insert: chosen.insert,
+    caret: caretAt,
+    pending: next,
+  };
+}
+
+function typed(
+  view: EditorView,
+  from: number,
+  to: number,
+  text: string,
+): boolean {
+  if (from !== to || view.composing || view.compositionStarted) {
+    return false;
+  }
+  const plan = typedPlan(
+    view.state,
+    from,
+    text,
+    deadlineIn(PARSE_BUDGET.typing),
+  );
+  if (!plan) {
     return false;
   }
   view.dispatch({
-    changes: { from: chosen.at, insert: chosen.insert },
-    selection: EditorSelection.cursor(caretAt),
-    effects: setPending.of(next),
+    changes: { from: plan.at, insert: plan.insert },
+    selection: EditorSelection.cursor(plan.caret),
+    effects: setPending.of(plan.pending),
     userEvent: "input.type",
     scrollIntoView: true,
   });

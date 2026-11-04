@@ -15,9 +15,11 @@ import { elementMenuKey } from "../elementEdit";
 import { hiddenMarkDrawing, linkClicks } from "../preview";
 import { blockDrawing, listEnter, taskKeymap } from "./blocks";
 import { caretKeymap, caretNormalizer } from "./caret";
+import { compositionCheck } from "./composition";
 import { checkedDeletion } from "./deleteCheck";
 import { deletionKeymap, headingQuestion, keepPartnerMarks } from "./deleting";
 import { formatting } from "./formatting";
+import { checkedInsert } from "./insertCheck";
 import { hiddenMarkLayerOn } from "./mode";
 
 export type { TaskState } from "./blocks";
@@ -82,11 +84,15 @@ export function hiddenMarkLayer(options: HiddenMarkOptions = {}): Extension {
     deletionKeymap,
     // The format waiting for typing and the typing rules around formats.
     formatting,
+    // An IME composition, judged with the same rules when it ends.
+    compositionCheck,
     // Filters run last-listed first: a range deletion is rewritten to keep
     // its partner marks, then checked against the text it leaves (repaired
-    // or refused), before the caret it leaves is normalized.
+    // or refused), and an insert against the pairs around it (I2), before
+    // the caret it leaves is normalized.
     caretNormalizer,
     checkedDeletion,
+    checkedInsert,
     keepPartnerMarks,
     ...(options.confirmHeadingChange
       ? [headingQuestion.of(options.confirmHeadingChange)]

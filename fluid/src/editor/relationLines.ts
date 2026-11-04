@@ -22,27 +22,42 @@ function reserved(path: string): boolean {
   return name === INDEX_FILE || name === LOG_FILE;
 }
 
-/** `split_category`: the leading `[category]` of a bullet's content. */
-function readsAsCategory(content: string): boolean {
+/**
+ * `split_category` (parse.rs): the leading `[category]` of a bullet's
+ * content, as the span of its brackets in `content` (`[` to past `]`), or
+ * null. The category is the text up to the first `]`: not empty, with no
+ * `[`, not starting with `^` (a footnote reference) and no task box (` `,
+ * `x`, `X`, `~`); a `(` or `[` right after the `]` makes it a link. The end
+ * of the content right after the `]` is a category too. The one detector the
+ * editor asks: the relation reader, the chips and the category marks.
+ */
+export function splitCategory(
+  content: string,
+): { from: number; to: number } | null {
   if (!content.startsWith("[")) {
-    return false;
+    return null;
   }
   const rest = content.slice(1);
   const close = rest.indexOf("]");
   if (close < 0) {
-    return false;
+    return null;
   }
   const category = rest.slice(0, close);
   if (category === "" || category.includes("[") || category.startsWith("^")) {
-    return false;
+    return null;
   }
-  if (category === " " || category === "x" || category === "X") {
-    return false;
+  if (
+    category === " " ||
+    category === "x" ||
+    category === "X" ||
+    category === "~"
+  ) {
+    return null;
   }
-  if (category === "~") {
-    return false;
+  if (/^[([]/.test(rest.slice(close + 1))) {
+    return null;
   }
-  return !/^[([]/.test(rest.slice(close + 1));
+  return { from: 0, to: close + 2 };
 }
 
 /** Inline code spans of one line as `[start, end)` ranges, as `code_spans`. */
@@ -457,7 +472,7 @@ export function relationType(
     return null;
   }
   const { content } = bullet;
-  if (readsAsCategory(content)) {
+  if (splitCategory(content) !== null) {
     return null;
   }
   const open = relationAt(content);

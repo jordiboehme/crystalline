@@ -43,6 +43,12 @@ export interface MarkViewOptions {
    * `\r` in each line; a solo screen picks it from the file (`separatorOf`).
    */
   lineSeparator?: "\n" | "\r\n";
+  /**
+   * Whether the view's parse is finished before it is handed back (the
+   * default). False keeps whatever the first parse of the state reached,
+   * for a test of what a press does on a short tree.
+   */
+  parsed?: boolean;
 }
 
 const views = new Set<EditorView>();
@@ -140,7 +146,7 @@ export function markView(
   if (roomText) {
     roomTexts.set(view, roomText);
   }
-  return parsedView(view);
+  return options.parsed === false ? view : parsedView(view);
 }
 
 /**

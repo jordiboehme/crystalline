@@ -9,7 +9,8 @@
  *
  * A line whose marks show (`marksHiddenOnLine` false: Raw, or show mode on a
  * touched line) has none, except an HTML comment in a Reflection, which is
- * never shown there. The frontmatter block, code and math hold no marks.
+ * never shown there. The frontmatter block, code and math hold no marks: a
+ * `$$` block too, and an unclosed `$$` to where the page ends it (D41).
  */
 
 import { syntaxTree } from "@codemirror/language";
@@ -19,8 +20,9 @@ import { IterMode } from "@lezer/common";
 
 import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { isIdLine } from "../../reflectionText";
-import { OBSERVATION_LINE } from "../crystallineLines";
+import { observationCategory } from "../crystallineLines";
 import { frontmatterRegion } from "../frontmatterRegion";
+import { inMathRegion, mathRegions } from "../mathBlocks";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { marksHiddenOnLine } from "./mode";
 
@@ -44,6 +46,16 @@ export interface Mark {
   side: "open" | "close" | "prefix" | "whole";
   /** The index of the paired mark in the same line's array, if it is there. */
   partner: number | null;
+}
+
+/**
+ * An image with no alt text, linked or not (`![](src)`, `[![](src)](href)`):
+ * nothing of it is text, so it is no pair of marks but one atom, drawn as one
+ * piece that a caret steps over and a key removes whole (D40).
+ */
+export interface MarkAtom {
+  from: number;
+  to: number;
 }
 
 /** Touching marks taken together: what a caret steps over in one go. */
@@ -207,7 +219,14 @@ interface LineScan {
   at: Line;
   /** Whether the line's marks are read; else only its comments. */
   hidden: boolean;
+  /**
+   * Whether the line is `$$` math the page draws (D41): formula source, so
+   * only its quote marks are read.
+   */
+  math: boolean;
   drafts: Draft[];
+  /** The images with no alt text on the line. */
+  atoms: MarkAtom[];
   /** Whether a code block covers the line's start. */
   inCode: boolean;
   /**
@@ -215,7 +234,8 @@ interface LineScan {
    * the parser's link over the same brackets is not read twice.
    */
   taken: Set<number>;
-  category: RegExpExecArray | null;
+  /** The category's bracket span in line offsets (M1), or null. */
+  category: { from: number; to: number } | null;
   /** The depth of a node whose inside this line does not read, or -1. */
   skip: number;
   /** The walk step that last found the node in hand on this line. */
@@ -226,6 +246,8 @@ interface LineScan {
 export interface MarkScan {
   /** The marks of each line, as `marksOnLine` gives them: first line first. */
   lines: Mark[][];
+  /** The atoms of each line (images with no alt text), first line first. */
+  atoms: MarkAtom[][];
   /**
    * The closing child of each pair whose marks are its node's first and last
    * child (an inline pair, a link), by the start of its first child: how an
@@ -286,6 +308,17 @@ export function marksOnLine(
 }
 
 /**
+ * The atoms of line `line` (1-based): its images with no alt text, where its
+ * marks are hidden. A line with no `![]` has none, without a walk.
+ */
+export function atomsOnLine(state: EditorState, line: number): MarkAtom[] {
+  if (!state.doc.line(line).text.includes("![]")) {
+    return [];
+  }
+  return scanMarks(state, line, line).atoms[0] ?? [];
+}
+
+/**
  * The marks of lines `first` to `last` (1-based), each line exactly as
  * `marksOnLine` gives it, read in one walk over the syntax tree. Asking line
  * by line walks a paragraph's nodes from its start once per line, which a
@@ -301,6 +334,8 @@ export function scanMarks(
   const fence = frontmatterEnd(doc);
   // A Reflection never shows a comment, in either mode, in a table cell too.
   const comments = hidesIdLines(state) || state.facet(pageHidesComments);
+  // `$$` math the page draws is formula source, never marks (D41).
+  const math = mathRegions(state);
   const lines: Line[] = [];
   const scans: (LineScan | null)[] = [];
   for (let number = first; number <= last; number++) {
@@ -309,16 +344,19 @@ export function scanMarks(
     const hidden =
       at.from > fence &&
       (options.always === true || marksHiddenOnLine(state, number));
+    const inMath = math.length > 0 && inMathRegion(math, at.from);
     scans.push(
       at.from <= fence || (!hidden && !comments)
         ? null
         : {
             at,
             hidden,
+            math: inMath,
             drafts: [],
+            atoms: [],
             inCode: false,
             taken: new Set(),
-            category: hidden ? OBSERVATION_LINE.exec(at.text) : null,
+            category: hidden && !inMath ? observationCategory(at.text) : null,
             skip: -1,
             seen: -1,
           },
@@ -333,6 +371,7 @@ export function scanMarks(
   }
   return {
     lines: scans.map((scan) => (scan ? finished(scan) : [])),
+    atoms: scans.map((scan) => scan?.atoms ?? []),
     closers,
   };
 }
@@ -388,11 +427,18 @@ function walkMarks(
     if (!image && text.startsWith("^")) {
       return null;
     }
-    // `[[Target]]`: the wikilink chip's, never a link.
-    if (char(node.from - 1) === "[" && char(node.to) === "]") {
+    const after = close.nextSibling;
+    // `[[Target]]`: the wikilink chip's, never a link. Only a bare bracket
+    // link: an image inside a link (`[![alt](src)](href)`) and a link inside
+    // literal brackets (`[[t](u)]`) are what the page reads them as (D39).
+    if (
+      !image &&
+      after === null &&
+      char(node.from - 1) === "[" &&
+      char(node.to) === "]"
+    ) {
       return null;
     }
-    const after = close.nextSibling;
     let end = close.to;
     if (after?.name === "LinkMark" && char(after.from) === "(") {
       end = node.to;
@@ -411,6 +457,27 @@ function walkMarks(
       }
     }
     return { open, close: close.from, end };
+  };
+
+  /**
+   * Where node `node` ends when it is an image with no alt text, or a link
+   * whose words are only such an image: the end of its atom, else null.
+   */
+  const atomEnd = (
+    node: SyntaxNode,
+    plan: { open: SyntaxNode; close: number; end: number },
+  ): number | null => {
+    if (node.name === "Image") {
+      return plan.open.to === plan.close ? plan.end : null;
+    }
+    const image = node.getChild("Image");
+    if (!image || image.from !== plan.open.to || image.to !== plan.close) {
+      return null;
+    }
+    const inner = linkPlan(image);
+    return inner && inner.open.to === inner.close && inner.end === image.to
+      ? plan.end
+      : null;
   };
 
   /** Whether a pair node's last child is its first child's partner. */
@@ -469,6 +536,15 @@ function walkMarks(
     }
     if (name === "Link" || name === "Image") {
       const plan = linkPlan(node);
+      const atom = plan ? atomEnd(node, plan) : null;
+      if (atom !== null) {
+        for (const scan of hidden) {
+          if (node.from >= scan.at.from && atom <= scan.at.to) {
+            scan.atoms.push({ from: node.from, to: atom });
+          }
+        }
+        return true;
+      }
       if (plan) {
         for (const scan of hidden) {
           if (!scan.taken.has(plan.open.from)) {
@@ -592,8 +668,11 @@ function walkMarks(
         }
         scan.seen = step;
         any = true;
-        if (scan.hidden) hidden.push(scan);
-        else inside = true;
+        if (scan.hidden && (!scan.math || ref.name === "QuoteMark")) {
+          hidden.push(scan);
+        } else {
+          inside = true;
+        }
       }
       if (!any) {
         return false;
@@ -646,8 +725,8 @@ function walkMarks(
 function finished(scan: LineScan): Mark[] {
   const { at, drafts, taken, category } = scan;
   if (category && !scan.inCode) {
-    const open = at.from + at.text.indexOf("[");
-    const close = open + (category[1] ?? "").length + 1;
+    const open = at.from + category.from;
+    const close = at.from + category.to - 1;
     taken.add(open);
     // The link the parser read over these brackets, if any, is dropped.
     for (let index = drafts.length - 1; index >= 0; index -= 1) {

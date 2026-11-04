@@ -1153,6 +1153,124 @@ test.describe("hidden marks", () => {
       expect(removed.ok(), await removed.text()).toBeTruthy();
     }
   });
+
+  test("Tab to the toolbar, Enter on Bold, then typing: bold, and the caret stays (D38)", async ({
+    page,
+  }) => {
+    const permalink = await createEngram(page, titled("Marks Toolbar Keys"));
+    const source = await edit(page, permalink);
+    const watch = line(source, "Watch list");
+    await clickBeside(watch, "two", "after");
+    await page.keyboard.type(" ");
+    const before = await held(page);
+    // Out of the editor with the keyboard, to the sticky bar's Bold button.
+    const bold = page
+      .getByRole("button", { name: "Bold", exact: true })
+      .first();
+    for (let i = 0; i < 40; i += 1) {
+      await page.keyboard.press("Tab");
+      if (await bold.evaluate((el) => el === document.activeElement)) break;
+    }
+    await expect(bold).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(source).toBeFocused();
+    expect((await held(page)).head).toBe(before.head);
+    await page.keyboard.type("calm");
+    await expect(watch).toHaveText("Watch list: one two calm");
+    expect(await weightOf(watch, "calm")).toBeGreaterThanOrEqual(600);
+    await bodySatisfies(page, permalink, (b) =>
+      b.includes("Watch list: one two **calm**"),
+    );
+  });
+
+  test("on a phone keyboard a composition is judged when it ends: Bold, a word after bold, a shrink beside bold", async ({
+    browser,
+  }) => {
+    const context = await newContext(browser, { ...devices["Pixel 7"] });
+    try {
+      const page = await context.newPage();
+      await signIn(page);
+      const permalink = await createEngram(
+        page,
+        titled("Marks Phone"),
+        // Near the top, so a phone's short view draws it.
+        BUOY.replace("- First buoy", "Tide **a.** b\n\n- First buoy"),
+      );
+      const source = await edit(page, permalink);
+      const cdp: CDPSession = await context.newCDPSession(page);
+      const lineOf = async (text: string) =>
+        (await held(page)).doc.split("\n").find((l) => l.includes(text)) ?? "";
+      /** A word composed letter by letter, then committed. */
+      const compose = async (word: string) => {
+        for (let i = 1; i <= word.length; i += 1) {
+          await cdp.send("Input.imeSetComposition", {
+            text: word.slice(0, i),
+            selectionStart: i,
+            selectionEnd: i,
+          });
+        }
+        await cdp.send("Input.insertText", { text: word });
+        // The check at a composition's end waits 60 ms for its last change.
+        await page.waitForTimeout(300);
+      };
+
+      // Bold with no selection, then a word composed: the word is bold.
+      const watch = line(source, "Watch list");
+      await clickBeside(watch, "one", "after");
+      await expect(source).toBeFocused();
+      await page.waitForTimeout(300);
+      // The emulated phone keeps the host's platform, so Mod is Cmd on a
+      // Mac host (where Ctrl+B moves the caret left, as in Emacs).
+      await page.keyboard.press("ControlOrMeta+b");
+      await compose("sea");
+      expect(await lineOf("Watch list")).toBe("Watch list: one**sea** two");
+      expect(await weightOf(watch, "sea")).toBeGreaterThanOrEqual(600);
+
+      // The space committed on its own, then the next word composed, right
+      // after a bold word: bold, as on a desktop (D34).
+      await clickBeside(line(source, "Second buoy is"), "red", "after");
+      await expect(source).toBeFocused();
+      await page.waitForTimeout(300);
+      await cdp.send("Input.insertText", { text: " " });
+      await compose("sea");
+      expect(await lineOf("Second buoy")).toBe(
+        "- Second buoy is **red** **sea**",
+      );
+
+      // The Task 14 sequence beside `**a.** b`: a word composed, shrunk twice
+      // inside the composition, committed. Whatever the composition did, the
+      // pair is kept when it ends: no mark shows and `a.` stays bold.
+      const tide = line(source, "Tide");
+      await clickBeside(tide, "a.", "after");
+      await expect(source).toBeFocused();
+      await page.waitForTimeout(300);
+      const typed = " harbour";
+      for (let i = 1; i <= typed.length; i += 1) {
+        await cdp.send("Input.imeSetComposition", {
+          text: typed.slice(0, i),
+          selectionStart: i,
+          selectionEnd: i,
+        });
+      }
+      for (const n of [typed.length - 1, typed.length - 2]) {
+        await cdp.send("Input.imeSetComposition", {
+          text: typed.slice(0, n),
+          selectionStart: n,
+          selectionEnd: n,
+        });
+      }
+      await cdp.send("Input.insertText", { text: typed.slice(0, -2) });
+      await page.waitForTimeout(300);
+      expect(await tide.textContent()).not.toContain("*");
+      expect(await lineOf("Tide")).toMatch(/^Tide \*\*a\.[^*]*\*\*/);
+      expect(await weightOf(tide, "a.")).toBeGreaterThanOrEqual(600);
+      await bodySatisfies(page, permalink, (b) =>
+        b.includes("- Second buoy is **red** **sea**"),
+      );
+    } finally {
+      await context.close();
+    }
+  });
 });
 
 /** The checkpoint screenshots Jordi looks at; only when a run asks for them. */
