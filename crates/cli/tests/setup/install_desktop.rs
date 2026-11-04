@@ -886,8 +886,9 @@ fn uninstall_removes_the_file_and_the_record_and_says_where_to_finish() {
     assert_eq!(
         out,
         format!(
-            "Removed the built extension ({}) and Crystalline's record of it.\n{REMOVE_LINE}\n{SKILL_STAYS_LINE}\n",
-            bundle.display()
+            "Removed the built extension ({}) and Crystalline's record of it.\n{REMOVE_LINE}\nThe skill zip stays at {}.\n{SKILL_STAYS_LINE}\n",
+            bundle.display(),
+            zip.display()
         )
     );
     assert!(!bundle.exists());
@@ -965,4 +966,65 @@ fn uninstall_leaves_the_install_receipt_alone() {
     std::fs::write(&receipt, &planted).unwrap();
     s.uninstall().assert().success();
     assert_eq!(std::fs::read(&receipt).unwrap(), planted);
+}
+
+#[test]
+fn uninstall_names_a_skill_zip_kept_in_the_state_folder() {
+    let s = Setup::new();
+    s.install_with_skill().assert().success();
+    let zip = s
+        .state()
+        .join("claude-desktop")
+        .join("crystalline-intelligence.zip");
+    assert!(zip.is_file());
+    let assert = s.uninstall().assert().success();
+    assert!(
+        stdout(&assert).contains(&format!("The skill zip stays at {}.\n", zip.display())),
+        "{}",
+        stdout(&assert)
+    );
+    assert!(zip.is_file());
+    assert!(!s.bundle().exists());
+}
+
+#[test]
+fn uninstall_with_only_a_record_says_so() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    std::fs::remove_file(s.bundle()).unwrap();
+    let assert = s.uninstall().assert().success();
+    assert_eq!(
+        stdout(&assert),
+        format!(
+            "Removed Crystalline's record of the Claude Desktop install.\n{REMOVE_LINE}\n{SKILL_STAYS_LINE}\n"
+        )
+    );
+    assert!(!s.record_file().exists());
+}
+
+#[test]
+fn uninstall_while_an_update_offer_runs_deletes_nothing() {
+    let s = Setup::new();
+    s.install(&s.path_env()).assert().success();
+    let lock_path = s.state().join("claude-desktop.offer.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    let assert = s.uninstall().assert().failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("An update offer is running right now. Try again in a moment."),
+        "{stderr}"
+    );
+    assert!(s.bundle().is_file());
+    assert!(s.record_file().is_file());
+    assert!(lock_path.is_file());
+    drop(lock);
+    s.uninstall().assert().success();
+    assert!(!s.bundle().exists());
+    assert!(!lock_path.exists(), "the lock file goes last");
 }

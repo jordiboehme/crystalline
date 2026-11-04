@@ -178,12 +178,41 @@ pub(crate) fn run_uninstall(json: bool) -> anyhow::Result<()> {
     let bundle = desktop_record::bundle_path()?;
     let record_path = desktop_record::record_path()?;
 
+    // The offer lock first, so an update offer cannot write the record and
+    // the extension back while they are being deleted.
+    let lock_file = crystalline_service::desktop_offer::lock_path()?;
+    if let Some(parent) = lock_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_file)
+        .map_err(|e| anyhow::anyhow!("Could not open {}: {e}", lock_file.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            anyhow::bail!("An update offer is running right now. Try again in a moment.")
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            anyhow::bail!("Could not lock {}: {e}", lock_file.display())
+        }
+    }
+
+    // Read before the record goes: it knows where the skill zip was left.
+    let skill_zip = desktop_record::load(&record_path)
+        .ok()
+        .flatten()
+        .and_then(|record| record.skill)
+        .map(|skill| PathBuf::from(skill.file))
+        .filter(|file| file.is_file());
+
     let removed_file = remove_if_there(&bundle)?.then(|| bundle.display().to_string());
     for leftover in [
         with_suffix(&bundle, ".previous"),
         with_suffix(&bundle, ".partial"),
         with_suffix(&record_path, ".partial"),
-        crystalline_service::desktop_offer::lock_path()?,
     ] {
         remove_if_there(&leftover)?;
     }
@@ -191,6 +220,15 @@ pub(crate) fn run_uninstall(json: bool) -> anyhow::Result<()> {
     // The folder goes only when nothing else is in it.
     if let Some(folder) = bundle.parent() {
         let _ = std::fs::remove_dir(folder);
+    }
+    // The lock file goes last. Windows refuses to delete a file that is
+    // open, so the lock is let go first there.
+    if cfg!(windows) {
+        drop(lock);
+        remove_if_there(&lock_file)?;
+    } else {
+        remove_if_there(&lock_file)?;
+        drop(lock);
     }
 
     if json {
@@ -216,6 +254,9 @@ pub(crate) fn run_uninstall(json: bool) -> anyhow::Result<()> {
     println!(
         "Crystalline cannot remove the extension from Claude Desktop. Remove it there: {REMOVE_ROUTE}, then Crystalline."
     );
+    if let Some(file) = &skill_zip {
+        println!("The skill zip stays at {}.", file.display());
+    }
     println!("The skill stays in Claude Desktop until you delete it under {SKILLS_ROUTE}.");
     Ok(())
 }
