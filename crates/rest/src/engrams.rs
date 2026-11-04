@@ -896,6 +896,9 @@ pub async fn create(
         // key and sends that, through the routes that take one.
         share_link: None,
         model: None,
+        // A create replaces nothing, so it has nothing to guard; the PUT
+        // carries the token of the version it replaces.
+        expected_checksum: None,
     };
     let mut written = state
         .engine

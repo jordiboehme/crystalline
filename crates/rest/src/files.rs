@@ -128,6 +128,13 @@ pub struct UploadedAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = true)]
     pub draft: Option<bool>,
+    /// Present and true when the path already held exactly these bytes, so
+    /// nothing was written. Uploading the same bytes to a path that already
+    /// holds them succeeds this way, also with `If-None-Match: *`, so a retry
+    /// after a timeout is safe. Absent on every other upload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = true)]
+    pub unchanged: Option<bool>,
 }
 
 /// `GET /domains/{domain}/files/{*path}` - one attachment's bytes.
@@ -327,10 +334,14 @@ pub(crate) fn attachment_response(
                    follow it into the OWNER's files overlay instead, to be \
                    folded or discarded with the draft that references them.\n\n\
                    With `If-None-Match: *` the upload only creates: a path \
-                   that already holds a file is refused with 412. On a domain \
-                   that reviews changes that is the file the caller sees \
-                   there (its own draft bytes, or a reviewed file it has not \
-                   deleted).",
+                   that already holds different bytes is refused with 412. On \
+                   a domain that reviews changes that is the file the caller \
+                   sees there (its own draft bytes, or a reviewed file it has \
+                   not deleted).\n\n\
+                   Uploading the same bytes to a path that already holds them \
+                   answers 200 with `unchanged: true` and writes nothing, with \
+                   `If-None-Match: *` or without, so a retry after a timeout \
+                   is safe.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -353,9 +364,10 @@ pub(crate) fn attachment_response(
         (
             "If-None-Match" = Option<String>,
             Header,
-            description = "`*` to only create: a path that already holds a \
-                           file is refused with 412 and left as it is. Any \
-                           other value is 422.",
+            description = "`*` to only create: a path that already holds \
+                           different bytes is refused with 412 and left as it \
+                           is; the same bytes answer 200 with `unchanged: \
+                           true`. Any other value is 422.",
         ),
     ),
     request_body(
@@ -367,7 +379,8 @@ pub(crate) fn attachment_response(
         (
             status = 200,
             description = "Stored. The path to reference it by, its mime, its \
-                           size and its checksum.",
+                           size and its checksum; `unchanged: true` when the \
+                           path already held exactly these bytes.",
             body = UploadedAttachment,
         ),
         (
@@ -410,8 +423,9 @@ pub(crate) fn attachment_response(
         ),
         (
             status = 412,
-            description = "`If-None-Match: *` and the path already holds a \
-                           file; nothing was stored. Pick another name.",
+            description = "`If-None-Match: *` and the path already holds \
+                           different bytes; nothing was stored. Pick another \
+                           name.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -474,6 +488,7 @@ pub async fn write(
         size: written.row.size,
         sha256: written.row.sha256,
         draft: written.draft.then_some(true),
+        unchanged: written.unchanged.then_some(true),
     }))
 }
 

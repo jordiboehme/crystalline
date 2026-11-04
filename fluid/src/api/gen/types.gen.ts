@@ -1814,6 +1814,18 @@ export type ProblemDetail = {
      */
     home_url?: string | null;
     /**
+     * An RFC 9457 extension member, present only on a refusal to start a
+     * GitHub link (`POST /me/github-link/start`) because of how this
+     * instance's GitHub App is set up: `no_app` (none is configured),
+     * `app_unusable` (one is configured and cannot be used), `keychain`
+     * (the keychain that holds it cannot be read), `no_client_secret` or
+     * `no_public_url` (`service.public_url` is not set). The profile says
+     * the cause in plain words to a person who is not an admin and shows an
+     * admin the detail, which names the fix. Absent from every other
+     * problem document on this surface.
+     */
+    reason?: string | null;
+    /**
      * The HTTP status, mirrored into the body so a client that only has the
      * parsed payload can still branch on it.
      */
@@ -2493,6 +2505,13 @@ export type UploadedAttachment = {
      * Byte length as stored.
      */
     size: number;
+    /**
+     * Present and true when the path already held exactly these bytes, so
+     * nothing was written. Uploading the same bytes to a path that already
+     * holds them succeeds this way, also with `If-None-Match: *`, so a retry
+     * after a timeout is safe. Absent on every other upload.
+     */
+    unchanged?: boolean | null;
 };
 
 /**
@@ -2521,6 +2540,13 @@ export type UploadedReflectionAsset = {
      * Byte length as stored.
      */
     size: number;
+    /**
+     * Present and true when the path already held exactly these bytes, so
+     * nothing was written. Uploading the same bytes to a path that already
+     * holds them succeeds this way, also with `If-None-Match: *`, so a retry
+     * after a timeout is safe. Absent on every other upload.
+     */
+    unchanged?: boolean | null;
 };
 
 /**
@@ -4359,7 +4385,7 @@ export type WriteAttachmentData = {
          */
         'X-Crystalline-Join'?: string | null;
         /**
-         * `*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.
+         * `*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.
          */
         'If-None-Match'?: string | null;
     };
@@ -4399,7 +4425,7 @@ export type WriteAttachmentErrors = {
      */
     409: ProblemDetail;
     /**
-     * `If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.
+     * `If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.
      */
     412: ProblemDetail;
     /**
@@ -4416,7 +4442,7 @@ export type WriteAttachmentError = WriteAttachmentErrors[keyof WriteAttachmentEr
 
 export type WriteAttachmentResponses = {
     /**
-     * Stored. The path to reference it by, its mime, its size and its checksum.
+     * Stored. The path to reference it by, its mime, its size and its checksum; `unchanged: true` when the path already held exactly these bytes.
      */
     200: UploadedAttachment;
 };
@@ -5321,7 +5347,7 @@ export type WriteReflectionAssetData = {
     body: string;
     headers?: {
         /**
-         * `*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.
+         * `*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.
          */
         'If-None-Match'?: string | null;
     };
@@ -5357,7 +5383,7 @@ export type WriteReflectionAssetErrors = {
      */
     409: ProblemDetail;
     /**
-     * `If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.
+     * `If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.
      */
     412: ProblemDetail;
     /**
@@ -5374,7 +5400,7 @@ export type WriteReflectionAssetError = WriteReflectionAssetErrors[keyof WriteRe
 
 export type WriteReflectionAssetResponses = {
     /**
-     * Stored. `path` is inside `reflections/`.
+     * Stored. `path` is inside `reflections/`; `unchanged: true` when the path already held exactly these bytes.
      */
     200: UploadedReflectionAsset;
 };
@@ -7502,13 +7528,17 @@ export type StartMyGithubLinkErrors = {
      */
     403: ProblemDetail;
     /**
-     * `service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.
+     * `service.public_url` is not set, so there is no callback address to give GitHub (`reason` `no_public_url`), or the GitHub App has no client secret, so a code cannot be exchanged (`no_client_secret`). The detail names the fix; `reason` names the cause for a person who cannot apply it.
      */
     409: ProblemDetail;
     /**
-     * No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.
+     * No GitHub App is configured on this instance (`reason` `no_app`), or the keychain that holds it cannot be read (`keychain`). The detail names the fix.
      */
     422: ProblemDetail;
+    /**
+     * The GitHub App is configured and cannot be used (`reason` `app_unusable`). The detail names the fix.
+     */
+    500: ProblemDetail;
     /**
      * Too many links are in flight at once; try again in a moment.
      */

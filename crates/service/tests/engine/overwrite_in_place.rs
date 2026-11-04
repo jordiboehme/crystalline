@@ -77,6 +77,7 @@ fn capture(title: &str, folder: Option<&str>, content: &str, overwrite: bool) ->
         overwrite,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 

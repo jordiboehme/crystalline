@@ -48,6 +48,7 @@ async fn write(engine: &Engine, title: &str, status: &str, body: &str) {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();

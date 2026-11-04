@@ -57,6 +57,7 @@ pub fn write_params(title: &str, folder: Option<&str>, content: &str) -> WritePa
         overwrite: false,
         model: None,
         share_link: None,
+        expected_checksum: None,
     }
 }
 

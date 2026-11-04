@@ -1571,6 +1571,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -8963,6 +8964,83 @@ async fn two_create_only_overlay_uploads_of_one_path_land_once() {
             .unwrap();
         assert_eq!(bytes, winner, "{path}");
     }
+}
+
+/// **In review mode the same bytes again are unchanged, as this actor sees
+/// the domain.** Their own draft file is not written again and stays a
+/// draft; a reviewed file with the same bytes gets no draft copy at all;
+/// other bytes are still refused; and after this actor deleted the reviewed
+/// file, the same bytes are a real upload again.
+#[tokio::test]
+async fn an_overlay_upload_of_the_bytes_the_view_shows_is_unchanged() {
+    use crystalline_service::EngineError;
+    use crystalline_service::engine::ASSET_EXISTS;
+    let f = review_fixture().await;
+    let up = |path: &'static str, bytes: &'static [u8], create_only: bool| {
+        let engine = f.engine.clone();
+        async move {
+            engine
+                .attachment_write_joined(
+                    "team",
+                    path,
+                    bytes.to_vec(),
+                    &scope_of("alice"),
+                    None,
+                    create_only,
+                )
+                .await
+        }
+    };
+
+    // Her own draft file.
+    let first = up("assets/own.png", b"own bytes", true).await.unwrap();
+    assert!(first.draft && first.created && !first.unchanged);
+    let own = f.state.join("overlays/team/alice/files/assets/own.png");
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&own)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    for create_only in [true, false] {
+        let again = up("assets/own.png", b"own bytes", create_only)
+            .await
+            .unwrap();
+        assert!(again.unchanged && again.draft && !again.created);
+        assert_eq!(again.row.sha256, first.row.sha256);
+        assert_eq!(
+            std::fs::metadata(&own).unwrap().modified().unwrap(),
+            past,
+            "create_only {create_only}: not written again"
+        );
+    }
+    let err = up("assets/own.png", b"other bytes", true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Conflict(text) if text.ends_with(ASSET_EXISTS)),
+        "{err:?}"
+    );
+
+    // A reviewed file with the same bytes: no draft copy.
+    let assets = f.domain_root("team").join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("base.png"), b"base bytes").unwrap();
+    f.engine.sync(None).await.unwrap();
+    let base = up("assets/base.png", b"base bytes", true).await.unwrap();
+    assert!(base.unchanged && !base.draft && !base.created, "{base:?}");
+    let copy = f.state.join("overlays/team/alice/files/assets/base.png");
+    assert!(!copy.exists(), "no draft copy of a reviewed file");
+
+    // Deleted in her view: the same bytes are a real upload again.
+    f.engine
+        .attachment_delete_as("team", "assets/base.png", &scope_of("alice"))
+        .await
+        .unwrap();
+    let back = up("assets/base.png", b"base bytes", true).await.unwrap();
+    assert!(back.draft && back.created && !back.unchanged, "{back:?}");
+    assert_eq!(std::fs::read(&copy).unwrap(), b"base bytes");
 }
 
 fn alice() -> Scope {

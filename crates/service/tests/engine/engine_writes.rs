@@ -154,6 +154,7 @@ async fn a_permalink_collision_names_the_permalink_and_the_overwrite_hint() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap_err();
@@ -211,6 +212,7 @@ async fn a_stale_save_is_a_conflict_on_file_and_virtual_domains() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -291,6 +293,7 @@ async fn a_stale_edit_is_a_conflict_on_file_and_virtual_domains() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -670,6 +673,7 @@ fn write_params(
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -1792,6 +1796,7 @@ async fn split_works_on_a_virtual_domain_too() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -2039,6 +2044,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -2150,6 +2156,7 @@ async fn every_write_verb(scope: &Scope) -> Vec<(&'static str, serde_json::Value
                     overwrite: false,
                     share_link: None,
                     model: None,
+                    expected_checksum: None,
                 },
                 Some(ACTOR),
                 scope,
@@ -2842,6 +2849,7 @@ async fn the_sync_after_a_parser_change_reparses_file_and_virtual_domains_once()
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -2918,6 +2926,7 @@ async fn a_failing_virtual_reparse_does_not_stop_the_sync() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();

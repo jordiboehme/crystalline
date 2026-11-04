@@ -132,6 +132,22 @@ pub struct DomainView<'a> {
     _writing: Option<crate::rename::WriteTicket<'a>>,
 }
 
+/// What one write into this actor's files overlay landed as
+/// ([`DomainView::put_file`]).
+#[derive(Debug)]
+pub(crate) struct PutFile {
+    /// The row describing the bytes the view now shows at the path.
+    pub row: AttachmentRow,
+    /// Whether the view showed no file at the path before.
+    pub created: bool,
+    /// Whether the view already showed exactly these bytes, so nothing was
+    /// put in the overlay.
+    pub unchanged: bool,
+    /// Whether those bytes are this actor's own (in the overlay) rather than
+    /// the folder's reviewed file.
+    pub in_overlay: bool,
+}
+
 /// Where an occupant stands: the path that was asked for, and for a file
 /// domain the root to look its on-disk spelling up under. The lookup lists
 /// directories, so it runs only when a refusal prints the name
@@ -487,19 +503,9 @@ impl<'a> DomainView<'a> {
                     .await?
             };
             if held.is_none() {
-                self.engine
-                    .refuse_only_elsewhere(
-                        &desc.domain,
-                        desc.domain_id,
-                        crate::engine::ElsewhereRow::Engram(&desc.path),
-                    )
-                    .await?;
-                return Err(EngineError::NotFound(format!(
-                    "the file of '{}' is not on this disk, so no draft can start from it \
-                     (the index holds its body only); sync domain '{}' or restore the file, \
-                     then try again",
-                    desc.permalink, desc.domain
-                )));
+                return Err(self
+                    .no_draft_without_the_file(desc.domain_id, &desc.path, &desc.permalink)
+                    .await);
             }
         }
         self.text_at(base, desc).await
@@ -2015,6 +2021,82 @@ impl<'a> DomainView<'a> {
         }))
     }
 
+    /// The whole text this view holds at a PATH: the actor's own draft when
+    /// they hold one, `None` where they deleted it, and the base text
+    /// otherwise ([`DomainView::engram_text_at_path`]). The text a read in
+    /// this view hands a checksum out for, which is why a guarded overwrite
+    /// of a draft compares against it.
+    pub(crate) async fn own_text_at_path(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<String>> {
+        if let Some(actor) = self.actor.as_deref() {
+            let held = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store.overlay_entry(domain_id, actor, path).await?
+            };
+            match held {
+                Some(entry) if entry.tombstone => return Ok(None),
+                Some(entry) => return Ok(Some(entry.content)),
+                None => {}
+            }
+        }
+        let found = self.engram_text_at_path(path).await?;
+        // An engram the index still has whose file is gone from this disk:
+        // the write would start the draft that `text_for_draft` refuses to
+        // start, so it is refused in the same words rather than called gone.
+        if found.is_none()
+            && self.actor.is_some()
+            && matches!(self.substrate(), Some(ContentSource::File { .. }))
+        {
+            let row = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store
+                    .list_engrams(&self.domain, Some(path), None)
+                    .await?
+                    .into_iter()
+                    .find(|row| row.path == path)
+            };
+            if let Some(row) = row {
+                return Err(self
+                    .no_draft_without_the_file(domain_id, path, &row.permalink)
+                    .await);
+            }
+        }
+        Ok(found.map(|found| found.content))
+    }
+
+    /// The refusal for a draft that would start from an engram whose file is
+    /// gone from this disk: the index holds its body only, so there is nothing
+    /// whole to start from. During an open host move it names that remedy.
+    async fn no_draft_without_the_file(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        permalink: &str,
+    ) -> EngineError {
+        if let Err(elsewhere) = self
+            .engine
+            .refuse_only_elsewhere(
+                &self.domain,
+                domain_id,
+                crate::engine::ElsewhereRow::Engram(path),
+            )
+            .await
+        {
+            return elsewhere;
+        }
+        EngineError::NotFound(format!(
+            "the file of '{permalink}' is not on this disk, so no draft can start from it \
+             (the index holds its body only); sync domain '{}' or restore the file, \
+             then try again",
+            self.domain
+        ))
+    }
+
     /// Whether this reader has deleted the path: `true` only when their own
     /// tombstone stands there.
     ///
@@ -2237,7 +2319,7 @@ impl<'a> DomainView<'a> {
     /// read and would let a concurrent replace hand this caller a receipt
     /// describing the other writer's bytes - which is what the folder arm's
     /// per-file lock exists to prevent there.
-    pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<(AttachmentRow, bool)> {
+    pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<PutFile> {
         self.put_file_ruled(path, bytes, false).await
     }
 
@@ -2245,11 +2327,7 @@ impl<'a> DomainView<'a> {
     /// a file at `path` ([`DomainView::shows_file`]): a create-only upload.
     /// The refusal is [`EngineError::Conflict`] ending in
     /// [`crate::engine::ASSET_EXISTS`], the folder's own.
-    pub(crate) async fn put_file_if_absent(
-        &self,
-        path: &str,
-        bytes: &[u8],
-    ) -> Result<(AttachmentRow, bool)> {
+    pub(crate) async fn put_file_if_absent(&self, path: &str, bytes: &[u8]) -> Result<PutFile> {
         self.put_file_ruled(path, bytes, true).await
     }
 
@@ -2262,12 +2340,14 @@ impl<'a> DomainView<'a> {
     ///
     /// Answers the row and whether this actor's view showed no file at the
     /// path before (`created`), read under the same lock.
-    async fn put_file_ruled(
-        &self,
-        path: &str,
-        bytes: &[u8],
-        create_only: bool,
-    ) -> Result<(AttachmentRow, bool)> {
+    ///
+    /// **The bytes this actor's view already shows are nothing to write**,
+    /// create-only or not: their own draft file, or a reviewed file they have
+    /// not deleted, with the same sha256. Nothing is put in the overlay, and
+    /// the answer says `unchanged` and whether those bytes are this actor's
+    /// own (`in_overlay`) or the folder's. A retry after a timeout is safe
+    /// that way.
+    async fn put_file_ruled(&self, path: &str, bytes: &[u8], create_only: bool) -> Result<PutFile> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
         let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
@@ -2275,6 +2355,30 @@ impl<'a> DomainView<'a> {
         let lock = self.engine.write_lock(&abs);
         let _guard = lock.lock().await;
         let shown = self.shows_file(path).await?;
+        if shown {
+            // What this actor's view shows, read the way a read of it reads
+            // it. A folder half with no file (a row a hand edit left) shows
+            // no bytes to compare, so it is not the same file.
+            let in_overlay = matches!(
+                self.own_held(path)?,
+                Some(crate::overlay_files::Held::Bytes)
+            );
+            let held = match self.attachment_bytes(path).await {
+                Ok((_, row)) => Some(row),
+                Err(EngineError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(row) = held
+                && crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)?
+            {
+                return Ok(PutFile {
+                    row,
+                    created: false,
+                    unchanged: true,
+                    in_overlay,
+                });
+            }
+        }
         if create_only && shown {
             return Err(EngineError::Conflict(format!(
                 "'{path}' {}",
@@ -2284,7 +2388,12 @@ impl<'a> DomainView<'a> {
         crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
             .map_err(|e| self.files_io(path, e))?;
         let row = crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))?;
-        Ok((row, !shown))
+        Ok(PutFile {
+            row,
+            created: !shown,
+            unchanged: false,
+            in_overlay: true,
+        })
     }
 
     /// Whether this actor's files overlay shows a file at `path`: its own

@@ -99,6 +99,7 @@ pub(crate) fn write_params(domain: &str, title: &str) -> WriteParams {
         overwrite: false,
         model: None,
         share_link: None,
+        expected_checksum: None,
     }
 }
 

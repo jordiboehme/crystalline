@@ -1713,6 +1713,33 @@ async fn a_create_only_upload_refuses_an_existing_file_with_412() {
     assert_eq!(up["created"], false, "{up}");
 }
 
+/// A create-only upload of the bytes the path already holds answers 200
+/// with `unchanged: true`, for a contributor and a curator alike; other
+/// bytes still answer 412.
+#[tokio::test]
+async fn a_create_only_upload_of_the_same_bytes_answers_unchanged() {
+    let s = serve().await;
+    let (ann, ed) = (
+        Session::login(s.addr, "ann").await,
+        Session::login(s.addr, "ed").await,
+    );
+    const FILE: &str = "/api/v1/domains/eng/reflection/assets/again.png";
+    let png = crate::assets::PNG;
+    let star = [("if-none-match", "*")];
+    let (status, first) = ann.put_bytes_with(FILE, png, &star).await;
+    assert_eq!(status, 200, "{first}");
+    assert!(first.get("unchanged").is_none(), "{first}");
+    for who in [&ann, &ed] {
+        let (status, again) = who.put_bytes_with(FILE, png, &star).await;
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again["unchanged"], true, "{again}");
+        assert_eq!(again["created"], false, "{again}");
+        assert_eq!(again["sha256"], first["sha256"], "{again}");
+        let (status, err) = who.put_bytes_with(FILE, b"other", &star).await;
+        assert_eq!(status, 412, "{err}");
+    }
+}
+
 /// Only `*` asks to create: any other `If-None-Match` is 422 and stores
 /// nothing.
 #[tokio::test]

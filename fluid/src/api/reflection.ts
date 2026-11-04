@@ -785,7 +785,7 @@ export type UploadedReflectionAsset = UploadedAttachment & {
 /**
  * One PUT of a file's bytes; the two callers below decide what it may
  * overwrite. `createOnly` sends `If-None-Match: *`, and the server then
- * answers 412 instead of replacing a file that is already at `path`.
+ * answers 412 instead of replacing other bytes that are already at `path`.
  */
 async function putReflectionAsset(
   domain: string,
@@ -807,8 +807,9 @@ async function putReflectionAsset(
 
 /**
  * A new file under a path the upload flow picked as free. Create-only: when
- * somebody stored a file there since the listing, the server answers 412 and
- * the upload flow tries the next free name.
+ * somebody stored other bytes there since the listing, the server answers 412
+ * and the upload flow tries the next free name; the same bytes answer 200 with
+ * `unchanged: true`.
  */
 export async function uploadReflectionAsset(
   domain: string,

@@ -148,6 +148,7 @@ fn write_params(title: &str, overwrite: bool) -> WriteParams {
         overwrite,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -1898,4 +1899,124 @@ async fn attachment_events_are_not_repeated_by_the_sync_walker() {
     let heard = drain(&mut rx);
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(engram_of(&heard[0]).kind, ChangeKind::Files);
+}
+
+/// **The same bytes again announce nothing and mark nothing pending.** An
+/// engram file in a direct domain, one in a review-mode domain (the actor's
+/// own draft) and a Reflection file are each uploaded once, the pending
+/// marks are cleared, and the same bytes go up again with and without
+/// create-only: no change on the bus, and neither domain goes pending. New
+/// bytes then do both, so the check can see them. The domain names are this
+/// test's own, since the pending marks are process-wide.
+#[tokio::test]
+async fn an_upload_of_the_same_bytes_again_announces_nothing_and_marks_nothing_pending() {
+    use crystalline_service::ReflectionCaller;
+    use crystalline_service::maintenance;
+    const DIRECT: &str = "same-bytes";
+    const REVIEW: &str = "same-bytes-review";
+    let _scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut cfg = GlobalConfig::default();
+    let direct = root.join(DIRECT);
+    seed(
+        &direct,
+        "MANIFEST.md",
+        &manifest(DIRECT).replace("status: stable\n", "status: stable\nreflection: on\n"),
+    );
+    cfg.domains
+        .insert(DIRECT.to_string(), DomainEntry::file(direct));
+    let review = root.join(REVIEW);
+    seed(&review, "MANIFEST.md", &manifest(REVIEW));
+    let mut entry = DomainEntry::file(review);
+    entry.review = Some(ReviewMode::Overlay);
+    cfg.domains.insert(REVIEW.to_string(), entry);
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let engine =
+        Engine::new(store.clone(), cfg, None, Some(config_path)).with_state_dir(root.join("state"));
+    let engine = Arc::new(support::as_this_machine(engine, &store).await);
+    engine.sync(None).await.unwrap();
+    let owner = ReflectionCaller::person(Scope::Unrestricted, "jordi");
+    let pending = |domain: &str| {
+        maintenance::load()
+            .pending_domains
+            .contains(&domain.to_string())
+    };
+
+    for domain in [DIRECT, REVIEW] {
+        engine
+            .attachment_write_joined(domain, "assets/a.png", png(1), &ada(), None, true)
+            .await
+            .unwrap();
+    }
+    engine
+        .reflection_asset_create(DIRECT, "assets/r.png", png(1), &owner)
+        .await
+        .unwrap();
+    // Another file last, so the bus's duplicate window (it drops an event
+    // equal to the one before it) cannot hide an announce of `a.png`.
+    engine
+        .attachment_write_joined(DIRECT, "assets/b.png", png(3), &ada(), None, true)
+        .await
+        .unwrap();
+    maintenance::record_run(&[DIRECT.to_string(), REVIEW.to_string()]);
+    assert!(!pending(DIRECT) && !pending(REVIEW));
+
+    let mut rx = engine.changes().subscribe();
+    for create_only in [true, false] {
+        for domain in [DIRECT, REVIEW] {
+            let again = engine
+                .attachment_write_joined(domain, "assets/a.png", png(1), &ada(), None, create_only)
+                .await
+                .unwrap();
+            assert!(again.unchanged, "{domain}, create_only {create_only}");
+        }
+        let again = if create_only {
+            engine
+                .reflection_asset_create(DIRECT, "assets/r.png", png(1), &owner)
+                .await
+        } else {
+            engine
+                .reflection_asset_write(DIRECT, "assets/r.png", png(1), &owner)
+                .await
+        }
+        .unwrap();
+        assert!(again.unchanged, "reflection, create_only {create_only}");
+    }
+    let heard = drain(&mut rx);
+    assert!(
+        heard.is_empty(),
+        "the same bytes announce nothing: {heard:?}"
+    );
+    assert!(!pending(DIRECT), "a direct domain stays as swept");
+    assert!(!pending(REVIEW), "a review-mode domain stays as swept");
+
+    // New bytes are a change: announced, and both domains go pending.
+    for domain in [DIRECT, REVIEW] {
+        engine
+            .attachment_write_joined(domain, "assets/a.png", png(2), &ada(), None, false)
+            .await
+            .unwrap();
+    }
+    engine
+        .reflection_asset_write(DIRECT, "assets/r.png", png(2), &owner)
+        .await
+        .unwrap();
+    let heard = drain(&mut rx);
+    assert!(
+        heard.iter().any(
+            |c| matches!(c, Change::Engram(e) if e.domain == DIRECT && e.path == "assets/a.png")
+        ),
+        "{heard:?}"
+    );
+    assert!(
+        heard
+            .iter()
+            .any(|c| matches!(c, Change::Reflection(r) if r.domain == DIRECT)),
+        "{heard:?}"
+    );
+    assert!(pending(DIRECT) && pending(REVIEW));
 }

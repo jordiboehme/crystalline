@@ -282,6 +282,93 @@ async fn a_second_upload_is_refused_unless_it_overwrites() {
     );
 }
 
+/// Push a file's modification time into the past, so a test can tell
+/// whether a later call wrote it again.
+fn age(file: &std::path::Path) -> std::time::SystemTime {
+    let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    past
+}
+
+fn modified(file: &std::path::Path) -> std::time::SystemTime {
+    std::fs::metadata(file).unwrap().modified().unwrap()
+}
+
+/// An upload of the bytes a path already holds succeeds and writes nothing,
+/// with `overwrite` or without, so a retry after a timeout is safe. Other
+/// bytes are still refused without `overwrite`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_bytes_again_succeed_unchanged_and_other_bytes_are_still_refused() {
+    let h = Harness::new().await;
+    let (client, _server) = h.connect().await;
+    let args = |b: &[u8], overwrite: bool| json!({ "domain": "eng", "path": "assets/a.png", "base64": BASE64.encode(b), "overwrite": overwrite });
+    let first = body(
+        &try_call(client.peer(), "write_engram", args(PNG, false))
+            .await
+            .unwrap(),
+    );
+    assert!(first.get("unchanged").is_none(), "{first}");
+    let file = h.root.join("eng/assets/a.png");
+    let past = age(&file);
+    for overwrite in [false, true] {
+        let again = body(
+            &try_call(client.peer(), "write_engram", args(PNG, overwrite))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(again["unchanged"], true, "{again}");
+        assert_eq!(again["created"], false, "{again}");
+        assert_eq!(again["sha256"], first["sha256"], "{again}");
+        assert_eq!(again["size"], first["size"], "{again}");
+        assert_eq!(again["path"], first["path"], "{again}");
+        assert_eq!(again["mime"], first["mime"], "{again}");
+        assert!(again.get("draft").is_none(), "{again}");
+        assert_eq!(modified(&file), past, "overwrite {overwrite}: not written");
+    }
+    let err = try_call(client.peer(), "write_engram", args(b"other", false))
+        .await
+        .unwrap_err();
+    assert!(err.contains(ASSET_EXISTS), "{err}");
+    assert_eq!(std::fs::read(&file).unwrap(), PNG);
+}
+
+/// `write_reflection` `write_asset` takes the same bytes again the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reflection_file_uploaded_again_with_the_same_bytes_is_unchanged() {
+    let h = Harness::new().await;
+    let (client, _server) = h.connect().await;
+    let args = |content: &str, overwrite: bool| json!({ "domain": "eng", "action": "write_asset", "path": "assets/data.csv", "content": content, "overwrite": overwrite });
+    let first = body(
+        &try_call(client.peer(), "write_reflection", args("a,b\n", false))
+            .await
+            .unwrap(),
+    );
+    assert!(first.get("unchanged").is_none(), "{first}");
+    let file = h.root.join("eng/reflections/assets/data.csv");
+    let past = age(&file);
+    for overwrite in [false, true] {
+        let again = body(
+            &try_call(client.peer(), "write_reflection", args("a,b\n", overwrite))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(again["unchanged"], true, "{again}");
+        assert_eq!(again["created"], false, "{again}");
+        assert_eq!(again["sha256"], first["sha256"], "{again}");
+        assert_eq!(again["path"], first["path"], "{again}");
+        assert_eq!(modified(&file), past, "overwrite {overwrite}: not written");
+    }
+    let err = try_call(client.peer(), "write_reflection", args("x", false))
+        .await
+        .unwrap_err();
+    assert!(err.contains(ASSET_EXISTS), "{err}");
+}
+
 /// Review Focus 1: a path that is not under `assets/`, or leaves it, is
 /// refused with the sentence REST gives, and nothing is written anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

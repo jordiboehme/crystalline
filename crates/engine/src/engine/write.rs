@@ -594,13 +594,42 @@ impl Engine {
             // from no text, so there is no base to check. A room that closed
             // since the look above is no room at all: the replace then takes
             // the ordinary path below, as it does for a page nobody has open.
+            //
+            // **A guarded replacement is checked against the room's text**,
+            // the way the edit's live arm checks it: that text is what a read
+            // of the open page handed out, and the file's checksum would
+            // refuse every guarded write made while anybody had the page
+            // open. A clean room also accepts the stored bytes' checksum, so
+            // a token read before the room opened still holds. The text it
+            // was checked against is then the compose's base, so a person
+            // typing between this look and the compose refuses it under the
+            // room's own lock instead of being written over.
+            let guarded_base = match p.expected_checksum.as_deref() {
+                Some(expected) => match rooms.live_text(&p.domain, &permalink, overlay).await {
+                    Some(live) if live.saving => {
+                        let text_sum = sha256_hex(live.text.as_bytes());
+                        if expected != live.checksum && expected != text_sum {
+                            return Err(EngineError::Conflict(stale_edit_message(
+                                expected,
+                                &live.checksum,
+                            )));
+                        }
+                        Some(live.text)
+                    }
+                    // A room that will not save is refused below as it is
+                    // for an unguarded write, and one that closed takes the
+                    // ordinary path, whose arms check the stored bytes.
+                    _ => None,
+                },
+                None => None,
+            };
             self.take_live_compose_hold().await;
             match rooms
                 .compose_while_saving(
                     &p.domain,
                     &permalink,
                     overlay,
-                    None,
+                    guarded_base.as_deref(),
                     markdown.clone(),
                     &actor,
                     peer,
@@ -636,6 +665,18 @@ impl Engine {
                     // end by
                     // `a_virtual_manifest_replaced_in_its_room_reaches_the_routing_cache`.
                     return Ok(receipt);
+                }
+                // Somebody typed after the look: the text the token named is
+                // gone. Only a guarded compose has a base that can move.
+                Err(crate::collab::session::ComposeRefused::Moved)
+                    if p.expected_checksum.is_some() =>
+                {
+                    let expected = p.expected_checksum.as_deref().unwrap_or_default();
+                    let found = match rooms.live_text(&p.domain, &permalink, overlay).await {
+                        Some(live) => live.checksum,
+                        None => "a newer text".to_string(),
+                    };
+                    return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
                 }
                 Err(_) if !rooms.has_live_room(&p.domain, &permalink, overlay).await => {}
                 Err(_) => {
@@ -740,6 +781,17 @@ impl Engine {
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
         if let Some((_, domain_id)) = overlay_draft {
+            // Checked against this caller's own view, under the draft lock:
+            // their draft when they hold one, the base when they do not.
+            if let Some(expected) = p.expected_checksum.as_deref() {
+                let current = view.own_text_at_path(domain_id, &path).await?;
+                refuse_stale_replacement(
+                    expected,
+                    current.as_deref().map(str::as_bytes),
+                    &permalink,
+                    &p.domain,
+                )?;
+            }
             let warning = view.write(domain_id, &path, &markdown).await?;
             receipt["draft"] = json!(true);
             // Whose draft it landed in, when that is not the caller's own, in
@@ -770,6 +822,11 @@ impl Engine {
                         });
                     }
                 };
+                // The bytes just read under the write lock, which is the
+                // checksum a read hands out for a file engram.
+                if let Some(expected) = p.expected_checksum.as_deref() {
+                    refuse_stale_replacement(expected, previous.as_deref(), &permalink, &p.domain)?;
+                }
                 write_file(&abs, &markdown)?;
                 let indexed = async {
                     let store = self.store.lock().await;
@@ -815,9 +872,28 @@ impl Engine {
                     .upsert_domain(&p.domain, None, DomainKind::Virtual)
                     .await?;
                 let before = store.engram_content(domain_id, &path).await?;
+                // Compared here for the sentence, and handed to the store as
+                // its compare-and-swap token, which is what holds against a
+                // writer on another instance sharing the database.
+                if let Some(expected) = p.expected_checksum.as_deref() {
+                    refuse_stale_replacement(
+                        expected,
+                        before.as_deref().map(str::as_bytes),
+                        &permalink,
+                        &p.domain,
+                    )?;
+                }
                 let stamp = virtual_stamp(&markdown);
-                self.index_markdown(&*store, domain_id, &path, &markdown, stamp, None, true)
-                    .await?;
+                self.index_markdown(
+                    &*store,
+                    domain_id,
+                    &path,
+                    &markdown,
+                    stamp,
+                    p.expected_checksum.as_deref(),
+                    true,
+                )
+                .await?;
                 (before.is_some(), before.as_deref().and_then(engram_title))
             }
         };
@@ -2349,6 +2425,30 @@ fn put_back(abs: &Path, previous: Option<&[u8]>) {
     }
 }
 
+/// The guard a whole-engram overwrite with `expected_checksum` runs under its
+/// write lock: `current` is what the write would replace, as the caller's view
+/// holds it. A changed engram is refused in the words a stale edit gets, and
+/// a missing one is refused too, so a guarded write never creates.
+fn refuse_stale_replacement(
+    expected: &str,
+    current: Option<&[u8]>,
+    permalink: &str,
+    domain: &str,
+) -> Result<()> {
+    let Some(current) = current else {
+        return Err(EngineError::Conflict(format!(
+            "the engram '{permalink}' in domain '{domain}' was deleted or moved after you read it \
+             (expected {expected}). Nothing was written. Re-read it, or write it without \
+             expected_checksum to create it"
+        )));
+    };
+    let found = sha256_hex(current);
+    if found != expected {
+        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod put_back_tests {
     use super::*;
@@ -2418,6 +2518,7 @@ mod landing_race_tests {
                         overwrite: true,
                         share_link: None,
                         model: None,
+                        expected_checksum: None,
                     })
                     .await
             })
@@ -2489,6 +2590,7 @@ mod landing_race_tests {
             overwrite: true,
             share_link: None,
             model: None,
+            expected_checksum: None,
         };
         let ada = crate::scope::Scope::User {
             account: "ada".to_string(),
@@ -2597,6 +2699,7 @@ mod landing_race_tests {
                         overwrite: false,
                         share_link: None,
                         model: None,
+                        expected_checksum: None,
                     })
                     .await
             })
@@ -2696,6 +2799,7 @@ mod on_disk_name_tests {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         }
     }
 

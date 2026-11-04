@@ -164,6 +164,12 @@ impl Engine {
     /// the folder file's, in an overlay the overlay file's, where it asks what
     /// this actor's view shows (its own bytes, or a reviewed file it has not
     /// deleted).
+    ///
+    /// A path that already shows exactly these bytes (same sha256) is not
+    /// refused and not written, with `create_only` or without: the receipt
+    /// says `unchanged`, and no file, row, change or pending mark follows. A
+    /// retry after a timeout is safe that way. `draft` then says where those
+    /// bytes are: this actor's own file, or the folder's reviewed one.
     pub(crate) async fn attachment_write_in(
         &self,
         view: &DomainView<'_>,
@@ -185,7 +191,7 @@ impl Engine {
             )));
         }
         if let Some(actor) = view.actor() {
-            let (row, created) = if create_only {
+            let put = if create_only {
                 view.put_file_if_absent(path, &bytes).await?
             } else {
                 view.put_file(path, &bytes).await?
@@ -196,13 +202,19 @@ impl Engine {
             // uploading it again to keep your version or deleting it to take
             // the team's, so both of those take the path out of the recorded
             // conflicts on the way out.
+            //
+            // That holds for the same bytes again too: uploading your own
+            // version unchanged is still how you keep it.
             self.settle_file_convergence(view.domain(), actor, path)
                 .await;
-            crate::maintenance::record_pending(view.domain());
+            if !put.unchanged {
+                crate::maintenance::record_pending(view.domain());
+            }
             return Ok(WrittenAttachment {
-                row,
-                draft: true,
-                created,
+                row: put.row,
+                draft: put.in_overlay,
+                created: put.created,
+                unchanged: put.unchanged,
             });
         }
         let replace = if create_only {
@@ -210,19 +222,26 @@ impl Engine {
         } else {
             ReplaceRule::Allow
         };
-        let WrittenAsset { row, created } = self
+        let WrittenAsset {
+            row,
+            created,
+            unchanged,
+        } = self
             .asset_write_in(AssetHome::Engram, view.domain(), path, bytes, replace)
             .await?;
-        self.announce_attachment(
-            view.domain(),
-            &row.path,
-            Some(row.sha256.clone()),
-            actor_label,
-        );
+        if !unchanged {
+            self.announce_attachment(
+                view.domain(),
+                &row.path,
+                Some(row.sha256.clone()),
+                actor_label,
+            );
+        }
         Ok(WrittenAttachment {
             row,
             draft: false,
             created,
+            unchanged,
         })
     }
 
@@ -1185,6 +1204,7 @@ impl Engine {
                     // would be a link to the page being split, not to this.
                     share_link: None,
                     model: None,
+                    expected_checksum: None,
                 },
                 client,
                 // The splitter's own scope: the new engram is written by

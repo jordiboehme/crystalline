@@ -59,6 +59,14 @@
 //!   was, so the next call tries again. Only the server's own refusal asks
 //!   for a new sign-in: an OAuth `invalid_grant` or `invalid_client` from the
 //!   token endpoint, or a `401` that a refresh cannot cure.
+//! - **A write that went out and got no answer may have happened.** A
+//!   forwarded write (a tool call or an automation verb that changes data)
+//!   that fails after the connect finished, on the overall limit or a broken
+//!   connection, is [`RemoteFailure::Unanswered`]: the caller reads that the
+//!   write may or may not have happened and how to check, and the source
+//!   stays up (it took the connection). A connect that failed never sent
+//!   anything and stays [`RemoteFailure::TimedOut`] or
+//!   [`RemoteFailure::Unreachable`].
 //! - **A source that failed is down for a short window** ([`DOWN_WINDOW`]).
 //!   While it lasts every call answers the recorded failure at once without
 //!   touching the network; the first call after it tries again, and the first
@@ -111,6 +119,30 @@ pub const AGENT_FILES_CAPABILITY: &str = "agent_files";
 /// The first release that lists [`AGENT_FILES_CAPABILITY`], named in the
 /// sentence an agent reads when its server is older.
 pub const AGENT_FILES_RELEASE: &str = "0.31.0";
+
+/// The first release whose `write_engram` takes `expected_checksum`. An older
+/// server ignores the field and writes last-write-wins, so a guarded write is
+/// not sent to one.
+pub const WRITE_CHECKSUM_RELEASE: &str = "0.32.0";
+
+/// Whether a `major.minor.patch` version is at least `min`. A pre-release or
+/// build suffix after the patch is ignored, and a version that does not parse
+/// is never enough: a guard is not handed to a server on a guess.
+pub fn version_at_least(version: &str, min: &str) -> bool {
+    fn parts(v: &str) -> Option<(u64, u64, u64)> {
+        let core = v.trim().trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        let mut it = core.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        it.next().is_none().then_some((major, minor, patch))
+    }
+    match (parts(version), parts(min)) {
+        (Some(have), Some(need)) => have >= need,
+        _ => false,
+    }
+}
 
 /// The largest answer to a [`FILE_COMMAND`] this client reads: the base64 of
 /// the largest file a domain holds ([`crystalline_core::MAX_ATTACHMENT_BYTES`],
@@ -233,6 +265,17 @@ pub enum RemoteFailure {
         /// How long it waited.
         after: Duration,
     },
+    /// A write went out and no answer came: the limit ran out, the
+    /// connection broke after the connect had finished, or a gateway
+    /// answered 504 or 502 ([`Silence`]). The server may have done the write
+    /// or not. It does not open the down window, whatever the [`Budget`]
+    /// (the server took the connection), except for a gateway's 502, which
+    /// marks the source down with the gateway's own sentence
+    /// ([`RemoteFailure::down_mark`]). A failure of the connect itself (name,
+    /// TCP, TLS) never sent anything and stays [`RemoteFailure::TimedOut`]
+    /// or [`RemoteFailure::Unreachable`]. Boxed, so every error that carries
+    /// a failure stays small.
+    Unanswered(Box<UnansweredWrite>),
 }
 
 impl RemoteFailure {
@@ -247,6 +290,25 @@ impl RemoteFailure {
     pub fn server_text(&self) -> Option<&str> {
         match self {
             RemoteFailure::Status { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+
+    /// The failure the down window records for this one, when it opens the
+    /// window: an unreachable or timed-out source as it is, and a write a
+    /// gateway answered with `502` as the gateway's plain sentence, so a
+    /// later call inside the window is never told about a write it did not
+    /// send.
+    pub fn down_mark(&self) -> Option<RemoteFailure> {
+        match self {
+            failure if failure.is_unreachable() => Some(failure.clone()),
+            RemoteFailure::Unanswered(write) if write.silence == Silence::Gateway(502) => {
+                Some(RemoteFailure::Unreachable {
+                    source: write.source.clone(),
+                    url: write.url.clone(),
+                    detail: gateway_detail(502),
+                })
+            }
             _ => None,
         }
     }
@@ -295,11 +357,83 @@ impl std::fmt::Display for RemoteFailure {
                 "{source} ({url}) {UNREACHABLE_WORDS}: it did not answer within {} ({NETWORK_HINT})",
                 seconds(*after)
             ),
+            RemoteFailure::Unanswered(write) => {
+                let (source, url, check) = (&write.source, &write.url, &write.check);
+                match write.silence {
+                    Silence::Waited(after) => write!(
+                        f,
+                        "{source} ({url}) did not answer within {}. {check}",
+                        seconds(after)
+                    ),
+                    Silence::BrokeOff => write!(
+                        f,
+                        "{source} ({url}) broke off the connection before it answered. {check}"
+                    ),
+                    Silence::Gateway(status) if status == GATEWAY_TIMEOUT => write!(
+                        f,
+                        "{source} ({url}) did not answer in time: its gateway answered {}. {check}",
+                        status_text(status)
+                    ),
+                    Silence::Gateway(status) => write!(
+                        f,
+                        "{source} ({url}) gave no answer: its gateway answered {}. \
+                         {check}",
+                        status_text(status)
+                    ),
+                }
+            }
         }
     }
 }
 
 impl std::error::Error for RemoteFailure {}
+
+/// A write that went out with no answer ([`RemoteFailure::Unanswered`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnansweredWrite {
+    /// The source's name.
+    pub source: String,
+    /// The server.
+    pub url: String,
+    /// How the answer failed to come.
+    pub silence: Silence,
+    /// What may have happened and how to check, for the tool that was
+    /// called.
+    pub check: String,
+}
+
+/// How a write's answer failed to come ([`UnansweredWrite`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Silence {
+    /// The limit ran out after this long.
+    Waited(Duration),
+    /// The connection broke while the request went out or while its answer
+    /// was awaited.
+    BrokeOff,
+    /// A gateway in front of the server answered with this status: `504`
+    /// (it passed the write on and the server did not answer it in time) or
+    /// `502` (the connection to the server broke).
+    Gateway(u16),
+}
+
+/// The status a gateway answers when the server behind it did not answer in
+/// time.
+const GATEWAY_TIMEOUT: u16 = 504;
+
+/// `504 Gateway Timeout`: a status with its reason, as a person reads it.
+fn status_text(status: u16) -> String {
+    reqwest::StatusCode::from_u16(status)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| status.to_string())
+}
+
+/// What a gateway's `502`, `503` or `504` says about the server behind it.
+fn gateway_detail(status: u16) -> String {
+    format!(
+        "its gateway answered {}, so the server behind it is down",
+        status_text(status)
+    )
+}
 
 /// `3 s`, `0.7 s`: a deadline as a person reads it.
 pub fn seconds(after: Duration) -> String {
@@ -500,6 +634,37 @@ impl Peer {
         }
     }
 
+    /// A transport error on a request that changes data, `check` being what
+    /// the caller reads about it. Every failure after the connect (the
+    /// overall limit running out, a connection that broke while the request
+    /// went out or while its answer was awaited) may have left the change
+    /// done, so it says so and how to check. The connect has a timer of its
+    /// own and its failures read as connect errors (name, TCP, TLS): those
+    /// never sent anything and stay [`Peer::failure`], as does every request
+    /// that only reads.
+    fn sent_failure(
+        &self,
+        e: &reqwest::Error,
+        limit: Duration,
+        check: Option<&str>,
+    ) -> RemoteFailure {
+        match check {
+            Some(check) if !e.is_connect() && !e.is_builder() => {
+                RemoteFailure::Unanswered(Box::new(UnansweredWrite {
+                    source: self.source.clone(),
+                    url: self.url.clone(),
+                    silence: if e.is_timeout() {
+                        Silence::Waited(limit)
+                    } else {
+                        Silence::BrokeOff
+                    },
+                    check: check.to_string(),
+                }))
+            }
+            _ => self.failure(e, limit),
+        }
+    }
+
     /// A redirect: refused, never followed ([`http_client`]).
     fn redirect(&self, status: reqwest::StatusCode) -> Option<RemoteFailure> {
         status
@@ -512,8 +677,32 @@ impl Peer {
         matches!(status.as_u16(), 502..=504).then(|| RemoteFailure::Unreachable {
             source: self.source.clone(),
             url: self.url.clone(),
-            detail: format!("its gateway answered {status}, so the server behind it is down"),
+            detail: gateway_detail(status.as_u16()),
         })
+    }
+
+    /// A gateway's answer to a request that changes data, `check` being what
+    /// the caller reads about it. A `504` (the gateway passed the request on
+    /// and the server did not answer in time) and a `502` (the connection
+    /// behind the gateway broke) may have left the change done. A `503` (no
+    /// server behind the gateway, nothing passed on) and every read are
+    /// [`Peer::gateway`].
+    fn sent_gateway(
+        &self,
+        status: reqwest::StatusCode,
+        check: Option<&str>,
+    ) -> Option<RemoteFailure> {
+        match (check, status.as_u16()) {
+            (Some(check), code @ (502 | 504)) => {
+                Some(RemoteFailure::Unanswered(Box::new(UnansweredWrite {
+                    source: self.source.clone(),
+                    url: self.url.clone(),
+                    silence: Silence::Gateway(code),
+                    check: check.to_string(),
+                })))
+            }
+            _ => self.gateway(status),
+        }
     }
 }
 
@@ -739,9 +928,9 @@ impl Connection {
     /// server cannot erase a mark another call just set.
     pub(crate) fn note<T>(&self, result: &Result<T, RemoteFailure>) {
         if let Err(failure) = result
-            && failure.is_unreachable()
+            && let Some(mark) = failure.down_mark()
         {
-            self.health.mark_down(&self.source.key(), failure);
+            self.health.mark_down(&self.source.key(), &mark);
             self.drop_pool();
         }
     }
@@ -1021,6 +1210,22 @@ impl Connection {
             .is_some_and(|all| all.iter().any(|c| c == AGENT_FILES_CAPABILITY)))
     }
 
+    /// The version the server names in its `status` answer, or `None` when
+    /// it names none.
+    pub async fn server_version(
+        &self,
+        limit: Duration,
+        budget: Budget,
+    ) -> Result<Option<String>, RemoteFailure> {
+        let status = self
+            .ctl_data_within(json!({ "v": 1, "cmd": "status" }), limit, budget)
+            .await?;
+        Ok(status["version"]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string))
+    }
+
     /// One file of a domain on the server, by its domain-relative path
     /// (`assets/...` or `reflections/assets/...`), within `limit`: the
     /// server's `{mime, size, base64}`, read with [`FILE_ANSWER_CAP`] as the
@@ -1058,6 +1263,9 @@ impl Connection {
                 after: limit,
             });
         }
+        // A request that changes data and got no answer after it went out
+        // may have been done; what the caller checks depends on the request.
+        let check = crate::unanswered::unanswered_check(request);
         let response = self
             .http()
             .post(format!("{}{}", self.source.url, crate::CTL_PATH))
@@ -1067,9 +1275,9 @@ impl Connection {
             .body(request.to_string())
             .send()
             .await
-            .map_err(|e| peer.failure(&e, limit))?;
+            .map_err(|e| peer.sent_failure(&e, limit, check.as_deref()))?;
         let status = response.status();
-        if let Some(down) = peer.gateway(status) {
+        if let Some(down) = peer.sent_gateway(status, check.as_deref()) {
             return Err(down);
         }
         self.answered();
@@ -1086,7 +1294,10 @@ impl Connection {
                 .await
                 .map_err(|e| e.into_failure(&peer, limit))?
         } else {
-            response.text().await.map_err(|e| peer.failure(&e, limit))?
+            response
+                .text()
+                .await
+                .map_err(|e| peer.sent_failure(&e, limit, check.as_deref()))?
         };
         if status == reqwest::StatusCode::NOT_FOUND
             || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
@@ -1568,6 +1779,391 @@ mod tests {
         assert_eq!(connection.down(), None);
     }
 
+    /// A loopback server that reads each request whole, its body included,
+    /// and then never answers, holding the connection open.
+    async fn silent_after_the_body() -> String {
+        after_the_body("", true).await
+    }
+
+    /// A loopback server that reads each request whole, its body included,
+    /// and then drops the connection without an answer.
+    async fn dropping_after_the_body() -> String {
+        after_the_body("", false).await
+    }
+
+    /// Reads each request whole, writes `answer` (nothing, a whole answer or
+    /// the start of one), then holds the connection (`hold`) or drops it.
+    async fn after_the_body(answer: &'static str, hold: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&seen).to_lowercase();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if seen.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    // The whole request is in; `answer` is all that goes out.
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    if hold {
+                        std::future::pending::<()>().await;
+                    }
+                    drop(socket);
+                });
+            }
+        });
+        url
+    }
+
+    /// A connection to `url` with a token in hand.
+    fn signed_in(url: &str) -> Connection {
+        let mut connection = connection(Health::new(Duration::from_secs(30)));
+        connection.source.url = url.to_string();
+        connection.current = Arc::new(std::sync::Mutex::new(Some(ServerCredential::token(
+            "cmt_live".to_string(),
+            url.to_string(),
+            "keeper".to_string(),
+            Utc::now(),
+        ))));
+        connection
+    }
+
+    async fn write(connection: &Connection, args: Value, limit: Duration) -> RemoteFailure {
+        connection
+            .tool_within_as(
+                "write_engram",
+                args,
+                &ForwardedAgent { client: None },
+                limit,
+                Budget::Own,
+            )
+            .await
+            .unwrap_err()
+    }
+
+    /// An upload the server took in and never answered may have been
+    /// written: the agent is told so and how to check, not that the server
+    /// cannot be reached, and the source stays up even on its own limit.
+    #[tokio::test]
+    async fn an_upload_sent_and_never_answered_may_have_been_written() {
+        let url = silent_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                    "base64": "aGVsbG8=" }),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(matches!(failed, RemoteFailure::Unanswered(_)), "{failed:?}");
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) did not answer within 0.3 s. The file may or may not be written. \
+                 Read assets/shot.png with read_engram to check its sha256, or upload the same \
+                 file again: the same bytes are accepted."
+            )
+        );
+        assert!(!failed.to_string().contains(UNREACHABLE_WORDS));
+        assert_eq!(connection.down(), None, "slow is not down");
+    }
+
+    /// An engram write that was sent and never answered says the engram may
+    /// be written and to read it before writing it again.
+    #[tokio::test]
+    async fn an_engram_write_sent_and_never_answered_may_have_been_written() {
+        let url = silent_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Night deploys", "content": "We deploy at night." }),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) did not answer within 0.3 s. The engram may or may not be written. \
+                 Read 'Night deploys' with read_engram to see whether it holds your text before \
+                 you write it again."
+            )
+        );
+        assert_eq!(connection.down(), None);
+    }
+
+    /// A write whose connection broke after the request went out may have
+    /// been done too: it says so, never "cannot be reached", and the source
+    /// stays up.
+    #[tokio::test]
+    async fn a_write_whose_connection_broke_after_sending_may_have_been_written() {
+        let url = dropping_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                    "base64": "aGVsbG8=" }),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) broke off the connection before it answered. The file may or may \
+                 not be written. Read assets/shot.png with read_engram to check its sha256, or \
+                 upload the same file again: the same bytes are accepted."
+            )
+        );
+        assert!(!failed.to_string().contains(UNREACHABLE_WORDS));
+        assert_eq!(connection.down(), None);
+    }
+
+    /// An automation verb that changes data gets the same treatment; one
+    /// that only reads keeps its old failure.
+    #[tokio::test]
+    async fn an_automation_write_never_answered_may_have_happened() {
+        let url = silent_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = connection
+            .ctl_within_as(
+                json!({ "v": 1, "cmd": "automation_run_record", "loop": "evolve",
+                        "domain": "open", "token": "t", "report": {} }),
+                Duration::from_millis(300),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failed.to_string(),
+            format!(
+                "acme ({url}) did not answer within 0.3 s. The run may or may not be recorded. \
+                 Run crystalline evolve status: the run still shows as running while it is not \
+                 recorded."
+            )
+        );
+        assert_eq!(connection.down(), None);
+
+        let read = connection
+            .ctl_within_as(
+                json!({ "v": 1, "cmd": "automation_status", "loop": "evolve" }),
+                Duration::from_millis(300),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(read, RemoteFailure::TimedOut { .. }), "{read:?}");
+        assert!(connection.down().is_some());
+    }
+
+    /// A gateway that answers 504 passed the write on and the server behind
+    /// it did not answer in time: it may have happened, and the source stays
+    /// up. A 502 says the same to the caller but still opens the down window,
+    /// with the gateway's plain sentence for every call that follows.
+    #[tokio::test]
+    async fn a_gateway_answer_to_a_write_says_it_may_have_happened() {
+        for (status, said, down) in [
+            (
+                "504 Gateway Timeout",
+                "did not answer in time: its gateway answered 504 Gateway Timeout",
+                false,
+            ),
+            (
+                "502 Bad Gateway",
+                "gave no answer: its gateway answered 502 Bad Gateway",
+                true,
+            ),
+        ] {
+            let head: &'static str = Box::leak(
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .into_boxed_str(),
+            );
+            for (args, check) in [
+                (
+                    json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                            "base64": "aGVsbG8=" }),
+                    "The file may or may not be written. Read assets/shot.png with read_engram \
+                     to check its sha256, or upload the same file again: the same bytes are \
+                     accepted.",
+                ),
+                (
+                    json!({ "domain": "open", "title": "Night deploys", "content": "x" }),
+                    "The engram may or may not be written. Read 'Night deploys' with \
+                     read_engram to see whether it holds your text before you write it again.",
+                ),
+            ] {
+                let url = after_the_body(head, false).await;
+                let connection = signed_in(&url);
+                let failed = write(&connection, args, Duration::from_secs(3)).await;
+                assert_eq!(
+                    failed.to_string(),
+                    format!("acme ({url}) {said}. {check}"),
+                    "{status}"
+                );
+                match connection.down() {
+                    Some(mark) if down => {
+                        assert!(mark.to_string().contains(UNREACHABLE_WORDS), "{mark}");
+                        assert!(!mark.to_string().contains("may or may not"), "{mark}");
+                    }
+                    None if !down => {}
+                    other => panic!("{status}: down window {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A read through a gateway that answers 504 keeps today's sentence and
+    /// opens the down window.
+    #[tokio::test]
+    async fn a_gateway_timeout_on_a_read_still_cannot_be_reached() {
+        let url = after_the_body(
+            "HTTP/1.1 504 Gateway Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            false,
+        )
+        .await;
+        let connection = signed_in(&url);
+        let failed = connection
+            .tool_within_as(
+                "read_engram",
+                json!({ "identifier": "x", "domain": "open" }),
+                &ForwardedAgent { client: None },
+                Duration::from_secs(3),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, RemoteFailure::Unreachable { .. }),
+            "{failed:?}"
+        );
+        assert!(
+            failed.to_string().contains("gateway answered 504"),
+            "{failed}"
+        );
+        assert!(connection.down().is_some());
+    }
+
+    /// The answer's headers came and its body did not: on a write that is
+    /// the same unknown result, whether the body stalls or breaks off.
+    #[tokio::test]
+    async fn a_write_whose_answer_body_failed_may_have_happened() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"v\":1";
+        for (hold, said) in [
+            (true, "did not answer within 0.5 s"),
+            (false, "broke off the connection before it answered"),
+        ] {
+            let url = after_the_body(head, hold).await;
+            let connection = signed_in(&url);
+            let failed = write(
+                &connection,
+                json!({ "domain": "open", "title": "Night deploys", "content": "x" }),
+                Duration::from_millis(500),
+            )
+            .await;
+            assert!(
+                failed.to_string().starts_with(&format!(
+                    "acme ({url}) {said}. The engram may or may not be written."
+                )),
+                "{failed}"
+            );
+            assert_eq!(connection.down(), None);
+        }
+    }
+
+    /// A read that timed out is still a source that does not answer: it says
+    /// so and opens the down window, as before.
+    #[tokio::test]
+    async fn a_read_sent_and_never_answered_still_cannot_be_reached() {
+        let url = silent_after_the_body().await;
+        let connection = signed_in(&url);
+        let failed = connection
+            .tool_within_as(
+                "search_engrams",
+                json!({ "query": "deploy" }),
+                &ForwardedAgent { client: None },
+                Duration::from_millis(300),
+                Budget::Own,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(failed, RemoteFailure::TimedOut { .. }),
+            "{failed:?}"
+        );
+        assert!(connection.down().is_some());
+    }
+
+    /// A connect that timed out (here a TLS handshake nobody answers) never
+    /// sent the write: it still cannot be reached and opens the down window.
+    #[tokio::test]
+    async fn a_write_whose_connect_timed_out_cannot_be_reached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let connection = signed_in(&url);
+        connection.http.lock().unwrap().client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Shot", "path": "assets/shot.png",
+                    "base64": "aGVsbG8=" }),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            matches!(failed, RemoteFailure::TimedOut { .. }),
+            "{failed:?}"
+        );
+        assert!(failed.to_string().contains(UNREACHABLE_WORDS), "{failed}");
+        assert!(connection.down().is_some());
+    }
+
+    /// A refused connect never sent the write either.
+    #[tokio::test]
+    async fn a_write_whose_connect_was_refused_cannot_be_reached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let connection = signed_in(&url);
+        let failed = write(
+            &connection,
+            json!({ "domain": "open", "title": "Night deploys", "content": "x" }),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            matches!(failed, RemoteFailure::Unreachable { .. }),
+            "{failed:?}"
+        );
+        assert!(failed.to_string().contains(UNREACHABLE_WORDS), "{failed}");
+        assert!(connection.down().is_some());
+    }
+
     /// The ceiling holds the largest file a domain keeps, as base64.
     #[test]
     fn the_file_ceiling_holds_the_largest_file_as_base64() {
@@ -1579,5 +2175,23 @@ mod tests {
 
     fn connection_with_no_mark() -> Connection {
         connection(Health::new(Duration::from_secs(30)))
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::version_at_least;
+
+    #[test]
+    fn a_version_is_compared_by_its_numbers_and_an_odd_one_is_never_enough() {
+        assert!(version_at_least("0.32.0", "0.32.0"));
+        assert!(version_at_least("0.32.1", "0.32.0"));
+        assert!(version_at_least("1.0.0", "0.32.0"));
+        assert!(version_at_least("0.40.0-rc.1", "0.32.0"));
+        assert!(!version_at_least("0.31.9", "0.32.0"));
+        assert!(!version_at_least("0.4.0", "0.32.0"));
+        assert!(!version_at_least("", "0.32.0"));
+        assert!(!version_at_least("next", "0.32.0"));
+        assert!(!version_at_least("0.32", "0.32.0"));
     }
 }

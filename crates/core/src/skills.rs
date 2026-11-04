@@ -393,6 +393,17 @@ mod tests {
     }
 
     #[test]
+    fn the_capture_skill_guards_a_whole_engram_overwrite_too() {
+        let capture = skill("crystalline-capture").unwrap().content;
+        for needle in [
+            "`write_engram` with `overwrite: true` that rewrites the whole engram",
+            "pass the checksum from your read",
+        ] {
+            assert!(capture.contains(needle), "capture skill lacks {needle}");
+        }
+    }
+
+    #[test]
     fn the_capture_skill_teaches_the_close_folder_hint() {
         let capture = skill("crystalline-capture").unwrap().content;
         for needle in ["`close_folders`", "`move_engram`", "V112"] {
