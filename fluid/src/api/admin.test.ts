@@ -132,6 +132,8 @@ describe("the admin client layer", () => {
           app_id: 7,
           slug: "crystalline-kb",
           source: "keyring",
+          client_id: "Iv23.kb",
+          client_secret_set: false,
           install_url:
             "https://github.example/apps/crystalline-kb/installations/new",
           webhook_secret_set: true,
@@ -142,6 +144,9 @@ describe("the admin client layer", () => {
       appId: 7,
       slug: "crystalline-kb",
       source: "keyring",
+      clientId: "Iv23.kb",
+      clientSecretSet: false,
+      webhookSecretSet: true,
       installUrl:
         "https://github.example/apps/crystalline-kb/installations/new",
       error: null,

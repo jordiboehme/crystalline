@@ -649,13 +649,23 @@ export type GithubAppManifestResponse = {
 };
 
 /**
- * The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.
+ * The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the client secret and the webhook secret are set.
  */
 export type GithubAppView = {
     /**
      * The numeric App id, when the App could be read.
      */
     app_id?: number | null;
+    /**
+     * The App's client id, when the App could be read. Not a secret: it
+     * goes into the authorize URL of every sign-in.
+     */
+    client_id?: string | null;
+    /**
+     * Whether a client secret is set. Without one nobody can link their
+     * GitHub account. False while the App is still loading.
+     */
+    client_secret_set: boolean;
     /**
      * Why the App cannot be used, when it cannot.
      */

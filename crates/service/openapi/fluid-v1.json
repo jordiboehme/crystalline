@@ -13245,8 +13245,9 @@
       },
       "GithubAppView": {
         "type": "object",
-        "description": "The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.",
+        "description": "The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the client secret and the webhook secret are set.",
         "required": [
+          "client_secret_set",
           "webhook_secret_set",
           "loading"
         ],
@@ -13260,6 +13261,19 @@
             "description": "The numeric App id, when the App could be read.",
             "example": 123456,
             "minimum": 0
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The App's client id, when the App could be read. Not a secret: it\ngoes into the authorize URL of every sign-in.",
+            "example": "Iv23liExample"
+          },
+          "client_secret_set": {
+            "type": "boolean",
+            "description": "Whether a client secret is set. Without one nobody can link their\nGitHub account. False while the App is still loading.",
+            "example": true
           },
           "error": {
             "type": [

@@ -448,6 +448,55 @@ function appLanding(params: URLSearchParams): Notice | null {
 }
 
 /**
+ * What the card says about the App's client secret: whether it is set and,
+ * when it is not, the step on the server that fixes it. Only whether, never
+ * the secret: nothing here takes one. The settings screen is for admins, so
+ * only an admin sees this line.
+ */
+function ClientSecretLine({ app }: { app: GithubApp }) {
+  // An App that is refused or unreadable carries no ids and no secret state:
+  // the secret may well be set, and saving the App again could do harm. The
+  // error beside it says what is wrong, so nothing is claimed here.
+  if (app.error !== null && app.appId === null && app.clientId === null) {
+    return null;
+  }
+  if (app.clientSecretSet) {
+    return <p className="text-sm">Client secret: set</p>;
+  }
+  // `set` saves the whole App again, so it needs the id, the client id and
+  // the private key too; none of those is a secret except the key file.
+  const command = [
+    "crystalline github app set",
+    `--app-id ${app.appId === null ? "<id>" : String(app.appId)}`,
+    `--client-id ${app.clientId ?? "<id>"}`,
+    "--private-key-file <file>",
+    "--client-secret-file <file>",
+    ...(app.webhookSecretSet ? ["--webhook-secret-file <file>"] : []),
+  ].join(" ");
+  const hint = "text-slate-500 dark:text-slate-400";
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      <p>Client secret: not set</p>
+      <p className={hint}>
+        Without it, people cannot link their GitHub account.
+      </p>
+      {app.source === "environment" && (
+        <p className={hint}>
+          Set CRYSTALLINE_GITHUB_APP_CLIENT_SECRET or
+          CRYSTALLINE_GITHUB_APP_CLIENT_SECRET_FILE on the server, then restart
+          it.
+        </p>
+      )}
+      {(app.source === "keyring" || app.source === "file") && (
+        <p className={hint}>
+          Run this on the server: <code className="font-mono">{command}</code>
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * The instance's GitHub App: create it through GitHub's manifest flow, then
  * install it on repositories.
  *
@@ -538,6 +587,7 @@ function AppSection({
               (app.appId === null ? "GitHub App" : `App ${String(app.appId)}`)}
             {app.source !== null && ` (${app.source})`}
           </p>
+          <ClientSecretLine app={app} />
           {app.error !== null && (
             <p
               role="alert"

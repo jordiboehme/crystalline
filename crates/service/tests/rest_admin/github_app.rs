@@ -155,6 +155,8 @@ struct Setup {
     /// The API url under `/api/v3`, as for an Enterprise Server.
     ghes: bool,
     read_only: bool,
+    /// Environment variables the overlay reads (an App from the environment).
+    env: Vec<(String, String)>,
 }
 
 impl Default for Setup {
@@ -163,6 +165,7 @@ impl Default for Setup {
             public_url: true,
             ghes: false,
             read_only: false,
+            env: Vec::new(),
         }
     }
 }
@@ -211,7 +214,7 @@ impl Ctx {
             .insert("eng".to_string(), DomainEntry::file(dir));
         let config_path = tmp.path().join("config.yaml");
         crystalline_core::config::save_yaml(&config_path, &config).unwrap();
-        let overlay = EnvOverlay::from_vars(Vec::<(String, String)>::new()).unwrap();
+        let overlay = EnvOverlay::from_vars(setup.env.clone()).unwrap();
         let clock = Arc::new(Mutex::new(Instant::now()));
         let read = clock.clone();
         let store = TursoStore::open_in_memory().await.unwrap();
@@ -238,6 +241,7 @@ impl Ctx {
             ("root", Role::Admin),
             ("rita", Role::Admin),
             ("ann", Role::Editor),
+            ("vera", Role::Viewer),
         ] {
             auth.add_user(name, name, None, role, PASSWORD)
                 .await
@@ -764,4 +768,114 @@ async fn the_setup_landing_goes_to_the_settings_page() {
         .await;
     assert_eq!(response.status(), 303);
     assert_eq!(location(&response), "/settings/github?app=installed");
+}
+
+/// The environment of an App that comes from the variables.
+fn env_app(client_secret: Option<&str>) -> Vec<(String, String)> {
+    let mut vars = vec![
+        ("CRYSTALLINE_GITHUB_APP_ID".to_string(), "7".to_string()),
+        (
+            "CRYSTALLINE_GITHUB_APP_CLIENT_ID".to_string(),
+            "Iv23.env".to_string(),
+        ),
+        (
+            "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY".to_string(),
+            PEM.to_string(),
+        ),
+    ];
+    if let Some(secret) = client_secret {
+        vars.push((
+            "CRYSTALLINE_GITHUB_APP_CLIENT_SECRET".to_string(),
+            secret.to_string(),
+        ));
+    }
+    vars
+}
+
+/// The status JSON once the App has settled (a saved or environment App
+/// loads in the background first and reads as loading until then).
+async fn settled_app(ctx: &Ctx, cookies: &Cookies) -> (String, serde_json::Value) {
+    let started = Instant::now();
+    loop {
+        let text = ctx
+            .get("/settings/github", cookies)
+            .await
+            .text()
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if status["app"]["loading"] == false || started.elapsed() > Duration::from_secs(20) {
+            return (text, status);
+        }
+        ctx.engine.preload_github_app();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_view_says_whether_an_app_from_the_environment_has_a_client_secret() {
+    let github = FakeGithub::start().await;
+    for (secret, set) in [(Some("env-client-secret-value"), true), (None, false)] {
+        let ctx = Ctx::with(
+            &github,
+            Setup {
+                env: env_app(secret),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let root = ctx.login("root").await;
+        let (text, status) = settled_app(&ctx, &root).await;
+        assert_eq!(status["app"]["source"], "environment", "{text}");
+        assert_eq!(status["app"]["client_secret_set"], set, "{text}");
+        assert_eq!(status["app"]["client_id"], "Iv23.env", "{text}");
+        assert!(!text.contains("env-client-secret-value"), "{text}");
+        assert!(!text.contains("PRIVATE KEY"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn the_view_says_whether_a_saved_app_has_a_client_secret() {
+    let github = FakeGithub::start().await;
+    for (secret, set) in [(Some("saved-client-secret-value"), true), (None, false)] {
+        let ctx = Ctx::start(&github).await;
+        AppStore::file_fallback(&ctx.tmp.path().join("tokens"))
+            .save(&crystalline_remote::AppCredentials {
+                app_id: 9,
+                client_id: "Iv23.saved".to_string(),
+                private_key: PEM.to_string(),
+                client_secret: secret.map(str::to_string),
+                webhook_secret: None,
+                slug: Some(SLUG.to_string()),
+                host: github.url.trim_start_matches("http://").to_string(),
+            })
+            .unwrap();
+        ctx.engine.reset_github_app();
+        let root = ctx.login("root").await;
+        let (text, status) = settled_app(&ctx, &root).await;
+        assert_eq!(status["app"]["source"], "file", "{text}");
+        assert_eq!(status["app"]["client_secret_set"], set, "{text}");
+        assert_eq!(status["app"]["client_id"], "Iv23.saved", "{text}");
+        assert!(!text.contains("saved-client-secret-value"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn the_status_with_the_client_secret_state_is_for_admins_only() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::with(
+        &github,
+        Setup {
+            env: env_app(Some("env-client-secret-value")),
+            ..Setup::default()
+        },
+    )
+    .await;
+    for name in ["ann", "vera"] {
+        let cookies = ctx.login(name).await;
+        let response = ctx.get("/settings/github", &cookies).await;
+        assert_eq!(response.status(), 403, "{name}");
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("client_secret_set"), "{name}: {text}");
+    }
 }
