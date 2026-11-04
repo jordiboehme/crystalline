@@ -16,6 +16,7 @@ mod remote_server;
 
 mod configure;
 mod daemon_task;
+mod desktop_bundle;
 mod desktop_state;
 mod doctor;
 mod doctor_names;

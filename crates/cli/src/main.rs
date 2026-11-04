@@ -17,6 +17,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod automation;
 mod cmd;
+mod desktop_bundle;
 mod desktop_state;
 mod doctor;
 mod harness_command;
@@ -400,6 +401,23 @@ enum Command {
         /// time is up, as that command does when it finishes.
         #[arg(long)]
         standalone: Option<String>,
+    },
+    /// Release and CI: stage a Claude Desktop extension (manifest, icon and,
+    /// for the hollow one, the launcher) under a folder. Hidden, and not a
+    /// setup step.
+    #[command(name = "desktop-bundle", hide = true)]
+    DesktopBundle {
+        /// Which bundle to stage.
+        #[arg(value_enum)]
+        kind: desktop_bundle::BundleKind,
+        /// The folder the files are written into (created if missing).
+        outdir: PathBuf,
+        /// The Crystalline binary the hollow manifest pins.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Also pack the staged files into this .mcpb (hollow only).
+        #[arg(long = "pack")]
+        pack: Option<PathBuf>,
     },
     /// Windows: register, remove or print the Task Scheduler task that
     /// starts the daemon outside any app package. The MSI runs it; `doctor
@@ -2390,6 +2408,12 @@ fn run() -> anyhow::Result<()> {
                 cli.json,
             )
         }),
+        Some(Command::DesktopBundle {
+            kind,
+            outdir,
+            binary,
+            pack,
+        }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
         Some(Command::DaemonTask { action }) => daemon_task_command(action),

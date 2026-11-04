@@ -99,6 +99,8 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# `tests/setup/desktop_bundle.rs` reads back the .mcpb the command packs.
+zip = { workspace = true }
 # The in-process Crystalline server the source tests connect to.
 axum = { workspace = true }
 assert_cmd = { workspace = true }
