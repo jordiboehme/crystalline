@@ -82,6 +82,7 @@ import type { Format } from "../editor/marks/formatting";
 import { NO_FORMATS } from "../editor/marks/formatting";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
 import { imagePreviews } from "../editor/imagePreviews";
+import { prefetchPictureTools } from "../editor/pictures/loader";
 import { readScalar } from "../editor/frontmatterFields";
 import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
@@ -544,6 +545,11 @@ function Surface({
   const [linksFiles, setLinksFiles] = useState(() =>
     linksAFile(mountText, home),
   );
+  // The picture tools' chunk, warmed on mount, so the first key around a
+  // picture finds its keys in.
+  useEffect(() => {
+    void prefetchPictureTools();
+  }, []);
   useEffect(() => {
     if (linksFiles) {
       return;

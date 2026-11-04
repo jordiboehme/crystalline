@@ -12,7 +12,7 @@
 
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { beforeAll, afterEach, describe, expect, it } from "vitest";
 
 import {
   bytes,
@@ -29,6 +29,11 @@ import { linkAt, linkChanges } from "../elementVerbs";
 import { imagePreviews } from "../imagePreviews";
 import { baseExtensions } from "../setup";
 import { marksOnLine } from "./hiddenMarks";
+import { prefetchPictureTools } from "../pictures/loader";
+
+beforeAll(async () => {
+  await prefetchPictureTools();
+});
 
 afterEach(cleanupMarkViews);
 

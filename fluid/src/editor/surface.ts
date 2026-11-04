@@ -36,6 +36,7 @@ import {
   hiddenMarkLayer,
 } from "./marks";
 import { marksOnEditLine } from "./marks/mode";
+import { pictureTools } from "./pictures/loader";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
 import { richPaste } from "./richPaste";
@@ -183,6 +184,10 @@ export function previewConfig(
         // page, so the picture is drawn here too: an author placing an image
         // sees what a reader will see rather than the reference to it.
         images,
+        // The keys around a picture, and later its handles and drag, from
+        // a lazy chunk the first time a page holds an image. Right after
+        // the pictures they act on.
+        pictureTools(),
         // Prose is proportional, code is not. Raw mode does not need this -
         // the whole buffer is mono there - so it rides the preview branch
         // with the rest of the read model.

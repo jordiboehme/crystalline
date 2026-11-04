@@ -33,6 +33,7 @@ import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 import { mainSelectionParked } from "../parkedSelection";
 import type { MarkKind, MarkRun } from "./hiddenMarks";
 import { atomsOnLine, runAt, runsOnLine } from "./hiddenMarks";
+import { pictureForKeys } from "./mode";
 
 /** A stretch a caret stays inside: a line, or a table cell's content. */
 export interface Segment {
@@ -221,6 +222,15 @@ function arrow(forward: boolean, extend: boolean): Command {
     const range = selection.main;
     if ((!extend && !range.empty) || !hasRuns(state, range.head)) {
       return false;
+    }
+    if (!extend) {
+      // A step onto a drawn picture is the picture tools' (P3): they select
+      // it first.
+      const run = runAt(state, range.head);
+      const edge = run ? (forward ? run.to : run.from) : range.head;
+      if (pictureForKeys(state, edge, forward) !== null) {
+        return false;
+      }
     }
     const head = stepVisible(state, range.head, forward, viewAtoms(view));
     if (head === null) {

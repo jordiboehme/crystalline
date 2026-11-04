@@ -14,7 +14,7 @@
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AssetResolver } from "../api/files";
 import {
@@ -30,8 +30,13 @@ import { attachmentUploads } from "./attachments";
 import { assetPath } from "./imageFormat";
 import { imagePreviews } from "./imagePreviews";
 import { baseExtensions, lineSeparatorFor } from "./setup";
+import { prefetchPictureTools } from "./pictures/loader";
 
 const opened: EditorView[] = [];
+
+beforeAll(async () => {
+  await prefetchPictureTools();
+});
 
 afterEach(() => {
   for (const view of opened) view.destroy();

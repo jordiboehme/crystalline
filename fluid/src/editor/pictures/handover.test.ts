@@ -9,7 +9,7 @@
 
 import { Compartment, EditorSelection, StateEffect } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { beforeAll, afterEach, describe, expect, it } from "vitest";
 
 import { copyHtmlOf } from "../copyHtml";
 import type { ElementEdit } from "../elementEdit";
@@ -28,6 +28,11 @@ import {
   setRaw,
   setShowMarks,
 } from "../../test/markKit";
+import { prefetchPictureTools } from "./loader";
+
+beforeAll(async () => {
+  await prefetchPictureTools();
+});
 
 afterEach(cleanupMarkViews);
 
@@ -177,13 +182,16 @@ describe("the delete check around a drawn picture", () => {
     },
   );
 
-  it("takes the picture whole with one Backspace after it or one Delete before it", () => {
+  it("selects the picture with one Backspace after it or one Delete before it, and takes it whole with the next", () => {
     for (const [at, key] of [
       [23, "Backspace"],
       [5, "Delete"],
     ] as const) {
       const view = drawn(BOLD);
       setCaret(view, at);
+      keys(view, key);
+      expect(bytes(view.state)).toBe(BOLD);
+      expect(view.state.selection.main).toMatchObject({ from: 5, to: 23 });
       keys(view, key);
       expect(bytes(view.state)).toBe("**ab**\n\nend");
     }
@@ -210,36 +218,51 @@ describe("the delete check around a drawn picture", () => {
 });
 
 describe("the caret around a drawn picture", () => {
-  /** Where ArrowRight stops from 0, then ArrowLeft back, until each end. */
-  function walk(view: EditorView): { right: number[]; left: number[] } {
-    const right: number[] = [];
-    const left: number[] = [];
+  /**
+   * Where ArrowRight stops from 0, then ArrowLeft back, until each end, as
+   * `anchor:head`: a press onto a picture the tools own selects it (ruling
+   * 3), the next one passes it.
+   */
+  function walk(view: EditorView): { right: string[]; left: string[] } {
+    const right: string[] = [];
+    const left: string[] = [];
+    const stop = () => {
+      const { anchor, head } = view.state.selection.main;
+      return `${anchor}:${head}`;
+    };
     setCaret(view, 0);
     for (let i = 0; i < 40 && caret(view) < view.state.doc.length; i += 1) {
       keys(view, "ArrowRight");
-      right.push(caret(view));
+      right.push(stop());
     }
     for (let i = 0; i < 40 && caret(view) > 0; i += 1) {
       keys(view, "ArrowLeft");
-      left.push(caret(view));
+      left.push(stop());
     }
     return { right, left };
   }
 
   it.each([
-    ["a [![Shot](assets/a.png)](https://x) b", 3, 24],
-    ["x **![x](assets/a.png)** y", 4, 22],
-  ])("walks %s with no stop inside the picture", (doc, from, to) => {
-    const view = drawn(doc);
-    const { right, left } = walk(view);
-    expect(right.at(-1)).toBe(doc.length);
-    expect(left.at(-1)).toBe(0);
-    for (const stops of [right, left]) {
-      // Every press moves the caret.
-      expect(new Set(stops).size).toBe(stops.length);
-      expect(stops.some((pos) => pos > from && pos < to)).toBe(false);
-    }
-  });
+    ["a [![Shot](assets/a.png)](https://x) b", 3, 24, false],
+    ["x **![x](assets/a.png)** y", 4, 22, true],
+  ] as const)(
+    "walks %s with no stop inside the picture",
+    (doc, from, to, selects) => {
+      const view = drawn(doc);
+      const { right, left } = walk(view);
+      expect(right.at(-1)).toBe(`${doc.length}:${doc.length}`);
+      expect(left.at(-1)).toBe("0:0");
+      for (const stops of [right, left]) {
+        // Every press moves the caret or the selection.
+        expect(new Set(stops).size).toBe(stops.length);
+        const ends = stops.flatMap((s) => s.split(":").map(Number));
+        expect(ends.some((pos) => pos > from && pos < to)).toBe(false);
+      }
+      // A linked picture is the link's: the caret steps over it whole.
+      expect(right.includes(`${from}:${to}`)).toBe(selects);
+      expect(left.includes(`${to}:${from}`)).toBe(selects);
+    },
+  );
 });
 
 describe("a copy around a drawn picture", () => {
@@ -460,5 +483,8 @@ describe("a deletion that covers a whole drawn picture next to a mark", () => {
       }
       expect(differ).toEqual([]);
     },
+    // Every range of the document, twice over: seconds of work that a full
+    // parallel run can push past the default 5 s.
+    30_000,
   );
 });

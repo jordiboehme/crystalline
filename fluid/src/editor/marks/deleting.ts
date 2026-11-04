@@ -57,7 +57,7 @@ import {
 } from "./caret";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
-import { marksHiddenOnLine } from "./mode";
+import { marksHiddenOnLine, pictureForKeys } from "./mode";
 import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 
 type HeadingQuestion = (
@@ -377,6 +377,10 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
   let removal: Range;
   if (forward) {
     const q = run ? run.to : head;
+    if (pictureForKeys(state, q, true) !== null) {
+      // The picture tools select it first (P3).
+      return false;
+    }
     if (q >= segment.to) {
       return deleteAtEdge(view, segment.to, true);
     }
@@ -393,6 +397,9 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
     }
   } else {
     const q = run ? run.from : head;
+    if (pictureForKeys(state, q, false) !== null) {
+      return false;
+    }
     if (q <= start) {
       return blockRule(view, start);
     }

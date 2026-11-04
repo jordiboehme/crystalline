@@ -34,6 +34,45 @@ export const picturesDrawn = Facet.define<boolean, boolean>({
   combine: (values) => values.some(Boolean),
 });
 
+/**
+ * Provided by the picture tools (`pictures/selectKeys.ts`, a lazy chunk):
+ * the keys around a picture are theirs (rulings 3 and 5), so the hidden-mark
+ * layer's own arrows and deletes leave a step onto a picture to them
+ * (`pictureForKeys`). Until the chunk is in, or when it never loads, the
+ * hidden-mark layer keeps its own keys there.
+ */
+export const pictureKeysOn = Facet.define<boolean, boolean>({
+  combine: (values) => values.some(Boolean),
+});
+
+/**
+ * The picture the tools' keys act on from the edge `pos`: the one that
+ * starts at `pos` going `forward`, or ends there going back. Null without
+ * the picture layer or the tools, and for a picture in a link or a table
+ * cell, which keep their own keys (P2, P5). `pos` is the caret already
+ * moved past a run of hidden marks on that side.
+ */
+export function pictureForKeys(
+  state: EditorState,
+  pos: number,
+  forward: boolean,
+): PictureRef | null {
+  if (
+    !state.facet(pictureKeysOn) ||
+    !state.facet(picturesDrawn) ||
+    (forward ? pos >= state.doc.length : pos <= 0)
+  ) {
+    return null;
+  }
+  // One in from the edge, so a picture that only touches `pos` from the
+  // other side is not the one found.
+  const ref = pictureAt(state, forward ? pos + 1 : pos - 1);
+  if (ref === null || ref.inLink || ref.inCell) {
+    return null;
+  }
+  return (forward ? ref.from : ref.to) === pos ? ref : null;
+}
+
 /** Whether `range` is exactly one picture outside a table, as written. */
 function onePicture(
   state: EditorState,
