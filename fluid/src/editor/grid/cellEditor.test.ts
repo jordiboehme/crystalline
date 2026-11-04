@@ -138,8 +138,14 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
       lines[2] = line;
       return withTable(f, lines);
     };
+    // Read off a whole parse: right after a change the state's own tree has
+    // had one 20 ms slice of wall clock, which a busy machine can cut short
+    // of the table (D54). The grid draws through that (`gridField`); a test
+    // that reads the tree itself asks for the parse, as `parsedState` says.
     const shape = (main: EditorView) =>
-      gridTables(main.state)[0]?.rows.map((r) => r.map((c) => c.text));
+      gridTables(parsedState(main.state))[0]?.rows.map((r) =>
+        r.map((c) => c.text),
+      );
 
     test("Backspace on a bare first cell's only character keeps the cell open", () => {
       const main = make(f.text);
@@ -205,7 +211,7 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
         // Lezer agrees: one table, every data row with its two cells.
         let tables = 0;
         let rows = 0;
-        syntaxTree(main.state).iterate({
+        syntaxTree(parsedState(main.state)).iterate({
           enter: (node) => {
             if (node.name === "Table") tables += 1;
             if (node.name === "TableRow") rows += 1;

@@ -4,6 +4,7 @@
  * the open cell (`openCellField`), the document bytes and where the focus is.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -975,5 +976,36 @@ describe("grid-nav edits are their own undo step (R18b)", () => {
     expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "| Q |"));
     press(cellView(main), "z", { mod: true });
     expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "| 2x |"));
+  });
+});
+
+/**
+ * An undo in a cell on a busy machine (D54). An undo gives the parse of the
+ * new state a 20 ms slice of wall clock; a pause of the page during it left
+ * the tree short of the table, the grid drew no table, and the cell editor
+ * went with it. Here every look at the clock during the undo jumps a second,
+ * so the slice takes one parse step, at any load.
+ */
+describe("an undo in a cell whose parse fell short (D54)", () => {
+  test("keeps the table drawn and the cell open", () => {
+    const above = Array.from(
+      { length: 10 },
+      (_, i) => `Paragraph ${String(i)} of the page.`,
+    ).join("\n\n");
+    const main = solo(`${above}\n\n${DOC}`);
+    const view = open(main, 1, 1);
+    typeIn({ view, destroy: () => undefined }, "x");
+    const now = Date.now.bind(Date);
+    let ahead = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1_000;
+      return now() + ahead;
+    });
+    press(cellView(main), "z", { mod: true });
+    clock.mockRestore();
+    // The state's own tree stopped short, as on a busy machine.
+    expect(syntaxTree(main.state).length).toBeLessThan(main.state.doc.length);
+    expect(bytes(main.state)).toBe(`${above}\n\n${DOC}`);
+    expectOpen(main, 1, 1);
   });
 });

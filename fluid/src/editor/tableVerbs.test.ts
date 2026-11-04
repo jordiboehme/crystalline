@@ -13,7 +13,7 @@ import { undo } from "@codemirror/commands";
 import { syntaxTree } from "@codemirror/language";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { yCollab } from "y-codemirror.next";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
@@ -814,4 +814,35 @@ describe("every verb on tables without outer pipes (R23)", () => {
       }
     });
   }
+});
+
+/**
+ * A verb right after an undo on a busy machine (D54). An undo gives the parse
+ * of the new state a 20 ms slice of wall clock; a pause of the page during it
+ * leaves the tree short of the table, and the verb read "no table" there.
+ * Here every look at the clock during the undo jumps a second, so the slice
+ * takes one parse step, at any load.
+ */
+describe("a verb right after an undo whose parse fell short (D54)", () => {
+  test("still finds the table", () => {
+    const above = Array.from(
+      { length: 400 },
+      (_, i) => `Paragraph ${String(i)} of the page.`,
+    ).join("\n\n");
+    const text = `${above}\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n`;
+    const at = text.indexOf("| 1") + 2;
+    const v = editor(text, at);
+    expect(tableAddRowBelow(v, at)).toBe(true);
+    const now = Date.now.bind(Date);
+    let ahead = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1_000;
+      return now() + ahead;
+    });
+    undo(v);
+    clock.mockRestore();
+    expect(syntaxTree(v.state).length).toBeLessThan(at);
+    expect(tableAlignColumn(v, "right", at)).toBe(true);
+    expect(docText(v.state)).toContain("| ---: | --- |");
+  });
 });

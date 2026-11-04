@@ -23,8 +23,10 @@
  * `EditorView.findFromDOM` would find the nested cell view first.
  */
 
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { Extension, Range } from "@codemirror/state";
 import { EditorState, StateField } from "@codemirror/state";
+import type { Transaction } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
@@ -630,10 +632,24 @@ export class GridWidget extends WidgetType {
   }
 }
 
-function build(state: EditorView["state"]): DecorationSet {
+/**
+ * The grid's tables. With `reach`, the tree is first parsed that far: the
+ * end of the last table the grid drew before a change. A change gives the
+ * new state's parse a 20 ms slice of wall clock, and a pause of the page
+ * during it left the tree short of a table, which the grid then stopped
+ * drawing, closing the cell open in it (D54). The parse to a table the grid
+ * already drew is asked for whole, not timed: the tree was there before the
+ * change, so only what the change touched is parsed again.
+ */
+function build(state: EditorView["state"], reach = -1): DecorationSet {
   const doc = state.doc;
   const resolve = chipResolver(state);
-  const ranges: Range<Decoration>[] = gridTables(state).map((table) =>
+  const upto = Math.min(reach, doc.length);
+  const tree =
+    upto > syntaxTree(state).length
+      ? (ensureSyntaxTree(state, upto, Infinity) ?? syntaxTree(state))
+      : syntaxTree(state);
+  const ranges: Range<Decoration>[] = gridTables(state, tree).map((table) =>
     Decoration.replace({
       block: true,
       widget: new GridWidget(table, resolve, notesKey(state, table)),
@@ -642,9 +658,22 @@ function build(state: EditorView["state"]): DecorationSet {
   return Decoration.set(ranges);
 }
 
+/**
+ * Where the last table the grid drew before `tr` ends, after `tr`, when the
+ * tree before `tr` reached it; else -1.
+ */
+function drawnTo(value: DecorationSet, tr: Transaction): number {
+  let end = -1;
+  for (let at = value.iter(); at.value !== null; at.next()) {
+    end = Math.max(end, at.to);
+  }
+  if (end < 0 || syntaxTree(tr.startState).length < end) return -1;
+  return tr.changes.mapPos(end, 1);
+}
+
 /** The grid's block replacements, rebuilt on doc and syntax tree changes. */
 export const gridField = StateField.define<DecorationSet>({
-  create: build,
+  create: (state) => build(state),
   update: (value, tr) =>
     tr.docChanged ||
     parseAdvanced(tr) ||
@@ -652,7 +681,7 @@ export const gridField = StateField.define<DecorationSet>({
       tr.state.facet(wikilinkResolverFacet) ||
     // A footnote read settled: the closed cells draw its numbers.
     footnoteVersion(tr.startState) !== footnoteVersion(tr.state)
-      ? build(tr.state)
+      ? build(tr.state, tr.docChanged ? drawnTo(value, tr) : -1)
       : value,
   provide: (field) => EditorView.decorations.from(field),
 });

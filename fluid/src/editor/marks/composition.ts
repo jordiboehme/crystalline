@@ -53,11 +53,14 @@ interface CompositionLog {
 /** Ends the log: the composition was judged, or is not to be. */
 const endLog = StateEffect.define<null>();
 
-/**
- * Starts a log anew: a composition began while the last one waited to be
- * judged, so the last one was judged first, in the same transaction (D50).
- */
-const beginLog = StateEffect.define<CompositionLog>();
+/** The events a waiting composition is judged before (D56, D57). */
+const FIRST_EVENTS = [
+  "compositionstart",
+  "mousedown",
+  "paste",
+  "drop",
+  "cut",
+] as const;
 
 /** How long after `compositionend` the last composed change may arrive. */
 const SETTLE_MS = 60;
@@ -65,9 +68,6 @@ const SETTLE_MS = 60;
 const compositionLog = StateField.define<CompositionLog | null>({
   create: () => null,
   update(log, tr) {
-    for (const effect of tr.effects) {
-      if (effect.is(beginLog)) return effect.value;
-    }
     if (tr.effects.some((effect) => effect.is(endLog))) {
       return null;
     }
@@ -364,13 +364,17 @@ export function judgeComposition(view: EditorView): void {
 }
 
 /**
- * The person's next action while a composition waits to be judged (a key,
- * a paste, a click, a new composition): the composition is judged first, on
- * the state before the action, in the same transaction (D47, D50). The
- * action follows, mapped through the correction, with the selection it set
- * (a caret the person moved stays where they put it, D51). Plain typing is
- * part of the composition (CodeMirror can deliver the last composed change
- * that way), and a peer's change ends the log unjudged (the D33 limit).
+ * An action no DOM event announced (a toolbar command, a popover commit, a
+ * test's dispatch) while a composition waits to be judged: the composition
+ * is judged first, on the state before the action, in the same transaction
+ * (D47). Keys, presses, pastes, drops, cuts and a new composition are judged
+ * before they reach CodeMirror (`judgeBeforeKey`, the capture listeners in
+ * `settle`), in a transaction of their own that joins the composition's undo
+ * step (D57). The action follows, mapped through the correction, with the
+ * selection it set (a caret the person moved stays where they put it, D51).
+ * Typing, composed or plain, is part of the composition (CodeMirror can
+ * deliver the last composed change that way), so nothing is written while
+ * the IME composes; a peer's change ends the log unjudged (the D33 limit).
  *
  * Listed after the deletion and insert checks, so it runs after them: they
  * judge the action itself, and this one only puts the composition's
@@ -382,15 +386,13 @@ export const judgeFirst: Extension = State.transactionFilter.of((tr) => {
     return tr;
   }
   const event = tr.annotation(Transaction.userEvent);
-  const next = tr.isUserEvent("input.type.compose.start");
   if (
     event === undefined ||
     tr.annotation(judgedElsewhere) === true ||
     tr.annotation(Transaction.remote) !== undefined ||
-    (!next &&
-      (tr.isUserEvent("input.type") ||
-        composing(start) ||
-        (!tr.docChanged && tr.selection === undefined)))
+    tr.isUserEvent("input.type") ||
+    composing(start) ||
+    (!tr.docChanged && tr.selection === undefined)
   ) {
     return tr;
   }
@@ -408,25 +410,12 @@ export const judgeFirst: Extension = State.transactionFilter.of((tr) => {
     : fix.caret === null
       ? undefined
       : EditorSelection.cursor(fix.caret).map(rest);
-  const after: EditorState | null = next
-    ? start.update({
-        changes: fix.changes,
-        ...(fix.caret === null
-          ? {}
-          : { selection: EditorSelection.cursor(fix.caret) }),
-        effects: fix.effects,
-        filter: false,
-      }).state
-    : null;
   return [
     { changes: fix.changes, effects: fix.effects },
     {
       changes: rest,
       ...(selection ? { selection } : {}),
-      effects: [
-        ...StateEffect.mapEffects(effects, rest),
-        ...(after ? [beginLog.of({ start: after, changes: rest })] : []),
-      ],
+      effects: StateEffect.mapEffects(effects, rest),
       annotations: carried(tr),
       scrollIntoView: tr.scrollIntoView,
       sequential: true,
@@ -440,8 +429,24 @@ const settle = ViewPlugin.fromClass(
 
     readonly view: EditorView;
 
+    /** Judges a waiting composition before CodeMirror hears the event. */
+    readonly first = (): void => {
+      if ((this.view.state.field(compositionLog, false) ?? null) !== null) {
+        this.cancel();
+        judgeComposition(this.view);
+      }
+    };
+
     constructor(view: EditorView) {
       this.view = view;
+      // Capture on the editor's outer element: before CodeMirror's own
+      // handlers on the content, and before the browser writes the next
+      // composition's first text (D56). A press, a paste, a drop and a cut
+      // are judged there too, so the correction is a step of the
+      // composition's own, apart from the action (D57).
+      for (const type of FIRST_EVENTS) {
+        view.dom.addEventListener(type, this.first, true);
+      }
     }
 
     schedule(ms: number): void {
@@ -475,6 +480,9 @@ const settle = ViewPlugin.fromClass(
 
     destroy(): void {
       this.cancel();
+      for (const type of FIRST_EVENTS) {
+        this.view.dom.removeEventListener(type, this.first, true);
+      }
     }
   },
   {

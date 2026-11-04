@@ -40,7 +40,7 @@ import { canonical } from "./caret";
 import type { Lines, Range } from "./deleteCheck";
 import { blockLines, carried, linesOf, merged, readsSame } from "./deleteCheck";
 import { droppable, judgedElsewhere } from "./deleting";
-import { runAt } from "./hiddenMarks";
+import { marksOnLine, runAt } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
 import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 import type { Deadline } from "./parse";
@@ -65,11 +65,64 @@ function isSpace(char: string): boolean {
   return /\s/.test(char);
 }
 
+/**
+ * The block marks (bullet, number, task box, quote mark) each line the
+ * pieces start begins with in `trial`, as one comparable word.
+ */
+function blockShape(
+  trial: EditorState,
+  changes: ChangeSet,
+  pieces: Place["pieces"],
+  deadline: Deadline,
+): string {
+  const starts: number[] = [];
+  for (const piece of pieces) {
+    const at = changes.mapPos(piece.at, -1);
+    for (const found of piece.insert.matchAll(/\r?\n/g)) {
+      starts.push(
+        Math.min(at + (found.index ?? 0) + found[0].length, trial.doc.length),
+      );
+    }
+  }
+  const last = Math.max(0, ...starts);
+  const parsed = parsedTo(trial, trial.doc.lineAt(last).to, deadline) ?? trial;
+  const out: string[] = [];
+  for (const pos of starts) {
+    const line = parsed.doc.lineAt(pos);
+    const kinds: string[] = [];
+    let end = line.from;
+    for (const mark of marksOnLine(parsed, line.number, { always: true })) {
+      if (mark.side !== "prefix" || mark.from > end) break;
+      kinds.push(`${mark.kind}:${parsed.sliceDoc(mark.from, mark.to)}`);
+      end = mark.to;
+    }
+    out.push(kinds.join(" "));
+  }
+  return out.join("|");
+}
+
 /** The places to try for `text` put in at `at` (after `deleted` went). */
 function places(state: EditorState, at: number, text: string): Place[] {
   const out: Place[] = [{ pieces: [{ at, insert: text }] }];
   const run = runAt(state, at);
   if (!run) {
+    return out;
+  }
+  if (/[\r\n]/.test(text)) {
+    // Text that breaks the line is never split across a run (D55): it goes
+    // whole to the run's far side, after a closing run, or before the
+    // formats an opening run holds (after a line's block marks).
+    if (run.marks.some((mark) => mark.side === "close") && run.to !== at) {
+      out.push({ pieces: [{ at: run.to, insert: text }] });
+    }
+    const format = run.marks.find((mark) => mark.side === "open");
+    if (
+      run.marks.every((mark) => mark.side !== "close") &&
+      format &&
+      format.from !== at
+    ) {
+      out.push({ pieces: [{ at: format.from, insert: text }] });
+    }
     return out;
   }
   let lead = 0;
@@ -182,6 +235,11 @@ export function judgeInsert(
     ...deletions,
     ...(insert.from < insert.to ? [{ from: insert.from, to: insert.to }] : []),
   ];
+  const breaks = /[\r\n]/.test(insert.text);
+  // The block marks each new line starts with where the text lands as put:
+  // a place elsewhere must start them the same (D55), or Enter in a list
+  // item would make a line that is no item.
+  let shape: string | null = null;
   for (const [index, place] of places(
     start,
     insert.from,
@@ -213,6 +271,11 @@ export function judgeInsert(
       true,
     );
     if (reads === null) return null;
+    if (breaks) {
+      const read = blockShape(trial, changes, place.pieces, deadline);
+      if (index === 0) shape = read;
+      else if (read !== shape) continue;
+    }
     if (!reads) continue;
     // The text as it landed, keeping its pairs: nothing to change.
     if (index === 0 && deleted.length === merged(removed).length) return null;

@@ -7,7 +7,7 @@
  * timers).
  */
 
-import { EditorSelection, StateEffect } from "@codemirror/state";
+import { EditorSelection, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import {
   afterEach,
@@ -64,15 +64,28 @@ function ime(view: EditorView) {
   let first = true;
   return {
     /**
-     * Starts one in CodeMirror's order: its own observer marks the view as
-     * composing before any plugin hears the event.
+     * Starts one in the browser's order: a capture listener on the editor
+     * hears the event first, then CodeMirror's own observer on the content
+     * marks the view as composing (here: a listener on the content), and
+     * only then does the browser write composed text.
      */
     start() {
-      state.on = true;
       first = true;
+      view.contentDOM.addEventListener(
+        "compositionstart",
+        () => {
+          state.on = true;
+        },
+        { once: true },
+      );
       view.contentDOM.dispatchEvent(
         new Event("compositionstart", { bubbles: true }),
       );
+      expect(state.on).toBe(true);
+    },
+    /** Whether the view composes now, as the stub says. */
+    get on() {
+      return state.on;
     },
     /** One composed change, the caret after its text. */
     change(from: number, to: number, insert: string) {
@@ -348,19 +361,36 @@ describe.each([false, true])(
       expect(bytes(view.state)).toBe("ab**\ud55c** **\uad6d**");
     });
 
-    it("judges the last composition before the next one begins (CodeMirror's event order)", () => {
+    it("judges the last composition before the next one begins, and writes nothing while it composes (D56)", () => {
       const view = markView("**a.** b", { room });
+      setCaret(view, 7);
       const keyboard = ime(view);
+      const written: string[] = [];
+      view.dispatch({
+        effects: StateEffect.appendConfig.of(
+          EditorView.updateListener.of((update) => {
+            for (const tr of update.transactions) {
+              if (keyboard.on && tr.docChanged) {
+                written.push(tr.annotation(Transaction.userEvent) ?? "");
+              }
+            }
+          }),
+        ),
+      });
       keyboard.start();
       keyboard.change(6, 7, "");
       keyboard.end(false);
-      expect(view.compositionStarted).toBe(false);
+      // The next composition starts: the last one is judged before the
+      // view composes, so the space is back before any composed text.
       keyboard.start();
-      expect(view.compositionStarted).toBe(true);
-      // The new composition types after the `b` the person sees.
-      keyboard.change(7, 7, "x");
+      expect(bytes(view.state)).toBe("**a.** b");
+      keyboard.change(8, 8, "x");
       keyboard.end();
       expect(bytes(view.state)).toBe("**a.** bx");
+      expect(written).toEqual([
+        "input.type.compose.start",
+        "input.type.compose.start",
+      ]);
     });
 
     it("keeps a caret the person moved before the judge ran", () => {
@@ -404,6 +434,82 @@ describe.each([false, true])(
       keyboard.change(at, at + 1, "");
       keyboard.end();
       expect(bytes(view.state)).toContain(`\n${ID}\n`);
+    });
+  },
+);
+
+describe.each([false, true])(
+  "Korean syllables back to back, room %s (D56)",
+  (room) => {
+    it("judges each syllable before the next composes, never while it composes", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "\ud55c");
+      keyboard.end(false);
+      keyboard.start();
+      // Bold was written around the first syllable before this one began.
+      expect(bytes(view.state)).toBe("ab**\ud55c**");
+      const at = caret(view);
+      keyboard.change(at, at, "\uad6d");
+      expect(bytes(view.state)).toBe("ab**\ud55c\uad6d**");
+      keyboard.end();
+      expect(bytes(view.state)).toBe("ab**\ud55c\uad6d**");
+    });
+  },
+);
+
+/** A paste as the browser sends it, with `text` on its clipboard. */
+function domPaste(view: EditorView, text: string): void {
+  const event = new Event("paste", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: {
+      getData: (kind: string) => (kind === "text/plain" ? text : ""),
+      types: ["text/plain"],
+    },
+  });
+  view.contentDOM.dispatchEvent(event);
+}
+
+describe.each([false, true])(
+  "one undo after an action in the window, room %s (D57)",
+  (room) => {
+    it("takes back a paste and leaves the judged text the person saw", () => {
+      const view = markView("**a.** b", { room });
+      view.focus();
+      setCaret(view, 7);
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(6, 7, "");
+      keyboard.end(false);
+      domPaste(view, "Z");
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("**a.** Zb");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe("**a.** b");
+    });
+
+    it("takes back the composition, never stopping on the text it broke, after a press", () => {
+      const view = markView("ab", { room });
+      setCaret(view, 2);
+      keys(view, "Mod-b");
+      const keyboard = ime(view);
+      keyboard.start();
+      keyboard.change(2, 2, "cd");
+      keyboard.end(false);
+      view.contentDOM.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+        }),
+      );
+      vi.advanceTimersByTime(60);
+      expect(bytes(view.state)).toBe("ab**cd**");
+      undoOnce(view);
+      expect(bytes(view.state)).toBe("ab");
     });
   },
 );

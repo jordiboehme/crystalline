@@ -8,6 +8,7 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
+import type { Tree } from "@lezer/common";
 import type { EditorState, Text } from "@codemirror/state";
 
 import type { Align, TableModel } from "../tableModel";
@@ -70,9 +71,12 @@ export function tableIn(doc: Text, from: number, to: number): GridTable {
 }
 
 /** Every table the grid draws, in document order. */
-export function gridTables(state: EditorState): GridTable[] {
+export function gridTables(
+  state: EditorState,
+  tree: Tree = syntaxTree(state),
+): GridTable[] {
   const found: GridTable[] = [];
-  syntaxTree(state).iterate({
+  tree.iterate({
     enter: (node) => {
       if (node.name === "Table" && gridDraws(node, state.doc)) {
         found.push(tableIn(state.doc, node.from, node.to));
@@ -83,10 +87,15 @@ export function gridTables(state: EditorState): GridTable[] {
 }
 
 /** The grid table holding `pos`, or null (also for a table the grid skips). */
-export function gridTableAt(state: EditorState, pos: number): GridTable | null {
+export function gridTableAt(
+  state: EditorState,
+  pos: number,
+  tree: Tree = syntaxTree(state),
+): GridTable | null {
   return (
-    gridTables(state).find((table) => table.from <= pos && pos <= table.to) ??
-    null
+    gridTables(state, tree).find(
+      (table) => table.from <= pos && pos <= table.to,
+    ) ?? null
   );
 }
 

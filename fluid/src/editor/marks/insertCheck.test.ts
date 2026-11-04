@@ -113,7 +113,8 @@ describe.each([false, true])("an insert at a mark edge, room %s", (room) => {
     const line = markView("a **bold** c", { room });
     setCaret(line, 10);
     paste(line, "word\n");
-    expect(bytes(line.state)).toBe("a **boldword**\n c");
+    // Never split across the run (D55): the whole line goes after it.
+    expect(bytes(line.state)).toBe("a **bold**word\n c");
     undoOnce(line);
     expect(bytes(line.state)).toBe("a **bold** c");
   });
@@ -168,3 +169,50 @@ describe.each([false, true])(
     });
   },
 );
+
+/**
+ * Enter on a bold line (D55): the line break is never split across a run.
+ * It goes whole after the closing marks at an item's end, and before the
+ * format's marks at the text's start, so the new line starts the same
+ * block (bullet, number, task box, quote) as Enter where the marks show.
+ */
+const ENTER: [string, string, number | "end", string][] = [
+  ["a bullet, at its end", "- **a**", "end", "- **a**\n- "],
+  ["a bullet, at its text start", "- **ab**", 2, "- \n- **ab**"],
+  ["an ordered item, at its end", "1. **a**", "end", "1. **a**\n2. "],
+  ["an ordered item, at its text start", "1. **ab**", 3, "1. \n2. **ab**"],
+  [
+    "a nested item, at its end",
+    "- a\n  - **b**",
+    "end",
+    "- a\n  - **b**\n  - ",
+  ],
+  [
+    "a nested item, at its text start",
+    "- a\n  - **bc**",
+    8,
+    "- a\n  - \n  - **bc**",
+  ],
+  ["a task, at its end", "- [ ] **a**", "end", "- [ ] **a**\n- [ ] "],
+  ["a task, at its text start", "- [ ] **ab**", 6, "- [ ] \n- [ ] **ab**"],
+  ["a quoted item, at its end", "> - **a**", "end", "> - **a**\n> - "],
+  ["a quoted item, at its text start", "> - **ab**", 4, "> - \n> - **ab**"],
+  ["a plain line, at its end", "**ab**", "end", "**ab**\n"],
+  ["a plain line, at its start", "**ab**", 0, "\n**ab**"],
+  ["a heading, at its end", "## **h**", "end", "## **h**\n"],
+];
+
+describe.each(
+  (["hidden", "show"] as const).flatMap((mode) =>
+    [false, true].map((room) => ({ mode, room })),
+  ),
+)("Enter on a bold line, $mode mode, room $room", ({ mode, room }) => {
+  it.each(ENTER)("%s", (_name, text, at, want) => {
+    const view = markView(text, { mode, room });
+    setCaret(view, at === "end" ? text.length : at);
+    keys(view, "Enter");
+    expect(bytes(view.state)).toBe(want);
+    undoOnce(view);
+    expect(bytes(view.state)).toBe(text);
+  });
+});

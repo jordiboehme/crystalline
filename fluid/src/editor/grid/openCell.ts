@@ -83,8 +83,23 @@ function cellAtHead(
   head: number,
 ): GridCell | null | undefined {
   if (head < 0 || head > state.doc.length) return null;
-  if (syntaxTree(state).length < state.doc.lineAt(head).to) return undefined;
-  const table = gridTableAt(state, head);
+  // The parse must reach the end of the table's block, not only the head's
+  // line: a tree that stops inside the table holds no whole table (D54).
+  let line = state.doc.lineAt(head);
+  while (
+    line.number < state.doc.lines &&
+    state.doc.line(line.number + 1).text.trim() !== ""
+  ) {
+    line = state.doc.line(line.number + 1);
+  }
+  // A state's own tree may stop short after a change while the parse it
+  // shares already went on (the grid asked for it): read that one then.
+  const tree =
+    syntaxTree(state).length >= line.to
+      ? syntaxTree(state)
+      : ensureSyntaxTree(state, line.to, 0);
+  if (!tree || tree.length < line.to) return undefined;
+  const table = gridTableAt(state, head, tree);
   return table ? cellAt(table, head) : null;
 }
 

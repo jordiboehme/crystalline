@@ -36,11 +36,11 @@
  * refused. `quoteMarked` is that check and states the case.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { ChangeSpec, EditorState, Extension } from "@codemirror/state";
 import { ChangeSet, EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import type { SyntaxNode } from "@lezer/common";
+import type { SyntaxNode, Tree } from "@lezer/common";
 
 import { gridDraws, gridLoaded } from "./grid/draws";
 import type { Align, SpanChange, TableModel } from "./tableModel";
@@ -83,8 +83,35 @@ export interface TableContext {
  * past the table's last character the situation is exactly mirrored, and side
  * -1 is the one that carries it. Neither side alone covers both ends.
  */
-function tableNodeAt(state: EditorState, pos: number): SyntaxNode | null {
+/** How long a verb may wait for the parse to reach its table, in ms. */
+const TABLE_PARSE_MS = 500;
+
+/**
+ * A syntax tree that reaches the end of the block holding `pos`. The tree a
+ * state carries can stop short: after an undo, the parse of the new state
+ * gets a 20 ms slice of wall clock, and a pause of the page during it leaves
+ * the table unparsed (D54). A verb asks for the parse outright, as the press
+ * that wants the table is the moment it is needed; the caret's table
+ * context (the toolbar's) reads the tree as it stands.
+ */
+function treeThrough(state: EditorState, pos: number): Tree {
   const tree = syntaxTree(state);
+  let line = state.doc.lineAt(pos);
+  while (line.number < state.doc.lines && line.text.trim() !== "") {
+    line = state.doc.line(line.number + 1);
+  }
+  if (tree.length >= line.to) {
+    return tree;
+  }
+  return ensureSyntaxTree(state, line.to, TABLE_PARSE_MS) ?? tree;
+}
+
+function tableNodeAt(
+  state: EditorState,
+  pos: number,
+  parse = false,
+): SyntaxNode | null {
+  const tree = parse ? treeThrough(state, pos) : syntaxTree(state);
   for (const side of [-1, 1] as const) {
     let node: SyntaxNode | null = tree.resolveInner(pos, side);
     while (node !== null) {
@@ -149,9 +176,10 @@ function quoteMarked(state: EditorState, node: SyntaxNode): boolean {
 function analyze(
   state: EditorState,
   at?: number,
+  parse = false,
 ): { context: TableContext; model: TableModel } | null {
   const head = at ?? state.selection.main.head;
-  const node = tableNodeAt(state, head);
+  const node = tableNodeAt(state, head, parse);
   if (node === null || quoteMarked(state, node)) {
     return null;
   }
@@ -306,7 +334,8 @@ function target(
   if (!clearOfFoldedFrontmatter(view)) {
     return null;
   }
-  return analyze(view.state, at);
+  // A verb is a press: the table is read off a tree that reaches it (D54).
+  return analyze(view.state, at, true);
 }
 
 /**
