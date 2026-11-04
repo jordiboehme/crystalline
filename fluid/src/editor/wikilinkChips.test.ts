@@ -21,6 +21,8 @@ import { singlePage } from "../api/engrams";
 import { fetchSearch, titleMatchesKey } from "../api/search";
 import { parsedState } from "../test/parse";
 import type { WikilinkResolution } from "../wikilinks";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   wikilinkChips,
@@ -53,9 +55,11 @@ function hit(domain: string, permalink: string, title: string): EngramRow {
   };
 }
 
+/** Show mode unless asked: most tests here pin what a touched chip reveals. */
 function editor(
   resolve: (inner: string) => WikilinkResolution | null,
   doc = DOC,
+  mode: "hidden" | "show" = "show",
 ): EditorView {
   return new EditorView({
     // `parsedState`, because a chip is drawn off the syntax tree and a new
@@ -71,6 +75,8 @@ function editor(
           ...baseExtensions(false),
           wikilinkResolverFacet.of(resolve),
           wikilinkChips(),
+          hiddenMarkLayer(),
+          marksOnEditLine.of(mode === "show"),
         ],
       }),
     ),
@@ -160,6 +166,29 @@ describe("wikilink chips", () => {
       selection: EditorSelection.cursor(DOC.indexOf("Beta") + 1),
     });
     expect(view.contentDOM.textContent).toContain("[[Beta Note]]");
+    view.destroy();
+  });
+
+  it("keeps the chip drawn with the caret right after it in hidden mode", () => {
+    const view = editor(() => ({ kind: "unresolved" }), DOC, "hidden");
+    view.dispatch({
+      selection: EditorSelection.cursor(DOC.indexOf(" and")),
+    });
+    expect(view.dom.querySelector(".cm-wikilink")?.textContent).toBe(
+      "Beta Note",
+    );
+    expect(view.contentDOM.textContent).not.toContain("[[Beta Note]]");
+    view.destroy();
+  });
+
+  it("hands the chip back as text with the caret right after it in show mode", () => {
+    const view = editor(() => ({ kind: "unresolved" }), DOC, "show");
+    view.dispatch({
+      selection: EditorSelection.cursor(DOC.indexOf(" and")),
+    });
+    expect(view.contentDOM.textContent).toContain("[[Beta Note]]");
+    // A chip on the same line the caret does not touch stays a chip.
+    expect(view.dom.querySelector(".cm-wikilink")?.textContent).toBe("ghost");
     view.destroy();
   });
 

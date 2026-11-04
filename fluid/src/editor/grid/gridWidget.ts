@@ -23,9 +23,12 @@
  * `EditorView.findFromDOM` would find the nested cell view first.
  */
 
-import type { Extension, Range } from "@codemirror/state";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import type { Extension, Range, Text } from "@codemirror/state";
 import { EditorState, StateField } from "@codemirror/state";
+import type { Transaction } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
+import type { Tree } from "@lezer/common";
 import {
   Decoration,
   EditorView,
@@ -34,8 +37,14 @@ import {
 } from "@codemirror/view";
 
 import type { WikilinkResolver } from "../../wikilinks";
+import { elementEditCell } from "../elementEdit";
 import { floatingCell } from "../floatingContext";
+import { footnoteRefsIn, footnoteVersion } from "../footnotes";
+import { hidesIdLines } from "../hiddenIdLines";
+import { formatCell } from "../marks/formatting";
+import { PARSE_BUDGET } from "../marks/parse";
 import { parseAdvanced } from "../parseProgress";
+import { parseTable } from "../tableModel";
 import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
@@ -49,6 +58,7 @@ import {
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import { cellPaste } from "./gridPaste";
 import {
+  drawnGridTables,
   gridWritable,
   mountedCell,
   onCellClosed,
@@ -57,7 +67,7 @@ import {
   setOpenCell,
 } from "./openCell";
 import type { GridCell, GridTable } from "./structure";
-import { gridTableAt, gridTables } from "./structure";
+import { gridTableAt, gridTables, tableIn } from "./structure";
 
 const HOSTING = "cm-grid-hosting";
 
@@ -157,14 +167,55 @@ function chipResolver(state: EditorState): WikilinkResolver | undefined {
   return resolve === noResolver ? undefined : resolve;
 }
 
+/**
+ * What a static cell is drawn from besides its text: the footnote numbers of
+ * its references (offsets into its text), and whether comments are left out
+ * (a Reflection). Its key tells a redraw is due.
+ */
+interface CellExtras {
+  notes: { from: number; to: number; number: number }[];
+  hideComments: boolean;
+  key: string;
+}
+
+function extrasOf(state: EditorState, cell: GridCell | undefined): CellExtras {
+  const hideComments = hidesIdLines(state);
+  const notes = cell
+    ? footnoteRefsIn(state, cell.content.from, cell.content.to).map((n) => ({
+        from: n.from - cell.content.from,
+        to: n.to - cell.content.from,
+        number: n.number,
+      }))
+    : [];
+  const key = `${hideComments ? "c" : ""}${notes
+    .map((n) => `${String(n.from)}-${String(n.to)}:${String(n.number)}`)
+    .join(",")}`;
+  return { notes, hideComments, key };
+}
+
+/**
+ * The numbers a table's references are drawn with, as one string, with
+ * offsets from the table's start: an edit above the table leaves it alone.
+ */
+function notesKey(state: EditorState, table: GridTable): string {
+  return footnoteRefsIn(state, table.from, table.to)
+    .map((n) => `${String(n.from - table.from)}:${String(n.number)}`)
+    .join(",");
+}
+
 function drawStatic(
   el: HTMLElement,
   text: string,
   resolve: WikilinkResolver | undefined,
+  extras: CellExtras,
 ): void {
   el.classList.remove(HOSTING);
-  renderCellContent(text, el, resolve ? { resolve } : {});
-  drawnOf.set(el, text);
+  renderCellContent(text, el, {
+    ...(resolve ? { resolve } : {}),
+    notes: extras.notes,
+    hideComments: extras.hideComments,
+  });
+  drawnOf.set(el, `${extras.key}\u0000${text}`);
 }
 
 function hosts(main: EditorView, el: HTMLElement): boolean {
@@ -191,9 +242,15 @@ function patch(root: HTMLElement, main: EditorView): void {
     const [row, column] = placeOf(el);
     if (hosts(main, el)) continue;
     setAlign(el, table, column);
-    const text = table.rows[row]?.[column]?.text ?? "";
-    if (redrawAll || drawnOf.get(el) !== text || el.classList.contains(HOSTING))
-      drawStatic(el, text, resolve);
+    const cell = table.rows[row]?.[column];
+    const text = cell?.text ?? "";
+    const extras = extrasOf(main.state, cell);
+    if (
+      redrawAll ||
+      drawnOf.get(el) !== `${extras.key}\u0000${text}` ||
+      el.classList.contains(HOSTING)
+    )
+      drawStatic(el, text, resolve, extras);
   }
 }
 
@@ -288,10 +345,12 @@ function restore(main: EditorView, el: HTMLElement): void {
     return;
   }
   const [row, column] = placeOf(el);
+  const cell = table.rows[row]?.[column];
   drawStatic(
     el,
-    table.rows[row]?.[column]?.text ?? "",
+    cell?.text ?? "",
     chipResolver(main.state),
+    extrasOf(main.state, cell),
   );
 }
 
@@ -329,6 +388,8 @@ function host(
     cellPaste,
     cellKeymap,
     floatingCell(main),
+    formatCell(main),
+    elementEditCell(main),
     cellAttributes(main),
   ]);
   hostOf.set(main, el);
@@ -437,20 +498,28 @@ function openFromMouse(
 export class GridWidget extends WidgetType {
   readonly table: GridTable;
   readonly resolve: WikilinkResolver | undefined;
+  /** The footnote numbers its references are drawn with (`notesKey`). */
+  readonly notes: string;
 
-  constructor(table: GridTable, resolve: WikilinkResolver | undefined) {
+  constructor(
+    table: GridTable,
+    resolve: WikilinkResolver | undefined,
+    notes = "",
+  ) {
     super();
     this.table = table;
     this.resolve = resolve;
+    this.notes = notes;
   }
 
-  /** Same shape, same alignments and same cell texts. */
+  /** Same shape, same alignments, same cell texts and footnote numbers. */
   override eq(other: GridWidget): boolean {
     return (
       sameShape(this.table, other.table) &&
       sameAligns(this.table, other.table) &&
       sameTexts(this.table, other.table) &&
-      this.resolve === other.resolve
+      this.resolve === other.resolve &&
+      this.notes === other.notes
     );
   }
 
@@ -567,27 +636,180 @@ export class GridWidget extends WidgetType {
   }
 }
 
-function build(state: EditorView["state"]): DecorationSet {
+/** Where the block holding `pos` ends: its last line before a blank one. */
+function blockEnd(doc: Text, pos: number): number {
+  let line = doc.lineAt(pos);
+  while (line.number < doc.lines && doc.line(line.number + 1).text.trim()) {
+    line = doc.line(line.number + 1);
+  }
+  return line.to;
+}
+
+/**
+ * Whether `tree` reads `table` whole: it reaches the end of the table's
+ * block. A tree that stops inside a table holds no whole table (D54).
+ */
+function reaches(tree: Tree, doc: Text, table: GridTable): boolean {
+  return tree.length >= doc.length || tree.length >= blockEnd(doc, table.to);
+}
+
+/** The table each of the grid's widgets draws. */
+function drawnTables(value: DecorationSet): GridTable[] {
+  const out: GridTable[] = [];
+  for (let at = value.iter(); at.value !== null; at.next()) {
+    const { widget } = at.value.spec as { widget?: unknown };
+    if (widget instanceof GridWidget) out.push(widget.table);
+  }
+  return out;
+}
+
+/**
+ * Whether the line holding `pos` reads as something other than a table row
+ * to the page: indented four columns or more (code), or opening a list
+ * item or a quote, where the grid draws no table either (`gridDraws`).
+ */
+function notATableLine(doc: Text, pos: number): boolean {
+  const line = doc.lineAt(pos);
+  let column = 0;
+  let at = 0;
+  while (at < line.text.length && /[ \t]/.test(line.text[at] ?? "")) {
+    column += line.text[at] === "\t" ? 4 - (column % 4) : 1;
+    at += 1;
+  }
+  if (column >= 4) return true;
+  return /^(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)|^>/.test(line.text.slice(at));
+}
+
+/** `table` read again from `doc` over `from` to `to`, or null if no table. */
+function readAgain(doc: Text, from: number, to: number): GridTable | null {
+  if (
+    from >= to ||
+    notATableLine(doc, from) ||
+    parseTable(doc.sliceString(from, to)) === null
+  ) {
+    return null;
+  }
+  return tableIn(doc, from, to);
+}
+
+/** A table the grid drew, read again at its place after a change. */
+interface Carried {
+  table: GridTable;
+  /** The change touched its lines or the line breaks beside them. */
+  touched: boolean;
+}
+
+/**
+ * The tables the grid drew before `tr`, each read again from the new text at
+ * its mapped place: no parse, only a read of the table's own lines. A table
+ * the change left alone reads as before, moved; one it touched reads with
+ * the change in it, or goes when its text is no table any more.
+ */
+function carry(value: DecorationSet, tr: Transaction): Carried[] {
+  const before = tr.startState.doc;
+  const out: Carried[] = [];
+  for (const table of drawnTables(value)) {
+    const lineFrom = before.lineAt(table.from).from;
+    const lineTo = before.lineAt(table.to).to;
+    let touched = false;
+    tr.changes.iterChangedRanges((fromA, toA) => {
+      if (fromA <= lineTo + 1 && toA >= lineFrom - 1) touched = true;
+    });
+    const from = tr.changes.mapPos(table.from, 1);
+    const read = touched
+      ? (readAgain(tr.state.doc, from, tr.changes.mapPos(table.to, 1)) ??
+        readAgain(tr.state.doc, from, tr.changes.mapPos(table.to, -1)))
+      : readAgain(tr.state.doc, from, tr.changes.mapPos(table.to, -1));
+    if (read) out.push({ table: read, touched });
+  }
+  return out;
+}
+
+/**
+ * The grid's tables: those `tree` reads whole, and past where it reaches,
+ * the tables the grid drew before (`carried`), read again at their places.
+ *
+ * The tree after a change can stop short of a table: the new state's parse
+ * gets a 20 ms slice, and a paste or an undo above a table can need a whole
+ * parse of the text after it. Asking for that parse inside the transaction
+ * stalled the person and, in a room, every peer at once (D58); a table not
+ * drawn closed the cell open in it (D54). So a table the tree does not reach
+ * yet stays drawn from its own lines, and the tree takes over once the
+ * background parse reaches it (`parseAdvanced`).
+ */
+function build(
+  state: EditorView["state"],
+  tree: Tree = syntaxTree(state),
+  carried: readonly GridTable[] = [],
+): DecorationSet {
   const doc = state.doc;
   const resolve = chipResolver(state);
-  const ranges: Range<Decoration>[] = gridTables(state).map((table) =>
+  const tables = gridTables(state, tree).filter((table) =>
+    reaches(tree, doc, table),
+  );
+  const lines = (table: GridTable) => ({
+    from: doc.lineAt(table.from).from,
+    to: doc.lineAt(table.to).to,
+  });
+  const taken = tables.map(lines);
+  for (const table of carried) {
+    if (reaches(tree, doc, table)) continue;
+    const span = lines(table);
+    if (taken.some((other) => other.from <= span.to && span.from <= other.to)) {
+      continue;
+    }
+    taken.push(span);
+    tables.push(table);
+  }
+  const ranges: Range<Decoration>[] = tables.map((table) =>
     Decoration.replace({
       block: true,
-      widget: new GridWidget(table, resolve),
+      widget: new GridWidget(table, resolve, notesKey(state, table)),
     }).range(doc.lineAt(table.from).from, doc.lineAt(table.to).to),
   );
-  return Decoration.set(ranges);
+  return Decoration.set(ranges, true);
+}
+
+/**
+ * The grid after `tr`. A change that touches no drawn table parses nothing
+ * here: the tables are carried (`carry`), and drawn from the tree once the
+ * parse reaches them. A change that touches a drawn table parses to that
+ * table's end with the typing budget (50 ms), and keeps the carried table
+ * when that falls short (D58).
+ */
+function rebuild(value: DecorationSet, tr: Transaction): DecorationSet {
+  const { state } = tr;
+  if (!tr.docChanged)
+    return build(state, syntaxTree(state), drawnTables(value));
+  let tree = syntaxTree(state);
+  // The common case: the tree reaches the end, and it alone decides.
+  if (tree.length >= state.doc.length) return build(state, tree);
+  const carried = carry(value, tr);
+  let upto = -1;
+  for (const { table, touched } of carried) {
+    if (touched) upto = Math.max(upto, blockEnd(state.doc, table.to));
+  }
+  if (upto > tree.length) {
+    tree = ensureSyntaxTree(state, upto, PARSE_BUDGET.typing) ?? tree;
+  }
+  return build(
+    state,
+    tree,
+    carried.map(({ table }) => table),
+  );
 }
 
 /** The grid's block replacements, rebuilt on doc and syntax tree changes. */
 export const gridField = StateField.define<DecorationSet>({
-  create: build,
+  create: (state) => build(state),
   update: (value, tr) =>
     tr.docChanged ||
     parseAdvanced(tr) ||
     tr.startState.facet(wikilinkResolverFacet) !==
-      tr.state.facet(wikilinkResolverFacet)
-      ? build(tr.state)
+      tr.state.facet(wikilinkResolverFacet) ||
+    // A footnote read settled: the closed cells draw its numbers.
+    footnoteVersion(tr.startState) !== footnoteVersion(tr.state)
+      ? rebuild(value, tr)
       : value,
   provide: (field) => EditorView.decorations.from(field),
 });
@@ -702,5 +924,13 @@ const gridTheme = EditorView.baseTheme({
   ".cm-grid-hosting .cm-line": { padding: "0" },
 });
 
-/** The grid's view side: the field, the host watch and the theme. */
-export const gridView: Extension = [gridField, hostWatch, gridTheme];
+/** The grid's view side: the field, its tables for the open cell, the host watch and the theme. */
+export const gridView: Extension = [
+  gridField,
+  drawnGridTables.of((state) => {
+    const value = state.field(gridField, false);
+    return value ? drawnTables(value) : [];
+  }),
+  hostWatch,
+  gridTheme,
+];

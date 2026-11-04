@@ -1,6 +1,6 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { API_BASE, ApiProblem, api } from "../api/client";
 import {
@@ -125,6 +125,15 @@ beforeEach(() => {
   apiMock.mockReset();
   saved.calls = [];
 });
+
+// The screen and the body that draws its text are lazy parts (D37's
+// pattern): their first import compiles them, which on a loaded machine
+// outlasts a `findByRole`. They are loaded once here, so a test waits for
+// the page, not for the compile.
+beforeAll(async () => {
+  await import("./ReflectionPage");
+  await import("../components/MarkdownBody");
+}, 120_000);
 
 describe("the reflection page", () => {
   it("renders the page without its frontmatter or its section ids", async () => {

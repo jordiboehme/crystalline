@@ -7,6 +7,7 @@
  * change that makes a section vanish asks first.
  */
 
+import { history, undo } from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -16,10 +17,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { engramAdapter, JOIN_SECTIONS, reflectionAdapter } from "./adapter";
 import {
   CODE_SKELETON,
-  cycleHeading,
-  headingLevelAfter,
   insertBlock,
   insertMarkdownLink,
+  setHeadingLevel,
   toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
@@ -92,17 +92,11 @@ describe("the reflection adapter", () => {
   it("asks before a section heading becomes a level 3 heading, and drops its id once confirmed", () => {
     const v = mount(DOC, adapter.extensions, DOC.indexOf("## B") + 3);
     const line = caretLine(v);
-    expect(
-      adapter.confirmHeadingChange(
-        v.state,
-        line,
-        headingLevelAfter(v.state, line, 3),
-      ),
-    ).toBe(JOIN_SECTIONS);
+    expect(adapter.confirmHeadingChange(v.state, line, 3)).toBe(JOIN_SECTIONS);
     expect(JOIN_SECTIONS).toBe(
       "This joins the section with the one above. The agent will see the change and rebuild its sources.",
     );
-    cycleHeading(v, 3, { joinSections: true });
+    setHeadingLevel(v, 3, { joinSections: true });
     expect(v.state.doc.toString()).toBe(
       "# P\n\n## A\n<!-- r:aaaa0001 -->\n\none\n\n### B\n\ntwo\n",
     );
@@ -111,12 +105,11 @@ describe("the reflection adapter", () => {
   it("asks before a section heading is taken off or made a title", () => {
     const v = mount(DOC, adapter.extensions, DOC.indexOf("## B") + 3);
     const line = caretLine(v);
-    // Heading 2 on a level 2 heading takes the heading off.
-    expect(headingLevelAfter(v.state, line, 2)).toBe(0);
+    // Body takes the heading off: setHeadingLevel never toggles.
     expect(adapter.confirmHeadingChange(v.state, line, 0)).toBe(JOIN_SECTIONS);
     expect(adapter.confirmHeadingChange(v.state, line, 1)).toBe(JOIN_SECTIONS);
     expect(adapter.confirmHeadingChange(v.state, line, 2)).toBeNull();
-    cycleHeading(v, 2, { joinSections: true });
+    setHeadingLevel(v, 0, { joinSections: true });
     expect(v.state.doc.toString()).toBe(
       "# P\n\n## A\n<!-- r:aaaa0001 -->\n\none\n\nB\n\ntwo\n",
     );
@@ -125,21 +118,39 @@ describe("the reflection adapter", () => {
   it("goes ahead without asking when a paragraph becomes a section heading", () => {
     const v = mount(DOC, adapter.extensions, DOC.indexOf("one"));
     const line = caretLine(v);
-    expect(
-      adapter.confirmHeadingChange(
-        v.state,
-        line,
-        headingLevelAfter(v.state, line, 2),
-      ),
-    ).toBeNull();
-    cycleHeading(v, 2);
+    expect(adapter.confirmHeadingChange(v.state, line, 2)).toBeNull();
+    setHeadingLevel(v, 2);
     // No id line: the server mints the new section's id on save.
+    expect(v.state.doc.toString()).toBe(DOC.replace("\none\n", "\n## one\n"));
+  });
+
+  it("setHeadingLevel joins a section with its id line in one transaction, one undo restores both", () => {
+    const v = mount(
+      DOC,
+      [...adapter.extensions, history()],
+      DOC.indexOf("## B") + 3,
+    );
+    expect(adapter.confirmHeadingChange(v.state, caretLine(v), 3)).toBe(
+      JOIN_SECTIONS,
+    );
+    setHeadingLevel(v, 3, { joinSections: true });
+    expect(v.state.doc.toString()).toBe(
+      "# P\n\n## A\n<!-- r:aaaa0001 -->\n\none\n\n### B\n\ntwo\n",
+    );
+    undo(v);
+    expect(v.state.doc.toString()).toBe(DOC);
+  });
+
+  it("setHeadingLevel on a non-section line asks nothing and writes ##", () => {
+    const v = mount(DOC, adapter.extensions, DOC.indexOf("one"));
+    expect(adapter.confirmHeadingChange(v.state, caretLine(v), 2)).toBeNull();
+    setHeadingLevel(v, 2);
     expect(v.state.doc.toString()).toBe(DOC.replace("\none\n", "\n## one\n"));
   });
 
   it("keeps the id under the heading when the change was not confirmed", () => {
     const v = mount(DOC, adapter.extensions, DOC.indexOf("## B") + 3);
-    cycleHeading(v, 3);
+    setHeadingLevel(v, 3);
     expect(v.state.doc.toString()).toContain("### B\n<!-- r:bbbb0002 -->\n");
   });
 });
@@ -175,13 +186,13 @@ describe("the verbs from a caret on a hidden id line", () => {
 
   it("a heading change from the id line's end makes the line below a heading", () => {
     const v = mount(DOC, adapter.extensions, ID_TO);
-    cycleHeading(v, 2);
+    setHeadingLevel(v, 2);
     expect(v.state.doc.toString()).toContain(`## A${ID_LINE}## \none`);
   });
 
   it("a heading change from the id line's start is about the heading above", () => {
     const v = mount(DOC, adapter.extensions, ID_FROM);
-    cycleHeading(v, 3);
+    setHeadingLevel(v, 3);
     expect(v.state.doc.toString()).toContain(`### A${ID_LINE}`);
   });
 });

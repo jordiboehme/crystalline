@@ -32,6 +32,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
 import { mermaidConfig } from "../theme/mermaid";
+import { mermaidFence } from "./elementVerbs";
 import { gridDraws, gridLoaded, gridUnavailable } from "./grid/draws";
 import { parseAdvanced } from "./parseProgress";
 
@@ -437,9 +438,9 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name === "FencedCode") {
-        const text = doc.sliceString(node.from, node.to);
-        const fence = /^```(\w+)?[^\n]*\n([\s\S]*?)\n?```\s*$/.exec(text);
-        if (fence && fence[1] === "mermaid") {
+        // The test the code box shares, so a fence is drawn once.
+        const body = mermaidFence(state, node.node);
+        if (body !== null) {
           widgets.push(
             Decoration.widget({
               // The body starts on the line after the opening delimiter, which
@@ -447,7 +448,7 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
               // is what turns mermaid's fence-relative line into a line of
               // this document.
               widget: new MermaidPreviewWidget(
-                fence[2] ?? "",
+                body,
                 dark,
                 doc.lineAt(node.from).number + 1,
               ),

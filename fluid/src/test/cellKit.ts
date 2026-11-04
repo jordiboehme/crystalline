@@ -27,7 +27,8 @@ import { openCellRange, setOpenCell } from "../editor/grid/openCell";
 import type { GridCell } from "../editor/grid/structure";
 import { gridTables } from "../editor/grid/structure";
 import { baseExtensions, lineSeparatorFor } from "../editor/setup";
-import { parsedState } from "./parse";
+import { cellMarksExtensions } from "./cellMarksMode";
+import { parsedState, parsedView } from "./parse";
 
 const cleanups: (() => void)[] = [];
 
@@ -46,6 +47,7 @@ export function soloMain(text: string, extra: Extension[] = []): EditorView {
           ...lineSeparatorFor(text),
           ...baseExtensions(false),
           ...extra,
+          ...cellMarksExtensions(),
         ],
       }),
     ),
@@ -109,6 +111,7 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
           keymap.of(yUndoManagerKeymap),
           normalizePastedEndings,
           ...extra,
+          ...cellMarksExtensions(),
         ],
       }),
     ),
@@ -128,19 +131,30 @@ export function cellOf(
   row: number,
   column: number,
 ): GridCell {
-  const table = gridTables(main.state)[0];
+  const table = gridTables(parsedState(main.state))[0];
   const cell = table?.rows[row]?.[column];
   if (!cell) throw new Error(`no cell ${row}/${column}`);
   return cell;
 }
 
-/** Opens the cell holding `pos` and mounts a cell editor on it. */
+/**
+ * Opens the cell holding `pos` and mounts a cell editor on it.
+ *
+ * Main's parse is finished first. An edit on main (a typed letter, an undo)
+ * parses again within a 20 millisecond `Date.now()` budget, and on a loaded
+ * machine that budget runs out before the table: the open cell then has no
+ * range and the mount throws "no open cell". The grid never mounts on a short
+ * tree: `host` in `gridWidget.ts` mounts nothing while the cell is not parsed,
+ * and a landing asks for the parse first (`parseThrough` in `openCell.ts`).
+ * A test asks for it too, as `parse.ts` explains.
+ */
 export function openAt(
   main: EditorView,
   pos: number,
   focused = true,
   extensions: Extension[] = [],
 ): CellEditor {
+  parsedView(main);
   main.dispatch({
     effects: setOpenCell.of({ anchor: pos, head: pos, focused }),
   });

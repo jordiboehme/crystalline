@@ -18,12 +18,12 @@
 
 import type { EditorState, Extension, Line } from "@codemirror/state";
 import { EditorSelection, Prec } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
-import { keymap } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 
 import { frontmatterHidden } from "./frontmatterFold";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { isIdLineAt, joinSections, stepOffIdLines } from "./hiddenIdLines";
+import { roomUndo } from "./roomUndo";
 
 /**
  * Keep a command off a frontmatter block that is currently hidden.
@@ -175,20 +175,6 @@ export function toggleInline(view: EditorView, marker: string): boolean {
 const HEADING = /^(#{1,6})[ \t]+/;
 
 /**
- * The level line `lineNo` has once Heading `level` is picked on it: `level`,
- * or 0 when the line already wears that level and the pick takes it off.
- * What a document adapter is asked about before the change is made.
- */
-export function headingLevelAfter(
-  state: EditorState,
-  lineNo: number,
-  level: number,
-): number {
-  const worn = HEADING.exec(state.doc.line(lineNo).text)?.[1]?.length ?? 0;
-  return worn === level ? 0 : level;
-}
-
-/**
  * Heading level on the MAIN selection's line only - deliberate scope, not an
  * oversight: a heading is a line property, and cycling it under every cursor
  * of a multi-cursor selection is more surprise than help. The inline
@@ -206,6 +192,39 @@ export function cycleHeading(
   level: number,
   options: { joinSections?: boolean } = {},
 ): boolean {
+  return writeHeading(view, (worn) => (worn === level ? 0 : level), options);
+}
+
+/**
+ * Sets the main selection's line to exactly `level` `#` (0 is no heading).
+ * It never toggles - picking the level the line has changes nothing - and
+ * writes only the `#` run and its space: from `## x` to level 3 inserts one
+ * `#`, to 0 deletes `## `. The text style menu runs it.
+ *
+ * It is a gesture of its own, one undo step in a room too, and a page that is
+ * not writable takes nothing. `joinSections` is `cycleHeading`'s: the bar asks
+ * the document adapter first and passes it once the person has confirmed.
+ */
+export function setHeadingLevel(
+  view: EditorView,
+  level: 0 | 1 | 2 | 3 | 4,
+  options: { joinSections?: boolean } = {},
+): boolean {
+  if (!view.state.facet(EditorView.editable) || view.state.readOnly) {
+    return false;
+  }
+  const room = view.state.facet(roomUndo);
+  room?.stopCapturing();
+  const done = writeHeading(view, () => level, options);
+  room?.stopCapturing();
+  return done;
+}
+
+function writeHeading(
+  view: EditorView,
+  target: (worn: number) => number,
+  options: { joinSections?: boolean },
+): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
   }
@@ -213,17 +232,16 @@ export function cycleHeading(
   const { state } = view;
   const line = state.doc.lineAt(state.selection.main.head);
   const match = HEADING.exec(line.text);
-  const mark = `${"#".repeat(level)} `;
   // The level the line wears now, and how much of it the mark occupies. Zero
   // is "no heading here", which no `#{1,6}` match can otherwise produce.
   const worn = match?.[1]?.length ?? 0;
   const width = match?.[0]?.length ?? 0;
-  const changes: { from: number; to?: number; insert: string }[] =
-    worn === 0
-      ? [{ from: line.from, insert: mark }]
-      : worn === level
-        ? [{ from: line.from, to: line.from + width, insert: "" }]
-        : [{ from: line.from, to: line.from + width, insert: mark }];
+  const level = target(worn);
+  const mark = level === 0 ? "" : `${"#".repeat(level)} `;
+  const changes: { from: number; to?: number; insert: string }[] = [];
+  if (worn !== level) {
+    changes.push({ from: line.from, to: line.from + width, insert: mark });
+  }
   const joining =
     options.joinSections === true && isIdLineAt(state, line.number + 1);
   if (joining) {
@@ -234,11 +252,13 @@ export function cycleHeading(
       insert: "",
     });
   }
-  view.dispatch({
-    changes,
-    userEvent: "input",
-    ...(joining ? { annotations: joinSections.of(true) } : {}),
-  });
+  if (changes.length > 0) {
+    view.dispatch({
+      changes,
+      userEvent: "input",
+      ...(joining ? { annotations: joinSections.of(true) } : {}),
+    });
+  }
   view.focus();
   return true;
 }

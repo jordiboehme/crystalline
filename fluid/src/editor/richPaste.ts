@@ -24,7 +24,7 @@ import { Prec, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
 import { transferFiles } from "./attachments";
-import { carriesText, textOf } from "./clipboardHtml";
+import { carriesText, isOwnCopy, textOf } from "./clipboardHtml";
 
 type Converter = typeof import("./htmlToMarkdown");
 
@@ -144,6 +144,11 @@ export function richPaste(): Extension {
           return false;
         }
         const html = data.getData("text/html");
+        // Our own copy: the plain text is the Markdown, taken as it is by
+        // the editor's own paste.
+        if (isOwnCopy(html)) {
+          return false;
+        }
         const files = transferFiles(data);
         if (html.trim() === "" || filesAreThePaste(files, html)) {
           return false;

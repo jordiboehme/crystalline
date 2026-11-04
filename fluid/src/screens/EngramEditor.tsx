@@ -67,7 +67,11 @@ import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { ElementEdit, ElementRequest } from "../editor/elementEdit";
+import { ElementPopoverSlot } from "../editor/popovers/ElementPopoverSlot";
 import type { FloatingContext } from "../editor/floatingContext";
+import type { Format } from "../editor/marks/formatting";
+import { NO_FORMATS } from "../editor/marks/formatting";
 import {
   imagePreviews,
   refreshPreviews,
@@ -91,11 +95,16 @@ import {
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
 import { useRoomExit } from "../editor/useRoomExit";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
-import { wikilinkResolverFacet } from "../editor/wikilinkChips";
+import {
+  wikilinkResolverFacet,
+  wikilinkTitleOptions,
+} from "../editor/wikilinkChips";
 import { useIgnoredEngram } from "../events/ignored";
 import { moveDraft } from "../editor/drafts";
 import { editRoute, engramRoute, engramsRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
+import { marksOnEditLine } from "../editor/marks/mode";
+import { useMarkSetting } from "../markSetting/context";
 import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
@@ -221,6 +230,9 @@ interface EngramSurfaceOptions {
   /** The layer switch the Raw toggle reconfigures. */
   preview: Compartment;
   raw: boolean;
+  /** The marks setting's switch, reconfigured when the person flips it. */
+  marks: Compartment;
+  showMarks: boolean;
   /** The resolver's own switch, reconfigured when the graph lands. */
   resolverBox: Compartment;
   resolver: WikilinkResolver;
@@ -236,6 +248,10 @@ interface EngramSurfaceOptions {
   onElementContext: (face: ElementFace) => void;
   /** Told what the floating bar stands by; see `SurfaceOptions`. */
   onFloatingContext: (context: FloatingContext) => void;
+  /** Told the formats the format buttons show pressed; see `SurfaceOptions`. */
+  onFormatState: (formats: ReadonlySet<Format>) => void;
+  /** Told the element popover asked for; see `SurfaceOptions`. */
+  onElementEdit: (edit: ElementEdit | null, view: EditorView) => void;
 }
 
 /**
@@ -287,6 +303,8 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
         options.resolverBox.of(wikilinkResolverFacet.of(options.resolver)),
       ],
       preview: options.preview,
+      marks: options.marks,
+      showMarks: options.showMarks,
       raw: options.raw,
       images: imagePreviews(options.domain),
       uploads: options.uploads,
@@ -294,6 +312,8 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       onImageContext: options.onImageContext,
       onElementContext: options.onElementContext,
       onFloatingContext: options.onFloatingContext,
+      onFormatState: options.onFormatState,
+      onElementEdit: options.onElementEdit,
     }),
   ];
 }
@@ -485,6 +505,22 @@ function Surface({
    */
   const [preview] = useState(() => new Compartment());
   /**
+   * The marks setting's switch, outside the preview compartment: a flip
+   * reconfigures this alone, so Raw and the previews are never rebuilt.
+   */
+  const [marks] = useState(() => new Compartment());
+  const { showOnEditLine } = useMarkSetting();
+  // The setting as it stood at mount, so the first frame is right. The
+  // effect below carries every later flip, and re-applies the live value to
+  // any view a later remount builds.
+  const [showAtMount] = useState(showOnEditLine);
+  useEffect(() => {
+    // Nothing else in the transaction: no selection, no changes, no userEvent.
+    view?.dispatch({
+      effects: marks.reconfigure(marksOnEditLine.of(showOnEditLine)),
+    });
+  }, [view, marks, showOnEditLine]);
+  /**
    * The resolver's own switch. It is not part of the preview compartment
    * because it is not a layer: it is the answer the chips inside that layer
    * ask for, and it arrives once the neighborhood request lands rather than
@@ -511,6 +547,21 @@ function Surface({
   const [element, setElement] = useState<ElementFace>(null);
   /** What the floating action bar stands by: a selection, a cell, nothing. */
   const [floating, setFloating] = useState<FloatingContext>(null);
+  /** The formats the format buttons draw pressed. */
+  const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
+  /** The element popover asked for (a link, a wikilink), with the view that asked. */
+  const [elementEdit, setElementEdit] = useState<ElementRequest | null>(null);
+  /** The wikilink popover's title matches, the `[[` completion's lookup. */
+  const titleMatches = useCallback(
+    (term: string) => wikilinkTitleOptions(engram.domain, queryClient, term),
+    [engram.domain, queryClient],
+  );
+  const onElementEdit = useCallback(
+    (edit: ElementEdit | null, from: EditorView) => {
+      setElementEdit(edit ? { edit, view: from } : null);
+    },
+    [],
+  );
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -633,6 +684,8 @@ function Surface({
       dark: resolved === "dark",
       domain: engram.domain,
       preview,
+      marks,
+      showMarks: showOnEditLine,
       raw,
       resolverBox,
       resolver,
@@ -642,6 +695,8 @@ function Surface({
       onImageContext: setImageActive,
       onElementContext: setElement,
       onFloatingContext: setFloating,
+      onFormatState: setFormats,
+      onElementEdit,
     });
 
   /**
@@ -920,6 +975,10 @@ function Surface({
         dark: resolved === "dark",
         domain: engram.domain,
         preview,
+        marks,
+        // The live setting, so the first frame is right; the effect above
+        // carries every later flip.
+        showMarks: showAtMount,
         raw: RAW_AT_MOUNT,
         resolverBox,
         // The graph has not landed at mount; the compartment above carries
@@ -931,6 +990,8 @@ function Surface({
         onImageContext: setImageActive,
         onElementContext: setElement,
         onFloatingContext: setFloating,
+        onFormatState: setFormats,
+        onElementEdit,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -941,9 +1002,12 @@ function Surface({
       adapter,
       resolved,
       preview,
+      marks,
+      showAtMount,
       resolverBox,
       room,
       uploads.extension,
+      onElementEdit,
     ],
   );
 
@@ -1376,6 +1440,7 @@ function Surface({
             tableDrawn={tableContext.drawn}
             raw={raw}
             cellOpen={floating?.kind === "cell"}
+            formats={formats}
             imageActive={imageActive}
             calloutActive={element?.kind === "callout" ? element : null}
             statusActive={element?.kind === "status" ? element.colour : null}
@@ -1427,6 +1492,13 @@ function Surface({
             main={view}
             context={raw ? null : floating}
             wikilinks={adapter.wikilinks}
+            formats={formats}
+          />
+          {/* The element popovers; Raw asks for none. */}
+          <ElementPopoverSlot
+            main={view}
+            request={raw ? null : elementEdit}
+            titles={titleMatches}
           />
         </div>
         <EditorDetails hasHardErrors={session.hardErrors > 0}>

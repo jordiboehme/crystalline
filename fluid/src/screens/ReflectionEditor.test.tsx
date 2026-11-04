@@ -1,3 +1,4 @@
+import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -13,6 +14,7 @@ import { TEXT_NAME } from "../collab/provider";
 import type { CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
 import { addOffer, readDraft, readOffers, writeDraft } from "../editor/drafts";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { formatInstant } from "../format";
 import {
   answersFor,
@@ -21,6 +23,7 @@ import {
   soloCollabSession,
   userFixture,
 } from "../test/harness";
+import { typeText } from "../test/markKit";
 
 vi.setConfig({ testTimeout: 15000 });
 vi.mock("../api/client", async (importOriginal) => {
@@ -92,6 +95,67 @@ beforeEach(() => {
 });
 
 describe("the reflection editor", () => {
+  it("builds the page showing marks, first frame included, for a person who has the setting on", async () => {
+    localStorage.setItem("fluid-marks-on-edit-line", "on");
+    const built: EditorState[] = [];
+    const create = EditorState.create.bind(EditorState);
+    vi.spyOn(EditorState, "create").mockImplementation((config) => {
+      const state = create(config);
+      built.push(state);
+      return state;
+    });
+    serve("edit");
+    live(room(PAGE));
+    const editor = await openEditor();
+    const first = built.find((state) =>
+      state.doc.toString().includes("First."),
+    );
+    expect(first?.facet(marksOnEditLine)).toBe(true);
+    const host = editor.closest(".cm-editor");
+    const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+    expect(view?.state.facet(marksOnEditLine)).toBe(true);
+  });
+
+  it("keeps the bytes and the caret when the marks setting flips, and the next key lands at the caret", async () => {
+    serve("edit");
+    live(room(PAGE));
+    const editor = await openEditor();
+    const host = editor.closest(".cm-editor");
+    const view = host ? EditorView.findFromDOM(host as HTMLElement) : null;
+    if (!view) {
+      throw new Error("no EditorView is mounted on the page");
+    }
+    expect(view.state.facet(marksOnEditLine)).toBe(false);
+    const at = view.state.doc.toString().indexOf("First");
+    act(() => {
+      view.dispatch({ selection: { anchor: at } });
+    });
+    const before = view.state.doc.toString();
+
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
+    await user.click(
+      await screen.findByRole("menuitemcheckbox", {
+        name: "Show Markdown marks on the line I edit",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(view.state.facet(marksOnEditLine)).toBe(true);
+    });
+    expect(view.state.doc.toString()).toBe(before);
+    expect(view.state.selection.main.head).toBe(at);
+
+    act(() => {
+      typeText(view, "X");
+    });
+    expect(view.state.doc.toString()).toBe(
+      `${before.slice(0, at)}X${before.slice(at)}`,
+    );
+  });
+
   it("opens the live room with the ids hidden and Done back to the page", async () => {
     serve("edit");
     sessionMock.mockReturnValue(room(PAGE));
@@ -161,7 +225,7 @@ describe("the reflection editor", () => {
       "Italic",
       "Strikethrough",
       "Inline code",
-      "Heading",
+      "Text style",
       "Bulleted list",
       "Numbered list",
       "Task list",
@@ -187,9 +251,9 @@ describe("the reflection editor", () => {
       view.dispatch({ selection: { anchor: PAGE.indexOf("## One") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog).toHaveTextContent(
@@ -218,9 +282,9 @@ describe("the reflection editor", () => {
       view.dispatch({ selection: { anchor: PAGE.indexOf("## One") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     await user.click(
       within(await screen.findByRole("alertdialog")).getByRole("button", {
@@ -1617,7 +1681,7 @@ describe("the reflection editor takes files", () => {
     ).toBeDisabled();
     // The whole bar is off with it: the text can take no edit now.
     expect(screen.getByRole("button", { name: "Bold" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Heading" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Text style" })).toBeDisabled();
     editor.dispatchEvent(carrying("paste", [png()]));
     const drop = carrying("drop", [png()]);
     editor.dispatchEvent(drop);

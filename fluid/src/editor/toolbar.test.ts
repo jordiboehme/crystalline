@@ -16,6 +16,7 @@ import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { frontmatterFold } from "./frontmatterFold";
+import { roomUndo } from "./roomUndo";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import {
   CODE_SKELETON,
@@ -28,6 +29,7 @@ import {
   insertMarkdownLink,
   insertWikilink,
   selectToken,
+  setHeadingLevel,
   tableSkeleton,
   toggleInline,
   toggleLinePrefix,
@@ -127,6 +129,65 @@ describe("cycleHeading", () => {
     expect(docText(v.state)).toBe("### Title line");
     cycleHeading(v, 3);
     expect(docText(v.state)).toBe("Title line");
+  });
+});
+
+describe("setHeadingLevel", () => {
+  test("sets the line to exactly that level and never toggles", () => {
+    const v = solo("x", 1);
+    setHeadingLevel(v, 1);
+    expect(docText(v.state)).toBe("# x");
+    setHeadingLevel(v, 1);
+    expect(docText(v.state)).toBe("# x");
+  });
+
+  test("from ## to level 3 inserts one #", () => {
+    const v = solo("## x", 3);
+    setHeadingLevel(v, 3);
+    expect(docText(v.state)).toBe("### x");
+    expect(v.state.selection.main.head).toBe(4);
+  });
+
+  test("a level 0 deletes the run and its space", () => {
+    const v = solo("### x", 5);
+    setHeadingLevel(v, 0);
+    expect(docText(v.state)).toBe("x");
+  });
+
+  test("leaves everything else on the line alone", () => {
+    const v = solo("a\n#### b *c*\nd", 4);
+    setHeadingLevel(v, 2);
+    expect(docText(v.state)).toBe("a\n## b *c*\nd");
+  });
+
+  test("a page that is not writable takes nothing", () => {
+    const v = solo("x", 1);
+    v.setState(
+      EditorState.create({
+        doc: "x",
+        extensions: [EditorView.editable.of(false)],
+      }),
+    );
+    expect(setHeadingLevel(v, 1)).toBe(false);
+    expect(docText(v.state)).toBe("x");
+  });
+
+  test("a gesture of its own: it closes the room's capture window on both sides", () => {
+    const calls: string[] = [];
+    const manager = {
+      stopCapturing: () => calls.push("stop"),
+    } as unknown as Y.UndoManager;
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "x",
+        extensions: [roomUndo.of(manager)],
+      }),
+      parent: document.body,
+    });
+    view.dispatch({ selection: { anchor: 1 } });
+    const before = calls.length;
+    setHeadingLevel(view, 2);
+    expect(calls.length - before).toBe(2);
   });
 });
 

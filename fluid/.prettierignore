@@ -28,3 +28,8 @@ src/editor/fixtures/paste/
 # keep the spellings people write (no padding, no edge pipes, empty cells),
 # which prettier would pad into one aligned shape.
 src/editor/fixtures/tables/
+
+# The hidden-mark fidelity test's dialect file: every Markdown spelling the
+# editor draws (`*` and `+` bullets, `___` emphasis, setext headings, tilde
+# fences), which prettier would rewrite into one style.
+src/editor/fixtures/dialect/

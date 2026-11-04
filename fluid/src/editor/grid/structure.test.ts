@@ -29,7 +29,7 @@ function only(doc: string) {
 
 /** Row 0 of a table, as [span text, content text] pairs read off the doc. */
 function readRow(state: EditorState, row: number) {
-  const table = gridTables(state)[0];
+  const table = gridTables(parsedState(state))[0];
   const cells = table?.rows[row] ?? [];
   return cells.map((cell) => [
     state.doc.sliceString(cell.span.from, cell.span.to),
@@ -48,7 +48,7 @@ describe("gridTables", () => {
       [" 1 ", "1"],
       [" 2 ", "2"],
     ]);
-    const table = gridTables(state)[0];
+    const table = gridTables(parsedState(state))[0];
     expect(table?.rows.length).toBe(2);
     expect(table?.rows[0]?.[0]).toMatchObject({ row: 0, column: 0, text: "a" });
     expect(table?.rows[1]?.[1]).toMatchObject({ row: 1, column: 1, text: "2" });
@@ -64,14 +64,14 @@ describe("gridTables", () => {
 
   it("gives an empty cell with no padding an empty content at its span start", () => {
     const state = stateOf("||\n|-|\n||");
-    const cell = gridTables(state)[0]?.rows[0]?.[0];
+    const cell = gridTables(parsedState(state))[0]?.rows[0]?.[0];
     expect(cell?.span.from).toBe(cell?.span.to);
     expect(cell?.content).toEqual(cell?.span);
   });
 
   it("gives a cell holding one space an empty content after the space", () => {
     const state = stateOf("|  |\n|-|\n||");
-    const cell = gridTables(state)[0]?.rows[0]?.[0];
+    const cell = gridTables(parsedState(state))[0]?.rows[0]?.[0];
     expect(cell?.span.to).toBe((cell?.span.from ?? 0) + 2);
     expect(cell?.content.from).toBe((cell?.span.from ?? 0) + 1);
     expect(cell?.content.to).toBe(cell?.content.from);
@@ -79,7 +79,7 @@ describe("gridTables", () => {
 
   it("keeps a single-space cell's content empty and inside the span", () => {
     const state = stateOf("| |\n|-|\n||");
-    const cell = gridTables(state)[0]?.rows[0]?.[0];
+    const cell = gridTables(parsedState(state))[0]?.rows[0]?.[0];
     expect(cell?.span.to).toBe((cell?.span.from ?? 0) + 1);
     expect(cell?.content.from).toBe((cell?.span.from ?? 0) + 1);
     expect(cell?.content.to).toBe(cell?.content.from);
@@ -138,7 +138,7 @@ describe("gridTables", () => {
     const crlf = stateOf(lines.join("\r\n"));
     // Same document positions: CodeMirror counts a break as one position.
     const flat = (state: EditorState) =>
-      (gridTables(state)[0]?.rows ?? []).flat().map((cell) => ({
+      (gridTables(parsedState(state))[0]?.rows ?? []).flat().map((cell) => ({
         span: cell.span,
         content: cell.content,
         text: cell.text,
@@ -163,14 +163,14 @@ describe("gridTableAt and cellAt", () => {
 
   it("finds the table holding a position", () => {
     const state = stateOf(`intro\n\n${doc}\n\nafter`);
-    expect(gridTableAt(state, 0)).toBeNull();
-    expect(gridTableAt(state, 10)?.rows.length).toBe(2);
-    expect(gridTableAt(state, state.doc.length)).toBeNull();
+    expect(gridTableAt(parsedState(state), 0)).toBeNull();
+    expect(gridTableAt(parsedState(state), 10)?.rows.length).toBe(2);
+    expect(gridTableAt(parsedState(state), state.doc.length)).toBeNull();
   });
 
   it("is null for a table inside a blockquote", () => {
     const state = stateOf("> | a |\n> | - |\n> | 1 |");
-    expect(gridTableAt(state, 5)).toBeNull();
+    expect(gridTableAt(parsedState(state), 5)).toBeNull();
   });
 
   it("returns the cell whose span holds the position, pipe edges included", () => {

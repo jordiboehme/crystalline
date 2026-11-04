@@ -11,10 +11,15 @@
 
 import { autocompletion } from "@codemirror/autocomplete";
 import type { Compartment, Extension } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 
 import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
+import { codeBlocks } from "./codeBlocks";
+import { copyAsHtml } from "./copyHtml";
 import { elementContextListener } from "./elementContext";
+import type { ElementEdit } from "./elementEdit";
+import { elementEditListener } from "./elementEdit";
 import { elementPreviews } from "./elementPreviews";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
@@ -23,6 +28,14 @@ import { floatingContextListener } from "./floatingContext";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
+import type { Format } from "./marks";
+import {
+  crossEdge,
+  formatKeymap,
+  formatStateListener,
+  hiddenMarkLayer,
+} from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { readingTheme } from "./readingTheme";
 import { richPaste } from "./richPaste";
@@ -30,7 +43,6 @@ import { RAW_MONO, baseExtensions } from "./setup";
 import { slashCompletions } from "./slashMenu";
 import type { TableUiContext } from "./tableVerbs";
 import { tableContextListener } from "./tableVerbs";
-import { formattingKeymap } from "./toolbar";
 
 /** Everything one buffer on either editor is built from. */
 export interface SurfaceOptions {
@@ -91,6 +103,29 @@ export interface SurfaceOptions {
    * reason.
    */
   onFloatingContext: (context: FloatingContext) => void;
+  /**
+   * Told the formats the format buttons show as pressed (Bold, Italic,
+   * Strikethrough, Inline code), read from the view a format verb acts on.
+   * It travels with the listeners above for their reason. Absent, nothing
+   * is told.
+   */
+  onFormatState?: (formats: ReadonlySet<Format>) => void;
+  /**
+   * Told the element edit a click, Mod-k or Shift+F10 asked for (a link, a
+   * wikilink), with the view that asked (main, or the open table cell), and
+   * null when it closes; the screen's popover host answers it. It travels
+   * with the listeners above for their reason. Absent, nothing asks: the
+   * Link button and Mod-k insert `[text](url)` as the source view does.
+   */
+  onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
+  /**
+   * The compartment the screen reconfigures when the marks setting flips. It
+   * sits outside the preview compartment, so a flip never rebuilds Raw or the
+   * previews. Absent, the setting is a bare value for the life of the state.
+   */
+  marks?: Compartment;
+  /** Whether marks show on the line being edited. Absent means hidden. */
+  showMarks?: boolean;
 }
 
 /**
@@ -114,6 +149,10 @@ export function previewConfig(
     livePreview(),
     ...adapter.previewLayers,
   ];
+  const marks = hiddenMarkLayer({
+    confirmHeadingChange: (state, line, level) =>
+      adapter.confirmHeadingChange(state, line, level),
+  });
   return off
     ? // Raw is deliberately the source view, so the whole buffer goes back to
       // mono: the shared theme sets prose proportional, and this is the one
@@ -123,11 +162,23 @@ export function previewConfig(
         // Before the mark folding, so a callout head, a label or a formula
         // replaces its whole span over the marks folded inside it.
         ...proseLayers,
-        cellPreviewLayers.of(proseLayers),
+        // The cell editor draws with the prose layers and the hidden-mark
+        // layer after them, in the order main has them; the cell adds its own
+        // segment and the marks setting (`mountCellEditor`).
+        cellPreviewLayers.of([...proseLayers, marks]),
+        // After the prose layers and outside `livePreview()`.
+        marks,
         // Before the read-only previews: the grid takes over the tables it
         // draws once its chunk is in.
         tableGrid(),
+        // After the grid, whose way into a table from the line beside it
+        // comes first: an arrow at a line's visible edge, with hidden marks
+        // up to the raw edge, goes over the line break.
+        crossEdge,
         fencePreviews(dark),
+        // The code box: a fence's lines drawn as a box with a header, in
+        // the main view only (a table cell holds no fence).
+        codeBlocks(),
         // A pasted screenshot is a path in the buffer and a picture on the
         // page, so the picture is drawn here too: an author placing an image
         // sees what a reader will see rather than the reference to it.
@@ -168,6 +219,17 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // selection is a selection in Raw mode too, and the screen decides
     // there whether the bar draws.
     floatingContextListener(options.onFloatingContext),
+    // And for the pressed format buttons. Outside the preview compartment:
+    // bold is bold in Raw mode too.
+    ...(options.onFormatState
+      ? [formatStateListener(options.onFormatState)]
+      : []),
+    // And for the element popovers. Outside the preview compartment, so a
+    // Raw flip reaches the listener (which closes the popover) rather than
+    // tearing it down with the layer.
+    ...(options.onElementEdit
+      ? [elementEditListener(options.onElementEdit)]
+      : []),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.
     options.uploads,
@@ -177,12 +239,15 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // processor's picture of the copy) is converted and nothing is uploaded;
     // any other file, or images with no text, goes to the uploads.
     richPaste(),
+    // Copy and cut carry HTML beside the Markdown, in Raw mode too: the
+    // buffer is Markdown either way.
+    copyAsHtml(),
     // The toolbar's own shortcuts. Outside the preview compartment: Mod-b and
     // Mod-i are typing help like the completions below, and raw mode is
-    // still markdown being written. Its `Prec.high` wrapper - not its
-    // position here - is what beats defaultKeymap's own Mod-i; see
-    // `formattingKeymap`.
-    formattingKeymap,
+    // still markdown being written (`toggleFormat` wraps there as the source
+    // view always has). Its `Prec.high` wrapper - not its position here - is
+    // what beats defaultKeymap's own Mod-i; see `formatKeymap`.
+    formatKeymap,
     // Typing help rather than preview, so it stays on in raw mode: outside
     // the compartment the Raw toggle empties. One `autocompletion` for every
     // source, because two would fight over the override. The `/` menu comes
@@ -190,6 +255,11 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // starts a line, where no other source does.
     autocompletion({ override: [slashCompletions, ...adapter.completions] }),
     ...adapter.extensions,
+    // The marks setting. Outside the preview compartment: a flip dispatches
+    // `marks.reconfigure(...)` alone and never rebuilds Raw or the previews.
+    options.marks
+      ? options.marks.of(marksOnEditLine.of(options.showMarks ?? false))
+      : marksOnEditLine.of(options.showMarks ?? false),
     // Every later flip goes through the compartment rather than through this
     // array, which is read once per state.
     options.preview.of(

@@ -10,6 +10,7 @@
  */
 
 import { undo } from "@codemirror/commands";
+import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -25,6 +26,7 @@ import type { CollabConflict, CollabSession } from "../collab/useCollabSession";
 import { useCollabSession } from "../collab/useCollabSession";
 import type { Draft } from "../editor/drafts";
 import { readDraft } from "../editor/drafts";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { docText } from "../editor/setup";
 import { SAVE_EVENT } from "../editor/useEditorSession";
 import { FakeEventSource } from "../events/testSupport";
@@ -37,6 +39,7 @@ import {
   soloCollabSession,
   userFixture,
 } from "../test/harness";
+import { typeText } from "../test/markKit";
 import { parsedView } from "../test/parse";
 
 // Above roughly load average 33 this file's slower tests exceed the 5000 ms
@@ -426,6 +429,87 @@ describe("the engram editor on a domain GitHub governs", () => {
 });
 
 describe("the engram editor", () => {
+  it("keeps the bytes and the caret when the marks setting flips, and the next key lands at the caret", async () => {
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await openBuffer();
+    const view = mountedView(editor);
+    expect(view.state.facet(marksOnEditLine)).toBe(false);
+    const at = view.state.doc.toString().indexOf("rule");
+    act(() => {
+      view.dispatch({ selection: { anchor: at } });
+    });
+    const before = docText(view.state);
+
+    const menu = userEvent.setup();
+    await menu.click(
+      await screen.findByRole("button", { name: "Ada Lovelace" }),
+    );
+    await menu.click(
+      await screen.findByRole("menuitemcheckbox", {
+        name: "Show Markdown marks on the line I edit",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(view.state.facet(marksOnEditLine)).toBe(true);
+    });
+    expect(docText(view.state)).toBe(before);
+    expect(view.state.selection.main.head).toBe(at);
+    expect(view.state.selection.ranges).toHaveLength(1);
+
+    act(() => {
+      typeText(view, "X");
+    });
+    expect(docText(view.state)).toBe(
+      `${before.slice(0, at)}X${before.slice(at)}`,
+    );
+  });
+
+  it("builds the buffer showing marks, first frame and after a draft rebuild, for a person who has the setting on", async () => {
+    localStorage.setItem("fluid-marks-on-edit-line", "on");
+    localStorage.setItem(
+      "fluid.draft.ada.eng/alpha",
+      JSON.stringify({
+        content: CONTENT.replace("A rule.", "A recovered rule."),
+        baseChecksum: "3f8a1c05e2",
+        savedAt: "2026-08-09T10:00:00Z",
+      }),
+    );
+    // The states the screen builds, read before any effect can correct them.
+    const built: EditorState[] = [];
+    const create = EditorState.create.bind(EditorState);
+    vi.spyOn(EditorState, "create").mockImplementation((config) => {
+      const state = create(config);
+      built.push(state);
+      return state;
+    });
+    serveEditor();
+    renderApp("/d/eng/edit/alpha");
+    const editor = await openBuffer();
+    const first = built.find((state) =>
+      state.doc.toString().includes("A rule."),
+    );
+    expect(first?.facet(marksOnEditLine)).toBe(true);
+    expect(mountedView(editor).state.facet(marksOnEditLine)).toBe(true);
+
+    // Restoring a draft rebuilds the state on the same view, and nothing
+    // else reapplies the setting afterwards.
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Restore draft" }),
+    );
+    await waitFor(() => {
+      expect(screen.getByLabelText("Engram source").textContent).toContain(
+        "A recovered rule.",
+      );
+    });
+    expect(
+      mountedView(screen.getByLabelText("Engram source")).state.facet(
+        marksOnEditLine,
+      ),
+    ).toBe(true);
+  });
+
   it("loads the exact file text into the buffer", async () => {
     serveEditor();
     renderApp("/d/eng/edit/alpha");
@@ -768,9 +852,9 @@ describe("the engram editor", () => {
       view.dispatch({ selection: { anchor: content.indexOf("## Part") + 3 } });
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Heading" }));
+    await user.click(screen.getByRole("button", { name: "Text style" }));
     await user.click(
-      await screen.findByRole("menuitem", { name: "Heading 3" }),
+      await screen.findByRole("menuitemradio", { name: "Heading 2" }),
     );
     expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(docText(view.state)).toContain("### Part\n<!-- r:aaaa0001 -->\n");

@@ -2194,6 +2194,29 @@ describe("the avatar menu", () => {
       expect(within(menu).queryByRole("menuitem", { name: gone })).toBeNull();
     }
   });
+
+  it("offers the marks setting in the Display group, off until chosen", async () => {
+    localStorage.clear();
+    serve({
+      "/auth/me": () => meResponse({ anonymous: true }),
+      "/domains": domainsResponse,
+    });
+
+    renderApp("/");
+    const user = userEvent.setup();
+    const menu = await openAvatar(user, "Viewing anonymously");
+
+    const item = within(menu).getByRole("menuitemcheckbox", {
+      name: "Show Markdown marks on the line I edit",
+    });
+    expect(item).toHaveAttribute("aria-checked", "false");
+    await user.click(item);
+    expect(item).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("fluid-marks-on-edit-line")).toBe("on");
+    await user.click(item);
+    expect(item).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("fluid-marks-on-edit-line")).toBeNull();
+  });
 });
 
 /**

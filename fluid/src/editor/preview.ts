@@ -1,18 +1,16 @@
 /**
  * The live-preview decoration layer: a read-model over the buffer, never a
  * write-model. Syntax markers (heading #s, emphasis stars, backticks, link
- * brackets and targets) and HTML comments, which the reading page never
- * draws, fold away except on the lines a selection touches, so
- * prose reads as prose while the line being edited shows exactly what is
- * written. Nothing here rewrites the document: a decoration is a view over the
- * bytes, and the bytes come back out of the buffer exactly as they went in.
+ * brackets and targets, list, task and quote prefixes) and HTML comments,
+ * which the reading page never draws, fold away wherever the hidden-mark
+ * model says a line hides its marks (`marks/hiddenMarks.ts`): every line by
+ * default, and with the setting on every line but the ones a selection
+ * touches, which show exactly what is written. Nothing here rewrites the
+ * document: a decoration is a view over the bytes, and the bytes come back out
+ * of the buffer exactly as they went in.
  *
- * The one exception is deliberate and is an ordinary edit rather than a
- * decoration: a task marker is drawn as the checkbox it means, and toggling it
- * dispatches a transaction over the marker's own range, taken from the syntax
- * tree's node offsets. Those offsets are positions in the document, not
- * indexes into the file's string, and they never leave this module as
- * anything else.
+ * The list, task and quote marks are drawn by `marks/blocks.ts` (bullets,
+ * numbers, task boxes, quote bars), so they are left to it here.
  *
  * The frontmatter block is left entirely alone - the parser misreads its
  * fences as thematic breaks, and the form panel is that region's structured
@@ -28,278 +26,80 @@ import {
   ViewPlugin,
   WidgetType,
 } from "@codemirror/view";
-import type { SyntaxNodeRef } from "@lezer/common";
 
-import { htmlCommentRanges } from "../markdown/htmlComments";
-import { isIdLine } from "../reflectionText";
+import { openWindow } from "../base";
+import {
+  answersElementEdits,
+  elementEditAt,
+  macMenuClick,
+  pressElement,
+  writable,
+} from "./elementEdit";
+import { linkAddress, linkAt, openableAddress } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
-import { parkingChanged, revealRanges } from "./parkedSelection";
+import type { MarkKind } from "./marks/hiddenMarks";
+import { scanMarks } from "./marks/hiddenMarks";
+import { markModeChanged, marksOnEditLine } from "./marks/mode";
+import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 
-/** The formatting marks that fold away off the active lines. */
-const FOLDING_MARKS = new Set([
-  "HeaderMark",
-  "EmphasisMark",
-  "CodeMark",
-  "LinkMark",
-  "URL",
-]);
-
-/** A task marker drawn as the checkbox it means. The click IS a text edit. */
-class CheckboxWidget extends WidgetType {
-  // Assigned in the body rather than declared as constructor parameters:
-  // the build erases types, it does not run a TypeScript transform, and
-  // parameter properties are syntax that would need one.
-  readonly checked: boolean;
-  readonly from: number;
-  readonly to: number;
-
-  constructor(checked: boolean, from: number, to: number) {
-    super();
-    this.checked = checked;
-    this.from = from;
-    this.to = to;
-  }
-
-  override eq(other: CheckboxWidget): boolean {
-    return (
-      other.checked === this.checked &&
-      other.from === this.from &&
-      other.to === this.to
-    );
-  }
-
-  /**
-   * Flip the marker text in place. The range is the parsed marker's own span,
-   * so what is replaced is exactly `[ ]` or `[x]` and nothing around it; the
-   * decorations rebuild off the new document and this widget is replaced by
-   * one that no longer compares equal.
-   */
-  private toggle(view: EditorView): void {
-    view.dispatch({
-      changes: {
-        from: this.from,
-        to: this.to,
-        insert: this.checked ? "[ ]" : "[x]",
-      },
-    });
-  }
-
-  override toDOM(view: EditorView): HTMLElement {
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = this.checked;
-    box.className = "cm-task-toggle";
-    box.setAttribute(
-      "aria-label",
-      this.checked ? "Mark task open" : "Mark task done",
-    );
-    box.addEventListener("mousedown", (event) => {
-      // The editor must not also read the press as a click into the hidden
-      // marker text and move the selection there.
-      event.preventDefault();
-      this.toggle(view);
-    });
-    // Keyboard parity: a focused checkbox answers to Space, and the raw
-    // marker is always reachable by putting the cursor on the line, where
-    // the widget folds back into the `[ ]` it stands for.
-    box.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") {
-        event.preventDefault();
-        this.toggle(view);
-      }
-    });
-    return box;
-  }
-
-  override ignoreEvent(): boolean {
-    // The widget owns its events; the editor must not also treat the click
-    // as a selection change on the hidden marker text.
-    return true;
-  }
-}
+/** The marks `marks/blocks.ts` draws in their place. */
+const BLOCK_MARKS = new Set<MarkKind>(["list", "task", "quote"]);
 
 /**
- * The not-applicable marker `[~]`, drawn as a struck box. It is no checkbox
- * and toggles nothing: the third state is written by hand, and a click is a
- * click into the text, which puts the cursor on the line and shows `[~]` as
- * written.
+ * An image with no alt text where its marks are hidden: a small box with the
+ * width of a letter, so a caret on either side of it is a place of its own.
+ * The picture itself is drawn under the line (`imagePreviews.ts`).
  */
-class NotApplicableWidget extends WidgetType {
+class ImageAtomWidget extends WidgetType {
   override eq(): boolean {
     return true;
   }
 
-  override toDOM(): HTMLElement {
+  toDOM(): HTMLElement {
     const box = document.createElement("span");
-    box.className = "cm-task-na";
+    box.className = "cm-image-atom";
     box.setAttribute("role", "img");
-    box.setAttribute("aria-label", "Not applicable");
+    box.setAttribute("aria-label", "Image");
     return box;
   }
-
-  override ignoreEvent(): boolean {
-    return false;
-  }
 }
 
-/** `[~]` after a list mark and its space, as the reading page reads it. */
-const NOT_APPLICABLE = /^[ \t]\[~\](?:[ \t]|$)/;
+const IMAGE_ATOM = Decoration.replace({ widget: new ImageAtomWidget() });
 
 /**
- * A fenced code block's own delimiter line, which stays visible.
- *
- * `CodeMark` is both an inline backtick and a fence, and folding the fence
- * away strands the info string: the language name is left reading as a
- * paragraph above a block of code with no affordance saying it is one. Until
- * a widget draws the block properly, the fence is the affordance.
+ * The hidden marks of the visible lines, from the model (`marks/hiddenMarks.ts`):
+ * each one folds away as a plain replace, except the block marks (list, task
+ * and quote), which `marks/blocks.ts` draws.
  */
-function isFence(node: SyntaxNodeRef): boolean {
-  return node.name === "CodeMark" && node.node.parent?.name === "FencedCode";
-}
-
-/**
- * The line numbers any selection range touches. None while a table cell is
- * open: main's selection is stale then, and the line it sits on is not the
- * one being edited (`mainSelectionParked`).
- */
-function activeLines(view: EditorView): Set<number> {
-  const lines = new Set<number>();
-  for (const range of revealRanges(view.state)) {
-    const from = view.state.doc.lineAt(range.from).number;
-    const to = view.state.doc.lineAt(range.to).number;
-    for (let line = from; line <= to; line += 1) {
-      lines.add(line);
-    }
-  }
-  return lines;
-}
-
 function buildDecorations(view: EditorView): DecorationSet {
-  /*
-   * An opening `#` mark folds away with the space after it, so a heading
-   * starts at the same left edge as the text under it rather than one space
-   * in. Only a space or tab on the same line: a setext underline's mark is a
-   * line of its own, and its line break is not the mark's to take.
-   */
-  const markEnd = (node: SyntaxNodeRef): number => {
-    if (node.name !== "HeaderMark") {
-      return node.to;
-    }
-    const line = view.state.doc.lineAt(node.from);
-    const next = view.state.doc.sliceString(node.to, node.to + 1);
-    return node.from === line.from && (next === " " || next === "\t")
-      ? node.to + 1
-      : node.to;
-  };
+  const { state } = view;
+  const doc = state.doc;
   const decorations: Range<Decoration>[] = [];
-  // A node that straddles two visible ranges is entered by both passes, and
-  // the same replacement twice over is a decoration set the view rejects.
-  const placed = new Set<string>();
-  const doc = view.state.doc;
-  const active = activeLines(view);
-  // The frontmatter block ends here; -1 when there is none, which no node
-  // start can fall at or below.
-  const frontmatterEnd = frontmatterRegion(doc)?.to ?? -1;
-  /*
-   * An HTML comment is a note for whoever edits the file, and the reading
-   * page never draws it (`htmlComments.ts`): off the lines a selection
-   * touches it folds away the same way, line by line, since a replacement
-   * may not cross a line break. Text after the comment on its line stays,
-   * as on the page. A Reflection section's id line is left to
-   * `hiddenIdLines`. A comment in code is no comment node and never comes
-   * here.
-   */
-  const hideComments = (from: number, to: number) => {
-    for (const comment of htmlCommentRanges(doc.sliceString(from, to))) {
-      const start = from + comment.from;
-      const end = from + comment.to;
-      const first = doc.lineAt(start).number;
-      const last = doc.lineAt(end).number;
-      for (let number = first; number <= last; number += 1) {
-        const line = doc.line(number);
-        const pieceFrom = Math.max(start, line.from);
-        const pieceTo = Math.min(end, line.to);
-        const key = `comment:${pieceFrom}:${pieceTo}`;
-        if (
-          pieceFrom >= pieceTo ||
-          active.has(number) ||
-          isIdLine(line.text) ||
-          placed.has(key)
-        ) {
+  // A line two visible ranges both reach is drawn once.
+  let drawnTo = 0;
+  for (const { from, to } of view.visibleRanges) {
+    let number = Math.max(doc.lineAt(from).number, drawnTo + 1);
+    const last = doc.lineAt(to).number;
+    for (; number <= last; number += 1) {
+      const scan = scanMarks(state, number, number);
+      for (const mark of scan.lines[0] ?? []) {
+        if (BLOCK_MARKS.has(mark.kind)) {
           continue;
         }
-        placed.add(key);
-        decorations.push(Decoration.replace({}).range(pieceFrom, pieceTo));
+        decorations.push(Decoration.replace({}).range(mark.from, mark.to));
+      }
+      // An image with no alt text: one piece a caret steps over (D40).
+      for (const atom of scan.atoms[0] ?? []) {
+        decorations.push(IMAGE_ATOM.range(atom.from, atom.to));
       }
     }
-  };
-
-  for (const { from, to } of view.visibleRanges) {
-    syntaxTree(view.state).iterate({
-      from,
-      to,
-      enter: (node) => {
-        if (node.from <= frontmatterEnd) {
-          // Undefined rather than false: the block's own children are skipped
-          // by the same test, but the document node starts here too and its
-          // later children must still be reached.
-          return;
-        }
-        if (node.name === "Comment" || node.name === "CommentBlock") {
-          hideComments(node.from, node.to);
-          return false;
-        }
-        if (active.has(doc.lineAt(node.from).number)) {
-          return;
-        }
-        if (
-          node.name === "ListMark" &&
-          NOT_APPLICABLE.test(doc.sliceString(node.to, node.to + 5))
-        ) {
-          const key = `na:${node.to}`;
-          if (!placed.has(key)) {
-            placed.add(key);
-            decorations.push(
-              Decoration.replace({ widget: new NotApplicableWidget() }).range(
-                node.to + 1,
-                node.to + 4,
-              ),
-            );
-          }
-          return;
-        }
-        const isMark = FOLDING_MARKS.has(node.name) && !isFence(node);
-        const isTask = node.name === "TaskMarker";
-        if (!isMark && !isTask) {
-          return;
-        }
-        const key = `${node.from}:${node.to}`;
-        if (placed.has(key)) {
-          return;
-        }
-        placed.add(key);
-        decorations.push(
-          isTask
-            ? Decoration.replace({
-                widget: new CheckboxWidget(
-                  doc.sliceString(node.from, node.to).toLowerCase() === "[x]",
-                  node.from,
-                  node.to,
-                ),
-              }).range(node.from, node.to)
-            : Decoration.replace({}).range(node.from, markEnd(node)),
-        );
-      },
-    });
+    drawnTo = last;
   }
-  return Decoration.set(
-    decorations.sort((a, b) => a.from - b.from || a.to - b.to),
-    true,
-  );
+  return Decoration.set(decorations, true);
 }
 
-const previewPlugin = ViewPlugin.fromClass(
+const hiddenMarkPlugin = ViewPlugin.fromClass(
   class {
     decorations: DecorationSet;
 
@@ -310,10 +110,12 @@ const previewPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate) {
       if (
         update.docChanged ||
-        update.selectionSet ||
+        // A selection reveals marks only with the setting on.
+        (update.selectionSet && update.state.facet(marksOnEditLine)) ||
         update.viewportChanged ||
         parseAdvanced(update) ||
-        parkingChanged(update)
+        parkingChanged(update) ||
+        markModeChanged(update)
       ) {
         this.decorations = buildDecorations(update.view);
       }
@@ -366,22 +168,127 @@ const frontmatterTint = ViewPlugin.fromClass(
 
 const previewTheme = EditorView.baseTheme({
   ".cm-frontmatter": { color: "var(--color-slate-500)", fontSize: "0.85em" },
-  ".cm-task-toggle": { verticalAlign: "middle", margin: "0 0.15em" },
-  // A box the size of the checkbox beside it, struck through once.
-  ".cm-task-na": {
+  ".cm-image-atom": {
     display: "inline-block",
     width: "0.8em",
     height: "0.8em",
-    margin: "0 0.2em",
+    margin: "0 0.1em",
     verticalAlign: "-0.05em",
-    border: "1px solid var(--color-slate-400)",
+    border: "1px solid currentColor",
     borderRadius: "2px",
-    background:
-      "linear-gradient(var(--color-slate-500), var(--color-slate-500)) center / 100% 1px no-repeat",
+    opacity: "0.45",
   },
 });
 
+/** The words of every Markdown link in sight, marked as the place a press opens it. */
+function buildLinkTexts(view: EditorView): DecorationSet {
+  const { state } = view;
+  const marks: Range<Decoration>[] = [];
+  const seen = new Set<number>();
+  for (const { from, to } of view.visibleRanges) {
+    syntaxTree(state).iterate({
+      from,
+      to,
+      enter: (node) => {
+        if (node.name !== "Link" || seen.has(node.from)) {
+          return;
+        }
+        seen.add(node.from);
+        const link = linkAt(state, node.from);
+        if (link?.from === node.from && link.text.from < link.text.to) {
+          marks.push(LINK_TEXT.range(link.text.from, link.text.to));
+        }
+      },
+    });
+  }
+  return Decoration.set(marks, true);
+}
+
+const LINK_TEXT = Decoration.mark({ class: "cm-link-text" });
+
+/**
+ * A press on a link's words. Cmd or Ctrl opens a web or mail address in a
+ * new tab (never this one); a plain press asks for the "Link" popover. With
+ * marks hidden on the line the press places no caret inside the link; with
+ * the setting to show them the caret goes in as it always did, and the
+ * popover opens too. True when the press is handled here, which keeps
+ * CodeMirror from placing a caret for it.
+ */
+export function linkPressed(event: MouseEvent, view: EditorView): boolean {
+  if (
+    event.button !== 0 ||
+    macMenuClick(event) ||
+    !(event.target instanceof Element)
+  ) {
+    return false;
+  }
+  const el = event.target.closest(".cm-link-text");
+  if (!el || !view.contentDOM.contains(el)) {
+    return false;
+  }
+  const { state } = view;
+  const pos = view.posAtDOM(el);
+  if (!linkAt(state, pos)) {
+    return false;
+  }
+  if (event.metaKey || event.ctrlKey) {
+    const address = openableAddress(linkAddress(state, pos) ?? "");
+    if (address !== null) {
+      openWindow(address, "noopener,noreferrer");
+    }
+    event.preventDefault();
+    return true;
+  }
+  if (!writable(state) || !answersElementEdits(view)) {
+    return false;
+  }
+  const edit = elementEditAt(view, pos, el.getBoundingClientRect());
+  if (!edit) {
+    return false;
+  }
+  return pressElement(view, event, edit, pos);
+}
+
+const linkTexts = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+
+    constructor(view: EditorView) {
+      this.decorations = buildLinkTexts(view);
+    }
+
+    update(update: ViewUpdate) {
+      if (
+        update.docChanged ||
+        update.viewportChanged ||
+        parseAdvanced(update)
+      ) {
+        this.decorations = buildLinkTexts(update.view);
+      }
+    }
+  },
+  {
+    decorations: (value) => value.decorations,
+    eventHandlers: {
+      mousedown: (event, view) => linkPressed(event, view),
+    },
+  },
+);
+
+/**
+ * Link presses, for `hiddenMarkLayer()`: like the drawing, outside
+ * `livePreview()`, so a table cell does not open popovers before it has the
+ * layer.
+ */
+export const linkClicks: Extension = linkTexts;
+
+/**
+ * The hidden marks drawn, for `hiddenMarkLayer()`: outside `livePreview()`, so
+ * the table cell editor, which reads the prose layers, does not get it yet.
+ */
+export const hiddenMarkDrawing: Extension = hiddenMarkPlugin;
+
 /** The whole layer, handed to the caller's on/off compartment. */
 export function livePreview(): Extension {
-  return [previewPlugin, frontmatterTint, previewTheme];
+  return [frontmatterTint, previewTheme];
 }

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -57,6 +58,24 @@ export default defineConfig({
   // build serves at the root and under any path.
   base: "./",
   plugins: [react(), tailwindcss()],
+  // The footnote worker (src/editor/footnoteWorker.ts) runs the Markdown
+  // parser away from the page. The parser's entity decoder has a browser build
+  // that reads `document`, which a worker does not have, so the worker gets
+  // the table-based build instead (the package's own `worker` condition).
+  worker: {
+    format: "es",
+    plugins: () => [
+      {
+        name: "worker-entity-decoder",
+        enforce: "pre",
+        resolveId(id: string) {
+          return id === "decode-named-character-reference"
+            ? createRequire(import.meta.url).resolve(id)
+            : null;
+        },
+      },
+    ],
+  },
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(version),
   },

@@ -79,9 +79,14 @@ export function CommandPalette(): ReactElement | null {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      // A key something on the page already took is theirs: the editor's
+      // Mod-k opens its Link popover and prevents the default, and the
+      // palette opening over it would take the focus and close it again.
+      //
       // Either modifier: one keyboard has a Cmd key and the other does not,
       // and a reader should not have to know which one this app was built on.
       if (
+        event.defaultPrevented ||
         event.key.toLowerCase() !== "k" ||
         !(event.metaKey || event.ctrlKey)
       ) {

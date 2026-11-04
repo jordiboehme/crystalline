@@ -75,7 +75,11 @@ import {
 } from "../editor/drafts";
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { ElementRequest } from "../editor/elementEdit";
+import { ElementPopoverSlot } from "../editor/popovers/ElementPopoverSlot";
 import type { FloatingContext } from "../editor/floatingContext";
+import type { Format } from "../editor/marks/formatting";
+import { NO_FORMATS } from "../editor/marks/formatting";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
 import { imagePreviews } from "../editor/imagePreviews";
 import { readScalar } from "../editor/frontmatterFields";
@@ -83,7 +87,9 @@ import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import type { ElementFace } from "../editor/elementContext";
 import { roomUndo } from "../editor/roomUndo";
+import { marksOnEditLine } from "../editor/marks/mode";
 import { surfaceExtensions } from "../editor/surface";
+import { useMarkSetting } from "../markSetting/context";
 import type { TableUiContext } from "../editor/tableVerbs";
 import {
   UploadScreenContext,
@@ -608,6 +614,22 @@ function Surface({
    */
   const adapter = useMemo(() => reflectionAdapter(), []);
   const preview = useMemo(() => new Compartment(), []);
+  /**
+   * The marks setting's switch, outside the preview compartment: a flip
+   * reconfigures this alone and never rebuilds the previews.
+   */
+  const marks = useMemo(() => new Compartment(), []);
+  const { showOnEditLine } = useMarkSetting();
+  // The setting as it stood at mount, so the first frame is right. The
+  // effect below carries every later flip, and re-applies the live value to
+  // any view a later remount builds.
+  const [showAtMount] = useState(showOnEditLine);
+  useEffect(() => {
+    // Nothing else in the transaction: no selection, no changes, no userEvent.
+    view?.dispatch({
+      effects: marks.reconfigure(marksOnEditLine.of(showOnEditLine)),
+    });
+  }, [view, marks, showOnEditLine]);
   /** Whether the caret is in a table or on an image: the bar's context verbs. */
   const [tableContext, setTableContext] = useState<TableUiContext>({
     inTable: false,
@@ -618,6 +640,10 @@ function Surface({
   const [element, setElement] = useState<ElementFace>(null);
   /** What the floating action bar stands by: a selection, a cell, nothing. */
   const [floating, setFloating] = useState<FloatingContext>(null);
+  /** The formats the format buttons draw pressed. */
+  const [formats, setFormats] = useState<ReadonlySet<Format>>(NO_FORMATS);
+  /** The element popover asked for (a link), with the view that asked. */
+  const [elementEdit, setElementEdit] = useState<ElementRequest | null>(null);
   const extensions = useMemo(() => {
     const undoManager = new Y.UndoManager(ytext);
     return [
@@ -637,6 +663,10 @@ function Surface({
           editable.of(readOnly(mountEnded)),
         ],
         preview,
+        marks,
+        // The live setting, so the first frame is right; the effect above
+        // carries every later flip.
+        showMarks: showAtMount,
         raw: false,
         images: previews.of(imagePreviews(home)),
         uploads: uploads.extension,
@@ -644,6 +674,10 @@ function Surface({
         onImageContext: setImageActive,
         onElementContext: setElement,
         onFloatingContext: setFloating,
+        onFormatState: setFormats,
+        onElementEdit: (edit, from) => {
+          setElementEdit(edit ? { edit, view: from } : null);
+        },
       }),
     ];
   }, [
@@ -652,6 +686,8 @@ function Surface({
     resolved,
     adapter,
     preview,
+    marks,
+    showAtMount,
     editable,
     mountEnded,
     uploads.extension,
@@ -1068,6 +1104,7 @@ function Surface({
           tableDrawn={tableContext.drawn}
           raw={false}
           cellOpen={floating?.kind === "cell"}
+          formats={formats}
           imageActive={imageActive}
           calloutActive={element?.kind === "callout" ? element : null}
           statusActive={element?.kind === "status" ? element.colour : null}
@@ -1093,7 +1130,10 @@ function Surface({
           main={view}
           context={ended ? null : floating}
           wikilinks={adapter.wikilinks}
+          formats={formats}
         />
+        {/* The element popovers; none once the room has ended (R17). */}
+        <ElementPopoverSlot main={view} request={ended ? null : elementEdit} />
       </div>
       {collab.conflict !== null && resolving && (
         <CollabConflictDialog

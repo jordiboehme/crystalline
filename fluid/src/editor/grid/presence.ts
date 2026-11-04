@@ -32,6 +32,7 @@ import { ySyncFacet } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { canonical } from "../marks/caret";
 import { parseAdvanced } from "../parseProgress";
 import {
   cellMain,
@@ -396,7 +397,9 @@ class CellPresence {
 
   update(update: ViewUpdate): void {
     if (!this.room) return;
-    const asked = update.transactions.some((tr) => tr.annotation(redraw));
+    const asked = update.transactions.some(
+      (tr) => tr.annotation(redraw) || tr.reconfigured,
+    );
     if (!update.docChanged && !update.selectionSet && !asked) return;
     if (!this.synced()) {
       // A local change main has not taken yet: keep the carets where they
@@ -420,11 +423,14 @@ class CellPresence {
     for (const [client, raw] of room.awareness.getStates()) {
       const peer = peerOf(room, client, raw);
       if (!peer || peer.head < content.from || peer.head > content.to) continue;
+      // Drawn at its visible place: a head inside hidden marks would sit in
+      // a replaced range and not be drawn at all.
+      const at = canonical(this.view.state, peer.head);
       widgets.push(
         Decoration.widget({
           widget: new CaretWidget(peer.color, peer.name),
           side: peer.head - peer.anchor > 0 ? -1 : 1,
-        }).range(peer.head),
+        }).range(at),
       );
     }
     return Decoration.set(widgets, true);

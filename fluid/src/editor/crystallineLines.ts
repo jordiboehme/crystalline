@@ -14,30 +14,82 @@ import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 
 import type { Vocabulary } from "../api/vocabulary";
 import { frontmatterRegion } from "./frontmatterRegion";
+import {
+  marksHiddenOnLine,
+  markModeChanged,
+  marksOnEditLine,
+} from "./marks/mode";
+import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { CODE_CONTEXTS, inCompletableProse } from "./prose";
+import {
+  joinBullet,
+  placeTags,
+  relationType,
+  splitCategory,
+} from "./relationLines";
 
-// The literal "- " `top_level_bullet` strips (parse.rs) - not "-\s+": a tab
-// or a second space after the dash is a line the server's parser never reads
-// as a bullet at all, so marking it as one would be a UI claim the engine
-// does not honor.
-//
-// The relation type mirrors `parse_relation` (parse.rs): a quoted string
-// (any run of non-quote characters between a literal pair of `"`) or a bare
-// token of any non-whitespace characters, letter case included - the server
-// neither requires a lowercase start nor forbids one, so requiring it here
-// understated what a line can mean. `[` is excluded from the bare token only
-// to keep this regex's own greediness from eating into the `[[` delimiter;
-// the server's `content.find("[[")` has no such need because it searches
-// rather than matching greedily.
-//
-// A task box is never a category: `[x]`, `[X]` and `[~]` (and `[ ]`, which
-// the first character class already refuses) are a task line, as the core
-// reads them. A bracket that opens with `^` is a footnote reference
-// (`- [^1] text`), never a category, as `split_category` (parse.rs) reads it.
-export const OBSERVATION_LINE = /^- \[(?![ xX~]\])([^\]\s^][^\]]*)\]\s/;
-export const RELATION_LINE = /^- ("[^"]*"|[^\s"[]+)\s*\[\[/;
+/**
+ * The bracket span `[from, to)` of an observation line's category, in line
+ * offsets, or null: `split_category` (parse.rs, `splitCategory` here) on the
+ * content after the literal "- " `top_level_bullet` strips. Not "-\s+": a
+ * tab after the dash is no bullet to the server's parser, and a nested or
+ * indented bullet is no observation. A task box (`[ ]`, `[x]`, `[X]`,
+ * `[~]`) and a footnote reference (`- [^1] text`) are never a category; a
+ * category may start with a space and may end the line, as on the server.
+ */
+export function observationCategory(
+  text: string,
+): { from: number; to: number } | null {
+  if (!text.startsWith("- ")) {
+    return null;
+  }
+  const span = splitCategory(text.slice(2));
+  return span ? { from: span.from + 2, to: span.to + 2 } : null;
+}
+
 const TRAILING_TAG = /#[\w-]+/g;
+
+/** `is_hashtag` (parse.rs): `#` and then one or more of A-Z a-z 0-9 `_` `-` `/`. */
+const HASHTAG = /^#[A-Za-z0-9_/-]+$/;
+
+/**
+ * The tags of an observation line as `split_observation` (parse.rs) reads
+ * them: from the text after the category, a trailing parenthesized group is
+ * the context and is set aside, then whitespace-separated hashtag tokens are
+ * taken from the end until one is not a tag. Offsets are in the line.
+ */
+function serverTags(
+  text: string,
+  bodyFrom: number,
+): { from: number; to: number }[] {
+  let end = text.length;
+  while (end > bodyFrom && /\s/.test(text[end - 1] ?? "")) {
+    end -= 1;
+  }
+  if (text[end - 1] === ")") {
+    const open = text.lastIndexOf("(", end - 1);
+    if (open >= bodyFrom) {
+      end = open;
+    }
+  }
+  const found: { from: number; to: number }[] = [];
+  for (;;) {
+    while (end > bodyFrom && /\s/.test(text[end - 1] ?? "")) {
+      end -= 1;
+    }
+    let start = end;
+    while (start > bodyFrom && !/\s/.test(text[start - 1] ?? "")) {
+      start -= 1;
+    }
+    if (start >= end || !HASHTAG.test(text.slice(start, end))) {
+      break;
+    }
+    found.unshift({ from: start, to: end });
+    end = start;
+  }
+  return found;
+}
 
 /**
  * Where a bullet is code rather than an observation or relation line.
@@ -79,34 +131,70 @@ function buildMarks(view: EditorView): DecorationSet {
         (range) => line.from >= range.from && line.from < range.to,
       );
       if (line.from > fmEnd && !inCode) {
-        const observation = OBSERVATION_LINE.exec(line.text);
+        // Hidden marks draw chips on the words; a line whose marks show (the
+        // caret line in show mode, Raw) keeps the bracketed marking.
+        const chips = marksHiddenOnLine(view.state, line.number);
+        // The n-th line after this one, unless it is code.
+        const lineAfter = (offset: number): string | undefined => {
+          const number = line.number + offset;
+          if (number > doc.lines) {
+            return undefined;
+          }
+          const next = doc.line(number);
+          return code.some(
+            (range) => next.from >= range.from && next.from < range.to,
+          )
+            ? undefined
+            : next.text;
+        };
+        const observation = observationCategory(line.text);
         if (observation) {
-          const category = observation[1] ?? "";
-          const start = line.from + line.text.indexOf("[");
+          const start = line.from + observation.from;
+          const end = line.from + observation.to;
           marks.push(
-            Decoration.mark({ class: "cm-obs-category" }).range(
-              start,
-              start + category.length + 2,
-            ),
+            chips
+              ? Decoration.mark({ class: "cm-category-chip" }).range(
+                  start + 1,
+                  end - 1,
+                )
+              : Decoration.mark({ class: "cm-obs-category" }).range(start, end),
           );
-          for (const tag of line.text.matchAll(TRAILING_TAG)) {
-            marks.push(
-              Decoration.mark({ class: "cm-line-tag" }).range(
-                line.from + tag.index,
-                line.from + tag.index + tag[0].length,
-              ),
-            );
+          if (chips) {
+            // The server reads tags from the joined bullet, so a wrapped
+            // observation's chips sit on whichever line holds them.
+            const bullet = joinBullet(lineAfter);
+            const found = bullet
+              ? placeTags(
+                  bullet,
+                  serverTags(bullet.content, observation.to - 2),
+                )
+              : [];
+            for (const tag of found) {
+              const holder = doc.line(line.number + tag.offset);
+              marks.push(
+                Decoration.mark({ class: "cm-tag-chip" }).range(
+                  holder.from + tag.from,
+                  holder.from + tag.to,
+                ),
+              );
+            }
+          } else {
+            for (const tag of line.text.matchAll(TRAILING_TAG)) {
+              marks.push(
+                Decoration.mark({ class: "cm-line-tag" }).range(
+                  line.from + tag.index,
+                  line.from + tag.index + tag[0].length,
+                ),
+              );
+            }
           }
         } else {
-          const relation = RELATION_LINE.exec(line.text);
-          if (relation) {
-            const relType = relation[1] ?? "";
-            const start = line.from + line.text.indexOf(relType);
+          const span = relationType(lineAfter);
+          if (span) {
             marks.push(
-              Decoration.mark({ class: "cm-rel-type" }).range(
-                start,
-                start + relType.length,
-              ),
+              Decoration.mark({
+                class: chips ? "cm-relation-chip" : "cm-rel-type",
+              }).range(line.from + span.from, line.from + span.to),
             );
           }
         }
@@ -129,7 +217,13 @@ const linesPlugin = ViewPlugin.fromClass(
       if (
         update.docChanged ||
         update.viewportChanged ||
-        parseAdvanced(update)
+        parseAdvanced(update) ||
+        // The chips replace the bracketed marking where marks are hidden, so
+        // a selection that reveals a line (show mode), a flip of the setting
+        // or of the layer, and a parked selection draw it again.
+        (update.selectionSet && update.state.facet(marksOnEditLine)) ||
+        markModeChanged(update) ||
+        parkingChanged(update)
       ) {
         this.decorations = buildMarks(update.view);
       }
@@ -152,6 +246,27 @@ const linesTheme = EditorView.baseTheme({
     color: "var(--link)",
   },
   ".cm-line-tag": { color: "var(--color-slate-500)" },
+  ".cm-category-chip": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    fontSize: "0.85em",
+    color: "var(--color-slate-600)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+    padding: "0 0.3em",
+  },
+  ".cm-relation-chip": {
+    fontFamily: "var(--font-mono, ui-monospace, monospace)",
+    fontSize: "0.85em",
+    color: "var(--link)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+    padding: "0 0.3em",
+  },
+  ".cm-tag-chip": {
+    color: "var(--color-slate-500)",
+    backgroundColor: "var(--color-slate-100)",
+    borderRadius: "0.25rem",
+  },
 });
 
 /** The recognition layer; belongs inside the caller's preview compartment. */

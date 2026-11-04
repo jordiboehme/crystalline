@@ -31,7 +31,6 @@ import {
   ChevronDown,
   Code,
   Columns3,
-  Heading,
   Italic,
   Link,
   List,
@@ -61,10 +60,16 @@ import {
   setCalloutKind,
   setStatusColour,
 } from "./elementContext";
-import { openCellView } from "./floatingContext";
+import { linkVerb } from "./elementEdit";
+import { verbTarget } from "./floatingContext";
+import type { Format } from "./marks/formatting";
+import { judgeBeforeCommand } from "./marks/commandJudge";
+import { toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
+import type { StyleLevel } from "./TextStyleMenu";
+import { TextStyleMenu } from "./TextStyleMenu";
 import { TableSizePicker } from "./TableSizePicker";
 import type { ImageAlign } from "./imageFormat";
 import {
@@ -89,11 +94,8 @@ import {
 import type { Align } from "./tableModel";
 import {
   ORDERED_ITEM,
-  cycleHeading,
-  headingLevelAfter,
-  insertMarkdownLink,
+  setHeadingLevel,
   insertWikilink,
-  toggleInline,
   toggleLinePrefix,
 } from "./toolbar";
 import {
@@ -104,9 +106,6 @@ import {
   tableDeleteRow,
   tablePrettify,
 } from "./tableVerbs";
-
-/** The heading levels the menu offers - deeper marks stay a typed thing. */
-const HEADING_LEVELS = [1, 2, 3];
 
 /**
  * The alignments a column can be given, in the order they read, each with the
@@ -207,6 +206,7 @@ function CalloutSegment({
   const fold = face.fold ?? (face.callout === "details" ? "closed" : null);
   const run = (edit: (v: EditorView) => boolean) => {
     if (view && allow(view)) {
+      judgeBeforeCommand(view);
       edit(view);
     }
   };
@@ -413,6 +413,7 @@ export function EditorToolbar({
   disabled = false,
   attachDisabled = false,
   cellOpen = false,
+  formats,
 }: {
   view: EditorView | null;
   /** Whether the caret is in a table right now; the screen watches for it. */
@@ -476,6 +477,14 @@ export function EditorToolbar({
    * segments drawn from main's caret (image, table, callout, status).
    */
   cellOpen?: boolean;
+  /**
+   * The formats the view a format verb acts on has at its caret or over its
+   * selection, drawn as Bold, Italic, Strikethrough and Inline code pressed.
+   * The screen is told them by the buffer's format state listener. Absent
+   * (a surface with no listener, the MANIFEST), the buttons are plain
+   * buttons rather than toggles that would always say "not pressed".
+   */
+  formats?: ReadonlySet<Format>;
 }): ReactElement {
   const view = disabled ? null : buffer;
   const off = view === null;
@@ -493,7 +502,7 @@ export function EditorToolbar({
   const lineOff = off || cellNow;
   /** The heading change waiting for the person's answer, if any. */
   const [asking, setAsking] = useState<{
-    level: number;
+    level: StyleLevel;
     sentence: string;
   } | null>(null);
   /**
@@ -503,58 +512,49 @@ export function EditorToolbar({
    */
   const askingNow = useRef(false);
   /**
-   * The view a verb acts on, read when it runs: the open cell's editor, or
-   * main, or nothing. Nothing while main's selection is parked behind an
-   * open cell whose editor is not mounted (its table scrolled away): that
-   * selection is stale, and the cell is not there to take the verb. Main
-   * holding the focus itself always means main.
+   * Whether a verb on main's line or caret may run now. The view a verb acts
+   * on is `verbTarget`'s, read when it runs: the open cell's editor, else
+   * main, or nothing while main's selection is parked behind a cell whose
+   * editor is not mounted. The floating bar uses the same rule.
    */
-  const targetOf = (v: EditorView): EditorView | null => {
-    const cell = openCellView(v);
-    if (cell) return cell;
-    const focused = v.dom.ownerDocument.activeElement === v.contentDOM;
-    return v.state.facet(mainSelectionParked) && !focused ? null : v;
-  };
-  /** Whether a verb on main's line or caret may run now. */
-  const mainTurn = (v: EditorView): boolean => targetOf(v) === v;
+  const mainTurn = (v: EditorView): boolean => verbTarget(v) === v;
   /**
    * A verb on main's line or main's caret. Refused unless main is the
    * target, so a click that beats the render that turned the button off
    * still changes nothing.
    */
   const act = (run: (view: EditorView) => boolean) => () => {
-    if (view && targetOf(view) === view) {
+    if (view && verbTarget(view) === view) {
+      judgeBeforeCommand(view);
       run(view);
     }
   };
   /** An inline verb: in the open cell when there is one, else on main. */
   const actInline = (run: (view: EditorView) => boolean) => () => {
-    const target = view ? targetOf(view) : null;
+    const target = view ? verbTarget(view) : null;
     if (target) {
+      judgeBeforeCommand(target);
       run(target);
     }
   };
   const keepSelection = (event: MouseEvent) => {
     event.preventDefault();
   };
+  /** A format button's pressed state, when the screen tells the formats. */
+  const pressed = (format: Format) =>
+    formats ? { "aria-pressed": formats.has(format) } : {};
   /** The question a heading change on the caret's line asks, or null. */
-  const questionFor = (v: EditorView, level: number): string | null => {
+  const questionFor = (v: EditorView, level: StyleLevel): string | null => {
     const line = v.state.doc.lineAt(v.state.selection.main.head).number;
-    return (
-      adapter?.confirmHeadingChange(
-        v.state,
-        line,
-        headingLevelAfter(v.state, line, level),
-      ) ?? null
-    );
+    return adapter?.confirmHeadingChange(v.state, line, level) ?? null;
   };
-  const pickHeading = (v: EditorView, level: number): boolean => {
-    // The line the change is made on, as `cycleHeading` will find it: off a
+  const pickHeading = (v: EditorView, level: StyleLevel): boolean => {
+    // The line the change is made on, as `setHeadingLevel` will find it: off a
     // hidden id line first, so the question is about that same line.
     stepOffIdLines(v);
     const sentence = questionFor(v, level);
     if (sentence === null) {
-      return cycleHeading(v, level);
+      return setHeadingLevel(v, level);
     }
     askingNow.current = true;
     setAsking({ level, sentence });
@@ -571,7 +571,7 @@ export function EditorToolbar({
     // while the dialog was open, and a line that no longer asks is left as
     // it is.
     if (view && level !== undefined && questionFor(view, level) !== null) {
-      cycleHeading(view, level, { joinSections: true });
+      setHeadingLevel(view, level, { joinSections: true });
     }
   };
   return (
@@ -595,64 +595,41 @@ export function EditorToolbar({
           label="Bold"
           icon={Bold}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "**"))}
+          {...pressed("strong")}
+          onClick={actInline((v) => toggleFormat(v, "strong"))}
         />
         <IconButton
           label="Italic"
           icon={Italic}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "*"))}
+          {...pressed("em")}
+          onClick={actInline((v) => toggleFormat(v, "em"))}
         />
         <IconButton
           label="Strikethrough"
           icon={Strikethrough}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "~~"))}
+          {...pressed("strike")}
+          onClick={actInline((v) => toggleFormat(v, "strike"))}
         />
         <IconButton
           label="Inline code"
           icon={Code}
           disabled={off}
-          onClick={actInline((v) => toggleInline(v, "`"))}
+          {...pressed("code")}
+          onClick={actInline((v) => toggleFormat(v, "code"))}
         />
-        <DropdownMenu.Root>
-          <DropdownMenu.Trigger asChild>
-            <IconButton label="Heading" icon={Heading} disabled={lineOff} />
-          </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
-            <DropdownMenu.Content
-              align="start"
-              sideOffset={6}
-              className={MENU_CLASSES}
-              // Radix hands focus back to the trigger when the menu closes,
-              // which would leave the caret out of the buffer right after a
-              // command put it back there. The buffer is where an author wants
-              // to be either way - having picked a heading, or having changed
-              // their mind and pressed Escape - so this bar always returns them.
-              onCloseAutoFocus={(event) => {
-                event.preventDefault();
-                // A change that asks first hands focus to its dialog instead.
-                if (!askingNow.current) {
-                  view?.focus();
-                }
-              }}
-            >
-              {HEADING_LEVELS.map((level) => (
-                <DropdownMenu.Item
-                  key={level}
-                  className={ITEM_CLASSES}
-                  onSelect={() => {
-                    if (view && targetOf(view) === view) {
-                      pickHeading(view, level);
-                    }
-                  }}
-                >
-                  Heading {level}
-                </DropdownMenu.Item>
-              ))}
-            </DropdownMenu.Content>
-          </DropdownMenu.Portal>
-        </DropdownMenu.Root>
+        <TextStyleMenu
+          view={view}
+          disabled={lineOff}
+          keepsFocus={() => askingNow.current}
+          onPick={(level) => {
+            if (view && verbTarget(view) === view) {
+              judgeBeforeCommand(view);
+              pickHeading(view, level);
+            }
+          }}
+        />
         <IconButton
           label="Bulleted list"
           icon={List}
@@ -690,7 +667,7 @@ export function EditorToolbar({
           label="Link"
           icon={Link}
           disabled={off}
-          onClick={actInline(insertMarkdownLink)}
+          onClick={actInline(linkVerb)}
         />
         {/*
         The insert verbs are named buttons of their own, and this hairline
@@ -718,7 +695,10 @@ export function EditorToolbar({
           <AttachButton
             onAttach={(files) => {
               // An upload inserts at main's selection: only on main's turn.
-              if (view && mainTurn(view)) onAttach(files);
+              if (view && mainTurn(view)) {
+                judgeBeforeCommand(view);
+                onAttach(files);
+              }
             }}
             disabled={lineOff || attachDisabled}
           />

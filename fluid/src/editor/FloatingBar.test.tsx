@@ -22,6 +22,7 @@ import { tableAddRowBelow } from "./tableVerbs";
 import { hostOpenCell } from "./grid/gridWidget";
 import { gridExtension } from "./grid/index";
 import { openCellRange, setOpenCell } from "./grid/openCell";
+import { cleanupMarkViews, markView } from "../test/markKit";
 
 const DOC =
   "Intro words\n\n| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n\nOutro\n";
@@ -547,5 +548,61 @@ describe("placement by an open cell (finding 3)", () => {
     });
     expect(el.style.top).toBe("314px");
     expect(el.style.left).toBe("80px");
+  });
+});
+
+describe("the format buttons over hidden marks", () => {
+  afterEach(cleanupMarkViews);
+
+  test("Bold formats the visible characters of the selection", () => {
+    const v = markView("ab **cd** ef");
+    v.focus();
+    v.dispatch({ selection: { anchor: 1, head: 6 } });
+    render(
+      <FloatingBar
+        main={v}
+        context={{ kind: "text", rect: new DOMRect() }}
+        wikilinks
+        formats={new Set(["strong"])}
+      />,
+      { wrapper: Tooltips },
+    );
+    fireEvent.click(quick("Bold"));
+    expect(bytes(v.state)).toBe("a**b cd** ef");
+  });
+
+  test("the four format buttons say which formats the selection has", () => {
+    const v = markView("**hello**");
+    v.focus();
+    v.dispatch({ selection: { anchor: 2, head: 7 } });
+    render(
+      <FloatingBar
+        main={v}
+        context={{ kind: "text", rect: new DOMRect() }}
+        wikilinks
+        formats={new Set(["strong"])}
+      />,
+      { wrapper: Tooltips },
+    );
+    expect(quick("Bold")).toHaveAttribute("aria-pressed", "true");
+    expect(quick("Italic")).toHaveAttribute("aria-pressed", "false");
+    expect(quick("Strikethrough")).toHaveAttribute("aria-pressed", "false");
+    expect(quick("Inline code")).toHaveAttribute("aria-pressed", "false");
+    expect(quick("Link")).not.toHaveAttribute("aria-pressed");
+  });
+
+  test("with no formats told, the format buttons are not toggles", () => {
+    const v = markView("**hello**");
+    v.focus();
+    v.dispatch({ selection: { anchor: 2, head: 7 } });
+    render(
+      <FloatingBar
+        main={v}
+        context={{ kind: "text", rect: new DOMRect() }}
+        wikilinks
+      />,
+      { wrapper: Tooltips },
+    );
+    expect(quick("Bold")).not.toHaveAttribute("aria-pressed");
   });
 });

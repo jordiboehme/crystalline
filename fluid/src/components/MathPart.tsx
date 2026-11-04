@@ -7,6 +7,10 @@
  * formula KaTeX cannot read stays on screen as the TeX that was written
  * (`throwOnError: false` paints it in the error colour), and so does one
  * the setter throws on for any other reason.
+ *
+ * With `report` (the formula popover's Preview) a formula KaTeX cannot read
+ * shows KaTeX's message instead, so the person sees what to fix. Nothing
+ * here ever throws.
  */
 
 import "katex/dist/katex.min.css";
@@ -17,9 +21,11 @@ import { useEffect, useRef } from "react";
 export default function MathPart({
   tex,
   display,
+  report = false,
 }: {
   tex: string;
   display: boolean;
+  report?: boolean;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
   useEffect(() => {
@@ -30,13 +36,14 @@ export default function MathPart({
     try {
       katex.render(tex, element, {
         displayMode: display,
-        throwOnError: false,
+        throwOnError: report,
         strict: "ignore",
         trust: false,
       });
-    } catch {
-      element.textContent = tex;
+    } catch (error) {
+      element.textContent =
+        report && error instanceof Error ? error.message : tex;
     }
-  }, [tex, display]);
+  }, [tex, display, report]);
   return <span ref={ref} />;
 }

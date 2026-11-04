@@ -34,6 +34,7 @@ import { useRef, useState } from "react";
 import { MENU_CLASSES } from "../components/menu";
 import { FOCUS_RING, IconButton } from "../components/primitives";
 import type { BlockSelection } from "./toolbar";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 import { insertBlock, selectToken, tableSkeleton } from "./toolbar";
 
 /** How far the grid goes. Beyond this a table is written, not clicked. */
@@ -153,6 +154,7 @@ export function TableSizePicker({
 
   const insert = (columns: number, rows: number) => {
     if (view && (allow?.(view) ?? true)) {
+      judgeBeforeCommand(view);
       const lines = tableSkeleton(columns, rows);
       const select: BlockSelection | null = selectToken(lines, PLACEHOLDER);
       insertBlock(view, lines, select);

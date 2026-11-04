@@ -1,15 +1,25 @@
 import { CompletionContext } from "@codemirror/autocomplete";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { Vocabulary } from "../api/vocabulary";
+import {
+  bytes,
+  caret,
+  cleanupMarkViews,
+  keys,
+  markView,
+  setCaret,
+  typeText,
+} from "../test/markKit";
 import { parsedState } from "../test/parse";
 import {
-  OBSERVATION_LINE,
   crystallineCompletions,
   crystallineLines,
+  observationCategory,
 } from "./crystallineLines";
+import { marksOnLine } from "./marks/hiddenMarks";
 import { baseExtensions } from "./setup";
 
 const DOC =
@@ -90,12 +100,18 @@ describe("grammar fidelity", () => {
     view.destroy();
   });
 
-  it("does not draw for a bullet the server's literal '- ' prefix would reject", () => {
+  it("draws no category for a bullet the server's literal '- ' prefix would reject, but reads a spaced relation", () => {
     const doc =
       "---\nt: x\n---\n\n-  [decision] two spaces\n-\t[decision] a tab\n-  relates_to [[Beta]]\n";
     const view = mount(doc);
     expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
-    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+    // `parse_relation` trims the words before the target, so the second
+    // space is no obstacle to a relation, as it is to a category.
+    expect(
+      [...view.dom.querySelectorAll(".cm-rel-type")].map(
+        (el) => el.textContent,
+      ),
+    ).toEqual(["relates_to"]);
     view.destroy();
   });
 
@@ -176,17 +192,250 @@ describe("completion stays out of code and frontmatter", () => {
 
 describe("task lines", () => {
   it("never reads a task box as an observation category", () => {
-    expect(OBSERVATION_LINE.test("- [x] done ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [X] done ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [~] skipped ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [ ] open ")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [fact] x ")).toBe(true);
-    expect(OBSERVATION_LINE.test("- [xy] x ")).toBe(true);
+    expect(observationCategory("- [x] done ")).toBeNull();
+    expect(observationCategory("- [X] done ")).toBeNull();
+    expect(observationCategory("- [~] skipped ")).toBeNull();
+    expect(observationCategory("- [ ] open ")).toBeNull();
+    expect(observationCategory("- [fact] x ")).not.toBeNull();
+    expect(observationCategory("- [xy] x ")).not.toBeNull();
   });
 
   it("never reads a footnote reference as an observation category", () => {
-    expect(OBSERVATION_LINE.test("- [^1] the source")).toBe(false);
-    expect(OBSERVATION_LINE.test("- [^note] more")).toBe(false);
-    expect(OBSERVATION_LINE.exec("- [a^b] x")?.[1]).toBe("a^b");
+    expect(observationCategory("- [^1] the source")).toBeNull();
+    expect(observationCategory("- [^note] more")).toBeNull();
+    expect(observationCategory("- [a^b] x")).toEqual({ from: 2, to: 7 });
+  });
+});
+
+describe("chips in hidden mode", () => {
+  const LINE = "- [decision] text #tag";
+
+  afterEach(cleanupMarkViews);
+
+  it("draws the category word as a chip, with no bracket", () => {
+    const view = markView(LINE);
+    setCaret(view, LINE.length);
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "decision",
+    );
+    expect(view.dom.querySelector(".cm-obs-category")).toBeNull();
+    expect(view.dom.textContent).not.toContain("[");
+    expect(view.dom.querySelector(".cm-tag-chip")?.textContent).toBe("#tag");
+    expect(view.dom.querySelector(".cm-line-tag")).toBeNull();
+    expect(bytes(view.state)).toBe(LINE);
+  });
+
+  it("types after the drawn category word into the word", () => {
+    const view = markView(LINE);
+    setCaret(view, 11);
+    expect(caret(view)).toBe(11);
+    typeText(view, "s");
+    expect(bytes(view.state)).toBe("- [decisions] text #tag");
+    expect(view.dom.textContent).not.toContain("[");
+  });
+
+  it("puts Home inside the category and types there", () => {
+    const view = markView(LINE);
+    setCaret(view, 14);
+    keys(view, "Home");
+    expect(caret(view)).toBe(3);
+    typeText(view, "x");
+    expect(bytes(view.state)).toBe("- [xdecision] text #tag");
+    expect(view.dom.textContent).not.toContain("[");
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "xdecision",
+    );
+  });
+
+  it("draws the relation type as a chip", () => {
+    const view = markView("- relates_to [[T]]");
+    setCaret(view, 0);
+    expect(view.dom.querySelector(".cm-relation-chip")?.textContent).toBe(
+      "relates_to",
+    );
+    expect(view.dom.querySelector(".cm-rel-type")).toBeNull();
+  });
+
+  it("keeps the line's bytes", () => {
+    const doc = "- [decision] text #a #b\n- relates_to [[T]]\n";
+    const view = markView(doc);
+    expect(bytes(view.state)).toBe(doc);
+    expect(
+      [...view.dom.querySelectorAll(".cm-tag-chip")].map((e) => e.textContent),
+    ).toEqual(["#a", "#b"]);
+  });
+
+  it("keeps today's marking in show mode on the line the caret touches", () => {
+    const view = markView(LINE, { mode: "show" });
+    setCaret(view, 5);
+    expect(view.dom.querySelector(".cm-obs-category")?.textContent).toBe(
+      "[decision]",
+    );
+    expect(view.dom.querySelector(".cm-category-chip")).toBeNull();
+    expect(view.dom.querySelector(".cm-line-tag")?.textContent).toBe("#tag");
+  });
+
+  it("draws the chips in show mode on a line the caret is not on", () => {
+    const doc = `${LINE}\nother`;
+    const view = markView(doc, { mode: "show" });
+    setCaret(view, doc.length);
+    expect(view.dom.querySelector(".cm-category-chip")?.textContent).toBe(
+      "decision",
+    );
+    setCaret(view, 3);
+    expect(view.dom.querySelector(".cm-category-chip")).toBeNull();
+    expect(view.dom.querySelector(".cm-obs-category")).not.toBeNull();
+  });
+
+  it("shows a comment in an engram in show mode with the caret on the line", () => {
+    const doc = "x <!-- c --> y";
+    const view = markView(doc, { mode: "show" });
+    setCaret(view, 1);
+    expect(view.dom.textContent).toContain("<!-- c -->");
+  });
+});
+
+describe("tag chips follow the tags the server reads", () => {
+  afterEach(cleanupMarkViews);
+
+  const tagsOf = (doc: string): string[] => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return [...view.dom.querySelectorAll(".cm-tag-chip")].map(
+      (el) => el.textContent ?? "",
+    );
+  };
+
+  it.each([
+    ["- [fact] use #include here", []],
+    ["- [fact] see issue#12", []],
+    ["- [fact] a #x then text", []],
+    ["- [fact] text #area/sub", ["#area/sub"]],
+    ["- [fact] text #a #b", ["#a", "#b"]],
+    ["- [fact] text #tag (the context)", ["#tag"]],
+    ["- [fact] text (the context) #tag", ["#tag"]],
+    ["- [fact] text #tag.", []],
+    ["- [fact] text #tag-1_x ", ["#tag-1_x"]],
+    ["- [fact] #only", ["#only"]],
+  ])("%s", (doc, expected) => {
+    expect(tagsOf(doc)).toEqual(expected);
+  });
+});
+
+describe("relation chips follow the relations the server reads", () => {
+  afterEach(cleanupMarkViews);
+
+  const chipOf = (doc: string): string | null => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return view.dom.querySelector(".cm-relation-chip")?.textContent ?? null;
+  };
+
+  it.each([
+    ["- relates_to [[T]]", "relates_to"],
+    ["- rel[[T]]", "rel"],
+    ['- "part of" [[T]]', '"part of"'],
+    ["- See [[T]]", "See"],
+    ["- part_of [Doc](doc.md)", "part_of"],
+    ["- part_of [Doc](sub/Doc.MD#top)", "part_of"],
+    ['- "part of" [Doc](doc.md)', '"part of"'],
+    ["- rel [Doc](a[[x]]b.md)", "rel"],
+    ["- relates_to\n  [[T]]", "relates_to"],
+    ["- part_of\n  [Doc](doc.md)", "part_of"],
+    // Rust's char::is_lowercase is the Unicode Lowercase property.
+    ["- ªrel [Doc](doc.md)", "ªrel"],
+    // Offsets are UTF-16 throughout: an astral character before a mask.
+    ["- rel [\u{1F600} Doc](a[[x]]b.md)", "rel"],
+    // Not relations to the server.
+    ["- See [Three](chapter-3.md)", null],
+    ["- uses [x](page.html)", null],
+    ["- uses ![x](a.md)", null],
+    ["- uses [x](http://a.org/b.md)", null],
+    ["- uses [x](index.md)", null],
+    ["- uses [x](sub/log.md)", null],
+    ["- uses [[index.md]]", null],
+    ["- two words [[T]]", null],
+    ["- :x [[T]]", null],
+    ["- [x] done [[T]]", null],
+    ["- uses [[|alias]]", null],
+    ["- [fact] see [[T]]", null],
+    ["- uses `[x](a.md)`", null],
+    ["- relates_to [[T]\n", null],
+    ["- rel[\u{1F600}]([[x]]b.html)", null],
+    ["  - relates_to [[T]]", null],
+  ])("%j", (doc, expected) => {
+    expect(chipOf(doc)).toBe(expected);
+  });
+});
+
+describe("tag chips on a wrapped observation", () => {
+  afterEach(cleanupMarkViews);
+
+  const chips = (doc: string): string[] => {
+    const view = markView(doc);
+    setCaret(view, doc.length);
+    return [...view.dom.querySelectorAll(".cm-tag-chip")].map(
+      (el) => el.textContent ?? "",
+    );
+  };
+
+  it.each([
+    // The server reads the tags from the joined text: only the last run.
+    ["- [fact] a #x\n  b #y", ["#y"]],
+    ["- [fact] a\n  #x #y", ["#x", "#y"]],
+    ["- [fact] a #x\n  b #y\n  c", []],
+    ["- [fact] a\n  b #y (ctx)", ["#y"]],
+    ["- [fact] a #x\n\n  #y", ["#x"]],
+  ])("%j", (doc, expected) => {
+    expect(chips(doc)).toEqual(expected);
+  });
+});
+
+/**
+ * The category as the server's `split_category` (crates/core/src/parse.rs)
+ * reads it, on a zero-indent `- ` bullet: the nine rows of the final review's
+ * table (Must-cover 4). The bracket span is in line offsets, or null.
+ */
+describe("the category, as the server reads it (M1)", () => {
+  afterEach(cleanupMarkViews);
+
+  const ROWS: [string, string, { from: number; to: number } | null][] = [
+    ["a category and text", "- [decision] text", { from: 2, to: 12 }],
+    ["a category with a space", "- [a b] x", { from: 2, to: 7 }],
+    ["a category before a tab", "- [a]\tx", { from: 2, to: 5 }],
+    ["a done box before text", "- [x]text", null],
+    ["an open box", "- [ ] x", null],
+    ["a footnote reference", "- [^1] x", null],
+    ["a category right before text", "- [decision]text", { from: 2, to: 12 }],
+    ["a category that starts with a space", "- [ a] x", { from: 2, to: 6 }],
+    ["a category at the line end", "- [a]", { from: 2, to: 5 }],
+    [
+      "a category before a wrapped line",
+      "- [decision]\n  wraps",
+      { from: 2, to: 12 },
+    ],
+    ["a category before a colon", "- [a]: x", { from: 2, to: 5 }],
+    ["a bracket inside the category", "- [a[b] x", null],
+  ];
+
+  it.each(ROWS)("%s", (_name, doc, span) => {
+    const line = doc.split("\n")[0] ?? "";
+    expect(observationCategory(line)).toEqual(span);
+    const view = markView(`x\n${doc}`);
+    const categories = marksOnLine(parsedState(view.state), 2).filter(
+      (mark) => mark.kind === "category",
+    );
+    expect(categories.map((mark) => [mark.from - 2, mark.to - 2])).toEqual(
+      span
+        ? [
+            [span.from, span.from + 1],
+            [span.to - 1, span.to],
+          ]
+        : [],
+    );
+    const chip = view.contentDOM.querySelector(".cm-category-chip");
+    expect(chip?.textContent ?? null).toBe(
+      span ? line.slice(span.from + 1, span.to - 1) : null,
+    );
   });
 });

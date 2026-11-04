@@ -125,6 +125,30 @@ describe("the command palette", () => {
     expect(await screen.findByRole("dialog")).toBeVisible();
   });
 
+  it("stays shut on a Cmd+K something on the page already took", async () => {
+    // The editor's own Mod-k (the Link popover) takes the key and prevents
+    // its default; the palette must not open over the popover it opened.
+    serve();
+    const user = userEvent.setup();
+    await openApp();
+    const taker = document.createElement("div");
+    taker.tabIndex = 0;
+    taker.addEventListener("keydown", (event) => {
+      if (event.key === "k") event.preventDefault();
+    });
+    document.body.append(taker);
+    taker.focus();
+
+    await user.keyboard("{Meta>}k{/Meta}");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // The same key nobody took opens it, so the palette was shut, not slow.
+    taker.remove();
+    await user.keyboard("{Meta>}k{/Meta}");
+    expect(await screen.findByRole("dialog")).toBeVisible();
+  });
+
   it("asks for titles once the typing pauses, and lists what came back", async () => {
     serve();
     const user = userEvent.setup();

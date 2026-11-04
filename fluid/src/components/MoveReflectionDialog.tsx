@@ -15,7 +15,7 @@ import { problemDetail } from "../api/client";
 import { moveReflection, reflectionDocKey } from "../api/reflection";
 import { invalidateReflection } from "../api/reflectionDomains";
 import { useAuth } from "../auth/AuthContext";
-import { FOCUS_HEADING, focusPageHeading } from "../focusHeading";
+import { FOCUS_HEADING } from "../focusHeading";
 import { reflectionPageRoute } from "../paths";
 import { movePageDrafts } from "../reflectionPageDrafts";
 import { BUTTON, FIELD } from "./primitives";
@@ -46,10 +46,21 @@ export function MoveReflectionDialog({
   // Set once the page has moved, so closing the dialog hands focus to the
   // page's heading instead of back to a Move button that is gone.
   const moved = useRef(false);
+  // Where the page went, for the focus request Close makes.
+  const movedTo = useRef(path);
+  // Set when the person closes the dialog (Close, Escape, the overlay). The
+  // dialog also unmounts when the route changes under it, and that must not
+  // send the reader back to the moved page.
+  const closedByPerson = useRef(false);
+  const close = (): void => {
+    closedByPerson.current = true;
+    onClose();
+  };
   const move = useMutation({
     mutationFn: () => moveReflection(domain, path, to.trim()),
     onSuccess: (receipt) => {
       moved.current = true;
+      movedTo.current = receipt.to;
       movePageDrafts(account, domain, path, receipt.to);
       queryClient.removeQueries({ queryKey: reflectionDocKey(domain, path) });
       invalidateReflection(queryClient, domain);
@@ -80,7 +91,7 @@ export function MoveReflectionDialog({
       open
       onOpenChange={(next) => {
         if (!next) {
-          onClose();
+          close();
         }
       }}
     >
@@ -90,8 +101,15 @@ export function MoveReflectionDialog({
           onCloseAutoFocus={(event) => {
             if (moved.current) {
               event.preventDefault();
-              if (unlinked.length > 0) {
-                focusPageHeading();
+              if (unlinked.length > 0 && closedByPerson.current) {
+                // The page at the new path may still be loading when Close
+                // is pressed, so its heading is asked for the way a move
+                // without a list asks for it: the page focuses it once it
+                // has drawn it, now or later.
+                void navigate(reflectionPageRoute(domain, movedTo.current), {
+                  replace: true,
+                  state: FOCUS_HEADING,
+                });
               }
             }
           }}
@@ -147,7 +165,7 @@ export function MoveReflectionDialog({
                 <button
                   type="button"
                   ref={closeButton}
-                  onClick={onClose}
+                  onClick={close}
                   className={BUTTON.primary}
                 >
                   Close

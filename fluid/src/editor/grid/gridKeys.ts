@@ -30,6 +30,7 @@ import { Prec } from "@codemirror/state";
 import type { Command, EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 
+import { stepVisible, viewAtoms } from "../marks/caret";
 import { roomUndo } from "../roomUndo";
 import { tableAddRowBelow } from "../tableVerbs";
 import type { CellEditor } from "./cellEditor";
@@ -499,7 +500,13 @@ function enter(dir: -1 | 1, atEdge: boolean): Command {
     if (selection.ranges.length > 1 || !selection.main.empty) return false;
     const head = selection.main.head;
     const line = view.state.doc.lineAt(head);
-    if (atEdge && head !== (dir > 0 ? line.to : line.from)) return false;
+    // At the visible edge: only hidden marks may lie between the caret and
+    // the line's end (or start), as after `x **b**`.
+    if (
+      atEdge &&
+      stepVisible(view.state, head, dir > 0, viewAtoms(view)) !== null
+    )
+      return false;
     const table = tableBeside(view, line.number, dir);
     if (!table) return false;
     const cell =

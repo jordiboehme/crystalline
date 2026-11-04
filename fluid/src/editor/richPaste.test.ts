@@ -74,6 +74,39 @@ function keydown(v: EditorView, init: KeyboardEventInit): void {
 const RICH = "<h2>Steps</h2><ul><li><b>Build</b> it</li></ul>";
 const RICH_PLAIN = "Steps\nBuild it";
 
+describe("HTML Fluid wrote itself", () => {
+  const OWN = '<div data-crystalline-copy="1">';
+
+  it("takes the plain text as it is", () => {
+    const v = mount("");
+    const plain = "See [[Other Page]] and ![d](att/x.png) :status[Done]{green}";
+    const event = paste(v, {
+      html: `${OWN}<p>See Other Page and d Done</p></div>`,
+      plain,
+    });
+    expect(event.defaultPrevented).toBe(true);
+    expect(v.state.doc.toString()).toBe(plain);
+  });
+
+  it("finds the marker after the wrapper a browser adds", () => {
+    const v = mount("");
+    paste(v, {
+      html: `<meta charset='utf-8'><html><body><!--StartFragment-->${OWN}<p>x</p></div>`,
+      plain: "[[A]]",
+    });
+    expect(v.state.doc.toString()).toBe("[[A]]");
+  });
+
+  it("gives another page's HTML with the attribute deeper in no trust", async () => {
+    const v = mount("");
+    paste(v, {
+      html: `<h2>one</h2>${OWN}</div>`,
+      plain: "one",
+    });
+    await vi.waitFor(() => expect(v.state.doc.toString()).toContain("## one"));
+  });
+});
+
 describe("richPaste", () => {
   it("inserts the converted Markdown of an HTML paste in one transaction", async () => {
     const v = mount("Intro\n\n");

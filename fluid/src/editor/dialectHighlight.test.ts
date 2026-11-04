@@ -46,7 +46,7 @@ describe("the dialect markers", () => {
   it("are parsed as marks, not links", () => {
     const v = mount();
     const names: string[] = [];
-    syntaxTree(v.state).iterate({
+    syntaxTree(parsedState(v.state)).iterate({
       enter: (node) => {
         names.push(node.name);
       },
@@ -71,7 +71,7 @@ describe("the dialect markers", () => {
   function namesOf(doc: string): string[] {
     const v = mount(doc);
     const names: string[] = [];
-    syntaxTree(v.state).iterate({
+    syntaxTree(parsedState(v.state)).iterate({
       enter: (node) => {
         names.push(node.name);
       },

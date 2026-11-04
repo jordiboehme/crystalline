@@ -5,6 +5,7 @@
  * focus - and taken back when it leaves.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import type { MockInstance } from "vitest";
@@ -13,6 +14,7 @@ import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
 import { cleanupCells, press, roomMain, typeIn } from "../../test/cellKit";
+import { parsedState } from "../../test/parse";
 import { PIPELESS_FIXTURES } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
 import { activeCell } from "./cellEditor";
@@ -94,7 +96,13 @@ function seenHead(
 /** "row/column" of the first table's cell holding `pos`, or null. */
 function cellName(main: EditorView, pos: number | null): string | null {
   if (pos === null) return null;
-  const table = gridTableAt(main.state, pos);
+  // The whole parse: after a cell edit, main's own tree can stop short of
+  // the table on a loaded machine (the grid no longer parses it untimed).
+  const table = gridTableAt(
+    main.state,
+    pos,
+    syntaxTree(parsedState(main.state)),
+  );
   const cell = table ? cellAt(table, pos) : null;
   return cell ? `${String(cell.row)}/${String(cell.column)}` : null;
 }
@@ -203,7 +211,7 @@ describe("peers' carets in static cells", () => {
 describe.each(PIPELESS_FIXTURES)("presence without outer pipes: $name", (f) => {
   test("a peer's caret at either end of each cell is drawn in that cell", () => {
     const { main, rtext, remoteAwareness } = roomMain(f.text, layers());
-    const table = gridTables(main.state)[0];
+    const table = gridTables(parsedState(main.state))[0];
     if (!table) throw new Error("no table");
     for (const row of table.rows) {
       for (const cell of row) {

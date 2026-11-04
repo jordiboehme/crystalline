@@ -36,10 +36,15 @@ import { parsedState, parsedView } from "../test/parse";
 import { crystallineLines } from "./crystallineLines";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { baseExtensions } from "./setup";
 import { tableContextAt } from "./tableVerbs";
 import { wikilinkChips, wikilinkResolverFacet } from "./wikilinkChips";
+
+/** The hidden-mark layer in show mode: these tests pin a touched line's marks. */
+const showModeMarks = [hiddenMarkLayer(), marksOnEditLine.of(true)];
 
 const DOC =
   "---\ntitle: Alpha\n---\n\n# Heading\n\nSome *emphasis* here.\n\n- [ ] a task\n";
@@ -85,7 +90,7 @@ describe("a starved parse", () => {
 
   it("leaves the live-preview marks unfolded, and parsedState folds them", () => {
     const short = starved(() =>
-      state(DOC, [baseExtensions(false), livePreview()]),
+      state(DOC, [baseExtensions(false), livePreview(), ...showModeMarks]),
     );
     const raw = new EditorView({ state: short, parent: document.body });
     // The failure this file exists for, on demand: the heading mark and the
@@ -185,7 +190,11 @@ describe("a parse that catches up under a mounted view", () => {
   }
 
   it("folds the live-preview marks that mounted unfolded", () => {
-    const view = mounted(DOC, [baseExtensions(false), livePreview()]);
+    const view = mounted(DOC, [
+      baseExtensions(false),
+      livePreview(),
+      ...showModeMarks,
+    ]);
     expect(view.contentDOM.textContent).toContain("# Heading");
     expect(view.contentDOM.textContent).toContain("*emphasis*");
 

@@ -29,13 +29,20 @@ import {
   defaultKeymap,
   historyField,
   redo as historyRedo,
+  isolateHistory,
   undo as historyUndo,
 } from "@codemirror/commands";
+import {
+  ensureSyntaxTree,
+  syntaxHighlighting,
+  syntaxTree,
+} from "@codemirror/language";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
   Annotation,
   ChangeSet,
+  Compartment,
   EditorSelection,
   EditorState,
   Facet,
@@ -54,8 +61,15 @@ import {
 } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
-import { documentLanguage } from "../setup";
-import { formattingKeymap } from "../toolbar";
+import { copyAsHtml } from "../copyHtml";
+import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
+import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
+import { deletionOutcome } from "../marks/deleteCheck";
+import { judgedElsewhere, keptWhole } from "../marks/deleting";
+import { documentLanguage, editorHighlight } from "../setup";
+import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
+import { marksOnEditLine } from "../marks/mode";
+import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
 import type { MountedCell, OpenCell } from "./openCell";
@@ -95,6 +109,12 @@ interface CellRange {
 export const fromCell = Annotation.define<boolean>();
 /** Marks a cell-view transaction that came from the main view. */
 const fromMain = Annotation.define<boolean>();
+/**
+ * Marks a local insert whose text is already cell Markdown (a paste of
+ * Fluid's own copy): its escapes stay as they are, and only a bare pipe gets
+ * its backslash (`withEscapes`), so the paste is byte for byte.
+ */
+export const cellMarkdown = Annotation.define<boolean>();
 /** Sets the cell's content range outright. */
 const setRange = StateEffect.define<CellRange>();
 
@@ -218,6 +238,15 @@ function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
   return units;
 }
 
+/** Whether `[from, to)` touches an escape unit whose backslash is hidden. */
+function keepsEscape(state: EditorState, from: number, to: number): boolean {
+  const range = state.field(rangeField, false);
+  if (!range) return false;
+  return cellUnits(state.doc, range).some(
+    (unit) => unit.hide !== null && unit.from < to && from < unit.to,
+  );
+}
+
 /**
  * Inside the cell: every escaping backslash hidden (an escaped `\|` shows
  * `|`, any `\\` shows `\`), each `<br>` drawn as a line break. The bytes are
@@ -251,10 +280,23 @@ function clampSelection(
   );
 }
 
-/** Carries a transaction's user event over to a rebuilt spec. */
-function userEventOf(tr: Transaction): { userEvent?: string } {
+/**
+ * Carries a transaction's user event over to a rebuilt spec, and its history
+ * isolation: a gesture (a format, a popover commit, a mark-aware delete) is
+ * one undo step of its own on main's stack too.
+ */
+function userEventOf(tr: Transaction): {
+  userEvent?: string;
+  annotations?: Annotation<unknown>[];
+} {
   const event = tr.annotation(Transaction.userEvent);
-  return event === undefined ? {} : { userEvent: event };
+  const isolate = tr.annotation(isolateHistory);
+  return {
+    ...(event === undefined ? {} : { userEvent: event }),
+    ...(isolate === undefined
+      ? {}
+      : { annotations: [isolateHistory.of(isolate)] }),
+  };
 }
 
 /**
@@ -268,8 +310,11 @@ function cellChange(
   toA: number,
   text: string,
   floor: number,
+  markdown = false,
 ): { from: number; to: number; insert: string } {
-  const insert = text.replace(/\r\n|\r|\n/g, "").replaceAll("|", "\\|");
+  const flat = text.replace(/\r\n|\r|\n/g, "");
+  // Markdown keeps its escapes; `withEscapes` adds the one a bare pipe needs.
+  const insert = markdown ? flat : flat.replaceAll("|", "\\|");
   const inside = (pos: number) =>
     units.find((unit) => unit.from < pos && pos < unit.to);
   let from = inside(fromA)?.from ?? fromA;
@@ -528,7 +573,14 @@ const clampToCell = EditorState.transactionFilter.of(
       }
       const text = inserted.sliceString(0, inserted.length, "\n");
       const floor = kept.at(-1)?.to ?? 0;
-      const change = cellChange(units, fromA, toA, text, floor);
+      const change = cellChange(
+        units,
+        fromA,
+        toA,
+        text,
+        floor,
+        tr.annotation(cellMarkdown) === true,
+      );
       if (change.insert !== text || change.from !== fromA || change.to !== toA)
         altered = true;
       if (change.insert.length === 0 && change.from === change.to) return;
@@ -646,9 +698,10 @@ export { cellMain };
 
 /**
  * Whether the cell view's caret is empty and at the visible start (`side`
- * -1) or end (1) of the cell's content: only hidden escapes lie between it
- * and the edge. A leading `\|` hides its `\`, so the caret after it still
- * looks like the start.
+ * -1) or end (1) of the cell's content: only hidden escapes or hidden marks
+ * lie between it and the edge (C3). A leading `\|` hides its `\`, so the
+ * caret after it still looks like the start; a canonical caret before the
+ * closing `**` of a bold cell is at its end.
  */
 export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
   const { selection } = view.state;
@@ -656,8 +709,10 @@ export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
   const head = selection.main.head;
   const range = view.state.field(rangeField, false);
   if (!range) return false;
-  if (side === 1) return head >= range.to;
-  if (head <= range.from) return true;
+  if (side === 1 ? head >= range.to : head <= range.from) return true;
+  if (stepVisible(view.state, head, side === 1, viewAtoms(view)) === null)
+    return true;
+  if (side === 1) return false;
   const first = cellUnits(view.state.doc, range)[0];
   return first?.hide === range.from && head === range.from + 1;
 }
@@ -751,6 +806,39 @@ const forwardingOn = Facet.define<boolean, boolean>({
   combine: (values) => values.some(Boolean),
 });
 
+/**
+ * The marks setting inside a cell view, read from main at mount and
+ * reconfigured by `Forwarding` when main's flips, so the open cell switches
+ * in place. One compartment serves every cell view: it is only a key.
+ */
+const cellMarksMode = new Compartment();
+
+/**
+ * Puts the cell view's caret into main's `openCellField`, so main holds the
+ * head the cell shows (F1): after the mount, which settles the opening caret
+ * on its drawn place, and after an outside change the cell's normalizer moved
+ * the caret for. Main is often mid-update then, so it waits for a microtask;
+ * it does nothing once the cell is gone or the views disagree.
+ */
+function settleMainCaret(main: EditorView, view: EditorView): void {
+  const run = (): void => {
+    if (isDestroyed(main) || mountedCell(main)?.view !== view) return;
+    if (inUpdate(main) || inUpdate(view)) {
+      queueMicrotask(run);
+      return;
+    }
+    const open = main.state.field(openCellField, false);
+    if (!open || !view.state.doc.eq(main.state.doc)) return;
+    const { anchor, head } = view.state.selection.main;
+    if (open.anchor === anchor && open.head === head) return;
+    main.dispatch({
+      effects: setOpenCell.of({ anchor, head, focused: open.focused }),
+      annotations: [fromCell.of(true)],
+    });
+  };
+  run();
+}
+
 /** Feeds main changes into the mounted cell and runs the gone check. */
 class Forwarding {
   readonly main: EditorView;
@@ -787,6 +875,24 @@ class Forwarding {
     const cell = mountedCell(main);
     if (!cell || !now) return;
     const view = cell.view;
+    // The setting flipped: the open cell follows in place, with its caret.
+    const show = update.state.facet(marksOnEditLine);
+    if (view.state.facet(marksOnEditLine) !== show) {
+      view.dispatch({
+        effects: cellMarksMode.reconfigure(marksOnEditLine.of(show)),
+        annotations: [fromMain.of(true)],
+      });
+      // The drawn place stays; its one position may differ in the new mode.
+      const { main: range } = view.state.selection;
+      const place = canonical(view.state, range.head);
+      if (range.empty && place !== range.head) {
+        view.dispatch({
+          selection: { anchor: place },
+          annotations: [fromMain.of(true)],
+        });
+      }
+      settleMainCaret(main, view);
+    }
     let touched = false;
     for (const tr of update.transactions) {
       if (tr.annotation(fromCell)) continue;
@@ -816,6 +922,8 @@ class Forwarding {
       effects: setRange.of(range),
       annotations: [fromMain.of(true)],
     });
+    // The normalizer may have moved main's head to its drawn place.
+    settleMainCaret(main, view);
   }
 
   destroy(): void {
@@ -856,6 +964,63 @@ export function activeCell(main: EditorView): CellEditor | null {
 }
 
 const editors = new WeakMap<EditorView, CellEditor>();
+
+/**
+ * How long a cell may parse the page up to its row when it opens: a
+ * watchdog, not a budget. Main has parsed the same text already, so this is
+ * tens of milliseconds on the longest page. Read from main, so a test can
+ * make it fire.
+ */
+export const cellParseBudget = Facet.define<number, number>({
+  combine: (values) => values[0] ?? 2_000,
+});
+
+/** What a delete in a cell says while its row is not read yet. */
+export const CELL_NOT_READ =
+  "This cell is still loading. Try again in a moment.";
+
+/** Whether the cell's row is not read yet: the parse stops above it. */
+function rowUnread(state: EditorState): boolean {
+  const cell = state.field(rangeField, false);
+  return cell !== undefined && syntaxTree(state).length < cell.to;
+}
+
+/**
+ * When the watchdog fired before the parse reached the row, the cell opens
+ * with no marks hidden and no atoms drawn: a delete then could split a
+ * label or leave a lone mark, and a format command would wrap raw marks.
+ * Every delete and every command edit (a bare `input`: the format keys and
+ * bar, links, popover commits) is refused, and so is a format waiting for
+ * typing, with one sentence each, until the background parse has read the
+ * row (D13). The format commands ask first (`formatGate`), so they say it
+ * before they read the short tree themselves. Typing or a paste over a selection deletes that selection, so
+ * it is refused like a delete (D17). Typing at a caret stays, and so does a
+ * composition, which is the browser's to finish.
+ */
+const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
+  if (!rowUnread(tr.startState)) return tr;
+  const overSelection =
+    tr.isUserEvent("input") &&
+    !tr.isUserEvent("input.type.compose") &&
+    tr.startState.selection.ranges.some((range) => !range.empty);
+  const command =
+    tr.docChanged &&
+    (tr.isUserEvent("delete") ||
+      tr.annotation(Transaction.userEvent) === "input" ||
+      overSelection);
+  const waiting =
+    (tr.startState.field(pendingFormat, false) ?? null) === null &&
+    (tr.state.field(pendingFormat, false) ?? null) !== null;
+  if (!command && !waiting) return tr;
+  return {
+    selection: tr.startState.selection,
+    effects: [
+      EditorView.announce.of(CELL_NOT_READ),
+      // A refused delete is named as the deletion check names its own.
+      ...(tr.isUserEvent("delete") ? [deletionOutcome.of("refused")] : []),
+    ],
+  };
+});
 
 /**
  * Mounts the cell editor for `main`'s open cell (`openCellField`, which must
@@ -905,12 +1070,19 @@ export function mountCellEditor(
     for (const tr of local) {
       if (!tr.docChanged) continue;
       sent = true;
+      const { userEvent, annotations = [] } = userEventOf(tr);
       tellMain(
         {
           changes: tr.changes,
           effects: setOpenCell.of(own(tr.state)),
-          annotations: [fromCell.of(true)],
-          ...userEventOf(tr),
+          // The cell judged its own deletion with its row's marks shown or
+          // hidden by its own caret; main would read the row as hidden.
+          annotations: [
+            fromCell.of(true),
+            judgedElsewhere.of(true),
+            ...annotations,
+          ],
+          ...(userEvent === undefined ? {} : { userEvent }),
         },
         tr.startState.doc,
       );
@@ -929,51 +1101,91 @@ export function mountCellEditor(
     }
   });
 
-  const view = new EditorView({
-    state: EditorState.create({
-      doc: main.state.doc,
-      selection: selectionFor(open, range),
-      extensions: [
-        ...(separator ? [EditorState.lineSeparator.of(separator)] : []),
-        cellMain.of(main),
-        rangeField.init(() => range),
-        Prec.highest([hideOutside, cellMarks]),
-        clampToCell,
-        composeEdges,
-        forward,
-        Prec.high([
-          keymap.of([
-            {
-              key: "Mod-z",
-              run: () => runMainUndo(main, "undo"),
-              preventDefault: true,
-            },
-            {
-              key: "Mod-Shift-z",
-              run: () => runMainUndo(main, "redo"),
-              preventDefault: true,
-            },
-            {
-              key: "Mod-y",
-              run: () => runMainUndo(main, "redo"),
-              preventDefault: true,
-            },
-          ]),
-          cellSearchKeys,
-        ]),
-        cellPresence,
-        documentLanguage,
-        ...main.state.facet(cellPreviewLayers),
-        formattingKeymap,
-        ...extensions,
+  const fresh = EditorState.create({
+    doc: main.state.doc,
+    selection: selectionFor(open, range),
+    extensions: [
+      ...(separator ? [EditorState.lineSeparator.of(separator)] : []),
+      cellMain.of(main),
+      rangeField.init(() => range),
+      Prec.highest([hideOutside, cellMarks]),
+      clampToCell,
+      // Lowest, so it runs before every other filter (the last listed run
+      // first): an unread row says so before a check reads its short tree.
+      Prec.lowest(unreadRowGuard),
+      // Backspace and Delete over hidden marks leave every hidden escape to
+      // `cellChange`, which takes such a unit whole.
+      keptWhole.of(keepsEscape),
+      composeEdges,
+      forward,
+      Prec.high([
         keymap.of([
-          { key: "Shift-Enter", run: insertLineBreakTag },
-          // Never text; a caller's Enter (navigation) comes first.
-          { key: "Enter", run: () => true },
+          {
+            key: "Mod-z",
+            run: () => runMainUndo(main, "undo"),
+            preventDefault: true,
+          },
+          {
+            key: "Mod-Shift-z",
+            run: () => runMainUndo(main, "redo"),
+            preventDefault: true,
+          },
+          {
+            key: "Mod-y",
+            run: () => runMainUndo(main, "redo"),
+            preventDefault: true,
+          },
         ]),
-        keymap.of(defaultKeymap),
-      ],
-    }),
+        cellSearchKeys,
+      ]),
+      cellPresence,
+      documentLanguage,
+      // The formats drawn as main draws them (bold, italic, code, links):
+      // with the marks hidden, the style is the only sign of a format.
+      syntaxHighlighting(editorHighlight),
+      // The cell's content is the segment the hidden-mark layer's caret,
+      // delete and format rules stay inside; outside it, the line.
+      markSegment.of((state, pos) => {
+        const cell = state.field(rangeField, false);
+        return cell && pos >= cell.from && pos <= cell.to ? cell : null;
+      }),
+      cellMarksMode.of(marksOnEditLine.of(main.state.facet(marksOnEditLine))),
+      // A Reflection never shows a comment, in a cell too.
+      pageHidesComments.of(hidesIdLines(main.state)),
+      // The room's undo manager, so a gesture in the cell closes its
+      // capture window (`stopCapturing`) as it does in main.
+      roomUndo.of(main.state.facet(roomUndo)),
+      ...main.state.facet(cellPreviewLayers),
+      // Copy and cut carry HTML beside the Markdown, as in main.
+      copyAsHtml(),
+      formatKeymap,
+      formatGate.of((state) => (rowUnread(state) ? CELL_NOT_READ : null)),
+      ...extensions,
+      keymap.of([
+        { key: "Shift-Enter", run: insertLineBreakTag },
+        // Never text; a caller's Enter (navigation) comes first.
+        { key: "Enter", run: () => true },
+      ]),
+      keymap.of(defaultKeymap),
+    ],
+  });
+  // A new state parses only what fits a short time budget, and the rest
+  // later in the background: on a long page that stops above the table, so
+  // the cell would open with no marks hidden and no atoms drawn, and a key
+  // pressed then would edit the raw text. Its row is read at once instead;
+  // the empty update publishes the parse into the state.
+  ensureSyntaxTree(fresh, range.to, main.state.facet(cellParseBudget));
+  const created = fresh.update({}).state;
+  // The caret the cell opens with rests on its drawn place, as every caret a
+  // transaction sets does: "start" in a bold cell is inside the `**`. Main
+  // takes that head once the cell is registered (`settleMainCaret`).
+  const opened = created.selection.main;
+  const settled = canonical(created, opened.head);
+  const view = new EditorView({
+    state:
+      opened.empty && settled !== opened.head
+        ? created.update({ selection: { anchor: settled } }).state
+        : created,
     parent,
   });
 
@@ -996,5 +1208,6 @@ export function mountCellEditor(
   };
   editors.set(view, editor);
   registerCell(main, entry);
+  settleMainCaret(main, view);
   return editor;
 }

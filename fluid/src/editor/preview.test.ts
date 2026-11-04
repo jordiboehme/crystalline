@@ -10,10 +10,18 @@
 
 import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import {
+  cleanupMarkViews,
+  markView,
+  setCaret,
+  setShowMarks,
+} from "../test/markKit";
 import { parsedState } from "../test/parse";
 import { frontmatterRegion } from "./frontmatterRegion";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 
@@ -33,6 +41,9 @@ function editor(doc: string, at?: number): EditorView {
           ...lineSeparatorFor(doc),
           ...baseExtensions(false),
           livePreview(),
+          hiddenMarkLayer(),
+          // Show mode: these tests pin the marks a touched line reveals.
+          marksOnEditLine.of(true),
         ],
       }),
     ),
@@ -46,6 +57,64 @@ function editor(doc: string, at?: number): EditorView {
   });
   return view;
 }
+
+afterEach(cleanupMarkViews);
+
+describe("hidden marks", () => {
+  it("draws no star on the caret line in hidden mode and the stars in show mode", () => {
+    const hidden = markView("a **bold** c", { mode: "hidden" });
+    setCaret(hidden, 6);
+    expect(hidden.contentDOM.textContent).toBe("a bold c");
+    expect(hidden.contentDOM.textContent).not.toContain("*");
+    const show = markView("a **bold** c", { mode: "show" });
+    setCaret(show, 6);
+    expect(show.contentDOM.textContent).toContain("**bold**");
+  });
+
+  it("builds no new decoration set for a caret move in hidden mode", () => {
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: "a **bold** c\nnext",
+          extensions: [
+            ...baseExtensions(false),
+            livePreview(),
+            hiddenMarkLayer(),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    const sets = () =>
+      view.state.facet(EditorView.atomicRanges).map((ranges) => ranges(view));
+    const before = sets();
+    expect(before.some((set) => set.size > 0)).toBe(true);
+    view.dispatch({ selection: EditorSelection.cursor(14) });
+    const after = sets();
+    expect(after).toHaveLength(before.length);
+    after.forEach((set, index) => {
+      expect(set).toBe(before[index]);
+    });
+    view.destroy();
+  });
+
+  it("shows every mark in the source view", () => {
+    const raw = markView("a **bold** c", { raw: true });
+    setCaret(raw, 6);
+    expect(raw.contentDOM.textContent).toContain("**bold**");
+  });
+
+  it("redraws the caret line when the setting flips, with no selection change", () => {
+    const view = markView("a **bold** c", { mode: "hidden" });
+    setCaret(view, 6);
+    expect(view.contentDOM.textContent).not.toContain("*");
+    setShowMarks(view, true);
+    expect(view.state.selection.main.head).toBe(6);
+    expect(view.contentDOM.textContent).toContain("**bold**");
+    setShowMarks(view, false);
+    expect(view.contentDOM.textContent).not.toContain("*");
+  });
+});
 
 describe("frontmatterRegion", () => {
   it("finds the opening block and only the opening block", () => {
@@ -208,7 +277,7 @@ describe("live preview", () => {
 });
 
 describe("the not-applicable task state", () => {
-  it("draws [~] as a struck box that does not toggle", () => {
+  it("draws [~] as a struck box that a click marks open", () => {
     const doc = "# Doc\n\n- [~] skipped\n- [ ] open\n";
     const view = editor(doc, 0);
     const box = view.dom.querySelector<HTMLElement>(".cm-task-na");
@@ -216,10 +285,12 @@ describe("the not-applicable task state", () => {
     expect(box?.getAttribute("aria-label")).toBe("Not applicable");
     expect(box?.tagName).not.toBe("INPUT");
     expect(view.contentDOM.textContent).not.toContain("[~]");
-    box?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    expect(docText(view.state)).toBe(doc);
     // The open task keeps its own checkbox.
     expect(view.dom.querySelectorAll("input.cm-task-toggle").length).toBe(1);
+    // A click writes the one character: the box becomes an open task.
+    box?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    expect(docText(view.state)).toBe("# Doc\n\n- [ ] skipped\n- [ ] open\n");
+    expect(view.dom.querySelector(".cm-task-na")).toBeNull();
     view.destroy();
   });
 

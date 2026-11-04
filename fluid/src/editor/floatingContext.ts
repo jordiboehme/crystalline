@@ -269,6 +269,22 @@ export function openCellView(main: EditorView): EditorView | null {
 }
 
 /**
+ * The view a verb of either format bar acts on, read when it runs: the open
+ * cell's editor, else main, or nothing while main's selection is parked
+ * behind an open cell whose editor is not mounted (its table scrolled away)
+ * and main does not hold the focus. That selection is stale, and the cell is
+ * not there to take the verb. The one rule for both bars and for the pressed
+ * state they draw.
+ */
+export function verbTarget(main: EditorView): EditorView | null {
+  const cell = openCellView(main);
+  if (cell) return cell;
+  return main.state.facet(mainSelectionParked) && !mainFocused(main)
+    ? null
+    : main;
+}
+
+/**
  * Whether main itself holds the focus: the person is typing in main even
  * though a cell is still mounted (Shift+Tab back in, a `main.focus()`), so
  * main's selection is the live one. Read from the DOM, because

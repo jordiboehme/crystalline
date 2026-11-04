@@ -10,13 +10,13 @@
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
-import { languages } from "@codemirror/language-data";
 import { search, searchKeymap } from "@codemirror/search";
 import type { Extension } from "@codemirror/state";
 import { EditorState, Prec } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 
+import { codeLanguageFor } from "./codeLanguage";
 import { dialectGrammar } from "./dialectHighlight";
 
 /**
@@ -251,7 +251,9 @@ export const RAW_MONO: Extension = Prec.high(
  */
 export const documentLanguage: Extension = markdown({
   base: markdownLanguage,
-  codeLanguages: languages,
+  // One lookup with the code box's header (`codeLanguage.ts`), exact, so a
+  // fence the header calls plain text is not highlighted as another language.
+  codeLanguages: codeLanguageFor,
   // The callout marker and the status label, as marks rather than links.
   extensions: dialectGrammar,
 });

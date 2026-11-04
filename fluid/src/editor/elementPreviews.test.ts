@@ -7,15 +7,19 @@
  */
 
 import { cursorCharLeft } from "@codemirror/commands";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { render, waitFor } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { cleanupMarkViews, markView } from "../test/markKit";
 import { parsedState } from "../test/parse";
 import CmEditor from "./CmEditor";
+import type { ElementEdit } from "./elementEdit";
 import { elementPreviews } from "./elementPreviews";
+import { hiddenMarkLayer } from "./marks";
+import { marksOnEditLine } from "./marks/mode";
 import { livePreview } from "./preview";
 import { baseExtensions, lineSeparatorFor } from "./setup";
 
@@ -26,11 +30,14 @@ afterEach(() => {
   view = null;
 });
 
-/** A buffer with both preview layers, in the order the surface mounts them. */
+/**
+ * A buffer with the preview layers, in the order the surface mounts them.
+ * Show mode unless asked: most tests here pin what a touched line reveals.
+ */
 function editor(
   doc: string,
   at: number,
-  options: { sections?: boolean } = {},
+  options: { sections?: boolean; mode?: "hidden" | "show" } = {},
 ): EditorView {
   view = new EditorView({
     state: parsedState(
@@ -42,6 +49,8 @@ function editor(
           ...baseExtensions(false),
           elementPreviews(options),
           livePreview(),
+          hiddenMarkLayer(),
+          marksOnEditLine.of((options.mode ?? "show") === "show"),
         ],
       }),
     ),
@@ -156,6 +165,46 @@ describe("a status label", () => {
   });
 });
 
+describe("with marks hidden on the caret line", () => {
+  const DOC = "Build :status[Done]{green} at $`x^2`$ now\n\nEnd\n";
+  const afterPill = DOC.indexOf(" at");
+  const afterMath = DOC.indexOf(" now");
+
+  it("keeps a status pill and inline math drawn with the caret right after them", async () => {
+    for (const at of [afterPill, afterMath]) {
+      const v = editor(DOC, at, { mode: "hidden" });
+      expect(v.dom.querySelector(".status-label")?.textContent).toBe("Done");
+      await waitFor(() => {
+        expect(v.dom.querySelector(".cm-math-inline .katex")).not.toBeNull();
+      });
+      expect(lineText(v, 1)).not.toContain(":status[");
+      expect(lineText(v, 1)).not.toContain("$`");
+      v.destroy();
+    }
+    view = null;
+  });
+
+  it("hands them back as text in show mode", () => {
+    for (const at of [afterPill, afterMath]) {
+      const v = editor(DOC, at, { mode: "show" });
+      expect(v.dom.querySelector(".status-label")).toBeNull();
+      expect(v.dom.querySelector(".cm-math-inline")).toBeNull();
+      expect(lineText(v, 1)).toBe("Build :status[Done]{green} at $`x^2`$ now");
+      v.destroy();
+    }
+    view = null;
+  });
+
+  it("keeps a callout head and a display formula drawn with the caret on them", () => {
+    const doc = "> [!NOTE]\n> body\n\n$$\na^2\n$$\n\nEnd\n";
+    const v = editor(doc, doc.indexOf("a^2"), { mode: "hidden" });
+    expect(v.dom.querySelector(".cm-math-block")).not.toBeNull();
+    v.dispatch({ selection: EditorSelection.cursor(3) });
+    expect(v.dom.querySelector(".cm-callout-head")).not.toBeNull();
+    expect(lineText(v, 1)).not.toContain("[!NOTE]");
+  });
+});
+
 describe("a colour code", () => {
   const DOC = "Accent `#0969DA` here and `#define` there\n\nEnd\n";
 
@@ -230,7 +279,11 @@ describe("inside the React screen that mounts the buffer", () => {
       const { container, unmount } = render(
         createElement(CmEditor, {
           initialDoc: "Top\n\n> [!NOTE]\n> body\n",
-          extensions: [...baseExtensions(false), elementPreviews()],
+          extensions: [
+            ...baseExtensions(false),
+            elementPreviews(),
+            hiddenMarkLayer(),
+          ],
           ariaLabel: "Source",
           onReady: () => {},
           onDocChanged: () => {},
@@ -367,5 +420,89 @@ describe("math, the edges", () => {
     page.destroy();
     const engram = editor(doc, doc.length);
     expect(engram.dom.querySelector(".cm-math-block")).not.toBeNull();
+  });
+});
+
+describe("the drawn elements ask for their editors", () => {
+  it("draws the callout's kind icon and chevron as named buttons", async () => {
+    const doc = "> [!TIP]- Short way\n> body\n\nEnd\n";
+    const v = editor(doc, doc.length);
+    const head = v.dom.querySelector(".cm-callout-head");
+    await waitFor(() => {
+      expect(head?.querySelector("button")).not.toBeNull();
+    });
+    const kind = head?.querySelector('button[aria-label="Callout kind: Tip"]');
+    const fold = head?.querySelector('button[aria-label="Callout fold"]');
+    expect(kind).not.toBeNull();
+    expect(fold?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it.each([
+    ["a pill", "x\n:status[Done]{green}", ".status-label", "status", 2],
+    ["inline math", "x\na $`y`$", ".cm-math-inline", "math", 4],
+    ["a display formula", "x\n\n$$\na\n$$", ".cm-math-block", "math", 3],
+  ])(
+    "asks for %s's editor on a press (show mode)",
+    (_name, doc, selector, kind, at) => {
+      const heard: (ElementEdit | null)[] = [];
+      const v = markView(doc, {
+        mode: "show",
+        onElementEdit: (edit) => {
+          heard.push(edit);
+        },
+      });
+      const el = v.contentDOM.querySelector(selector);
+      expect(el).not.toBeNull();
+      el?.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+      expect(heard.at(-1)).toMatchObject({ kind, at });
+      cleanupMarkViews();
+    },
+  );
+
+  it("asks nothing for a pill in Raw or on a page that takes no writes", () => {
+    const heard: (ElementEdit | null)[] = [];
+    const v = markView("x\n:status[Done]", {
+      onElementEdit: (edit) => {
+        heard.push(edit);
+      },
+    });
+    v.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    v.contentDOM
+      .querySelector(".status-label")
+      ?.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+      );
+    expect(heard).toEqual([]);
+    cleanupMarkViews();
+    const raw = markView("x\n:status[Done]", { raw: true });
+    expect(raw.contentDOM.querySelector(".status-label")).toBeNull();
+    cleanupMarkViews();
+  });
+});
+
+describe("inline math read as the page reads it", () => {
+  it("draws a formula after an escaped backslash, and none after an escaped dollar", () => {
+    const v = editor("a \\\\$`x`$ b \\$`y`$\n\nEnd", 0, { mode: "hidden" });
+    const drawn = v.contentDOM.querySelectorAll(".cm-math-inline");
+    expect(drawn).toHaveLength(1);
+  });
+});
+
+describe("a math fence in a list item (I6)", () => {
+  it.each([
+    ["after a blank line", "- item\n\n  ```math\n  x^2\n  ```\n\nEnd\n"],
+    ["right under the item", "- item\n  ```math\n  x^2\n  ```\n\nEnd\n"],
+  ])("sets it as display math, %s", async (_name, doc) => {
+    const v = editor(doc, doc.length);
+    await waitFor(() => {
+      expect(
+        v.dom.querySelectorAll(".cm-math-block .katex-display"),
+      ).toHaveLength(1);
+    });
+    expect(v.dom.querySelector(".cm-code-box")).toBeNull();
   });
 });

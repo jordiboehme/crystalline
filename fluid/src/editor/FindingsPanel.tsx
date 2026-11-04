@@ -9,6 +9,7 @@ import { EditorView } from "@codemirror/view";
 import type { ReactElement } from "react";
 
 import type { ValidateFinding, ValidateResponse } from "../api/model";
+import { judgeBeforeCommand } from "./marks/commandJudge";
 
 /**
  * Place the cursor on a one-based line and reveal it. Exported for reuse:
@@ -25,6 +26,8 @@ export function jumpToLine(view: EditorView, line: number): void {
   // than trusted, so a stale or out-of-range finding still lands somewhere
   // sane instead of throwing.
   const clamped = Math.max(1, Math.min(line, view.state.doc.lines));
+  // From outside the editor's DOM: a waiting composition first (D60).
+  judgeBeforeCommand(view);
   const at = view.state.doc.line(clamped).from;
   view.dispatch({
     selection: { anchor: at },

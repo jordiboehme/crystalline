@@ -13,7 +13,7 @@ import { undo } from "@codemirror/commands";
 import { syntaxTree } from "@codemirror/language";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { yCollab } from "y-codemirror.next";
 import { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
@@ -79,7 +79,7 @@ function editor(
 describe("tableContextAt", () => {
   test("resolves the cell under the caret", () => {
     const v = editor(DOC, IN_TABLE);
-    const context = tableContextAt(v.state);
+    const context = tableContextAt(parsedState(v.state));
     expect(context).not.toBeNull();
     expect(context?.row).toBe(2);
     expect(context?.column).toBe(0);
@@ -87,9 +87,9 @@ describe("tableContextAt", () => {
 
   test("prose, fences and a pipe line inside a fence are not tables", () => {
     const v = editor(DOC, 2);
-    expect(tableContextAt(v.state)).toBeNull();
+    expect(tableContextAt(parsedState(v.state))).toBeNull();
     const fenced = editor("```text\n| a | b |\n|---|---|\n```\n", 12);
-    expect(tableContextAt(fenced.state)).toBeNull();
+    expect(tableContextAt(parsedState(fenced.state))).toBeNull();
   });
 
   test("the caret at the table's FIRST character is in the table", () => {
@@ -98,7 +98,7 @@ describe("tableContextAt", () => {
     // retry finds it. A side -1-only implementation passes every interior
     // test and fails this ordinary Home-key caret position.
     const v = editor(DOC, DOC.indexOf("| a"));
-    const context = tableContextAt(v.state);
+    const context = tableContextAt(parsedState(v.state));
     expect(context).not.toBeNull();
     expect(context?.row).toBe(0);
     expect(context?.column).toBe(0);
@@ -108,12 +108,12 @@ describe("tableContextAt", () => {
     // Side -1 carries this edge; one position further (the next line's
     // start) is the null case the prose test above already covers.
     const v = editor(DOC, DOC.indexOf("| 1 | 2 |") + "| 1 | 2 |".length);
-    expect(tableContextAt(v.state)).not.toBeNull();
+    expect(tableContextAt(parsedState(v.state))).not.toBeNull();
   });
 
   test("the delimiter row is row 1, and it is not a row to delete", () => {
     const v = editor(DOC, DOC.indexOf("| --- ") + 2);
-    expect(tableContextAt(v.state)?.row).toBe(1);
+    expect(tableContextAt(parsedState(v.state))?.row).toBe(1);
     // The rule is structure, not content: deleting it would stop the table
     // being a table, so the verb refuses rather than obliging.
     expect(tableDeleteRow(v)).toBe(false);
@@ -147,7 +147,7 @@ describe("tableContextAt", () => {
     // report column 1 - so the whole table is refused instead.
     const doc = "> | a | b |\n| --- | --- |\n> | 1 | 2 |\n";
     const v = editor(doc, doc.indexOf("| 1") + 3);
-    expect(tableContextAt(v.state)).toBeNull();
+    expect(tableContextAt(parsedState(v.state))).toBeNull();
     expect(tableAddColumnAfter(v)).toBe(false);
     expect(tablePrettify(v)).toBe(false);
     expect(docText(v.state)).toBe(doc);
@@ -168,7 +168,7 @@ describe("tableContextAt", () => {
 
     const bare = "abc | def\n--- | ---\nbar | baz\n";
     const v = editor(bare, bare.indexOf("bar") + 1);
-    expect(tableContextAt(v.state)?.column).toBe(0);
+    expect(tableContextAt(parsedState(v.state))?.column).toBe(0);
     expect(tableAddColumnAfter(v)).toBe(true);
     expect(docText(v.state)).toBe(
       "abc | Column | def\n--- | --- | ---\nbar |  | baz\n",
@@ -680,7 +680,9 @@ describe("every verb on tables without outer pipes (R23)", () => {
     ).toBe(true);
     const tables: [number, number][] = [];
     let rows = 0;
-    syntaxTree(state).iterate({
+    // The whole parse: a verb's own transaction parses for 20 ms of wall
+    // clock, and on a loaded machine its tree stops short of the table.
+    syntaxTree(parsedState(state)).iterate({
       enter: (node) => {
         if (node.name === "Table") tables.push([node.from, node.to]);
         if (node.name === "TableRow") rows += 1;
@@ -814,4 +816,35 @@ describe("every verb on tables without outer pipes (R23)", () => {
       }
     });
   }
+});
+
+/**
+ * A verb right after an undo on a busy machine (D54). An undo gives the parse
+ * of the new state a 20 ms slice of wall clock; a pause of the page during it
+ * leaves the tree short of the table, and the verb read "no table" there.
+ * Here every look at the clock during the undo jumps a second, so the slice
+ * takes one parse step, at any load.
+ */
+describe("a verb right after an undo whose parse fell short (D54)", () => {
+  test("still finds the table", () => {
+    const above = Array.from(
+      { length: 400 },
+      (_, i) => `Paragraph ${String(i)} of the page.`,
+    ).join("\n\n");
+    const text = `${above}\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n`;
+    const at = text.indexOf("| 1") + 2;
+    const v = editor(text, at);
+    expect(tableAddRowBelow(v, at)).toBe(true);
+    const now = Date.now.bind(Date);
+    let ahead = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1_000;
+      return now() + ahead;
+    });
+    undo(v);
+    clock.mockRestore();
+    expect(syntaxTree(v.state).length).toBeLessThan(at);
+    expect(tableAlignColumn(v, "right", at)).toBe(true);
+    expect(docText(v.state)).toContain("| ---: | --- |");
+  });
 });
