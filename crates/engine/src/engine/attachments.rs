@@ -1204,6 +1204,7 @@ impl Engine {
                     // would be a link to the page being split, not to this.
                     share_link: None,
                     model: None,
+                    expected_checksum: None,
                 },
                 client,
                 // The splitter's own scope: the new engram is written by

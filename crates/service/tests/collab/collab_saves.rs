@@ -1882,6 +1882,7 @@ async fn a_full_rename_that_stops_does_not_tell_its_rooms_a_new_name() {
                     overwrite: false,
                     share_link: None,
                     model: None,
+                    expected_checksum: None,
                 })
                 .await
         })
@@ -1938,6 +1939,7 @@ async fn a_refused_rename_does_not_tell_its_rooms_a_new_name() {
                     overwrite: false,
                     share_link: None,
                     model: None,
+                    expected_checksum: None,
                 })
                 .await
         })

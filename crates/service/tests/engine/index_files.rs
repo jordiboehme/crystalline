@@ -59,6 +59,7 @@ fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -381,6 +382,7 @@ async fn a_virtual_domain_generates_no_files() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();

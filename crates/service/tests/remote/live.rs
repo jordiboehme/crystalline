@@ -1322,6 +1322,114 @@ async fn a_server_before_agent_files_is_refused_before_anything_is_sent() {
     assert!(server.file("open", "plain-old.md").exists());
 }
 
+/// A guarded write is sent only to a server that keeps the guard. One older
+/// than 0.32.0, or one that names no version, would ignore
+/// `expected_checksum` and write last-write-wins, so the call is refused here
+/// before anything is sent. A new server gets it as sent and checks it
+/// itself. A write without the field goes through as before, whatever the
+/// server's version.
+#[tokio::test]
+async fn a_guarded_write_is_sent_only_to_a_server_that_keeps_the_guard() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let write = |content: &str, checksum: Option<&str>| {
+        let mut args = json!({
+            "domain": "open",
+            "title": "Guarded",
+            "content": content,
+            "overwrite": true,
+        });
+        if let Some(checksum) = checksum {
+            args["expected_checksum"] = json!(checksum);
+        }
+        args
+    };
+    call(client.peer(), "write_engram", write("- [fact] first", None))
+        .await
+        .unwrap();
+    let path = server.file("open", "guarded.md");
+    let token = crate::support::sha256_hex(&std::fs::read(&path).unwrap());
+
+    for (play, says) in [
+        (
+            Play::Version("0.31.0"),
+            "runs Crystalline 0.31.0, which cannot guard",
+        ),
+        (
+            Play::NoVersion,
+            "runs a Crystalline that does not name its version, which cannot guard",
+        ),
+    ] {
+        server.play(play);
+        server.clear_ctl_log();
+        let refused = call(
+            client.peer(),
+            "write_engram",
+            write("- [fact] guarded", Some(&token)),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.starts_with("The server at http"), "{refused}");
+        assert!(refused.contains(says), "{refused}");
+        assert!(
+            refused.ends_with(
+                "it needs 0.32 or newer. Leave expected_checksum out to write without the guard."
+            ),
+            "{refused}"
+        );
+        assert!(
+            !used_tool(&server, "write_engram"),
+            "the guarded write was sent: {:?}",
+            server.ctl_requests()
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("first"));
+    }
+
+    // Without the field nothing changes, even on an old server.
+    server.play(Play::Version("0.31.0"));
+    call(
+        client.peer(),
+        "write_engram",
+        write("- [fact] second", None),
+    )
+    .await
+    .unwrap();
+    assert!(std::fs::read_to_string(&path).unwrap().contains("second"));
+
+    // A new server gets the field and keeps the guard: a stale token is
+    // refused there, the current one lands.
+    server.play(Play::Version("0.32.0"));
+    let stale = call(
+        client.peer(),
+        "write_engram",
+        write("- [fact] stale", Some(&token)),
+    )
+    .await
+    .unwrap_err();
+    assert!(stale.contains("re-read"), "{stale}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("second"));
+    let current = crate::support::sha256_hex(&std::fs::read(&path).unwrap());
+    server.clear_ctl_log();
+    call(
+        client.peer(),
+        "write_engram",
+        write("- [fact] third", Some(&current)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        server.ctl_requests().iter().any(
+            |r| r["tool"] == "write_engram" && r["args"]["expected_checksum"] == json!(current)
+        ),
+        "the field was forwarded as sent: {:?}",
+        server.ctl_requests()
+    );
+    assert!(std::fs::read_to_string(&path).unwrap().contains("third"));
+}
+
 /// Through a mount, `include_images` decides a picture's shape as it does
 /// locally: by default an image block and no base64, with `false` base64 and
 /// no image block. A copy from an engram attachment into the Reflection with

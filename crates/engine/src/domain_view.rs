@@ -503,19 +503,9 @@ impl<'a> DomainView<'a> {
                     .await?
             };
             if held.is_none() {
-                self.engine
-                    .refuse_only_elsewhere(
-                        &desc.domain,
-                        desc.domain_id,
-                        crate::engine::ElsewhereRow::Engram(&desc.path),
-                    )
-                    .await?;
-                return Err(EngineError::NotFound(format!(
-                    "the file of '{}' is not on this disk, so no draft can start from it \
-                     (the index holds its body only); sync domain '{}' or restore the file, \
-                     then try again",
-                    desc.permalink, desc.domain
-                )));
+                return Err(self
+                    .no_draft_without_the_file(desc.domain_id, &desc.path, &desc.permalink)
+                    .await);
             }
         }
         self.text_at(base, desc).await
@@ -2029,6 +2019,82 @@ impl<'a> DomainView<'a> {
             checksum: sha256_hex(content.as_bytes()),
             content,
         }))
+    }
+
+    /// The whole text this view holds at a PATH: the actor's own draft when
+    /// they hold one, `None` where they deleted it, and the base text
+    /// otherwise ([`DomainView::engram_text_at_path`]). The text a read in
+    /// this view hands a checksum out for, which is why a guarded overwrite
+    /// of a draft compares against it.
+    pub(crate) async fn own_text_at_path(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<String>> {
+        if let Some(actor) = self.actor.as_deref() {
+            let held = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store.overlay_entry(domain_id, actor, path).await?
+            };
+            match held {
+                Some(entry) if entry.tombstone => return Ok(None),
+                Some(entry) => return Ok(Some(entry.content)),
+                None => {}
+            }
+        }
+        let found = self.engram_text_at_path(path).await?;
+        // An engram the index still has whose file is gone from this disk:
+        // the write would start the draft that `text_for_draft` refuses to
+        // start, so it is refused in the same words rather than called gone.
+        if found.is_none()
+            && self.actor.is_some()
+            && matches!(self.substrate(), Some(ContentSource::File { .. }))
+        {
+            let row = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store
+                    .list_engrams(&self.domain, Some(path), None)
+                    .await?
+                    .into_iter()
+                    .find(|row| row.path == path)
+            };
+            if let Some(row) = row {
+                return Err(self
+                    .no_draft_without_the_file(domain_id, path, &row.permalink)
+                    .await);
+            }
+        }
+        Ok(found.map(|found| found.content))
+    }
+
+    /// The refusal for a draft that would start from an engram whose file is
+    /// gone from this disk: the index holds its body only, so there is nothing
+    /// whole to start from. During an open host move it names that remedy.
+    async fn no_draft_without_the_file(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        permalink: &str,
+    ) -> EngineError {
+        if let Err(elsewhere) = self
+            .engine
+            .refuse_only_elsewhere(
+                &self.domain,
+                domain_id,
+                crate::engine::ElsewhereRow::Engram(path),
+            )
+            .await
+        {
+            return elsewhere;
+        }
+        EngineError::NotFound(format!(
+            "the file of '{permalink}' is not on this disk, so no draft can start from it \
+             (the index holds its body only); sync domain '{}' or restore the file, \
+             then try again",
+            self.domain
+        ))
     }
 
     /// Whether this reader has deleted the path: `true` only when their own

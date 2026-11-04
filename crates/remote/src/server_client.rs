@@ -120,6 +120,30 @@ pub const AGENT_FILES_CAPABILITY: &str = "agent_files";
 /// sentence an agent reads when its server is older.
 pub const AGENT_FILES_RELEASE: &str = "0.31.0";
 
+/// The first release whose `write_engram` takes `expected_checksum`. An older
+/// server ignores the field and writes last-write-wins, so a guarded write is
+/// not sent to one.
+pub const WRITE_CHECKSUM_RELEASE: &str = "0.32.0";
+
+/// Whether a `major.minor.patch` version is at least `min`. A pre-release or
+/// build suffix after the patch is ignored, and a version that does not parse
+/// is never enough: a guard is not handed to a server on a guess.
+pub fn version_at_least(version: &str, min: &str) -> bool {
+    fn parts(v: &str) -> Option<(u64, u64, u64)> {
+        let core = v.trim().trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        let mut it = core.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next()?.parse().ok()?;
+        it.next().is_none().then_some((major, minor, patch))
+    }
+    match (parts(version), parts(min)) {
+        (Some(have), Some(need)) => have >= need,
+        _ => false,
+    }
+}
+
 /// The largest answer to a [`FILE_COMMAND`] this client reads: the base64 of
 /// the largest file a domain holds ([`crystalline_core::MAX_ATTACHMENT_BYTES`],
 /// which is also the JSON API's body ceiling) plus room for the envelope.
@@ -1094,6 +1118,22 @@ impl Connection {
             .is_some_and(|all| all.iter().any(|c| c == AGENT_FILES_CAPABILITY)))
     }
 
+    /// The version the server names in its `status` answer, or `None` when
+    /// it names none.
+    pub async fn server_version(
+        &self,
+        limit: Duration,
+        budget: Budget,
+    ) -> Result<Option<String>, RemoteFailure> {
+        let status = self
+            .ctl_data_within(json!({ "v": 1, "cmd": "status" }), limit, budget)
+            .await?;
+        Ok(status["version"]
+            .as_str()
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string))
+    }
+
     /// One file of a domain on the server, by its domain-relative path
     /// (`assets/...` or `reflections/assets/...`), within `limit`: the
     /// server's `{mime, size, base64}`, read with [`FILE_ANSWER_CAP`] as the
@@ -1927,5 +1967,23 @@ mod tests {
 
     fn connection_with_no_mark() -> Connection {
         connection(Health::new(Duration::from_secs(30)))
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::version_at_least;
+
+    #[test]
+    fn a_version_is_compared_by_its_numbers_and_an_odd_one_is_never_enough() {
+        assert!(version_at_least("0.32.0", "0.32.0"));
+        assert!(version_at_least("0.32.1", "0.32.0"));
+        assert!(version_at_least("1.0.0", "0.32.0"));
+        assert!(version_at_least("0.40.0-rc.1", "0.32.0"));
+        assert!(!version_at_least("0.31.9", "0.32.0"));
+        assert!(!version_at_least("0.4.0", "0.32.0"));
+        assert!(!version_at_least("", "0.32.0"));
+        assert!(!version_at_least("next", "0.32.0"));
+        assert!(!version_at_least("0.32", "0.32.0"));
     }
 }

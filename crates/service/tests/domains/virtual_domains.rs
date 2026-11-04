@@ -68,6 +68,7 @@ fn write_params(title: &str, content: &str) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -799,6 +800,7 @@ fn tagged(title: &str, content: &str, tags: Vec<&str>) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 

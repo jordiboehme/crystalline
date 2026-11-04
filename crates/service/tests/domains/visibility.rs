@@ -1222,6 +1222,7 @@ async fn a_capture_over_a_virtual_manifest_cannot_switch_read_only_on() {
         overwrite: true,
         model: None,
         share_link: None,
+        expected_checksum: None,
     };
     let err = engine
         .write_engram_as(&p, None, &user("out"))
@@ -1258,6 +1259,7 @@ async fn a_capture_over_a_virtual_manifest_that_leaves_the_flag_alone_lands() {
         overwrite: true,
         model: None,
         share_link: None,
+        expected_checksum: None,
     };
     engine
         .write_engram_as(&p, None, &user("out"))
@@ -1333,6 +1335,7 @@ async fn a_reviewing_draft_move_onto_the_manifest_is_judged_by_the_draft() {
         overwrite: false,
         model: None,
         share_link: None,
+        expected_checksum: None,
     };
     let written = engine
         .write_engram_as(&draft, None, &user("out"))

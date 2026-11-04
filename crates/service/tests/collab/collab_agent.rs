@@ -923,6 +923,7 @@ async fn a_capture_titled_after_an_open_manifest_is_refused() {
             overwrite: true,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .expect_err("a capture never replaces the MANIFEST, open or not");
@@ -3191,6 +3192,7 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
                 overwrite: true,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             },
             None,
             &crystalline_service::Scope::Unrestricted,
@@ -3344,6 +3346,7 @@ fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams
         overwrite,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -3810,6 +3813,7 @@ async fn a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_noth
         overwrite: true,
         share_link: None,
         model: None,
+        expected_checksum: None,
     };
     let target = engine
         .live_write_target(
@@ -4219,9 +4223,10 @@ async fn a_stale_full_page_overwrite_while_the_room_is_open_is_refused() {
 }
 
 /// **Probe, Task 11, a recorded finding rather than a contract.** The same
-/// stale full-page write after the person closed the page. Nothing guards it:
-/// `write_engram` takes no checksum, so the old read replaces the file and
-/// the person's saved cell edit is reverted.
+/// stale full-page write after the person closed the page. Sent without
+/// `expected_checksum` it is last-write-wins: the old read replaces the file
+/// and the person's saved cell edit is reverted. The guarded twin below sends
+/// the token of that read and is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stale_full_page_overwrite_after_the_room_closed_reverts_the_saved_cell_edit() {
     let (tmp, engine, _scratch) = table_fixture().await;
@@ -4253,5 +4258,181 @@ async fn a_stale_full_page_overwrite_after_the_room_closed_reverts_the_saved_cel
     assert!(
         on_disk.contains("| 1 | 2Z |") && !on_disk.contains("1x"),
         "the old read replaced the person's saved edit: {on_disk:?}"
+    );
+}
+
+/// The guarded twin of the probe above: the agent sends the checksum of the
+/// read its full-page write was built from. The person's saved cell edit
+/// changed the file since, so the write is refused and the edit stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_full_page_overwrite_with_its_checksum_is_refused_after_the_room_closed() {
+    let (tmp, engine, _scratch) = table_fixture().await;
+    let token = read_checksum(&engine).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let typed = type_after_unsent(&doc, "| 1", "x");
+    joined
+        .session
+        .handle_frame(joined.conn, &frame_update(typed))
+        .await;
+    assert!(joined.session.remove_conn(joined.conn).await);
+    joined.session.final_save().await;
+    sessions.dispose_if_empty(&joined.session).await;
+    let path = tmp.path().join("eng/alpha.md");
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("| 1x | 2 |")
+    );
+
+    let mut call = stale_overwrite_alpha();
+    call["arguments"]["expected_checksum"] = json!(token);
+    let mut wire = Wire::to(engine.clone());
+    let answer = wire.open(modern(1, "tools/call", call)).await;
+    // The error a stale edit_engram gets, in the same words.
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("stale edit:") && message.contains("re-read"),
+        "{answer}"
+    );
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("| 1x | 2 |") && !on_disk.contains("2Z"),
+        "the saved cell edit stands: {on_disk:?}"
+    );
+}
+
+/// The checksum `read_engram` hands out for `alpha` in the base view: the
+/// live text's while a room is open over it, the file's otherwise.
+async fn read_checksum(engine: &Engine) -> String {
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+                ..ReadParams::default()
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    read["checksum"].as_str().unwrap().to_string()
+}
+
+/// A guarded wholesale overwrite of `alpha`, as the CLI or the control socket
+/// sends it: below the MCP layer, which refuses every overwrite of an open
+/// page before the engine sees it.
+fn guarded_overwrite(token: &str) -> WriteParams {
+    WriteParams {
+        path: None,
+        base64: None,
+        domain: "eng".to_string(),
+        title: "Alpha".to_string(),
+        content: Some(REPLACEMENT.to_string()),
+        folder: None,
+        engram_type: None,
+        tags: Vec::new(),
+        status: None,
+        metadata: None,
+        overwrite: true,
+        share_link: None,
+        model: None,
+        expected_checksum: Some(token.to_string()),
+    }
+}
+
+/// A person who types after a guarded overwrite was checked against the
+/// room's text, and before it composes, moves the text the token named. The
+/// compose is refused under the room's own lock and the write is a stale
+/// conflict: the typing stays and nothing of the replacement lands. A compose
+/// sent without the checked text as its base would write over the typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_between_a_guarded_overwrites_check_and_its_compose_refuses_it() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed before the read").await;
+    let token = read_checksum(&engine).await;
+
+    let (entered, release) = engine.hold_next_live_compose_until();
+    let writing = {
+        let engine = engine.clone();
+        let token = token.clone();
+        tokio::spawn(async move { engine.write_engram(&guarded_overwrite(&token)).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the write passed its check and reached the compose");
+    append_line(&joined, &doc, "typed inside the window").await;
+    release.notify_one();
+
+    let refused = writing
+        .await
+        .unwrap()
+        .expect_err("the text the token named moved");
+    assert!(
+        matches!(&refused, crystalline_service::engine::EngineError::Conflict(m)
+            if m.starts_with("stale edit:") && m.contains("re-read")),
+        "{refused:?}"
+    );
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.contains("typed inside the window") && !live.contains(REPLACEMENT),
+        "the room keeps the typing: {live:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "nothing reached the file"
+    );
+}
+
+/// An overwrite of a page open in the editor is checked against the text the
+/// room holds, which is what a read of it handed out: the token of the
+/// person's unsaved text lets the replacement compose into the room, and a
+/// token from before their latest typing is refused with the room untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guarded_overwrite_of_an_open_page_is_checked_against_the_live_text() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed before the read").await;
+    let token = read_checksum(&engine).await;
+    append_line(&joined, &doc, "typed after the read").await;
+
+    // The token is of text the room has moved past: refused, room untouched.
+    let refused = engine
+        .write_engram(&guarded_overwrite(&token))
+        .await
+        .expect_err("the room's text changed since the read");
+    assert!(
+        matches!(&refused, crystalline_service::engine::EngineError::Conflict(m) if m.contains("re-read")),
+        "{refused:?}"
+    );
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.contains("typed after the read") && !live.contains(REPLACEMENT),
+        "the room keeps the typing: {live:?}"
+    );
+
+    // A fresh read of the live text is current, so the replacement composes in.
+    let token = read_checksum(&engine).await;
+    let receipt = engine
+        .write_engram(&guarded_overwrite(&token))
+        .await
+        .expect("the token is the room's text");
+    assert_eq!(receipt["landed"].as_str(), Some("live"), "{receipt}");
+    resync(&joined, &doc).await;
+    assert!(client_text(&doc).contains(REPLACEMENT));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap(),
+        ALPHA,
+        "the file waits for the room's saver"
     );
 }

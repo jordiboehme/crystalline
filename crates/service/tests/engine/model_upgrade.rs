@@ -77,6 +77,7 @@ fn write(title: &str, content: &str) -> WriteParams {
         // has no Default, so a literal must name them.
         model: None,
         share_link: None,
+        expected_checksum: None,
     }
 }
 

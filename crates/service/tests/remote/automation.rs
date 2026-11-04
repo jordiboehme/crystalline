@@ -121,6 +121,7 @@ async fn only_the_lease_accounts_mcp_writes_are_noted() {
                 overwrite: false,
                 model: None,
                 share_link: None,
+                expected_checksum: None,
             },
             None,
             &keeper(),
