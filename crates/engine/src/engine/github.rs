@@ -1559,7 +1559,7 @@ pub const UNATTENDED_LINK: &str = "an unattended session cannot hand out a link 
 
 /// What a link is refused with when the GitHub App has no client secret, so
 /// the browser flow could not exchange GitHub's code.
-pub const NO_CLIENT_SECRET_TO_LINK: &str = "the GitHub App has no client secret, so the browser link cannot exchange GitHub's code; an admin adds it with: crystalline github app set --client-secret-file <file> (or sets CRYSTALLINE_GITHUB_APP_CLIENT_SECRET when the App comes from the environment)";
+pub const NO_CLIENT_SECRET_TO_LINK: &str = "the GitHub App has no client secret, so the browser link cannot exchange GitHub's code; an admin adds it with: crystalline github app set --app-id <id> --client-id <id> --private-key-file <file> --client-secret-file <file> (add --webhook-secret-file <file> when the App has a webhook secret, because set replaces the saved App), or sets CRYSTALLINE_GITHUB_APP_CLIENT_SECRET when the App comes from the environment";
 
 /// What a link is refused with when no GitHub App is configured.
 const NO_APP_TO_LINK: &str = "linking a GitHub account needs a GitHub App, and none is configured on this instance; an admin sets one up with: crystalline github app set";

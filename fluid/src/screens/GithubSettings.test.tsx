@@ -79,6 +79,8 @@ const APP = {
   app_id: 7,
   slug: "crystalline-kb",
   source: "keyring",
+  client_id: "Iv23.kb",
+  client_secret_set: true,
   install_url: "https://github.example/apps/crystalline-kb/installations/new",
   webhook_secret_set: true,
   error: null,
@@ -501,6 +503,127 @@ describe("the GitHub settings screen", () => {
     ).toBeInTheDocument();
   });
 
+  it("says the client secret is set", async () => {
+    serveAs("admin", {
+      "/settings/github": () => statusPayload({ app: APP }),
+    });
+    renderApp("/settings/github");
+
+    expect(await screen.findByText("Client secret: set")).toBeInTheDocument();
+    expect(screen.queryByText(/not set/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cannot link/i)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["keyring", true],
+    ["file", false],
+  ])(
+    "gives the command to run when a %s App has no client secret",
+    async (source, webhook) => {
+      serveAs("admin", {
+        "/settings/github": () =>
+          statusPayload({
+            app: {
+              ...APP,
+              source,
+              client_secret_set: false,
+              webhook_secret_set: webhook,
+            },
+          }),
+      });
+      renderApp("/settings/github");
+
+      expect(
+        await screen.findByText("Client secret: not set"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/people cannot link their github account/i),
+      ).toBeInTheDocument();
+      const command = screen.getByText(/crystalline github app set/);
+      expect(command.textContent).toContain("--app-id 7");
+      expect(command.textContent).toContain("--client-id Iv23.kb");
+      expect(command.textContent).toContain("--private-key-file <file>");
+      expect(command.textContent).toContain("--client-secret-file <file>");
+      expect(command.textContent?.includes("--webhook-secret-file")).toBe(
+        webhook,
+      );
+      expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/CRYSTALLINE_GITHUB_APP/)).toBeNull();
+    },
+  );
+
+  it("names the variables when an App from the environment has no client secret", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          app: { ...APP, source: "environment", client_secret_set: false },
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText("Client secret: not set"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Set CRYSTALLINE_GITHUB_APP_CLIENT_SECRET or\s+CRYSTALLINE_GITHUB_APP_CLIENT_SECRET_FILE on the server, then restart it\./,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/crystalline github app set/)).toBeNull();
+  });
+
+  it("gives only the first sentence when the source is not known", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          app: { ...APP, source: null, client_secret_set: false },
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText("Client secret: not set"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Without it, people cannot link their GitHub account."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/restart/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/crystalline github app set/)).toBeNull();
+  });
+
+  it("shows no client secret line while the App is loading", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          app: {
+            ...APP,
+            app_id: null,
+            source: null,
+            client_secret_set: false,
+            loading: true,
+          },
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(await screen.findByText("Reading the App")).toBeInTheDocument();
+    expect(screen.queryByText(/client secret/i)).not.toBeInTheDocument();
+  });
+
+  it("draws no client secret line for a non-admin", async () => {
+    serveAs("editor", {
+      "/settings/github": () =>
+        statusPayload({ app: { ...APP, client_secret_set: false } }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(/nothing is filed at this address/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/client secret/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cannot link/i)).not.toBeInTheDocument();
+  });
+
   it("offers no Create while a saved App is still loading", async () => {
     serveAs("admin", {
       "/settings/github": () =>
@@ -509,6 +632,8 @@ describe("the GitHub settings screen", () => {
             app_id: null,
             slug: null,
             source: null,
+            client_id: null,
+            client_secret_set: false,
             install_url: null,
             webhook_secret_set: false,
             error: null,

@@ -88,6 +88,12 @@ export interface GithubApp {
   slug: string | null;
   /** `keyring`, `file` or `environment`. */
   source: string | null;
+  /** The App's client id (not a secret), when the App could be read. */
+  clientId: string | null;
+  /** Whether the App has a client secret. Only whether, never the secret. */
+  clientSecretSet: boolean;
+  /** Whether the App has a webhook secret. Only whether. */
+  webhookSecretSet: boolean;
   /** Where an owner installs the App, when it is usable and its slug known. */
   installUrl: string | null;
   /** Why the App cannot be used, in the server's words. */
@@ -130,6 +136,9 @@ function readApp(value: unknown): GithubApp | null {
     appId: asNumber(record.app_id),
     slug: asString(record.slug),
     source: asString(record.source),
+    clientId: asString(record.client_id),
+    clientSecretSet: record.client_secret_set === true,
+    webhookSecretSet: record.webhook_secret_set === true,
     installUrl: asString(record.install_url),
     error: asString(record.error),
     loading: record.loading === true,

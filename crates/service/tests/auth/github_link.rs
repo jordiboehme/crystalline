@@ -840,7 +840,7 @@ async fn start_without_a_client_secret_is_409() {
         body["detail"]
             .as_str()
             .unwrap()
-            .contains("crystalline github app set --client-secret-file"),
+            .contains("crystalline github app set --app-id <id> --client-id <id> --private-key-file <file> --client-secret-file <file>"),
         "{body}"
     );
     assert_eq!(body["reason"], "no_client_secret", "{body}");
