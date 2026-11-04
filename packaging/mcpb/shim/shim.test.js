@@ -167,7 +167,7 @@ test("a pinned binary that is gone with nothing else found names the command", (
   assert.deepEqual(outcome, { kind: "gone", path: PINNED });
   for (const platform of ["darwin", "win32"]) {
     const gone = shim.notice(outcome, platform, "0.32.0");
-    const reason = `the Crystalline at ${PINNED} that this extension was built for is gone`;
+    const reason = `the Crystalline at ${PINNED} that this extension was built for cannot be found or does not start`;
     assert.equal(
       gone.instructions,
       `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to install Crystalline again, then run \`crystalline install claude-desktop\` in a terminal and confirm the dialog in Claude Desktop. Call the status tool for the full details to relay.`,

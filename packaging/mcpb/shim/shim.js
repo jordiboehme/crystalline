@@ -172,7 +172,7 @@ function notice(outcome, platform, extensionVersion) {
     instructions = `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to update it with ${update}, then restart Claude Desktop. Call the status tool for the full details to relay.`;
     fix = `Update Crystalline with ${update}, then restart Claude Desktop.`;
   } else if (outcome.kind === "gone") {
-    reason = `the Crystalline at ${outcome.path} that this extension was built for is gone`;
+    reason = `the Crystalline at ${outcome.path} that this extension was built for cannot be found or does not start`;
     instructions = `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to install Crystalline again, then run \`crystalline install claude-desktop\` in a terminal and confirm the dialog in Claude Desktop. Call the status tool for the full details to relay.`;
     fix = "Install Crystalline again, then run `crystalline install claude-desktop` and confirm the dialog in Claude Desktop.";
   } else if (mac) {
