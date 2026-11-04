@@ -16,6 +16,7 @@ pub mod control;
 pub mod daemon;
 pub mod daemon_task;
 pub mod desktop_state;
+pub mod desktop_update;
 mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;

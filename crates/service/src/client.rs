@@ -166,11 +166,6 @@ fn resolve_harness_gate_at(harness: Option<&str>, receipt: &Path) -> HarnessGate
 /// takeover after an upgrade, a crash): it reconnects, replays the MCP
 /// handshake and continues the session, so the harness never sees its stdio
 /// transport die just because the daemon was replaced.
-///
-/// `update_offered` says this Crystalline has offered the Claude Desktop
-/// extension update (the CLI decides that before it calls this), so a too old
-/// launcher's note asks the user to confirm the update dialog.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_mcp(
     embedded: bool,
     db: Option<&Path>,
@@ -179,7 +174,6 @@ pub async fn run_mcp(
     harness: Option<&str>,
     unattended: bool,
     run_domain: Option<&str>,
-    update_offered: bool,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
@@ -208,6 +202,17 @@ pub async fn run_mcp(
         );
     }
     let embedded = embedded && !packaged;
+
+    // A newer Crystalline under an older Claude Desktop extension offers the
+    // extension update, off the session's path (`desktop_update`). Outside
+    // a package this process does it on a thread of its own; inside one it
+    // asks the daemon once that is attached, below.
+    let older_extension = crate::desktop_update::older_extension();
+    if let Some(launcher) = &older_extension
+        && !packaged
+    {
+        crate::desktop_update::offer_on_thread(launcher.clone());
+    }
 
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
@@ -269,6 +274,9 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
+                let update_offered =
+                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged)
+                        .await;
                 return pump_stdio(
                     stream,
                     stdin,
@@ -341,9 +349,8 @@ pub const MINIMUM_LAUNCHER: (u32, u32, u32) = (0, 24, 0);
 /// that started it is older than [`MINIMUM_LAUNCHER`].
 const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to run `crystalline install claude-desktop` in a terminal, then confirm the install dialog in Claude Desktop.";
 
-/// The launcher note when this Crystalline has offered the extension update
-/// in Claude Desktop (the CLI does that when `install claude-desktop` once
-/// built the extension, see `desktop_update.rs` in the CLI crate).
+/// The launcher note when this Crystalline's extension update was offered
+/// in Claude Desktop and Claude Desktop took it (`desktop_update`).
 const LAUNCHER_OFFERED_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Crystalline offered the extension update in Claude Desktop. Ask the user to confirm the update dialog there. If no dialog shows, ask them to run `crystalline install claude-desktop` in a terminal.";
 
 /// The numeric triple of a launcher version such as `0.25.1` or
@@ -2879,10 +2886,8 @@ async fn ctl_exchange(conn: Connection, cmd: Value) -> anyhow::Result<Value> {
 }
 
 /// The `crystalline mcp` client's log: stderr only, since stdout is the MCP
-/// stdio stream, filtered by RUST_LOG with a default of `warn`. A second
-/// call keeps the first subscriber, so a caller that logs before
-/// [`run_mcp`] can call it first.
-pub fn init_tracing() {
+/// stdio stream, filtered by RUST_LOG with a default of `warn`.
+fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

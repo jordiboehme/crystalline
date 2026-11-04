@@ -919,6 +919,16 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
             (envelope_ok(json!({ "stamped": true })), false)
         }
+        // The Claude Desktop extension update for a bridge inside Claude
+        // Desktop's app package, which may not write the build or the record
+        // under AppData itself (`desktop_update`). Answers at once; the offer
+        // runs on a thread of its own.
+        crate::desktop_update::DESKTOP_OFFER_COMMAND => {
+            match crate::desktop_update::answer_ctl(req) {
+                Ok(data) => (envelope_ok(data), false),
+                Err(msg) => (envelope_err(msg), false),
+            }
+        }
         // The configuration `prompt system` builds its routing block from,
         // for a CLI inside Claude Desktop's app package: its own read of the
         // config file can open the package's private copy (issue 153).

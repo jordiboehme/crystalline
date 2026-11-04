@@ -1,7 +1,8 @@
 //! Hand a file to Claude Desktop, or show it in the file manager.
 //!
 //! `install claude-desktop` opens the extension it built here, so Claude
-//! Desktop shows its install dialog. Nothing in this module prints: a caller
+//! Desktop shows its install dialog, and a newer Crystalline opens its
+//! update the same way (`desktop_offer`). Nothing in this module prints: a caller
 //! gets the error text and says what to do instead.
 //!
 //! Debug builds read a test seam, [`TEST_DESKTOP_OPEN_ENV`], so tests never
@@ -9,43 +10,35 @@
 //! runs `install claude-desktop` without `--no-open` must be compiled only
 //! into debug builds (`#[cfg(debug_assertions)]`, as `tests/setup/main.rs`
 //! does for its `install_desktop` module), or `cargo test --release` would
-//! open the real app. The unit tests below never reach the real open: they
-//! run `/bin/sh` in its place.
+//! open the real app. The same holds for a test that starts a bridge or a
+//! daemon which may offer the extension update. The unit tests below never
+//! reach the real open: they run `/bin/sh` in its place.
 
 use std::path::Path;
 
 /// The debug build's stand-in for the real open. `fail` refuses every call,
 /// `log:<file>` appends one line per call to `<file>` and succeeds, and
 /// `hold:<file>` writes `<file>.held` and then does the same once
-/// `<file>.go` exists (it gives up after [`HOLD_LIMIT`]), so a test can
-/// hold an open and watch what else goes on. Empty or unset is the real open.
+/// `<file>.go` exists (it gives up after a minute), so a test can
+/// hold an open and watch what else goes on. `refuse:<file>` appends the
+/// line too and then refuses, so a test sees when a refused open happened.
+/// Empty or unset is the real open.
 ///
 /// Only a debug build reads it. A test that relies on it must be compiled
 /// only into debug builds, or a release test run opens Claude Desktop.
-#[cfg_attr(
-    not(any(debug_assertions, test)),
-    expect(dead_code, reason = "only a debug build reads the seam")
-)]
-pub(crate) const TEST_DESKTOP_OPEN_ENV: &str = "CRYSTALLINE_TEST_DESKTOP_OPEN";
+pub const TEST_DESKTOP_OPEN_ENV: &str = "CRYSTALLINE_TEST_DESKTOP_OPEN";
 
 /// Opens files the way this machine does.
-pub(crate) trait DesktopOpener {
+pub trait DesktopOpener {
     /// Open `file` with Claude Desktop.
     fn open_extension(&self, file: &Path) -> Result<(), String>;
     /// Show `file` in Finder or File Explorer.
-    #[cfg_attr(
-        not(all(test, debug_assertions)),
-        expect(
-            dead_code,
-            reason = "the skill step that reveals its zip is not written yet"
-        )
-    )]
     fn reveal(&self, file: &Path) -> Result<(), String>;
 }
 
 /// The opener this process uses: in a debug build the test seam when it is
 /// set, else the real one.
-pub(crate) fn for_this_process() -> Box<dyn DesktopOpener> {
+pub fn for_this_process() -> Box<dyn DesktopOpener> {
     #[cfg(debug_assertions)]
     if let Some(seam) = std::env::var(TEST_DESKTOP_OPEN_ENV)
         .ok()
@@ -63,6 +56,7 @@ enum Seam {
     Fail,
     Log(std::path::PathBuf),
     Hold(std::path::PathBuf),
+    Refuse(std::path::PathBuf),
     Unknown(String),
 }
 
@@ -83,6 +77,8 @@ impl Seam {
             Seam::Log(file.into())
         } else if let Some(file) = value.strip_prefix("hold:") {
             Seam::Hold(file.into())
+        } else if let Some(file) = value.strip_prefix("refuse:") {
+            Seam::Refuse(file.into())
         } else {
             Seam::Unknown(value.to_string())
         })
@@ -114,6 +110,10 @@ impl Seam {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 Seam::Log(log.clone()).call(verb, file)
+            }
+            Seam::Refuse(log) => {
+                Seam::Log(log.clone()).call(verb, file)?;
+                Seam::Fail.call(verb, file)
             }
             Seam::Unknown(value) => Err(format!("unknown {TEST_DESKTOP_OPEN_ENV} value '{value}'")),
         }
@@ -302,6 +302,10 @@ mod tests {
             Seam::parse("hold:/tmp/open.log"),
             Some(Seam::Hold("/tmp/open.log".into()))
         );
+        assert_eq!(
+            Seam::parse("refuse:/tmp/open.log"),
+            Some(Seam::Refuse("/tmp/open.log".into()))
+        );
         assert_eq!(Seam::parse(""), None, "empty is the real opener");
         assert_eq!(Seam::parse("yes"), Some(Seam::Unknown("yes".to_string())));
     }
@@ -351,6 +355,15 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             format!("open {0}\nreveal {0}\n", file.display())
+        );
+        let refused = dir.path().join("refused.log");
+        assert_eq!(
+            Seam::Refuse(refused.clone()).open_extension(file),
+            Err("the test seam refused it".to_string())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&refused).unwrap(),
+            format!("open {}\n", file.display())
         );
         assert_eq!(
             Seam::Unknown("yes".to_string()).open_extension(file),

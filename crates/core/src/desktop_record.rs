@@ -4,8 +4,8 @@
 //! Crystalline cannot see what Claude Desktop has installed, so this record
 //! is all it knows: the extension it built (version, pinned binary, launcher
 //! hash, file, time, whether it was opened), the skill zip it saved and the
-//! version last offered to Claude Desktop.
-//! `doctor` and `uninstall` read it back.
+//! version last offered to Claude Desktop. `doctor` and `uninstall` read it
+//! back, and the extension update (`desktop_offer`) keeps it current.
 //!
 //! It is a file of its own, not a row in the install receipt
 //! (`installs.json`), because an older binary rewriting the receipt would
@@ -17,14 +17,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crystalline_core::config;
+use crate::config;
 
 /// The record format this binary writes.
-pub(crate) const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 1;
 
 /// The whole record file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DesktopRecord {
+pub struct DesktopRecord {
     /// Always [`FORMAT`] when written by this binary.
     pub format: u32,
     /// The extension built last, if any.
@@ -54,7 +54,7 @@ impl Default for DesktopRecord {
 
 /// The extension a run built.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ExtensionRecord {
+pub struct ExtensionRecord {
     /// The Crystalline version the extension was built for.
     pub version: String,
     /// The binary path pinned in its manifest.
@@ -71,7 +71,7 @@ pub(crate) struct ExtensionRecord {
 
 /// The skill zip a run saved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SkillRecord {
+pub struct SkillRecord {
     /// The skill's name.
     pub name: String,
     /// The sha256 of its `SKILL.md` text.
@@ -83,12 +83,12 @@ pub(crate) struct SkillRecord {
 }
 
 /// The record's location, `<state_dir>/claude-desktop.json`.
-pub(crate) fn record_path() -> anyhow::Result<PathBuf> {
+pub fn record_path() -> anyhow::Result<PathBuf> {
     Ok(config::state_dir()?.join("claude-desktop.json"))
 }
 
 /// Where the built extension goes, `<state_dir>/claude-desktop/crystalline.mcpb`.
-pub(crate) fn bundle_path() -> anyhow::Result<PathBuf> {
+pub fn bundle_path() -> anyhow::Result<PathBuf> {
     Ok(config::state_dir()?
         .join("claude-desktop")
         .join("crystalline.mcpb"))
@@ -98,7 +98,7 @@ pub(crate) fn bundle_path() -> anyhow::Result<PathBuf> {
 /// or an unknown format is an error the caller treats as no record. The
 /// error is the reason only, without the path, so a caller can put it in a
 /// sentence that names the path itself.
-pub(crate) fn load(path: &Path) -> anyhow::Result<Option<DesktopRecord>> {
+pub fn load(path: &Path) -> anyhow::Result<Option<DesktopRecord>> {
     let bytes = match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => anyhow::bail!("{e}"),
@@ -118,7 +118,7 @@ pub(crate) fn load(path: &Path) -> anyhow::Result<Option<DesktopRecord>> {
 /// Write the record to `<path>.partial`, then rename it over `path`, so a
 /// reader never sees half a file. Pretty JSON with a trailing newline.
 /// The error is the plain I/O error, without the path.
-pub(crate) fn save(path: &Path, record: &DesktopRecord) -> std::io::Result<()> {
+pub fn save(path: &Path, record: &DesktopRecord) -> std::io::Result<()> {
     let mut text = serde_json::to_string_pretty(record).map_err(std::io::Error::other)?;
     text.push('\n');
     write_replacing(path, text.as_bytes())
@@ -128,7 +128,7 @@ pub(crate) fn save(path: &Path, record: &DesktopRecord) -> std::io::Result<()> {
 /// parent folder first. When the write or the rename fails, the partial
 /// file is removed again; the error is the plain I/O error, without the
 /// path.
-pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

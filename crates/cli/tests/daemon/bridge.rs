@@ -531,3 +531,147 @@ fn an_old_launcher_is_named_in_the_discover_instructions() {
     let current = launcher_instructions("0.25.1", discover());
     assert!(!current.contains(LAUNCHER_NOTE), "{current}");
 }
+
+/// The Claude Desktop extension update for a bridge inside Claude Desktop's
+/// app package: the bridge writes nothing and asks the daemon (started
+/// through the `serve` task seam, outside the package) to offer it. The
+/// open goes through the debug build's seam, so these run in debug builds
+/// on macOS and Windows only.
+#[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
+mod desktop_offer {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{Value, json};
+
+    use super::{Bridge, LAUNCHER_NOTE, initialize, short_home, stop_daemon};
+
+    const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    /// The launcher note once the update to this version was offered.
+    const OFFERED_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Crystalline offered the extension update in Claude Desktop. Ask the user to confirm the update dialog there. If no dialog shows, ask them to run `crystalline install claude-desktop` in a terminal.";
+
+    const OLD_BUNDLE: &str = "the extension an older Crystalline built";
+
+    fn state(home: &Path) -> PathBuf {
+        crate::common::isolated_state_dir(home)
+    }
+
+    fn bundle(home: &Path) -> PathBuf {
+        state(home).join("claude-desktop").join("crystalline.mcpb")
+    }
+
+    fn record_file(home: &Path) -> PathBuf {
+        state(home).join("claude-desktop.json")
+    }
+
+    /// A record of an extension an older Crystalline built, and its file.
+    fn plant(home: &Path) {
+        let bundle = bundle(home);
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::write(&bundle, OLD_BUNDLE).unwrap();
+        let record = json!({
+            "format": 1,
+            "extension": {
+                "version": "0.1.0",
+                "binary": "/nowhere/crystalline",
+                "shim_sha256": "ab".repeat(32),
+                "file": bundle.display().to_string(),
+                "built_at": "2026-01-01T00:00:00Z",
+                "opened": true,
+            },
+            "offered": "0.1.0",
+        });
+        std::fs::write(record_file(home), format!("{record:#}\n")).unwrap();
+    }
+
+    fn record(home: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(record_file(home)).unwrap()).unwrap()
+    }
+
+    fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !check() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The instructions a packaged bridge with an old launcher and the open
+    /// seam `seam` answers `initialize` with.
+    fn instructions(home: &Path, seam: &str) -> String {
+        let mut bridge = Bridge::start_with(
+            home,
+            "serve",
+            &[
+                ("CRYSTALLINE_LAUNCHER_VERSION", "0.1.0"),
+                ("CRYSTALLINE_TEST_DESKTOP_OPEN", seam),
+            ],
+        );
+        let answer = bridge.ask(initialize());
+        bridge.finish();
+        answer["result"]["instructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no instructions: {answer}"))
+            .to_string()
+    }
+
+    #[test]
+    fn a_packaged_bridge_has_the_daemon_offer_the_update_once() {
+        let home = short_home();
+        plant(home.path());
+        let log = home.path().join("open.log");
+        let seam = format!("log:{}", log.display());
+
+        let first = instructions(home.path(), &seam);
+        assert!(
+            first.ends_with(&format!("\n\n{LAUNCHER_NOTE}")),
+            "an offer still in flight is not called offered: {first}"
+        );
+        wait_until("the offered version in the record", || {
+            record(home.path())["offered"] == VERSION
+        });
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("open {}\n", bundle(home.path()).display()),
+            "the daemon opened the rebuilt extension"
+        );
+        assert_eq!(record(home.path())["extension"]["version"], VERSION);
+
+        let second = instructions(home.path(), &seam);
+        stop_daemon(home.path());
+        assert!(second.ends_with(&format!("\n\n{OFFERED_NOTE}")), "{second}");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "the second start offers nothing"
+        );
+    }
+
+    #[test]
+    fn a_failed_open_in_the_daemon_keeps_the_record_and_the_note() {
+        let home = short_home();
+        plant(home.path());
+        let before = std::fs::read(record_file(home.path())).unwrap();
+
+        // The daemon logs to nothing here, so the seam says when it refused.
+        let refused = home.path().join("refused.log");
+        let seam = format!("refuse:{}", refused.display());
+        let first = instructions(home.path(), &seam);
+        assert!(first.ends_with(&format!("\n\n{LAUNCHER_NOTE}")), "{first}");
+        wait_until("the refused open", || refused.exists());
+        wait_until("the old bundle back in its place", || {
+            std::fs::read_to_string(bundle(home.path())).is_ok_and(|text| text == OLD_BUNDLE)
+        });
+        let aside = bundle(home.path()).with_extension("mcpb.previous");
+        assert!(!aside.exists(), "nothing is left aside");
+        assert_eq!(std::fs::read(record_file(home.path())).unwrap(), before);
+
+        let second = instructions(home.path(), &seam);
+        stop_daemon(home.path());
+        assert!(
+            second.ends_with(&format!("\n\n{LAUNCHER_NOTE}")) && !second.contains(OFFERED_NOTE),
+            "a failed open is never called offered: {second}"
+        );
+    }
+}

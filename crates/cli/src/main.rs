@@ -18,10 +18,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 mod automation;
 mod cmd;
 mod desktop_bundle;
-mod desktop_open;
-mod desktop_record;
 mod desktop_state;
-mod desktop_update;
 mod doctor;
 mod harness_command;
 mod harness_files;
@@ -5119,10 +5116,6 @@ async fn mcp_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    // The bridge's log is up before the extension update logs anything.
-    crystalline_service::client::init_tracing();
-    // Decided here and done on a thread of its own: the session never waits.
-    let update_offered = desktop_update::offer_in_background();
     crystalline_service::run_mcp(
         embedded,
         db.as_deref(),
@@ -5131,7 +5124,6 @@ async fn mcp_dispatch(
         harness.as_deref(),
         unattended,
         domain.as_deref(),
-        update_offered,
     )
     .await
 }

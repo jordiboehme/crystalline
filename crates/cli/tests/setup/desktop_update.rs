@@ -7,7 +7,9 @@
 //! `CRYSTALLINE_LAUNCHER_VERSION`). The open goes through the debug build's
 //! seam (`CRYSTALLINE_TEST_DESKTOP_OPEN`), so no test opens Claude Desktop.
 //! The decision matrix (older, same and newer launcher, record or none,
-//! offered already) is unit tested in `src/desktop_update.rs`.
+//! offered already) is unit tested in `crystalline_core::desktop_offer` and
+//! the service's `desktop_update`; the daemon route a packaged bridge takes
+//! is tested in `tests/daemon/bridge.rs`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +30,15 @@ const FAILED: &str = "could not offer the Claude Desktop extension update to Cry
 
 /// The line an info log shows when this version was offered already.
 const OFFERED_ALREADY: &str = "was offered already";
+
+/// The line an info log shows when another offer holds the lock.
+const BUSY: &str = "another Crystalline is offering the Claude Desktop extension update";
+
+/// The `RUST_LOG` that shows the bridge's info lines about the offer.
+const INFO: &str = "crystalline_service=info";
+
+/// What the planted extension file holds, the one a failed offer puts back.
+const OLD_BUNDLE: &str = "the extension an older Crystalline built";
 
 const BINARY_NAME: &str = if cfg!(windows) {
     "crystalline.exe"
@@ -65,7 +76,8 @@ impl Setup {
             },
             "offered": OLD_LAUNCHER,
         });
-        std::fs::create_dir_all(s.state()).unwrap();
+        std::fs::create_dir_all(s.bundle().parent().unwrap()).unwrap();
+        std::fs::write(s.bundle(), OLD_BUNDLE).unwrap();
         std::fs::write(s.record_file(), format!("{record:#}\n")).unwrap();
         s
     }
@@ -84,6 +96,17 @@ impl Setup {
 
     fn record_file(&self) -> PathBuf {
         self.state().join("claude-desktop.json")
+    }
+
+    /// The old bundle is back and nothing a failed offer wrote is left.
+    fn assert_old_bundle_kept(&self) {
+        assert_eq!(std::fs::read_to_string(self.bundle()).unwrap(), OLD_BUNDLE);
+        let folder: Vec<String> = std::fs::read_dir(self.bundle().parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "crystalline.mcpb.partial")
+            .collect();
+        assert_eq!(folder, vec!["crystalline.mcpb".to_string()]);
     }
 
     fn record(&self) -> Value {
@@ -264,7 +287,7 @@ fn a_newer_bridge_offers_the_extension_update_once_per_version() {
     assert_eq!(ext["binary"], s.pinned().display().to_string());
 
     // A second start at the same version offers nothing.
-    let mut second = s.bridge(&log_seam(&s), Some("crystalline=info"));
+    let mut second = s.bridge(&log_seam(&s), Some(INFO));
     assert!(second.initialize()["result"].is_object());
     second.wait_for_log(OFFERED_ALREADY);
     second.finish();
@@ -316,14 +339,16 @@ fn a_failed_open_logs_one_line_and_changes_no_record() {
         "{errors}"
     );
     assert_eq!(std::fs::read(s.record_file()).unwrap(), before);
+    s.assert_old_bundle_kept();
 }
 
 #[test]
 fn a_failed_build_logs_one_line_and_changes_no_record() {
     let s = Setup::new();
     let before = std::fs::read(s.record_file()).unwrap();
-    // A file where the extension's folder goes: the build cannot write.
-    std::fs::write(s.state().join("claude-desktop"), "in the way").unwrap();
+    // A folder where the build writes its partial file: the write fails.
+    let partial = s.bundle().with_extension("mcpb.partial");
+    std::fs::create_dir_all(partial.join("in-the-way")).unwrap();
     let mut bridge = s.bridge(&log_seam(&s), None);
     assert!(bridge.initialize()["result"].is_object());
     bridge.wait_for_log(FAILED);
@@ -335,4 +360,26 @@ fn a_failed_build_logs_one_line_and_changes_no_record() {
     );
     assert_eq!(std::fs::read(s.record_file()).unwrap(), before);
     assert!(!s.open_log().exists(), "a failed build opens nothing");
+    s.assert_old_bundle_kept();
+}
+
+#[test]
+fn a_held_offer_lock_makes_a_second_bridge_do_nothing() {
+    let s = Setup::new();
+    let before = std::fs::read(s.record_file()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(s.state().join("claude-desktop.offer.lock"))
+        .unwrap();
+    lock.try_lock().expect("this test holds the offer lock");
+    let mut bridge = s.bridge(&log_seam(&s), Some(INFO));
+    assert!(bridge.initialize()["result"].is_object());
+    bridge.wait_for_log(BUSY);
+    bridge.finish();
+    drop(lock);
+    assert!(!s.open_log().exists(), "the second offer opened nothing");
+    assert_eq!(std::fs::read(s.record_file()).unwrap(), before);
+    s.assert_old_bundle_kept();
 }

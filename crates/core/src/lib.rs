@@ -22,6 +22,9 @@ pub mod base;
 pub mod config;
 pub mod conventional;
 pub mod desktop_extension;
+pub mod desktop_offer;
+pub mod desktop_open;
+pub mod desktop_record;
 pub mod emit;
 pub mod engram;
 pub mod folders;
@@ -42,6 +45,7 @@ pub mod markdown;
 pub mod names;
 pub mod parse;
 pub mod path;
+pub mod program;
 pub mod prompt;
 pub mod provision;
 pub mod reflection;
@@ -56,6 +60,7 @@ pub mod text;
 pub mod threads;
 pub mod tree;
 pub mod verify;
+pub mod version;
 pub mod yaml;
 
 pub use address::{
