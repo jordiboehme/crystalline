@@ -680,7 +680,7 @@ fn instructions_head(output: &PromptOutput) -> String {
 /// hook block ([`render_text`]) and [`behavior_bullets`] leave it out: that
 /// harness has the skills as files.
 pub const SKILLS_HINT: &str =
-    "Before your first Crystalline task, call skills: no arguments lists them, name reads one.";
+    "Before your first Crystalline task, call the skills tool: no arguments lists them, name reads one.";
 
 /// The single line that stands in for the domain list: how many are
 /// registered, and the one call that returns them. One writer, so
@@ -1449,7 +1449,7 @@ mod tests {
     /// pointers do not: a harness with a session hook has the skills as files.
     #[test]
     fn the_instructions_point_at_the_skills_tool() {
-        const HINT: &str = "Before your first Crystalline task, call skills: no arguments lists them, name reads one.";
+        const HINT: &str = "Before your first Crystalline task, call the skills tool: no arguments lists them, name reads one.";
         assert_eq!(SKILLS_HINT, HINT);
 
         let (tmp, global) = fixture();
