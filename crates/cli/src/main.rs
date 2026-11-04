@@ -195,7 +195,9 @@ enum Command {
     /// as already present. Static like `verify` and `prompt`: no database,
     /// service or network connection. A missing or failing harness CLI is
     /// never fatal - the MCP command to run by hand is printed and the hooks
-    /// and skills still install.
+    /// and skills still install. `claude-desktop` is different: it builds the
+    /// Claude Desktop extension on this machine, opens it in Claude Desktop
+    /// and saves the skill zip to upload there (macOS and Windows only).
     Install {
         /// Which harness to wire up.
         #[arg(value_enum)]
@@ -226,7 +228,9 @@ enum Command {
     /// Reverse `crystalline install` for a harness: deregister the MCP server,
     /// remove the managed hooks and drop the copied skills, leaving every
     /// hook, key and skill that is not Crystalline's own untouched. A skill a
-    /// person edited by hand is kept unless `--force` is given.
+    /// person edited by hand is kept unless `--force` is given. For
+    /// `claude-desktop` it removes the built extension and Crystalline's
+    /// record of it; remove the extension itself in Claude Desktop.
     Uninstall {
         /// Which harness to unwire.
         #[arg(value_enum)]
