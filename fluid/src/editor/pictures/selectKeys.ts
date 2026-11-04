@@ -8,8 +8,9 @@
  * - Backspace from its end and Delete from its start select it; either key
  *   on a selected picture removes it (`removePicture`), with its line when
  *   it stands alone on one.
- * - Enter on a selected picture adds one line break after it and keeps it;
- *   Escape puts the caret after it. Typing over it replaces it, as over any
+ * - Enter on a selected picture is Escape then Enter: the caret after it,
+ *   then the editor's own Enter (a list item continues); Escape alone puts
+ *   the caret after it. Typing over it replaces it, as over any
  *   selection.
  * - A cut of a selected picture writes its reference text, the source
  *   bytes, as `text/plain` and removes it the way the keys do. Part 2's copy
@@ -28,10 +29,9 @@
 import type { EditorState, Extension } from "@codemirror/state";
 import { EditorSelection, Prec } from "@codemirror/state";
 import type { Command } from "@codemirror/view";
-import { EditorView, keymap } from "@codemirror/view";
+import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
 
 import { writable } from "../elementEdit";
-import { dispatchGesture } from "../gesture";
 import { runAt } from "../marks/hiddenMarks";
 import { pictureForKeys, pictureKeysOn, picturesDrawn } from "../marks/mode";
 import type { PictureRef } from "./refs";
@@ -104,13 +104,11 @@ function arrow(forward: boolean): Command {
 
 function deletion(forward: boolean): Command {
   return (view) => {
-    if (!writable(view.state)) {
-      return false;
-    }
     const ref = chosen(view.state);
     if (ref !== null) {
       // One in from its start, so a picture that ends where this one begins
-      // is not the one removed. A refusal says why on its own.
+      // is not the one removed. A refusal (also on a page that is not
+      // writable, `removePicture`'s own check) says why on its own.
       removePicture(view, ref.from + 1);
       return true;
     }
@@ -123,20 +121,29 @@ function deletion(forward: boolean): Command {
   };
 }
 
-/** Enter on a selected picture: one line break after it, the picture kept. */
+/**
+ * Enter on a selected picture: Escape, then Enter (P30). The caret goes
+ * after the picture and the Enter key runs again from there through every
+ * keymap, so a list item or a quote continues as it does from a caret, and
+ * the picture is kept.
+ */
 const enter: Command = (view) => {
   const { state } = view;
   const ref = chosen(state);
   if (ref === null || !writable(state)) {
     return false;
   }
-  const insert = state.lineBreak;
-  dispatchGesture(view, {
-    changes: { from: ref.to, insert },
-    selection: EditorSelection.cursor(ref.to + insert.length),
-    userEvent: "input",
-    scrollIntoView: true,
-  });
+  caretAt(view, ref.to);
+  runScopeHandlers(
+    view,
+    new KeyboardEvent("keydown", {
+      key: "Enter",
+      keyCode: 13,
+      bubbles: true,
+      cancelable: true,
+    }),
+    "editor",
+  );
   return true;
 };
 
@@ -153,8 +160,9 @@ const escape: Command = (view) => {
 /**
  * A cut of a selected picture. At the default precedence and after Part 2's
  * copy layer in the configuration, so that layer has read the selection for
- * its HTML before this removes it; the event is prevented, which is what
- * lets that layer add the HTML (P9). The removal is `removePicture`, judged
+ * its HTML before this removes it; CodeMirror prevents the event for a
+ * handler that answers true, which is what lets that layer add the HTML
+ * (P9). The removal is `removePicture`, judged
  * as any delete (D12, P7). On a page that is not writable it is the
  * editor's: a copy and nothing removed.
  */
@@ -166,7 +174,6 @@ const cut = EditorView.domEventHandlers({
     if (ref === null || data === null || !writable(state)) {
       return false;
     }
-    event.preventDefault();
     data.clearData();
     data.setData("text/plain", state.sliceDoc(ref.from, ref.to));
     removePicture(view, ref.from + 1);

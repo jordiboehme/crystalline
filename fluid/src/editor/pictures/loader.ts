@@ -116,7 +116,14 @@ export function pictureToolsWith(
       }
 
       check(): void {
-        if (!this.asked && hasImage(this.view.state)) this.ask();
+        if (this.asked) return;
+        if (loaded !== null) {
+          // The compartment already holds the tools (a view built after the
+          // load, mostly after the mount prefetch): nothing to ask, no walk.
+          this.asked = true;
+          return;
+        }
+        if (hasImage(this.view.state)) this.ask();
       }
 
       ask(): void {

@@ -456,25 +456,24 @@ describe("a deletion that covers a whole drawn picture next to a mark", () => {
   it.each(DOCS)(
     "judges every range of %s as without the picture layer",
     (doc) => {
-      const views = [imagePreviews("eng"), []].map((images) =>
-        markView(doc, { images }),
+      // The checks are transaction filters: each range is judged on the two
+      // start states, with no view and no `setState` per range.
+      const starts = [imagePreviews("eng"), []].map(
+        (images) => markView(doc, { images }).state,
       );
-      const starts = views.map((view) => view.state);
       const differ: string[] = [];
       for (let from = 0; from < doc.length; from += 1) {
         for (let to = from + 1; to <= doc.length; to += 1) {
           for (const userEvent of ["delete.selection", "delete.cut"]) {
-            const [drawnBytes, plainBytes] = views.map((view, i) => {
-              const start = starts[i];
-              if (!start) throw new Error("no start state");
-              view.setState(start);
-              view.dispatch({
-                changes: { from, to },
-                selection: { anchor: from },
-                userEvent,
-              });
-              return bytes(view.state);
-            });
+            const [drawnBytes, plainBytes] = starts.map((start) =>
+              bytes(
+                start.update({
+                  changes: { from, to },
+                  selection: { anchor: from },
+                  userEvent,
+                }).state,
+              ),
+            );
             if (drawnBytes !== plainBytes) {
               differ.push(`${String(from)}-${String(to)} ${userEvent}`);
             }
@@ -483,8 +482,5 @@ describe("a deletion that covers a whole drawn picture next to a mark", () => {
       }
       expect(differ).toEqual([]);
     },
-    // Every range of the document, twice over: seconds of work that a full
-    // parallel run can push past the default 5 s.
-    30_000,
   );
 });

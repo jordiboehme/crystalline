@@ -5,9 +5,11 @@
  * drawn and selectable by a press, with no keys.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import { Tree } from "@lezer/common";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState, parsedView } from "../../test/parse";
@@ -166,5 +168,49 @@ describe("pictureToolsWith", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("loads when only a later parse step reveals an image", () => {
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const loader = pictureToolsWith(load);
+    const doc = `${"Paragraph with **bold** text.\n\n".repeat(5000)}![x](assets/p.png)`;
+    // A clock that jumps at every look stops the first parse short, as a
+    // busy page does (the technique of marks/parse.test.ts).
+    let ahead = 0;
+    const base = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1e6;
+      return base + ahead;
+    });
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        extensions: [...baseExtensions(false), loader.extension()],
+      }),
+      parent: document.body,
+    });
+    clock.mockRestore();
+    views.push(view);
+    expect(syntaxTree(view.state).length).toBeLessThan(doc.length / 2);
+    expect(load).not.toHaveBeenCalled();
+    // Only the tree moves on: no change of the text or the viewport.
+    parsedView(view);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it("walks no tree once the tools are in", async () => {
+    const loader = pictureToolsWith(() => Promise.resolve(chunk()));
+    await loader.prefetch();
+    const walks = (extensions: Extension[]) => {
+      const view = mount("plain text", extensions);
+      const spy = vi.spyOn(Tree.prototype, "iterate");
+      for (let i = 0; i < 5; i += 1) {
+        view.dispatch({ changes: { from: 0, insert: "x" } });
+      }
+      const count = spy.mock.calls.length;
+      spy.mockRestore();
+      return count;
+    };
+    expect(walks([loader.extension()])).toBe(walks([]));
   });
 });

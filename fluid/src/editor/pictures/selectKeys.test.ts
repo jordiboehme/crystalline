@@ -34,6 +34,7 @@ import { pictureForKeys, pictureKeysOn, picturesDrawn } from "../marks/mode";
 import { baseExtensions } from "../setup";
 import { parsedState } from "../../test/parse";
 import { prefetchPictureTools } from "./loader";
+import { movePicture } from "./verbs";
 
 beforeAll(async () => {
   await prefetchPictureTools();
@@ -46,8 +47,24 @@ const ALONE = "a\n\n![x](assets/p.png)\n\nb";
 
 /** Where each document's picture stands, and what removing it leaves. */
 const CASES = [
-  { name: "inside a sentence", doc: INLINE, from: 2, to: 20, removed: "a  b" },
-  { name: "alone on its line", doc: ALONE, from: 3, to: 21, removed: "a\n\nb" },
+  {
+    name: "inside a sentence",
+    doc: INLINE,
+    from: 2,
+    to: 20,
+    removed: "a  b",
+    // The editor's Enter after the picture: the space it would leave at
+    // the start of the new line goes (P30).
+    entered: "a ![x](assets/p.png)\nb",
+  },
+  {
+    name: "alone on its line",
+    doc: ALONE,
+    from: 3,
+    to: 21,
+    removed: "a\n\nb",
+    entered: "a\n\n![x](assets/p.png)\n\n\nb",
+  },
 ] as const;
 
 type Mode = "hidden" | "show";
@@ -103,7 +120,7 @@ function select(view: EditorView, from: number, to: number): void {
 describe.each(SETUPS)(
   "the keys around a picture (%s mode, %s)",
   (mode, where) => {
-    describe.each(CASES)("$name", ({ doc, from, to, removed }) => {
+    describe.each(CASES)("$name", ({ doc, from, to, removed, entered }) => {
       it("ArrowRight at its start selects it, and the next one goes past it", () => {
         const { view } = build(doc, mode, where);
         setCaret(view, from);
@@ -162,7 +179,7 @@ describe.each(SETUPS)(
         const { view } = built;
         select(view, from, to);
         expect(keys(view, "Enter")).toBe(true);
-        const after = `${doc.slice(0, to)}\n${doc.slice(to)}`;
+        const after = entered;
         expect(bytes(view.state)).toBe(after);
         expect(selection(view)).toEqual([to + 1, to + 1]);
         expect(built.other()).toBe(after);
@@ -397,5 +414,107 @@ describe("pictureForKeys", () => {
     expect(pictureForKeys(on, 20, false)).toMatchObject({ from: 2, to: 20 });
     expect(pictureForKeys(on, 20, true)).toBeNull();
     expect(pictureForKeys(on, 2, false)).toBeNull();
+  });
+});
+
+describe.each(SETUPS)(
+  "a picture that is a pair's only content goes with its pair (P29, %s mode, %s)",
+  (mode, where) => {
+    const P = "![x](assets/p.png)";
+    const CASES29 = [
+      { doc: `a **${P}** b`, after: "a  b" },
+      { doc: `a ~~${P}~~ b`, after: "a  b" },
+      { doc: `a *${P}* b`, after: "a  b" },
+      { doc: `a ***${P}*** b`, after: "a  b" },
+      { doc: `a\n\n**${P}**\n\nb`, after: "a\n\nb" },
+      // Not the pair's only content: the pair stays.
+      { doc: `**a**${P}**b**`, after: "**ab**" },
+      { doc: `*a ${P} b*`, after: "*a  b*" },
+    ];
+    const ways = ["Backspace", "Delete", "mouse", "cut", "move"] as const;
+
+    it.each(CASES29.flatMap((c) => ways.map((way) => ({ ...c, way }))))(
+      "$doc by $way",
+      ({ doc, after, way }) => {
+        const built = build(doc, mode, where);
+        const { view } = built;
+        const from = doc.indexOf(P);
+        const to = from + P.length;
+        if (way === "Backspace") {
+          setCaret(view, to);
+          keys(view, "Backspace", "Backspace");
+        } else if (way === "Delete") {
+          setCaret(view, from);
+          keys(view, "Delete", "Delete");
+        } else if (way === "mouse") {
+          select(view, from, to);
+          keys(view, "Backspace");
+        } else if (way === "cut") {
+          select(view, from, to);
+          expect(send(view, "cut").data.get("text/plain")).toBe(P);
+        } else {
+          // A move to after the document's last line.
+          const last = view.state.doc.lines;
+          const landing = {
+            line: last,
+            pos: view.state.doc.line(last).to,
+            caret: view.state.doc.line(last).to,
+          };
+          expect(movePicture(view, from, landing)).toBe(true);
+          expect(bytes(view.state).startsWith(after)).toBe(true);
+          expect(bytes(view.state)).toContain(P);
+          undoOnce(view);
+          expect(bytes(view.state)).toBe(doc);
+          return;
+        }
+        expect(bytes(view.state)).toBe(after);
+        expect(built.other()).toBe(after);
+        undoOnce(view);
+        expect(bytes(view.state)).toBe(doc);
+      },
+    );
+  },
+);
+
+describe.each(SETUPS)(
+  "Enter on a selected picture is Escape then Enter (P30, %s mode, %s)",
+  (mode, where) => {
+    const P = "![x](assets/p.png)";
+    it.each([
+      { doc: `- a ${P}\n- b`, after: `- a ${P}\n- \n- b` },
+      { doc: `> ${P}`, after: `> ${P}\n> ` },
+    ])("continues $doc", ({ doc, after }) => {
+      const { view } = build(doc, mode, where);
+      const from = doc.indexOf(P);
+      select(view, from, from + P.length);
+      keys(view, "Enter");
+      expect(bytes(view.state)).toBe(after);
+      const viaEscape = build(doc, mode, where).view;
+      select(viaEscape, from, from + P.length);
+      keys(viaEscape, "Escape", "Enter");
+      expect(bytes(viaEscape.state)).toBe(after);
+    });
+  },
+);
+
+describe("several selection ranges", () => {
+  it("leave Backspace to the editor, also when the main one is a picture", () => {
+    const doc = `xy ${INLINE}`;
+    const view = markView(doc, { images: imagePreviews("eng") });
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorState.allowMultipleSelections.of(true),
+      ),
+    });
+    view.dispatch({
+      selection: EditorSelection.create(
+        [EditorSelection.range(0, 1), EditorSelection.range(5, 23)],
+        1,
+      ),
+    });
+    keys(view, "Backspace");
+    // Both ranges go, as the editor deletes a selection; the picture is not
+    // removed on its own.
+    expect(bytes(view.state)).toBe("y a  b");
   });
 });

@@ -4,14 +4,21 @@
  * A picture alone on its line takes the line with it, so no empty line is
  * left where it stood: the line and the break after it (the break before it
  * on the last line), and one of two blank lines that would otherwise meet.
- * A picture inside prose takes its span and nothing else. A Reflection's id
- * line, and the breaks on either side of it, are never part of the range.
+ * A picture inside prose takes its span and nothing else, except a pair of
+ * marks the picture is the only content of (`a **P** b`): the pair goes with
+ * it, as Part 2's keys drop a pair they empty (P29), so no mark is left as
+ * page text. A Reflection's id line, and the breaks on either side of it,
+ * are never part of the range.
  */
 
 import type { EditorState, Line } from "@codemirror/state";
 
 import { isIdLineAt } from "../hiddenIdLines";
 import type { PictureRef } from "./refs";
+import { imageNodeAt } from "./refs";
+
+/** The inline pairs whose first and last child are their marks. */
+const PAIRS = new Set(["Emphasis", "StrongEmphasis", "Strikethrough"]);
 
 /** A document range, in positions. */
 interface Range {
@@ -34,6 +41,34 @@ function reachesIdLine(state: EditorState, range: Range): boolean {
   return false;
 }
 
+/**
+ * The picture's span, widened over every pair whose only content it is:
+ * `**P**`, `~~P~~`, `***P***`.
+ */
+function pairedSpan(state: EditorState, ref: PictureRef): Range {
+  const span = { from: ref.from, to: ref.to };
+  const image = imageNodeAt(state, ref.from + 1);
+  if (image?.from !== ref.from || image.to !== ref.to) {
+    return span;
+  }
+  for (let node = image.parent; node !== null; node = node.parent) {
+    const first = node.firstChild;
+    const last = node.lastChild;
+    if (
+      !PAIRS.has(node.name) ||
+      first === null ||
+      last === null ||
+      first.to !== span.from ||
+      last.from !== span.to
+    ) {
+      break;
+    }
+    span.from = node.from;
+    span.to = node.to;
+  }
+  return span;
+}
+
 function empty(line: Line | null): boolean {
   return line !== null && line.text.trim() === "";
 }
@@ -44,9 +79,9 @@ export function pictureRemoval(
   ref: PictureRef,
 ): { from: number; to: number } {
   const { doc } = state;
-  const bare = { from: ref.from, to: ref.to };
-  const line = doc.lineAt(ref.from);
-  if (line.text.trim() !== doc.sliceString(ref.from, ref.to)) {
+  const bare = pairedSpan(state, ref);
+  const line = doc.lineAt(bare.from);
+  if (line.text.trim() !== doc.sliceString(bare.from, bare.to)) {
     return bare;
   }
   const above = line.number > 1 ? doc.line(line.number - 1) : null;
