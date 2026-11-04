@@ -570,6 +570,7 @@ impl DiscoveryFailure {
                 token_required: None,
                 retry_after: None,
                 home_url: None,
+                reason: None,
             },
             DiscoveryFailure::Unavailable => provider_unavailable("discovery"),
         }
@@ -976,6 +977,7 @@ fn provider_unavailable(what: &str) -> ApiError {
         token_required: None,
         retry_after: None,
         home_url: None,
+        reason: None,
     }
 }
 
@@ -1463,6 +1465,7 @@ async fn start_sign_on(
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         });
     }
     let cookie = Cookie::build((STATE_COOKIE, state_value))

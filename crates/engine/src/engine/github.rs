@@ -955,21 +955,49 @@ impl Engine {
     /// answers. The caller builds the authorize url and exchanges the code
     /// with the App's client id, client secret and auth base.
     pub fn github_link_app(&self) -> Result<Arc<crystalline_remote::GithubApp>> {
-        let app = self.link_app()?;
-        self.link_access()?;
+        self.github_link_app_explained()
+            .map_err(|refusal| refusal.error)
+    }
+
+    /// [`Engine::github_link_app`], with the refusal's
+    /// [`LinkSetupReason`] beside the same error when the cause is the
+    /// App's setup, so a surface can tell a person who cannot fix it what
+    /// is wrong without reading the sentence.
+    pub fn github_link_app_explained(
+        &self,
+    ) -> std::result::Result<Arc<crystalline_remote::GithubApp>, LinkAppRefusal> {
+        let app = self
+            .link_app_with_reason()
+            .map_err(|(reason, error)| LinkAppRefusal {
+                error,
+                reason: Some(reason),
+            })?;
+        self.link_access().map_err(|error| LinkAppRefusal {
+            error,
+            reason: None,
+        })?;
         Ok(app)
     }
 
     /// The App a link goes through, or why there is none to use.
     fn link_app(&self) -> Result<Arc<crystalline_remote::GithubApp>> {
+        self.link_app_with_reason().map_err(|(_, error)| error)
+    }
+
+    /// [`Engine::link_app`], with the setup reason of a refusal.
+    fn link_app_with_reason(
+        &self,
+    ) -> std::result::Result<Arc<crystalline_remote::GithubApp>, (LinkSetupReason, EngineError)>
+    {
         match self.github_app_slot() {
             super::github_app::AppSlot::Ready(router) => Ok(router.app().clone()),
             super::github_app::AppSlot::Refused(detail) => {
-                Err(super::github_app::app_refusal(detail))
+                Err(super::github_app::app_refusal_with_reason(detail))
             }
-            super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => {
-                Err(EngineError::Conflict(NO_APP_TO_LINK.to_string()))
-            }
+            super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => Err((
+                LinkSetupReason::NoApp,
+                EngineError::Conflict(NO_APP_TO_LINK.to_string()),
+            )),
         }
     }
 
@@ -1480,6 +1508,50 @@ impl crate::pending::PendingRecord for LinkInvite {
     fn started(&self) -> std::time::Instant {
         self.started
     }
+}
+
+/// Why a GitHub link cannot start because of how this instance's GitHub App
+/// is set up, as a value a client can branch on. The refusal's sentence
+/// names the admin's fix; this names only the cause, so a surface can say it
+/// in plain words to a person who is not an admin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSetupReason {
+    /// No GitHub App is configured.
+    NoApp,
+    /// A GitHub App is configured and cannot be used.
+    AppUnusable,
+    /// The GitHub App is saved in a keychain that cannot be read.
+    Keychain,
+    /// The GitHub App has no client secret, so a code cannot be exchanged.
+    NoClientSecret,
+    /// `service.public_url` is not set, so GitHub has no address to send the
+    /// browser back to.
+    NoPublicUrl,
+}
+
+impl LinkSetupReason {
+    /// The stable wire form: `no_app`, `app_unusable`, `keychain`,
+    /// `no_client_secret` or `no_public_url`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkSetupReason::NoApp => "no_app",
+            LinkSetupReason::AppUnusable => "app_unusable",
+            LinkSetupReason::Keychain => "keychain",
+            LinkSetupReason::NoClientSecret => "no_client_secret",
+            LinkSetupReason::NoPublicUrl => "no_public_url",
+        }
+    }
+}
+
+/// Why [`Engine::github_link_app_explained`] refused: the error every surface
+/// already answers with, and the setup reason when the cause is the App's
+/// setup (`None` when this process keeps no accounts to link).
+#[derive(Debug)]
+pub struct LinkAppRefusal {
+    /// The refusal, unchanged from [`Engine::github_link_app`].
+    pub error: EngineError,
+    /// The cause, when it is the App's setup.
+    pub reason: Option<LinkSetupReason>,
 }
 
 /// What an unattended session is refused a link with.

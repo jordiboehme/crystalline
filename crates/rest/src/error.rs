@@ -30,7 +30,9 @@ use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 
 use crate::auth_store::GITHUB_ID_TAKEN;
-use crate::engine::{EngineError, FILE_HOSTED_MARK, FILE_NO_HOST_MARK, ONLY_ELSEWHERE};
+use crate::engine::{
+    EngineError, FILE_HOSTED_MARK, FILE_NO_HOST_MARK, LinkSetupReason, ONLY_ELSEWHERE,
+};
 
 /// An error response in RFC 9457 shape. `title` is a short stable slug a
 /// client may match on; `detail` carries the engine's own message verbatim,
@@ -59,6 +61,10 @@ pub struct ApiError {
     /// answers a reflection route with. `None` on every other failure, and
     /// the member is then absent from the body.
     pub home_url: Option<String>,
+    /// Why a GitHub link cannot start because of the App's setup. See
+    /// [`ApiError::reason`]; `None` on every other failure, and the member
+    /// is then absent from the body.
+    pub reason: Option<LinkSetupReason>,
 }
 
 impl ApiError {
@@ -71,6 +77,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -84,6 +91,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -99,6 +107,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -116,6 +125,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -140,6 +150,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -155,6 +166,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -170,6 +182,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -185,6 +198,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -197,6 +211,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -209,6 +224,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -221,6 +237,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -235,6 +252,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 
@@ -264,6 +282,16 @@ impl ApiError {
     /// up the shared error type.
     pub fn token_required(mut self) -> ApiError {
         self.token_required = Some(true);
+        self
+    }
+
+    /// Mark this problem document with the `reason` extension member: why a
+    /// GitHub link cannot start because of how the instance's GitHub App is
+    /// set up. The detail names the admin's fix, with a command or a setting;
+    /// the profile shows that to an admin and turns this member into plain
+    /// words for everybody else, so it never has to read the prose.
+    pub fn reason(mut self, reason: LinkSetupReason) -> ApiError {
+        self.reason = Some(reason);
         self
     }
 
@@ -301,6 +329,7 @@ impl ApiError {
             token_required: None,
             retry_after: None,
             home_url: None,
+            reason: None,
         }
     }
 }
@@ -412,6 +441,18 @@ pub struct ProblemDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "https://team.example.com")]
     pub home_url: Option<String>,
+    /// An RFC 9457 extension member, present only on a refusal to start a
+    /// GitHub link (`POST /me/github-link/start`) because of how this
+    /// instance's GitHub App is set up: `no_app` (none is configured),
+    /// `app_unusable` (one is configured and cannot be used), `keychain`
+    /// (the keychain that holds it cannot be read), `no_client_secret` or
+    /// `no_public_url` (`service.public_url` is not set). The profile says
+    /// the cause in plain words to a person who is not an admin and shows an
+    /// admin the detail, which names the fix. Absent from every other
+    /// problem document on this surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "no_client_secret")]
+    pub reason: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
@@ -425,6 +466,7 @@ impl IntoResponse for ApiError {
             detail: self.detail,
             token_required: self.token_required,
             home_url: self.home_url,
+            reason: self.reason.map(LinkSetupReason::as_str),
         };
         let mut resp = (self.status, axum::Json(body)).into_response();
         // `axum::Json` writes `application/json`; RFC 9457 requires the
@@ -777,6 +819,7 @@ fn unprocessable_error(detail: String) -> ApiError {
         token_required: None,
         retry_after: None,
         home_url: None,
+        reason: None,
     }
 }
 
@@ -789,6 +832,7 @@ fn internal_error(detail: String) -> ApiError {
         token_required: None,
         retry_after: None,
         home_url: None,
+        reason: None,
     }
 }
 
@@ -1085,6 +1129,38 @@ mod tests {
         assert_eq!(marked["token_required"], true);
         assert_eq!(marked["status"], 403, "and the rest of the shape is intact");
         assert_eq!(marked["title"], "forbidden");
+    }
+
+    /// The link setup's extension member: present on the refusal that was
+    /// asked to carry it, as its wire string, and absent from the body
+    /// entirely otherwise.
+    #[tokio::test]
+    async fn the_reason_member_appears_only_when_it_is_set() {
+        let body = |error: ApiError| async {
+            let resp = error.into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+
+        let plain = body(ApiError::conflict("no")).await;
+        assert!(
+            plain.get("reason").is_none(),
+            "an ordinary refusal carries no reason: {plain}"
+        );
+        for (reason, wire) in [
+            (LinkSetupReason::NoApp, "no_app"),
+            (LinkSetupReason::AppUnusable, "app_unusable"),
+            (LinkSetupReason::Keychain, "keychain"),
+            (LinkSetupReason::NoClientSecret, "no_client_secret"),
+            (LinkSetupReason::NoPublicUrl, "no_public_url"),
+        ] {
+            let marked = body(ApiError::conflict("no").reason(reason)).await;
+            assert_eq!(marked["reason"], wire);
+            assert_eq!(marked["status"], 409, "and the rest of the shape is intact");
+            assert_eq!(marked["detail"], "no");
+        }
     }
 
     /// The Reflection's extension member: present on the refusal that was

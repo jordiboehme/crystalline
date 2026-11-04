@@ -27,7 +27,9 @@ use crystalline_core::config::{
     AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OidcConfig, ResponseFormat, ServiceConfig,
 };
 use crystalline_index::TursoStore;
+use crystalline_remote::{AppLookup, AppStore};
 use crystalline_service::daemon::http_router;
+use crystalline_service::engine::ConfigureAction;
 use crystalline_service::mcp::McpServer;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, EnvOverlay};
@@ -183,6 +185,12 @@ struct Setup {
     /// A single sign-on provider configured (never reached: the tests only
     /// read where the browser is sent).
     sso: bool,
+    /// The App's private key is not a key, so the App is configured and
+    /// cannot be used.
+    bad_key: bool,
+    /// No App in the environment, and the keychain that holds the saved App
+    /// cannot be read.
+    keychain_locked: bool,
 }
 
 impl Default for Setup {
@@ -193,6 +201,8 @@ impl Default for Setup {
             app: true,
             mcp_auth: false,
             sso: false,
+            bad_key: false,
+            keychain_locked: false,
         }
     }
 }
@@ -248,12 +258,15 @@ impl Ctx {
         let mut env = vec![
             ("CRYSTALLINE_GITHUB_APP_ID", "7"),
             ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", CLIENT_ID),
-            ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM),
+            (
+                "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+                if setup.bad_key { "not a key" } else { PEM },
+            ),
         ];
-        if !setup.app {
+        if !setup.app || setup.keychain_locked {
             env.clear();
         }
-        if setup.app && setup.client_secret {
+        if setup.app && !setup.keychain_locked && setup.client_secret {
             env.push(("CRYSTALLINE_GITHUB_APP_CLIENT_SECRET", CLIENT_SECRET));
         }
         let overlay = EnvOverlay::from_vars(
@@ -265,18 +278,20 @@ impl Ctx {
         let clock = Arc::new(Mutex::new(Instant::now()));
         let read = clock.clone();
         let store = TursoStore::open_in_memory().await.unwrap();
-        let engine = Arc::new(
-            Engine::new(
-                Arc::new(tokio::sync::Mutex::new(store)),
-                config,
-                None,
-                Some(config_path),
-            )
-            .with_state_dir(tmp.path().to_path_buf())
-            .with_token_store_dir(tmp.path().join("tokens"))
-            .with_env_overlay(overlay)
-            .with_link_clock(Arc::new(move || *read.lock().unwrap())),
-        );
+        let mut engine = Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            config,
+            None,
+            Some(config_path),
+        )
+        .with_state_dir(tmp.path().to_path_buf())
+        .with_token_store_dir(tmp.path().join("tokens"))
+        .with_env_overlay(overlay)
+        .with_link_clock(Arc::new(move || *read.lock().unwrap()));
+        if setup.keychain_locked {
+            engine = engine.with_app_store_lookup(locked_keychain(tmp.path().join("tokens")));
+        }
+        let engine = Arc::new(engine);
         engine.sync(None).await.unwrap();
         let auth = Arc::new(
             AuthStore::open(&tmp.path().join("web-auth.db"))
@@ -426,6 +441,20 @@ impl Ctx {
         assert_eq!(response.status(), 200);
         response.json().await.unwrap()
     }
+}
+
+/// A lookup that answers like a keychain that cannot be read, with the
+/// marker saying an App is saved in it (an empty marker counts for every
+/// host).
+fn locked_keychain(file_dir: std::path::PathBuf) -> crystalline_service::engine::AppLookupFn {
+    Arc::new(move || {
+        Ok(AppLookup {
+            store: AppStore::file_fallback(&file_dir),
+            credentials: None,
+            keychain_failed: Some("the keychain is locked".to_string()),
+            marker: Some(String::new()),
+        })
+    })
 }
 
 fn cookie_header(cookies: &Cookies) -> String {
@@ -787,6 +816,7 @@ async fn start_without_public_url_is_409() {
             .contains("service.public_url"),
         "{body}"
     );
+    assert_eq!(body["reason"], "no_public_url", "{body}");
 }
 
 /// The web flow cannot exchange a code without the App's client secret, so
@@ -813,6 +843,84 @@ async fn start_without_a_client_secret_is_409() {
             .contains("crystalline github app set --client-secret-file"),
         "{body}"
     );
+    assert_eq!(body["reason"], "no_client_secret", "{body}");
+}
+
+/// The start of a link refused because of the App's setup, as a viewer
+/// sees it: the status and the `reason` the profile turns into plain words.
+async fn start_refusal(setup: Setup) -> (u16, serde_json::Value) {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::with(&github, setup).await;
+    let vic = ctx.login("vic").await;
+    let response = ctx.start_link(&vic).await;
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap())
+}
+
+/// Without a GitHub App there is nothing to link through.
+#[tokio::test]
+async fn start_without_an_app_says_no_app() {
+    let (status, body) = start_refusal(Setup {
+        app: false,
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["reason"], "no_app", "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("crystalline github app set"),
+        "the detail keeps the admin's fix: {body}"
+    );
+}
+
+/// An App that is configured and cannot be used (its key is not a key).
+#[tokio::test]
+async fn start_with_an_unusable_app_says_app_unusable() {
+    let (status, body) = start_refusal(Setup {
+        bad_key: true,
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["reason"], "app_unusable", "{body}");
+}
+
+/// An App saved in a keychain that cannot be read.
+#[tokio::test]
+async fn start_with_an_unreadable_keychain_says_keychain() {
+    let (status, body) = start_refusal(Setup {
+        keychain_locked: true,
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(status, 422, "{body}");
+    assert_eq!(body["reason"], "keychain", "{body}");
+    assert!(
+        body["detail"].as_str().unwrap().contains("keychain"),
+        "{body}"
+    );
+}
+
+/// A refusal that is not about the App's setup carries no `reason`: the
+/// start without its CSRF token.
+#[tokio::test]
+async fn a_refusal_that_is_not_the_setup_carries_no_reason() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    let response = ctx
+        .client
+        .post(ctx.url("/me/github-link/start"))
+        .header(reqwest::header::COOKIE, cookie_header(&ann))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body.get("reason").is_none(), "{body}");
 }
 
 /// A person unlinks their own account: the token is revoked at GitHub and
@@ -1084,6 +1192,40 @@ async fn the_link_spends_once() {
     assert!(page.contains("Ask your agent for a new link"), "{page}");
     let page = assert_html_page(ctx.go("deadbeef", &ann).await, 404).await;
     assert!(page.contains("Ask your agent for a new link"), "{page}");
+}
+
+/// A link minted while the setup was whole meets a setup that changed
+/// before it was opened: `service.public_url` is gone. A person who is not
+/// an admin reads the cause in plain words, with no setting named; an admin
+/// reads the server's sentence, which names it.
+#[tokio::test]
+async fn a_link_that_cannot_start_says_why_in_plain_words_to_a_non_admin() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let vic = ctx.login("vic").await;
+    let root = ctx.login("root").await;
+    let for_vic = ctx.engine.mint_github_link("vic").unwrap();
+    let for_root = ctx.engine.mint_github_link("root").unwrap();
+    ctx.engine
+        .configure(&ConfigureAction::Unset {
+            key: "service.public_url".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let page = assert_html_page(ctx.go(&for_vic, &vic).await, 409).await;
+    assert!(
+        page.contains(
+            "This instance does not know its public address yet, so GitHub cannot send you \
+             back. Ask an admin to set it."
+        ),
+        "{page}"
+    );
+    assert!(!page.contains("service.public_url"), "{page}");
+
+    let page = assert_html_page(ctx.go(&for_root, &root).await, 409).await;
+    assert!(page.contains("service.public_url"), "{page}");
+    assert!(!page.contains("does not know its public address"), "{page}");
 }
 
 /// A link lives ten minutes.
