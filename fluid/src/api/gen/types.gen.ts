@@ -1814,6 +1814,18 @@ export type ProblemDetail = {
      */
     home_url?: string | null;
     /**
+     * An RFC 9457 extension member, present only on a refusal to start a
+     * GitHub link (`POST /me/github-link/start`) because of how this
+     * instance's GitHub App is set up: `no_app` (none is configured),
+     * `app_unusable` (one is configured and cannot be used), `keychain`
+     * (the keychain that holds it cannot be read), `no_client_secret` or
+     * `no_public_url` (`service.public_url` is not set). The profile says
+     * the cause in plain words to a person who is not an admin and shows an
+     * admin the detail, which names the fix. Absent from every other
+     * problem document on this surface.
+     */
+    reason?: string | null;
+    /**
      * The HTTP status, mirrored into the body so a client that only has the
      * parsed payload can still branch on it.
      */
@@ -7516,13 +7528,17 @@ export type StartMyGithubLinkErrors = {
      */
     403: ProblemDetail;
     /**
-     * `service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.
+     * `service.public_url` is not set, so there is no callback address to give GitHub (`reason` `no_public_url`), or the GitHub App has no client secret, so a code cannot be exchanged (`no_client_secret`). The detail names the fix; `reason` names the cause for a person who cannot apply it.
      */
     409: ProblemDetail;
     /**
-     * No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.
+     * No GitHub App is configured on this instance (`reason` `no_app`), or the keychain that holds it cannot be read (`keychain`). The detail names the fix.
      */
     422: ProblemDetail;
+    /**
+     * The GitHub App is configured and cannot be used (`reason` `app_unusable`). The detail names the fix.
+     */
+    500: ProblemDetail;
     /**
      * Too many links are in flight at once; try again in a moment.
      */

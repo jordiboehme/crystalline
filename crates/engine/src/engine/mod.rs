@@ -7545,7 +7545,10 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
-pub use github::{NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK};
+pub use github::{
+    LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP,
+    UNATTENDED_LINK,
+};
 mod github_access;
 pub use github_access::{
     CLOSE_GRACE, CONFIRM_TIMEOUT, ClosedDomain, FRESH_FOR, GithubEventOutcome, GithubGovernor,

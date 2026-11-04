@@ -44,9 +44,11 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::auth::{Identity, no_store};
+use super::auth_store::Role;
 use super::github_settings::GithubPendingView;
 use super::pending::{PENDING_TTL, PendingRecord, PendingStore, StateMiss};
 use super::{ApiError, ApiQuery, ProblemDetail, RestState, refuse_read_only};
+use crate::engine::LinkSetupReason;
 use crate::engine::{EngineError, GithubLinkView, GithubUnlink};
 
 /// Where GitHub sends the browser back to, under `/api/v1`. Registered as the
@@ -263,16 +265,29 @@ pub async fn status(
         (
             status = 409,
             description = "`service.public_url` is not set, so there is no \
-                           callback address to give GitHub, or the GitHub App \
-                           has no client secret, so a code cannot be \
-                           exchanged. The detail names the fix.",
+                           callback address to give GitHub (`reason` \
+                           `no_public_url`), or the GitHub App has no client \
+                           secret, so a code cannot be exchanged \
+                           (`no_client_secret`). The detail names the fix; \
+                           `reason` names the cause for a person who cannot \
+                           apply it.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 422,
-            description = "No GitHub App is configured on this instance, or \
-                           it cannot be used. The detail names the fix.",
+            description = "No GitHub App is configured on this instance \
+                           (`reason` `no_app`), or the keychain that holds \
+                           it cannot be read (`keychain`). The detail names \
+                           the fix.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The GitHub App is configured and cannot be used \
+                           (`reason` `app_unusable`). The detail names the \
+                           fix.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -305,10 +320,20 @@ pub async fn start(
 /// GitHub's authorize url.
 fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiError> {
     refuse_read_only(state)?;
-    let app = state.engine.github_link_app()?;
+    let app = state
+        .engine
+        .github_link_app_explained()
+        .map_err(|refusal| {
+            let error = ApiError::from(refusal.error);
+            match refusal.reason {
+                Some(reason) => error.reason(reason),
+                None => error,
+            }
+        })?;
     let credentials = app.credentials();
     if credentials.client_secret.is_none() {
-        return Err(ApiError::conflict(crate::engine::NO_CLIENT_SECRET_TO_LINK));
+        return Err(ApiError::conflict(crate::engine::NO_CLIENT_SECRET_TO_LINK)
+            .reason(LinkSetupReason::NoClientSecret));
     }
     let config = state.engine.config();
     let Some(public) = crate::settings::public_base(&config) else {
@@ -316,7 +341,8 @@ fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiErro
             "linking GitHub from the browser needs service.public_url: GitHub sends the browser \
              back to <service.public_url>/api/v1/github/link/callback, which must also be the \
              GitHub App's callback url",
-        ));
+        )
+        .reason(LinkSetupReason::NoPublicUrl));
     };
     let redirect_uri = public.join(&format!("/api/v1{CALLBACK_PATH}"));
     let flow_state = new_state();
@@ -542,7 +568,45 @@ pub async fn go(
                 user.name,
                 e.detail
             );
-            page(e.status, &e.detail)
+            page(e.status, refusal_text(&e, user.role == Role::Admin))
+        }
+    }
+}
+
+/// What the link's page says when the link cannot start: the refusal's own
+/// sentence, except that a person who is not an admin reads a setup
+/// refusal's cause in plain words ([`setup_sentence`]), since the sentence
+/// names a command or a setting only an admin can use.
+fn refusal_text(error: &ApiError, admin: bool) -> &str {
+    match error.reason {
+        Some(reason) if !admin => setup_sentence(reason),
+        _ => &error.detail,
+    }
+}
+
+/// The plain words for a setup refusal, for a person who is not an admin.
+/// Keep in step with `START_REASONS` in `fluid/src/screens/Profile.tsx`,
+/// which says the same on the profile's "Connect GitHub".
+fn setup_sentence(reason: LinkSetupReason) -> &'static str {
+    match reason {
+        LinkSetupReason::NoClientSecret => {
+            "The GitHub App on this instance has no client secret yet, so it cannot link \
+             accounts. Ask an admin to add it."
+        }
+        LinkSetupReason::NoPublicUrl => {
+            "This instance does not know its public address yet, so GitHub cannot send you \
+             back. Ask an admin to set it."
+        }
+        LinkSetupReason::AppUnusable => {
+            "The GitHub App on this instance is set up but cannot be used right now. Ask an \
+             admin to check its settings."
+        }
+        LinkSetupReason::Keychain => {
+            "This instance cannot read the GitHub App's stored keys right now. Ask an admin to \
+             check the server."
+        }
+        LinkSetupReason::NoApp => {
+            "This instance has no GitHub App yet. Ask an admin to set one up."
         }
     }
 }
@@ -785,4 +849,64 @@ pub async fn unlink(
     Ok(Json(unlink_response(
         state.engine.unlink_github(&user.name).await?,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every setup reason, and a refusal with none.
+    const REASONS: [LinkSetupReason; 5] = [
+        LinkSetupReason::NoApp,
+        LinkSetupReason::AppUnusable,
+        LinkSetupReason::Keychain,
+        LinkSetupReason::NoClientSecret,
+        LinkSetupReason::NoPublicUrl,
+    ];
+
+    /// A person who is not an admin reads the cause in plain words for every
+    /// reason, never the admin's sentence with its command; an admin reads
+    /// the server's sentence.
+    #[test]
+    fn a_setup_refusal_page_says_the_cause_to_a_non_admin_and_the_fix_to_an_admin() {
+        for reason in REASONS {
+            let error =
+                ApiError::conflict("an admin runs: crystalline github app set").reason(reason);
+            let plain = refusal_text(&error, false);
+            assert!(plain.ends_with('.'), "{plain}");
+            assert!(plain.contains("Ask an admin"), "{plain}");
+            assert!(!plain.contains("crystalline"), "{plain}");
+            assert_eq!(
+                refusal_text(&error, true),
+                "an admin runs: crystalline github app set"
+            );
+        }
+        assert_eq!(
+            refusal_text(
+                &ApiError::conflict("x").reason(LinkSetupReason::NoClientSecret),
+                false
+            ),
+            "The GitHub App on this instance has no client secret yet, so it cannot link \
+             accounts. Ask an admin to add it."
+        );
+        assert_eq!(
+            refusal_text(
+                &ApiError::conflict("x").reason(LinkSetupReason::Keychain),
+                false
+            ),
+            "This instance cannot read the GitHub App's stored keys right now. Ask an admin to \
+             check the server."
+        );
+    }
+
+    /// A refusal that is not about the setup keeps its own words for
+    /// everybody: they name no command.
+    #[test]
+    fn a_refusal_without_a_reason_keeps_its_sentence() {
+        let error = ApiError::service_unavailable("too many links are in flight at once");
+        assert_eq!(
+            refusal_text(&error, false),
+            "too many links are in flight at once"
+        );
+    }
 }
