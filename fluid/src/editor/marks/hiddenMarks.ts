@@ -319,6 +319,17 @@ export function atomsOnLine(state: EditorState, line: number): MarkAtom[] {
 }
 
 /**
+ * `always`: the marks a line has whether they show or not. `pictures`: on
+ * the lines whose marks are hidden, a drawn picture's marks too, which the
+ * drawing and the caret never read (the picture is one atom there) but a
+ * deletion that cuts into the picture is judged by (P2).
+ */
+export interface ScanOptions {
+  always?: boolean;
+  pictures?: boolean;
+}
+
+/**
  * The marks of lines `first` to `last` (1-based), each line exactly as
  * `marksOnLine` gives it, read in one walk over the syntax tree. Asking line
  * by line walks a paragraph's nodes from its start once per line, which a
@@ -328,7 +339,7 @@ export function scanMarks(
   state: EditorState,
   first: number,
   last: number,
-  options: { always?: boolean } = {},
+  options: ScanOptions = {},
 ): MarkScan {
   const doc = state.doc;
   const fence = frontmatterEnd(doc);
@@ -374,7 +385,7 @@ export function scanMarks(
       closers,
       head.at.from,
       tail.at.to,
-      options.always === true,
+      options.always === true || options.pictures === true,
     );
   }
   return {
@@ -391,16 +402,17 @@ function walkMarks(
   closers: Map<number, { from: number; to: number }>,
   from: number,
   to: number,
-  always: boolean,
+  withPictures: boolean,
 ): void {
   const doc = state.doc;
   const char = (pos: number) => doc.sliceString(pos, pos + 1);
   // A picture the picture layer draws in place is its span, so the drawing,
   // the caret and the keys read no marks in it (P5). The marks a line has
   // whether they show or not (`always`: the delete check, the format
-  // commands) still include its pair, so a range that cuts into it is judged
-  // as before.
-  const picture = (node: SyntaxNode) => !always && drawnAsPicture(state, node);
+  // commands) and the marks a deletion keeps (`pictures`) still include its
+  // pair, so a range that cuts into it is judged as before.
+  const picture = (node: SyntaxNode) =>
+    !withPictures && drawnAsPicture(state, node);
   // A `>` with the one optional space after it.
   const quote = (scan: LineScan, from: number, to: number) => {
     addTo(scan, from, isSpace(char(to)) ? to + 1 : to, "quote", "prefix");

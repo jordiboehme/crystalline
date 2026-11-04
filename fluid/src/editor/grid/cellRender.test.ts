@@ -271,6 +271,33 @@ describe("renderCellContent", () => {
     expect(unavailable.textContent).toBe("deck");
   });
 
+  test("a refused or unavailable image with no alt text says why", () => {
+    const refused = draw("a ![](assets/a.png) b", {
+      assets: {
+        resolve: (target) => target,
+        url: (path) => path,
+        refused: () => "Not here.",
+      },
+    });
+    expect(refused.querySelector(".cm-image-error")?.textContent).toBe(
+      "Not here.",
+    );
+    const unavailable = draw("![](assets/deck.pdf)");
+    expect(unavailable.querySelector(".cm-image-error")?.textContent).toBe(
+      "This image is not available.",
+    );
+  });
+
+  test("an image that will not load is its alt text and a quiet sentence", () => {
+    const cell = draw("![shot](assets/a.png)");
+    cell.querySelector("img")?.dispatchEvent(new Event("error"));
+    expect(cell.querySelector("img")).toBeNull();
+    expect(cell.textContent).toBe("shot This image is not available.");
+    expect(cell.querySelector(".cm-image-error")?.textContent).toBe(
+      "This image is not available.",
+    );
+  });
+
   test("drawing again replaces what was there", () => {
     const cell = draw("**a**");
     renderCellContent("b", cell);

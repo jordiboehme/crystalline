@@ -1695,7 +1695,7 @@ describe("the reflection editor takes files", () => {
     expect(session.get().ytext?.toJSON()).toBe(PAGE);
   });
 
-  it("draws a Reflection file's image under its link, and no engram file", async () => {
+  it("draws a Reflection file's image in place of its reference, and no engram file", async () => {
     serveFiles([[]]);
     live(
       room(`${PAGE}\n![a](../assets/2026/10/a.png)\n\n![x](assets/x.png)\n`),

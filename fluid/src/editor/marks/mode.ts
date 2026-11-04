@@ -7,7 +7,7 @@
  */
 
 import type { EditorState, SelectionRange } from "@codemirror/state";
-import { Facet } from "@codemirror/state";
+import { Facet, StateField } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
 
 import { revealRanges } from "../parkedSelection";
@@ -34,14 +34,13 @@ export const picturesDrawn = Facet.define<boolean, boolean>({
   combine: (values) => values.some(Boolean),
 });
 
-/**
- * Whether `range` is exactly one picture the picture layer draws: selecting a
- * picture is no edit of its line, so the picture under the pointer stays the
- * picture rather than turning into its source.
- */
-function onePicture(state: EditorState, range: SelectionRange): boolean {
+/** Whether `range` is exactly one picture outside a table, as written. */
+function onePicture(
+  state: EditorState,
+  range: { from: number; to: number },
+): boolean {
   if (
-    range.empty ||
+    range.from === range.to ||
     !state.facet(picturesDrawn) ||
     state.doc.sliceString(range.from, range.from + 2) !== "!["
   ) {
@@ -57,9 +56,53 @@ function onePicture(state: EditorState, range: SelectionRange): boolean {
 }
 
 /**
+ * The main selection when it is exactly one picture that was drawn under its
+ * edited line (a block) when it was selected, else null. Selecting a picture
+ * never swaps the element under the pointer: one selected where it is drawn
+ * in place is no edit of its line, and one selected under its edited line
+ * keeps that line edited, so it stays the block it was (P25). Provided by
+ * `imagePreviews()`.
+ */
+export const blockPictureSelection = StateField.define<{
+  from: number;
+  to: number;
+} | null>({
+  create: () => null,
+  update(value, tr) {
+    if (tr.selection === undefined) {
+      if (value === null || !tr.docChanged) return value;
+      const from = tr.changes.mapPos(value.from, 1);
+      const to = tr.changes.mapPos(value.to, -1);
+      return from < to ? { from, to } : null;
+    }
+    const { main } = tr.state.selection;
+    if (!onePicture(tr.state, main)) return null;
+    // How the picture was drawn just before this selection reached it.
+    const back = tr.changes.invert(tr.startState.doc);
+    const before = pictureAt(tr.startState, back.mapPos(main.from + 1));
+    return before !== null && !pictureInline(tr.startState, before)
+      ? { from: main.from, to: main.to }
+      : null;
+  },
+});
+
+/**
+ * Whether `range` is a one-picture selection that is no edit of its line:
+ * exactly one picture, drawn in place when it was selected.
+ */
+function selectsInlinePicture(
+  state: EditorState,
+  range: SelectionRange,
+): boolean {
+  if (!onePicture(state, range)) return false;
+  const block = state.field(blockPictureSelection, false);
+  return !(block?.from === range.from && block.to === range.to);
+}
+
+/**
  * Whether `line` (1-based) is the edited line of the show-marks mode: the
  * setting is on and a revealing selection range touches the line, other than
- * a range that is exactly one drawn picture. A selection parked behind an
+ * a range that is exactly one picture drawn in place (`blockPictureSelection`). A selection parked behind an
  * open table cell reveals nothing.
  */
 function lineEdited(state: EditorState, line: number): boolean {
@@ -69,7 +112,9 @@ function lineEdited(state: EditorState, line: number): boolean {
   const at = state.doc.line(line);
   return revealRanges(state).some(
     (range) =>
-      range.from <= at.to && range.to >= at.from && !onePicture(state, range),
+      range.from <= at.to &&
+      range.to >= at.from &&
+      !selectsInlinePicture(state, range),
   );
 }
 

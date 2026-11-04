@@ -37,7 +37,12 @@ import {
 import type { AssetResolver } from "../api/files";
 import type { ImageFormat } from "./imageFormat";
 import { engramAssetHome, imageStyle } from "./imageFormat";
-import { markModeChanged, pictureInline, picturesDrawn } from "./marks/mode";
+import {
+  blockPictureSelection,
+  markModeChanged,
+  pictureInline,
+  picturesDrawn,
+} from "./marks/mode";
 import { parkingChanged } from "./parkedSelection";
 import { parseAdvanced } from "./parseProgress";
 import { altDisplay } from "./pictures/altText";
@@ -494,6 +499,7 @@ export function imagePreviews(source: string | AssetResolver): Extension {
   return [
     pictureAssets.of(assets),
     picturesDrawn.of(true),
+    blockPictureSelection,
     field,
     pointerPlugin(field),
     previewTheme,

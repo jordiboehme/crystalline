@@ -25,7 +25,7 @@ import { referenceState, wikilinkWords } from "../../wikilinks";
 import { dialectGrammar } from "../dialectHighlight";
 import { imageSpansIn } from "../imageFormat";
 import { altDisplay } from "../pictures/altText";
-import { ENGRAM_RESOLVER, pictureTarget } from "../pictures/refs";
+import { ENGRAM_RESOLVER, UNAVAILABLE, pictureTarget } from "../pictures/refs";
 
 export interface CellRenderOptions {
   /**
@@ -123,6 +123,14 @@ function inlineParser(): InlineParser {
     extensions: [dialectGrammar, wikilinkGrammar],
   }).language.parser as unknown as InlineParser;
   return parser;
+}
+
+/** A reason in the muted caption style the main view's pictures use. */
+function caption(reason: string): HTMLElement {
+  const span = document.createElement("span");
+  span.className = "cm-image-error";
+  span.textContent = reason;
+  return span;
 }
 
 /** A pipe is escaped inside a table cell; the target names it bare. */
@@ -422,7 +430,10 @@ class Drawer {
       this.options.assets ?? ENGRAM_RESOLVER,
     );
     if (target.src === null) {
-      into.appendChild(document.createTextNode(alt));
+      // The alt text says what is missing; with none, the reason does, so
+      // the reference never vanishes without a trace.
+      if (alt !== "") into.appendChild(document.createTextNode(alt));
+      else into.appendChild(caption(target.reason ?? UNAVAILABLE));
       return;
     }
     const image = document.createElement("img");
@@ -433,6 +444,14 @@ class Drawer {
       maxHeight: "6em",
       maxWidth: "100%",
       verticalAlign: "middle",
+    });
+    // A file that will not load is its alt text and one quiet sentence, as
+    // in the main view, never the browser's broken-image box.
+    image.addEventListener("error", () => {
+      const words = document.createDocumentFragment();
+      if (alt !== "") words.append(`${alt} `);
+      words.append(caption(UNAVAILABLE));
+      image.replaceWith(words);
     });
     into.appendChild(image);
   }

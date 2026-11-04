@@ -7,13 +7,16 @@
  * Every view is built through the surface with a finished parse (`markView`).
  */
 
-import { EditorSelection } from "@codemirror/state";
+import { Compartment, EditorSelection, StateEffect } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { copyHtmlOf } from "../copyHtml";
 import type { ElementEdit } from "../elementEdit";
 import { imagePreviews } from "../imagePreviews";
+import { toggleFormat } from "../marks/formatting";
+import { atomsOnLine, marksOnLine } from "../marks/hiddenMarks";
+import { mainSelectionParked } from "../parkedSelection";
 import type { MarkViewOptions } from "../../test/markKit";
 import {
   bytes,
@@ -23,6 +26,7 @@ import {
   markView,
   setCaret,
   setRaw,
+  setShowMarks,
 } from "../../test/markKit";
 
 afterEach(cleanupMarkViews);
@@ -95,6 +99,7 @@ describe("the picture layer and the hidden-mark layer", () => {
 
   it("keeps the other marks of the line hidden while one picture is selected", () => {
     const view = drawn("**a** ![x](assets/a.png)\n\nend", { mode: "show" });
+    setCaret(view, 29);
     view.dispatch({ selection: EditorSelection.range(6, 24) });
     expect(view.contentDOM.textContent).not.toContain("**");
   });
@@ -246,5 +251,149 @@ describe("a copy around a drawn picture", () => {
       copyHtmlOf(view.state, [EditorSelection.range(0, doc.length)]),
     );
     expect(withPictures).toBe(without);
+  });
+});
+
+describe("a press on the picture under an edited line (P25)", () => {
+  it("selects it and keeps it the same block, its line still edited", () => {
+    const view = drawn(DOC, { mode: "show" });
+    setCaret(view, 0);
+    const block = view.contentDOM.querySelector(".cm-picture-block");
+    if (!block) throw new Error("no block picture");
+    press(block);
+    expect(view.state.selection.main.from).toBe(2);
+    expect(view.state.selection.main.to).toBe(20);
+    expect(view.contentDOM.querySelector(".cm-picture")).toBe(block);
+    expect(block.classList.contains("cm-picture-block")).toBe(true);
+    expect(block.classList.contains("cm-picture-selected")).toBe(true);
+    expect(view.contentDOM.textContent).toContain("![x](assets/a.png)");
+  });
+
+  it("keeps an inline picture inline when it is pressed", () => {
+    const view = drawn(DOC, { mode: "show" });
+    setCaret(view, DOC.length);
+    const picture = view.contentDOM.querySelector(".cm-picture");
+    if (!picture) throw new Error("no picture");
+    press(picture);
+    expect(view.contentDOM.querySelector(".cm-picture")).toBe(picture);
+    expect(picture.classList.contains("cm-picture-block")).toBe(false);
+  });
+
+  it("follows the picture through an edit elsewhere, and lets go on the next selection", () => {
+    const view = drawn(DOC, { mode: "show" });
+    setCaret(view, 0);
+    press(view.contentDOM.querySelector(".cm-picture-block") as Element);
+    view.dispatch({ changes: { from: DOC.length, insert: "!" } });
+    expect(view.contentDOM.querySelector(".cm-picture-block")).not.toBeNull();
+    setCaret(view, DOC.length);
+    expect(view.contentDOM.querySelector(".cm-picture-block")).toBeNull();
+  });
+});
+
+describe("a linked picture with no alt text", () => {
+  const LINKED_EMPTY = "a [![](assets/a.png)](https://x) b";
+
+  it("is the picture, not one atom over the whole link", () => {
+    const view = drawn(LINKED_EMPTY);
+    expect(images(view)).toHaveLength(1);
+    expect(view.contentDOM.querySelector(".cm-image-atom")).toBeNull();
+    expect(atomsOnLine(view.state, 1)).toEqual([]);
+    expect(view.contentDOM.textContent).toBe("a  b");
+  });
+
+  it("stays Part 2's atom without the picture layer", () => {
+    const view = markView(LINKED_EMPTY);
+    expect(atomsOnLine(view.state, 1)).toEqual([{ from: 2, to: 32 }]);
+  });
+});
+
+describe("what the delete check and the format commands read at a drawn picture", () => {
+  const BOLD = "**a**![x](assets/p.png)**b**\n\nend";
+
+  it("reads the picture's pair whether the marks show or not, and not for the drawing", () => {
+    const view = drawn(BOLD);
+    const spans = (always: boolean) =>
+      marksOnLine(view.state, 1, { always }).map((m) => [m.from, m.to]);
+    expect(spans(true)).toEqual([
+      [0, 2],
+      [3, 5],
+      [5, 7],
+      [8, 23],
+      [23, 25],
+      [26, 28],
+    ]);
+    expect(spans(false)).toEqual([
+      [0, 2],
+      [3, 5],
+      [23, 25],
+      [26, 28],
+    ]);
+  });
+
+  it.each([
+    [7, 12],
+    [6, 8],
+    [3, 12],
+  ])(
+    "keeps the picture's pair when a delete cuts into it (%i to %i)",
+    (from, to) => {
+      const results = [drawn(BOLD), markView(BOLD)].map((view) => {
+        view.dispatch({ changes: { from, to }, userEvent: "delete.selection" });
+        return bytes(view.state);
+      });
+      expect(results[0]).toBe("**a**![](assets/p.png)**b**\n\nend");
+      expect(results[1]).toBe(results[0]);
+    },
+  );
+
+  it("formats the alt words of a range that cuts into the picture", () => {
+    const view = drawn(BOLD);
+    view.dispatch({ selection: EditorSelection.range(3, 12) });
+    toggleFormat(view, "em");
+    expect(bytes(view.state)).toBe("**a**![*x*](assets/p.png)**b**\n\nend");
+  });
+});
+
+describe("a picture swaps between in place and under its line", () => {
+  it("when the setting flips with the caret on its line", () => {
+    const view = drawn(DOC, { mode: "show" });
+    setCaret(view, 0);
+    expect(view.contentDOM.querySelector(".cm-picture-block")).not.toBeNull();
+    setShowMarks(view, false);
+    expect(view.contentDOM.querySelector(".cm-picture-block")).toBeNull();
+    expect(images(view)).toHaveLength(1);
+    expect(view.contentDOM.textContent).not.toContain("![");
+    setShowMarks(view, true);
+    expect(view.contentDOM.querySelector(".cm-picture-block")).not.toBeNull();
+  });
+
+  it("when the selection is parked behind an open cell", () => {
+    const view = drawn(DOC, { mode: "show" });
+    setCaret(view, 0);
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(mainSelectionParked.of(true)),
+    });
+    expect(view.contentDOM.querySelector(".cm-picture-block")).toBeNull();
+    expect(view.contentDOM.textContent).not.toContain("![");
+  });
+
+  it("when the picture layer comes in, the hidden-mark layer gives the span up", () => {
+    const images = new Compartment();
+    const view = markView("x ![](assets/a.png) y", { images: images.of([]) });
+    expect(view.contentDOM.querySelector(".cm-image-atom")).not.toBeNull();
+    view.dispatch({ effects: images.reconfigure(imagePreviews("eng")) });
+    expect(view.contentDOM.querySelector(".cm-image-atom")).toBeNull();
+    expect(view.contentDOM.querySelectorAll(".cm-picture")).toHaveLength(1);
+  });
+});
+
+describe("a picture in a table", () => {
+  it("keeps Part 2's marks in the main view's scan", () => {
+    const TABLE = "| a |\n| - |\n| ![x](assets/a.png) |\n";
+    const view = drawn(TABLE);
+    const spans = (state: typeof view.state) =>
+      marksOnLine(state, 3).map((m) => [m.from, m.to]);
+    expect(spans(view.state)).toEqual(spans(markView(TABLE).state));
+    expect(spans(view.state)).toContainEqual([14, 16]);
   });
 });

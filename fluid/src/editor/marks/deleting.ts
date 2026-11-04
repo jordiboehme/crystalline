@@ -735,7 +735,9 @@ function marksOfLines(
       end += 1;
     }
     const first = sorted[start] ?? 1;
-    const scan = scanMarks(state, first, sorted[end] ?? first);
+    const scan = scanMarks(state, first, sorted[end] ?? first, {
+      pictures: true,
+    });
     scan.lines.forEach((marks, i) => out.set(first + i, marks));
     start = end + 1;
   }

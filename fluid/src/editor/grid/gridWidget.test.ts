@@ -19,12 +19,14 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
+import type { AssetResolver } from "../../api/files";
 import { parsedState } from "../../test/parse";
 import {
   LIST_ITEM_NOT_A_TABLE,
   PIPELESS_FIXTURES,
 } from "../../test/pipelessTables";
 import { fencePreviews } from "../fencePreviews";
+import { pictureAssets } from "../pictures/refs";
 import { baseExtensions } from "../setup";
 import { tableAlignColumn } from "../tableVerbs";
 import { wikilinkResolverFacet } from "../wikilinkChips";
@@ -316,6 +318,33 @@ describe("drawing", () => {
     expect(main.dom.querySelector('[role="grid"]')).toBeNull();
     expect(main.dom.querySelector(".cm-table-preview")).toBeNull();
     expect(main.contentDOM.textContent).toContain("a | b");
+  });
+});
+
+describe("pictures in static cells (P14)", () => {
+  const PICTURED = "| a | b |\n| - | - |\n| ![x](assets/a.png) | 2 |\n";
+  const resolver = (base: string): AssetResolver => ({
+    resolve: (target) => target,
+    url: (path) => `${base}/${path}`,
+    refused: () => null,
+  });
+
+  test("draw with the page's resolver, and again when it changes", () => {
+    const assets = new Compartment();
+    const main = soloMain(PICTURED, [
+      assets.of(pictureAssets.of(resolver("/one"))),
+      ...layers(),
+    ]);
+    const src = () =>
+      cellEl(main, 1, 0).querySelector("img")?.getAttribute("src");
+    expect(src()).toBe("/one/assets/a.png");
+    expect(cellEl(main, 1, 0).querySelector("img")?.getAttribute("alt")).toBe(
+      "x",
+    );
+    main.dispatch({
+      effects: assets.reconfigure(pictureAssets.of(resolver("/two"))),
+    });
+    expect(src()).toBe("/two/assets/a.png");
   });
 });
 
