@@ -21,6 +21,7 @@ pub mod automation;
 pub mod base;
 pub mod config;
 pub mod conventional;
+pub mod desktop_extension;
 pub mod emit;
 pub mod engram;
 pub mod folders;
