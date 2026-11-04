@@ -591,6 +591,35 @@ describe("the GitHub settings screen", () => {
     expect(screen.queryByText(/crystalline github app set/)).toBeNull();
   });
 
+  it.each(["environment", "keyring", "file"])(
+    "claims nothing about the client secret of a refused %s App",
+    async (source) => {
+      serveAs("admin", {
+        "/settings/github": () =>
+          statusPayload({
+            app: {
+              ...APP,
+              app_id: null,
+              client_id: null,
+              slug: null,
+              source,
+              client_secret_set: false,
+              install_url: null,
+              error: "the private key is not valid",
+            },
+          }),
+      });
+      renderApp("/settings/github");
+
+      expect(
+        await screen.findByText("the private key is not valid"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/client secret/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/crystalline github app set/)).toBeNull();
+      expect(screen.queryByText(/CRYSTALLINE_GITHUB_APP/)).toBeNull();
+    },
+  );
+
   it("shows no client secret line while the App is loading", async () => {
     serveAs("admin", {
       "/settings/github": () =>

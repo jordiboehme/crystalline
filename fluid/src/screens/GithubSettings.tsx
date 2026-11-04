@@ -454,6 +454,12 @@ function appLanding(params: URLSearchParams): Notice | null {
  * only an admin sees this line.
  */
 function ClientSecretLine({ app }: { app: GithubApp }) {
+  // An App that is refused or unreadable carries no ids and no secret state:
+  // the secret may well be set, and saving the App again could do harm. The
+  // error beside it says what is wrong, so nothing is claimed here.
+  if (app.error !== null && app.appId === null && app.clientId === null) {
+    return null;
+  }
   if (app.clientSecretSet) {
     return <p className="text-sm">Client secret: set</p>;
   }
