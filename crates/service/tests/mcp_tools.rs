@@ -7938,6 +7938,7 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();

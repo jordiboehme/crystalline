@@ -368,6 +368,7 @@ async fn assert_ada_keeps_her_role(eng: &Engine, title: &str) {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             },
             None,
             &ada_scope(),

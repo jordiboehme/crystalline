@@ -177,6 +177,10 @@ pub enum Play {
     /// its status names no `agent_files` capability, so it cannot take a file
     /// from an agent.
     BeforeAgentFiles,
+    /// A server whose status names this version instead of its own.
+    Version(&'static str),
+    /// A server whose status names no version at all.
+    NoVersion,
     /// A hostile server: every mime it names is `text/html`, and a read
     /// answer lists files with paths no domain may hold.
     BadFiles,
@@ -293,6 +297,12 @@ async fn record_ctl(
             }
             (Play::BeforeAgentFiles, _) => {
                 data.remove("capabilities");
+            }
+            (Play::Version(version), "status") => {
+                data.insert("version".into(), json!(version));
+            }
+            (Play::NoVersion, "status") => {
+                data.remove("version");
             }
             (Play::BadFiles, "file") => {
                 data.insert("mime".into(), json!("text/html"));

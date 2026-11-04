@@ -188,6 +188,7 @@ async fn write_engram_content_with_crlf_is_stored_lf() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();

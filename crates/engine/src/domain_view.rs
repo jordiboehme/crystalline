@@ -2015,6 +2015,34 @@ impl<'a> DomainView<'a> {
         }))
     }
 
+    /// The whole text this view holds at a PATH: the actor's own draft when
+    /// they hold one, `None` where they deleted it, and the base text
+    /// otherwise ([`DomainView::engram_text_at_path`]). The text a read in
+    /// this view hands a checksum out for, which is why a guarded overwrite
+    /// of a draft compares against it.
+    pub(crate) async fn own_text_at_path(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<String>> {
+        if let Some(actor) = self.actor.as_deref() {
+            let held = {
+                let store = self.engine.store();
+                let store = store.lock().await;
+                store.overlay_entry(domain_id, actor, path).await?
+            };
+            match held {
+                Some(entry) if entry.tombstone => return Ok(None),
+                Some(entry) => return Ok(Some(entry.content)),
+                None => {}
+            }
+        }
+        Ok(self
+            .engram_text_at_path(path)
+            .await?
+            .map(|found| found.content))
+    }
+
     /// Whether this reader has deleted the path: `true` only when their own
     /// tombstone stands there.
     ///

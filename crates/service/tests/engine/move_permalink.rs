@@ -631,6 +631,7 @@ async fn virtual_domains_rewrite_at_both_ends() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();
@@ -994,6 +995,7 @@ async fn a_refused_swap_leaves_a_virtual_linker_as_it_was() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();
@@ -1097,6 +1099,7 @@ async fn a_lost_swap_of_a_virtual_linker_is_applied_again() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();

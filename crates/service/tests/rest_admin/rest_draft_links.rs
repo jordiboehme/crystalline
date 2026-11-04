@@ -196,6 +196,7 @@ impl Fixture {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         };
         let receipt = self
             .engine
@@ -1286,6 +1287,7 @@ async fn draft_in(f: &Fixture, account: &str, folder: &str, title: &str, body: &
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             },
             None,
             &as_account(account),
@@ -1467,6 +1469,7 @@ async fn the_join_refusal_names_the_permalink() {
                 overwrite: true,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             },
             None,
             &as_account("alice"),

@@ -4476,6 +4476,7 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();

@@ -40,6 +40,7 @@ fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -1861,6 +1862,7 @@ async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             },
             Some("claude-code/2.0-for-alice"),
             &Scope::User {
