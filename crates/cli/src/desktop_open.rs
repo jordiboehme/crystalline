@@ -15,8 +15,10 @@
 use std::path::Path;
 
 /// The debug build's stand-in for the real open. `fail` refuses every call,
-/// `log:<file>` appends one line per call to `<file>` and succeeds. Empty or
-/// unset is the real open.
+/// `log:<file>` appends one line per call to `<file>` and succeeds, and
+/// `hold:<file>` writes `<file>.held` and then does the same once
+/// `<file>.go` exists (it gives up after [`HOLD_LIMIT`]), so a test can
+/// hold an open and watch what else goes on. Empty or unset is the real open.
 ///
 /// Only a debug build reads it. A test that relies on it must be compiled
 /// only into debug builds, or a release test run opens Claude Desktop.
@@ -60,8 +62,13 @@ pub(crate) fn for_this_process() -> Box<dyn DesktopOpener> {
 enum Seam {
     Fail,
     Log(std::path::PathBuf),
+    Hold(std::path::PathBuf),
     Unknown(String),
 }
+
+/// How long the `hold:` seam waits for its release file.
+#[cfg(debug_assertions)]
+const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(debug_assertions)]
 impl Seam {
@@ -74,6 +81,8 @@ impl Seam {
             Seam::Fail
         } else if let Some(file) = value.strip_prefix("log:") {
             Seam::Log(file.into())
+        } else if let Some(file) = value.strip_prefix("hold:") {
+            Seam::Hold(file.into())
         } else {
             Seam::Unknown(value.to_string())
         })
@@ -89,6 +98,23 @@ impl Seam {
                 .open(log)
                 .and_then(|mut out| writeln!(out, "{verb} {}", file.display()))
                 .map_err(|e| e.to_string()),
+            Seam::Hold(log) => {
+                let beside = |suffix: &str| {
+                    let mut path = log.as_os_str().to_owned();
+                    path.push(suffix);
+                    std::path::PathBuf::from(path)
+                };
+                std::fs::write(beside(".held"), "").map_err(|e| e.to_string())?;
+                let release = beside(".go");
+                let deadline = std::time::Instant::now() + HOLD_LIMIT;
+                while !release.exists() {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the test seam was never released".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Seam::Log(log.clone()).call(verb, file)
+            }
             Seam::Unknown(value) => Err(format!("unknown {TEST_DESKTOP_OPEN_ENV} value '{value}'")),
         }
     }
@@ -272,8 +298,37 @@ mod tests {
             Some(Seam::Log(r"C:\Users\me\open.log".into())),
             "only the first colon separates"
         );
+        assert_eq!(
+            Seam::parse("hold:/tmp/open.log"),
+            Some(Seam::Hold("/tmp/open.log".into()))
+        );
         assert_eq!(Seam::parse(""), None, "empty is the real opener");
         assert_eq!(Seam::parse("yes"), Some(Seam::Unknown("yes".to_string())));
+    }
+
+    /// `hold:<log>` waits for `<log>.go` before it logs, so a test can show
+    /// that something else went on while the open was still held.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_hold_seam_logs_only_once_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("open.log");
+        let seam = Seam::Hold(log.clone());
+        let file = Path::new("/x/crystalline.mcpb");
+        let held = std::thread::spawn(move || seam.open_extension(file));
+        let marker = dir.path().join("open.log.held");
+        while !marker.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!held.is_finished(), "the open waits for the release file");
+        assert!(!log.exists());
+        std::fs::write(dir.path().join("open.log.go"), "").unwrap();
+        held.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("open {}\n", file.display())
+        );
     }
 
     #[cfg(debug_assertions)]

@@ -3,7 +3,8 @@
 //!
 //! Crystalline cannot see what Claude Desktop has installed, so this record
 //! is all it knows: the extension it built (version, pinned binary, launcher
-//! hash, file, time, whether it was opened) and the skill zip it saved.
+//! hash, file, time, whether it was opened), the skill zip it saved and the
+//! version last offered to Claude Desktop.
 //! `doctor` and `uninstall` read it back.
 //!
 //! It is a file of its own, not a row in the install receipt
@@ -32,6 +33,12 @@ pub(crate) struct DesktopRecord {
     /// The skill zip saved last, if any.
     #[serde(default)]
     pub skill: Option<SkillRecord>,
+    /// The Crystalline version whose extension was last handed to Claude
+    /// Desktop, by `install claude-desktop` or by a newer `crystalline mcp`
+    /// offering the update (`desktop_update.rs`). A start at this version
+    /// offers nothing again.
+    #[serde(default)]
+    pub offered: Option<String>,
 }
 
 impl Default for DesktopRecord {
@@ -40,6 +47,7 @@ impl Default for DesktopRecord {
             format: FORMAT,
             extension: None,
             skill: None,
+            offered: None,
         }
     }
 }
@@ -160,6 +168,7 @@ mod tests {
                 file: "/home/Downloads/crystalline-intelligence.zip".to_string(),
                 saved_at: "2026-11-04T10:00:01Z".to_string(),
             }),
+            offered: Some("0.32.0".to_string()),
         }
     }
 

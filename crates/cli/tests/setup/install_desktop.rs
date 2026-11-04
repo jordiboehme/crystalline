@@ -453,6 +453,11 @@ fn the_extension_is_opened_in_claude_desktop() {
         format!("open {}\n", s.bundle().display())
     );
     assert_eq!(s.record()["extension"]["opened"], true);
+    assert_eq!(
+        s.record()["offered"],
+        env!("CARGO_PKG_VERSION"),
+        "an opened extension counts as offered, so a bridge of this version does not offer it again"
+    );
     let out = stdout(&assert);
     assert!(out.contains(OPENED_LINE), "{out}");
     assert!(!out.contains(NO_OPEN_LINE), "{out}");
@@ -475,6 +480,10 @@ fn a_failed_open_prints_the_path_and_the_steps() {
     let assert = s.install_opening(&s.path_env(), "fail").assert().success();
     assert!(s.bundle().is_file());
     assert_eq!(s.record()["extension"]["opened"], false);
+    assert!(
+        s.record()["offered"].is_null(),
+        "a failed open offered nothing"
+    );
     let out = stdout(&assert);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(

@@ -67,11 +67,73 @@ pub(crate) struct DesktopInstallOptions {
 }
 
 /// What a run did with the extension.
-struct BuiltExtension {
-    file: String,
-    binary: String,
-    opened: bool,
-    open_error: Option<String>,
+pub(crate) struct BuiltExtension {
+    /// Where the `.mcpb` was written.
+    pub file: String,
+    /// The binary pinned in its manifest.
+    pub binary: String,
+    /// Whether Claude Desktop took the file.
+    pub opened: bool,
+    /// Why the open failed, when it was tried and failed.
+    pub open_error: Option<String>,
+    /// A notice about the pinned path, for the caller to pass on.
+    pub warning: Option<String>,
+}
+
+/// Build the extension at this version into the pinned path, hand it to
+/// Claude Desktop when `open` is set, and put what was done into `record`
+/// (in memory: the caller saves it). An open that worked also sets
+/// `record.offered` to this version. `keep` is a binary path kept while it
+/// still names an executable crystalline (see `resolve_program`). Nothing
+/// is printed, so the MCP bridge can call this too (`desktop_update.rs`).
+pub(crate) fn build_extension(
+    record: &mut DesktopRecord,
+    keep: Option<&str>,
+    open: bool,
+) -> anyhow::Result<BuiltExtension> {
+    let path = std::env::var_os("PATH");
+    let resolved = resolve_program(
+        "Claude Desktop",
+        CommandSpelling::AbsolutePathEntry,
+        path.as_deref(),
+        keep,
+    );
+    let file = desktop_record::bundle_path()?;
+    let zip = pack(&files(
+        Bundle::Hollow {
+            binary: Some(&resolved.program),
+        },
+        VERSION,
+    ))
+    .context("could not pack the Claude Desktop extension")?;
+    desktop_record::write_replacing(&file, &zip)
+        .with_context(|| format!("could not write {}", file.display()))?;
+    let open_error = if open {
+        crate::desktop_open::for_this_process()
+            .open_extension(&file)
+            .err()
+    } else {
+        None
+    };
+    let built = BuiltExtension {
+        file: file.display().to_string(),
+        binary: resolved.program,
+        opened: open && open_error.is_none(),
+        open_error,
+        warning: resolved.warning,
+    };
+    record.extension = Some(ExtensionRecord {
+        version: VERSION.to_string(),
+        binary: built.binary.clone(),
+        shim_sha256: shim_sha256(),
+        file: built.file.clone(),
+        built_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        opened: built.opened,
+    });
+    if built.opened {
+        record.offered = Some(VERSION.to_string());
+    }
+    Ok(built)
 }
 
 /// Run `crystalline install claude-desktop`.
@@ -94,45 +156,8 @@ pub(crate) fn run_install(opts: DesktopInstallOptions, json: bool) -> anyhow::Re
     let mut extension = None;
 
     if !opts.skip_extension {
-        let path = std::env::var_os("PATH");
-        let resolved = resolve_program(
-            "Claude Desktop",
-            CommandSpelling::AbsolutePathEntry,
-            path.as_deref(),
-            None,
-        );
-        notices.extend(resolved.warning);
-        let file = desktop_record::bundle_path()?;
-        let zip = pack(&files(
-            Bundle::Hollow {
-                binary: Some(&resolved.program),
-            },
-            VERSION,
-        ))
-        .context("could not pack the Claude Desktop extension")?;
-        desktop_record::write_replacing(&file, &zip)
-            .with_context(|| format!("could not write {}", file.display()))?;
-        let open_error = if opts.open {
-            crate::desktop_open::for_this_process()
-                .open_extension(&file)
-                .err()
-        } else {
-            None
-        };
-        let built = BuiltExtension {
-            file: file.display().to_string(),
-            binary: resolved.program,
-            opened: opts.open && open_error.is_none(),
-            open_error,
-        };
-        record.extension = Some(ExtensionRecord {
-            version: VERSION.to_string(),
-            binary: built.binary.clone(),
-            shim_sha256: shim_sha256(),
-            file: built.file.clone(),
-            built_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            opened: built.opened,
-        });
+        let built = build_extension(&mut record, None, opts.open)?;
+        notices.extend(built.warning.clone());
         extension = Some(built);
     }
 

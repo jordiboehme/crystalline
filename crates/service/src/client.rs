@@ -166,6 +166,11 @@ fn resolve_harness_gate_at(harness: Option<&str>, receipt: &Path) -> HarnessGate
 /// takeover after an upgrade, a crash): it reconnects, replays the MCP
 /// handshake and continues the session, so the harness never sees its stdio
 /// transport die just because the daemon was replaced.
+///
+/// `update_offered` says this Crystalline has offered the Claude Desktop
+/// extension update (the CLI decides that before it calls this), so a too old
+/// launcher's note asks the user to confirm the update dialog.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mcp(
     embedded: bool,
     db: Option<&Path>,
@@ -174,6 +179,7 @@ pub async fn run_mcp(
     harness: Option<&str>,
     unattended: bool,
     run_domain: Option<&str>,
+    update_offered: bool,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
@@ -263,7 +269,16 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                return pump_stdio(stream, stdin, db, config_path, read_only, harness_gate).await;
+                return pump_stdio(
+                    stream,
+                    stdin,
+                    db,
+                    config_path,
+                    read_only,
+                    harness_gate,
+                    update_offered,
+                )
+                .await;
             }
             Err(e) if packaged => {
                 let bridge = crate::daemon_task::BridgeFailure::of(&e);
@@ -326,6 +341,11 @@ pub const MINIMUM_LAUNCHER: (u32, u32, u32) = (0, 24, 0);
 /// that started it is older than [`MINIMUM_LAUNCHER`].
 const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to run `crystalline install claude-desktop` in a terminal, then confirm the install dialog in Claude Desktop.";
 
+/// The launcher note when this Crystalline has offered the extension update
+/// in Claude Desktop (the CLI does that when `install claude-desktop` once
+/// built the extension, see `desktop_update.rs` in the CLI crate).
+const LAUNCHER_OFFERED_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Crystalline offered the extension update in Claude Desktop. Ask the user to confirm the update dialog there. If no dialog shows, ask them to run `crystalline install claude-desktop` in a terminal.";
+
 /// The numeric triple of a launcher version such as `0.25.1` or
 /// `0.26.0-rc.1`, read like the launcher's own `parseVersion`: a pre-release
 /// suffix is dropped. `None` for anything else.
@@ -364,12 +384,30 @@ fn launcher_too_old(env_value: Option<&str>, channel: Option<&str>) -> bool {
     version < MINIMUM_LAUNCHER
 }
 
+/// The launcher note for a launcher of `env_value` on `channel`: none when
+/// it is not too old, else [`LAUNCHER_OFFERED_NOTE`] when `update_offered`
+/// and [`LAUNCHER_NOTE`] otherwise.
+fn launcher_note(
+    env_value: Option<&str>,
+    channel: Option<&str>,
+    update_offered: bool,
+) -> Option<&'static str> {
+    if !launcher_too_old(env_value, channel) {
+        return None;
+    }
+    Some(if update_offered {
+        LAUNCHER_OFFERED_NOTE
+    } else {
+        LAUNCHER_NOTE
+    })
+}
+
 /// The note to add to this session's onboarding instructions, read once from
 /// this process's environment when the bridge starts.
-fn launcher_note_from_env() -> Option<&'static str> {
+fn launcher_note_from_env(update_offered: bool) -> Option<&'static str> {
     let version = std::env::var(overlay::LAUNCHER_VERSION_ENV).ok();
     let channel = std::env::var(overlay::CHANNEL_ENV).ok();
-    launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
+    launcher_note(version.as_deref(), channel.as_deref(), update_offered)
 }
 
 /// How long the bridge waits for the daemon's `status` behind the split
@@ -702,12 +740,16 @@ async fn pump_stdio<R>(
     config_path: Option<&Path>,
     read_only: bool,
     harness_gate: HarnessGate,
+    update_offered: bool,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: onboarding_note(launcher_note_from_env(), split_note_here().await),
+        launcher_note: onboarding_note(
+            launcher_note_from_env(update_offered),
+            split_note_here().await,
+        ),
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();
@@ -2837,8 +2879,10 @@ async fn ctl_exchange(conn: Connection, cmd: Value) -> anyhow::Result<Value> {
 }
 
 /// The `crystalline mcp` client's log: stderr only, since stdout is the MCP
-/// stdio stream, filtered by RUST_LOG with a default of `warn`.
-fn init_tracing() {
+/// stdio stream, filtered by RUST_LOG with a default of `warn`. A second
+/// call keeps the first subscriber, so a caller that logs before
+/// [`run_mcp`] can call it first.
+pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -3153,6 +3197,20 @@ mod tests {
             assert!(!launcher_too_old(Some("0.1.0"), channel), "{channel:?}");
             assert!(!launcher_too_old(None, channel), "{channel:?}");
         }
+    }
+
+    #[test]
+    fn the_launcher_note_says_when_the_update_was_offered() {
+        assert_eq!(
+            launcher_note(Some("0.23.0"), Some("desktop"), false),
+            Some(LAUNCHER_NOTE)
+        );
+        assert_eq!(
+            launcher_note(Some("0.23.0"), Some("desktop"), true),
+            Some(LAUNCHER_OFFERED_NOTE)
+        );
+        assert_eq!(launcher_note(Some("0.25.1"), Some("desktop"), true), None);
+        assert_eq!(launcher_note(Some("0.23.0"), Some("mcpb"), true), None);
     }
 
     const LAUNCHER_INIT: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;
