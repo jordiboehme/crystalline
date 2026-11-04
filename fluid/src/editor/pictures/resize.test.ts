@@ -5,6 +5,7 @@
  * judged (solo, in a room, hidden and show mode).
  */
 
+import { EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
@@ -190,6 +191,7 @@ describe.each([
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
     );
     expect(image?.style.width).toBe(was);
+    expect(box(view).dataset["resizing"]).toBeUndefined();
     pointer(document, "pointerup", 220);
     expect(bytes(view.state)).toBe(PAGE);
   });
@@ -245,3 +247,169 @@ describe.each([
     expect(box(view).querySelector(".cm-picture-handle")).toBeNull();
   });
 });
+
+/** The element the image's percent width is a share of, as the code picks it. */
+function container(view: EditorView): HTMLElement {
+  const picture = box(view);
+  const found = picture.classList.contains("cm-picture-block")
+    ? picture
+    : picture.closest<HTMLElement>(".cm-line");
+  if (!found) throw new Error("no containing block");
+  return found;
+}
+
+/** Gives the containing block a width and a horizontal padding of `pad` each side. */
+function pad(view: EditorView, width: number, each: number): void {
+  const element = container(view);
+  Object.defineProperty(element, "clientWidth", {
+    configurable: true,
+    value: width,
+  });
+  element.style.paddingLeft = `${String(each)}px`;
+  element.style.paddingRight = `${String(each)}px`;
+}
+
+describe("the percent base is the image's containing block (P41)", () => {
+  const cases: [string, string, Mode][] = [
+    ["a list item", "- item ![x](assets/p.png#right,w=50%) end\n", "hidden"],
+    ["a quote", "> quoted ![x](assets/p.png#right,w=50%) end\n", "hidden"],
+    ["a plain line", "Intro ![x](assets/p.png#right,w=50%) end\n", "hidden"],
+  ];
+  it.each(cases)(
+    "%s: the written share is of its padded width",
+    (_n, doc, mode) => {
+      const view = build(doc, mode, false);
+      selectPicture(view, "![x](assets/p.png#right,w=50%)");
+      layout(view, 200);
+      pad(view, 400, 15);
+      // The base is 370: 200 + 100 pixels is 81 percent, not the 75 of 400.
+      drag(view, "se", [200]);
+      expect(bytes(view.state)).toBe(doc.replace("w=50%", "w=81%"));
+    },
+  );
+
+  it("a block picture is a share of its own box less its padding", () => {
+    const doc = "Intro.\n\n![x](assets/p.png#right,w=50%)\n\nEnd.\n";
+    const view = build(doc, "show", false);
+    const ref = "![x](assets/p.png#right,w=50%)";
+    view.dispatch({ selection: { anchor: doc.indexOf(ref) + ref.length } });
+    expect(box(view).classList.contains("cm-picture-block")).toBe(true);
+    selectPicture(view, ref);
+    layout(view, 200);
+    pad(view, 400, 12);
+    drag(view, "se", [200]);
+    expect(bytes(view.state)).toBe(doc.replace("w=50%", "w=80%"));
+  });
+});
+
+describe("a drag follows the picture and its peers", () => {
+  it("a centered picture grows on both sides, so the handle follows the pointer", () => {
+    const doc = "Intro ![x](assets/p.png#w=50%) words.\n";
+    const view = build(doc, "hidden", false);
+    selectPicture(view, "![x](assets/p.png#w=50%)");
+    layout(view, 200);
+    const image = box(view).querySelector("img");
+    drag(view, "se", [150], false);
+    // 50 pixels of pointer is 50 pixels at each edge.
+    expect(image?.style.width).toBe("300px");
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(doc.replace("w=50%", "w=75%"));
+  });
+
+  it("an unchanged share writes nothing even when the pixels moved", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    const steps = undoSteps(view);
+    // 201 of 400 pixels still rounds to 50.
+    drag(view, "se", [101]);
+    expect(bytes(view.state)).toBe(PAGE);
+    expect(undoSteps(view)).toBe(steps);
+  });
+
+  it("setState ends the drag and puts the inline width back", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    const image = box(view).querySelector("img");
+    const was = image?.style.width;
+    drag(view, "se", [150, 220], false);
+    expect(image?.style.width).toBe("320px");
+    view.setState(EditorState.create({ doc: PAGE, extensions: [] }));
+    expect(image?.style.width).toBe(was);
+  });
+
+  it("a deleted picture ends the drag with nothing written", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    drag(view, "se", [150], false);
+    const from = PAGE.indexOf(P);
+    view.dispatch({ changes: { from, to: from + P.length } });
+    const after = bytes(view.state);
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(after);
+  });
+
+  it("a picture a peer turned into an external one is not resized", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    drag(view, "se", [150], false);
+    const from = PAGE.indexOf("assets/p.png#right,w=50%");
+    view.dispatch({
+      changes: {
+        from,
+        to: from + "assets/p.png#right,w=50%".length,
+        insert: "https://example.com/p.png",
+      },
+    });
+    const after = bytes(view.state);
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(after);
+  });
+
+  it("a drawn picture taken out of the page by an update ends the drag with nothing written", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    drag(view, "se", [150], false);
+    // What a redraw into a new element does to the one the drag holds.
+    box(view).remove();
+    view.dispatch({ changes: { from: 0, insert: "Peer. " } });
+    const after = bytes(view.state);
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(after);
+  });
+
+  it("a peer's alt edit keeps the drag going", () => {
+    const view = build(PAGE, "hidden", false);
+    selectPicture(view, P);
+    layout(view, 200);
+    drag(view, "se", [150], false);
+    const at = PAGE.indexOf("![x]") + 2;
+    view.dispatch({ changes: { from: at, insert: "long" } });
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(
+      at_(PAGE, "![longx](assets/p.png#right,w=63%)"),
+    );
+  });
+
+  it("a peer's change of alignment mid-drag keeps the drag and the write follows it", () => {
+    const view = build(PAGE, "hidden", true);
+    selectPicture(view, P);
+    layout(view, 200);
+    const image = box(view).querySelector("img");
+    drag(view, "se", [150], false);
+    const at = PAGE.indexOf("#right") + 1;
+    view.dispatch({ changes: { from: at, to: at + 5, insert: "left" } });
+    expect(box(view).querySelector("img")).toBe(image);
+    expect(image?.style.width).toBe("250px");
+    pointer(document, "pointerup", 150);
+    expect(bytes(view.state)).toBe(at_(PAGE, "![x](assets/p.png#left,w=63%)"));
+  });
+});
+
+function at_(page: string, replacement: string): string {
+  return page.replace(P, replacement);
+}

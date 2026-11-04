@@ -214,12 +214,25 @@ class PictureWidget extends WidgetType {
       ...(this.selected ? ["cm-picture-selected"] : []),
     ].join(" ");
     const image = box.querySelector("img");
+    // A resize drag keeps its live width and its handles through a repaint
+    // (a peer's change to the format, say); `dataset.width` is the width
+    // the format asks for, which the drag puts back when it ends.
+    const dragging = box.dataset["resizing"] === "true";
     if (image) {
+      const live = image.style.width;
       image.removeAttribute("style");
       Object.assign(
         image.style,
         imageStyle(this.kind === "attachment" ? this.format : CENTERED),
       );
+      box.dataset["width"] = image.style.width;
+      if (dragging) {
+        image.style.width = live;
+      }
+    }
+    if (dragging) {
+      placeHandles(box);
+      return;
     }
     for (const handle of box.querySelectorAll(".cm-picture-handle")) {
       handle.remove();

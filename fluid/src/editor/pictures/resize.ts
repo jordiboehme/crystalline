@@ -37,6 +37,10 @@ interface Drag {
   handle: HTMLElement;
   /** Whether the handle is on the east side: growing to the right. */
   east: boolean;
+  /** How far the image grows per pixel of pointer: 2 when it grows on both sides. */
+  gain: number;
+  /** The share the picture is written with now, if it is a percent. */
+  current: number | null;
   startX: number;
   startWidth: number;
   column: number;
@@ -47,13 +51,33 @@ interface Drag {
   width: number;
 }
 
-/** The content column's width: `contentDOM` less its horizontal padding. */
-function columnWidth(content: HTMLElement): number {
-  const style = content.ownerDocument.defaultView?.getComputedStyle(content);
+/** The share a written width is, when it is a percent. */
+function percentOf(width: string | undefined): number | null {
+  if (width === undefined || !width.endsWith("%")) return null;
+  const share = Number.parseFloat(width);
+  return Number.isFinite(share) ? share : null;
+}
+
+/** The content width of `element`: its width less its horizontal padding. */
+function contentWidth(element: HTMLElement): number {
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
   const pad =
     (Number.parseFloat(style?.paddingLeft ?? "") || 0) +
     (Number.parseFloat(style?.paddingRight ?? "") || 0);
-  return content.clientWidth - pad;
+  return element.clientWidth - pad;
+}
+
+/**
+ * The width `w=N%` is a share of (P41): the content box of the image's
+ * containing block, which is the block picture's own box and for a picture
+ * in a line the line. The editor column stands in where no layout says.
+ */
+function columnWidth(content: HTMLElement, box: HTMLElement): number {
+  const container = box.classList.contains("cm-picture-block")
+    ? box
+    : box.closest<HTMLElement>(".cm-line");
+  const width = container ? contentWidth(container) : 0;
+  return width > 0 ? width : contentWidth(content);
 }
 
 const resizeListeners = ViewPlugin.fromClass(
@@ -76,7 +100,7 @@ const resizeListeners = ViewPlugin.fromClass(
       const image = box.querySelector("img");
       const ref = pictureOfElement(this.view, box);
       if (!image || ref === null || ref.kind !== "attachment") return;
-      const column = columnWidth(this.view.contentDOM);
+      const column = columnWidth(this.view.contentDOM, box);
       if (!(column > 0)) return;
       // The press is the handle's: no selection change, no drag of the
       // picture, no text selection.
@@ -88,6 +112,7 @@ const resizeListeners = ViewPlugin.fromClass(
         // The pointer is gone already: the release below never comes either.
       }
       const startWidth = image.getBoundingClientRect().width;
+      box.dataset["resizing"] = "true";
       this.drag = {
         box,
         image,
@@ -95,6 +120,9 @@ const resizeListeners = ViewPlugin.fromClass(
         pointerId: event.pointerId,
         handle,
         east: handle.dataset["corner"]?.endsWith("e") === true,
+        gain:
+          ref.format?.align === "left" || ref.format?.align === "right" ? 1 : 2,
+        current: percentOf(ref.format?.width),
         startX: event.clientX,
         startWidth,
         column,
@@ -114,7 +142,7 @@ const resizeListeners = ViewPlugin.fromClass(
       const drag = this.drag;
       if (drag === null || event.pointerId !== drag.pointerId) return;
       const delta = event.clientX - drag.startX;
-      const wanted = drag.startWidth + (drag.east ? delta : -delta);
+      const wanted = drag.startWidth + drag.gain * (drag.east ? delta : -delta);
       const low = (drag.column * MIN_PERCENT) / 100;
       drag.width = Math.min(drag.column, Math.max(low, wanted));
       drag.image.style.width = `${String(drag.width)}px`;
@@ -128,8 +156,13 @@ const resizeListeners = ViewPlugin.fromClass(
         MAX_PERCENT,
         Math.max(MIN_PERCENT, Math.round((drag.width / drag.column) * 100)),
       );
-      drag.image.style.width = drag.inline;
-      if (Math.round(drag.width) === Math.round(drag.startWidth)) return;
+      this.restore(drag);
+      if (
+        Math.round(drag.width) === Math.round(drag.startWidth) ||
+        percent === drag.current
+      ) {
+        return;
+      }
       const ref = pictureAt(this.view.state, drag.from + 1);
       if (
         ref?.from !== drag.from ||
@@ -158,12 +191,18 @@ const resizeListeners = ViewPlugin.fromClass(
       const drag = this.drag;
       if (drag === null) return;
       this.end();
-      drag.image.style.width = drag.inline;
+      this.restore(drag);
       try {
         drag.handle.releasePointerCapture(drag.pointerId);
       } catch {
         // Not captured any more.
       }
+    }
+
+    /** Puts the width the format asks for back on the image. */
+    restore(drag: Drag): void {
+      delete drag.box.dataset["resizing"];
+      drag.image.style.width = drag.box.dataset["width"] ?? drag.inline;
     }
 
     /** Forgets the drag and its listeners. */
