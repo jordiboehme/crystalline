@@ -44,7 +44,7 @@ import {
 import { cellForwarding } from "./grid/cellEditor";
 import { codeLanguageFor, languageOf } from "./codeLanguage";
 import { toggleLinePrefix } from "./toolbar";
-import { parsedState } from "../test/parse";
+import { parsedState, parsedView } from "../test/parse";
 
 afterEach(() => {
   cleanupMarkViews();
@@ -891,5 +891,55 @@ describe("words the old fuzzy lookup found and the exact one keeps", () => {
       if (old?.name !== languageOf(word)?.name) differ.push(word);
     }
     expect(differ).toEqual([]);
+  });
+});
+
+/**
+ * A commit whose own parse fell short (D64). On a busy machine the commit's
+ * parse slice stopped before the box, so the filter that keeps a caret off
+ * a hidden fence line saw no hidden line and let the caret rest on the
+ * fence. When the parse moves on and hides that line, the caret goes into
+ * the box, as after a peer's change. A clock that jumps a second at every
+ * look gives the commit's parse one step at any load.
+ */
+describe("the caret after a commit whose parse fell short (D64)", () => {
+  it("goes into the box once the parse hides its fence line", async () => {
+    const above = Array.from(
+      { length: 200 },
+      (_, i) => `Paragraph ${String(i)} of the page.`,
+    ).join("\n\n");
+    const text = `${above}\n\n${DOC}`;
+    const fence = text.indexOf("```ts");
+    const view = markView(text, { onElementEdit: () => {} });
+    setCaret(view, fence + 6);
+    requestElementEdit(view, {
+      kind: "language",
+      at: fence,
+      rect: new DOMRect(),
+    });
+    const now = Date.now.bind(Date);
+    let ahead = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1_000;
+      return now() + ahead;
+    });
+    try {
+      expect(
+        commitElementEdit(view, (state, edit) =>
+          edit.kind === "language"
+            ? languageChanges(state, edit.at, "py")
+            : null,
+        ),
+      ).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
+    // The commit's tree stops short of the box: the caret is on its fence.
+    expect(syntaxTree(view.state).length).toBeLessThan(fence);
+    expect(view.state.doc.lineAt(caret(view)).text).toBe("```py");
+    // The parse moves on, as the worker publishes it.
+    parsedView(view);
+    await Promise.resolve();
+    expect(view.state.doc.lineAt(caret(view)).text).toBe("x");
   });
 });

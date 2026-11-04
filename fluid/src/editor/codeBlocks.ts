@@ -529,16 +529,20 @@ const caretOffFenceLines = EditorState.transactionFilter.of((tr) => {
 });
 
 /**
- * After a change that set no selection (a peer's edit, a room undo) left the
- * caret on a hidden fence line, a follow-up moves it into the box: a
+ * After a change that set no selection (a peer's edit, a room undo), or a
+ * parse that moved on and hid the line (D64), left the caret on a hidden
+ * fence line, a follow-up moves it into the box: a
  * selection only, kept out of the undo history, so any write of the
  * person's (typing, a toolbar or slash verb, an insert) starts inside the
  * box. The remote transaction itself is never changed.
  */
 const caretIntoBoxAfterRemote = ViewPlugin.define((view) => ({
   update(update: ViewUpdate) {
+    // A parse that moved on can hide the fence line a caret already rests
+    // on: a commit whose own parse stopped short of the box set the caret
+    // there while the line was not hidden yet (D64).
     if (
-      !update.docChanged ||
+      !(update.docChanged || parseAdvanced(update)) ||
       update.transactions.some((tr) => tr.selection !== undefined)
     ) {
       return;
