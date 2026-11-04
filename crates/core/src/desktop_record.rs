@@ -5,7 +5,8 @@
 //! is all it knows: the extension it built (version, pinned binary, launcher
 //! hash, file, time, whether it was opened), the skill zip it saved and the
 //! version last offered to Claude Desktop. `doctor` and `uninstall` read it
-//! back, and the extension update (`desktop_offer`) keeps it current.
+//! back, and the extension update (the service crate's `desktop_offer`) keeps
+//! it current.
 //!
 //! It is a file of its own, not a row in the install receipt
 //! (`installs.json`), because an older binary rewriting the receipt would

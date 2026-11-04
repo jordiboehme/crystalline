@@ -22,8 +22,6 @@ pub mod base;
 pub mod config;
 pub mod conventional;
 pub mod desktop_extension;
-pub mod desktop_offer;
-pub mod desktop_open;
 pub mod desktop_record;
 pub mod emit;
 pub mod engram;

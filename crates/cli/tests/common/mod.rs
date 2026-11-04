@@ -63,8 +63,9 @@ pub fn fixtures_dir() -> PathBuf {
 ///
 /// `CRYSTALLINE_TEST_DESKTOP_OPEN=fail` is the debug build's stand-in for
 /// opening a file in Claude Desktop (`desktop_open::for_this_process` in the
-/// CLI). Without it `install claude-desktop` would open the real Claude
-/// Desktop and show its install dialog. A test that wants the open to work
+/// service crate). Without it `install claude-desktop`, or a bridge or a
+/// daemon that offers the extension update, would open the real Claude
+/// Desktop and show its dialog. A test that wants the open to work
 /// sets `log:<file>` after [`isolate`], which records each open instead.
 ///
 /// `HF_ENDPOINT` points the model downloader at [`NO_HUB`], so a child that

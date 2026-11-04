@@ -589,6 +589,16 @@ mod desktop_offer {
         serde_json::from_str(&std::fs::read_to_string(record_file(home)).unwrap()).unwrap()
     }
 
+    /// Stops the daemon the `serve` task seam started under its home when
+    /// it drops, so a failed assert leaves nothing running either.
+    struct StopsDaemon<'a>(&'a Path);
+
+    impl Drop for StopsDaemon<'_> {
+        fn drop(&mut self) {
+            stop_daemon(self.0);
+        }
+    }
+
     fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !check() {
@@ -620,6 +630,7 @@ mod desktop_offer {
     fn a_packaged_bridge_has_the_daemon_offer_the_update_once() {
         let home = short_home();
         plant(home.path());
+        let _stops = StopsDaemon(home.path());
         let log = home.path().join("open.log");
         let seam = format!("log:{}", log.display());
 
@@ -639,7 +650,6 @@ mod desktop_offer {
         assert_eq!(record(home.path())["extension"]["version"], VERSION);
 
         let second = instructions(home.path(), &seam);
-        stop_daemon(home.path());
         assert!(second.ends_with(&format!("\n\n{OFFERED_NOTE}")), "{second}");
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().lines().count(),
@@ -652,6 +662,7 @@ mod desktop_offer {
     fn a_failed_open_in_the_daemon_keeps_the_record_and_the_note() {
         let home = short_home();
         plant(home.path());
+        let _stops = StopsDaemon(home.path());
         let before = std::fs::read(record_file(home.path())).unwrap();
 
         // The daemon logs to nothing here, so the seam says when it refused.
@@ -668,7 +679,6 @@ mod desktop_offer {
         assert_eq!(std::fs::read(record_file(home.path())).unwrap(), before);
 
         let second = instructions(home.path(), &seam);
-        stop_daemon(home.path());
         assert!(
             second.ends_with(&format!("\n\n{LAUNCHER_NOTE}")) && !second.contains(OFFERED_NOTE),
             "a failed open is never called offered: {second}"

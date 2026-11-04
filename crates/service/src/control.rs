@@ -8,8 +8,8 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, domain_register, routing_config, maintenance_stamp, forget_domain,
-//! forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! provision, domain_register, routing_config, maintenance_stamp, desktop_offer,
+//! forget_domain, forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
@@ -1029,7 +1029,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, \
+                 desktop_offer, forget_domain or shutdown"
             )),
             false,
         ),

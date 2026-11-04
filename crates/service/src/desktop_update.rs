@@ -5,7 +5,7 @@
 //! `CRYSTALLINE_LAUNCHER_VERSION`, with `CRYSTALLINE_CHANNEL=desktop`. When
 //! this binary is newer, Claude Desktop runs an old extension after an
 //! upgrade, and the update is offered
-//! ([`crystalline_core::desktop_offer::offer_update`]: same builder as
+//! ([`crate::desktop_offer::offer_update`]: same builder as
 //! `install claude-desktop`, once per version, one offer at a time). The
 //! "Claude Desktop only" bundle starts this binary with the channel `mcpb`
 //! and no launcher, so it never gets here.
@@ -32,9 +32,9 @@
 use serde_json::{Value, json};
 
 use crystalline_core::VERSION;
-use crystalline_core::desktop_offer::{self, Offered};
-use crystalline_core::desktop_open;
 
+use crate::desktop_offer::{self, Offered};
+use crate::desktop_open;
 use crate::overlay::{CHANNEL_ENV, LAUNCHER_VERSION_ENV};
 
 /// The control command a packaged bridge sends the daemon.
@@ -99,10 +99,12 @@ fn offer_and_log(launcher: &str) {
     }
 }
 
-/// The daemon's answer to `desktop_offer`: `{"offer": "nothing"}` or
-/// `"already"` from the record, else `"started"` with the offer running on
-/// a thread of its own, so the answer comes at once. The daemon checks the
-/// record itself; the bridge only names its launcher's version.
+/// The daemon's answer to `desktop_offer`, one of three words. `nothing`:
+/// the extension is not older, this is not macOS or Windows, or there is
+/// no record of an extension. `already`: the record shows this version as
+/// offered. `started`: the offer runs on a thread of its own, so the
+/// answer comes at once. Only `started` starts a thread. The daemon checks
+/// the record itself; the bridge only names its launcher's version.
 pub(crate) fn answer_ctl(req: &Value) -> Result<Value, String> {
     let launcher = req
         .get("launcher")
@@ -110,11 +112,15 @@ pub(crate) fn answer_ctl(req: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("{DESKTOP_OFFER_COMMAND} needs the launcher version"))?;
     let answer = if !desktop_os() || !desktop_offer::is_newer(VERSION, launcher) {
         "nothing"
-    } else if desktop_offer::offered_already() {
-        "already"
     } else {
-        offer_on_thread(launcher.to_string());
-        "started"
+        match desktop_offer::recorded_now() {
+            Some(Offered::Already) => "already",
+            Some(_) => "nothing",
+            None => {
+                offer_on_thread(launcher.to_string());
+                "started"
+            }
+        }
     };
     Ok(json!({ "offer": answer }))
 }

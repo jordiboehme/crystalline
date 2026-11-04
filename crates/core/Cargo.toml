@@ -35,10 +35,9 @@ whoami = { workspace = true }
 zip = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# The roaming folder from the known-folder API (`config::roaming_root`), and
-# `desktop_open.rs` handing the Claude Desktop extension to the shell
-# (ShellExecuteW, with COM set up first for a shell-extension handler).
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# The roaming folder from the known-folder API (`config::roaming_root`): the
+# same three features etcetera already enables, so nothing new is built.
+windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 insta = { workspace = true }

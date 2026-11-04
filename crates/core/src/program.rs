@@ -4,7 +4,7 @@
 //! that lacks `crystalline`, so what they run is named by an absolute path.
 //! [`resolve_program`] picks that path; `install` uses it for the profile
 //! harnesses and for the Claude Desktop extension, and the extension update
-//! (`desktop_offer`) uses it with the binary the record pins.
+//! (the service crate's `desktop_offer`) uses it with the binary the record pins.
 
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};

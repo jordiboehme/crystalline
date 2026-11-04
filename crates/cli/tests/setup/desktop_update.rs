@@ -383,3 +383,21 @@ fn a_held_offer_lock_makes_a_second_bridge_do_nothing() {
     assert_eq!(std::fs::read(s.record_file()).unwrap(), before);
     s.assert_old_bundle_kept();
 }
+
+/// An offer that died after it moved the old bundle aside left it at
+/// `.previous` with nothing at the pinned path. The next offer puts it back
+/// before anything else, so even when that offer fails too the old bundle
+/// is where it belongs.
+#[test]
+fn the_leftover_of_a_dead_offer_comes_back_first() {
+    let s = Setup::new();
+    let aside = s.bundle().with_extension("mcpb.previous");
+    std::fs::rename(s.bundle(), &aside).unwrap();
+    let before = std::fs::read(s.record_file()).unwrap();
+    let mut bridge = s.bridge("fail", None);
+    assert!(bridge.initialize()["result"].is_object());
+    bridge.wait_for_log(FAILED);
+    bridge.finish();
+    s.assert_old_bundle_kept();
+    assert_eq!(std::fs::read(s.record_file()).unwrap(), before);
+}

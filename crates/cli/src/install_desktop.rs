@@ -7,21 +7,21 @@
 //! extension is the launcher-only bundle from
 //! [`crystalline_core::desktop_extension`], with the crystalline that
 //! `resolve_program` finds on PATH (or this binary) pinned in its manifest,
-//! built by `crystalline_core::desktop_offer::build_extension`, which the
+//! built by `crystalline_service::desktop_offer::build_extension`, which the
 //! extension update uses too.
 //! It is written to `<state_dir>/claude-desktop/crystalline.mcpb` and
 //! remembered in `<state_dir>/claude-desktop.json` (`crystalline_core::desktop_record`).
 //! Unless `--no-open` is given, the file is then handed to Claude Desktop
-//! (`crystalline_core::desktop_open`), which shows its install dialog.
+//! (`crystalline_service::desktop_open`), which shows its install dialog.
 //!
 //! Crystalline cannot see what Claude Desktop installed, so every run builds
 //! the extension again and the record says only what this command did last.
 
 use serde_json::{Value, json};
 
-use crystalline_core::desktop_offer::{BuiltExtension, build_extension};
-use crystalline_core::desktop_open;
 use crystalline_core::desktop_record::{self, DesktopRecord};
+use crystalline_service::desktop_offer::{BuiltExtension, build_extension};
+use crystalline_service::desktop_open;
 
 /// The Crystalline version this binary builds the extension for.
 const VERSION: &str = env!("CARGO_PKG_VERSION");

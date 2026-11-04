@@ -2,9 +2,10 @@
 //! Crystalline runs under an older extension.
 //!
 //! [`build_extension`] is what `crystalline install claude-desktop` does:
-//! pack the hollow extension at this version ([`crate::desktop_extension`]),
-//! write it to the pinned path, hand it to Claude Desktop when asked, and
-//! put it into the record ([`crate::desktop_record`]).
+//! pack the hollow extension at this version
+//! ([`crystalline_core::desktop_extension`]), write it to the pinned path,
+//! hand it to Claude Desktop when asked, and put it into the record
+//! ([`crystalline_core::desktop_record`]).
 //!
 //! [`offer_update`] is the same build for a running Crystalline whose
 //! extension is older: the extension's launcher passes its own version on,
@@ -19,6 +20,17 @@
 //! open, and a second caller that finds it held does nothing. The lock is
 //! the operating system's, so a process that dies lets go of it.
 //!
+//! The bundle that was at the pinned path is moved to `<bundle>.previous`
+//! for the build and put back when the build or the open fails. A process
+//! that dies in between (a bridge that exits, a daemon that stops) leaves
+//! `.previous` behind; the next offer settles it first, under the lock
+//! (`settle_leftover`), so the old bundle is never lost.
+//!
+//! This module lives in the service crate, beside the opener
+//! ([`crate::desktop_open`]), because both spawn processes and call the
+//! shell; core keeps the format parts. The CLI's `install claude-desktop`
+//! and the daemon both reach it here.
+//!
 //! The MCP bridge calls [`offer_update`] itself on macOS and outside an app
 //! package; inside Claude Desktop's package on Windows it asks the daemon,
 //! which runs outside the package, to call it (the `desktop_offer` control
@@ -28,13 +40,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::CommandSpelling;
-use crate::VERSION;
-use crate::desktop_extension::{Bundle, files, pack, shim_sha256};
+use crystalline_core::desktop_extension::{Bundle, files, is_complete, pack, shim_sha256};
+use crystalline_core::desktop_record::{self, DesktopRecord, ExtensionRecord};
+use crystalline_core::program::resolve_program;
+use crystalline_core::version::version_at_least;
+use crystalline_core::{CommandSpelling, VERSION};
+
 use crate::desktop_open::DesktopOpener;
-use crate::desktop_record::{self, DesktopRecord, ExtensionRecord};
-use crate::program::resolve_program;
-use crate::version::version_at_least;
 
 /// What a build did with the extension.
 #[derive(Debug)]
@@ -116,18 +128,6 @@ pub enum Offered {
     Now,
 }
 
-impl Offered {
-    /// The word the `desktop_offer` control command answers with.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Offered::Nothing => "nothing",
-            Offered::Already => "already",
-            Offered::Busy => "busy",
-            Offered::Now => "offered",
-        }
-    }
-}
-
 /// Whether `newer` is a strictly higher `major.minor.patch` than `older`.
 /// A pre-release suffix is ignored, and a version that does not parse is
 /// never newer.
@@ -153,19 +153,27 @@ fn load_record(path: &Path) -> Option<DesktopRecord> {
     desktop_record::load(path).ok().flatten()
 }
 
+/// What the record on disk says about an update to this version:
+/// [`Offered::Nothing`] without a record of an extension,
+/// [`Offered::Already`] when it was offered, `None` when it is due. The
+/// daemon answers `desktop_offer` from it before it starts any thread.
+pub fn recorded_now() -> Option<Offered> {
+    let record = desktop_record::record_path()
+        .ok()
+        .and_then(|path| load_record(&path));
+    recorded(record.as_ref())
+}
+
 /// Whether the update to this version was offered before, by the record
 /// alone. The bridge's launcher note says "offered" only then, so it never
 /// says so for an offer that failed.
 pub fn offered_already() -> bool {
-    desktop_record::record_path()
-        .ok()
-        .and_then(|path| load_record(&path))
-        .is_some_and(|record| recorded(Some(&record)) == Some(Offered::Already))
+    recorded_now() == Some(Offered::Already)
 }
 
 /// Where the offer lock lives, `<state_dir>/claude-desktop.offer.lock`.
 pub fn lock_path() -> anyhow::Result<PathBuf> {
-    Ok(crate::config::state_dir()?.join("claude-desktop.offer.lock"))
+    Ok(crystalline_core::config::state_dir()?.join("claude-desktop.offer.lock"))
 }
 
 /// Offer the update for an extension of version `launcher`: when this
@@ -217,6 +225,7 @@ pub fn offer_update(launcher: &str, opener: &dyn DesktopOpener) -> anyhow::Resul
     };
     let keep = record.extension.as_ref().map(|e| e.binary.clone());
     let bundle = desktop_record::bundle_path()?;
+    settle_leftover(&bundle)?;
     let kept = Previous::set_aside(&bundle)?;
     let outcome = build_extension(&mut record, keep.as_deref(), Some(opener)).and_then(|built| {
         match built.open_error {
@@ -225,8 +234,12 @@ pub fn offer_update(launcher: &str, opener: &dyn DesktopOpener) -> anyhow::Resul
         }
     });
     if let Err(e) = outcome {
-        kept.put_back(&bundle);
-        return Err(e);
+        return Err(match kept.put_back(&bundle) {
+            Ok(()) => e,
+            Err(restore) => anyhow::anyhow!(
+                "{e:#}, and the extension that was there before could not be put back ({restore})"
+            ),
+        });
     }
     kept.forget();
     desktop_record::save(&record_path, &record)
@@ -235,28 +248,63 @@ pub fn offer_update(launcher: &str, opener: &dyn DesktopOpener) -> anyhow::Resul
     Ok(Offered::Now)
 }
 
+/// Settle what an offer that died half way left behind: a
+/// `<bundle>.previous` is the bundle from before it. It goes back to the
+/// pinned path when no complete bundle is there (none, or one that does not
+/// pass [`is_complete`]: a zip that reads through, with our manifest and
+/// launcher), in one rename over whatever is there. When a complete bundle
+/// is at the pinned path, the dead offer had written its new one, and the
+/// old one is removed.
+fn settle_leftover(bundle: &Path) -> anyhow::Result<()> {
+    let aside = previous_path(bundle);
+    if !aside.is_file() {
+        return Ok(());
+    }
+    let complete = std::fs::read(bundle).is_ok_and(|bytes| is_complete(&bytes));
+    if complete {
+        std::fs::remove_file(&aside)
+            .with_context(|| format!("could not remove {}", aside.display()))
+    } else {
+        std::fs::rename(&aside, bundle).with_context(|| {
+            format!(
+                "could not put {} back to {}",
+                aside.display(),
+                bundle.display()
+            )
+        })
+    }
+}
+
 /// The bundle that was at the pinned path before an offer, moved aside to
 /// `<bundle>.previous` so a failed offer can put it back.
 struct Previous(Option<PathBuf>);
 
 impl Previous {
+    /// Move the bundle aside. A `.previous` that is already there is never
+    /// overwritten: [`settle_leftover`] runs first, and this refuses when
+    /// one is there anyway.
     fn set_aside(bundle: &Path) -> anyhow::Result<Previous> {
         if !bundle.is_file() {
             return Ok(Previous(None));
         }
         let aside = previous_path(bundle);
+        if aside.exists() {
+            anyhow::bail!("{} is in the way", aside.display());
+        }
         std::fs::rename(bundle, &aside)
             .with_context(|| format!("could not move {} aside", bundle.display()))?;
         Ok(Previous(Some(aside)))
     }
 
-    /// Remove what the failed offer wrote and put the old bundle back.
-    fn put_back(self, bundle: &Path) {
-        if bundle.is_file() {
-            let _ = std::fs::remove_file(bundle);
-        }
-        if let Some(aside) = self.0 {
-            let _ = std::fs::rename(aside, bundle);
+    /// Put the old bundle back with one rename over what the failed offer
+    /// wrote, or remove that when there was none before.
+    fn put_back(self, bundle: &Path) -> std::io::Result<()> {
+        match self.0 {
+            Some(aside) => std::fs::rename(aside, bundle),
+            None => match std::fs::remove_file(bundle) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
         }
     }
 
@@ -340,7 +388,7 @@ mod tests {
         let kept = Previous::set_aside(&bundle).unwrap();
         assert!(!bundle.exists());
         std::fs::write(&bundle, "half").unwrap();
-        kept.put_back(&bundle);
+        kept.put_back(&bundle).unwrap();
         assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "old");
         assert!(!previous_path(&bundle).exists());
 
@@ -353,10 +401,76 @@ mod tests {
         let none = dir.path().join("none.mcpb");
         let kept = Previous::set_aside(&none).unwrap();
         std::fs::write(&none, "half").unwrap();
-        kept.put_back(&none);
+        kept.put_back(&none).unwrap();
         assert!(
             !none.exists(),
             "a half-done bundle with nothing before it is removed"
         );
+    }
+
+    /// A whole bundle as `install claude-desktop` would write it.
+    fn whole_bundle() -> Vec<u8> {
+        pack(&files(Bundle::Hollow { binary: None }, VERSION)).unwrap()
+    }
+
+    #[test]
+    fn a_failed_put_back_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("crystalline.mcpb");
+        std::fs::write(&bundle, "old").unwrap();
+        let kept = Previous::set_aside(&bundle).unwrap();
+        // A folder that holds a file at the pinned path: no rename lands on it.
+        std::fs::create_dir_all(bundle.join("in-the-way")).unwrap();
+        assert!(kept.put_back(&bundle).is_err());
+        assert_eq!(
+            std::fs::read_to_string(previous_path(&bundle)).unwrap(),
+            "old",
+            "the old bundle is still aside, not lost"
+        );
+    }
+
+    #[test]
+    fn a_previous_bundle_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("crystalline.mcpb");
+        std::fs::write(&bundle, "new").unwrap();
+        std::fs::write(previous_path(&bundle), "old").unwrap();
+        assert!(Previous::set_aside(&bundle).is_err());
+        assert_eq!(
+            std::fs::read_to_string(previous_path(&bundle)).unwrap(),
+            "old"
+        );
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_leftover_of_a_dead_offer_is_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("crystalline.mcpb");
+        let aside = previous_path(&bundle);
+
+        // Died after the set-aside, before the new bundle was written.
+        std::fs::write(&aside, "old").unwrap();
+        settle_leftover(&bundle).unwrap();
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "old");
+        assert!(!aside.exists());
+
+        // Died with something at the pinned path that is not a whole bundle.
+        std::fs::write(&aside, "old").unwrap();
+        std::fs::write(&bundle, "half a zip").unwrap();
+        settle_leftover(&bundle).unwrap();
+        assert_eq!(std::fs::read_to_string(&bundle).unwrap(), "old");
+        assert!(!aside.exists());
+
+        // Died after the new bundle was written whole: it stays.
+        std::fs::write(&aside, "old").unwrap();
+        std::fs::write(&bundle, whole_bundle()).unwrap();
+        settle_leftover(&bundle).unwrap();
+        assert_eq!(std::fs::read(&bundle).unwrap(), whole_bundle());
+        assert!(!aside.exists());
+
+        // Nothing left over: nothing changes.
+        settle_leftover(&bundle).unwrap();
+        assert_eq!(std::fs::read(&bundle).unwrap(), whole_bundle());
     }
 }

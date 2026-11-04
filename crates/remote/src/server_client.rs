@@ -126,7 +126,7 @@ pub const AGENT_FILES_RELEASE: &str = "0.31.0";
 pub const WRITE_CHECKSUM_RELEASE: &str = "0.32.0";
 
 /// Whether a `major.minor.patch` version is at least `min`; it lives in core
-/// so the Claude Desktop extension update (`desktop_offer`) compares the same
+/// so the Claude Desktop extension update (the service crate's `desktop_offer`) compares the same
 /// way.
 pub use crystalline_core::version::version_at_least;
 

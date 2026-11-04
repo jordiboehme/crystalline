@@ -274,9 +274,13 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                let update_offered =
-                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged)
-                        .await;
+                // Both are bounded waits on the daemon; side by side, so the
+                // worst case is one timeout, not two.
+                let (update_offered, split) = tokio::join!(
+                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged),
+                    split_note_here(),
+                );
+                let note = onboarding_note(launcher_note_from_env(update_offered), split);
                 return pump_stdio(
                     stream,
                     stdin,
@@ -284,7 +288,7 @@ pub async fn run_mcp(
                     config_path,
                     read_only,
                     harness_gate,
-                    update_offered,
+                    note,
                 )
                 .await;
             }
@@ -747,16 +751,13 @@ async fn pump_stdio<R>(
     config_path: Option<&Path>,
     read_only: bool,
     harness_gate: HarnessGate,
-    update_offered: bool,
+    launcher_note: Option<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: onboarding_note(
-            launcher_note_from_env(update_offered),
-            split_note_here().await,
-        ),
+        launcher_note,
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();

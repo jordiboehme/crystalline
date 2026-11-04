@@ -487,8 +487,8 @@ mod tests {
 
     /// A release build must never read the seam, or a set variable would
     /// stop a real install from opening Claude Desktop. Every place this
-    /// crate names the variable is in this file, and every read of it sits
-    /// under `#[cfg(debug_assertions)]`.
+    /// crate's production code names the variable is in this file, and
+    /// every read of it sits under `#[cfg(debug_assertions)]`.
     #[test]
     fn only_a_debug_build_reads_the_seam() {
         let source = include_str!("desktop_open.rs");
@@ -526,10 +526,16 @@ mod tests {
                     && path.file_name().is_some_and(|n| n != "desktop_open.rs")
                 {
                     let text = std::fs::read_to_string(&path).unwrap();
+                    // A test module may name it (shaping.rs lists it as a
+                    // variable that is not a setting); production code not.
+                    let text = text
+                        .split("#[cfg(test)]\nmod tests {")
+                        .next()
+                        .unwrap_or_default();
                     assert!(
                         !text.contains(TEST_DESKTOP_OPEN_ENV)
                             && !text.contains("TEST_DESKTOP_OPEN_ENV"),
-                        "{} names the seam; read it only in desktop_open.rs",
+                        "{} names the seam outside its tests; read it only in desktop_open.rs",
                         path.display()
                     );
                 }

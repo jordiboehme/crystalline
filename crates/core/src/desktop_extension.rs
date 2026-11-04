@@ -280,6 +280,32 @@ pub fn files(bundle: Bundle<'_>, version: &str) -> Vec<(&'static str, Vec<u8>)> 
 /// caller stages it; [`pack`] writes this one entry executable.
 pub const BINARY_ENTRY: &str = "server/crystalline";
 
+/// Whether `bytes` are a whole hollow extension: a zip that reads, with a
+/// `manifest.json` that parses and names [`NAME`] and the launcher at
+/// `server/shim.js`. Every entry is read through, so a cut or damaged file
+/// is not complete. The extension update uses it to tell a leftover of an
+/// offer that died from a bundle that is fine.
+pub fn is_complete(bytes: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return false;
+    };
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            return false;
+        };
+        if std::io::copy(&mut entry, &mut std::io::sink()).is_err() {
+            return false;
+        }
+    }
+    let manifest = archive.by_name("manifest.json").ok().and_then(|mut entry| {
+        let mut text = Vec::new();
+        entry.read_to_end(&mut text).ok()?;
+        serde_json::from_slice::<Value>(&text).ok()
+    });
+    manifest.is_some_and(|m| m["name"] == NAME) && archive.by_name("server/shim.js").is_ok()
+}
+
 /// A zip of `files`, each `(path inside the zip, bytes)` in the given order.
 /// Every entry is deflated and dated `zip::DateTime::default()`, so the same
 /// files always give the same bytes. Every entry gets mode 0o644, except
@@ -345,6 +371,28 @@ mod tests {
     use std::io::Read;
 
     const PINNED: &str = "/opt/homebrew/bin/crystalline";
+
+    #[test]
+    fn a_whole_hollow_bundle_is_complete_and_anything_less_is_not() {
+        let whole = pack(&files(
+            Bundle::Hollow {
+                binary: Some(PINNED),
+            },
+            "0.33.0",
+        ))
+        .unwrap();
+        assert!(is_complete(&whole));
+        assert!(!is_complete(&whole[..whole.len() / 2]), "a cut zip");
+        assert!(!is_complete(b"not a zip"));
+        assert!(!is_complete(&[]));
+        let no_shim: Vec<_> = files(Bundle::Hollow { binary: None }, "0.33.0")
+            .into_iter()
+            .filter(|(path, _)| *path != "server/shim.js")
+            .collect();
+        assert!(!is_complete(&pack(&no_shim).unwrap()), "no launcher");
+        let other = pack(&[("manifest.json", br#"{"name":"other"}"#.to_vec())]).unwrap();
+        assert!(!is_complete(&other), "another extension");
+    }
 
     fn all_bundles() -> [Bundle<'static>; 3] {
         [
