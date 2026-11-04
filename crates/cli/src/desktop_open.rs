@@ -5,13 +5,21 @@
 //! gets the error text and says what to do instead.
 //!
 //! Debug builds read a test seam, [`TEST_DESKTOP_OPEN_ENV`], so tests never
-//! open the real Claude Desktop. Release builds never read it.
+//! open the real Claude Desktop. Release builds never read it, so a test that
+//! runs `install claude-desktop` without `--no-open` must be compiled only
+//! into debug builds (`#[cfg(debug_assertions)]`, as `tests/setup/main.rs`
+//! does for its `install_desktop` module), or `cargo test --release` would
+//! open the real app. The unit tests below never reach the real open: they
+//! run `/bin/sh` in its place.
 
 use std::path::Path;
 
 /// The debug build's stand-in for the real open. `fail` refuses every call,
 /// `log:<file>` appends one line per call to `<file>` and succeeds. Empty or
 /// unset is the real open.
+///
+/// Only a debug build reads it. A test that relies on it must be compiled
+/// only into debug builds, or a release test run opens Claude Desktop.
 #[cfg_attr(
     not(any(debug_assertions, test)),
     expect(dead_code, reason = "only a debug build reads the seam")
@@ -99,27 +107,55 @@ impl DesktopOpener for Seam {
 /// The real opener.
 struct System;
 
+/// The error when the open says Claude Desktop is not there: `open -b`
+/// exits 1 and `ShellExecuteW` answers `SE_ERR_NOASSOC`.
+#[cfg(any(target_os = "macos", windows, test))]
+const NOT_INSTALLED: &str = "Claude Desktop does not seem to be installed";
+
 #[cfg(target_os = "macos")]
 impl DesktopOpener for System {
     fn open_extension(&self, file: &Path) -> Result<(), String> {
-        run_open(&["-b", "com.anthropic.claudefordesktop"], file)
+        run_open(
+            std::ffi::OsStr::new("open"),
+            &["-b", "com.anthropic.claudefordesktop"],
+            file,
+            true,
+        )
     }
     fn reveal(&self, file: &Path) -> Result<(), String> {
-        run_open(&["-R"], file)
+        run_open(std::ffi::OsStr::new("open"), &["-R"], file, false)
     }
 }
 
-/// Run `open <args> <file>` and wait for it.
-#[cfg(target_os = "macos")]
-fn run_open(args: &[&str], file: &Path) -> Result<(), String> {
-    let status = std::process::Command::new("open")
+/// Run `<program> <args> <file>` and wait for it. Its stdout goes nowhere
+/// and its stderr into the error, so nothing reaches this process's own
+/// streams: in the MCP bridge stdout is the JSON-RPC channel. With
+/// `exit_1_is_missing`, exit code 1 means Claude Desktop is not there.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn run_open(
+    program: &std::ffi::OsStr,
+    args: &[&str],
+    file: &Path,
+    exit_1_is_missing: bool,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    let output = std::process::Command::new(program)
         .args(args)
         .arg(file)
-        .status()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("could not run open ({e})"))?;
-    match status.code() {
+    let said = String::from_utf8_lossy(&output.stderr);
+    let said = said.lines().map(str::trim).find(|l| !l.is_empty());
+    match output.status.code() {
         Some(0) => Ok(()),
-        Some(code) => Err(format!("open exited with {code}")),
+        Some(1) if exit_1_is_missing => Err(NOT_INSTALLED.to_string()),
+        Some(code) => Err(match said {
+            Some(line) => format!("open exited with {code} ({line})"),
+            None => format!("open exited with {code}"),
+        }),
         None => Err("open was stopped by a signal".to_string()),
     }
 }
@@ -127,12 +163,36 @@ fn run_open(args: &[&str], file: &Path) -> Result<(), String> {
 #[cfg(windows)]
 impl DesktopOpener for System {
     fn open_extension(&self, file: &Path) -> Result<(), String> {
-        windows::shell_open(file.as_os_str(), None)
+        windows::shell_open(file.as_os_str(), None).map_err(|code| shell_error(code, true))
     }
     fn reveal(&self, file: &Path) -> Result<(), String> {
-        let mut select = std::ffi::OsString::from("/select,");
-        select.push(file);
-        windows::shell_open(std::ffi::OsStr::new("explorer.exe"), Some(&select))
+        windows::shell_open(
+            std::ffi::OsStr::new("explorer.exe"),
+            Some(&select_parameter(file)),
+        )
+        .map_err(|code| shell_error(code, false))
+    }
+}
+
+/// Explorer's `/select,"<file>"`. The quotes keep a path with spaces or
+/// commas in one piece; without them Explorer opens its default folder.
+#[cfg(any(windows, test))]
+fn select_parameter(file: &Path) -> std::ffi::OsString {
+    let mut select = std::ffi::OsString::from("/select,\"");
+    select.push(file);
+    select.push("\"");
+    select
+}
+
+/// The error for a `ShellExecuteW` result of 32 or less. When the file is
+/// the extension, `SE_ERR_NOASSOC` (31) means no app opens `.mcpb` files.
+#[cfg(any(windows, test))]
+fn shell_error(code: isize, opening_extension: bool) -> String {
+    const SE_ERR_NOASSOC: isize = 31;
+    if opening_extension && code == SE_ERR_NOASSOC {
+        NOT_INSTALLED.to_string()
+    } else {
+        format!("Windows could not open the file ({code})")
     }
 }
 
@@ -154,7 +214,9 @@ mod windows {
 
     /// `ShellExecuteW(null, "open", file, parameters, null, SW_SHOWNORMAL)`.
     /// COM is set up first, since the handler may be a shell extension.
-    pub(super) fn shell_open(file: &OsStr, parameters: Option<&OsStr>) -> Result<(), String> {
+    /// The error is the result code, 32 or less. A GUI call: it writes
+    /// nothing to this process's stdout or stderr.
+    pub(super) fn shell_open(file: &OsStr, parameters: Option<&OsStr>) -> Result<(), isize> {
         let verb = wide(OsStr::new("open"));
         let file = wide(file);
         let parameters = parameters.map(wide);
@@ -179,11 +241,7 @@ mod windows {
             result as isize
         };
         // A value above 32 is success; 32 or less is an error code.
-        if code > 32 {
-            Ok(())
-        } else {
-            Err(format!("Windows could not open the file ({code})"))
-        }
+        if code > 32 { Ok(()) } else { Err(code) }
     }
 }
 
@@ -243,6 +301,120 @@ mod tests {
             Seam::Unknown("yes".to_string()).open_extension(file),
             Err(format!("unknown {TEST_DESKTOP_OPEN_ENV} value 'yes'"))
         );
+    }
+
+    /// The real opener's branches, with `/bin/sh -c <script>` in place of
+    /// `open`, so no app is ever opened.
+    #[cfg(unix)]
+    fn sh(script: &str, exit_1_is_missing: bool) -> Result<(), String> {
+        run_open(
+            std::ffi::OsStr::new("/bin/sh"),
+            &["-c", script, "stub"],
+            Path::new("/x/crystalline.mcpb"),
+            exit_1_is_missing,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_real_opener_reads_the_exit_status() {
+        assert_eq!(sh("exit 0", true), Ok(()));
+        assert_eq!(
+            sh(r#"test "$1" = /x/crystalline.mcpb"#, false),
+            Ok(()),
+            "the file is the last argument"
+        );
+        assert_eq!(
+            sh("echo 'no such app' >&2; exit 1", true),
+            Err("Claude Desktop does not seem to be installed".to_string())
+        );
+        assert_eq!(
+            sh("exit 1", false),
+            Err("open exited with 1".to_string()),
+            "exit 1 of a reveal keeps its code"
+        );
+        assert_eq!(
+            sh("printf '\\n  it went wrong  \\nmore\\n' >&2; exit 2", true),
+            Err("open exited with 2 (it went wrong)".to_string())
+        );
+        assert_eq!(
+            sh("kill -9 $$", true),
+            Err("open was stopped by a signal".to_string())
+        );
+        let missing = run_open(
+            std::ffi::OsStr::new("/nonexistent/open"),
+            &[],
+            Path::new("/x"),
+            true,
+        )
+        .unwrap_err();
+        assert!(missing.starts_with("could not run open ("), "{missing}");
+    }
+
+    /// The env variable naming the script [`noisy_open_in_a_child`] runs.
+    #[cfg(unix)]
+    const NOISY_SCRIPT_ENV: &str = "DESKTOP_OPEN_NOISY_SCRIPT";
+
+    /// Run by [`the_real_opener_writes_nothing_to_our_streams`] in a child
+    /// test process, whose streams that test reads.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "run in a child process by the_real_opener_writes_nothing_to_our_streams"]
+    fn noisy_open_in_a_child() {
+        let script = std::env::var(NOISY_SCRIPT_ENV).expect("set by the parent test");
+        println!("result: {:?}", sh(&script, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_real_opener_writes_nothing_to_our_streams() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "desktop_open::tests::noisy_open_in_a_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(NOISY_SCRIPT_ENV, "echo STUB-OUT; echo STUB-ERR >&2; exit 3")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains(r#"result: Err("open exited with 3 (STUB-ERR)")"#),
+            "the child ran the stub: {stdout}"
+        );
+        assert!(!stdout.contains("STUB-OUT"), "{stdout}");
+        assert!(!stderr.contains("STUB-OUT"), "{stderr}");
+        assert!(!stderr.contains("STUB-ERR"), "{stderr}");
+        assert_eq!(
+            stdout.matches("STUB-ERR").count(),
+            1,
+            "stderr reached us only inside the error: {stdout}"
+        );
+    }
+
+    #[test]
+    fn explorer_gets_the_file_in_quotes() {
+        assert_eq!(
+            select_parameter(Path::new(r"C:\Users\Ana Lopez\a,b.zip")),
+            std::ffi::OsString::from(r#"/select,"C:\Users\Ana Lopez\a,b.zip""#)
+        );
+    }
+
+    #[test]
+    fn a_missing_association_says_claude_desktop_is_not_there() {
+        assert_eq!(
+            shell_error(31, true),
+            "Claude Desktop does not seem to be installed"
+        );
+        assert_eq!(
+            shell_error(31, false),
+            "Windows could not open the file (31)"
+        );
+        assert_eq!(shell_error(2, true), "Windows could not open the file (2)");
     }
 
     /// A release build must never read the seam, or a set variable would
