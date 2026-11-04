@@ -26,7 +26,7 @@
 
 import type { EditorState, Extension, Range } from "@codemirror/state";
 import { StateEffect, StateField } from "@codemirror/state";
-import type { DecorationSet } from "@codemirror/view";
+import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
   EditorView,
@@ -333,8 +333,12 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
       readonly view: EditorView;
       /** Whether the last press began on a handle. */
       onHandle = false;
-      /** The picture a press held now selects when it is released. */
-      pending: PictureRef | null = null;
+      /**
+       * The picture a press held now selects when it is released: where it
+       * stands, mapped through every change while the press is held (P39),
+       * and its text then.
+       */
+      pending: { from: number; to: number; text: string } | null = null;
 
       readonly mousedown = (event: MouseEvent): void => {
         this.pending = null;
@@ -366,7 +370,11 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         if (!ref || ref.inLink) {
           return;
         }
-        this.pending = ref;
+        this.pending = {
+          from: ref.from,
+          to: ref.to,
+          text: this.view.state.sliceDoc(ref.from, ref.to),
+        };
       };
 
       readonly mouseup = (): void => {
@@ -375,9 +383,14 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         if (ref === null) {
           return;
         }
-        // Read again: the text may have changed while the press was held.
+        // Read again: a picture that itself changed while the press was
+        // held is not selected.
         const now = pictureAt(this.view.state, ref.from + 1);
-        if (now?.from !== ref.from || now.to !== ref.to) {
+        if (
+          now?.from !== ref.from ||
+          now.to !== ref.to ||
+          this.view.state.sliceDoc(now.from, now.to) !== ref.text
+        ) {
           return;
         }
         this.view.dispatch({
@@ -401,6 +414,16 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
           event.preventDefault();
         }
       };
+
+      update(update: ViewUpdate): void {
+        if (this.pending !== null && update.docChanged) {
+          this.pending = {
+            ...this.pending,
+            from: update.changes.mapPos(this.pending.from, 1),
+            to: update.changes.mapPos(this.pending.to, -1),
+          };
+        }
+      }
 
       constructor(view: EditorView) {
         this.view = view;

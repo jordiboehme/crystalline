@@ -181,7 +181,7 @@ for (const { name, br } of ENDINGS) {
         expect(movePicture(view, ref.from, landing)).toBe(true);
         expect(bytes(view.state)).toBe(expected);
         expect(bytes(view.state)).toBe(
-          ["intro", "", "later", "", picture, "", ""].join(br),
+          ["intro", "", "later", "", picture, ""].join(br),
         );
         const selected = selectedPicture(parsedState(view.state));
         expect(view.state.sliceDoc(selected?.from, selected?.to)).toBe(picture);
@@ -244,7 +244,7 @@ for (const { name, br } of ENDINGS) {
       if (!landing) throw new Error("no landing");
       expect(movePicture(view, at - 1, landing)).toBe(true);
       expect(bytes(view.state)).toBe(
-        ["intro", "", "later", "", picture, "", ""].join(br),
+        ["intro", "", "later", "", picture, ""].join(br),
       );
       undoOnce(view);
       expect(bytes(view.state)).toBe(original);
@@ -462,7 +462,7 @@ describe("movePicture", () => {
     expect(movePicture(view, b + 1, landing)).toBe(false);
     expect(movePicture(view, b, landing)).toBe(true);
     expect(bytes(view.state)).toBe(
-      "![a](assets/a.png)\n\nlater\n\n![b](assets/b.png)\n\n",
+      "![a](assets/a.png)\n\nlater\n\n![b](assets/b.png)\n",
     );
   });
 
@@ -501,9 +501,7 @@ describe("a picture between two bold words", () => {
       const landing = dropLanding(state, state.doc.length - 2);
       if (!landing) throw new Error("no landing");
       expect(movePicture(view, 5, landing)).toBe(true);
-      expect(bytes(view.state)).toBe(
-        "**ab**\n\nlater\n\n![x](assets/p.png)\n\n",
-      );
+      expect(bytes(view.state)).toBe("**ab**\n\nlater\n\n![x](assets/p.png)\n");
       expect(bold(view, "a")).toBe(true);
       expect(bold(view, "b")).toBe(true);
       const selected = selectedPicture(parsedState(view.state));
@@ -530,7 +528,7 @@ describe("a picture between two bold words", () => {
     if (!landing) throw new Error("no landing");
     expect(movePicture(local, 5, landing)).toBe(true);
     sync();
-    expect(bytes(peer.state)).toBe("**ab**\n\nlater\n\n![x](assets/p.png)\n\n");
+    expect(bytes(peer.state)).toBe("**ab**\n\nlater\n\n![x](assets/p.png)\n");
     expect(bytes(peer.state)).toBe(bytes(local.state));
   });
 });
@@ -625,7 +623,7 @@ describe("a removal from a caret on a hidden fence line", () => {
     sync();
     expect(caret(local)).toBe(35);
     expect(removePicture(local, 1)).toBe(true);
-    expect(bytes(local.state)).toBe("\na\n```ts\nx\ny\n```");
+    expect(bytes(local.state)).toBe("a\n```ts\nx\ny\n```");
   });
 });
 

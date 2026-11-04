@@ -327,6 +327,27 @@ describe("a picture in place of its reference", () => {
     expect(view.state.selection.main.to).toBe(20);
   });
 
+  it("selects the picture where an edit above moved it while the press was held (P39)", () => {
+    const view = editor("a ![x](assets/a.png) b");
+    down(nth(view));
+    view.dispatch({ changes: { from: 0, insert: "zz" } });
+    document.body.dispatchEvent(
+      new MouseEvent("mouseup", { bubbles: true, button: 0 }),
+    );
+    expect(view.state.selection.main.from).toBe(4);
+    expect(view.state.selection.main.to).toBe(22);
+  });
+
+  it("selects nothing on release when the picture itself changed meanwhile", () => {
+    const view = editor("a ![x](assets/a.png) b");
+    down(nth(view));
+    view.dispatch({ changes: { from: 5, insert: "y" } });
+    document.body.dispatchEvent(
+      new MouseEvent("mouseup", { bubbles: true, button: 0 }),
+    );
+    expect(view.state.selection.main.empty).toBe(true);
+  });
+
   it("selects nothing on release when the press became a drag", () => {
     const view = editor("a ![x](assets/a.png) b");
     const picture = nth(view);

@@ -49,10 +49,10 @@ describe("a move the insert judge relocates", () => {
     });
     expect(movePicture(view, 0, landing)).toBe(true);
     expect(vi.mocked(judgeInsert)).toHaveBeenCalledTimes(1);
-    expect(bytes(view.state)).toBe("\nmid\n\nlater\n\n\n![x](assets/p.png)\n");
+    expect(bytes(view.state)).toBe("mid\n\nlater\n\n\n![x](assets/p.png)\n");
     const selected = selectedPicture(parsedState(view.state));
     expect(selected?.token).toBe("assets/p.png");
-    expect(selected?.from).toBe("\nmid\n\nlater\n\n\n".length);
+    expect(selected?.from).toBe("mid\n\nlater\n\n\n".length);
     undoOnce(view);
     expect(bytes(view.state)).toBe(doc);
   });
@@ -67,7 +67,7 @@ describe("a move the insert judge relocates", () => {
     const asked = vi.mocked(judgeInsert).mock.calls[0]?.[2];
     expect(asked?.text).toBe("\n\n![x](assets/p.png)\n");
     expect(bytes(view.state)).toBe(
-      "\r\nmid\r\n\r\n![x](assets/p.png)\r\n\r\n\r\nlater\r\n",
+      "mid\r\n\r\n![x](assets/p.png)\r\n\r\n\r\nlater\r\n",
     );
   });
 });

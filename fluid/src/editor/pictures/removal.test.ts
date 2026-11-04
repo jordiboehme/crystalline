@@ -57,7 +57,15 @@ describe("pictureRemoval", () => {
 
   it("takes the whole text of a page that is only the picture", () => {
     expect(removed("![x](assets/p.png)")).toBe("");
-    expect(removed("  ![x](assets/p.png)  \n\nb")).toBe("\nb");
+    expect(removed("  ![x](assets/p.png)  \n\nb")).toBe("b");
+  });
+
+  it("leaves no blank line at the start of the page (P36)", () => {
+    expect(removed("![x](assets/p.png)\n\n## H\n")).toBe("## H\n");
+    expect(removed("![x](assets/p.png)\n\n\nb")).toBe("b");
+    expect(removed("![x](assets/p.png)\nb")).toBe("b");
+    expect(removed("![x](assets/p.png)\n\n")).toBe("");
+    expect(removed("![x](assets/p.png)\r\n\r\nb")).toBe("b");
   });
 
   it("leaves a Reflection id line byte for byte", () => {

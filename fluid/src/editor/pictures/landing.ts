@@ -260,3 +260,20 @@ export function landingAt(view: EditorView, event: Pointed): Landing | null {
   const at = dropPosition(view, event);
   return at === null ? null : dropLanding(view.state, at);
 }
+
+/**
+ * Whether a drag or drop event over `view` is inside another editor drawn
+ * in its content: an open table cell's own view. Nothing is dropped there
+ * (P37) and no drop line is drawn for it.
+ */
+export function insideOtherEditor(view: EditorView, event: Event): boolean {
+  const node = event.target;
+  const element =
+    node instanceof Element
+      ? node
+      : node instanceof Node
+        ? node.parentElement
+        : null;
+  const content = element?.closest(".cm-content") ?? null;
+  return content !== null && content !== view.contentDOM;
+}

@@ -3,7 +3,9 @@
  *
  * A picture alone on its line takes the line with it, so no empty line is
  * left where it stood: the line and the break after it (the break before it
- * on the last line), and one of two blank lines that would otherwise meet.
+ * on the last line), and one of two blank lines that would otherwise meet;
+ * on the page's first line the blank lines below it too, so the page never
+ * starts with a blank line (P36).
  * A picture inside prose takes its span and nothing else, except a pair of
  * marks the picture is the only content of (`a **P** b`): the pair goes with
  * it, as Part 2's keys drop a pair they empty (P29), so no mark is left as
@@ -87,6 +89,20 @@ export function pictureRemoval(
   const above = line.number > 1 ? doc.line(line.number - 1) : null;
   const below = line.number < doc.lines ? doc.line(line.number + 1) : null;
   const candidates: Range[] = [];
+  if (above === null && below !== null && empty(below)) {
+    // The first line of the page: the blank lines below it go too, so the
+    // page never starts with one (P36).
+    let last = below;
+    while (last.number < doc.lines) {
+      const next = doc.line(last.number + 1);
+      if (!empty(next)) break;
+      last = next;
+    }
+    candidates.push({
+      from: line.from,
+      to: last.number < doc.lines ? last.to + 1 : last.to,
+    });
+  }
   if (below !== null) {
     if (empty(above) && empty(below) && above !== null) {
       // "para, blank, picture, blank, next" keeps one blank line.

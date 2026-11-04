@@ -200,7 +200,7 @@ describe.each([
     const view = build(doc, mode, room);
     const { transfer } = dragPicture(view, doc.indexOf("Third"));
     expect(transfer.getData("text/uri-list")).toBe("https://example.com/p.png");
-    expect(bytes(view.state)).toBe(`Intro  words.\n\nThird.\n\n${web}\n\n`);
+    expect(bytes(view.state)).toBe(`Intro  words.\n\nThird.\n\n${web}\n`);
   });
 
   it("puts a picture dropped on a Reflection heading below its id line", () => {
@@ -212,12 +212,29 @@ describe.each([
     );
   });
 
+  it("leaves no blank line at the page start when the first picture moves (P36)", () => {
+    const doc = `${P}\n\n## H\n<!-- r:7f3a9c2e -->\n\nBody.\n`;
+    const view = build(doc, mode, room, { adapter: "reflection" });
+    dragPicture(view, doc.indexOf("H\n"));
+    expect(bytes(view.state)).toBe(
+      `## H\n<!-- r:7f3a9c2e -->\n\n${P}\n\n\nBody.\n`,
+    );
+  });
+
+  it("leaves no blank line at the page end below the last block (P40)", () => {
+    const view = build(PAGE, mode, room);
+    dragPicture(view, PAGE.indexOf("End"));
+    expect(bytes(view.state)).toBe(
+      `Intro  words.\n\nSecond.\n\nThird.\n\nEnd.\n\n${P}\n`,
+    );
+  });
+
   it("takes a pair whose only content the picture is along (P29)", () => {
     const pic = "![x](assets/p.png)";
     const doc = `a **${pic}** b\n\nlater\n`;
     const view = build(doc, mode, room);
     dragPicture(view, doc.indexOf("later"));
-    expect(bytes(view.state)).toBe(`a  b\n\nlater\n\n${pic}\n\n`);
+    expect(bytes(view.state)).toBe(`a  b\n\nlater\n\n${pic}\n`);
     undoOnce(view);
     expect(bytes(view.state)).toBe(doc);
   });
@@ -255,6 +272,19 @@ describe("a picture drop the move does not take", () => {
     transfer.setData(PICTURE_TYPE, "stale");
     transfer.setData("text/plain", P);
     vi.spyOn(view, "posAtCoords").mockReturnValue(PAGE.indexOf("Third"));
+    const drop = fireDrag(view.contentDOM, "drop", transfer, AT);
+    expect(drop.defaultPrevented).toBe(true);
+    expect(bytes(view.state)).toBe(PAGE);
+  });
+
+  it("writes nothing for a drop whose token is not this drag's", () => {
+    const view = markView(PAGE, { images: imagePreviews("eng") });
+    const box = pictureBox(view);
+    const transfer = new FakeTransfer();
+    fireDrag(box, "dragstart", transfer);
+    transfer.setData(PICTURE_TYPE, "another drag");
+    vi.spyOn(view, "posAtCoords").mockReturnValue(PAGE.indexOf("Third"));
+    fireDrag(view.contentDOM, "dragover", transfer, AT);
     const drop = fireDrag(view.contentDOM, "drop", transfer, AT);
     expect(drop.defaultPrevented).toBe(true);
     expect(bytes(view.state)).toBe(PAGE);

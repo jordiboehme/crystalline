@@ -522,16 +522,31 @@ export const MERMAID_SKELETON = [
 /**
  * The text `insertBlock` writes below `line` and where the block's first line
  * then begins, for a caller that puts a block below a line itself (a picture
- * moved to a drop landing): the same lead, separator and position arithmetic,
- * so the two can never place a block differently. `start` is in positions of
- * the document after the change.
+ * moved to a drop landing, a dropped file): the same lead, separator and
+ * position arithmetic, so the two can never place a block differently.
+ * `start` is in positions of the document after the change. Below the last
+ * block, where only line breaks follow, the block takes no line break of its
+ * own, so the page does not end in a blank line (P40).
  */
 export function blockInsertion(
   state: EditorState,
   line: Line,
   lines: readonly string[],
 ): { change: { from: number; insert: string }; start: number } {
-  return placeBlock(state, line, lines, 0);
+  const placed = placeBlock(state, line, lines, 0);
+  const rest = state.doc.sliceString(line.to);
+  if (rest !== "" && rest.trim() === "") {
+    const separator = state.lineBreak;
+    const { insert } = placed.change;
+    return {
+      ...placed,
+      change: {
+        from: placed.change.from,
+        insert: insert.slice(0, insert.length - separator.length),
+      },
+    };
+  }
+  return placed;
 }
 
 /**

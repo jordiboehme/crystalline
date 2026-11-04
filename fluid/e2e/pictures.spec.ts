@@ -133,7 +133,7 @@ interface Held {
   to: number;
 }
 
-/** The editor's text and its main selection. Read only. */
+/** The editor's text and its main selection. Read only; `caretAt` writes. */
 function held(page: Page): Promise<Held> {
   return page.evaluate((name) => {
     type View = {
@@ -201,9 +201,7 @@ test.describe("pictures", () => {
     await expect(picture).toHaveClass(/cm-picture-selected/);
     // The browser's own selection settles after the press: the selection
     // CodeMirror then reads from it must still be the picture.
-    await page.waitForTimeout(300);
-    const after = await held(page);
-    expect([after.from, after.to]).toEqual([from, from + PICTURE.length]);
+    await steady(page, [from, from + PICTURE.length]);
     await expect(picture).toHaveClass(/cm-picture-selected/);
   });
 
@@ -230,46 +228,127 @@ test.describe("pictures", () => {
     await expectMoved(page, permalink);
   });
 
-  test("with the marks shown on the edited line, a held press leaves the picture in place", async ({
+  test("a picture dragged onto a drawn table moves below the table (P38)", async ({
     page,
   }) => {
-    const permalink = await createEngram(page, BODY);
+    const table = "| Berth | Ship |\n| --- | --- |\n| 1 | Lantern |";
+    const body = `# Picture moves\n\nIntro ${PICTURE} words.\n\n${table}\n\nThird paragraph.\n`;
+    const permalink = await createEngram(page, body);
+    const { source, picture } = await edit(page, permalink);
+    const cell = source.locator(".cm-grid td").filter({ hasText: "Lantern" });
+    await expect(cell).toBeVisible();
+    await dragOnto(page, picture, cell);
+    const moved = `# Picture moves\n\nIntro  words.\n\n${table}\n\n${PICTURE}\n\n\nThird paragraph.\n`;
+    await expect
+      .poll(async () => (await held(page)).doc.endsWith(moved))
+      .toBe(true);
+    expect((await held(page)).doc.split(PICTURE)).toHaveLength(2);
+    await expect
+      .poll(
+        async () => {
+          await settle(page);
+          return bodyOnDisk(page, permalink);
+        },
+        { timeout: 20_000 },
+      )
+      .toBe(moved);
+  });
+
+  test("with the marks shown, a held press on the block picture under the edited line leaves it in place (P25)", async ({
+    page,
+  }) => {
+    const alone = `# Picture moves\n\nIntro words.\n\n${PICTURE}\n\nThird paragraph.\n\nThe end.\n`;
+    const permalink = await createEngram(page, alone);
     expect(await flipSetting(page)).toBe(true);
     try {
-      const { picture } = await edit(page, permalink);
-      const before = await held(page);
+      await edit(page, permalink);
+      // The caret on the picture's line: the line shows its source and the
+      // picture is drawn as a block below it.
+      const { doc } = await held(page);
+      const from = doc.indexOf(PICTURE);
+      await caretAt(page, from + PICTURE.length);
+      const block = page.locator(".cm-picture-block").first();
+      await expect(block).toBeVisible();
       await page.evaluate(() => {
         (window as unknown as { pressed: Element | null }).pressed =
-          document.querySelector(".cm-picture");
+          document.querySelector(".cm-picture-block");
       });
-      const at = await middleOf(picture);
+      const at = await middleOf(block);
       await page.mouse.move(at.x, at.y);
       await page.mouse.down();
-      await page.waitForTimeout(300);
-      // Nothing moved under the pointer while the press is held: the caret
-      // stayed off the picture's line and the picture is the same element.
-      const during = await held(page);
-      expect([during.from, during.to]).toEqual([before.from, before.to]);
+      // Nothing moves under the pointer while the press is held: the
+      // caret stays where it was and the block is the same element.
+      await steady(page, [from + PICTURE.length, from + PICTURE.length]);
       expect(
         await page.evaluate(
           () =>
             (window as unknown as { pressed: Element | null }).pressed ===
-            document.querySelector(".cm-picture"),
+            document.querySelector(".cm-picture-block"),
         ),
       ).toBe(true);
       await page.mouse.up();
-      const from = during.doc.indexOf(PICTURE);
-      await expect
-        .poll(async () => {
-          const now = await held(page);
-          return [now.from, now.to];
-        })
-        .toEqual([from, from + PICTURE.length]);
+      await steady(page, [from, from + PICTURE.length]);
+      // Selected, it is still the block under its edited line.
+      await expect(block).toHaveClass(/cm-picture-selected/);
+      expect(
+        await page.evaluate(
+          () =>
+            (window as unknown as { pressed: Element | null }).pressed ===
+            document.querySelector(".cm-picture-block"),
+        ),
+      ).toBe(true);
     } finally {
       expect(await flipSetting(page)).toBe(false);
     }
   });
 });
+
+/**
+ * Waits until the editor's main selection reads `[from, to]` on several
+ * reads in a row, each after the browser drew two more frames: a selection
+ * that moves after a press settles fails here, however late it moves within
+ * the poll.
+ */
+async function steady(page: Page, expected: [number, number]): Promise<void> {
+  const reads: string[] = [];
+  const want = JSON.stringify(expected);
+  await expect
+    .poll(async () => {
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                resolve();
+              });
+            });
+          }),
+      );
+      const now = await held(page);
+      reads.push(JSON.stringify([now.from, now.to]));
+      return reads.length >= 6 && reads.slice(-6).every((r) => r === want);
+    })
+    .toBe(true);
+}
+
+/** Puts the editor's caret at `pos`, as a click there would. */
+async function caretAt(page: Page, pos: number): Promise<void> {
+  await page.evaluate(
+    ([name, at]) => {
+      type View = {
+        dispatch(spec: unknown): void;
+        focus(): void;
+      };
+      const view = (
+        window as unknown as { fluidView?: (label: string) => View | null }
+      ).fluidView?.(name);
+      if (!view) throw new Error(`no editor view for ${name}`);
+      view.dispatch({ selection: { anchor: at }, userEvent: "select.pointer" });
+      view.focus();
+    },
+    [SOURCE, pos] as const,
+  );
+}
 
 /** A drawn line of the editor, by the text it shows. */
 function paragraph(source: Locator, text: string): Locator {

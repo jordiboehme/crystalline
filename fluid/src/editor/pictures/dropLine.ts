@@ -11,8 +11,10 @@
  * never for a text drag. It goes on a drop, when the drag ends, and when it
  * leaves the editor.
  *
- * Native listeners on `contentDOM` (P12), where the drop handlers run, so a
- * line is drawn only where a drop is taken; the line itself takes no
+ * Native listeners on `contentDOM` (P12), beside the native drop listeners
+ * of the uploads and the drag-move, which take a drop anywhere in the
+ * content (P38), so a line is drawn only where a drop is then taken there;
+ * never in an open table cell editor (P37). The line itself takes no
  * pointer, so a drop over it still reaches the text below. It is redrawn on
  * every dragover, so a chunk loaded mid-drag draws it from the next one.
  */
@@ -20,17 +22,26 @@
 import type { Extension } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 
+import { caretPlaced } from "../attachments";
 import { writable } from "../elementEdit";
 import { carriesPicture, draggingPictureIn } from "./dragMove";
 import type { Landing } from "./landing";
-import { landingAt } from "./landing";
+import { insideOtherEditor, landingAt } from "./landing";
 
-/** Whether a drag over `view` is one the line is drawn for. */
+/**
+ * Whether a drag over `view` is one the line is drawn for: exactly the drags
+ * a native drop listener of this view then takes and lands at the line
+ * (P38). A file needs the upload handlers (`attachmentUploads`); neither
+ * lands in an open table cell editor (P37).
+ */
 function linesFor(view: EditorView, event: DragEvent): boolean {
-  if (!writable(view.state)) return false;
-  const types = Array.from(event.dataTransfer?.types ?? []);
+  if (!writable(view.state) || insideOtherEditor(view, event)) return false;
   if (carriesPicture(event)) return draggingPictureIn(view);
-  return types.includes("Files");
+  const types = Array.from(event.dataTransfer?.types ?? []);
+  return (
+    types.includes("Files") &&
+    view.state.field(caretPlaced, false) !== undefined
+  );
 }
 
 /** A computed padding in pixels, 0 where the browser gives none. */
@@ -51,12 +62,6 @@ const plugin = ViewPlugin.fromClass(
       if (landing === null) {
         this.hide();
       } else {
-        // A file drag is a copy into the page; the picture move sets its
-        // own drop effect.
-        if (!carriesPicture(event)) {
-          event.preventDefault();
-          if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-        }
         this.show(landing);
       }
     };

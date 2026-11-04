@@ -13,14 +13,27 @@
 
 import { EditorState, StateEffect } from "@codemirror/state";
 import type { BlockInfo, EditorView } from "@codemirror/view";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { syntaxTree } from "@codemirror/language";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import type { AssetHome } from "../../api/files";
 import { FakeTransfer, fireDrag } from "../../test/dragKit";
 import type { MarkViewOptions } from "../../test/markKit";
 import { bytes, cleanupMarkViews, markView } from "../../test/markKit";
 import { attachmentUploads, uploadAttachments } from "../attachments";
+import { drawnGridTables } from "../grid/draws";
 import { prefetchGrid } from "../grid/loader";
+import type { GridTable } from "../grid/structure";
+import { hostOpenCell } from "../grid/gridWidget";
+import { setOpenCell } from "../grid/openCell";
 import { imagePreviews } from "../imagePreviews";
 import { prefetchPictureTools } from "./loader";
 
@@ -167,6 +180,21 @@ const FIXTURES: {
     after: `---\ntitle: T\n---\nBody line\nmore\n\n${LINK}\n\n\nend\n`,
   },
   {
+    // The grid still draws the first two lines as a table while the parse
+    // reads one paragraph (D58): the drawn table wins, for the line too.
+    name: "a table the grid draws past the parse",
+    doc: "a\nb\nc\n\nd\n",
+    pointer: () => 0,
+    end: () => 3,
+    after: `a\nb\n\n${LINK}\n\nc\n\nd\n`,
+    options: {
+      images: [
+        imagePreviews("eng"),
+        drawnGridTables.of(() => [{ from: 0, to: 3 } as unknown as GridTable]),
+      ],
+    },
+  },
+  {
     name: "the last line",
     doc: "one\n\nlast",
     pointer: (doc) => doc.length,
@@ -220,6 +248,44 @@ describe.each(FIXTURES)(
     });
   },
 );
+
+describe("the drop line past a short parse", () => {
+  // A clock that jumps at every look stops the first parse almost at once,
+  // as a long page's first parse stops (landing.test does the same).
+  beforeEach(() => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1e6;
+      return now;
+    });
+  });
+
+  it("is drawn below a whole loose list, where the file then lands (P19)", async () => {
+    const prefix = Array.from(
+      { length: 3000 },
+      (_, i) => `Paragraph ${String(i)} of the long page.`,
+    ).join("\n\n");
+    const doc = `${prefix}\n\n- a\n\n- b\n\n- c\n\nend\n`;
+    const end = doc.indexOf("- c") + 3;
+    const { view, uploads, asked } = build(doc, doc.indexOf("- a"), {
+      parsed: false,
+    });
+    expect(syntaxTree(view.state).length).toBeLessThan(doc.indexOf("- a"));
+    fileOver(view);
+    expect(asked.at(-1)).toBe(end);
+    expect(dropLineOf(view)?.style.top).toBe(topFor(view, BASE + end));
+    fireDrag(
+      view.contentDOM,
+      "drop",
+      new FakeTransfer({ files: [new File(["x"], "shot.png")] }),
+      AT,
+    );
+    expect(await Promise.all(uploads)).toEqual([1]);
+    expect(bytes(view.state).slice(prefix.length)).toBe(
+      `\n\n- a\n\n- b\n\n- c\n\n${LINK}\n\n\nend\n`,
+    );
+  });
+});
 
 describe("the drop line", () => {
   const DOC = "one\n\ntwo\n";
@@ -282,5 +348,140 @@ describe("the drop line", () => {
     });
     fileOver(view);
     expect(dropLineOf(view)).toBeNull();
+  });
+});
+
+/**
+ * P38: the line and the drop are one native pair. A drop over a widget
+ * CodeMirror's handlers never see (a drawn table, a code box header) is
+ * taken where the line was drawn, for a file and for a picture.
+ */
+describe.each([
+  {
+    name: "a drawn table's cell",
+    doc: "intro\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nend\n",
+    pointer: (doc: string) => doc.indexOf("1 |"),
+    target: ".cm-grid td",
+    end: 40,
+    after: (block: string) =>
+      `intro\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n${block}\n\n\nend\n`,
+  },
+  {
+    name: "a code box header",
+    doc: "a\n\n```js\ncode\n```\n\nb\n",
+    pointer: (doc: string) => doc.indexOf("code"),
+    target: ".cm-code-header",
+    end: 17,
+    after: (block: string) =>
+      `a\n\n\`\`\`js\ncode\n\`\`\`\n\n${block}\n\n\nb\n`,
+  },
+])("a drop on $name", ({ doc, pointer, target, end, after }) => {
+  function widget(view: EditorView): Element {
+    const el = view.contentDOM.querySelector(target);
+    if (!el) throw new Error(`no ${target}`);
+    return el;
+  }
+
+  it("takes a file and lands it where the line was drawn", async () => {
+    const { view, uploads, asked } = build(doc, pointer(doc));
+    const over = fireDrag(
+      widget(view),
+      "dragover",
+      new FakeTransfer({ namesFiles: true }),
+      AT,
+    );
+    expect(over.defaultPrevented).toBe(true);
+    expect(asked.at(-1)).toBe(end);
+    expect(dropLineOf(view)?.style.top).toBe(topFor(view, BASE + end));
+    const drop = fireDrag(
+      widget(view),
+      "drop",
+      new FakeTransfer({ files: [new File(["x"], "shot.png")] }),
+      AT,
+    );
+    expect(drop.defaultPrevented).toBe(true);
+    expect(dropLineOf(view)).toBeNull();
+    expect(await Promise.all(uploads)).toEqual([1]);
+    expect(bytes(view.state)).toBe(after(LINK));
+  });
+
+  it("takes a picture and lands it where the line was drawn", () => {
+    const source = `${doc}\n${P}\n`;
+    const { view, asked } = build(source, pointer(doc));
+    const box = view.contentDOM.querySelector(".cm-picture");
+    if (!box) throw new Error("no drawn picture");
+    const transfer = new FakeTransfer();
+    fireDrag(box, "dragstart", transfer);
+    const over = fireDrag(widget(view), "dragover", transfer, AT);
+    expect(over.defaultPrevented).toBe(true);
+    expect(transfer.dropEffect).toBe("move");
+    expect(asked.at(-1)).toBe(end);
+    expect(dropLineOf(view)?.style.top).toBe(topFor(view, BASE + end));
+    const drop = fireDrag(widget(view), "drop", transfer, AT);
+    expect(drop.defaultPrevented).toBe(true);
+    fireDrag(box, "dragend", transfer);
+    expect(bytes(view.state)).toBe(after(P).replace(/\n\n\n$/, "\n\n"));
+  });
+});
+
+/** P37: nothing is dropped into an open cell editor, and no line is drawn there. */
+describe("a drag over an open cell editor", () => {
+  const DOC = `intro\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nend\n\n${P}\n`;
+
+  /** Opens the first body cell of the table and answers its editor's content. */
+  function openCell(view: EditorView): Element {
+    const at = DOC.indexOf("1 |");
+    view.dispatch({
+      effects: setOpenCell.of({ anchor: at, head: at, focused: false }),
+    });
+    hostOpenCell(view, "none");
+    const cell = view.contentDOM.querySelector(".cm-grid .cm-content");
+    if (!cell || cell === view.contentDOM) {
+      throw new Error("no open cell editor");
+    }
+    return cell;
+  }
+
+  function opened(): Built & { cell: Element } {
+    const built = build(DOC, DOC.indexOf("1 |"));
+    return { ...built, cell: openCell(built.view) };
+  }
+
+  it("takes no file there", async () => {
+    const { view, uploads, cell } = opened();
+    const files = new FakeTransfer({ namesFiles: true });
+    const over = fireDrag(cell, "dragover", files, AT);
+    expect(over.defaultPrevented).toBe(true);
+    expect(files.dropEffect).toBe("none");
+    expect(dropLineOf(view)).toBeNull();
+    const drop = fireDrag(
+      cell,
+      "drop",
+      new FakeTransfer({ files: [new File(["text"], "notes.txt")] }),
+      AT,
+    );
+    expect(drop.defaultPrevented).toBe(true);
+    expect(uploads).toHaveLength(0);
+    await Promise.resolve();
+    expect(bytes(view.state)).toBe(DOC);
+  });
+
+  it("takes no picture there", () => {
+    const { view } = build(DOC, DOC.indexOf("1 |"));
+    const box = view.contentDOM.querySelector(".cm-picture");
+    if (!box) throw new Error("no drawn picture");
+    const transfer = new FakeTransfer();
+    fireDrag(box, "dragstart", transfer);
+    // The drag selected the picture, which closed any cell; one opened
+    // during the drag is under the pointer now.
+    const cell = openCell(view);
+    const over = fireDrag(cell, "dragover", transfer, AT);
+    expect(over.defaultPrevented).toBe(true);
+    expect(transfer.dropEffect).toBe("none");
+    expect(dropLineOf(view)).toBeNull();
+    const drop = fireDrag(cell, "drop", transfer, AT);
+    expect(drop.defaultPrevented).toBe(true);
+    fireDrag(box, "dragend", transfer);
+    expect(bytes(view.state)).toBe(DOC);
   });
 });

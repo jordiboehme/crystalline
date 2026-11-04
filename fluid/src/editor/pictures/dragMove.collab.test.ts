@@ -5,7 +5,8 @@
  * meanwhile.
  */
 
-import type { EditorView } from "@codemirror/view";
+import type { TransactionSpec } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { FakeTransfer, fireDrag } from "../../test/dragKit";
@@ -16,6 +17,7 @@ import {
   undoOnce,
 } from "../../test/markKit";
 import { imagePreviews } from "../imagePreviews";
+import { PICTURE_CHANGED } from "./dragMove";
 import { prefetchPictureTools } from "./loader";
 
 beforeAll(async () => {
@@ -38,6 +40,20 @@ function typeAt(view: EditorView, at: number, text: string): void {
     selection: { anchor: at + text.length },
     userEvent: "input.type",
   });
+}
+
+/** The announcements `view` makes from now on. */
+function heard(view: EditorView): string[] {
+  const said: string[] = [];
+  const own = view.dispatch.bind(view);
+  view.dispatch = ((...specs: TransactionSpec[]) => {
+    const tr = view.state.update(...specs);
+    for (const effect of tr.effects) {
+      if (effect.is(EditorView.announce)) said.push(effect.value);
+    }
+    own(tr);
+  }) as EditorView["dispatch"];
+  return said;
 }
 
 /** How often `needle` stands in `text`. */
@@ -109,6 +125,34 @@ describe.each(["hidden", "show"] as const)(
       const expected = `Intro ${P}B1 words.\n\nSecond.\n\nThirdB2.\n\nEnd.\n`;
       expect(bytes(local.state)).toBe(expected);
       expect(bytes(peer.state)).toBe(expected);
+    });
+
+    it("still moves the picture when the other peer typed above it meanwhile (P35)", () => {
+      const { local, peer, sync } = peers();
+      const drag = startDrag(local);
+      typeAt(peer, 0, "B0 ");
+      sync();
+      const said = heard(local);
+      finishDrag(local, drag, bytes(local.state).indexOf("Third"));
+      const expected = `B0 Intro  words.\n\nSecond.\n\nThird.\n\n${P}\n\n\nEnd.\n`;
+      expect(bytes(local.state)).toBe(expected);
+      expect(said).toEqual([]);
+      sync();
+      expect(bytes(peer.state)).toBe(expected);
+    });
+
+    it("refuses the move and says why when the other peer changed the picture (P35)", () => {
+      const { local, peer, sync } = peers();
+      const drag = startDrag(local);
+      // B renames the picture: its alt "x" becomes "xy".
+      typeAt(peer, PAGE.indexOf(P) + 3, "y");
+      sync();
+      const before = bytes(local.state);
+      const said = heard(local);
+      const drop = finishDrag(local, drag, before.indexOf("Third"));
+      expect(drop.defaultPrevented).toBe(true);
+      expect(bytes(local.state)).toBe(before);
+      expect(said).toEqual([PICTURE_CHANGED]);
     });
 
     it("writes nothing when the other peer deleted the picture meanwhile", () => {
