@@ -18,6 +18,7 @@ import * as Y from "yjs";
 import type { DocumentAdapter } from "../editor/adapter";
 import { engramAdapter, reflectionAdapter } from "../editor/adapter";
 import type { ElementEdit } from "../editor/elementEdit";
+import type { FloatingContext } from "../editor/floatingContext";
 import { marksOnEditLine } from "../editor/marks/mode";
 import { roomUndo } from "../editor/roomUndo";
 import { previewConfig, surfaceExtensions } from "../editor/surface";
@@ -35,6 +36,8 @@ export interface MarkViewOptions {
   raw?: boolean;
   /** Told the formats the format buttons show as pressed. */
   onFormatState?: (formats: ReadonlySet<string>) => void;
+  /** Told what the floating action bar stands by. */
+  onFloatingContext?: (context: FloatingContext) => void;
   /** Told the element edit a click, Mod-k or Shift+F10 asked for. */
   onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
   /** The room's shared text, for a second peer (`markPeers`). */
@@ -131,7 +134,7 @@ export function markView(
           onTableContext: () => {},
           onImageContext: () => {},
           onElementContext: () => {},
-          onFloatingContext: () => {},
+          onFloatingContext: options.onFloatingContext ?? (() => {}),
           ...(options.onFormatState
             ? { onFormatState: options.onFormatState }
             : {}),
@@ -199,8 +202,10 @@ export function markPeers(
     ...options,
     ytext: localDoc.getText("content"),
   });
+  // The local view's listeners are the local view's: the peer has none.
   const peer = markView(text, {
     ...options,
+    onFloatingContext: () => {},
     ytext: peerDoc.getText("content"),
   });
   return {

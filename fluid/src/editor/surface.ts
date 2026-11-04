@@ -99,9 +99,10 @@ export interface SurfaceOptions {
    */
   onElementContext: (face: ElementFace) => void;
   /**
-   * Told what the floating action bar stands by: a text selection, the open
-   * table cell, or nothing. It travels with the listeners above for their
-   * reason.
+   * Told what the floating action bar stands by: a selected picture (read
+   * with the page's own `pictureAssets`, so nothing more is passed here), a
+   * text selection, the open table cell, or nothing. It travels with the
+   * listeners above for their reason.
    */
   onFloatingContext: (context: FloatingContext) => void;
   /**

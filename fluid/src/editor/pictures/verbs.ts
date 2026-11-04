@@ -167,12 +167,15 @@ export function setPictureWidth(
 /**
  * Changes the alt text to read `next`: one change to the part that differs,
  * escaped where it has to be (`altEdit`). The same words dispatch nothing
- * (false).
+ * (false). With `select` false the selection is left where it is (mapped
+ * through the change): the bar writes a typed alt text when it closes,
+ * after the selection may have moved on.
  */
 export function setPictureAlt(
   view: EditorView,
   next: string,
   at?: number,
+  select = true,
 ): boolean {
   const ref = target(view, at);
   if (ref === null) {
@@ -188,7 +191,11 @@ export function setPictureAlt(
       to: ref.altFrom + edit.to,
       insert: edit.insert,
     },
-    selection: selected(ref, edit.insert.length - (edit.to - edit.from)),
+    ...(select
+      ? {
+          selection: selected(ref, edit.insert.length - (edit.to - edit.from)),
+        }
+      : {}),
     userEvent: "input.alt",
     scrollIntoView: true,
   });

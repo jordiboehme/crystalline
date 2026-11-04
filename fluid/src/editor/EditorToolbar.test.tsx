@@ -627,9 +627,10 @@ describe("the attach verb", () => {
 });
 
 /**
- * The image-format menu is context too: it is drawn only where the caret is
- * actually on an attachment image, and every row of it edits the target of
- * that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
+ * The image-format menu is context too: it is drawn only in Raw, where the
+ * caret is on an attachment image's reference text (outside Raw the picture
+ * is selected and the floating bar holds its options), and every row of it
+ * edits the target of that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
  * under test here is that each label reaches the verb it promises.
  */
 describe("the image-format menu", () => {
@@ -648,7 +649,7 @@ describe("the image-format menu", () => {
       ),
       parent: document.body,
     });
-    bar = render(<EditorToolbar view={view} imageActive />, {
+    bar = render(<EditorToolbar view={view} imageActive raw />, {
       wrapper: Tooltips,
     });
     return view;
@@ -662,11 +663,19 @@ describe("the image-format menu", () => {
   }
 
   test("is there only while the caret is on an image", () => {
-    const { rerender } = render(<EditorToolbar view={null} />, {
+    const { rerender } = render(<EditorToolbar view={null} raw />, {
       wrapper: Tooltips,
     });
     expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
-    rerender(<EditorToolbar view={null} imageActive />);
+    rerender(<EditorToolbar view={null} imageActive raw />);
+    expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
+  });
+
+  test("is Raw's only: with the pictures drawn the floating bar has them", () => {
+    mountOnImage();
+    bar?.rerender(<EditorToolbar view={view} imageActive raw={false} />);
+    expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
+    bar?.rerender(<EditorToolbar view={view} imageActive raw />);
     expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
   });
 

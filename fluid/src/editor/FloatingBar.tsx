@@ -2,7 +2,8 @@
  * The floating action bar: a small `role="toolbar"` named "Quick format"
  * that stands just above a text selection, or above (or below) the table
  * whose cell is open, with what makes sense there. A table with no room on
- * either side, or taller than the viewport, has the bar by the caret.
+ * either side, or taller than the viewport, has the bar by the caret. On a
+ * selected picture it is named "Picture options" and stands by the image.
  *
  * - On text: Bold, Italic, Strikethrough, Inline code, Link and Wiki link,
  *   the sticky bar's own commands under the sticky bar's own names (the
@@ -12,6 +13,10 @@
  *   table actions", which opens the grid's Cell actions menu. The table verbs
  *   run through the grid's own action path (`runCellAction`), so they keep
  *   its undo groups, its focus rule and the cell they land in.
+ * - On a picture: `PictureControls`, its placement, size, alt text and
+ *   removal. Its alt field takes the focus like a field: a press on it is
+ *   not cancelled, and Left, Right, Home and End edit its text, with Left
+ *   at the start and Right at the end going on along the bar (P13).
  *
  * Every command runs on `verbTarget(main)`, the sticky bar's own rule, read
  * when it runs: the open cell's view, else main, and nothing while main's
@@ -83,6 +88,7 @@ import {
 import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { toggleFormat } from "./marks/formatting";
+import { PictureControls, pictureLabels } from "./PictureControls";
 import { insertWikilink } from "./toolbar";
 
 export interface FloatingBarProps {
@@ -200,7 +206,7 @@ export default function FloatingBar({
    * back.
    */
   const [dismissed, setDismissed] = useState<{
-    kind: "text" | "cell" | null;
+    kind: NonNullable<FloatingContext>["kind"] | null;
     moves: number;
   } | null>(null);
   const [pointerDown, setPointerDown] = useState(false);
@@ -308,17 +314,25 @@ export default function FloatingBar({
     !pointerDown &&
     focused;
 
+  const picture = visible && context.kind === "image" ? context : null;
   const items: Item[] =
-    visible && context.kind === "cell"
-      ? [...textItems(wikilinks), ...cellItems(main)]
-      : textItems(wikilinks);
+    picture !== null
+      ? []
+      : visible && context.kind === "cell"
+        ? [...textItems(wikilinks), ...cellItems(main)]
+        : textItems(wikilinks);
   const inCell = visible && context.kind === "cell";
   const alignOff = inCell && !cellActionApplies(main, "Align left");
-  /** The enabled buttons, in order: the roving tab stop is one of them. */
-  const labels = [
-    ...items.filter((item) => !item.disabled).map((item) => item.label),
-    ...(inCell ? [...(alignOff ? [] : ["Align"]), "More table actions"] : []),
-  ];
+  /** The enabled controls, in order: the roving tab stop is one of them. */
+  const labels =
+    picture !== null
+      ? pictureLabels(picture.formattable)
+      : [
+          ...items.filter((item) => !item.disabled).map((item) => item.label),
+          ...(inCell
+            ? [...(alignOff ? [] : ["Align"]), "More table actions"]
+            : []),
+        ];
   const stop =
     current !== null && labels.includes(current) ? current : labels[0];
 
@@ -391,6 +405,17 @@ export default function FloatingBar({
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
     if (!target.hasAttribute("data-roving")) return; // inside the Align menu
+    // The alt field's keys edit its text; only its edges go on (P13).
+    if (target instanceof HTMLInputElement) {
+      const start = target.selectionStart;
+      const end = target.selectionEnd;
+      const length = target.value.length;
+      if (event.key === "Home" || event.key === "End") return;
+      if (event.key === "ArrowLeft" && !(start === 0 && end === 0)) return;
+      if (event.key === "ArrowRight" && !(start === length && end === length)) {
+        return;
+      }
+    }
     const stops = [
       ...(bar.current?.querySelectorAll<HTMLElement>(
         "[data-roving]:not(:disabled)",
@@ -424,6 +449,8 @@ export default function FloatingBar({
   };
 
   const keepSelection = (event: MouseEvent) => {
+    // The alt field is a field: a press on it puts the caret there (P13).
+    if (event.target instanceof HTMLInputElement) return;
     event.preventDefault();
   };
 
@@ -439,13 +466,16 @@ export default function FloatingBar({
     <div
       ref={bar}
       role="toolbar"
-      aria-label="Quick format"
+      aria-label={picture !== null ? "Picture options" : "Quick format"}
       aria-orientation="horizontal"
       {...{ [MARK]: "" }}
       onMouseDown={keepSelection}
       onKeyDown={onKeyDown}
       className="absolute z-20 flex items-center gap-0.5 rounded-md border border-slate-200 bg-white p-0.5 shadow-md print:hidden dark:border-slate-700 dark:bg-slate-900"
     >
+      {picture !== null && (
+        <PictureControls main={main} context={picture} roving={roving} />
+      )}
       {items.map((item) => (
         <IconButton
           key={item.label}

@@ -381,6 +381,17 @@ describe("setPictureSize", () => {
   });
 });
 
+describe("setPictureAlt without selecting", () => {
+  it("writes the alt text and leaves the caret where it was", () => {
+    const view = on("Hi ![a](assets/a.png)");
+    view.dispatch({ selection: EditorSelection.cursor(1) });
+    expect(setPictureAlt(view, "ab", 4, false)).toBe(true);
+    expect(bytes(view.state)).toBe("Hi ![ab](assets/a.png)\n");
+    expect(view.state.selection.main.head).toBe(1);
+    expect(view.state.selection.main.empty).toBe(true);
+  });
+});
+
 describe("setPictureWidth", () => {
   it("writes an integer share clamped to 10 through 100", () => {
     const view = on("![a](assets/a.png#right)");

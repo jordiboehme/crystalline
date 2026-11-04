@@ -14,10 +14,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cellOf, cleanupCells, soloMain } from "../test/cellKit";
 import { fencePreviews } from "./fencePreviews";
 import type { FloatingContext } from "./floatingContext";
-import { floatingContextListener } from "./floatingContext";
+import { floatingContextListener, watchDocChanges } from "./floatingContext";
 import { hostOpenCell } from "./grid/gridWidget";
 import { gridExtension } from "./grid/index";
 import { closeCell, setOpenCell } from "./grid/openCell";
+import { imagePreviews } from "./imagePreviews";
 
 const DOC = "Intro words\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nOutro\n";
 
@@ -190,5 +191,148 @@ describe("the cell context's rect (finding 3)", () => {
     const context = last();
     if (context?.kind !== "cell") throw new Error("no cell context");
     expect(context.rect.top).toBe(context.caret.top);
+  });
+});
+
+describe("the picture context", () => {
+  const ATTACHED = "![Chart](assets/c.png)";
+  const EXTERNAL = "![Map](https://example.com/m.png)";
+  const PICTURES = `Words ${ATTACHED} and ${EXTERNAL}.\n\n[${"![In](assets/i.png)"}](https://x.y)\n`;
+
+  function pictures(doc = PICTURES) {
+    return setup(doc, [imagePreviews("eng")]);
+  }
+
+  function select(main: EditorView, from: number, to: number): void {
+    main.dispatch({ selection: { anchor: from, head: to } });
+  }
+
+  test("a selected attachment reports image, formattable", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("image");
+    });
+    expect(last()).toMatchObject({
+      kind: "image",
+      from,
+      to: from + ATTACHED.length,
+      formattable: true,
+    });
+  });
+
+  test("a selected external picture reports image, not formattable", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(EXTERNAL);
+    select(main, from, from + EXTERNAL.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("image");
+    });
+    expect(last()).toMatchObject({ kind: "image", formattable: false });
+  });
+
+  test("a selection one character longer than the picture reports text", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length + 1);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("text");
+    });
+  });
+
+  test("a picture inside a link reports text", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf("![In]");
+    select(main, from, from + "![In](assets/i.png)".length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("text");
+    });
+  });
+
+  test("collapsing the selection reports null", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("image");
+    });
+    main.dispatch({ selection: { anchor: from } });
+    await vi.waitFor(() => {
+      expect(last()).toBeNull();
+    });
+  });
+
+  test("with no pictures drawn, a selected reference is text", async () => {
+    const { main, last } = setup(PICTURES);
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("text");
+    });
+  });
+
+  test("a change that keeps the rect reports the picture's new place", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("image");
+    });
+    // jsdom has no layout: every rect is the empty one, so only the
+    // positions tell the two contexts apart (D8).
+    main.dispatch({ changes: { from: 0, insert: "More " } });
+    await vi.waitFor(() => {
+      expect(last()).toMatchObject({ kind: "image", from: from + 5 });
+    });
+  });
+
+  test("the rect is the drawn image's box", async () => {
+    const { main, last } = pictures();
+    const from = PICTURES.indexOf(ATTACHED);
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(
+        main.contentDOM.querySelector(".cm-picture-selected img"),
+      ).not.toBeNull();
+    });
+    const image = main.contentDOM.querySelector(".cm-picture-selected img");
+    if (!(image instanceof HTMLElement)) throw new Error("no drawn image");
+    image.getBoundingClientRect = () => new DOMRect(40, 300, 200, 100);
+    main.dispatch({ selection: { anchor: 0 } });
+    select(main, from, from + ATTACHED.length);
+    await vi.waitFor(() => {
+      expect(last()?.kind).toBe("image");
+    });
+    const context = last();
+    if (context?.kind !== "image") throw new Error("no image context");
+    expect([context.rect.left, context.rect.top, context.rect.bottom]).toEqual([
+      40, 300, 400,
+    ]);
+  });
+});
+
+describe("watchDocChanges", () => {
+  test("hands every change of main to a watcher until it stops", () => {
+    const { main } = setup();
+    const seen: number[] = [];
+    const stop = watchDocChanges(main, (changes) => {
+      seen.push(changes === null ? -1 : changes.mapPos(0, 1));
+    });
+    main.dispatch({ changes: { from: 0, insert: "ab" } });
+    main.dispatch({ selection: { anchor: 1 } });
+    stop();
+    main.dispatch({ changes: { from: 0, insert: "c" } });
+    expect(seen).toEqual([2]);
+  });
+
+  test("tells a watcher when the state is replaced", () => {
+    const { main } = setup();
+    const seen: unknown[] = [];
+    watchDocChanges(main, (changes) => {
+      seen.push(changes);
+    });
+    main.setState(main.state);
+    expect(seen).toEqual([null]);
   });
 });

@@ -7,7 +7,14 @@
 import { undo } from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -23,6 +30,7 @@ import { hostOpenCell } from "./grid/gridWidget";
 import { gridExtension } from "./grid/index";
 import { openCellRange, setOpenCell } from "./grid/openCell";
 import { cleanupMarkViews, markView } from "../test/markKit";
+import { imagePreviews } from "./imagePreviews";
 
 const DOC =
   "Intro words\n\n| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n\nOutro\n";
@@ -77,7 +85,9 @@ function harness(extra: Extension[] = []): Harness {
 }
 
 function bar(): HTMLElement {
-  return screen.getByRole("toolbar", { name: "Quick format" });
+  return screen.getByRole("toolbar", {
+    name: /^(Quick format|Picture options)$/,
+  });
 }
 
 function quick(name: string): HTMLElement {
@@ -486,6 +496,76 @@ describe("the floating bar in an open cell", () => {
   });
 });
 
+describe("the floating bar on a picture", () => {
+  afterEach(cleanupMarkViews);
+
+  /** A view with the picture layer, its picture selected, and the bar drawn. */
+  async function onPicture(doc: string, ref: string): Promise<EditorView> {
+    let latest: FloatingContext = null;
+    const v = markView(doc, {
+      images: imagePreviews("eng"),
+      onFloatingContext: (next) => {
+        latest = next;
+      },
+    });
+    const from = doc.indexOf(ref);
+    v.focus();
+    v.dispatch({ selection: { anchor: from, head: from + ref.length } });
+    await vi.waitFor(() => {
+      expect(latest?.kind).toBe("image");
+    });
+    render(<FloatingBar main={v} context={latest} wikilinks />, {
+      wrapper: Tooltips,
+    });
+    return v;
+  }
+
+  const picture = () =>
+    screen.getByRole("toolbar", { name: "Picture options" });
+
+  test("is named Picture options and offers no text group", async () => {
+    await onPicture("![C](assets/c.png)\n", "![C](assets/c.png)");
+    expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();
+    expect(
+      within(picture()).queryByRole("button", { name: "Bold" }),
+    ).toBeNull();
+  });
+
+  test("Alt+F10 focuses Left with text wrap, the one tab stop", async () => {
+    const v = await onPicture("![C](assets/c.png)\n", "![C](assets/c.png)");
+    altF10(v.contentDOM);
+    const first = within(picture()).getByRole("button", {
+      name: "Left with text wrap",
+    });
+    await vi.waitFor(() => {
+      expect(first).toHaveFocus();
+    });
+    expect(first).toHaveAttribute("tabindex", "0");
+    expect(
+      within(picture()).getByRole("textbox", { name: "Alt text" }),
+    ).toHaveAttribute("tabindex", "-1");
+    fireEvent.keyDown(first, { key: "End" });
+    expect(
+      within(picture()).getByRole("button", { name: "Remove picture" }),
+    ).toHaveFocus();
+    fireEvent.keyDown(document.activeElement ?? first, { key: "Escape" });
+    expect(v.hasFocus).toBe(true);
+    const sel = v.state.selection.main;
+    expect(v.state.sliceDoc(sel.from, sel.to)).toBe("![C](assets/c.png)");
+  });
+
+  test("Alt+F10 on an external picture focuses the alt field", async () => {
+    const ref = "![M](https://example.com/m.png)";
+    const v = await onPicture(`${ref}\n`, ref);
+    altF10(v.contentDOM);
+    await vi.waitFor(() => {
+      expect(
+        within(picture()).getByRole("textbox", { name: "Alt text" }),
+      ).toHaveFocus();
+    });
+  });
+});
+
 describe("placement by an open cell (finding 3)", () => {
   const box = (top: number, bottom: number, left = 20) =>
     new DOMRect(left, top, 200, bottom - top);
@@ -537,6 +617,19 @@ describe("placement by an open cell (finding 3)", () => {
       selection: false,
     });
     expect(el.style.top).toBe("406px");
+  });
+
+  test("stands above a picture, and below it with no room above", () => {
+    const image = (rect: DOMRect): FloatingContext => ({
+      kind: "image",
+      rect,
+      from: 0,
+      to: 0,
+      formattable: true,
+    });
+    expect(placed(image(box(300, 400))).style.top).toBe("264px");
+    cleanup();
+    expect(placed(image(box(10, 400))).style.top).toBe("406px");
   });
 
   test("goes by the caret when the table leaves no room on either side", () => {

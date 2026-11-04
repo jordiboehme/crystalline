@@ -432,7 +432,8 @@ export function EditorToolbar({
   /**
    * Whether the caret is on an attachment image right now. Drawn rather than
    * disabled, like the table segment beside it: a menu that has nothing to act
-   * on is one more thing to read past on the way to the verbs that do.
+   * on is one more thing to read past on the way to the verbs that do. Only
+   * in Raw: elsewhere the floating bar has the picture's options.
    */
   imageActive?: boolean;
   /**
@@ -703,11 +704,13 @@ export function EditorToolbar({
             disabled={lineOff || attachDisabled}
           />
         )}
-        {imageActive && !cellNow && (
+        {imageActive && raw && !cellNow && (
           <>
             {/*
             The same hairline, in front of the one menu that acts on the image
-            the caret is on rather than on the document at large.
+            the caret is on rather than on the document at large. Raw only:
+            outside it the picture is drawn, a press selects it, and the
+            floating bar holds its options (ruling 15).
           */}
             <Divider />
             <DropdownMenu.Root>
