@@ -255,7 +255,8 @@ const LINK_ERRORS: Record<string, string> = {
  * What a person who is not an admin learns when a link cannot start because
  * of the GitHub App's setup, by the `reason` the refusal carries. The words
  * name no command and no setting; an admin gets the server's sentence, which
- * names both.
+ * names both. The page an agent's link opens says the same: keep in step with
+ * `setup_sentence` in `crates/rest/src/github_link.rs`.
  */
 const START_REASONS: Record<string, string> = {
   no_client_secret:

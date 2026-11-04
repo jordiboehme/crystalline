@@ -29,6 +29,7 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_remote::{AppLookup, AppStore};
 use crystalline_service::daemon::http_router;
+use crystalline_service::engine::ConfigureAction;
 use crystalline_service::mcp::McpServer;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, EnvOverlay};
@@ -1191,6 +1192,40 @@ async fn the_link_spends_once() {
     assert!(page.contains("Ask your agent for a new link"), "{page}");
     let page = assert_html_page(ctx.go("deadbeef", &ann).await, 404).await;
     assert!(page.contains("Ask your agent for a new link"), "{page}");
+}
+
+/// A link minted while the setup was whole meets a setup that changed
+/// before it was opened: `service.public_url` is gone. A person who is not
+/// an admin reads the cause in plain words, with no setting named; an admin
+/// reads the server's sentence, which names it.
+#[tokio::test]
+async fn a_link_that_cannot_start_says_why_in_plain_words_to_a_non_admin() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let vic = ctx.login("vic").await;
+    let root = ctx.login("root").await;
+    let for_vic = ctx.engine.mint_github_link("vic").unwrap();
+    let for_root = ctx.engine.mint_github_link("root").unwrap();
+    ctx.engine
+        .configure(&ConfigureAction::Unset {
+            key: "service.public_url".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let page = assert_html_page(ctx.go(&for_vic, &vic).await, 409).await;
+    assert!(
+        page.contains(
+            "This instance does not know its public address yet, so GitHub cannot send you \
+             back. Ask an admin to set it."
+        ),
+        "{page}"
+    );
+    assert!(!page.contains("service.public_url"), "{page}");
+
+    let page = assert_html_page(ctx.go(&for_root, &root).await, 409).await;
+    assert!(page.contains("service.public_url"), "{page}");
+    assert!(!page.contains("does not know its public address"), "{page}");
 }
 
 /// A link lives ten minutes.
