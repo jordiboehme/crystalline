@@ -139,3 +139,44 @@ async fn only_the_lease_accounts_mcp_writes_are_noted() {
         vec!["fixes/run-fix.md", "linker.md", "run-fix.md"]
     );
 }
+
+/// A retried upload of a headless run is still the run's: the first upload
+/// landed but was never noted (here it went through the engine, the way a
+/// handler cancelled by a timeout leaves it), and the retry with the same
+/// bytes answers `unchanged: true` and notes the path, so the pull request
+/// carries the file.
+#[tokio::test]
+async fn a_retried_upload_with_the_same_bytes_is_still_noted() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server
+        .engine
+        .automation_lease_take(Loop::Evolve, "open", "k8s", &keeper())
+        .await
+        .unwrap();
+    let token = server.token_for("keeper").await;
+    let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00retry";
+    server
+        .engine
+        .attachment_write_as("open", "assets/retry.png", png.to_vec(), &keeper())
+        .await
+        .unwrap();
+    assert!(noted(&server).await.is_empty());
+
+    let (_, reply) = server
+        .ctl(
+            Some(&token),
+            tool(
+                "write_engram",
+                json!({
+                    "domain": "open",
+                    "path": "assets/retry.png",
+                    "base64": base64::engine::general_purpose::STANDARD.encode(png),
+                }),
+            ),
+        )
+        .await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["data"]["unchanged"], true, "{reply}");
+    assert_eq!(noted(&server).await, vec!["assets/retry.png"]);
+}

@@ -7520,7 +7520,7 @@ mod adopt_names;
 mod asset_home;
 mod automation;
 pub use asset_home::{ASSET_EXISTS, MOVE_ONTO_A_FILE};
-pub(crate) use asset_home::{AssetHome, ReplaceRule, WrittenAsset};
+pub(crate) use asset_home::{AssetHome, ReplaceRule, WrittenAsset, same_bytes};
 pub use automation::{Delivery, WEBHOOK_NO_SECRET, WebhookTarget};
 pub use uploads::{file_answer, is_text_file_mime, upload_bytes};
 mod attachments;

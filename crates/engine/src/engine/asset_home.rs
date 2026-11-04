@@ -432,7 +432,7 @@ impl Engine {
                 let previous = store.get_asset(home.table(), domain_id, path).await?;
                 // The same bytes again are nothing to write, as in a folder.
                 if let Some(prior) = &previous
-                    && prior.sha256 == row.sha256
+                    && same_bytes(prior.size, || Ok(prior.sha256.clone()), &bytes)?
                 {
                     return Ok(WrittenAsset {
                         row: prior.clone(),
@@ -885,21 +885,6 @@ pub(crate) fn refuse_extension_change(from: &str, to: &str) -> Result<()> {
 
 /// The row a moved file gets when its stored row still describes it: the
 /// same bytes at the new path, the mime read off the new name.
-/// Whether the file at `abs` holds exactly `bytes`: the same size, then the
-/// same sha256. The size is asked first so a different file of another size
-/// costs no read.
-fn holds_these_bytes(abs: &Path, bytes: &[u8]) -> Result<bool> {
-    let io = |source| EngineError::Io {
-        path: abs.display().to_string(),
-        source,
-    };
-    if std::fs::metadata(abs).map_err(io)?.len() != bytes.len() as u64 {
-        return Ok(false);
-    }
-    let held = std::fs::read(abs).map_err(io)?;
-    Ok(sha256_hex(&held) == sha256_hex(bytes))
-}
-
 fn moved_row(prior: AttachmentRow, to: &str) -> Result<AttachmentRow> {
     let name = to.rsplit('/').next().unwrap_or(to);
     let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
@@ -912,6 +897,37 @@ fn moved_row(prior: AttachmentRow, to: &str) -> Result<AttachmentRow> {
         mime: mime.to_string(),
         ..prior
     })
+}
+
+/// Whether a stored file of `size` bytes is exactly `bytes`: the same size,
+/// then the same sha256, which `sha` hands over only when the sizes agree.
+/// The one same-bytes check every upload makes (the folder, a virtual
+/// domain's row and an actor's view), so a file of another size costs no
+/// read and no hash.
+pub(crate) fn same_bytes(
+    size: u64,
+    sha: impl FnOnce() -> Result<String>,
+    bytes: &[u8],
+) -> Result<bool> {
+    if size != bytes.len() as u64 {
+        return Ok(false);
+    }
+    Ok(sha()? == sha256_hex(bytes))
+}
+
+/// Whether the file at `abs` holds exactly `bytes` ([`same_bytes`] over the
+/// file's own size and contents).
+fn holds_these_bytes(abs: &Path, bytes: &[u8]) -> Result<bool> {
+    let io = |source| EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    };
+    let size = std::fs::metadata(abs).map_err(io)?.len();
+    same_bytes(
+        size,
+        || Ok(sha256_hex(&std::fs::read(abs).map_err(io)?)),
+        bytes,
+    )
 }
 
 #[cfg(test)]

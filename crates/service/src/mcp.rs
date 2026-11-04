@@ -2646,10 +2646,10 @@ impl McpServer {
         let Scope::User { account, .. } = &caller.scope else {
             return;
         };
-        // An upload of the bytes the path already held wrote nothing.
-        if receipt["unchanged"] == true {
-            return;
-        }
+        // An upload of the bytes the path already held is noted too: it may
+        // be the retry of an upload that landed but was never noted (its
+        // handler cancelled by a timeout), and the run's pull request must
+        // still carry the file.
         for (domain, paths) in written_paths(receipt) {
             if let Err(e) = self.engine.note_written(&domain, account, &paths).await {
                 tracing::warn!("noting a run's writes in '{domain}': {e}");

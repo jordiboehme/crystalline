@@ -2290,19 +2290,20 @@ impl<'a> DomainView<'a> {
         let _guard = lock.lock().await;
         let shown = self.shows_file(path).await?;
         if shown {
-            let sha = sha256_hex(bytes);
-            let held = match self.own_attachment(path)? {
-                Some((_, row)) => Some((row, true)),
-                // A folder half with no file (a row a hand edit left) shows
-                // no bytes to compare, so it is not the same file.
-                None => match self.engine.attachment_read(&self.domain, path).await {
-                    Ok((_, row)) => Some((row, false)),
-                    Err(EngineError::NotFound(_)) => None,
-                    Err(e) => return Err(e),
-                },
+            // What this actor's view shows, read the way a read of it reads
+            // it. A folder half with no file (a row a hand edit left) shows
+            // no bytes to compare, so it is not the same file.
+            let in_overlay = matches!(
+                self.own_held(path)?,
+                Some(crate::overlay_files::Held::Bytes)
+            );
+            let held = match self.attachment_bytes(path).await {
+                Ok((_, row)) => Some(row),
+                Err(EngineError::NotFound(_)) => None,
+                Err(e) => return Err(e),
             };
-            if let Some((row, in_overlay)) = held
-                && row.sha256 == sha
+            if let Some(row) = held
+                && crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)?
             {
                 return Ok(PutFile {
                     row,
