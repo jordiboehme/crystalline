@@ -97,7 +97,7 @@ fn first_on_path(path_env: &OsStr) -> Option<PathBuf> {
 }
 
 /// An existing file (links followed) that may be run.
-fn is_executable(path: &Path) -> bool {
+pub fn is_executable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };

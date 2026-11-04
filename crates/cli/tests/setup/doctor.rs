@@ -3602,3 +3602,59 @@ fn every_delete_engram_caller_holds_a_transaction() {
         "the delete_engram callers moved; a new one needs its own transaction"
     );
 }
+
+#[test]
+fn doctor_reports_the_claude_desktop_record() {
+    let home = tempfile::tempdir().unwrap();
+    let state = crate::common::isolated_state_dir(home.path());
+    std::fs::create_dir_all(&state).unwrap();
+    let gone = home.path().join("gone").join("crystalline");
+    let record = json!({
+        "format": 1,
+        "extension": {
+            "version": "0.23.0",
+            "binary": gone.display().to_string(),
+            "shim_sha256": "0",
+            "file": state.join("claude-desktop/crystalline.mcpb").display().to_string(),
+            "built_at": "2026-11-04T10:00:00Z",
+            "opened": true
+        }
+    });
+    std::fs::write(
+        state.join("claude-desktop.json"),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| {
+        let mut cmd = crate::common::crystalline();
+        crate::common::isolate(&mut cmd, home.path());
+        cmd.env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
+            .arg("doctor")
+            .args(extra);
+        cmd.output().unwrap()
+    };
+
+    let json_out = run(&["--json"]);
+    let report: Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(report["claude_desktop"]["launcher_outdated"], true);
+    assert_eq!(report["claude_desktop"]["binary_missing"], true);
+    assert_eq!(report["claude_desktop"]["launcher_changed"], true);
+
+    let text = run(&[]);
+    let text_out = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text_out.contains("claude desktop ("), "{text_out}");
+    assert!(
+        text_out.contains("[warning] the extension is older than this Crystalline supports. Run: crystalline install claude-desktop"),
+        "{text_out}"
+    );
+    assert!(text_out.contains("is gone, so the extension falls back to its own search."));
+
+    // Warnings only: the exit status is the one the same machine gives
+    // without the record.
+    std::fs::remove_file(state.join("claude-desktop.json")).unwrap();
+    let without = run(&[]);
+    assert_eq!(text.status.code(), without.status.code());
+    assert!(!String::from_utf8_lossy(&without.stdout).contains("claude desktop"));
+}
