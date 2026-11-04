@@ -9,10 +9,12 @@
  * the second click undo the first.
  */
 
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { undo } from "@codemirror/commands";
+import { EditorSelection, EditorState, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import type { AssetResolver } from "../api/files";
 import { parsedState } from "../test/parse";
 import {
   clearImageFormat,
@@ -21,6 +23,7 @@ import {
   setImageAlign,
   setImageWidth,
 } from "./imageVerbs";
+import { pictureAssets } from "./pictures/refs";
 import { baseExtensions } from "./setup";
 
 /** A buffer with the caret at `at`, parsed far enough to answer about it. */
@@ -165,6 +168,82 @@ describe("the format verbs", () => {
     expect(view.state.doc.toString()).toBe(
       "![a](assets/a.png) ![b](assets/b.png#left)\n",
     );
+    view.destroy();
+  });
+});
+
+describe("the format verbs at a position", () => {
+  it("edits the picture `at` names, not the one the caret is on", () => {
+    const doc = "![a](assets/a.png) ![b](assets/b.png)\n";
+    const view = editor(doc, 2);
+    expect(setImageWidth(view, "50%", doc.indexOf("![b]") + 2)).toBe(true);
+    expect(view.state.doc.toString()).toBe(
+      "![a](assets/a.png) ![b](assets/b.png#w=50%)\n",
+    );
+    expect(setImageAlign(view, "left", doc.indexOf("![b]") + 2)).toBe(true);
+    expect(clearImageFormat(view, 2)).toBe(true);
+    expect(view.state.doc.toString()).toBe(
+      "![a](assets/a.png) ![b](assets/b.png#left,w=50%)\n",
+    );
+    view.destroy();
+  });
+
+  it("tags the rewrite input.format, one undo step of its own", () => {
+    const doc = "![a](assets/a.png)\n";
+    const events: (string | undefined)[] = [];
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          selection: EditorSelection.cursor(2),
+          extensions: [
+            ...baseExtensions(false),
+            EditorView.updateListener.of((update) => {
+              for (const tr of update.transactions) {
+                if (tr.docChanged) {
+                  events.push(tr.annotation(Transaction.userEvent));
+                }
+              }
+            }),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    view.dispatch({
+      changes: { from: doc.length, insert: "x" },
+      userEvent: "input.type",
+    });
+    setImageAlign(view, "right");
+    expect(events).toEqual(["input.type", "input.format"]);
+    undo(view);
+    expect(view.state.doc.toString()).toBe(`${doc}x`);
+    view.destroy();
+  });
+});
+
+describe("imageContextAt with a Reflection's resolver", () => {
+  it("finds a ../assets picture through pictureAssets", () => {
+    const reflection: AssetResolver = {
+      resolve: (target) =>
+        target.startsWith("../assets/") ? target.slice(3) : null,
+      url: (path) => `/reflection/${path}`,
+      refused: () => null,
+    };
+    const doc = "![Shot](../assets/a.png)\n";
+    const view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          selection: EditorSelection.cursor(2),
+          extensions: [...baseExtensions(false), pictureAssets.of(reflection)],
+        }),
+      ),
+      parent: document.body,
+    });
+    expect(imageContextAt(view.state)?.path).toBe("assets/a.png");
+    expect(setImageAlign(view, "right")).toBe(true);
+    expect(view.state.doc.toString()).toBe("![Shot](../assets/a.png#right)\n");
     view.destroy();
   });
 });

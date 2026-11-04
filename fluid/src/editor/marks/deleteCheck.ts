@@ -75,6 +75,8 @@ const CHECKED = new Set([
   "delete.selection",
   // A cut removes a selection too (D12).
   "delete.cut",
+  // A picture's removal from its tools (P7).
+  "delete.picture",
 ]);
 
 /**
@@ -718,7 +720,9 @@ export function judgeDeletion(
 
 /** The bound of one press of `event` (D35). */
 function budgetOf(event: string): number {
-  return event === "delete.selection" || event === "delete.cut"
+  return event === "delete.selection" ||
+    event === "delete.cut" ||
+    event === "delete.picture"
     ? PARSE_BUDGET.gesture
     : PARSE_BUDGET.key;
 }

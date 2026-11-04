@@ -658,6 +658,8 @@ const PERSON_REPLACES = new Set([
   "input.complete",
   "delete.selection",
   "delete.cut",
+  // A picture's removal from its tools (P7).
+  "delete.picture",
   "move.drop",
   // The word and line deletes (Mod/Alt/Cmd+Backspace and Delete), and the
   // plain keys where they fall through to CodeMirror's own command. A
