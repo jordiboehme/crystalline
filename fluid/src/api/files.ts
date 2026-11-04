@@ -244,6 +244,12 @@ export interface UploadedAttachment {
   mime: string;
   size: number;
   sha256: string;
+  /**
+   * Present and true when the path already held exactly these bytes, so
+   * nothing was written. Uploading the same bytes to a path that already
+   * holds them succeeds this way, so a retry after a timeout is safe.
+   */
+  unchanged?: true;
 }
 
 /** One attachment a domain carries. */
@@ -264,6 +270,7 @@ export function readUploaded(
     mime: asString(record?.mime) ?? "application/octet-stream",
     size: asNumber(record?.size) ?? size,
     sha256: asString(record?.sha256) ?? "",
+    ...(record?.unchanged === true ? { unchanged: true as const } : {}),
   };
 }
 

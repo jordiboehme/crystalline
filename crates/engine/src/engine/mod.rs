@@ -9117,6 +9117,9 @@ pub struct WrittenAttachment {
     /// domain: in an overlay, neither its own bytes nor a reviewed file it
     /// has not deleted.
     pub created: bool,
+    /// Whether the path already showed exactly these bytes, so nothing was
+    /// written: a retry of an upload that already landed.
+    pub unchanged: bool,
 }
 
 /// The metadata row describing these bytes at this path. The mime comes from

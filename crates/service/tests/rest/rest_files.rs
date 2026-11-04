@@ -1182,6 +1182,34 @@ fn exists_detail(path: &str) -> String {
     format!("'{path}' {}", crystalline_service::engine::ASSET_EXISTS)
 }
 
+/// A create-only upload of the bytes a path already holds answers 200 with
+/// `unchanged: true` and writes nothing, on every kind of domain; other
+/// bytes still answer 412. A retry after a timeout is safe that way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_only_engram_upload_of_the_same_bytes_answers_unchanged() {
+    let fx = serve(Options {
+        review: true,
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    for domain in ["eng", "scratch", "rev"] {
+        let url = format!("/api/v1/domains/{domain}/files/assets/again.png");
+        let resp = put_if_none_match(fx.addr, &eddy, &url, PNG, "*").await;
+        assert_eq!(resp.status(), 200, "{url}");
+        let first: serde_json::Value = resp.json().await.unwrap();
+        assert!(first.get("unchanged").is_none(), "{url}: {first}");
+        let resp = put_if_none_match(fx.addr, &eddy, &url, PNG, "*").await;
+        assert_eq!(resp.status(), 200, "{url}");
+        let again: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(again["unchanged"], true, "{url}: {again}");
+        assert_eq!(again["sha256"], first["sha256"], "{url}: {again}");
+        assert_eq!(again["path"], first["path"], "{url}: {again}");
+        let resp = put_if_none_match(fx.addr, &eddy, &url, PDF, "*").await;
+        assert_eq!(resp.status(), 412, "{url}");
+    }
+}
+
 /// `If-None-Match: *` makes an engram upload create-only on every kind of
 /// domain: a file domain (a file the sync saw and one only the disk holds), a
 /// virtual domain, and a domain that reviews changes, where what counts is

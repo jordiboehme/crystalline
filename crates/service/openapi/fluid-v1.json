@@ -3304,7 +3304,7 @@
           "attachments"
         ],
         "summary": "Upload an attachment, creating or replacing it.",
-        "description": "Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.\n\nThe path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.\n\nOn a domain that reviews changes the bytes land in the caller's own files overlay and the folder the team reviewed is not touched, which is what `draft` in the answer says. With `X-Crystalline-Join` naming a live join the bytes follow it into the OWNER's files overlay instead, to be folded or discarded with the draft that references them.\n\nWith `If-None-Match: *` the upload only creates: a path that already holds a file is refused with 412. On a domain that reviews changes that is the file the caller sees there (its own draft bytes, or a reviewed file it has not deleted).",
+        "description": "Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.\n\nThe path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.\n\nOn a domain that reviews changes the bytes land in the caller's own files overlay and the folder the team reviewed is not touched, which is what `draft` in the answer says. With `X-Crystalline-Join` naming a live join the bytes follow it into the OWNER's files overlay instead, to be folded or discarded with the draft that references them.\n\nWith `If-None-Match: *` the upload only creates: a path that already holds different bytes is refused with 412. On a domain that reviews changes that is the file the caller sees there (its own draft bytes, or a reviewed file it has not deleted).\n\nUploading the same bytes to a path that already holds them answers 200 with `unchanged: true` and writes nothing, with `If-None-Match: *` or without, so a retry after a timeout is safe.",
         "operationId": "write_attachment",
         "parameters": [
           {
@@ -3341,7 +3341,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "`*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.",
+            "description": "`*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.",
             "required": false,
             "schema": {
               "type": [
@@ -3364,7 +3364,7 @@
         },
         "responses": {
           "200": {
-            "description": "Stored. The path to reference it by, its mime, its size and its checksum.",
+            "description": "Stored. The path to reference it by, its mime, its size and its checksum; `unchanged: true` when the path already held exactly these bytes.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3424,7 +3424,7 @@
             }
           },
           "412": {
-            "description": "`If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.",
+            "description": "`If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5387,7 +5387,7 @@
           "reflection"
         ],
         "summary": "Add a file to the Reflection, or replace one.",
-        "description": "Needs `edit` for a new path and `curate` to replace a file, since a replace removes the old bytes. The request body is the raw file, not multipart; the extension allowlist decides the mime. The path rules, the allowlist and the 10 MiB ceiling are the engram attachments' own. With `If-None-Match: *` the upload only creates: a path that already holds a file is refused with 412, for a curator too, so two people cannot replace each other's upload by accident.",
+        "description": "Needs `edit` for a new path and `curate` to replace a file, since a replace removes the old bytes. The request body is the raw file, not multipart; the extension allowlist decides the mime. The path rules, the allowlist and the 10 MiB ceiling are the engram attachments' own. With `If-None-Match: *` the upload only creates: a path that already holds different bytes is refused with 412, for a curator too, so two people cannot replace each other's upload by accident. Uploading the same bytes to a path that already holds them answers 200 with `unchanged: true` and writes nothing, with `If-None-Match: *` or without, so a retry after a timeout is safe.",
         "operationId": "write_reflection_asset",
         "parameters": [
           {
@@ -5412,7 +5412,7 @@
           {
             "name": "If-None-Match",
             "in": "header",
-            "description": "`*` to only create: a path that already holds a file is refused with 412 and left as it is. Any other value is 422.",
+            "description": "`*` to only create: a path that already holds different bytes is refused with 412 and left as it is; the same bytes answer 200 with `unchanged: true`. Any other value is 422.",
             "required": false,
             "schema": {
               "type": [
@@ -5435,7 +5435,7 @@
         },
         "responses": {
           "200": {
-            "description": "Stored. `path` is inside `reflections/`.",
+            "description": "Stored. `path` is inside `reflections/`; `unchanged: true` when the path already held exactly these bytes.",
             "content": {
               "application/json": {
                 "schema": {
@@ -5485,7 +5485,7 @@
             }
           },
           "412": {
-            "description": "`If-None-Match: *` and the path already holds a file; nothing was stored. Pick another name.",
+            "description": "`If-None-Match: *` and the path already holds different bytes; nothing was stored. Pick another name.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15810,6 +15810,14 @@
             "description": "Byte length as stored.",
             "example": 20481,
             "minimum": 0
+          },
+          "unchanged": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present and true when the path already held exactly these bytes, so\nnothing was written. Uploading the same bytes to a path that already\nholds them succeeds this way, also with `If-None-Match: *`, so a retry\nafter a timeout is safe. Absent on every other upload.",
+            "example": true
           }
         }
       },
@@ -15849,6 +15857,14 @@
             "description": "Byte length as stored.",
             "example": 20481,
             "minimum": 0
+          },
+          "unchanged": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present and true when the path already held exactly these bytes, so\nnothing was written. Uploading the same bytes to a path that already\nholds them succeeds this way, also with `If-None-Match: *`, so a retry\nafter a timeout is safe. Absent on every other upload.",
+            "example": true
           }
         }
       },

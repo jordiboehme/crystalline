@@ -291,6 +291,26 @@ describe("uploadAttachment", () => {
     });
   });
 
+  it("keeps unchanged when the path already held these bytes", async () => {
+    stubFetch(
+      jsonResponse({
+        path: "assets/a.png",
+        mime: "image/png",
+        size: 1,
+        sha256: "abc",
+        unchanged: true,
+      }),
+    );
+
+    const stored = await uploadAttachment(
+      "eng",
+      "assets/a.png",
+      new Blob(["x"]),
+    );
+
+    expect(stored.unchanged).toBe(true);
+  });
+
   it("names a content type for a blob that carries none", async () => {
     const spy = stubFetch(
       jsonResponse({ path: "assets/a.txt", mime: "text/plain", size: 1 }),

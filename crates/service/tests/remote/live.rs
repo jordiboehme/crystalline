@@ -1474,6 +1474,52 @@ async fn a_status_timeout_refuses_the_upload_and_keeps_the_source_up() {
     assert!(page.to_string().contains("open-note"), "{page}");
 }
 
+/// A retry through a mount of an upload the server already took succeeds on
+/// the server as unchanged, for an engram file and a Reflection file. Other
+/// bytes are still refused.
+#[tokio::test]
+async fn a_mounted_upload_sent_again_with_the_same_bytes_is_unchanged() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let png = base64::engine::general_purpose::STANDARD.encode(PIC);
+    for (tool, args, on_server) in [
+        (
+            "write_engram",
+            json!({ "domain": "open", "path": "assets/again.png", "base64": png }),
+            "assets/again.png",
+        ),
+        (
+            "write_reflection",
+            json!({ "domain": "open", "action": "write_asset", "path": "assets/again.png", "base64": png }),
+            "reflections/assets/again.png",
+        ),
+    ] {
+        let first = call(client.peer(), tool, args.clone()).await.unwrap();
+        assert!(first.get("unchanged").is_none(), "{tool}: {first}");
+        let again = call(client.peer(), tool, args.clone()).await.unwrap();
+        assert_eq!(again["unchanged"], true, "{tool}: {again}");
+        assert_eq!(again["created"], false, "{tool}: {again}");
+        assert_eq!(again["sha256"], first["sha256"], "{tool}: {again}");
+        assert_eq!(
+            std::fs::read(server.file("open", on_server)).unwrap(),
+            PIC,
+            "{tool}"
+        );
+        let mut other = args.clone();
+        other["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(b"other"));
+        let refused = call(client.peer(), tool, other).await.unwrap_err();
+        assert!(
+            refused.contains(crystalline_service::engine::ASSET_EXISTS),
+            "{tool}: {refused}"
+        );
+    }
+}
+
 /// A server that has agent files takes the upload through a mount, and the
 /// routed answers for a file render as the local ones do: plain JSON (also
 /// under a TOON configuration) and, for a picture, one image block with no

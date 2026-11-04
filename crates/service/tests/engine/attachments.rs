@@ -271,6 +271,60 @@ async fn a_virtual_domain_attachment_lives_in_the_database_only() {
     );
 }
 
+/// A virtual domain takes the bytes it already holds again as unchanged: the
+/// row keeps its time, and other bytes are still refused when the upload only
+/// creates.
+#[tokio::test]
+async fn a_virtual_domain_takes_the_same_bytes_again_as_unchanged() {
+    let (_tmp, engine, _root, _scratch) = engine_fixture().await;
+    let path = "assets/data.json";
+    let first = engine
+        .attachment_write_joined(
+            "scratch",
+            path,
+            b"{\"a\":1}".to_vec(),
+            &Scope::Unrestricted,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(first.created && !first.unchanged);
+    for create_only in [true, false] {
+        let again = engine
+            .attachment_write_joined(
+                "scratch",
+                path,
+                b"{\"a\":1}".to_vec(),
+                &Scope::Unrestricted,
+                None,
+                create_only,
+            )
+            .await
+            .unwrap();
+        assert!(again.unchanged, "create_only {create_only}");
+        assert!(!again.created && !again.draft, "create_only {create_only}");
+        assert_eq!(again.row, first.row, "create_only {create_only}");
+    }
+    let err = engine
+        .attachment_write_joined(
+            "scratch",
+            path,
+            b"{\"a\":2}".to_vec(),
+            &Scope::Unrestricted,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Conflict(text) if text.ends_with(crystalline_service::engine::ASSET_EXISTS)),
+        "{err:?}"
+    );
+    let (bytes, _) = engine.attachment_read("scratch", path).await.unwrap();
+    assert_eq!(bytes, b"{\"a\":1}");
+}
+
 #[tokio::test]
 async fn a_write_refuses_a_traversal_path_a_bad_extension_and_an_oversized_body() {
     let (_tmp, engine, _root, _scratch) = engine_fixture().await;

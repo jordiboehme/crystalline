@@ -143,6 +143,9 @@ pub(crate) struct WrittenAsset {
     pub row: AttachmentRow,
     /// Whether the path held no file before.
     pub created: bool,
+    /// Whether the path already held exactly these bytes, so nothing was
+    /// written.
+    pub unchanged: bool,
 }
 
 impl Engine {
@@ -305,6 +308,11 @@ impl Engine {
     /// under the lock that serialises the write, so two racing writes cannot
     /// both find the path empty.
     ///
+    /// A path that already holds exactly these bytes (same sha256) is
+    /// nothing to write, under any `replace`: the answer is the row with
+    /// `unchanged` set, and no file, row, change or after-change step
+    /// follows. That is what makes a retry after a timeout safe.
+    ///
     /// Both kinds owe the home's after-change step afterwards
     /// (`Engine::after_asset_change`).
     pub(crate) async fn asset_write_in(
@@ -342,6 +350,18 @@ impl Engine {
                 // cannot report what it replaced, so this one stat stays, under
                 // the lock so no racing write can slip in after it.
                 let existed = abs.is_file();
+                // **The same bytes again are nothing to write**, whatever
+                // `replace` says: nothing would be replaced. This is what
+                // makes a retry after a timeout safe. The disk decides here
+                // too, and the comparison is the one a move makes
+                // (`Engine::free_asset_destination`): same sha256, same file.
+                if existed && holds_these_bytes(&abs, &bytes)? {
+                    return Ok(WrittenAsset {
+                        row: attachment_row(path, &bytes, asset_modified(&abs))?,
+                        created: false,
+                        unchanged: true,
+                    });
+                }
                 if existed && let Some(refusal) = replace.refusal(path) {
                     return Err(refusal);
                 }
@@ -401,6 +421,7 @@ impl Engine {
                 WrittenAsset {
                     row,
                     created: !existed,
+                    unchanged: false,
                 }
             }
             (AssetHome::Engram, ContentSource::Virtual) => {
@@ -409,6 +430,16 @@ impl Engine {
                 // What was there before this write, so a failure can put it
                 // back rather than approximate it.
                 let previous = store.get_asset(home.table(), domain_id, path).await?;
+                // The same bytes again are nothing to write, as in a folder.
+                if let Some(prior) = &previous
+                    && prior.sha256 == row.sha256
+                {
+                    return Ok(WrittenAsset {
+                        row: prior.clone(),
+                        created: false,
+                        unchanged: true,
+                    });
+                }
                 if previous.is_some()
                     && let Some(refusal) = replace.refusal(path)
                 {
@@ -451,6 +482,7 @@ impl Engine {
                 WrittenAsset {
                     row,
                     created: previous.is_none(),
+                    unchanged: false,
                 }
             }
             (AssetHome::Reflection, ContentSource::Virtual) => return Err(home.no_virtual()),
@@ -853,6 +885,21 @@ pub(crate) fn refuse_extension_change(from: &str, to: &str) -> Result<()> {
 
 /// The row a moved file gets when its stored row still describes it: the
 /// same bytes at the new path, the mime read off the new name.
+/// Whether the file at `abs` holds exactly `bytes`: the same size, then the
+/// same sha256. The size is asked first so a different file of another size
+/// costs no read.
+fn holds_these_bytes(abs: &Path, bytes: &[u8]) -> Result<bool> {
+    let io = |source| EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    };
+    if std::fs::metadata(abs).map_err(io)?.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let held = std::fs::read(abs).map_err(io)?;
+    Ok(sha256_hex(&held) == sha256_hex(bytes))
+}
+
 fn moved_row(prior: AttachmentRow, to: &str) -> Result<AttachmentRow> {
     let name = to.rsplit('/').next().unwrap_or(to);
     let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
