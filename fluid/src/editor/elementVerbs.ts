@@ -547,10 +547,24 @@ export function unwikilinkChanges(
  */
 export function openableAddress(address: string): string | null {
   const trimmed = address.trim();
-  return isWebAddress(trimmed) || trimmed.startsWith("mailto:")
-    ? trimmed
-    : null;
+  if (!isWebAddress(trimmed) && !trimmed.startsWith("mailto:")) return null;
+  // The URL parser must agree on the scheme, so an address that only looks
+  // like a web or mail address never becomes an href.
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  return OPENABLE_PROTOCOLS.has(url.protocol) ? trimmed : null;
 }
+
+/** The schemes a link may open with. */
+const OPENABLE_PROTOCOLS: ReadonlySet<string> = new Set([
+  "http:",
+  "https:",
+  "mailto:",
+]);
 
 /** A status label as the popover reads it. */
 export interface StatusElement extends Span {
