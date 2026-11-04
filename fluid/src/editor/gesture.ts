@@ -22,18 +22,19 @@ import { judgeBeforeCommand } from "./marks/commandJudge";
 import { roomUndo } from "./roomUndo";
 
 /**
- * Dispatches `spec` as one undo step of its own. A caller reads the text
- * after its own `judgeBeforeCommand` call; if the judge here still changed
- * the text, the spec's positions are stale and nothing is dispatched.
+ * Dispatches `spec` as one undo step of its own, and says whether it did.
+ * A caller reads the text after its own `judgeBeforeCommand` call; if the
+ * judge here still changed the text, the spec's positions are stale and
+ * nothing is dispatched (false).
  */
 export function dispatchGesture(
   view: EditorView,
   spec: TransactionSpec & { userEvent: string },
-): void {
+): boolean {
   const before = view.state.doc;
   judgeBeforeCommand(view);
   if (view.state.doc !== before) {
-    return;
+    return false;
   }
   const given = spec.annotations;
   const annotations: readonly Annotation<unknown>[] =
@@ -45,4 +46,5 @@ export function dispatchGesture(
     annotations: [...annotations, isolateHistory.of("full")],
   });
   room?.stopCapturing();
+  return true;
 }

@@ -74,10 +74,12 @@ describe("dispatchGesture", () => {
       }),
       parent: document.body,
     });
-    dispatchGesture(view, {
-      changes: { from: 0, insert: "y" },
-      userEvent: "input.format",
-    });
+    expect(
+      dispatchGesture(view, {
+        changes: { from: 0, insert: "y" },
+        userEvent: "input.format",
+      }),
+    ).toBe(true);
     expect(seen).toEqual(["judge", "input.format"]);
     expect(view.state.doc.toString()).toBe("yx\n");
     view.destroy();
@@ -98,10 +100,12 @@ describe("dispatchGesture", () => {
       }),
       parent: document.body,
     });
-    dispatchGesture(view, {
-      changes: { from: 1, insert: "y" },
-      userEvent: "input.format",
-    });
+    expect(
+      dispatchGesture(view, {
+        changes: { from: 1, insert: "y" },
+        userEvent: "input.format",
+      }),
+    ).toBe(false);
     expect(view.state.doc.toString()).toBe("jx\n");
     view.destroy();
   });

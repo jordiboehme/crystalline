@@ -8,19 +8,29 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
+import type { TransactionSpec } from "@codemirror/state";
 import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import type { SyntaxNode } from "@lezer/common";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
   bytes,
+  caret,
   cleanupMarkViews,
+  keys,
   markPeers,
   markView,
+  setCaret,
   undoOnce,
+  undoSteps,
 } from "../../test/markKit";
 import { parsedState } from "../../test/parse";
+import { commandJudge } from "../marks/commandJudge";
+import { CANNOT_JOIN } from "../marks/deleteCheck";
+import { keepPartnerMarks } from "../marks/deleting";
+import { hiddenMarkLayerOn } from "../marks/mode";
+import { baseExtensions } from "../setup";
 import { blockInsertion } from "../toolbar";
 import { dropLanding } from "./landing";
 import { pictureAt, picturesIn, selectedPicture } from "./refs";
@@ -310,7 +320,7 @@ describe("setPictureAlign", () => {
   it("dispatches nothing for the placement a picture already has", () => {
     const view = on("![a](assets/a.png#left)");
     const before = view.state;
-    expect(setPictureAlign(view, "left")).toBe(true);
+    expect(setPictureAlign(view, "left")).toBe(false);
     expect(view.state.doc).toBe(before.doc);
   });
 
@@ -387,7 +397,7 @@ describe("setPictureAlt", () => {
   it("dispatches nothing for the alt a picture already has", () => {
     const view = on("![a \\[b\\]](assets/a.png)");
     const before = view.state;
-    expect(setPictureAlt(view, "a [b]")).toBe(true);
+    expect(setPictureAlt(view, "a [b]")).toBe(false);
     expect(view.state.doc).toBe(before.doc);
   });
 
@@ -478,7 +488,7 @@ describe("a picture between two bold words", () => {
       });
       expect(removePicture(view, 6)).toBe(true);
       expect(bytes(view.state)).toBe(bytes(twin.state));
-      expect(bytes(view.state)).not.toBe("**a****b**\n");
+      expect(bytes(view.state)).toBe("**ab**\n");
       expect(bold(view, "a")).toBe(true);
       expect(bold(view, "b")).toBe(true);
       undoOnce(view);
@@ -491,9 +501,11 @@ describe("a picture between two bold words", () => {
       const landing = dropLanding(state, state.doc.length - 2);
       if (!landing) throw new Error("no landing");
       expect(movePicture(view, 5, landing)).toBe(true);
+      expect(bytes(view.state)).toBe(
+        "**ab**\n\nlater\n\n![x](assets/p.png)\n\n",
+      );
       expect(bold(view, "a")).toBe(true);
       expect(bold(view, "b")).toBe(true);
-      expect(bytes(view.state)).toContain("later\n\n![x](assets/p.png)\n");
       const selected = selectedPicture(parsedState(view.state));
       expect(selected?.token).toBe("assets/p.png");
       undoOnce(view);
@@ -505,8 +517,146 @@ describe("a picture between two bold words", () => {
     const { local, peer, sync } = markPeers(`${BOLD}\n`);
     expect(removePicture(local, 6)).toBe(true);
     sync();
+    expect(bytes(peer.state)).toBe("**ab**\n");
     expect(bytes(peer.state)).toBe(bytes(local.state));
     expect(bold(peer, "a")).toBe(true);
     expect(bold(peer, "b")).toBe(true);
   });
+
+  it("reaches the other peer of a room as the same bytes when moved", () => {
+    const { local, peer, sync } = markPeers(`${BOLD}\n\nlater\n`);
+    const state = parsedState(local.state);
+    const landing = dropLanding(state, state.doc.length - 2);
+    if (!landing) throw new Error("no landing");
+    expect(movePicture(local, 5, landing)).toBe(true);
+    sync();
+    expect(bytes(peer.state)).toBe("**ab**\n\nlater\n\n![x](assets/p.png)\n\n");
+    expect(bytes(peer.state)).toBe(bytes(local.state));
+  });
 });
+
+describe("a gesture dispatchGesture drops", () => {
+  it("answers false when the second judge changed the text", () => {
+    for (const verb of [
+      (view: EditorView) => setPictureSize(view, "small"),
+      (view: EditorView) => setPictureAlt(view, "b"),
+      (view: EditorView) => removePicture(view),
+    ]) {
+      const view = on("![a](assets/a.png)");
+      let calls = 0;
+      // The verb's own call finds nothing; the one inside dispatchGesture
+      // writes, so the verb's positions are stale.
+      view.dispatch({
+        effects: StateEffect.appendConfig.of(
+          commandJudge.of((v) => {
+            calls += 1;
+            if (calls === 2) {
+              v.dispatch({
+                changes: { from: v.state.doc.length, insert: "j" },
+              });
+            }
+          }),
+        ),
+      });
+      expect(verb(view)).toBe(false);
+      expect(bytes(view.state)).toBe("![a](assets/a.png)\nj");
+    }
+  });
+});
+
+describe("a picture whose removal would break a pair", () => {
+  // Without the picture the closer follows a period and precedes a letter,
+  // so it closes nothing: the check refuses the removal (P21).
+  const BROKEN = "**a.**![x](assets/p.png)b";
+
+  for (const room of [false, true]) {
+    it(`refuses the removal and says why ${room ? "in a room" : "solo"}`, () => {
+      const view = markView(`${BROKEN}\n`, { room });
+      const said = heard(view);
+      expect(removePicture(view, 7)).toBe(false);
+      expect(bytes(view.state)).toBe(`${BROKEN}\n`);
+      expect(said).toEqual([CANNOT_JOIN]);
+    });
+
+    it(`refuses the move and says why ${room ? "in a room" : "solo"}`, () => {
+      const view = markView(`${BROKEN}\n\nlater\n`, { room });
+      const state = parsedState(view.state);
+      const landing = dropLanding(state, state.doc.length - 2);
+      if (!landing) throw new Error("no landing");
+      const said = heard(view);
+      const steps = undoSteps(view);
+      expect(movePicture(view, 6, landing)).toBe(false);
+      expect(bytes(view.state)).toBe(`${BROKEN}\n\nlater\n`);
+      expect(said).toEqual([CANNOT_JOIN]);
+      expect(undoSteps(view)).toBe(steps);
+    });
+  }
+});
+
+describe("delete.picture and the partner marks (P7)", () => {
+  it("is a replacement keepPartnerMarks judges", () => {
+    // Only the partner filter, so its own answer is what is read.
+    const run = (userEvent: string) =>
+      parsedState(
+        EditorState.create({
+          doc: "**a** b",
+          extensions: [
+            ...baseExtensions(false),
+            hiddenMarkLayerOn.of(true),
+            keepPartnerMarks,
+          ],
+        }),
+      )
+        .update({ changes: { from: 0, to: 3 }, userEvent })
+        .state.doc.toString();
+    expect(run("delete.picture")).toBe(run("delete.selection"));
+    expect(run("delete.picture")).not.toBe(run("delete.unjudged"));
+  });
+});
+
+describe("a removal from a caret on a hidden fence line", () => {
+  // p=0..18, blank, a=20, ```ts=22..27, x=28, y=30, ```=32..35, b=36
+  const TEXT = "![p](assets/p.png)\n\na\n```ts\nx\ny\n```\nb";
+
+  it("removes the picture and does not move the caret instead", () => {
+    const { local, peer, sync } = markPeers(TEXT);
+    setCaret(local, 36);
+    peer.dispatch({ changes: { from: 35, to: 37 }, userEvent: "delete" });
+    sync();
+    expect(caret(local)).toBe(35);
+    expect(removePicture(local, 1)).toBe(true);
+    expect(bytes(local.state)).toBe("\na\n```ts\nx\ny\n```");
+  });
+});
+
+describe("a removal right after a Backspace, solo", () => {
+  it("is an undo step of its own", () => {
+    // The Backspace takes the character right after the picture, so the
+    // history would join the two deletions if the removal were not isolated.
+    const doc = "![a](assets/a.png)x y\n";
+    const view = markView(doc);
+    setCaret(view, doc.indexOf("x") + 1);
+    keys(view, "Backspace");
+    expect(bytes(view.state)).toBe("![a](assets/a.png) y\n");
+    expect(removePicture(view, 1)).toBe(true);
+    expect(bytes(view.state)).toBe(" y\n");
+    undoOnce(view);
+    expect(bytes(view.state)).toBe("![a](assets/a.png) y\n");
+    undoOnce(view);
+    expect(bytes(view.state)).toBe(doc);
+  });
+});
+
+/** Every sentence `view` announces from now on. */
+function heard(view: EditorView): string[] {
+  const said: string[] = [];
+  const own = view.dispatch.bind(view);
+  view.dispatch = ((...specs: TransactionSpec[]) => {
+    const tr = view.state.update(...specs);
+    for (const effect of tr.effects) {
+      if (effect.is(EditorView.announce)) said.push(effect.value);
+    }
+    own(tr);
+  }) as EditorView["dispatch"];
+  return said;
+}

@@ -110,7 +110,7 @@ function rewrite(
     view.focus();
     return true;
   }
-  dispatchGesture(view, {
+  const dispatched = dispatchGesture(view, {
     changes: {
       from: context.targetFrom,
       to: context.targetTo,
@@ -121,7 +121,7 @@ function rewrite(
   // The bar cancels its own mousedown so the caret never left the buffer;
   // the menu that opened over it did take focus, and this hands it back.
   view.focus();
-  return true;
+  return dispatched;
 }
 
 /** Place the image, keeping whatever width it already carries. */

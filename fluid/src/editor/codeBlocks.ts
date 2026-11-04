@@ -620,7 +620,10 @@ const writesOffFenceLines = EditorState.transactionFilter.of((tr) => {
   if (
     !tr.docChanged ||
     !PERSON_WRITES.some((event) => tr.isUserEvent(event)) ||
-    tr.annotation(Transaction.remote) !== undefined
+    tr.annotation(Transaction.remote) !== undefined ||
+    // A picture's removal names its picture, not the caret: it is no key
+    // pressed from a fence line (Part 3, P7).
+    tr.isUserEvent("delete.picture")
   ) {
     return tr;
   }

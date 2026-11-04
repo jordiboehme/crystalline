@@ -4,7 +4,9 @@
  *
  * Every verb re-reads the picture at dispatch (`pictureAt` at `at`, the
  * caret when omitted) rather than trusting what a control last drew, and
- * refuses (false, nothing dispatched) where it finds none. A picture inside
+ * refuses (false, nothing dispatched) where it finds none. A verb answers
+ * true only when the text changed: a refusal, a no-op, a removal a check
+ * refused and a gesture `dispatchGesture` dropped all answer false. A picture inside
  * a link is the link's (a press opens the link), and one in a table cell is
  * the grid's to draw and edit: both refuse every verb. The format verbs act
  * only on this page's own attachments; alt, removal and a move work for
@@ -25,7 +27,7 @@ import { dispatchGesture } from "../gesture";
 import type { ImageAlign, ImageFormat } from "../imageFormat";
 import { buildImageTarget } from "../imageFormat";
 import { judgeBeforeCommand } from "../marks/commandJudge";
-import { judgeDeletion } from "../marks/deleteCheck";
+import { deletionOutcome, judgeDeletion } from "../marks/deleteCheck";
 import { judgedElsewhere } from "../marks/deleting";
 import { judgeInsert } from "../marks/insertCheck";
 import { PARSE_BUDGET, deadlineIn } from "../marks/parse";
@@ -64,6 +66,18 @@ function target(view: EditorView, at: number | undefined): PictureRef | null {
   return ref;
 }
 
+/**
+ * Dispatches `spec` as a gesture and answers whether the text changed: false
+ * when `dispatchGesture` dropped it or a filter refused it.
+ */
+function changed(
+  view: EditorView,
+  spec: Parameters<typeof dispatchGesture>[1],
+): boolean {
+  const before = view.state.doc;
+  return dispatchGesture(view, spec) && view.state.doc !== before;
+}
+
 /** The picture as a selection, `delta` longer than it was. */
 function selected(ref: PictureRef, delta: number): EditorSelection {
   return EditorSelection.single(ref.from, ref.to + delta);
@@ -71,7 +85,7 @@ function selected(ref: PictureRef, delta: number): EditorSelection {
 
 /**
  * Rewrites the target of the attachment at `at` to the format `next` gives,
- * or refuses. A target that already reads so dispatches nothing.
+ * or refuses. A target that already reads so dispatches nothing (false).
  */
 function reformat(
   view: EditorView,
@@ -85,15 +99,14 @@ function reformat(
   const token = buildImageTarget(ref.written, next(ref.format));
   const old = view.state.sliceDoc(ref.targetFrom, ref.targetTo);
   if (token === old) {
-    return true;
+    return false;
   }
-  dispatchGesture(view, {
+  return changed(view, {
     changes: { from: ref.targetFrom, to: ref.targetTo, insert: token },
     selection: selected(ref, token.length - old.length),
     userEvent: "input.format",
     scrollIntoView: true,
   });
-  return true;
 }
 
 /**
@@ -153,7 +166,8 @@ export function setPictureWidth(
 
 /**
  * Changes the alt text to read `next`: one change to the part that differs,
- * escaped where it has to be (`altEdit`). The same words dispatch nothing.
+ * escaped where it has to be (`altEdit`). The same words dispatch nothing
+ * (false).
  */
 export function setPictureAlt(
   view: EditorView,
@@ -166,9 +180,9 @@ export function setPictureAlt(
   }
   const edit = altEdit(view.state.sliceDoc(ref.altFrom, ref.altTo), next);
   if (edit === null) {
-    return true;
+    return false;
   }
-  dispatchGesture(view, {
+  return changed(view, {
     changes: {
       from: ref.altFrom + edit.from,
       to: ref.altFrom + edit.to,
@@ -178,14 +192,14 @@ export function setPictureAlt(
     userEvent: "input.alt",
     scrollIntoView: true,
   });
-  return true;
 }
 
 /**
  * Removes the picture, with its line when it stands alone on one
  * (`pictureRemoval`). Tagged `delete.picture`, which the hidden-mark checks
  * judge like any deletion (P7): a pair the removal would break is repaired
- * or the removal refused, as a selection deleted there would be.
+ * or the removal refused (false, with the check's own announcement), as a
+ * selection deleted there would be.
  */
 export function removePicture(view: EditorView, at?: number): boolean {
   const ref = target(view, at);
@@ -193,13 +207,12 @@ export function removePicture(view: EditorView, at?: number): boolean {
     return false;
   }
   const range = pictureRemoval(view.state, ref);
-  dispatchGesture(view, {
+  return changed(view, {
     changes: range,
     selection: EditorSelection.cursor(range.from),
     userEvent: "delete.picture",
     scrollIntoView: true,
   });
-  return true;
 }
 
 /**
@@ -228,15 +241,16 @@ function sameBlocks(a: Text, b: Text): boolean {
 
 /**
  * The removal of `ref` and its insertion below `landing`'s line, as one
- * change of `state`, with where the picture then begins; null when the move
- * would leave every block where it is, lands inside what it takes away, or
- * a pair cannot be kept.
+ * change of `state`, with where the picture then begins; `said` when the
+ * removal's check refuses it (P21), with the sentence a refused delete
+ * gives; null when the move would leave every block where it is or lands
+ * inside what it takes away.
  */
 function moveChanges(
   state: EditorState,
   ref: PictureRef,
   landing: Landing,
-): { changes: ChangeSet; start: number } | null {
+): { changes: ChangeSet; start: number } | { said: string } | null {
   const { doc } = state;
   if (landing.line < 1 || landing.line > doc.lines) {
     return null;
@@ -258,7 +272,7 @@ function moveChanges(
   let removal: ChangeSet;
   switch (judged.outcome) {
     case "refused":
-      return null;
+      return { said: judged.said };
     case "unchecked":
       removal = plain;
       break;
@@ -303,7 +317,8 @@ function moveChanges(
  * Moves the picture at `from` below the block `landing` names
  * (`dropLanding`), in one gesture tagged `move.drop`, and selects it where
  * it lands. Refused when it would land inside what it takes away or would
- * leave the picture where it stands.
+ * leave the picture where it stands, and when the check refuses the removal,
+ * which then says why (P21).
  *
  * The move judges its own removal and insert with the hidden-mark judges
  * and is marked `judgedElsewhere`, so the filters leave it where the drop
@@ -324,7 +339,16 @@ export function movePicture(
   if (move === null) {
     return false;
   }
-  dispatchGesture(view, {
+  if ("said" in move) {
+    view.dispatch({
+      effects: [
+        EditorView.announce.of(move.said),
+        deletionOutcome.of("refused"),
+      ],
+    });
+    return false;
+  }
+  return changed(view, {
     changes: move.changes,
     selection: EditorSelection.single(
       move.start,
@@ -334,5 +358,4 @@ export function movePicture(
     annotations: judgedElsewhere.of(true),
     scrollIntoView: true,
   });
-  return true;
 }
