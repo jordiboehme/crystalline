@@ -282,6 +282,7 @@ fn owner_write(title: &str) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 

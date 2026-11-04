@@ -154,6 +154,7 @@ async fn an_embed_pass_with_a_rejected_batch_still_hands_over() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();

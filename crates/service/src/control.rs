@@ -1819,6 +1819,7 @@ mod tests {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         }
     }
 

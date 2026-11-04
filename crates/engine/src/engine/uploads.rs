@@ -135,6 +135,14 @@ impl Engine {
                 "an upload needs path, the file's path under assets/".into(),
             ));
         };
+        // Refused rather than ignored, as a delete refuses it: a caller who
+        // sent one would believe the replace was guarded when nothing
+        // compared anything.
+        if p.expected_checksum.is_some() {
+            return Err(EngineError::Invalid(format!(
+                "expected_checksum guards engram markdown only and has no meaning for the file '{path}'; upload it without one"
+            )));
+        }
         let set = engram_fields_set(p);
         if !set.is_empty() {
             return Err(EngineError::Invalid(format!(

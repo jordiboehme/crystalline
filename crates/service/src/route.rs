@@ -460,7 +460,56 @@ pub async fn routed(
                     }
                 }
             }
-            let left = limit.saturating_sub(started.elapsed());
+            // A guard the caller asked for is never dropped without a word:
+            // a server older than the release that takes it would ignore
+            // `expected_checksum` and write last-write-wins. One that names
+            // no version is refused the same way rather than trusted.
+            //
+            // The status question's time is not taken from the write: once it
+            // is answered the write gets its own full limit, as if it had been
+            // sent at once. A caller's own deadline still bounds both.
+            let mut gate_spent = std::time::Duration::ZERO;
+            if guards_a_write(tool, args) {
+                let asked_at = std::time::Instant::now();
+                let asked = limit
+                    .saturating_sub(started.elapsed())
+                    .min(ONE_DOMAIN_LIMIT);
+                match sources
+                    .server_version(&source, asked, crystalline_remote::Budget::Cut)
+                    .await
+                {
+                    Ok(version)
+                        if version.as_deref().is_some_and(|v| {
+                            crystalline_remote::version_at_least(
+                                v,
+                                crystalline_remote::WRITE_CHECKSUM_RELEASE,
+                            )
+                        }) =>
+                    {
+                        if deadline.is_none() {
+                            gate_spent = asked_at.elapsed();
+                        }
+                    }
+                    Ok(version) => {
+                        let url = sources
+                            .source_url(&source)
+                            .filter(|url| !url.is_empty())
+                            .unwrap_or_else(|| source.clone());
+                        return Some(Err(RouteError::Refused(unguarded_server_sentence(
+                            &url,
+                            version.as_deref(),
+                        ))));
+                    }
+                    Err(failure) => {
+                        return Some(Err(RouteError::Source {
+                            source,
+                            domain,
+                            failure: within(failure, asked),
+                        }));
+                    }
+                }
+            }
+            let left = limit.saturating_sub(started.elapsed().saturating_sub(gate_spent));
             // A caller's shorter budget running out says nothing about the
             // source, so it never opens the down window (Budget::Cut), and
             // neither does a file transfer's.
@@ -536,6 +585,31 @@ fn older_server_sentence(url: &str, transfer: Transfer) -> String {
     format!(
         "The server at {url} runs an older Crystalline that cannot {what} yet; update it to {} or later.",
         crystalline_remote::AGENT_FILES_RELEASE
+    )
+}
+
+/// Whether this call is a `write_engram` that carries `expected_checksum`.
+fn guards_a_write(tool: &str, args: &Value) -> bool {
+    tool == "write_engram"
+        && args
+            .get("expected_checksum")
+            .is_some_and(|value| !value.is_null())
+}
+
+/// What an agent reads when the server behind a guarded write cannot keep the
+/// guard: it is older than [`crystalline_remote::WRITE_CHECKSUM_RELEASE`], or
+/// it does not say which version it runs.
+fn unguarded_server_sentence(url: &str, version: Option<&str>) -> String {
+    let runs = match version {
+        Some(version) => format!("runs Crystalline {version}"),
+        None => "runs a Crystalline that does not name its version".to_string(),
+    };
+    let needed = crystalline_remote::WRITE_CHECKSUM_RELEASE
+        .strip_suffix(".0")
+        .unwrap_or(crystalline_remote::WRITE_CHECKSUM_RELEASE);
+    format!(
+        "The server at {url} {runs}, which cannot guard a write with expected_checksum; \
+         it needs {needed} or newer. Leave expected_checksum out to write without the guard."
     )
 }
 

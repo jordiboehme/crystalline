@@ -557,6 +557,11 @@ enum Command {
         /// at it; the receipt says so and names who is in there.
         #[arg(long)]
         overwrite: bool,
+        /// The checksum from a prior read; an overwrite is refused as a
+        /// conflict if the engram changed or is gone since, whichever storage
+        /// kind holds it. Pass it with --overwrite. Omit for last-write-wins.
+        #[arg(long)]
+        expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -4165,6 +4170,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             status,
             metadata,
             overwrite,
+            expected_checksum,
             config,
         } => {
             let body = content_or_stdin(content)?;
@@ -4187,6 +4193,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                     "status": status,
                     "metadata": metadata,
                     "overwrite": overwrite,
+                    "expected_checksum": expected_checksum,
                 }),
                 config,
             )

@@ -28,3 +28,4 @@ mod toon_measurement;
 mod virtual_domains;
 mod virtual_import;
 mod visibility;
+mod write_checksum;

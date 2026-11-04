@@ -171,6 +171,7 @@ fn write(title: &str, content: &str) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 

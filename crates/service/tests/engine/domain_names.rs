@@ -217,6 +217,7 @@ async fn a_manifest_edit_changes_the_table() {
             overwrite: false,
             share_link: None,
             model: None,
+            expected_checksum: None,
         })
         .await
         .unwrap();
@@ -389,6 +390,7 @@ fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
         overwrite: false,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 
@@ -2125,6 +2127,7 @@ async fn the_startup_pass_binds_what_an_upgrade_left_pending() {
                 overwrite: false,
                 share_link: None,
                 model: None,
+                expected_checksum: None,
             })
             .await
             .unwrap();

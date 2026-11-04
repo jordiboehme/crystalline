@@ -124,6 +124,13 @@ pub struct WriteParams {
     /// that path; without it a file there is refused.
     #[serde(default)]
     pub overwrite: bool,
+    /// The checksum from a prior `read_engram`, guarding an overwrite against
+    /// a change since it was read: the write is refused as a conflict if the
+    /// engram changed or is gone, whichever storage kind holds it. Pass it
+    /// with overwrite. Not for a file upload with `path`. Omit for
+    /// last-write-wins.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
     /// Your model id, for example claude-opus-5; recorded beside who wrote it
     /// so a reader can weigh the page. Omit it only if you do not know it.
     #[serde(default)]

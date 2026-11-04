@@ -148,6 +148,7 @@ fn write_params(title: &str, overwrite: bool) -> WriteParams {
         overwrite,
         share_link: None,
         model: None,
+        expected_checksum: None,
     }
 }
 

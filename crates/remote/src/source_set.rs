@@ -924,6 +924,20 @@ impl SourceSet {
         connection.takes_agent_files(left, budget).await
     }
 
+    /// The version `source` names in its `status` answer, within `deadline`
+    /// overall ([`crate::Connection::server_version`]).
+    pub async fn server_version(
+        &self,
+        source: &str,
+        deadline: Duration,
+        budget: Budget,
+    ) -> Result<Option<String>, RemoteFailure> {
+        let started = std::time::Instant::now();
+        let connection = self.connection(source, deadline).await?;
+        let left = deadline.saturating_sub(started.elapsed());
+        connection.server_version(left, budget).await
+    }
+
     /// One file of `domain` (the source's own name) by its domain-relative
     /// path, from `source`, within `deadline` overall: the server's
     /// `{mime, size, base64}`. A source inside its down window answers its
