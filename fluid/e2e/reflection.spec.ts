@@ -779,9 +779,9 @@ test.describe.serial("the Reflection journeys", () => {
       mimeType: "image/png",
       buffer: readFileSync(FLOW_PNG),
     });
-    // The address is a hidden mark in the editor, so the drawn text shows
-    // the label; the bytes below carry the path.
-    await expect(editor).toContainText("sketch.png");
+    // The reference is drawn as the picture itself, named by its label;
+    // the bytes below carry the path.
+    await expectLoaded(editor.getByRole("img", { name: "sketch.png" }));
     await expect
       .poll(() => pageSource(page, "guides/welcome.md"))
       .toMatch(

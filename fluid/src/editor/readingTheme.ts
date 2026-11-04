@@ -49,8 +49,9 @@ export const readingTheme: Extension = Prec.high([
       paddingBottom: "0.5rem",
       borderBottomRightRadius: "0.375rem",
     },
-    // Pictures stand on the text's own left edge, as on the reading page.
-    ".cm-image-preview": { padding: "0.5rem 0" },
+    // A picture under its line stands on the text's own left edge, as on
+    // the reading page; one in place of its reference sits in the line.
+    ".cm-image-preview.cm-picture-block": { padding: "0.5rem 0" },
     // A frontmatter block shown as text (the Reflection editor) reads as the
     // page's settings: small, mono and plain, even where the markdown parser
     // takes a `key:` line over the closing fence for a heading.

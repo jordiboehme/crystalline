@@ -24,7 +24,7 @@ import { observationCategory } from "../crystallineLines";
 import { frontmatterRegion } from "../frontmatterRegion";
 import { inMathRegion, mathRegions } from "../mathBlocks";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
-import { marksHiddenOnLine } from "./mode";
+import { drawnAsPicture, marksHiddenOnLine } from "./mode";
 
 export type MarkKind =
   | "strong"
@@ -367,7 +367,15 @@ export function scanMarks(
   const head = live[0];
   const tail = live.at(-1);
   if (head && tail) {
-    walkMarks(state, lines, scans, closers, head.at.from, tail.at.to);
+    walkMarks(
+      state,
+      lines,
+      scans,
+      closers,
+      head.at.from,
+      tail.at.to,
+      options.always === true,
+    );
   }
   return {
     lines: scans.map((scan) => (scan ? finished(scan) : [])),
@@ -383,9 +391,16 @@ function walkMarks(
   closers: Map<number, { from: number; to: number }>,
   from: number,
   to: number,
+  always: boolean,
 ): void {
   const doc = state.doc;
   const char = (pos: number) => doc.sliceString(pos, pos + 1);
+  // A picture the picture layer draws in place is its span, so the drawing,
+  // the caret and the keys read no marks in it (P5). The marks a line has
+  // whether they show or not (`always`: the delete check, the format
+  // commands) still include its pair, so a range that cuts into it is judged
+  // as before.
+  const picture = (node: SyntaxNode) => !always && drawnAsPicture(state, node);
   // A `>` with the one optional space after it.
   const quote = (scan: LineScan, from: number, to: number) => {
     addTo(scan, from, isSpace(char(to)) ? to + 1 : to, "quote", "prefix");
@@ -471,7 +486,13 @@ function walkMarks(
       return plan.open.to === plan.close ? plan.end : null;
     }
     const image = node.getChild("Image");
-    if (!image || image.from !== plan.open.to || image.to !== plan.close) {
+    if (
+      !image ||
+      image.from !== plan.open.to ||
+      image.to !== plan.close ||
+      // A drawn picture is no atom: the link's own marks hide around it.
+      picture(image)
+    ) {
       return null;
     }
     const inner = linkPlan(image);
@@ -535,6 +556,9 @@ function walkMarks(
       return name === "InlineCode";
     }
     if (name === "Link" || name === "Image") {
+      if (picture(node)) {
+        return true;
+      }
       const plan = linkPlan(node);
       const atom = plan ? atomEnd(node, plan) : null;
       if (atom !== null) {

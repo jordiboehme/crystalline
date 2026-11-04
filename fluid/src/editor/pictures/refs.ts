@@ -31,7 +31,7 @@ import { inMathRegion, mathRegions } from "../mathBlocks";
  * linked by that path itself, and no target is refused. The engram screen
  * provides its own with the files route's URLs.
  */
-const ENGRAM_RESOLVER: AssetResolver = {
+export const ENGRAM_RESOLVER: AssetResolver = {
   resolve: assetPath,
   url: (path) => path,
   refused: () => null,
@@ -158,6 +158,35 @@ function classify(
     return null;
   }
   const { token } = span;
+  return {
+    from: node.from,
+    to: node.to,
+    altFrom: first.to,
+    altTo: close.from,
+    targetFrom: node.from + span.targetFrom,
+    targetTo: node.from + span.targetTo,
+    token,
+    ...pictureTarget(token, resolver),
+    inLink: within(node, "Link"),
+    inCell: within(node, "Table"),
+  };
+}
+
+/** What a target token is to a page: the parts of a {@link PictureRef} it decides. */
+export type PictureTarget = Pick<
+  PictureRef,
+  "written" | "kind" | "format" | "src" | "reason"
+>;
+
+/**
+ * What one target token is, as `resolver` reads it: the one place a token
+ * becomes a kind, an address and a reason, for the main view's pictures and
+ * a table cell's alike.
+ */
+export function pictureTarget(
+  token: string,
+  resolver: AssetResolver,
+): PictureTarget {
   const refused = resolver.refused(token);
   const path = refused === null ? resolver.resolve(token) : null;
   const attachment = path !== null && isImageAttachment(path);
@@ -171,13 +200,6 @@ function classify(
           : "unavailable";
   const hash = token.indexOf("#");
   return {
-    from: node.from,
-    to: node.to,
-    altFrom: first.to,
-    altTo: close.from,
-    targetFrom: node.from + span.targetFrom,
-    targetTo: node.from + span.targetTo,
-    token,
     written:
       kind === "attachment" ? (hash < 0 ? token : token.slice(0, hash)) : "",
     kind,
@@ -194,9 +216,15 @@ function classify(
         : kind === "unavailable"
           ? UNAVAILABLE
           : null,
-    inLink: within(node, "Link"),
-    inCell: within(node, "Table"),
   };
+}
+
+/** The picture one `Image` node is under the page's resolver, or null when it stays text. */
+export function pictureOfNode(
+  state: EditorState,
+  node: SyntaxNode,
+): PictureRef | null {
+  return classify(state, node, state.facet(pictureAssets), mathRegions(state));
 }
 
 /**

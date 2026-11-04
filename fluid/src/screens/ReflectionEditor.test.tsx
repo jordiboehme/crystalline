@@ -1704,10 +1704,11 @@ describe("the reflection editor takes files", () => {
     const root = editor.closest(".cm-editor") as HTMLElement;
     await waitFor(() => {
       expect(
-        [...root.querySelectorAll(".cm-image-preview img")].map((img) =>
+        [...root.querySelectorAll(".cm-image-preview img")].map((img) => [
           img.getAttribute("src"),
-        ),
-      ).toEqual(["/api/v1/domains/eng/reflection/assets/2026/10/a.png"]);
+          img.getAttribute("alt"),
+        ]),
+      ).toEqual([["/api/v1/domains/eng/reflection/assets/2026/10/a.png", "a"]]);
     });
   });
 
@@ -1727,6 +1728,10 @@ describe("the reflection editor takes files", () => {
       [...root.querySelectorAll(".cm-image-preview img")].map((img) =>
         img.getAttribute("src"),
       );
+    const alts = () =>
+      [...root.querySelectorAll(".cm-image-preview img")].map((img) =>
+        img.getAttribute("alt"),
+      );
     // The listing that answered first is the baseline: the bytes on screen
     // are the ones the plain address serves, so no version is added.
     await waitFor(() => {
@@ -1738,6 +1743,7 @@ describe("the reflection editor takes files", () => {
     expect(srcs()).toEqual([
       "/api/v1/domains/eng/reflection/assets/2026/10/a.png",
     ]);
+    expect(alts()).toEqual(["a"]);
     // An upload refreshes the listing; the preview follows its new version.
     editor.dispatchEvent(carrying("paste", [png()]));
     await waitFor(() => {
@@ -1819,11 +1825,15 @@ describe("the reflection editor takes files", () => {
     const root = editor.closest(".cm-editor") as HTMLElement;
     await waitFor(() => {
       expect(
-        [...root.querySelectorAll(".cm-image-preview img")].map((img) =>
+        [...root.querySelectorAll(".cm-image-preview img")].map((img) => [
           img.getAttribute("src"),
-        ),
+          img.getAttribute("alt"),
+        ]),
       ).toEqual([
-        "/api/v1/domains/eng/reflection/assets/flow.png?v=222222222222",
+        [
+          "/api/v1/domains/eng/reflection/assets/flow.png?v=222222222222",
+          "Flow",
+        ],
       ]);
     });
   });

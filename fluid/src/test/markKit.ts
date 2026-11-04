@@ -7,6 +7,7 @@
  */
 
 import { undo, undoDepth } from "@codemirror/commands";
+import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
 import { QueryClient } from "@tanstack/react-query";
@@ -49,6 +50,11 @@ export interface MarkViewOptions {
    * for a test of what a press does on a short tree.
    */
   parsed?: boolean;
+  /**
+   * The picture layer the screen hands the preview compartment
+   * (`imagePreviews(...)`). Left out, none: the view draws no pictures.
+   */
+  images?: Extension;
 }
 
 const views = new Set<EditorView>();
@@ -57,7 +63,7 @@ const roomTexts = new WeakMap<EditorView, Y.Text>();
 const markCompartments = new WeakMap<EditorView, Compartment>();
 const previews = new WeakMap<
   EditorView,
-  { compartment: Compartment; adapter: DocumentAdapter }
+  { compartment: Compartment; adapter: DocumentAdapter; images: Extension }
 >();
 
 /** Destroys every view `markView` built; call in `afterEach`. */
@@ -118,7 +124,7 @@ export function markView(
           screen,
           preview,
           raw: options.raw ?? false,
-          images: [],
+          images: options.images ?? [],
           uploads: [],
           onTableContext: () => {},
           onImageContext: () => {},
@@ -139,7 +145,11 @@ export function markView(
   });
   views.add(view);
   markCompartments.set(view, marks);
-  previews.set(view, { compartment: preview, adapter });
+  previews.set(view, {
+    compartment: preview,
+    adapter,
+    images: options.images ?? [],
+  });
   if (undoManager) {
     undoManagers.set(view, undoManager);
   }
@@ -228,7 +238,7 @@ export function setRaw(view: EditorView, raw: boolean): void {
   }
   view.dispatch({
     effects: preview.compartment.reconfigure(
-      previewConfig(raw, false, [], preview.adapter),
+      previewConfig(raw, false, preview.images, preview.adapter),
     ),
   });
 }

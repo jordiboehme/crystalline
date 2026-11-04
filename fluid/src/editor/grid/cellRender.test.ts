@@ -218,10 +218,57 @@ describe("renderCellContent", () => {
     expect(cell.textContent).toBe('<img src=x onerror="alert(1)"> <b>no</b>');
   });
 
-  test("an image is the text that was written", () => {
+  test("an attachment image is drawn small, with its alt text", () => {
+    const cell = draw("see ![x](assets/a.png#right,w=50%) here");
+    const image = cell.querySelector("img");
+    expect(image?.getAttribute("alt")).toBe("x");
+    expect(image?.getAttribute("src")).toBe("assets/a.png");
+    expect(image?.getAttribute("draggable")).toBe("false");
+    expect(image?.style.maxHeight).toBe("6em");
+    // No float in a cell: the fragment's placement is for the page.
+    expect(image?.style.float).toBe("");
+    expect(image?.classList.contains("cm-picture")).toBe(false);
+    expect(cell.textContent).toBe("see  here");
+  });
+
+  test("an image's alt text is drawn without its escapes", () => {
+    const cell = draw("![a \\[b\\] c](assets/a.png)");
+    expect(cell.querySelector("img")?.getAttribute("alt")).toBe("a [b] c");
+  });
+
+  test("an image reads its address from the page's resolver", () => {
+    const cell = draw("![x](assets/a.png)", {
+      assets: {
+        resolve: (target) => target,
+        url: (path) => `/files/${path}`,
+        refused: () => null,
+      },
+    });
+    expect(cell.querySelector("img")?.getAttribute("src")).toBe(
+      "/files/assets/a.png",
+    );
+  });
+
+  test("an external image is drawn from its address", () => {
     const cell = draw("![alt](https://example.com/a.png)");
-    expect(cell.querySelector("img")).toBeNull();
-    expect(cell.textContent).toBe("![alt](https://example.com/a.png)");
+    expect(cell.querySelector("img")?.getAttribute("src")).toBe(
+      "https://example.com/a.png",
+    );
+  });
+
+  test("a refused or unavailable image is its alt text, and fetches nothing", () => {
+    const refused = draw("![no](assets/a.png)", {
+      assets: {
+        resolve: (target) => target,
+        url: (path) => path,
+        refused: () => "Not here.",
+      },
+    });
+    expect(refused.querySelector("img")).toBeNull();
+    expect(refused.textContent).toBe("no");
+    const unavailable = draw("![deck](assets/deck.pdf)");
+    expect(unavailable.querySelector("img")).toBeNull();
+    expect(unavailable.textContent).toBe("deck");
   });
 
   test("drawing again replaces what was there", () => {

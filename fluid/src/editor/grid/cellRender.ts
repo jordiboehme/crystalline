@@ -15,6 +15,7 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import type { NodeSet } from "@lezer/common";
 
+import type { AssetResolver } from "../../api/files";
 import { isWebAddress } from "../../format";
 import { htmlCommentRanges } from "../../markdown/htmlComments";
 import { statusColour } from "../../markdown/directives";
@@ -22,6 +23,9 @@ import { labelPlainWords, statusPieces } from "../../markdown/statusText";
 import type { WikilinkResolver } from "../../wikilinks";
 import { referenceState, wikilinkWords } from "../../wikilinks";
 import { dialectGrammar } from "../dialectHighlight";
+import { imageSpansIn } from "../imageFormat";
+import { altDisplay } from "../pictures/altText";
+import { ENGRAM_RESOLVER, pictureTarget } from "../pictures/refs";
 
 export interface CellRenderOptions {
   /**
@@ -37,6 +41,12 @@ export interface CellRenderOptions {
   notes?: readonly { from: number; to: number; number: number }[];
   /** Leave out every HTML comment: a Reflection never shows one. */
   hideComments?: boolean;
+  /**
+   * What an image's target means on this page (`pictureAssets`): where an
+   * attachment is read from, and which targets are refused. The engram
+   * resolver by default.
+   */
+  assets?: AssetResolver;
 }
 
 /** A stretch of the cell's text drawn other than as text. */
@@ -348,6 +358,9 @@ class Drawer {
       case "Link":
         this.link(element, into);
         return;
+      case "Image":
+        this.image(element, into);
+        return;
       case "URL":
         this.anchor(source(), element.from, element.to, [], into);
         return;
@@ -375,6 +388,53 @@ class Drawer {
       default:
         this.plain(element.from, element.to, into);
     }
+  }
+
+  /**
+   * `![alt](target)` as a small picture in the line, with its alt text: no
+   * float, no frame and no drag in a cell. A target the page refuses, or one
+   * that is no picture, is its alt text, and nothing is fetched for it.
+   */
+  image(element: InlineElement, into: Node): void {
+    const source = this.text.slice(element.from, element.to);
+    const [span, ...more] = imageSpansIn(source);
+    const marks = this.children(element).filter(
+      (kid) => this.name(kid) === "LinkMark",
+    );
+    const open = marks[0];
+    const close = marks.find(
+      (mark, i) => this.text[mark.from] === "]" && marks[i + 1] !== undefined,
+    );
+    if (
+      span === undefined ||
+      more.length > 0 ||
+      span.from !== 0 ||
+      span.to !== source.length ||
+      !open ||
+      !close
+    ) {
+      this.plain(element.from, element.to, into);
+      return;
+    }
+    const alt = altDisplay(this.text.slice(open.to, close.from));
+    const target = pictureTarget(
+      unescapePipes(span.token),
+      this.options.assets ?? ENGRAM_RESOLVER,
+    );
+    if (target.src === null) {
+      into.appendChild(document.createTextNode(alt));
+      return;
+    }
+    const image = document.createElement("img");
+    image.src = target.src;
+    image.alt = alt;
+    image.setAttribute("draggable", "false");
+    Object.assign(image.style, {
+      maxHeight: "6em",
+      maxWidth: "100%",
+      verticalAlign: "middle",
+    });
+    into.appendChild(image);
   }
 
   /** `[words](url)` with a web address is an anchor; any other link its text. */
