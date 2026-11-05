@@ -5,13 +5,14 @@
  * own DOM while confirming the buffer itself is untouched.
  */
 
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../test/parse";
 import { describeMermaidError, fencePreviews } from "./fencePreviews";
+import { drawnDiagrams } from "./diagram/draws";
 import { gridLoaded } from "./grid/draws";
 import { baseExtensions } from "./setup";
 
@@ -705,5 +706,60 @@ describe("the table preview and the grid", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
     view.destroy();
+  });
+});
+
+describe("the hand-over to the diagram layer", () => {
+  const FLOW = "```mermaid\nflowchart TD\n  A --> B\n```";
+
+  function withDrawn(doc: string, drawn: readonly number[]) {
+    const compartment = new Compartment();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            compartment.of(drawnDiagrams.of(drawn)),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    return { v, compartment };
+  }
+
+  it("gives a drawn fence no preview and an undrawn one keeps it", () => {
+    const doc = `${FLOW}\n\n${FLOW}`;
+    const { v } = withDrawn(doc, [0]);
+    expect(v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(1);
+    v.destroy();
+    const none = withDrawn(doc, []);
+    expect(none.v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(2);
+    none.v.destroy();
+  });
+
+  it("takes the preview away and gives it back when the set of drawn fences changes", () => {
+    const { v, compartment } = withDrawn(FLOW, []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([0])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.destroy();
+  });
+
+  it("draws an unclosed mermaid fence as text plus a drawing, as the page does (D43)", () => {
+    const { v } = withDrawn("```mermaid\nflowchart TD\n  A --> B", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    expect(v.state.doc.toString()).toBe("```mermaid\nflowchart TD\n  A --> B");
+    v.destroy();
+  });
+
+  it("draws nothing for an unclosed fence with no body", () => {
+    const { v } = withDrawn("```mermaid", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.destroy();
   });
 });

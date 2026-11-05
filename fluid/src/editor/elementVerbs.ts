@@ -1073,19 +1073,27 @@ export interface CodeFence extends Span {
 
 /**
  * The source of a mermaid fence the editor draws as a diagram
- * (`fencePreviews.ts`), or null: a closed fence whose info word is
- * `mermaid` (read as the page reads it, `fenceInfo`), with something in it.
- * The reading page draws exactly these. The one test for both layers.
+ * (`fencePreviews.ts`), or null: a fence whose info word is `mermaid` (read
+ * as the page reads it, `fenceInfo`), with something in it. The reading page
+ * draws exactly these, an unclosed fence too (D43): its body runs to where
+ * the fence's container ends. The one test for both layers; whether the
+ * fence is closed, and so may be an editable diagram, is `mermaidFences`'.
  */
 export function mermaidFence(
   state: EditorState,
   node: SyntaxNode,
 ): string | null {
   const info = fenceInfo(state.doc, node);
-  if (info?.name !== "mermaid" || info.close === null) {
+  if (info?.name !== "mermaid") {
     return null;
   }
-  const body = fenceBody(state.doc, info);
+  const doc = state.doc;
+  const body =
+    info.close !== null
+      ? fenceBody(doc, info)
+      : doc.lineAt(node.to).number > info.open
+        ? doc.sliceString(doc.line(info.open + 1).from, doc.lineAt(node.to).to)
+        : "";
   return body.trim() === "" ? null : body;
 }
 
