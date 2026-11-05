@@ -1289,6 +1289,11 @@ test("a domain is registered, filled from an archive and unregistered", async ({
   expect(await domains.text()).not.toContain(RESTORE_DOMAIN);
 });
 
+/** What the station journey leaves on the page: the screens it saw, in order. */
+interface StationScreens {
+  stationScreens: string[];
+}
+
 test("the station launches from the C64 screen and returns to the same page", async ({
   page,
 }) => {
@@ -1313,6 +1318,20 @@ test("the station launches from the C64 screen and returns to the same page", as
   await expect(
     page.getByRole("dialog", { name: "About Crystalline" }),
   ).toBeVisible();
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    (window as unknown as StationScreens).stationScreens = seen;
+    new MutationObserver(() => {
+      for (const label of ["Opening", "Connecting"]) {
+        if (
+          !seen.includes(label) &&
+          document.querySelector(`[role="dialog"][aria-label="${label}"]`)
+        ) {
+          seen.push(label);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
   await page.getByRole("link", { name: 'LOAD"GAME",8,1' }).click();
   await expect(page).toHaveURL(new RegExp(`/%CF%80${route}$`), LAUNCH);
   await expect(page.locator("canvas")).toBeVisible(LAUNCH);
@@ -1327,16 +1346,23 @@ test("the station launches from the C64 screen and returns to the same page", as
   });
   console.log(`renderer: ${renderer}`);
   // The opening question shows first, since the launch's click primed the
-  // sound, and skips on any key; the connecting screen follows and skips
-  // the same way.
-  const opening = page.getByRole("dialog", { name: "Opening" });
-  await expect(opening).toBeVisible(LAUNCH);
+  // sound; the connecting screen follows. Both end on their own within
+  // seconds, and on a loaded machine the room can land before a polled look
+  // at either one, so the page records them and the keys skip what is up.
+  // That a key skips each screen is pinned in ExploreRoute.test.tsx.
+  await expect
+    .poll(async () => {
+      await page.keyboard.press("Shift");
+      return page.evaluate(
+        () => (window as unknown as StationScreens).stationScreens,
+      );
+    }, LAUNCH)
+    .toEqual(["Opening", "Connecting"]);
   await page.keyboard.press("Shift");
-  await expect(opening).toHaveCount(0);
-  const connecting = page.getByRole("dialog", { name: "Connecting" });
-  await expect(connecting).toBeVisible();
-  await page.keyboard.press("Shift");
-  await expect(connecting).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Connecting" })).toHaveCount(
+    0,
+    LAUNCH,
+  );
   // Wait for the room to land before pausing: the HUD's status line leads
   // with the room's title once the room is entered (before that it holds
   // only the mouse hint).
