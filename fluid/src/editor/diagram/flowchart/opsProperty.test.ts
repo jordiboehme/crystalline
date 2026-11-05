@@ -7,16 +7,38 @@ import { describe, expect, test } from "vitest";
 
 import { STATUS_COLOURS } from "../../../markdown/directives";
 import { onlyEditedBytes, untouchedLinesEqual } from "../../../test/fidelity";
+import {
+  LABEL_HOLDERS,
+  LABEL_TEXTS,
+  MARKDOWN_MARKUP,
+  MARKDOWN_TEXTS,
+  PUNCTUATION_TEXTS,
+  REFUSED_LABELS,
+  REFUSED_ON_PLAIN_LABELS,
+} from "../../../test/labelTable";
 import { dbDelta, flowDbFor, flowDelta } from "../../../test/mermaidOracle";
 import { docText, lineSeparatorFor } from "../../setup";
 import { type TextEdit, applyEdits, toChanges } from "../edits";
 import { type FlowDbView, flowDbOf } from "../mermaidDb";
 import { agreesFlow } from "../verdict";
-import { COLOUR_PRESETS, SHAPES } from "./labels";
+import { COLOUR_PRESETS, SHAPES, tidyLabel } from "./labels";
 import { parseFlowchart } from "./parse";
 import { type FlowOp, compileFlowOp } from "./ops";
 
 const TIMEOUT = 120_000;
+
+interface Fs {
+  readdirSync: (path: string) => string[];
+  readFileSync: (path: string, encoding: "utf8") => string;
+}
+
+/** Node's process, reached without Node types (as in `mermaidVersion.test.ts`). */
+const node = globalThis as unknown as {
+  process: {
+    env: Record<string, string | undefined>;
+    getBuiltinModule(id: string): unknown;
+  };
+};
 
 const FLOWCHART = import.meta.glob<string>(
   "../../fixtures/diagrams/flowchart/*.mmd",
@@ -364,6 +386,48 @@ describe("flowDelta", () => {
       ["edge 0 type", "edge 0 stroke"],
     ],
     [
+      "a link",
+      "flowchart TD\n  A",
+      'flowchart TD\n  A\n  click A "https://x.y/"',
+      ["vertex A classes", "vertex A link"],
+    ],
+    [
+      "a tooltip",
+      'flowchart TD\n  A\n  click A "https://x.y/"',
+      'flowchart TD\n  A\n  click A "https://x.y/" "tip"',
+      ["vertex A tooltip"],
+    ],
+    [
+      "a label type",
+      'flowchart TD\n  A["x"]',
+      'flowchart TD\n  A["`x`"]',
+      ["vertex A labelType"],
+    ],
+    [
+      "a classDef",
+      "flowchart TD\n  A\n  classDef hot fill:#f00",
+      "flowchart TD\n  A\n  classDef hot fill:#0f0",
+      ["classDef hot styles"],
+    ],
+    [
+      "a new classDef",
+      "flowchart TD\n  A",
+      "flowchart TD\n  A\n  classDef hot fill:#f00",
+      ["classDef hot added"],
+    ],
+    [
+      "a subgraph's direction",
+      "flowchart TD\n  subgraph s\n    A\n  end",
+      "flowchart TD\n  subgraph s\n    direction LR\n    A\n  end",
+      ["subgraph s dir"],
+    ],
+    [
+      "a subgraph's title",
+      "flowchart TD\n  subgraph s [a]\n    A\n  end",
+      "flowchart TD\n  subgraph s [b]\n    A\n  end",
+      ["subgraph s title"],
+    ],
+    [
       "a subgraph's members",
       "flowchart TD\n  A\n  subgraph s\n    B\n  end",
       "flowchart TD\n  subgraph s\n    A\n    B\n  end",
@@ -457,21 +521,37 @@ describe("every op on the corpus", () => {
 });
 
 describe("the CRLF copy", () => {
-  const OPS = (ids: readonly string[]): FlowOp[] => [
-    { op: "direction", value: "LR" },
-    { op: "direction", value: "TD" },
-    ...ids.flatMap((id): FlowOp[] => [
-      { op: "rename", id, text: "Renamed" },
-      ...SHAPES.map((s): FlowOp => ({ op: "shape", id, shape: s.name })),
-      ...STATUS_COLOURS.map((colour): FlowOp => ({ op: "colour", id, colour })),
-      { op: "colour", id, colour: null },
+  /** Every op on every box, each with the delta it must show. */
+  const OPS = (ids: readonly string[]): [FlowOp, (string | null)[]][] => [
+    [{ op: "direction", value: "LR" }, ["direction"]],
+    [{ op: "direction", value: "TD" }, ["direction"]],
+    ...ids.flatMap((id): [FlowOp, (string | null)[]][] => [
+      [{ op: "rename", id, text: "Renamed" }, [`vertex ${id} text`, null]],
+      ...SHAPES.map((s): [FlowOp, string[]] => [
+        { op: "shape", id, shape: s.name },
+        [`vertex ${id} type`],
+      ]),
+      ...STATUS_COLOURS.map((colour): [FlowOp, string[]] => [
+        { op: "colour", id, colour },
+        [`vertex ${id} styles`],
+      ]),
+      [{ op: "colour", id, colour: null }, [`vertex ${id} styles`]],
     ]),
   ];
 
-  test.each(["f04-chains", "f14-odd-spacing"])(
+  const STYLED =
+    "flowchart TD\n  %% keep\n  A[a] --> B\n  style A fill:#fff\n  style B fill:#000,opacity:1\n  B --> C\n  style C stroke:#000\n  style C color:#000";
+
+  test.each([
+    ["f04-chains", corpus.find(([n]) => n === "f04-chains")?.[1] ?? ""],
+    [
+      "f14-odd-spacing",
+      corpus.find(([n]) => n === "f14-odd-spacing")?.[1] ?? "",
+    ],
+    ["a styled body, so whole lines go", STYLED],
+  ])(
     "%s saves with its own line breaks",
-    async (name) => {
-      const lf = corpus.find(([n]) => n === name)?.[1] ?? "";
+    async (_, lf) => {
       const crlf = lf.replaceAll("\n", "\r\n");
       const state = EditorState.create({
         doc: crlf,
@@ -482,7 +562,8 @@ describe("the CRLF copy", () => {
       const model = parseFlowchart(body);
       const beforeDb = await flowDbFor(body);
       let applied = 0;
-      for (const op of OPS(model.nodeOrder)) {
+      let linesGone = 0;
+      for (const [op, wanted] of OPS(model.nodeOrder)) {
         const result = compileFlowOp(model, op);
         if ("refused" in result) {
           throw new Error(`refused: ${JSON.stringify(op)} ${result.refused}`);
@@ -495,91 +576,138 @@ describe("the CRLF copy", () => {
         );
         expect(saved).toBe(after.replaceAll("\n", "\r\n"));
         expect(saved.replaceAll("\r\n", "")).not.toContain("\n");
-        if (result.edits.length > 0) {
-          applied++;
-          const checked = await broken(
-            body,
-            beforeDb,
-            result.edits,
-            dbDelta(beforeDb, await flowDbFor(after)),
-          );
-          expect(checked).not.toHaveProperty("problem");
+        if (result.edits.length === 0) {
+          continue;
         }
+        applied++;
+        if (after.split("\n").length < lf.split("\n").length) {
+          linesGone++;
+        }
+        // A bare box's rename also moves its type, as in the corpus suite.
+        const bare =
+          op.op === "rename" && model.nodes.get(op.id)?.defining === null;
+        const delta = wanted.flatMap((d) =>
+          d !== null
+            ? [d]
+            : bare && op.op === "rename"
+              ? [`vertex ${op.id} type`]
+              : [],
+        );
+        const checked = await broken(body, beforeDb, result.edits, delta);
+        expect(checked).not.toHaveProperty("problem");
       }
       expect(applied).toBeGreaterThan(0);
+      if (lf === STYLED) {
+        expect(linesGone).toBeGreaterThan(0);
+      }
     },
     TIMEOUT,
   );
 });
 
-describe("labels at the edges of the grammar, with real mermaid", () => {
-  const HOLDERS: Record<string, string> = {
-    rectangle: "A[Old]",
-    rounded: "A(Old)",
-    flag: "A>Old]",
-    decision: "A{Old}",
-    lean: "A[/Old/]",
-    quoted: 'A["Old"]',
-    markdown: 'A["`Old`"]',
-    bare: "A",
-    at: "A@{ shape: diam, label: Old }",
-    atQuoted: 'A@{ shape: diam, label: "Old" }',
-  };
-  const AT = ["at", "atQuoted"];
-  const R7 = Object.keys(HOLDERS);
-
-  /** Each text with the holders that refuse it; every other holder applies it. */
-  const TEXTS: readonly (readonly [string, readonly string[]])[] = [
-    ["a/", []],
-    ["/a", []],
-    ["-a", []],
-    ["a-", []],
-    ["\\a", AT],
-    ["a\\", AT],
-    ["x\\ny", AT],
-    ["end", []],
-    ["graph", []],
-    ["subgraph", []],
-    ["style x", []],
-    ["click", []],
-    ["a;b", []],
-    ["a#b", []],
-    ["#35;", []],
-    ["#quot;", []],
-    ["a`b", ["markdown", ...AT]],
-    ["`a`", ["quoted", "markdown", ...AT]],
-    ["a~~b", []],
-    ["a--b", []],
-    ["a-->b", []],
-    ["me@host", []],
-    ["a:b", []],
-    ["a,b", []],
-    ["100%", []],
-    ["%%", []],
-    ["%% c", []],
-    ["a%%b", []],
-    ["<b>x</b>", []],
-    ["A & B", []],
-    ["direction", []],
-    ["go direction LR", R7],
-    ["direction LR", R7],
-    ["1", []],
-    ["true", []],
-    ["null", []],
-    ["a\tb", []],
-    ["K\u00F6ln", []],
-    ["a  b", []],
-    ["one\ntwo", []],
-    [" a", []],
-    ["a ", []],
-    ["'a'", []],
-    ["a=b", []],
-    ["_a_", []],
-    ["@{x}", []],
-    ["a<br>b", []],
-    ["|", []],
-    ["...", []],
+describe("the table the browser draws", () => {
+  const FILE = "e2e/fixtures/label-table.json";
+  const texts = [
+    ...new Set([...LABEL_TEXTS, ...PUNCTUATION_TEXTS, ...MARKDOWN_TEXTS]),
   ];
+
+  /** Each text through `rename` on one box per text, per holder. */
+  function table(): string {
+    const bodies: Record<string, string> = {};
+    for (const [holder, ref] of Object.entries(LABEL_HOLDERS)) {
+      let body = "flowchart TD";
+      texts.forEach((_, i) => {
+        body += `\n  ${ref.replace(/^A/, `N${String(i)}`)}`;
+      });
+      texts.forEach((text, i) => {
+        const result = compileFlowOp(parseFlowchart(body), {
+          op: "rename",
+          id: `N${String(i)}`,
+          text,
+        });
+        if ("refused" in result) {
+          throw new Error(`${holder} refused ${JSON.stringify(text)}`);
+        }
+        body = applyEdits(body, result.edits);
+      });
+      bodies[holder] = body;
+    }
+    const markup = texts.flatMap((text, i) =>
+      MARKDOWN_MARKUP.includes(text) ? [i] : [],
+    );
+    return `${JSON.stringify({ drawn: texts.map(tidyLabel), markup, bodies }, null, 1)}\n`;
+  }
+
+  test("is what the op writes today", () => {
+    // Regenerate with FLUID_WRITE_LABEL_TABLE=1.
+    const fs = node.process.getBuiltinModule("node:fs") as Fs & {
+      writeFileSync: (path: string, text: string) => void;
+    };
+    if (node.process.env.FLUID_WRITE_LABEL_TABLE !== undefined) {
+      fs.writeFileSync(FILE, table());
+    }
+    expect(fs.readFileSync(FILE, "utf8")).toBe(table());
+  });
+
+  test("every body is one mermaid and the parser read the same way", async () => {
+    const { bodies } = JSON.parse(table()) as {
+      bodies: Record<string, string>;
+    };
+    for (const body of Object.values(bodies)) {
+      expect(agreesFlow(parseFlowchart(body), await flowDbFor(body))).toBe(
+        null,
+      );
+    }
+  });
+});
+
+describe("labels at the edges of the grammar, with real mermaid", () => {
+  const HOLDERS = LABEL_HOLDERS;
+  const TEXTS: readonly (readonly [string, readonly string[]])[] = [
+    ...new Set([...LABEL_TEXTS, ...PUNCTUATION_TEXTS, ...MARKDOWN_TEXTS]),
+  ].map((text) => [text, []] as const);
+
+  test.each(REFUSED_LABELS)(
+    "rename to %j is refused on every holder",
+    (text) => {
+      for (const ref of Object.values(HOLDERS)) {
+        const body = `flowchart TD\n  ${ref} --> B`;
+        expect(
+          compileFlowOp(parseFlowchart(body), { op: "rename", id: "A", text }),
+          ref,
+        ).toEqual({ refused: "invalid" });
+      }
+    },
+  );
+
+  test.each(REFUSED_ON_PLAIN_LABELS)(
+    "rename to %j is refused on a plain label and agrees on the others",
+    async (text) => {
+      for (const [holder, ref] of Object.entries(HOLDERS)) {
+        const body = `flowchart TD\n  ${ref} --> B`;
+        const result = compileFlowOp(parseFlowchart(body), {
+          op: "rename",
+          id: "A",
+          text,
+        });
+        if (holder === "markdown" || holder.startsWith("at")) {
+          if ("refused" in result) {
+            throw new Error(`${holder} refused`);
+          }
+          const checked = await broken(
+            body,
+            await flowDbFor(body),
+            result.edits,
+            ["vertex A text"],
+          );
+          expect(checked, holder).not.toHaveProperty("problem");
+        } else {
+          expect(result, holder).toEqual({ refused: "invalid" });
+        }
+      }
+    },
+    TIMEOUT,
+  );
 
   test.each(TEXTS)(
     "rename to %j",
@@ -704,19 +832,6 @@ describe("labels at the edges of the grammar, with real mermaid", () => {
     TIMEOUT,
   );
 });
-
-interface Fs {
-  readdirSync: (path: string) => string[];
-  readFileSync: (path: string, encoding: "utf8") => string;
-}
-
-/** Node's process, reached without Node types (as in `mermaidVersion.test.ts`). */
-const node = globalThis as unknown as {
-  process: {
-    env: Record<string, string | undefined>;
-    getBuiltinModule(id: string): unknown;
-  };
-};
 
 const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
 

@@ -39,6 +39,11 @@ export interface FlowVertexView {
   type: string | undefined;
   classes: string[];
   styles: string[];
+  /** `text` or `markdown`, how the label is read. */
+  labelType: string | undefined;
+  link: string | undefined;
+  linkTarget: string | undefined;
+  tooltip: string | undefined;
 }
 
 /** One edge, in `db.getEdges()` order (which is `linkStyle`'s index order). */
@@ -50,12 +55,22 @@ export interface FlowEdgeView {
   type: string | undefined;
   stroke: string | undefined;
   length: number | undefined;
+  labelType: string | undefined;
 }
 
 export interface FlowSubgraphView {
   id: string;
   title: string;
   nodes: string[];
+  dir: string | undefined;
+  labelType: string | undefined;
+}
+
+/** One `classDef`. */
+export interface FlowClassDefView {
+  id: string;
+  styles: string[];
+  textStyles: string[];
 }
 
 export interface FlowDbView {
@@ -63,6 +78,7 @@ export interface FlowDbView {
   vertices: FlowVertexView[];
   edges: FlowEdgeView[];
   subgraphs: FlowSubgraphView[];
+  classDefs: FlowClassDefView[];
 }
 
 /** The part of mermaid's FlowDB this module reads. */
@@ -77,6 +93,9 @@ interface RawFlowDb {
       type?: string;
       classes: string[];
       styles: string[];
+      labelType?: string;
+      link?: string;
+      linkTarget?: string;
     }
   >;
   getEdges(): {
@@ -88,8 +107,17 @@ interface RawFlowDb {
     type?: string;
     stroke?: string;
     length?: number;
+    labelType?: string;
   }[];
-  getSubGraphs(): { id: string; title: string; nodes: string[] }[];
+  getSubGraphs(): {
+    id: string;
+    title: string;
+    nodes: string[];
+    dir?: string;
+    labelType?: string;
+  }[];
+  getClasses(): Map<string, { styles: string[]; textStyles: string[] }>;
+  getTooltip(id: string): string | undefined;
 }
 
 /**
@@ -156,6 +184,10 @@ export async function flowDbOf(
         type: v.type,
         classes: [...v.classes],
         styles: [...v.styles],
+        labelType: v.labelType,
+        link: v.link,
+        linkTarget: v.linkTarget,
+        tooltip: db.getTooltip(v.id),
       })),
       edges: db.getEdges().map((e) => ({
         id: e.id,
@@ -165,11 +197,19 @@ export async function flowDbOf(
         type: e.type,
         stroke: e.stroke,
         length: e.length,
+        labelType: e.labelType,
       })),
       subgraphs: db.getSubGraphs().map((s) => ({
         id: s.id,
         title: s.title,
         nodes: [...s.nodes],
+        dir: s.dir,
+        labelType: s.labelType,
+      })),
+      classDefs: [...db.getClasses()].map(([id, c]) => ({
+        id,
+        styles: [...c.styles],
+        textStyles: [...c.textStyles],
       })),
     };
   } catch (error) {

@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { applyEdits } from "../edits";
 import { COLOUR_PRESETS, SHAPES } from "./labels";
 import { parseFlowchart } from "./parse";
-import { type FlowOp, compileFlowOp } from "./ops";
+import { type FlowOp, checked, compileFlowOp } from "./ops";
 
 const FIXTURES = import.meta.glob<string>(
   "../../fixtures/diagrams/flowchart/*.mmd",
@@ -66,6 +66,48 @@ describe("compileFlowOp in general", () => {
   });
 });
 
+describe("the self-check compares values, not only which field moved", () => {
+  const model = parseFlowchart(SKELETON);
+  const blue = {
+    from: SKELETON.length,
+    to: SKELETON.length,
+    insert: `\n    ${STYLE_BLUE}`,
+  };
+  const at = SKELETON.indexOf("Next step");
+  const relabel = { from: at, to: at + "Next step".length, insert: "Done" };
+
+  test("the right values pass", () => {
+    expect(checked(model, [relabel], { "B label": "Done" })).toEqual({
+      edits: [relabel],
+    });
+    expect(
+      checked(model, [blue], {
+        "B styles": null,
+        "B colours": JSON.stringify(["#1d4ed8", "#1e3a8a", "#ffffff"]),
+      }),
+    ).toEqual({ edits: [blue] });
+  });
+
+  test("a label other than the typed one is refused", () => {
+    expect(checked(model, [relabel], { "B label": "Other" })).toEqual({
+      refused: "invalid",
+    });
+  });
+
+  test("a preset that did not land is refused", () => {
+    expect(
+      checked(model, [blue], {
+        "B styles": null,
+        "B colours": JSON.stringify(["#b91c1c", "#7f1d1d", "#ffffff"]),
+      }),
+    ).toEqual({ refused: "invalid" });
+  });
+
+  test("a field that moved without being named is refused", () => {
+    expect(checked(model, [relabel], {})).toEqual({ refused: "invalid" });
+  });
+});
+
 describe("rename", () => {
   test("edits only the label", () => {
     expect(run(SKELETON, { op: "rename", id: "B", text: "Done" })).toBe(
@@ -119,25 +161,58 @@ describe("rename", () => {
     ).toBe('flowchart TD\n  A["`_New_`"]');
   });
 
-  test("a backtick in a markdown rename is refused, it would end the wrapper", () => {
+  test("a backtick in a markdown rename stays inside the wrapper", () => {
     expect(
-      refusal('flowchart TD\n  A["`**Old**`"]', {
+      run('flowchart TD\n  A["`**Old**`"]', {
         op: "rename",
         id: "A",
         text: "a`b",
       }),
-    ).toBe("invalid");
+    ).toBe('flowchart TD\n  A["`a#96;b`"]');
   });
 
-  test("text that would turn a quoted label into a markdown one is refused", () => {
+  test("backticks do not turn a quoted label into a markdown one", () => {
     expect(
-      refusal('flowchart TD\n  A["Old"]', {
-        op: "rename",
-        id: "A",
-        text: "`x`",
-      }),
-    ).toBe("invalid");
+      run('flowchart TD\n  A["Old"]', { op: "rename", id: "A", text: "`x`" }),
+    ).toBe('flowchart TD\n  A["#96;x#96;"]');
   });
+
+  test("outer space and runs of space, which SVG text cannot draw, are not written", () => {
+    expect(run(SKELETON, { op: "rename", id: "B", text: "  a   b " })).toBe(
+      "flowchart TD\n    A[First step] --> B[a b]",
+    );
+    expect(
+      edits(SKELETON, { op: "rename", id: "B", text: " Next  step " }),
+    ).toEqual([]);
+  });
+
+  test.each(["%%{init}%%", "a %%{b: c", "%%{"])(
+    "%j is refused, mermaid takes it out of the label as a directive (R42)",
+    (text) => {
+      expect(refusal(SKELETON, { op: "rename", id: "B", text })).toBe(
+        "invalid",
+      );
+    },
+  );
+
+  test("%% and { apart are fine", () => {
+    expect(run(SKELETON, { op: "rename", id: "B", text: "%% {" })).toBe(
+      'flowchart TD\n    A[First step] --> B["%% {"]',
+    );
+  });
+
+  test.each([
+    ["<script>x</script>", '"#lt;script#gt;x#lt;/script#gt;"'],
+    ["<!--c-->", '"#lt;!--c--#gt;"'],
+    ["<img src=x onerror=y>", '"#lt;img src=x onerror=y#gt;"'],
+  ])(
+    "%j is written as entity forms, never as markup (R42)",
+    (text, written) => {
+      const after = run(SKELETON, { op: "rename", id: "B", text });
+      expect(after).toBe(`flowchart TD\n    A[First step] --> B[${written}]`);
+      expect(after.split("\n")[1]?.slice(0, 22)).not.toContain("<");
+    },
+  );
 
   test("the @{ } form: a plain word stays bare", () => {
     expect(
@@ -159,18 +234,35 @@ describe("rename", () => {
     ).toBe('flowchart TD\n  A@{ shape: diam, label: "New" }');
   });
 
-  test.each(["true", "NULL", "1", "a: b", "a, b"])(
-    "the @{ } form quotes %j, which YAML would read as something else",
-    (text) => {
-      expect(
-        run("flowchart TD\n  A@{ shape: diam, label: Old }", {
-          op: "rename",
-          id: "A",
-          text,
-        }),
-      ).toBe(`flowchart TD\n  A@{ shape: diam, label: "${text}" }`);
-    },
-  );
+  test.each([
+    ["true", '"true"'],
+    ["NULL", '"NULL"'],
+    ["1", '"1"'],
+    ["a, b", '"a, b"'],
+    // mermaid reads this form as markdown, so the marks are entity forms.
+    ["a: b", '"a#58; b"'],
+    ["_a_", '"#95;a#95;"'],
+    ["http://x.y", '"http#58;//x.y"'],
+    ["www.x.y", '"www#46;x.y"'],
+  ])("the @{ } form writes %j as %s", (text, written) => {
+    expect(
+      run("flowchart TD\n  A@{ shape: diam, label: Old }", {
+        op: "rename",
+        id: "A",
+        text,
+      }),
+    ).toBe(`flowchart TD\n  A@{ shape: diam, label: ${written} }`);
+  });
+
+  test("a markdown label keeps its emphasis and loses what would vanish", () => {
+    expect(
+      run('flowchart TD\n  A["`Old`"]', {
+        op: "rename",
+        id: "A",
+        text: "**b** http://x.y",
+      }),
+    ).toBe('flowchart TD\n  A["`**b** http#58;//x.y`"]');
+  });
 
   test("the same text is no edit", () => {
     const body = 'flowchart TD\n  A["say #quot;hi#quot;"]\n  B["one<br/>two"]';
@@ -325,6 +417,56 @@ describe("what mermaid's own preprocessing would change", () => {
     },
   );
 
+  describe("a ; that mermaid would newly drop (R42)", () => {
+    const LINES = [
+      'A[x] --> B; click A "https://x.y/?a=1;b=2"',
+      'A[x] --> B; click A "https://x.y/" "a;b"',
+      "A[x] --> B; subgraph s [a;b]\n  end",
+    ];
+    test.each(LINES)("a rename that makes it so is refused: %s", (line) => {
+      const body = `flowchart TD\n  ${line}`;
+      for (const text of ["style:#b", "style a:#b", "classDef:#x"]) {
+        expect(
+          parseFlowchart(body).understood,
+          "the body is one the parser reads",
+        ).toBe(true);
+        expect(refusal(body, { op: "rename", id: "A", text })).toBe("invalid");
+      }
+    });
+
+    test("other text on the same line is fine", () => {
+      const body = `flowchart TD\n  ${LINES[0] ?? ""}`;
+      expect(run(body, { op: "rename", id: "A", text: "plain" })).toContain(
+        "A[plain]",
+      );
+    });
+
+    test("a terminator with only space after it may go", () => {
+      const body = "flowchart TD\n  A[x] --> B;  ";
+      expect(run(body, { op: "rename", id: "A", text: "style:#b" })).toContain(
+        'A["style:#b"]',
+      );
+    });
+
+    test("a ; the body already drops does not stop other ops", () => {
+      const body =
+        'flowchart <\n  style s1 fill:#fff !important; A["a: #fff; b"] ~~~ C\n  A[y]';
+      const model = parseFlowchart(body);
+      if (model.understood) {
+        expect(
+          compileFlowOp(model, { op: "direction", value: "LR" }),
+        ).toHaveProperty("edits");
+      }
+      const bodyTwo = 'flowchart TD\n  A["style: #fff; b"] --> C\n  A[y]';
+      expect(
+        compileFlowOp(parseFlowchart(bodyTwo), {
+          op: "direction",
+          value: "LR",
+        }),
+      ).toHaveProperty("edits");
+    });
+  });
+
   test("a label that spells style:#x; would lose its ; so it is refused (R9)", () => {
     expect(
       refusal(SKELETON, { op: "rename", id: "B", text: "style a:#b; c" }),
@@ -418,6 +560,13 @@ describe("colour", () => {
       expect(
         "edits" in result && result.edits.some((e) => e.insert.includes(";")),
       ).toBe(false);
+    }
+  });
+
+  test("a colour on the new line is one the self-check confirmed", () => {
+    for (const colour of ["grey", "red"] as const) {
+      const after = run(SKELETON, { op: "colour", id: "B", colour });
+      expect(after).toContain(`fill:${COLOUR_PRESETS[colour].fill}`);
     }
   });
 

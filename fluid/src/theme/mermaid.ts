@@ -184,7 +184,9 @@ const VARIABLES = {
  * foreignObject whose size mermaid measures before Safari applies its page
  * zoom: under zoom the text overflows the node it belongs to. SVG text scales
  * with its node. `wrappingWidth` is wide because SVG labels wrap at it, and a
- * long identifier broken across two lines is no longer the identifier.
+ * long identifier broken across two lines is no longer the identifier. SVG
+ * text leaves entity forms undecoded, so everything `mermaid.render` draws goes
+ * through `drawnLabels` (`mermaidText.ts`).
  */
 export function mermaidConfig(dark: boolean): MermaidConfig {
   return {

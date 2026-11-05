@@ -16,6 +16,7 @@ import { useEffect, useId, useRef, useState } from "react";
 
 import { useTheme } from "../theme/context";
 import { mermaidConfig } from "../theme/mermaid";
+import { drawnLabels } from "../theme/mermaidText";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { unclampDiagram } from "./wideDiagram";
@@ -104,7 +105,7 @@ export default function MermaidDiagram({
       .render(id, source)
       .then((result) => {
         if (live) {
-          setDrawn({ svg: result.svg });
+          setDrawn({ svg: drawnLabels(result.svg) });
         }
       })
       .catch(() => {
@@ -150,7 +151,7 @@ export default function MermaidDiagram({
         .render(`${id}-paper`, `${source}\n${directive}\n`)
         .then((result) => {
           if (live) {
-            setPaperDrawn({ source, svg: result.svg });
+            setPaperDrawn({ source, svg: drawnLabels(result.svg) });
           }
         })
         .catch(() => {

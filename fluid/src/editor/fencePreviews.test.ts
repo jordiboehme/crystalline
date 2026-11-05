@@ -125,6 +125,21 @@ describe("fence previews", () => {
     view.destroy();
   });
 
+  it("draws a label's entity forms as the characters they stand for", async () => {
+    vi.mocked(mermaid.render).mockImplementationOnce(() =>
+      Promise.resolve({
+        svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+      } as Awaited<ReturnType<typeof mermaid.render>>),
+    );
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(
+        view.dom.querySelector(".cm-mermaid-preview tspan")?.textContent,
+      ).toBe('say "hi"');
+    });
+    view.destroy();
+  });
+
   it("suppresses mermaid's own error rendering", async () => {
     // This preview redraws on every keystroke, so it renders half-typed
     // diagrams constantly and most of those fail. Mermaid's default is to

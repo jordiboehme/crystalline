@@ -288,14 +288,14 @@ describe("mermaid 12.2.0 flowchart grammar facts", () => {
 
   test("subgraphs: ids, titles and the nodes the db gives them", async () => {
     const view = await db(fixture("f13-subgraphs"));
-    expect(view.subgraphs).toEqual([
+    expect(view.subgraphs).toMatchObject([
       { id: "inner", title: "Engine", nodes: ["Y", "X"] },
       { id: "outer", title: "Daemon", nodes: ["inner", "Z"] },
     ]);
     const plain = await db(
       'flowchart TD\n  subgraph "Spaced title"\n    A\n  end\n  subgraph s2\n    B\n  end\n  subgraph two words\n    C\n  end\n',
     );
-    expect(plain.subgraphs).toEqual([
+    expect(plain.subgraphs).toMatchObject([
       { id: "subGraph0", title: "Spaced title", nodes: ["A"] },
       { id: "s2", title: "s2", nodes: ["B"] },
       { id: "subGraph2", title: "two words", nodes: ["C"] },

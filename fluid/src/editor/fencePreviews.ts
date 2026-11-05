@@ -300,8 +300,8 @@ class MermaidPreviewWidget extends WidgetType {
     previews.set(box, preview);
     mermaidSequence += 1;
     const id = `cm-mermaid-${String(mermaidSequence)}`;
-    void import("mermaid")
-      .then(async ({ default: mermaid }) => {
+    void Promise.all([import("mermaid"), import("../theme/mermaidText")])
+      .then(async ([{ default: mermaid }, { drawnLabels }]) => {
         // The same configuration the reading view uses, so a diagram does
         // not change palette between the editor and the page. It carries
         // `suppressErrorRendering`, which this surface needs most: the
@@ -315,7 +315,7 @@ class MermaidPreviewWidget extends WidgetType {
         mermaid.initialize(mermaidConfig(dark));
         const rendered = await mermaid.render(id, source);
         if (box.isConnected || box.childElementCount === 0) {
-          box.innerHTML = rendered.svg;
+          box.innerHTML = drawnLabels(rendered.svg);
         }
       })
       .catch((cause: unknown) => {

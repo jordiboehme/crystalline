@@ -19,6 +19,7 @@ import {
   type Span,
   type TextEdit,
   applyEdits,
+  sortedEdits,
 } from "../edits";
 import { droppedSemicolons } from "../scan";
 import { classesOf, stylesOf } from "../verdict";
@@ -27,8 +28,10 @@ import {
   type ColourPreset,
   SHAPES,
   decodeLabel,
+  encodeAtLabel,
   encodeLabel,
   encodeMarkdownLabel,
+  tidyLabel,
 } from "./labels";
 import {
   type DirectiveLine,
@@ -90,6 +93,18 @@ function shownShape(body: string, node: FlowNode): string {
     : `${shape.name}`;
 }
 
+/** The fill, stroke and color a box draws with: the last value of each, as CSS reads them. */
+function coloursOf(styles: readonly string[]): (string | null)[] {
+  return COLOUR_KEYS.map((key) => {
+    const entry = styles.findLast(
+      (s) => s.slice(0, s.indexOf(":")).trim().toLowerCase() === key,
+    );
+    return entry === undefined
+      ? null
+      : entry.slice(entry.indexOf(":") + 1).trim();
+  });
+}
+
 /**
  * The model as named fields, the same parts `agreesFlow` compares, so that two
  * models can be compared field by field.
@@ -132,27 +147,67 @@ function fieldsOf(model: FlowModel): Map<string, string> {
     fields.set(`${id} markdown`, String(shape?.markdown ?? false));
     fields.set(`${id} shape`, shownShape(body, node));
     fields.set(`${id} styles`, JSON.stringify(styles.get(id) ?? []));
+    fields.set(
+      `${id} colours`,
+      JSON.stringify(coloursOf(styles.get(id) ?? [])),
+    );
     fields.set(`${id} classes`, JSON.stringify(classes.get(id) ?? []));
   }
   return fields;
 }
 
+/** The offsets of the `;`s mermaid's `encodeEntities` drops from `model`, with the end of each one's line. */
+function droppedIn(model: FlowModel): { at: number; lineEnd: number }[] {
+  const out: { at: number; lineEnd: number }[] = [];
+  for (const line of model.scan.lines) {
+    if (
+      line.kind === "statement" ||
+      line.kind === "header" ||
+      line.kind === "acc"
+    ) {
+      const text = model.body.slice(line.from, line.to);
+      for (const i of droppedSemicolons(text)) {
+        out.push({ at: line.from + i, lineEnd: line.to });
+      }
+    }
+  }
+  return out;
+}
+
+/** Where `at` of the edited text was before `edits`, null inside an inserted text. */
+function beforeEdits(edits: readonly TextEdit[], at: number): number | null {
+  let shift = 0;
+  for (const edit of sortedEdits(edits, Number.MAX_SAFE_INTEGER)) {
+    const from = edit.from + shift;
+    if (at < from) {
+      break;
+    }
+    if (at < from + edit.insert.length) {
+      return null;
+    }
+    shift += edit.insert.length - (edit.to - edit.from);
+  }
+  return at - shift;
+}
+
 /**
- * Whether mermaid's `encodeEntities` would drop a `;` inside a box or arrow of
- * `model`: a label that spells `style a:#b; c` loses its `;` before the parse,
- * so mermaid would store other text than the source says (R9).
+ * Whether the edited text makes mermaid drop a `;` the body kept, with more
+ * than space after it on the line. Nothing in the source says so and the db
+ * shows it only in fields far from the edit: a rename to `style:#b` takes the
+ * `;` out of a click URL, a tooltip or a subgraph title on the same line (R9).
  */
-function dropsInsideChain(model: FlowModel): boolean {
-  return model.chains.some((chain) => {
-    const line = model.scan.lines[chain.line];
-    if (line === undefined) {
+function dropsNewSemicolon(
+  before: FlowModel,
+  after: FlowModel,
+  edits: readonly TextEdit[],
+): boolean {
+  const kept = new Set(droppedIn(before).map((d) => d.at));
+  return droppedIn(after).some(({ at, lineEnd }) => {
+    if (after.body.slice(at + 1, lineEnd).trim() === "") {
       return false;
     }
-    const text = model.body.slice(line.from, line.to);
-    return [...droppedSemicolons(text)].some((i) => {
-      const at = line.from + i;
-      return at >= chain.span.from && at < chain.span.to;
-    });
+    const was = beforeEdits(edits, at);
+    return was === null || !kept.has(was);
   });
 }
 
@@ -161,7 +216,7 @@ function dropsInsideChain(model: FlowModel): boolean {
  * `model` only in the fields `changes` names, each then holding the value named
  * there (null: any value). Otherwise `invalid`.
  */
-function checked(
+export function checked(
   model: FlowModel,
   edits: TextEdit[],
   changes: Readonly<Record<string, string | null>>,
@@ -170,7 +225,7 @@ function checked(
     return { edits };
   }
   const after = parseFlowchart(applyEdits(model.body, edits));
-  if (!after.understood || dropsInsideChain(after)) {
+  if (!after.understood || dropsNewSemicolon(model, after, edits)) {
     return refused("invalid");
   }
   const before = fieldsOf(model);
@@ -197,17 +252,15 @@ function encodedFor(text: string, shape: Shape): string {
     return encodeMarkdownLabel(text);
   }
   if (shape.form === "at") {
-    // The parser's bare `@{ }` value, the only one YAML cannot read as something else.
-    const bare =
-      /^[A-Za-z][A-Za-z0-9 _.-]*$/.test(text) &&
-      !/^\s|\s$|^(?:true|false|null)$/i.test(text);
-    return encodeLabel(text, shape.quoted || !bare);
+    return encodeAtLabel(text, shape.quoted);
   }
   return encodeLabel(text, shape.quoted);
 }
 
 function rename(model: FlowModel, node: FlowNode, text: string): OpResult {
-  if (text.trim() === "") {
+  const typed = tidyLabel(text);
+  // `%%{` is a directive to mermaid wherever it stands, so it would leave the label.
+  if (typed === "" || typed.includes("%%{")) {
     return refused("invalid");
   }
   const shape = node.defining?.shape ?? null;
@@ -217,26 +270,29 @@ function rename(model: FlowModel, node: FlowNode, text: string): OpResult {
   }
   const field = `${node.id} label`;
   if (shape === null) {
-    const encoded = encodeLabel(text, false);
-    const shown = decodeLabel(encoded, encoded.startsWith('"'));
-    if (shown === node.id) {
+    if (typed === node.id) {
       return { edits: [] };
     }
     const at = ref.idSpan.to;
-    return checked(model, [{ from: at, to: at, insert: `[${encoded}]` }], {
-      [field]: shown,
-      [`${node.id} shape`]: "rect",
-    });
+    return checked(
+      model,
+      [{ from: at, to: at, insert: `[${encodeLabel(typed, false)}]` }],
+      { [field]: typed, [`${node.id} shape`]: "rect" },
+    );
   }
-  const encoded = encodedFor(text, shape);
-  const shown = decodeLabel(encoded, encoded.startsWith('"'));
-  if (shown === shownLabel(model.body, shape)) {
+  if (typed === tidyLabel(shownLabel(model.body, shape))) {
     return { edits: [] };
   }
   return checked(
     model,
-    [{ from: shape.label.from, to: shape.label.to, insert: encoded }],
-    { [field]: shown },
+    [
+      {
+        from: shape.label.from,
+        to: shape.label.to,
+        insert: encodedFor(typed, shape),
+      },
+    ],
+    { [field]: typed },
   );
 }
 
@@ -328,6 +384,8 @@ function setColour(
 ): OpResult {
   const preset = COLOUR_PRESETS[name];
   const field = `${node.id} styles`;
+  const colours = `${node.id} colours`;
+  const landed = JSON.stringify([preset.fill, preset.stroke, preset.color]);
   const last = styleLines.at(-1);
   if (last === undefined) {
     const indent =
@@ -340,6 +398,7 @@ function setColour(
       [{ from: at, to: at, insert: `\n${indent}${line}` }],
       {
         [field]: null,
+        [colours]: landed,
       },
     );
   }
@@ -364,7 +423,7 @@ function setColour(
   if (appended !== "") {
     edits.push({ from: end, to: end, insert: appended });
   }
-  return checked(model, edits, { [field]: null });
+  return checked(model, edits, { [field]: null, [colours]: landed });
 }
 
 /** The ranges that take the colour entries out of a line that keeps others. */
@@ -444,7 +503,10 @@ function clearColour(
     ...span,
     insert: "",
   }));
-  return checked(model, edits, { [`${node.id} styles`]: null });
+  return checked(model, edits, {
+    [`${node.id} styles`]: null,
+    [`${node.id} colours`]: JSON.stringify([null, null, null]),
+  });
 }
 
 function colour(

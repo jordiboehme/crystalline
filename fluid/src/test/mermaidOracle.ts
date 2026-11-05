@@ -16,15 +16,26 @@ export async function flowDbFor(body: string): Promise<FlowDbView> {
 }
 
 /**
+ * How a label is read: mermaid's `text` and `string` are a label without and
+ * with quotes, and only `markdown` draws differently.
+ */
+function readAs(labelType: string | undefined): string {
+  return labelType === "markdown" ? "markdown" : "text";
+}
+
+/**
  * Every difference between two dbs, one string per difference, in a fixed
  * order, so a suite can assert the exact list:
  *
  * - `direction`
  * - `vertex <id> added`, `vertex <id> removed`, `vertex order`
- * - `vertex <id> text`, `type`, `styles`, `classes`
+ * - `vertex <id> text`, `type`, `styles`, `classes`, `labelType`, `link`,
+ *   `linkTarget`, `tooltip`
  * - `edge <n> added`, `edge <n> removed` (by position in the edge list)
- * - `edge <n> id`, `start`, `end`, `text`, `type`, `stroke`, `length`
- * - `subgraph <id> added`, `removed`, `title`, `nodes`
+ * - `edge <n> id`, `start`, `end`, `text`, `type`, `stroke`, `length`,
+ *   `labelType`
+ * - `subgraph <id> added`, `removed`, `title`, `nodes`, `dir`, `labelType`
+ * - `classDef <id> added`, `removed`, `styles`, `textStyles`
  *
  * A vertex's `domId` is left out on purpose: its number counts every
  * `addVertex` call, so any new `style` line moves the ones after it, and the
@@ -61,6 +72,14 @@ export function dbDelta(before: FlowDbView, after: FlowDbView): string[] {
     if (old.classes.join("\n") !== vertex.classes.join("\n")) {
       out.push(`vertex ${id} classes`);
     }
+    if (readAs(old.labelType) !== readAs(vertex.labelType)) {
+      out.push(`vertex ${id} labelType`);
+    }
+    for (const field of ["link", "linkTarget", "tooltip"] as const) {
+      if (old[field] !== vertex[field]) {
+        out.push(`vertex ${id} ${field}`);
+      }
+    }
   }
   const kept = (list: FlowDbView["vertices"], other: Map<string, unknown>) =>
     list.filter((v) => other.has(v.id)).map((v) => v.id);
@@ -93,6 +112,9 @@ export function dbDelta(before: FlowDbView, after: FlowDbView): string[] {
           out.push(`edge ${n} ${field}`);
         }
       }
+      if (readAs(old.labelType) !== readAs(edge.labelType)) {
+        out.push(`edge ${n} labelType`);
+      }
     }
   }
 
@@ -114,6 +136,33 @@ export function dbDelta(before: FlowDbView, after: FlowDbView): string[] {
     }
     if (old.nodes.join("\n") !== group.nodes.join("\n")) {
       out.push(`subgraph ${id} nodes`);
+    }
+    if (old.dir !== group.dir) {
+      out.push(`subgraph ${id} dir`);
+    }
+    if (readAs(old.labelType) !== readAs(group.labelType)) {
+      out.push(`subgraph ${id} labelType`);
+    }
+  }
+
+  const oldDefs = new Map(before.classDefs.map((c) => [c.id, c]));
+  const newDefs = new Map(after.classDefs.map((c) => [c.id, c]));
+  for (const id of oldDefs.keys()) {
+    if (!newDefs.has(id)) {
+      out.push(`classDef ${id} removed`);
+    }
+  }
+  for (const [id, def] of newDefs) {
+    const old = oldDefs.get(id);
+    if (old === undefined) {
+      out.push(`classDef ${id} added`);
+      continue;
+    }
+    if (old.styles.join("\n") !== def.styles.join("\n")) {
+      out.push(`classDef ${id} styles`);
+    }
+    if (old.textStyles.join("\n") !== def.textStyles.join("\n")) {
+      out.push(`classDef ${id} textStyles`);
     }
   }
   return out;

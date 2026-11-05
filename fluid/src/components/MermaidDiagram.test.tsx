@@ -417,4 +417,18 @@ describe("MermaidDiagram", () => {
       );
     });
   });
+
+  it("draws a label's entity forms as the characters they stand for", async () => {
+    vi.mocked(mermaid.render).mockResolvedValueOnce({
+      svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+    } as Awaited<ReturnType<typeof mermaid.render>>);
+    const { container } = render(
+      <ThemeProvider>
+        <MermaidDiagram source="flowchart TD" />
+      </ThemeProvider>,
+    );
+    await waitFor(() => {
+      expect(container.querySelector("tspan")?.textContent).toBe('say "hi"');
+    });
+  });
 });

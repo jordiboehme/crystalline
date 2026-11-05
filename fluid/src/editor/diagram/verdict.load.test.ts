@@ -50,6 +50,8 @@ vi.mock("mermaid", () => {
                 ]),
               getEdges: () => [],
               getSubGraphs: () => [],
+              getClasses: () => new Map(),
+              getTooltip: () => undefined,
             },
           });
         },

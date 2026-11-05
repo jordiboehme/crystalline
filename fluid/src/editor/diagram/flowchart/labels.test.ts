@@ -8,6 +8,7 @@ import {
   decodeLabel,
   encodeLabel,
   encodeMarkdownLabel,
+  tidyLabel,
 } from "./labels";
 import { AT_SHAPE_NAMES, CLASSIC_SHAPES } from "./model";
 
@@ -36,7 +37,7 @@ describe("encodeLabel and decodeLabel", () => {
     expect(encodeLabel("plain", true)).toBe('"plain"');
   });
 
-  test.each(["/api", "api/", "\\x", "x\\", "-x", "x-"])(
+  test.each(["/api", "api/", "-x", "x-"])(
     "%j gets quotes, or it would read as another shape's delimiter",
     (text) => {
       const encoded = encodeLabel(text, false);
@@ -44,6 +45,53 @@ describe("encodeLabel and decodeLabel", () => {
       expect(decodeLabel(encoded, true)).toBe(text);
     },
   );
+
+  // What mermaid would mangle on the way to an SVG label (R41).
+  test.each([
+    ['say "hi"', '"say #quot;hi#quot;"'],
+    ["x > y", '"x #gt; y"'],
+    ["a<b", '"a#lt;b"'],
+    ["a-->b", '"a--#gt;b"'],
+    ["> q", '"#gt; q"'],
+    ["C:\\new", '"C:#92;new"'],
+    ["a\\", '"a#92;"'],
+    ["`a`", '"#96;a#96;"'],
+    ["a`b", '"a#96;b"'],
+    ["&amp;", '"#38;amp;"'],
+    ["&#35;", '"#38;#35;35;"'],
+    ["#35;", '"#35;35;"'],
+    ["#a_b;", '"#35;a_b;"'],
+    ["x #_; y", '"x #35;_; y"'],
+    ["a:#b;", '"a:#35;b;"'],
+    ["<br>", '"#lt;br#gt;"'],
+    ["\u00B6\u00DF", '"#182;\u00DF"'],
+    ["\uFB02\u00B0", '"#64258;\u00B0"'],
+  ])("%j is written as %j and reads back", (text, encoded) => {
+    expect(encodeLabel(text, false)).toBe(encoded);
+    expect(decodeLabel(encoded, true)).toBe(text);
+  });
+
+  test("a plain & and a plain # stay as they are", () => {
+    expect(encodeLabel("A & B", false)).toBe('"A & B"');
+    expect(encodeLabel("a#b", false)).toBe('"a#b"');
+  });
+
+  test("the field shows what is drawn for labels already in a diagram", () => {
+    expect(decodeLabel('"#9829; #infin; #lt;"', true)).toBe("\u2665 \u221E <");
+    expect(decodeLabel("a &amp; b", false)).toBe("a & b");
+    expect(decodeLabel('"#bogus;"', true)).toBe("#bogus;");
+  });
+
+  test("a written <br> is text, a <br> in the source is a line break", () => {
+    expect(decodeLabel('"#lt;br#gt;"', true)).toBe("<br>");
+    expect(decodeLabel("a<br>b", false)).toBe("a\nb");
+  });
+
+  test("tidyLabel gives the text mermaid can draw: one space, no outer space", () => {
+    expect(tidyLabel("  a \t b  \r\n  c ")).toBe("a b\nc");
+    expect(tidyLabel("\n\na\n\nb\n")).toBe("a\n\nb");
+    expect(tidyLabel(" \n ")).toBe("");
+  });
 
   test.each(["me@host", "a~~b"])(
     "%j gets quotes, or mermaid's lexer would read an arrow in it",
