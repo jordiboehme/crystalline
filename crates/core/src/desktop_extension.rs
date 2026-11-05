@@ -551,10 +551,15 @@ mod tests {
         for i in 0..archive.len() {
             let entry = archive.by_index(i).unwrap();
             assert_eq!(entry.compression(), zip::CompressionMethod::Deflated);
+            // A zip written on Windows records its entries as made on DOS, so
+            // it carries no Unix mode; the release packs on Linux.
+            #[cfg(unix)]
             assert_eq!(entry.unix_mode().map(|m| m & 0o777), Some(0o644));
         }
     }
 
+    // Unix only: a zip written on Windows records no Unix mode (see above).
+    #[cfg(unix)]
     #[test]
     fn the_staged_binary_is_packed_executable() {
         let mut staged = files(Bundle::DesktopOnly, "9.9.9");
