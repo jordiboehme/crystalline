@@ -430,7 +430,7 @@ function tooLongForEntities(text: string): boolean {
   );
 }
 
-function droppedSemicolons(text: string): Set<number> {
+export function droppedSemicolons(text: string): Set<number> {
   const all = new Set<number>();
   // Both regexes need a `;`, and without one they backtrack for nothing.
   if (!text.includes(";")) {

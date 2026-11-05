@@ -87,7 +87,7 @@ function sameList(a: readonly string[], b: readonly string[]): boolean {
 }
 
 /** Each box's `style` entries in source order, as the db lists them. */
-function stylesOf(model: FlowModel): Map<string, string[]> {
+export function stylesOf(model: FlowModel): Map<string, string[]> {
   const out = new Map<string, string[]>();
   for (const directive of model.directives) {
     const id = directive.targets[0]?.id;
@@ -107,7 +107,7 @@ function stylesOf(model: FlowModel): Map<string, string[]> {
  * only counts after the box's first ref or `style` line. A `click` line adds
  * `clickable`.
  */
-function classesOf(model: FlowModel): Map<string, string[]> {
+export function classesOf(model: FlowModel): Map<string, string[]> {
   const steps: { at: number; run: () => void }[] = [];
   const known = new Set<string>();
   const out = new Map<string, string[]>();
