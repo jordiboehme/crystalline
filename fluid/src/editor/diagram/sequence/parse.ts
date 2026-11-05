@@ -19,10 +19,13 @@
  * - what cannot be read as mermaid reads it: a syntax error, an unclosed block;
  * - what the model cannot hold: half arrows and `()` central connections;
  * - a statement run over lines, a body or a line past the limits;
- * - a `#` that cuts a text, a `;` that `encodeEntities` removes, a `%%{` inside
+ * - a `#` that cuts a text or takes all of it (`A->>B: Issue #12`, `rect #fff`),
+ *   a `;` that `encodeEntities` removes, a `%%{` inside
  *   a line, a lone CR: the source and the drawing would say different things,
  *   and nobody could see why with the text hidden;
  * - a name with `#`, `%` or an entity;
+ * - `hideUnusedParticipants` named in the frontmatter or a directive: the db still
+ *   lists the participants it hides, so they would have no element;
  * - what the db accepts and the render cannot draw or shows otherwise: `activate`
  *   of nobody, a `create` or `destroy` with no message right after it, an
  *   unknown `@{ type }`, a menu on a participant drawn without a box, `$$`
@@ -344,6 +347,29 @@ const PARTICIPANT_TYPES = new Set([
   "queue",
 ]);
 
+/**
+ * The tokens after which a rule 3 comment on the same line loses text: a text
+ * that the `#` cuts, and a keyword that opens a `LINE`, whose whole text it takes.
+ */
+const CUT_BY_A_HASH = new Set([
+  "TXT",
+  "restOfLine",
+  "title",
+  "legacy_title",
+  "box",
+  "loop",
+  "rect",
+  "opt",
+  "alt",
+  "else",
+  "par",
+  "par_over",
+  "and",
+  "critical",
+  "option",
+  "break",
+]);
+
 const COMPILED = LEXER_RULES.map((source) => new RegExp(source, "iy"));
 
 /** A failure inside one statement: the message for `reasons`. */
@@ -425,6 +451,14 @@ function lexedText(
       line.kind === "directive" ||
       line.kind === "comment"
     ) {
+      if (
+        line.kind !== "comment" &&
+        body.slice(line.from, line.to).includes("hideUnusedParticipants")
+      ) {
+        reasons.push(
+          "hideUnusedParticipants leaves participants without an element.",
+        );
+      }
       continue;
     }
     let raw = body.slice(line.from, line.to);
@@ -500,12 +534,7 @@ function lex(text: string, reasons: string[]): SeqToken[] {
     }
     if (rule === 3) {
       const last = tokens[tokens.length - 1]?.kind;
-      if (
-        last === "TXT" ||
-        last === "restOfLine" ||
-        last === "title" ||
-        last === "legacy_title"
-      ) {
+      if (last !== undefined && CUT_BY_A_HASH.has(last)) {
         reasons.push(
           "A # starts a comment here, and mermaid drops the rest of the text.",
         );
@@ -546,17 +575,25 @@ export function lexSequence(body: string): SeqToken[] {
 }
 
 /**
- * A sequence text as drawn: entities decoded, each `<br>` form a line break,
- * outer space gone. mermaid's own renderer decodes these forms in sequence
- * diagrams (`drawnLabels` finds nothing left to do there).
+ * A sequence text as drawn: each `<br>` form a line break (mermaid's
+ * `lineBreakRegex`, `</br>` too), then entities decoded, outer space gone. The
+ * order matters: `a#lt;br#gt;b` draws the text `a<br>b`. mermaid's own renderer
+ * decodes these forms in sequence diagrams (`drawnLabels` finds nothing left to
+ * do there).
+ *
+ * A form that names no character keeps its source form here, where the drawing
+ * differs: `#foo;` and `#fff;` draw `&foo;` and `&fff;`, and `#0;`, `#1114112;`
+ * and `#55296;` draw U+FFFD. Nothing looks a message up by its drawn text, so
+ * `SeqTarget.text` and `occurrence` stay sound, but a field filled from this
+ * shows the source form.
  */
 export function decodeSeqText(raw: string): string {
   return raw
+    .replace(/<\/?br\s*\/?>/gi, "\n")
     .replace(/#(\d+|\w+);/g, (form, name: string) => {
       const key = /^\d+$/.test(name) ? `#${name}` : name;
       return entityText(key) ?? form;
     })
-    .replace(/<br\s*\/?>/gi, "\n")
     .trim();
 }
 
@@ -802,6 +839,9 @@ class Parser {
       this.bodyAt(token.from),
       this.span(token.from, token.to).to,
     );
+    if (/\$\$.*\$\$/.test(name)) {
+      refuse(`The name ${name} would be drawn as a formula.`);
+    }
     if (/[#%]/.test(name)) {
       refuse(`A # or % in the name ${name} makes it read oddly.`);
     }

@@ -269,6 +269,15 @@ describe("occurrence", () => {
   });
 });
 
+describe("occurrence of a text that shows a tag", () => {
+  test("is its own series beside a real line break", () => {
+    const model = understood(
+      `${BODY}  A->>B: a#lt;br#gt;b\n  A->>B: a<br>b\n  A->>B: a<br/>b`,
+    );
+    expect(model.messages.map((m) => m.occurrence)).toEqual([0, 0, 1]);
+  });
+});
+
 describe("decodeSeqText", () => {
   test.each([
     ["plain", "plain"],
@@ -279,6 +288,16 @@ describe("decodeSeqText", () => {
     ["#9829;", "\u2665"],
     ["#unknownname;", "#unknownname;"],
     ["  spaced  ", "spaced"],
+    ["a#lt;br#gt;b", "a<br>b"],
+    ["#lt;br#gt;", "<br>"],
+    ["x</br>y", "x\ny"],
+    ["x</BR >y", "x\ny"],
+    // Forms that decode to no character keep their source form.
+    ["#foo;", "#foo;"],
+    ["#fff;", "#fff;"],
+    ["#0;", "#0;"],
+    ["#1114112;", "#1114112;"],
+    ["#55296;", "#55296;"],
   ])("%s", (raw, text) => {
     expect(decodeSeqText(raw)).toBe(text);
   });

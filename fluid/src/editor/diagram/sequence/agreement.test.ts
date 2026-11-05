@@ -356,7 +356,7 @@ const TAMPERED: [string, string, (model: SeqModel) => void, RegExp][] = [
     /record list/,
   ],
   [
-    "a record's id",
+    "one record too many",
     "sequenceDiagram\n  A->>B: x",
     (m) => {
       m.records.push(defined(m.records[0]));
@@ -597,6 +597,53 @@ const EDGE_CASES: [string, EdgeState][] = [
   [`${S}  A->>B: wrap:`, "agrees"],
   [`${S}  A->>B: x<br>y<br/>z`, "agrees"],
   [`${S}  A->>B: #quot;#35;#59;`, "agrees"],
+  // A config option that leaves participants without an element.
+  [
+    `---\nconfig:\n  sequence:\n    hideUnusedParticipants: true\n---\n${S}  participant Z\n  A->>B: x`,
+    "refused",
+  ],
+  [
+    `---\nconfig:\n  sequence:\n    hideUnusedParticipants: false\n---\n${S}  A->>B: x`,
+    "refused",
+  ],
+  [
+    `%%{init: {"sequence":{"hideUnusedParticipants":true}}}%%\n${S}  participant Z\n  A->>B: x`,
+    "refused",
+  ],
+  [
+    `%%{\n  init: {"sequence":\n  {"hideUnusedParticipants":true}}\n}%%\n${S}  participant Z\n  A->>B: x`,
+    "refused",
+  ],
+  [
+    `${S}  %%{init: {"sequence":{"hideUnusedParticipants":true}}}%%\n  A->>B: x`,
+    "refused",
+  ],
+  [`${S}  %% hideUnusedParticipants is not set here\n  A->>B: x`, "agrees"],
+  [`${S}  A->>B: hideUnusedParticipants`, "agrees"],
+  [`---\nconfig:\n  sequence:\n    wrap: true\n---\n${S}  A->>B: x`, "agrees"],
+  // A # right after a keyword takes the whole text.
+  [`${S}  loop #1 retry\n  end`, "refused"],
+  [`${S}  alt #1\n  end`, "refused"],
+  [`${S}  alt a\n  else #2 no\n  end`, "refused"],
+  [`${S}  opt #a\n  end`, "refused"],
+  [`${S}  par #a\n  end`, "refused"],
+  [`${S}  par_over #a\n  end`, "refused"],
+  [`${S}  par a\n  and #b\n  end`, "refused"],
+  [`${S}  critical #a\n  end`, "refused"],
+  [`${S}  critical a\n  option #b\n  end`, "refused"],
+  [`${S}  break #a\n  end`, "refused"],
+  [`${S}  rect #fff\n  end`, "refused"],
+  [`${S}  box #fff Group\n  participant A\n  end`, "refused"],
+  [`${S}  rect rgb(1,2,3)\n  A->>B: x\n  end`, "agrees"],
+  [`${S}  box rgb(1,2,3) Group\n  participant A\n  end`, "agrees"],
+  [`${S}  loop\n# whole line\n  A->>B: x\n  end`, "agrees"],
+  [`${S}  loop #35;1 retry\n  A->>B: x\n  end`, "agrees"],
+  // A formula in a name, as in an alias.
+  [`${S}  participant $$x$$`, "refused"],
+  [`${S}  $$x$$->>B: y`, "refused"],
+  [`${S}  A->>$$x$$: y`, "refused"],
+  [`${S}  Note over $$x$$: y`, "refused"],
+  [`${S}  a$$b->>C: y`, "agrees"],
   // Statements that fit nothing.
   [`${S}  A`, "refused"],
   [`${S}  (`, "refused"],
@@ -644,7 +691,7 @@ describe("inputs at the edges of the grammar", () => {
 describe("the opt-in corpus", () => {
   const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
   test.skipIf(folder === undefined)(
-    "every file with the keyword sequenceDiagram is understood and agrees",
+    "what is understood agrees; refused files are counted and listed (R57)",
     async () => {
       const dir = folder ?? "";
       const fs = node.process.getBuiltinModule("node:fs") as Fs;
@@ -652,6 +699,7 @@ describe("the opt-in corpus", () => {
       let sequences = 0;
       let understood = 0;
       let agreeing = 0;
+      const refused: string[] = [];
       const failures: string[] = [];
       for (const file of files) {
         const body = fs.readFileSync(`${dir}/${file}`, "utf8");
@@ -661,15 +709,16 @@ describe("the opt-in corpus", () => {
         sequences++;
         const model = parseSequence(body);
         if (!model.understood) {
-          failures.push(`${file}: refused: ${model.reasons[0] ?? ""}`);
+          refused.push(`${file}: ${model.reasons[0] ?? ""}`);
           continue;
         }
         understood++;
         const view = await sequenceDbOf(body, false);
-        const difference =
-          "error" in view
-            ? `mermaid refuses it: ${String(view.error)}`
-            : agreesSequence(model, view);
+        if ("error" in view) {
+          refused.push(`${file}: mermaid refuses it: ${String(view.error)}`);
+          continue;
+        }
+        const difference = agreesSequence(model, view);
         if (difference === null) {
           agreeing++;
         } else {
@@ -677,7 +726,10 @@ describe("the opt-in corpus", () => {
         }
       }
       console.log(
-        `sequence corpus: ${String(understood)} of ${String(sequences)} understood, ${String(agreeing)} agree with mermaid`,
+        [
+          `sequence corpus: ${String(understood)} of ${String(sequences)} understood, ${String(agreeing)} agree with mermaid, ${String(refused.length)} refused`,
+          ...refused,
+        ].join("\n"),
       );
       expect(failures).toEqual([]);
     },
