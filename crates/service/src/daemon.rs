@@ -134,7 +134,9 @@ async fn test_parent_gone() -> &'static str {
     let parent = std::env::var(TEST_PARENT_PID_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|pid| *pid > 0);
+        // 0 and 1 are never a test process, and a value above i32::MAX
+        // would wrap to a negative pid, which names a process group.
+        .filter(|pid| (2..=i32::MAX as u32).contains(pid));
     let Some(parent) = parent else {
         return futures::future::pending().await;
     };
