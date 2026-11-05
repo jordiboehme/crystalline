@@ -15,7 +15,6 @@ use assert_cmd::Command;
 use crystalline_core::provision::sha256_hex;
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
-#[cfg(unix)]
 use serde_json::json;
 
 fn bin() -> Command {
