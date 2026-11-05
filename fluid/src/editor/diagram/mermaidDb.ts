@@ -92,6 +92,26 @@ interface RawFlowDb {
   getSubGraphs(): { id: string; title: string; nodes: string[] }[];
 }
 
+/**
+ * What a failed dynamic import says: Chromium, Firefox and WebKit each have
+ * their own words, and Vite's preload helper has its own for a CSS file.
+ */
+const IMPORT_FAILURE =
+  /Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed|Unable to preload CSS/;
+
+/**
+ * Whether `error` is a failed dynamic import and not a refusal of the body.
+ * mermaid's parser puts `hash` on its errors and quotes the source in them,
+ * so an error with a `hash` is a refusal whatever its words.
+ */
+export function isImportFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    !("hash" in error) &&
+    IMPORT_FAILURE.test(error.message)
+  );
+}
+
 /** The diagram types whose db is a FlowDB. */
 const FLOW_TYPES = new Set(["flowchart-v2", "flowchart", "flowchart-elk"]);
 
@@ -105,7 +125,9 @@ const FLOW_TYPES = new Set(["flowchart-v2", "flowchart", "flowchart-elk"]);
  *
  * A body mermaid refuses, or one that is not a flowchart, comes back as
  * `{ error }`. mermaid failing to load says nothing about the body, so it
- * comes back with `unavailable: true` as well. This never throws.
+ * comes back with `unavailable: true` as well, whether that is mermaid's main
+ * chunk or the diagram chunk it imports inside `getDiagramFromText`
+ * (`isImportFailure`). This never throws.
  */
 export async function flowDbOf(
   body: string,
@@ -151,6 +173,6 @@ export async function flowDbOf(
       })),
     };
   } catch (error) {
-    return { error };
+    return isImportFailure(error) ? { error, unavailable: true } : { error };
   }
 }

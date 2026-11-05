@@ -110,6 +110,19 @@ describe("the diagram verdict", () => {
     expect(verdict.ok).toBe(false);
   });
 
+  test("a real refusal by mermaid's db is a cached verdict", async () => {
+    // Understood, and refused by mermaid when it fills its db.
+    const body = 'flowchart TD\n  A@{ shape: foo, label: "x" }';
+    const verdict = await requestVerdict(body, false);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/refuses/);
+    }
+    expect(verdictFor(body)).toBe(verdict);
+    const parseError = await flowDbOf(fixture("x04"), false);
+    expect(parseError).not.toHaveProperty("unavailable");
+  });
+
   test("an @{ shape: icon }, which draws no g.node, is not drawable", async () => {
     const verdict = await requestVerdict(
       'flowchart TD\n  A@{ shape: icon, label: "x" }',

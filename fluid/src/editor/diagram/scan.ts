@@ -23,7 +23,10 @@
  *   line inside an `accDescr { }` block is a comment too.
  * - `encodeEntities`: on a line holding `style` (or `classDef`) followed by
  *   `:`, `#` and a `;`, the line's last `;` is removed before the parse, and
- *   an entity `#name;` is hidden from the lexer; neither splits here.
+ *   an entity `#name;` is hidden from the lexer; neither splits here. Its
+ *   regexes backtrack cubically, so a line that could reach them and is over
+ *   `MAX_ENTITY_LINE` is not understood and they do not run on it: the scan
+ *   runs on every changed body and must never freeze the page.
  * - The flowchart lexer's `.*direction\s+(TB|BT|RL|LR|TD)[^\n]*` takes a
  *   whole line holding such text as one direction token, so in a flowchart
  *   that line is one statement (`isDirectionLine`). Its `\s+` crosses line
@@ -36,7 +39,7 @@
  * The scanner knows no diagram grammar beyond these: `understood` is false
  * only for what leaves the line kinds themselves unknown (an unclosed
  * frontmatter, directive or `accDescr` block, text after a directive, a
- * direction run onto a later line, no header). What each type's
+ * direction run onto a later line, a line too long to split, no header). What each type's
  * parser refuses is that parser's verdict.
  */
 
@@ -89,6 +92,9 @@ const DIRECTION = /direction\s+(?:TB|BT|RL|LR|TD)/;
 const DIRECTIVE =
   /%{2}{\s*(?:(\w+)\s*:|(\w+))\s*(?:(\w+)|((?:(?!}%{2}).|\r?\n)*))?\s*(?:}%{2})?/;
 
+/** The longest line `droppedSemicolons` runs its regexes on. A real style line is far below it. */
+export const MAX_ENTITY_LINE = 1000;
+
 export function scanFence(body: string): Scan {
   const lines: ScannedLine[] = [];
   let from = 0;
@@ -138,10 +144,20 @@ export function scanFence(body: string): Scan {
   /** The body offset a directive runs to, while its lines are scanned. */
   let directiveEnd = -1;
   let accOpen = false;
-  const statementsOf = (offset: number, text: string): Span[] =>
-    flowchart && DIRECTION.test(text)
-      ? spans(offset, text, [{ from: 0, to: text.length }])
+  const statementsOf = (
+    line: ScannedLine,
+    offset: number,
+    text: string,
+  ): Span[] => {
+    const whole = () => spans(offset, text, [{ from: 0, to: text.length }]);
+    if (tooLongForEntities(text)) {
+      reasons.push(`Line ${String(line.index + 1)} is too long to read.`);
+      return whole();
+    }
+    return flowchart && DIRECTION.test(text)
+      ? whole()
       : splitStatements(offset, text);
+  };
   for (const line of lines.slice(start)) {
     const text = textOf(line);
     const rest = text.slice(line.indent.length);
@@ -182,6 +198,7 @@ export function scanFence(body: string): Scan {
         accOpen = false;
         // The lexer leaves the block at its `}` and lexes the rest.
         line.statements = statementsOf(
+          line,
           line.from + close + 1,
           text.slice(close + 1),
         );
@@ -208,6 +225,7 @@ export function scanFence(body: string): Scan {
         accOpen = true;
       } else {
         line.statements = statementsOf(
+          line,
           line.from + close + 1,
           text.slice(close + 1),
         );
@@ -216,7 +234,7 @@ export function scanFence(body: string): Scan {
     } else {
       line.kind = "statement";
     }
-    line.statements = statementsOf(line.from, text);
+    line.statements = statementsOf(line, line.from, text);
   }
   if (flowchart) {
     runOnDirections(body, lines, reasons);
@@ -403,6 +421,15 @@ function spans(offset: number, text: string, pieces: Span[]): Span[] {
  * `;` of a line matching `style.*:\S*#.*;`, then the last of the result if
  * it matches `classDef.*:\S*#.*;`.
  */
+/** A line the `encodeEntities` regexes could freeze on. */
+function tooLongForEntities(text: string): boolean {
+  return (
+    text.length > MAX_ENTITY_LINE &&
+    text.includes(";") &&
+    (text.includes("style") || text.includes("classDef"))
+  );
+}
+
 function droppedSemicolons(text: string): Set<number> {
   const all = new Set<number>();
   // Both regexes need a `;`, and without one they backtrack for nothing.

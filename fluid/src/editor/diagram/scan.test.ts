@@ -1,9 +1,10 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { defined } from "../../test/assert";
 import {
   type Scan,
   type ScannedLine,
+  MAX_ENTITY_LINE,
   hasStrayComment,
   isDirectionLine,
   scanFence,
@@ -427,11 +428,93 @@ describe("scanFence against mermaid 12.2", () => {
     expect(isDirectionLine(body, line(scanFence(body), 2))).toBe(false);
   });
 
-  test("a long line without a ; costs no regex backtracking", () => {
+  /**
+   * `scanFence(body)`, counting the runs of the backtracking `encodeEntities`
+   * regexes and failing at once on a run when `refuse` is set, so a broken
+   * guard shows as a failure and not as a test that hangs.
+   */
+  function entityRegexRuns(body: string, refuse: boolean) {
+    const real = Reflect.get(RegExp.prototype, "exec");
+    let runs = 0;
+    const spy = vi.spyOn(RegExp.prototype, "exec").mockImplementation(function (
+      this: RegExp,
+      text: string,
+    ) {
+      // No regex here: this spy sits under every regex call.
+      if (
+        this.source.startsWith("style.*:") ||
+        this.source.startsWith("classDef.*:")
+      ) {
+        runs++;
+        if (refuse) {
+          throw new Error("the backtracking regex ran");
+        }
+      }
+      return real.call(this, text);
+    });
+    try {
+      return { scan: scanFence(body), runs };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  test("a long line without a ; never runs the backtracking regexes", () => {
     const body = `flowchart TD\n  A[style ${":#".repeat(2000)}]`;
-    const from = performance.now();
-    scanFence(body);
-    expect(performance.now() - from).toBeLessThan(500);
+    const { scan, runs } = entityRegexRuns(body, true);
+    expect(runs).toBe(0);
+    expect(scan.understood).toBe(true);
+  });
+
+  test.each([
+    ["a ; before the style", `;A[style ${":#".repeat(10_000)}]`],
+    ["a real-looking line", `A --> B; style A ${"fill:#fff,".repeat(2000)}`],
+    ["classDef", `A; classDef c ${"fill:#fff,".repeat(2000)};`],
+    [
+      "a statement after accDescr",
+      `accDescr { x } A; style A ${"f:#,".repeat(5000)}`,
+    ],
+  ])(
+    "%s: over 1,000 characters it is refused without the regexes",
+    (_n, text) => {
+      expect(text.length).toBeGreaterThan(MAX_ENTITY_LINE);
+      const body = `flowchart TD\n  ${text}`;
+      const { scan, runs } = entityRegexRuns(body, true);
+      expect(runs).toBe(0);
+      expect(scan.understood).toBe(false);
+      expect(scan.reasons.join(" ")).toMatch(/Line 2/);
+    },
+  );
+
+  test("the 1,000 character limit is on the line, and shorter lines run the regexes as before", () => {
+    const lineOf = (length: number) => {
+      const tail = "]; style A fill:#fff;";
+      const head = "  A[";
+      return head + "x".repeat(length - head.length - tail.length) + tail;
+    };
+    const at = entityRegexRuns(
+      `flowchart TD\n${lineOf(MAX_ENTITY_LINE)}`,
+      false,
+    );
+    expect(at.runs).toBeGreaterThan(0);
+    expect(at.scan.understood).toBe(true);
+    const past = entityRegexRuns(
+      `flowchart TD\n${lineOf(MAX_ENTITY_LINE + 1)}`,
+      true,
+    );
+    expect(past.runs).toBe(0);
+    expect(past.scan.understood).toBe(false);
+  });
+
+  test("a normal line with a ; and a style reads as before", async () => {
+    const body = "flowchart TD\n  A --> B; style A fill:#fff";
+    const scan = scanFence(body);
+    expect(scan.understood).toBe(true);
+    expect(texts(body, line(scan, 1))).toEqual([
+      "A --> B",
+      "style A fill:#fff",
+    ]);
+    expect(await edgesOf(body)).toEqual(["A>B"]);
   });
 
   test("an accDescr block's close with nothing after it has no statements", async () => {

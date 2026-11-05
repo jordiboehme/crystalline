@@ -407,7 +407,7 @@ describe("parseFlowchart refusals", () => {
 });
 
 describe("parseFlowchart on large bodies", () => {
-  /** The best of three runs, in ms. */
+  /** The best of three runs, in ms: the least disturbed by a busy machine. */
   function fastest(body: string): number {
     let best = Infinity;
     for (let i = 0; i < 3; i++) {
@@ -442,24 +442,37 @@ describe("parseFlowchart on large bodies", () => {
     expect(model.edges.length).toBeLessThanOrEqual(500);
   });
 
-  test.each([
+  // A size comparison, not a time limit, so a busy machine slows both sides.
+  // Four times the body gives sixteen times the work on a quadratic path; the
+  // limit is nine, and the floor keeps timings too small to measure from
+  // deciding. Each quadratic path these replaced took 300 ms or more on the
+  // larger body, far over the floor's limit of 90 ms.
+  const GROWTH_LIMIT = 9;
+  const FLOOR_MS = 10;
+
+  test.each<[string, (size: number) => string]>([
     [
       "a chain without spaces",
-      () =>
-        `flowchart TD\n  ${Array.from({ length: 6000 }, (_, i) => `N${String(i)}`).join("-->")}`,
+      (size) =>
+        `flowchart TD\n  ${Array.from({ length: size / 8 }, (_, i) => `N${String(i)}`).join("-->")}`,
     ],
     [
       "spaces inside a text label",
-      () => `flowchart TD\n  A -- a${" ".repeat(49000)}b --> B`,
+      (size) => `flowchart TD\n  A -- a${" ".repeat(size)}b --> B`,
     ],
     [
       "spaces inside shape data",
-      () => `flowchart TD\n  A@{ shape: rect, label: x${" ".repeat(49000)}y }`,
+      (size) =>
+        `flowchart TD\n  A@{ shape: rect, label: x${" ".repeat(size)}y }`,
     ],
-  ])("%s is read in linear time", (_name, make) => {
-    const body = make();
-    expect(body.length).toBeLessThan(MAX_TEXT_SIZE);
-    expect(fastest(body)).toBeLessThan(250);
+  ])("%s grows linearly with the body", (_name, make) => {
+    const small = make(12_000);
+    const large = make(48_000);
+    expect(large.length).toBeLessThan(MAX_TEXT_SIZE);
+    expect(large.length).toBeGreaterThan(3.5 * small.length);
+    parseFlowchart(small); // warms the JIT up, so it does not count for `small`
+    const base = Math.max(fastest(small), FLOOR_MS);
+    expect(fastest(large)).toBeLessThan(GROWTH_LIMIT * base);
   });
 });
 
