@@ -156,9 +156,10 @@ jobs:
     needs: [build, macos-universal]
     runs-on: ubuntu-latest
     # No tag guard, unlike publish/images/homebrew below: a workflow_dispatch
-    # dry run packages and validates the two bundles too (the standard
-    # launcher extension and the Desktop-only Mac one), it just has nowhere
-    # to upload them.
+    # dry run stages, validates and packs the Desktop-only Mac bundle too, it
+    # just has nowhere to upload it. The hollow launcher extension is no
+    # release asset any more: `crystalline install claude-desktop` builds it
+    # on the user's machine.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,10 +173,8 @@ jobs:
           node-version: '26'
           package-manager-cache: false
 
-      - name: The launcher's tests and the manifest checks
-        run: |
-          node --test packaging/mcpb/shim/
-          bash packaging/mcpb/tests/check-manifests.sh
+      - name: The launcher's tests
+        run: node --test packaging/mcpb/shim/
 
       - name: Resolve release version
         id: version
@@ -196,9 +195,32 @@ jobs:
           name: crystalline-macos-universal
           path: downloads/macos-universal
 
+      # The release's own Linux build stages the bundles: it runs on this
+      # runner, and it is the same source as the macOS binary, so the staged
+      # manifest's version is the release's.
+      - name: Download the Linux amd64 binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: crystalline-linux-amd64
+          path: downloads/linux-amd64
+
+      - name: Extract the Linux amd64 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar xzf downloads/linux-amd64/*.tar.gz -C downloads/linux-amd64
+          bin=$(find downloads/linux-amd64 -type f -name crystalline | head -n1)
+          chmod +x "$bin"
+          cp "$bin" downloads/linux-amd64/stage-crystalline
+
+      - name: The manifest checks
+        run: bash packaging/mcpb/tests/check-manifests.sh
+        env:
+          CRYSTALLINE_BIN: downloads/linux-amd64/stage-crystalline
+
       # The packer is pinned like every other release tool; bump it
       # deliberately. validate checks the manifest schema and the icon only.
-      - name: Stage, validate and pack the two bundles
+      - name: Stage, validate and pack the Desktop-only bundle
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
@@ -207,30 +229,31 @@ jobs:
           version="$RELEASE_VERSION"
           mkdir -p mcpb-out
 
-          # The standard extension: the Node launcher, no binary. macOS and
-          # Windows. The default download.
-          stage="bundle/standard"
-          packaging/mcpb/generate-manifest.sh standard "$version" "$stage"
-          npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
-          npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-claude-desktop-v${version}.mcpb"
-
           # The Claude Desktop only extension: macOS, the universal binary
           # inside, for people who use only Claude Desktop.
           stage="bundle/desktop-only"
           mkdir -p "$stage/server"
           cp downloads/macos-universal/crystalline "$stage/server/crystalline"
           chmod +x "$stage/server/crystalline"
-          packaging/mcpb/generate-manifest.sh desktop-only "$version" "$stage"
+          downloads/linux-amd64/stage-crystalline desktop-bundle desktop-only "$stage"
           npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
           npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-claude-desktop-only-v${version}-macos.mcpb"
 
-          # Each bundle says the version it was packed for, so a manifest left
+          # The bundle says the version it was packed for, so a manifest left
           # at an old version never ships under a new name.
-          for f in "mcpb-out/crystalline-claude-desktop-v${version}.mcpb" \
-                   "mcpb-out/crystalline-claude-desktop-only-v${version}-macos.mcpb"; do
-            got=$(unzip -p "$f" manifest.json | jq -r .version)
-            [ "$got" = "$version" ] || { echo "::error::$f says version $got, expected $version"; exit 1; }
-          done
+          f="mcpb-out/crystalline-claude-desktop-only-v${version}-macos.mcpb"
+          got=$(unzip -p "$f" manifest.json | jq -r .version)
+          [ "$got" = "$version" ] || { echo "::error::$f says version $got, expected $version"; exit 1; }
+
+          # It carries the binary, executable: validate and the version check
+          # read only the manifest, so a stage without the binary would pass.
+          # mcpb stores the permission bits only, with no file type, so
+          # zipinfo prints '?rwxr-xr-x' for it; the first character is either.
+          mode=$( (unzip -Z "$f" server/crystalline 2>/dev/null || true) | awk 'NR==1 {print $1}')
+          case "$mode" in
+            ?rwx*) ;;
+            *) echo "::error::$f holds no executable server/crystalline (mode '${mode:-missing}')"; exit 1 ;;
+          esac
 
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -450,7 +473,6 @@ jobs:
           for f in \
             SHA256SUMS \
             "crystalline-fluid-${TAG}.cdx.json" \
-            "crystalline-claude-desktop-${TAG}.mcpb" \
             "crystalline-claude-desktop-only-${TAG}-macos.mcpb"; do
             [ -f "release/$f" ] || { echo "::error::missing attestation subject release/$f"; missing=1; }
           done
@@ -487,8 +509,7 @@ jobs:
 
       # Each platform's SBOM, attested against the assets that carry that
       # platform's binary. The Desktop-only bundle carries both macOS slices
-      # and gets both macOS SBOMs. The standard extension carries no binary
-      # and gets none.
+      # and gets both macOS SBOMs.
       - name: Attest the macos-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:

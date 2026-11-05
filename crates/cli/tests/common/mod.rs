@@ -61,11 +61,18 @@ pub fn fixtures_dir() -> PathBuf {
 /// starts the real daemon for the real user. A test that wants another
 /// answer sets the variable after [`isolate`], which wins.
 ///
+/// `CRYSTALLINE_TEST_DESKTOP_OPEN=fail` is the debug build's stand-in for
+/// opening a file in Claude Desktop (`desktop_open::for_this_process` in the
+/// service crate). Without it `install claude-desktop`, or a bridge or a
+/// daemon that offers the extension update, would open the real Claude
+/// Desktop and show its dialog. A test that wants the open to work
+/// sets `log:<file>` after [`isolate`], which records each open instead.
+///
 /// `HF_ENDPOINT` points the model downloader at [`NO_HUB`], so a child that
 /// would fetch the embedding or contradiction model (about 220 MB and 550 MB,
 /// into this test's empty cache) fails the fetch at once and goes on
 /// text-only, as it does offline. See [`NO_HUB`].
-pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 10] {
+pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 11] {
     [
         ("HOME", home.to_path_buf()),
         ("XDG_CONFIG_HOME", home.join("config")),
@@ -76,6 +83,7 @@ pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 10] {
         ("LOCALAPPDATA", home.join("local")),
         ("CRYSTALLINE_TEST_NO_KEYCHAIN", PathBuf::from("1")),
         ("CRYSTALLINE_TEST_DAEMON_TASK", PathBuf::from("missing")),
+        ("CRYSTALLINE_TEST_DESKTOP_OPEN", PathBuf::from("fail")),
         (HUB_ENDPOINT_VAR, PathBuf::from(NO_HUB)),
     ]
 }

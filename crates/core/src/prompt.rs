@@ -111,6 +111,12 @@ pub struct PromptOutput {
     /// states the knowledge is curated externally. Seeded from
     /// `service.read_only`; a `--read-only` flag can force it on.
     pub read_only: bool,
+    /// Whether the MCP instructions ([`render_instructions`],
+    /// [`render_counted_instructions`]) tell the agent to read the `skills`
+    /// tool first ([`SKILLS_HINT`]). True when built; the engine clears it
+    /// when `skills.serve` is off, since the tool is then not listed. The
+    /// session-hook block ([`render_text`]) never carries the sentence.
+    pub skills_tool: bool,
 }
 
 /// Build the routing prompt for a workspace: apply `prompt.rules`
@@ -170,6 +176,7 @@ pub fn generate_prompt(
         domains,
         warnings,
         read_only: global.read_only(),
+        skills_tool: true,
     }
 }
 
@@ -239,6 +246,7 @@ pub fn generate_prompt_unscoped(
         domains,
         warnings,
         read_only: global.read_only(),
+        skills_tool: true,
     }
 }
 
@@ -646,11 +654,32 @@ fn instructions_head(output: &PromptOutput) -> String {
             "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
         );
     }
+    if output.skills_tool {
+        head.push_str(SKILLS_HINT);
+        head.push_str("\n\n");
+    }
     render_behavior_block(output, &mut head);
     head.push('\n');
     head.push_str("Domains:\n");
     head
 }
+
+/// The sentence the MCP instructions carry between the intro and the
+/// Behavior block when [`PromptOutput::skills_tool`] is set: read the
+/// `skills` tool before the first task.
+///
+/// It exists for a harness that has no skill folder Crystalline can write
+/// into, Claude Desktop first: the served playbooks are always this binary's
+/// own, so such a harness gets the current skill text with every upgrade even
+/// when no skill was uploaded. The `skills` tool's description alone would
+/// not do it (a tool only its own description points to was never called on
+/// the evolve benchmark), which is why it is in the routing text.
+///
+/// Only the full instruction variants carry it. A harness with Crystalline's
+/// session hook gets the minimal or the conditional pointer instead, and its
+/// hook block ([`render_text`]) and [`behavior_bullets`] leave it out: that
+/// harness has the skills as files.
+pub const SKILLS_HINT: &str = "Before your first Crystalline task, call the skills tool: no arguments lists them, name reads one.";
 
 /// The single line that stands in for the domain list: how many are
 /// registered, and the one call that returns them. One writer, so
@@ -1293,10 +1322,11 @@ mod tests {
         // count tracks the size of the fixed head: every byte the Behavior
         // block gains is a byte the domain lines lose, so a head that grows
         // pulls this number down and a head that shrinks lets it rise.
-        let (_t2, mid) = many_domains(5, 5);
+        // The skills sentence (`SKILLS_HINT`) took it from five to three.
+        let (_t2, mid) = many_domains(3, 5);
         let tier2 = render_instructions(&generate_prompt_unscoped(&mid, &BTreeMap::new()));
         assert!(
-            tier2.contains("- domain04: When a task touches domain04 aspect 0\n"),
+            tier2.contains("- domain02: When a task touches domain02 aspect 0\n"),
             "one bullet per domain:\n{tier2}"
         );
         assert!(
@@ -1410,6 +1440,68 @@ mod tests {
         );
     }
 
+    /// The MCP instructions tell the agent to read the `skills` tool before
+    /// its first task: a harness with no skill folder (Claude Desktop) gets
+    /// the current playbooks from this server with every upgrade. Both full
+    /// renderings carry the sentence, in both modes, before the Behavior
+    /// block. The session-hook block, the behavior rules and the two short
+    /// pointers do not: a harness with a session hook has the skills as files.
+    #[test]
+    fn the_instructions_point_at_the_skills_tool() {
+        const HINT: &str = "Before your first Crystalline task, call the skills tool: no arguments lists them, name reads one.";
+        assert_eq!(SKILLS_HINT, HINT);
+
+        let (tmp, global) = fixture();
+        for read_only in [false, true] {
+            let mut output = generate_prompt_unscoped(&global, &BTreeMap::new());
+            output.read_only = read_only;
+            assert!(output.skills_tool, "a fresh prompt names the skills tool");
+            for (channel, text) in [
+                ("render_instructions", render_instructions(&output)),
+                (
+                    "render_counted_instructions",
+                    render_counted_instructions(&output),
+                ),
+            ] {
+                let at = text
+                    .find(HINT)
+                    .unwrap_or_else(|| panic!("read_only={read_only} {channel}:\n{text}"));
+                assert!(
+                    at < text.find("Behavior:\n").unwrap(),
+                    "read_only={read_only} {channel}: the hint comes before the rules:\n{text}"
+                );
+            }
+
+            let mut workspace = generate_prompt(&global, tmp.path(), &BTreeMap::new());
+            workspace.read_only = read_only;
+            let hook = render_text(&workspace);
+            assert!(!hook.contains("skills"), "the session-hook block:\n{hook}");
+            assert!(
+                !behavior_bullets(read_only)
+                    .iter()
+                    .any(|b| b.contains("skills")),
+                "read_only={read_only}: the behavior rules"
+            );
+
+            output.skills_tool = false;
+            for text in [
+                render_instructions(&output),
+                render_counted_instructions(&output),
+            ] {
+                assert!(
+                    !text.contains("skills"),
+                    "no skills tool is listed:\n{text}"
+                );
+            }
+        }
+        for text in [
+            render_minimal_instructions(),
+            render_conditional_minimal_instructions(),
+        ] {
+            assert!(!text.contains("skills"), "a short pointer:\n{text}");
+        }
+    }
+
     // --- prompt.rules matching (issue 95) -----------------------------------
 
     /// A pattern string for `dir` with forward slashes, so the glob reads the
@@ -1514,6 +1606,7 @@ mod tests {
             ],
             warnings: Vec::new(),
             read_only: false,
+            skills_tool: true,
         };
         let text = render_text(&output);
         assert!(
@@ -1592,6 +1685,7 @@ mod tests {
             ],
             warnings: vec![],
             read_only: false,
+            skills_tool: true,
         };
         annotate_reflection(&mut output, &BTreeMap::from([("eng".to_string(), 3u64)]));
         let text = render_text(&output);

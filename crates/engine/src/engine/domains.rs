@@ -1002,6 +1002,9 @@ impl Engine {
             }
         }
         output.read_only = self.read_only();
+        // `skills.serve = false` takes the skills tool off the list, so the
+        // instructions do not point at it.
+        output.skills_tool = self.skills_serve() != crystalline_core::config::SkillsServe::Never;
         output
     }
 

@@ -393,7 +393,9 @@ async fn every_stdio_onboarding_channel_lists_the_mounted_domains() {
     let server = RemoteServer::start(Options::TOKENS).await;
     let machine = LocalMachine::start(true).await;
     machine.connect(&server, "acme", "keeper").await;
-    machine.mount();
+    // The two mounted rows this test pins; lab and team would only crowd
+    // the block toward its count line.
+    machine.mount_only(&["open", "platform"]);
     let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
     let initialized = client
         .peer()
@@ -433,6 +435,7 @@ async fn every_stdio_onboarding_channel_lists_the_mounted_domains() {
         ("server/discover", &discovered),
         ("onboarding", &prompted),
     ] {
+        crate::local::assert_domain_lines_shown(text);
         let local = text
             .find("Route here for local notes questions")
             .unwrap_or_else(|| panic!("{channel} names the local domain: {text}"));

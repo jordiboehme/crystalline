@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+authors.workspace = true
 description = "Format, parsing and static verification primitives for Crystalline. No async, database or ML dependencies."
 
 [lib]
@@ -29,6 +30,9 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 anyhow = { workspace = true }
 whoami = { workspace = true }
+# The zip writer for the Claude Desktop extension and its skill
+# (`desktop_extension::pack`): deflate only, the workspace pin.
+zip = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # The roaming folder from the known-folder API (`config::roaming_root`): the

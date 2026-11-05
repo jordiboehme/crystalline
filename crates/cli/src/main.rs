@@ -17,6 +17,7 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod automation;
 mod cmd;
+mod desktop_bundle;
 mod desktop_state;
 mod doctor;
 mod harness_command;
@@ -24,6 +25,7 @@ mod harness_files;
 mod hook;
 mod hook_dialect;
 mod install;
+mod install_desktop;
 mod install_profile;
 mod kept;
 mod mcp_json;
@@ -193,7 +195,9 @@ enum Command {
     /// as already present. Static like `verify` and `prompt`: no database,
     /// service or network connection. A missing or failing harness CLI is
     /// never fatal - the MCP command to run by hand is printed and the hooks
-    /// and skills still install.
+    /// and skills still install. `claude-desktop` is different: it builds the
+    /// Claude Desktop extension on this machine, opens it in Claude Desktop
+    /// and saves the skill zip to upload there (macOS and Windows only).
     Install {
         /// Which harness to wire up.
         #[arg(value_enum)]
@@ -204,20 +208,29 @@ enum Command {
         /// MCP server per user.
         #[arg(long)]
         project: bool,
-        /// Skip registering the MCP server.
+        /// Skip registering the MCP server (for claude-desktop: the
+        /// extension).
         #[arg(long)]
         skip_mcp: bool,
         /// Skip installing the SessionStart, Stop and UserPromptSubmit hooks.
         #[arg(long)]
         skip_hooks: bool,
-        /// Skip copying the topical skills.
+        /// Skip copying the topical skills (for claude-desktop: the
+        /// crystalline-intelligence skill).
         #[arg(long)]
         skip_skills: bool,
+        /// claude-desktop only: write the extension and the skill zip and
+        /// print where to install them, without opening Claude Desktop or
+        /// showing the zip in Finder or File Explorer.
+        #[arg(long)]
+        no_open: bool,
     },
     /// Reverse `crystalline install` for a harness: deregister the MCP server,
     /// remove the managed hooks and drop the copied skills, leaving every
     /// hook, key and skill that is not Crystalline's own untouched. A skill a
-    /// person edited by hand is kept unless `--force` is given.
+    /// person edited by hand is kept unless `--force` is given. For
+    /// `claude-desktop` it removes the built extension and Crystalline's
+    /// record of it; remove the extension itself in Claude Desktop.
     Uninstall {
         /// Which harness to unwire.
         #[arg(value_enum)]
@@ -400,6 +413,23 @@ enum Command {
         /// time is up, as that command does when it finishes.
         #[arg(long)]
         standalone: Option<String>,
+    },
+    /// Release and CI: stage a Claude Desktop extension (manifest, icon and,
+    /// for the hollow one, the launcher) under a folder. Hidden, and not a
+    /// setup step.
+    #[command(name = "desktop-bundle", hide = true)]
+    DesktopBundle {
+        /// Which bundle to stage.
+        #[arg(value_enum)]
+        kind: desktop_bundle::BundleKind,
+        /// The folder the files are written into (created if missing).
+        outdir: PathBuf,
+        /// The Crystalline binary the hollow manifest pins.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Also pack the staged files into this .mcpb (hollow only).
+        #[arg(long = "pack")]
+        pack: Option<PathBuf>,
     },
     /// Windows: register, remove or print the Task Scheduler task that
     /// starts the daemon outside any app package. The MSI runs it; `doctor
@@ -2083,10 +2113,11 @@ enum OutputFormat {
     Github,
 }
 
-/// Which harness `install`/`uninstall` targets, as a clap `ValueEnum`. Mirrors
+/// Which target `install`/`uninstall` acts on, as a clap `ValueEnum`. Mirrors
 /// [`HarnessKind`] variant for variant, with identical spellings and doc
 /// comments, so the derived help text and invalid-value error read exactly
-/// as they did before the harness model moved to `crystalline-core`.
+/// as they did before the harness model moved to `crystalline-core`, plus
+/// `claude-desktop`, which is not a harness kind.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum HarnessArg {
     /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
@@ -2112,18 +2143,25 @@ enum HarnessArg {
     /// Qwen Code: MCP and a SessionStart hook in ~/.qwen/settings.json,
     /// skills under ~/.qwen/skills.
     Qwen,
+    /// Claude Desktop (macOS and Windows): build an extension that runs this
+    /// crystalline, open it in Claude Desktop and save the
+    /// crystalline-intelligence skill for upload.
+    ClaudeDesktop,
 }
 
-impl From<HarnessArg> for HarnessKind {
-    fn from(arg: HarnessArg) -> HarnessKind {
-        match arg {
-            HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
-            HarnessArg::Codex => HarnessKind::Codex,
-            HarnessArg::Copilot => HarnessKind::Copilot,
-            HarnessArg::Cursor => HarnessKind::Cursor,
-            HarnessArg::Kiro => HarnessKind::Kiro,
-            HarnessArg::Gemini => HarnessKind::Gemini,
-            HarnessArg::Qwen => HarnessKind::Qwen,
+impl HarnessArg {
+    /// The harness kind this target is, `None` for `claude-desktop`, which
+    /// has its own install flow.
+    fn harness(self) -> Option<HarnessKind> {
+        match self {
+            HarnessArg::ClaudeCode => Some(HarnessKind::ClaudeCode),
+            HarnessArg::Codex => Some(HarnessKind::Codex),
+            HarnessArg::Copilot => Some(HarnessKind::Copilot),
+            HarnessArg::Cursor => Some(HarnessKind::Cursor),
+            HarnessArg::Kiro => Some(HarnessKind::Kiro),
+            HarnessArg::Gemini => Some(HarnessKind::Gemini),
+            HarnessArg::Qwen => Some(HarnessKind::Qwen),
+            HarnessArg::ClaudeDesktop => None,
         }
     }
 }
@@ -2294,21 +2332,52 @@ fn run() -> anyhow::Result<()> {
             skip_mcp,
             skip_hooks,
             skip_skills,
-        }) => install::run_install(
-            install::InstallOptions {
-                harness: harness.into(),
-                project,
-                skip_mcp,
-                skip_hooks,
-                skip_skills,
-            },
-            cli.json,
-        ),
+            no_open,
+        }) => match harness.harness() {
+            None => {
+                if project {
+                    anyhow::bail!(install_desktop::PROJECT_REFUSAL);
+                }
+                if skip_hooks {
+                    anyhow::bail!(install_desktop::SKIP_HOOKS_REFUSAL);
+                }
+                install_desktop::run_install(
+                    install_desktop::DesktopInstallOptions {
+                        skip_extension: skip_mcp,
+                        skip_skill: skip_skills,
+                        open: !no_open,
+                    },
+                    cli.json,
+                )
+            }
+            Some(_) if no_open => anyhow::bail!("--no-open applies only to claude-desktop."),
+            Some(harness) => install::run_install(
+                install::InstallOptions {
+                    harness,
+                    project,
+                    skip_mcp,
+                    skip_hooks,
+                    skip_skills,
+                },
+                cli.json,
+            ),
+        },
         Some(Command::Uninstall {
             harness,
             project,
             force,
-        }) => install::run_uninstall(harness.into(), project, force, cli.json),
+        }) => match harness.harness() {
+            None => {
+                if project {
+                    anyhow::bail!(install_desktop::PROJECT_REFUSAL);
+                }
+                if force {
+                    anyhow::bail!(install_desktop::FORCE_REFUSAL);
+                }
+                install_desktop::run_uninstall(cli.json)
+            }
+            Some(harness) => install::run_uninstall(harness, project, force, cli.json),
+        },
         Some(Command::Origin { command }) => {
             on_runtime(move || run_origin(command, cli.db, cli.json))
         }
@@ -2390,6 +2459,12 @@ fn run() -> anyhow::Result<()> {
                 cli.json,
             )
         }),
+        Some(Command::DesktopBundle {
+            kind,
+            outdir,
+            binary,
+            pack,
+        }) => desktop_bundle::run(kind, &outdir, binary, pack),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
         Some(Command::DaemonTask { action }) => daemon_task_command(action),
@@ -6535,6 +6610,7 @@ mod tests {
             domains: Vec::new(),
             warnings: Vec::new(),
             read_only: false,
+            skills_tool: true,
         };
         let plain = crystalline_core::render_json(&output);
         let stale = vec!["Note: a".to_string(), "Note: b".to_string()];

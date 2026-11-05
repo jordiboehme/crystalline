@@ -57,12 +57,24 @@ function windowsPath(value) {
 }
 
 /**
- * Where to look, in order: the first hit that is Crystalline wins. A PATH
- * entry that is not absolute is skipped, so nothing is resolved against
- * Claude Desktop's working folder.
+ * The binary `crystalline install claude-desktop` pinned in the manifest, or
+ * null when it is not set or not an absolute path for this platform.
+ */
+function pinnedPath(platform, env) {
+  const pinned = env.CRYSTALLINE_BINARY;
+  if (typeof pinned !== "string" || !pinned) return null;
+  return (platform === "win32" ? path.win32 : path.posix).isAbsolute(pinned) ? pinned : null;
+}
+
+/**
+ * Where to look, in order: the pinned binary first, then the install
+ * places and PATH. A PATH entry that is not absolute is skipped, so nothing
+ * is resolved against Claude Desktop's working folder.
  */
 function candidates(platform, env) {
   const list = [];
+  const pinned = pinnedPath(platform, env);
+  if (pinned) list.push(pinned);
   if (platform === "win32") {
     // ProgramW6432 names the 64-bit Program Files even when this Node is a
     // 32-bit process, where ProgramFiles points at the (x86) folder.
@@ -97,14 +109,29 @@ function atLeast(triple, minimum) {
   return true;
 }
 
+/**
+ * The pinned path is one more place to look, never a gate. The first
+ * searched Crystalline decides, as before. A pinned one that is too old does
+ * not win: the search goes on, and `old` is answered (naming the pinned
+ * binary) only when every binary found is too old. `gone` means a pinned path that is not
+ * usable and a search that found nothing.
+ */
 function findBinary({ platform, env, isFile, runVersion }) {
+  const pinned = pinnedPath(platform, env);
+  let pinnedOld = null;
   for (const candidate of candidates(platform, env)) {
     if (!isFile(candidate)) continue;
     const parsed = parseVersion(runVersion(candidate));
     if (!parsed) continue;
-    return { kind: atLeast(parsed.triple, MINIMUM) ? "ok" : "old", path: candidate, version: parsed.text };
+    const found = { kind: atLeast(parsed.triple, MINIMUM) ? "ok" : "old", path: candidate, version: parsed.text };
+    if (candidate === pinned && found.kind === "old") {
+      pinnedOld = found;
+      continue;
+    }
+    return found.kind === "old" && pinnedOld ? pinnedOld : found;
   }
-  return { kind: "missing" };
+  if (pinnedOld) return pinnedOld;
+  return pinned ? { kind: "gone", path: pinned } : { kind: "missing" };
 }
 
 function isFile(candidate) {
@@ -144,6 +171,10 @@ function notice(outcome, platform, extensionVersion) {
     reason = `the Crystalline at ${outcome.path} is v${outcome.version}, and this extension needs v${MINIMUM_TEXT} or newer`;
     instructions = `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to update it with ${update}, then restart Claude Desktop. Call the status tool for the full details to relay.`;
     fix = `Update Crystalline with ${update}, then restart Claude Desktop.`;
+  } else if (outcome.kind === "gone") {
+    reason = `the Crystalline at ${outcome.path} that this extension was built for cannot be found or does not start`;
+    instructions = `Crystalline is not ready this session: ${reason}. No knowledge tools are available. Ask the user to install Crystalline again, then run \`crystalline install claude-desktop\` in a terminal and confirm the dialog in Claude Desktop. Call the status tool for the full details to relay.`;
+    fix = "Install Crystalline again, then run `crystalline install claude-desktop` and confirm the dialog in Claude Desktop.";
   } else if (mac) {
     reason = "Crystalline is not installed on this Mac";
     instructions = `Crystalline is not ready this session: ${reason}, and this extension only connects Claude Desktop to it. No knowledge tools are available. Ask the user to install it with \`brew install jordiboehme/tap/crystalline\` and restart Claude Desktop. Without Homebrew, they can install the Desktop-only extension for macOS from ${RELEASES}/latest instead of this extension. Call the status tool for the full details to relay.`;
@@ -327,9 +358,13 @@ function extensionVersion() {
 /**
  * The environment `crystalline mcp` runs with: this one, plus the channel and
  * this launcher's version, so the binary can say when the launcher is too old.
+ * The pinned binary path is dropped.
  */
 function childEnv(env, version) {
-  return Object.assign({}, env, { CRYSTALLINE_CHANNEL: "desktop", CRYSTALLINE_LAUNCHER_VERSION: version });
+  const child = Object.assign({}, env, { CRYSTALLINE_CHANNEL: "desktop", CRYSTALLINE_LAUNCHER_VERSION: version });
+  // The pinned path is for this launcher only.
+  delete child.CRYSTALLINE_BINARY;
+  return child;
 }
 
 function main() {
