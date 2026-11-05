@@ -1,0 +1,9 @@
+flowchart TD
+    %% crystalline install, per harness
+    install([crystalline install]) --> detect[Detect harnesses]
+    detect --> each{For each harness}
+    each --> mcp[Register the MCP server with --harness]
+    each --> hooks[Write the session hooks]
+    each --> skills[Place the skills]
+    mcp & hooks & skills --> receipt[(Install receipt)]
+    receipt --> gate[Per-harness gating at process start]

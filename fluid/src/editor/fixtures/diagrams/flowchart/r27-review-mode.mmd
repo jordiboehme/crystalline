@@ -1,0 +1,14 @@
+flowchart TD
+    %% a domain that reviews changes
+    edit[Author edits an engram] --> overlay[Draft row in the overlay]
+    overlay --> share{Ask for review?}
+    share -->|not yet| overlay
+    share -->|yes| link[Share link minted]
+    link --> reviewer[Reviewer reads the draft]
+    reviewer --> verdict{Approve?}
+    verdict -->|changes| overlay
+    verdict -->|approve| folder[Write into the domain folder]
+    folder --> index[(Index)]
+
+    classDef draft fill:#fff8e1,stroke:#c90
+    class overlay,link draft

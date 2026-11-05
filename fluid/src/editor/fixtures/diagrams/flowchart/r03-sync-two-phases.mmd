@@ -1,0 +1,18 @@
+flowchart TD
+    %% sync_domain_with = scan_domain + apply_scan
+    caller[sync_domain_with] --> snap[Read the stamp snapshot]
+    snap --> scan
+    subgraph scan [scan_domain: no store lock]
+        walk[Walk the domain folder] --> stat[Stat each file]
+        stat --> pre{mtime and size unchanged?}
+        pre -->|yes| keep[Reuse the stamp]
+        pre -->|no| hash[SHA-256 off-thread]
+    end
+    subgraph apply [apply_scan: one transaction]
+        classify[Classify new, modified, deleted, moved] --> deletes[Apply deletes first]
+        deletes --> slabs[Upsert in slabs]
+        slabs --> refs[Resolve forward references]
+    end
+    hash --> classify
+    keep --> classify
+    refs --> commit[(Commit)]

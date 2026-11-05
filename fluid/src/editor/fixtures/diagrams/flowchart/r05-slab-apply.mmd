@@ -1,0 +1,11 @@
+flowchart TD
+    %% apply works through the changed set in slabs of SYNC_SLAB_FILES
+    start([Changed set]) --> next{Files left?}
+    next -->|yes| read[Read one slab]
+    read --> parse[Parse and chunk off-thread]
+    parse --> upsert[Upsert each result as it arrives]
+    upsert --> next
+    next -->|no| resolve[resolve_forward_refs]
+    resolve --> done([Commit together])
+
+    linkStyle 4 stroke:#2b7a3d,stroke-width:2px

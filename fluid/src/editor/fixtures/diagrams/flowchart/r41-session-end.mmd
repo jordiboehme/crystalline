@@ -1,0 +1,8 @@
+graph TD;
+    %% session end hook, written the old way with semicolons
+    hook[Session end hook]-->ask{Anything learned?};
+    ask-->|yes|write[write_engram];
+    ask-->|no|stop[Done];
+    write-->sync[Sync];
+    sync-->stop;
+    style hook fill:#eef6ff;

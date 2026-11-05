@@ -1,0 +1,10 @@
+flowchart TD
+    %% crystalline connect, as a user sees it
+    cmd([crystalline connect URL]) --> discover[Read the server's discovery document]
+    discover --> browser[Open the sign-in page in the browser]
+    browser --> grant{Signed in and approved?}
+    grant -- no --> stop([Nothing stored])
+    grant -- yes --> token[Receive a token for this origin]
+    token --> keychain[(Keychain)]
+    keychain --> source[Add the server as a source]
+    source --> ctl[Later commands go through the ctl route]

@@ -1,0 +1,17 @@
+flowchart TD
+    %% merge_file(base, local, upstream) for one path
+    in[base, local, upstream] --> agree{local equals upstream?}
+    agree -->|yes| nothing[Nothing to do]
+    agree -->|no| localSame{local equals base?}
+    localSame -->|yes| take[Apply upstream]
+    localSame -->|no| upSame{upstream equals base?}
+    upSame -->|yes| nothing
+    upSame -->|no| engram{Engram file?}
+    engram -->|yes| fm[Frontmatter key by key, body line by line]
+    engram -->|no| lines[diffy::merge line by line]
+    fm & lines --> parses{Result still parses?}
+    parses -->|yes| take
+    parses -->|no| conflict[Conflict: local file untouched]
+
+    %% conflict markers never reach a file
+    style conflict fill:#fdecea,stroke:#b3261e

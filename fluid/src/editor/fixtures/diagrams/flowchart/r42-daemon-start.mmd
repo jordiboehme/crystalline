@@ -1,0 +1,10 @@
+flowchart  LR
+%% the daemon start, typed quickly
+   start([crystalline serve])  -->   lock{Instance lock free?}
+	lock -->|no|  attach[Talk to the running daemon]
+	lock -->|yes| load[Load config and overlay]   
+   load --> open[(Open the store)]
+      open --> syncAll[Startup sync of every domain]
+   syncAll -->  serve[Serve socket, MCP and HTTP]
+%% the poller starts last
+   serve --> poller[Origin poller]

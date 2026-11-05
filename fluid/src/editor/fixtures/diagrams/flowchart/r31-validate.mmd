@@ -1,0 +1,13 @@
+flowchart TD
+    %% validate_engrams: the verify passes
+    file[Engram file] --> format[format.rs]
+    format --> schema[schema_rules.rs]
+    schema --> links[links.rs]
+    links --> temporal[temporal.rs]
+    temporal --> quality[quality.rs]
+    quality --> report[report.rs]
+    manifest[MANIFEST.md] --> rules[manifest_rules.rs]
+    rules --> schema
+    report --> sev{Severity}
+    sev ==>|error| fail[Findings block the write]
+    sev -->|warning| note[Findings shown]

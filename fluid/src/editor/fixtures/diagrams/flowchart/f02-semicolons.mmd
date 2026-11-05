@@ -1,0 +1,6 @@
+graph TD;
+    %% every statement closed with a semicolon
+    A[Open file]-->B{Changed?};
+    B-->|yes|C[Hash it];
+    B-->|no|D[Skip];
+    C-->E[Index];

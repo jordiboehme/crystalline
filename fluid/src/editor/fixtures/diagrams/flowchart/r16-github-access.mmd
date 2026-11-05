@@ -1,0 +1,15 @@
+flowchart TD
+    %% GithubGovernor: who may read and write a governed domain
+    q[Question about a domain] --> app{GitHub App configured?}
+    app -->|no| plain[Ordinary membership rules]
+    app -->|yes| origin{Domain has an origin?}
+    origin -->|no| plain
+    origin -->|yes| snap{Snapshot for the repository?}
+    snap -->|none| noaccess[No access: fail closed]
+    snap -->|fresh, under 5 min| level[Snapshot::level_of by GitHub id]
+    snap -->|expired| ask[Ask GitHub again]
+    ask -->|answer| level
+    ask -->|failure, within 1 h| stale[Serve the stale snapshot]
+    ask -->|failure, past 1 h| noaccess
+    stale --> level
+    level --> answer([MemberLevel])
