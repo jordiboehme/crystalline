@@ -16,6 +16,7 @@
  * the address, the depth and the frame around it.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { Link, useSearchParams } from "react-router";
 
 import { parseCrystallineAddress } from "../api/engram";
@@ -28,6 +29,7 @@ export default function GraphView() {
   const address = params.get("anchor") ?? "";
   const anchor = parseCrystallineAddress(address);
   const depth = readGraphDepth(params.get("depth"));
+  usePageTitle("Graph");
 
   return (
     <div className="flex flex-col gap-6">

@@ -12,6 +12,7 @@
  * but a refusal to offer somebody the door key to lock themselves out with.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useRef, useState } from "react";
 
@@ -57,6 +58,7 @@ const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
 
 export default function UsersAdmin() {
   const { capabilities } = useAuth();
+  usePageTitle(capabilities.canAdminister ? "Users" : null);
   if (!capabilities.canAdminister) {
     return <NotFound />;
   }
