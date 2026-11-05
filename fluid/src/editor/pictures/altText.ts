@@ -117,16 +117,25 @@ function rewrites(
  * `starts[display.length]` is the source's length. A left-out mark has no
  * display character; a decoded entity's characters all start at the entity.
  */
-function readAlt(source: string): { display: string; starts: number[] } {
+function readAlt(source: string): {
+  display: string;
+  starts: number[];
+  /** The source spans left out of the display (marks, brackets). */
+  dropped: { from: number; to: number }[];
+} {
   let display = "";
   const starts: number[] = [];
+  const dropped: { from: number; to: number }[] = [];
   if (!MARKUP.test(source)) {
     for (let at = 0; at <= source.length; at += 1) starts.push(at);
-    return { display: source, starts };
+    return { display: source, starts, dropped };
   }
   let at = 0;
   for (const rewrite of rewrites(source)) {
     if (rewrite.from < at) continue;
+    if (rewrite.text === "") {
+      dropped.push({ from: rewrite.from, to: rewrite.to });
+    }
     for (; at < rewrite.from; at += 1) {
       starts.push(at);
       display += source[at] ?? "";
@@ -140,7 +149,7 @@ function readAlt(source: string): { display: string; starts: number[] } {
     display += source[at] ?? "";
   }
   starts.push(source.length);
-  return { display, starts };
+  return { display, starts, dropped };
 }
 
 /** `source` as a field shows it: as the reading page reads the alt. */
@@ -198,7 +207,7 @@ export function altEdit(
 ): { from: number; to: number; insert: string } | null {
   // A line break or a tab is written as one space (the alt is one line).
   const next = typed.replace(/\r\n|[\r\n\t]/g, " ");
-  const { display, starts } = readAlt(source);
+  const { display, starts, dropped } = readAlt(source);
   if (display === next) {
     return null;
   }
@@ -217,9 +226,30 @@ export function altEdit(
   const from = starts[prefix] ?? source.length;
   const to = starts[display.length - suffix] ?? source.length;
   const middle = next.slice(prefix, next.length - suffix);
-  for (const strict of [false, true]) {
-    const edit = middleEdit(source, from, to, middle, strict);
-    if (altDisplay(apply(source, edit)) === next) return edit;
+  // Where the change starts: right at the first changed character, else in
+  // front of the marks just before it (text typed before an autolink goes
+  // before its `<`, not inside it). An insert ends where it starts.
+  let before = from;
+  for (let moved = true; moved;) {
+    moved = false;
+    for (const span of dropped) {
+      if (span.to === before && span.from < before) {
+        before = span.from;
+        moved = true;
+      }
+    }
+  }
+  for (const start of before === from ? [from] : [from, before]) {
+    for (const strict of [false, true]) {
+      const edit = middleEdit(
+        source,
+        start,
+        to === from ? start : to,
+        middle,
+        strict,
+      );
+      if (altDisplay(apply(source, edit)) === next) return edit;
+    }
   }
   return middleEdit(source, 0, source.length, next, true);
 }

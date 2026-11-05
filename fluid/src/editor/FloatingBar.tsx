@@ -56,6 +56,7 @@ import type {
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -87,7 +88,7 @@ import {
 } from "./tableIcons";
 import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
-import { toggleFormat } from "./marks/formatting";
+import { formatRefusal, toggleFormat } from "./marks/formatting";
 import { focusBack } from "./focusBack";
 import { PictureControls, pictureLabels } from "./PictureControls";
 import { insertWikilink } from "./toolbar";
@@ -117,6 +118,8 @@ interface Item {
   disabled?: boolean;
   /** The format a format button toggles, for its pressed state. */
   format?: Format;
+  /** The id of the sentence that says why the item is off, if it says one. */
+  describedBy?: string;
   run: (main: EditorView) => void;
 }
 
@@ -134,11 +137,16 @@ function onTarget(run: (view: EditorView) => void) {
   };
 }
 
-function textItems(wikilinks: boolean): Item[] {
+/**
+ * The text group. `why` is the id of the sentence that says why the format
+ * buttons are off (a selected picture in a link), or null when they are on.
+ */
+function textItems(wikilinks: boolean, why: string | null = null): Item[] {
   const format = (label: string, icon: IconComponent, which: Format): Item => ({
     label,
     icon,
     format: which,
+    ...(why === null ? {} : { disabled: true, describedBy: why }),
     run: onTarget((view) => {
       toggleFormat(view, which);
     }),
@@ -316,12 +324,21 @@ export default function FloatingBar({
     focused;
 
   const picture = visible && context.kind === "image" ? context : null;
+  /**
+   * Why the format buttons are off, as the sticky bar says it (P21): a
+   * selected picture in a link stands here as text, and has none to format.
+   */
+  const target = main === null ? null : (verbTarget(main) ?? null);
+  const formatWhy =
+    visible && target !== null ? formatRefusal(target.state) : null;
+  const whyId = useId();
+  const why = formatWhy === null ? null : whyId;
   const items: Item[] =
     picture !== null
       ? []
       : visible && context.kind === "cell"
-        ? [...textItems(wikilinks), ...cellItems(main)]
-        : textItems(wikilinks);
+        ? [...textItems(wikilinks, why), ...cellItems(main)]
+        : textItems(wikilinks, why);
   const inCell = visible && context.kind === "cell";
   const alignOff = inCell && !cellActionApplies(main, "Align left");
   /** The enabled controls, in order: the roving tab stop is one of them. */
@@ -479,12 +496,20 @@ export default function FloatingBar({
       {picture !== null && (
         <PictureControls main={main} context={picture} roving={roving} />
       )}
+      {formatWhy !== null && picture === null && (
+        <span id={whyId} className="sr-only">
+          {formatWhy}
+        </span>
+      )}
       {items.map((item) => (
         <IconButton
           key={item.label}
           label={item.label}
           icon={item.icon}
           disabled={item.disabled ?? false}
+          {...(item.describedBy === undefined
+            ? {}
+            : { "aria-describedby": item.describedBy })}
           {...(item.format && formats
             ? { "aria-pressed": formats.has(item.format) }
             : {})}

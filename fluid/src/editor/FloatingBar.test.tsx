@@ -523,6 +523,38 @@ describe("the floating bar on a picture", () => {
   const picture = () =>
     screen.getByRole("toolbar", { name: "Picture options" });
 
+  // A picture in a link is the link's: the bar stands by it as text. Its
+  // format buttons are off and say why, as the sticky bar's are (P21).
+  test("a selected picture in a link draws the format buttons off, with the reason", async () => {
+    let latest: FloatingContext = null;
+    const doc = "a [![C](assets/c.png)](https://x.y) b\n";
+    const ref = "![C](assets/c.png)";
+    const v = markView(doc, {
+      images: imagePreviews("eng"),
+      onFloatingContext: (next) => {
+        latest = next;
+      },
+    });
+    const from = doc.indexOf(ref);
+    v.focus();
+    v.dispatch({ selection: { anchor: from, head: from + ref.length } });
+    await vi.waitFor(() => {
+      expect(latest).not.toBeNull();
+    });
+    render(<FloatingBar main={v} context={latest} wikilinks />, {
+      wrapper: Tooltips,
+    });
+    const quick = screen.getByRole("toolbar", { name: "Quick format" });
+    for (const name of ["Bold", "Italic", "Strikethrough", "Inline code"]) {
+      const button = within(quick).getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(
+        "A picture has no text to format.",
+      );
+    }
+    expect(within(quick).getByRole("button", { name: "Link" })).toBeEnabled();
+  });
+
   test("is named Picture options and offers no text group", async () => {
     await onPicture("![C](assets/c.png)\n", "![C](assets/c.png)");
     expect(screen.queryByRole("toolbar", { name: "Quick format" })).toBeNull();

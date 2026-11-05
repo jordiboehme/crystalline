@@ -101,10 +101,26 @@ describe("altEdit over marks and entities (M3)", () => {
     ["a b", "a *b*"],
     ["a b", "a_b_c &amp; `x`"],
     ["x", "~~y~~"],
+    ["<https://x.y>", "X https://x.y"],
+    ["a <https://x.y> b", "a https://x.y c"],
   ];
 
   it.each(EDITS)("%j to %j reads as typed", (source, next) => {
     expect(altDisplay(applied(source, next))).toBe(next);
+  });
+
+  it("types before an autolink without touching it", () => {
+    expect(altEdit("<https://x.y>", "X https://x.y")).toEqual({
+      from: 0,
+      to: 0,
+      insert: "X ",
+    });
+    expect(applied("<https://x.y> a", "X https://x.y a")).toBe(
+      "X <https://x.y> a",
+    );
+    expect(applied("<https://x.y> a", "https://x.y ab")).toBe(
+      "<https://x.y> ab",
+    );
   });
 
   it("keeps the marks it does not need to touch", () => {

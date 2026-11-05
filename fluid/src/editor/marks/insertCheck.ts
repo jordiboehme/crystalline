@@ -141,17 +141,19 @@ function blockShape(
 }
 
 /**
- * The run of marks at `pos` on a line whose marks show: read from the marks
- * the line has whether they show or not, so Enter there finds the same
- * places as where they are hidden (P48).
+ * The run of format marks at `pos` on a line whose marks show: read from the
+ * marks the line has whether they show or not, so Enter at an emphasis there
+ * finds the same places as where the marks are hidden (P48).
  */
 function shownRunAt(state: EditorState, pos: number): MarkRun | null {
   const line = state.doc.lineAt(pos).number;
-  return (
-    runsOf(marksOnLine(state, line, { always: true })).find(
-      (run) => run.from <= pos && pos <= run.to,
-    ) ?? null
+  // Emphasis, strikethrough and code marks only: a break moved out of a
+  // link's address or title, or an autolink, would take the space the
+  // newline replaced there and change the link.
+  const marks = marksOnLine(state, line, { always: true }).filter((mark) =>
+    FORMAT_KINDS.has(mark.kind),
   );
+  return runsOf(marks).find((run) => run.from <= pos && pos <= run.to) ?? null;
 }
 
 /** The places to try for `text` put in at `at` (after `deleted` went). */
@@ -340,6 +342,12 @@ export interface InsertJudgement {
   /** Where the inserted text ends in the result. */
   from: number;
   end: number;
+  /**
+   * Where a caret goes instead of `end`, when the line shows its marks and
+   * the break went before an opening run: after the marks it moved past, in
+   * the format the caret stood in, where the hidden mode's caret lands too.
+   */
+  caret?: number;
 }
 
 /**
@@ -428,10 +436,14 @@ export function judgeInsert(
     const lastPiece = place.pieces.at(-1);
     const firstPiece = place.pieces[0];
     if (!lastPiece || !firstPiece) return null;
+    const end = changes.mapPos(lastPiece.at, -1) + lastPiece.insert.length;
+    const shownBreakBefore =
+      breaks && !marksHiddenOnLine(start, line) && firstPiece.at < insert.from;
     return {
       changes,
       from: changes.mapPos(firstPiece.at, -1),
-      end: changes.mapPos(lastPiece.at, -1) + lastPiece.insert.length,
+      end,
+      ...(shownBreakBefore ? { caret: changes.mapPos(insert.to, 1) } : {}),
     };
   }
   return null;
@@ -489,7 +501,7 @@ export const checkedInsert: Extension = State.transactionFilter.of((tr) => {
   );
   if (!judged) return tr;
   const selection = tr.newSelection.main.empty
-    ? EditorSelection.cursor(judged.end)
+    ? EditorSelection.cursor(judged.caret ?? judged.end)
     : EditorSelection.range(judged.from, judged.end);
   return {
     changes: judged.changes,
