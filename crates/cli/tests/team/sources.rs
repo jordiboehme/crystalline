@@ -316,6 +316,9 @@ fn bin_cfg(home: &Path) -> Command {
 fn a_hidden_copy_is_warned_about_and_cannot_be_removed_or_renamed() {
     let server = CliServer::start_full(&[], &[("platform", "acme/platform")]);
     let home = tempfile::tempdir().unwrap();
+    // Stops the daemon below even when an assert fails before `ctl shutdown`.
+    #[cfg(unix)]
+    let _leftovers = crate::common::Leftovers(home.path().to_path_buf());
     let dir = home_with_a_team_copy(home.path());
     let out = bin_cfg(home.path())
         .args(["connect", &server.origin, "--name", "acme", "--token"])
@@ -627,6 +630,9 @@ fn a_running_daemon_learns_of_a_connect_at_once_and_status_merges_its_rows() {
     use std::time::{Duration, Instant};
     let server = CliServer::start();
     let home = tempfile::tempdir().unwrap();
+    // Stops the daemon below even when an assert fails before `ctl shutdown`.
+    #[cfg(unix)]
+    let _leftovers = crate::common::Leftovers(home.path().to_path_buf());
     let mut serve = crate::common::crystalline_std();
     for (name, value) in crate::common::isolation_env(home.path()) {
         serve.env(name, value);

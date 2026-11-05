@@ -110,16 +110,18 @@ impl Bridge {
 /// socket under it, and macOS allows 103 bytes for that path, which a
 /// default temp folder nearly spends on its own (`mcp_stub.rs` uses `/tmp`
 /// for the same reason).
-fn short_home() -> tempfile::TempDir {
+fn short_home() -> crate::common::GuardedHome {
     let base = if cfg!(unix) {
         std::path::PathBuf::from("/tmp")
     } else {
         std::env::temp_dir()
     };
-    tempfile::Builder::new()
-        .prefix("cq-")
-        .tempdir_in(base)
-        .unwrap()
+    crate::common::GuardedHome::new(
+        tempfile::Builder::new()
+            .prefix("cq-")
+            .tempdir_in(base)
+            .unwrap(),
+    )
 }
 
 fn initialize() -> Value {
