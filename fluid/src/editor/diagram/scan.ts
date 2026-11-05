@@ -9,8 +9,12 @@
  *
  * - Frontmatter (`matchFrontMatter`): only from the body's first line, `---`
  *   with an optional indent and trailing whitespace, closed by the same
- *   indent and `---` on a later line that is not the body's last.
- * - Directives (`directiveRegex`): `%%{` up to the next `}%%`, across lines.
+ *   indent and `---` on line 2 or later, not the body's last.
+ * - Directives (`directiveRegex`, used as mermaid writes it): a line that
+ *   starts with `%%{` and a word after the brace (the word may sit on a
+ *   later line), up to the next `}%%`, across lines. A `%%{` without a word
+ *   (`%%{ }%%`) is neither removed nor a comment, so it is lexed as written:
+ *   a header or statement line that `hasStrayComment` flags.
  * - Comments (`cleanupComments`, `/^\s*%%(?!{)[^\n]+/`): only a whole line
  *   that is `%%` followed by at least one character. A bare `%%` line is a
  *   node to mermaid and a trailing `%%` after a statement is a parse error;
@@ -22,11 +26,17 @@
  *   an entity `#name;` is hidden from the lexer; neither splits here.
  * - The flowchart lexer's `.*direction\s+(TB|BT|RL|LR|TD)[^\n]*` takes a
  *   whole line holding such text as one direction token, so in a flowchart
- *   that line is one statement (`isDirectionLine`).
+ *   that line is one statement (`isDirectionLine`). Its `\s+` crosses line
+ *   breaks, and the blank, comment and directive lines between are already
+ *   gone, so a line ending in `direction` whose next lexed line starts with
+ *   a direction is not understood.
+ * - The `accDescr {` block ends at its first `}`; the lexer reads the rest
+ *   of that line as statements, so that `acc` line carries them.
  *
  * The scanner knows no diagram grammar beyond these: `understood` is false
  * only for what leaves the line kinds themselves unknown (an unclosed
- * frontmatter, directive or `accDescr` block, no header). What each type's
+ * frontmatter, directive or `accDescr` block, text after a directive, a
+ * direction run onto a later line, no header). What each type's
  * parser refuses is that parser's verdict.
  */
 
@@ -53,8 +63,9 @@ export interface ScannedLine {
   /**
    * For a header or statement line, its statements: split on each top-level
    * `;` (outside quotes, brackets, `|...|` and backticks), each span trimmed
-   * of outer whitespace and without its `;`, empty ones left out. Empty for
-   * every other kind.
+   * of outer whitespace and without its `;`, empty ones left out. An `acc`
+   * line that closes an `accDescr { }` block holds the statements after its
+   * `}` (mermaid lexes them). Empty for every other line.
    */
   statements: Span[];
 }
@@ -74,6 +85,9 @@ const FLOWCHART_KEYWORDS = new Set(["flowchart", "graph", "flowchart-elk"]);
 
 const COMMENT = /^\s*%%(?!\{)./;
 const DIRECTION = /direction\s+(?:TB|BT|RL|LR|TD)/;
+/** mermaid 12.2.0's `directiveRegex` (regexes.ts), flags set where used. */
+const DIRECTIVE =
+  /%{2}{\s*(?:(\w+)\s*:|(\w+))\s*(?:(\w+)|((?:(?!}%{2}).|\r?\n)*))?\s*(?:}%{2})?/;
 
 export function scanFence(body: string): Scan {
   const lines: ScannedLine[] = [];
@@ -99,7 +113,9 @@ export function scanFence(body: string): Scan {
     const closing = `${opening[1] ?? ""}---`;
     const close = lines.findIndex(
       (line, i) =>
-        i > 0 &&
+        // `matchFrontMatter` looks for the close only after the opening
+        // line's break and the next one, so line 2 is the earliest.
+        i > 1 &&
         i < lines.length - 1 &&
         textOf(line).startsWith(closing) &&
         textOf(line).slice(closing.length).trim() === "",
@@ -119,37 +135,56 @@ export function scanFence(body: string): Scan {
   let header: ScannedLine | null = null;
   let keyword: string | null = null;
   let flowchart = false;
-  let open: "directive" | "acc" | null = null;
+  /** The body offset a directive runs to, while its lines are scanned. */
+  let directiveEnd = -1;
+  let accOpen = false;
+  const statementsOf = (offset: number, text: string): Span[] =>
+    flowchart && DIRECTION.test(text)
+      ? spans(offset, text, [{ from: 0, to: text.length }])
+      : splitStatements(offset, text);
   for (const line of lines.slice(start)) {
     const text = textOf(line);
     const rest = text.slice(line.indent.length);
-    if (open === "directive") {
+    if (line.from < directiveEnd) {
       line.kind = "directive";
-      const end = text.indexOf("}%%");
-      if (end !== -1) {
-        open = null;
-        afterDirective(text, end, reasons);
+      if (directiveEnd <= line.to) {
+        afterDirective(body, directiveEnd, line, reasons);
       }
       continue;
+    }
+    // Directives are removed before comments, and both before the lexer
+    // reads an `accDescr` block, so they are tested first.
+    if (rest.startsWith("%%{")) {
+      const directive = new RegExp(DIRECTIVE.source, "iy");
+      directive.lastIndex = line.from + line.indent.length;
+      const match = directive.exec(body);
+      if (match !== null) {
+        line.kind = "directive";
+        directiveEnd = directive.lastIndex;
+        if (!match[0].endsWith("}%%") && directiveEnd === body.length) {
+          reasons.push("A directive is not closed.");
+        } else if (directiveEnd <= line.to) {
+          afterDirective(body, directiveEnd, line, reasons);
+        }
+        continue;
+      }
+      // No word after the brace: mermaid removes nothing and the comment
+      // rule skips `%%{`, so the line is lexed as written.
     }
     if (COMMENT.test(text)) {
       line.kind = "comment";
       continue;
     }
-    if (open === "acc") {
+    if (accOpen) {
       line.kind = "acc";
-      if (text.includes("}")) {
-        open = null;
-      }
-      continue;
-    }
-    if (rest.startsWith("%%{")) {
-      line.kind = "directive";
-      const end = text.indexOf("}%%", line.indent.length + 3);
-      if (end === -1) {
-        open = "directive";
-      } else {
-        afterDirective(text, end, reasons);
+      const close = text.indexOf("}");
+      if (close !== -1) {
+        accOpen = false;
+        // The lexer leaves the block at its `}` and lexes the rest.
+        line.statements = statementsOf(
+          line.from + close + 1,
+          text.slice(close + 1),
+        );
       }
       continue;
     }
@@ -167,29 +202,26 @@ export function scanFence(body: string): Scan {
       continue;
     } else if (/^accDescr\s*\{/.test(rest)) {
       line.kind = "acc";
-      if (!rest.slice(rest.indexOf("{") + 1).includes("}")) {
-        open = "acc";
+      const open = text.indexOf("{");
+      const close = text.indexOf("}", open + 1);
+      if (close === -1) {
+        accOpen = true;
+      } else {
+        line.statements = statementsOf(
+          line.from + close + 1,
+          text.slice(close + 1),
+        );
       }
       continue;
     } else {
       line.kind = "statement";
     }
-    line.statements =
-      flowchart && DIRECTION.test(text)
-        ? spans(line.from, text, [{ from: 0, to: text.length }])
-        : splitStatements(line.from, text);
-    if (flowchart && /direction\s*$/.test(text)) {
-      const next = lines[line.index + 1];
-      if (next && /^\s*(?:TB|BT|RL|LR|TD)/.test(textOf(next))) {
-        reasons.push(
-          `Line ${line.index + 1} starts a direction that runs onto the next line.`,
-        );
-      }
-    }
+    line.statements = statementsOf(line.from, text);
   }
-  if (open === "directive") {
-    reasons.push("A directive is not closed.");
-  } else if (open === "acc") {
+  if (flowchart) {
+    runOnDirections(body, lines, reasons);
+  }
+  if (accOpen) {
     reasons.push("An accDescr block is not closed.");
   }
   if (header === null) {
@@ -204,10 +236,47 @@ export function scanFence(body: string): Scan {
   };
 }
 
-/** Text after a directive's `}%%` stays on the line mermaid parses. */
-function afterDirective(text: string, end: number, reasons: string[]): void {
-  if (text.slice(end + 3).trim() !== "") {
+/** Text after a directive on its last line stays for mermaid to parse. */
+function afterDirective(
+  body: string,
+  end: number,
+  line: ScannedLine,
+  reasons: string[],
+): void {
+  if (body.slice(end, line.to).trim() !== "") {
     reasons.push("Text follows a directive on its line.");
+  }
+}
+
+/**
+ * The lexer's `direction\s+(TB|BT|RL|LR|TD)` crosses line breaks, and the
+ * blank, comment and directive lines between are gone by the time it runs.
+ * So a statement that ends in `direction` and whose next lexed line starts
+ * with a direction swallows every line up to it: not understood.
+ */
+function runOnDirections(
+  body: string,
+  lines: ScannedLine[],
+  reasons: string[],
+): void {
+  for (const line of lines) {
+    if (line.statements.length === 0) {
+      continue;
+    }
+    if (!/direction\s*$/.test(body.slice(line.from, line.to))) {
+      continue;
+    }
+    const next = lines
+      .slice(line.index + 1)
+      .find(
+        (l) =>
+          l.kind !== "blank" && l.kind !== "comment" && l.kind !== "directive",
+      );
+    if (next && /^\s*(?:TB|BT|RL|LR|TD)/.test(body.slice(next.from, next.to))) {
+      reasons.push(
+        `Line ${line.index + 1} starts a direction that runs onto line ${next.index + 1}.`,
+      );
+    }
   }
 }
 
@@ -218,24 +287,37 @@ function afterDirective(text: string, end: number, reasons: string[]): void {
  * and statement lines are lexed; a removed line never is.
  */
 export function isDirectionLine(body: string, line: ScannedLine): boolean {
-  return (
-    (line.kind === "statement" || line.kind === "header") &&
-    DIRECTION.test(body.slice(line.from, line.to))
-  );
+  const text = lexedText(body, line);
+  return text !== null && DIRECTION.test(text);
 }
 
 /**
- * Whether a header or statement line holds a `%%` that is not a comment to
+ * The part of `line` mermaid's lexer reads: a header or statement line
+ * whole, the text after the `}` of an `acc` line that closes a block with
+ * statements after it, or null for a line the lexer never sees.
+ */
+function lexedText(body: string, line: ScannedLine): string | null {
+  if (line.kind === "statement" || line.kind === "header") {
+    return body.slice(line.from, line.to);
+  }
+  const first = line.statements[0];
+  return line.kind === "acc" && first !== undefined
+    ? body.slice(first.from, line.to)
+    : null;
+}
+
+/**
+ * Whether the lexed part of a line (`lexedText`) holds a `%%` that is not a comment to
  * mermaid: a bare `%%` line (mermaid reads it as a node), or a `%%` after or
  * between statements, outside quotes, brackets, `|...|` and backticks (a
  * parse error, or a directive removed from the middle of a line). A `%%`
  * inside a label is label text.
  */
 export function hasStrayComment(body: string, line: ScannedLine): boolean {
-  if (line.kind !== "statement" && line.kind !== "header") {
+  const text = lexedText(body, line);
+  if (text === null) {
     return false;
   }
-  const text = body.slice(line.from, line.to);
   let stray = false;
   walkTopLevel(text, (i) => {
     if (text.startsWith("%%", i)) {

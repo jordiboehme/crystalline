@@ -8,6 +8,7 @@ import {
   isDirectionLine,
   scanFence,
 } from "./scan";
+import { flowDbOf } from "./mermaidDb";
 
 const FIXTURES = import.meta.glob<string>(
   [
@@ -335,6 +336,123 @@ describe("scanFence statements", () => {
       const scan = scanFence(text.replace(/\n$/, ""));
       expect(scan.understood, path).toBe(true);
       expect(scan.keyword, path).toMatch(/^(flowchart|graph)$/);
+    }
+  });
+});
+
+// Review round 1. Each case is checked against mermaid 12.2.0's own parse
+// (the real parser, as in `mermaidDb.test.ts`), so the scan says what
+// mermaid does, not what the rule's prose says.
+describe("scanFence against mermaid 12.2", () => {
+  /** The edges mermaid's db holds for `body`, or "error". */
+  async function edgesOf(body: string): Promise<string[] | "error"> {
+    const db = await flowDbOf(body, false);
+    return "error" in db ? "error" : db.edges.map((e) => `${e.start}>${e.end}`);
+  }
+
+  test("a frontmatter block cannot close on its second line", async () => {
+    const tooSoon = "---\n---\nflowchart TD\n  A-->B";
+    expect(await edgesOf(tooSoon)).toBe("error");
+    const scan = scanFence(tooSoon);
+    expect(line(scan, 0).kind).toBe("frontmatter");
+    expect(line(scan, 1).kind).not.toBe("frontmatter");
+    expect(scan.understood).toBe(false);
+
+    const empty = "---\n\n---\nflowchart TD\n  A-->B";
+    expect(await edgesOf(empty)).toEqual(["A>B"]);
+    const ok = scanFence(empty);
+    expect(kinds(ok)).toEqual([
+      "frontmatter",
+      "frontmatter",
+      "frontmatter",
+      "header",
+      "statement",
+    ]);
+    expect(ok.understood).toBe(true);
+  });
+
+  test("text after an accDescr block's close is scanned as statements", async () => {
+    for (const body of [
+      "flowchart TD\n  accDescr {\n  x\n  } A-->B; C-->D",
+      "flowchart TD\n  accDescr { x } A-->B; C-->D",
+    ]) {
+      expect(await edgesOf(body)).toEqual(["A>B", "C>D"]);
+      const scan = scanFence(body);
+      const closing = defined(scan.lines.at(-1));
+      expect(closing.kind).toBe("acc");
+      expect(texts(body, closing)).toEqual(["A-->B", "C-->D"]);
+      expect(scan.understood).toBe(true);
+    }
+  });
+
+  test("the predicates read the statements after an accDescr block", () => {
+    const body =
+      "flowchart TD\n  accDescr { direction LR }\n  accDescr { x } A --> B %% n\n  accDescr { y } C --> D direction LR";
+    const scan = scanFence(body);
+    expect(isDirectionLine(body, line(scan, 1))).toBe(false);
+    expect(hasStrayComment(body, line(scan, 1))).toBe(false);
+    expect(hasStrayComment(body, line(scan, 2))).toBe(true);
+    expect(isDirectionLine(body, line(scan, 3))).toBe(true);
+    expect(texts(body, line(scan, 3))).toEqual(["C --> D direction LR"]);
+  });
+
+  test("an accDescr block's close with nothing after it has no statements", async () => {
+    const body = "flowchart TD\n  accDescr { x }   \n  C-->D";
+    expect(await edgesOf(body)).toEqual(["C>D"]);
+    expect(line(scanFence(body), 1).statements).toEqual([]);
+  });
+
+  test("a direction runs over blank, comment and directive lines", async () => {
+    // The run-on direction token swallows the lines up to its direction,
+    // so their nodes and edges vanish from mermaid's db.
+    for (const [body, edges] of [
+      ["flowchart TD\n  A[direction\n\n  LR] --> B\n  C --> D", ["C>D"]],
+      [
+        "flowchart TD\n  A[direction\n  %% c\n\n  LR] --> B\n  C --> D",
+        ["C>D"],
+      ],
+      [
+        "flowchart TD\n  A --> B\n  C[direction\n  %%{init: {}}%%\n  LR] --> D",
+        ["A>B"],
+      ],
+    ] as const) {
+      expect(await edgesOf(body), body).toEqual(edges);
+      const scan = scanFence(body);
+      expect(scan.understood, body).toBe(false);
+      expect(scan.reasons.join(" "), body).toMatch(/direction/);
+    }
+  });
+
+  test("a direction word with no direction after it is left to the parser", () => {
+    const scan = scanFence("flowchart TD\n  A[direction\n\n  E --> F");
+    expect(scan.reasons.join(" ")).not.toMatch(/direction/);
+  });
+
+  test("a %%{ line is a directive only with a word after the brace", async () => {
+    for (const body of [
+      "%%{ x }%%\nflowchart TD\n  A-->B",
+      "%%{ 1 }%%\nflowchart TD\n  A-->B",
+      "%%{\n  init: {}\n}%%\nflowchart TD\n  A-->B",
+    ]) {
+      expect(await edgesOf(body), body).toEqual(["A>B"]);
+      const scan = scanFence(body);
+      expect(scan.understood, body).toBe(true);
+      expect(defined(scan.header ?? undefined).index, body).toBe(
+        body.split("\n").indexOf("flowchart TD"),
+      );
+    }
+    for (const body of [
+      "%%{ }%%\nflowchart TD\n  A-->B",
+      "%%{}%%\nflowchart TD\n  A-->B",
+      "flowchart TD\n  %%{ }%%\n  A-->B",
+    ]) {
+      expect(await edgesOf(body), body).toBe("error");
+      const scan = scanFence(body);
+      const braces = defined(
+        scan.lines.find((l) => body.slice(l.from, l.to).includes("%%{")),
+      );
+      expect(["header", "statement"], body).toContain(braces.kind);
+      expect(hasStrayComment(body, braces), body).toBe(true);
     }
   });
 });
