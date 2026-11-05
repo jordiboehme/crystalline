@@ -16,7 +16,12 @@ mod remote_server;
 
 mod configure;
 mod daemon_task;
+mod desktop_bundle;
 mod desktop_state;
+// The update opens the extension: like install_desktop below, only in debug
+// builds, where the open seam is read.
+#[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
+mod desktop_update;
 mod doctor;
 mod doctor_names;
 mod domain_case;
@@ -26,6 +31,9 @@ mod harness_install;
 mod hook;
 #[cfg(unix)]
 mod install;
+// The open seam is read only in debug builds, so a release test build would open the real Claude Desktop.
+#[cfg(all(debug_assertions, any(target_os = "macos", windows)))]
+mod install_desktop;
 mod kept;
 mod prompt;
 #[cfg(unix)]

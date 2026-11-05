@@ -168,7 +168,7 @@ fn program_for(run: &Run, keep: bool) -> (String, Option<String>) {
     let keep = if keep { stored_program(run) } else { None };
     let path = std::env::var_os("PATH");
     let resolved = resolve_program(
-        harness,
+        harness.display_name(),
         harness.profile().command_spelling,
         path.as_deref(),
         keep.as_deref(),
