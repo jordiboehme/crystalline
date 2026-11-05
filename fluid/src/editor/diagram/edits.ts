@@ -29,11 +29,20 @@ export interface TextEdit {
 
 /** Why an op made no change. */
 export type RefusalCode =
-  "stale" | "gone" | "invalid" | "group" | "chain" | "unsupported";
+  | "stale"
+  | "gone"
+  | "invalid"
+  | "group"
+  | "chain"
+  | "unsupported"
+  | "unchecked";
 
-/** What an op compiler returns: the edits (and what they create) or a refusal. */
-export type OpResult =
-  { edits: TextEdit[]; created?: unknown } | { refused: RefusalCode };
+/**
+ * What an op compiler returns: the edits (and what they create, of a type each
+ * kind of diagram names) or a refusal.
+ */
+export type OpResult<Created = unknown> =
+  { edits: TextEdit[]; created?: Created } | { refused: RefusalCode };
 
 /** The notice shown for each refusal. None mentions Raw or text. */
 export const NOTICES: Record<RefusalCode, string> = {
@@ -45,6 +54,8 @@ export const NOTICES: Record<RefusalCode, string> = {
   chain: "This arrow is part of a chain, so it cannot be reversed on its own.",
   unsupported:
     "This diagram uses something the editor does not know yet, so it was not changed.",
+  unchecked:
+    "The diagram could not be checked, so it was not changed. Try again.",
 };
 
 /**

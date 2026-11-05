@@ -128,6 +128,8 @@ describe("NOTICES", () => {
         "This arrow is part of a chain, so it cannot be reversed on its own.",
       unsupported:
         "This diagram uses something the editor does not know yet, so it was not changed.",
+      unchecked:
+        "The diagram could not be checked, so it was not changed. Try again.",
     });
   });
 

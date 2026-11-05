@@ -57,15 +57,32 @@ export function soloMain(text: string, extra: Extension[] = []): EditorView {
   return main;
 }
 
-/** Two synced peers; the local main view is in the room. */
+/**
+ * Two synced peers; the local main view is in the room. `hold()` keeps what
+ * either peer writes from the other until `release()`, for a test of two edits
+ * made before a sync.
+ */
 export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
   const local = new Y.Doc();
   const remote = new Y.Doc();
+  let held: { to: Y.Doc; update: Uint8Array }[] | null = null;
+  const send = (to: Y.Doc, update: Uint8Array) => {
+    if (held) held.push({ to, update });
+    else Y.applyUpdate(to, update, "remote");
+  };
+  const hold = () => {
+    held ??= [];
+  };
+  const release = () => {
+    const waiting = held ?? [];
+    held = null;
+    for (const { to, update } of waiting) Y.applyUpdate(to, update, "remote");
+  };
   local.on("update", (update: Uint8Array, origin: unknown) => {
-    if (origin !== "remote") Y.applyUpdate(remote, update, "remote");
+    if (origin !== "remote") send(remote, update);
   });
   remote.on("update", (update: Uint8Array, origin: unknown) => {
-    if (origin !== "remote") Y.applyUpdate(local, update, "remote");
+    if (origin !== "remote") send(local, update);
   });
   const ytext = local.getText("content");
   const rtext = remote.getText("content");
@@ -122,7 +139,18 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
     awareness.destroy();
     remoteAwareness.destroy();
   });
-  return { main, ytext, rtext, awareness, remoteAwareness, local, remote };
+  return {
+    main,
+    ytext,
+    rtext,
+    awareness,
+    remoteAwareness,
+    local,
+    remote,
+    undoManager,
+    hold,
+    release,
+  };
 }
 
 /** The cell at `row` (0 is the header) and `column` of the first table. */

@@ -25,7 +25,12 @@ export type Verdict =
       /** db domId (without the `<svg id>-` prefix) to node id; boxes only, no clusters. */
       domIds: Map<string, string>;
     }
-  | { ok: false; reason: string };
+  | {
+      ok: false;
+      reason: string;
+      /** The check could not run: this says nothing about the body. */
+      unavailable?: true;
+    };
 
 const CACHE_SIZE = 256;
 const settled = new Map<string, Verdict>();
@@ -340,6 +345,7 @@ async function decide(body: string, dark: boolean): Promise<Decision> {
         verdict: {
           ok: false,
           reason: `mermaid could not be loaded: ${messageOf(db.error)}`,
+          unavailable: true,
         },
         final: false,
       };
@@ -364,8 +370,8 @@ async function decide(body: string, dark: boolean): Promise<Decision> {
  * view's `dark`) and `agreesFlow`. Cached by body; a request while one is
  * running for the same body gets the same promise. A check that could not
  * run (mermaid failing to load, an unexpected throw) answers `ok: false` with
- * the cause but is no verdict: it is not cached, and the next request tries
- * again.
+ * the cause and `unavailable`, but is no verdict: it is not cached, and the
+ * next request tries again.
  */
 export function requestVerdict(body: string, dark: boolean): Promise<Verdict> {
   const known = verdictFor(body);
@@ -378,7 +384,11 @@ export function requestVerdict(body: string, dark: boolean): Promise<Verdict> {
   }
   const promise = decide(body, dark)
     .catch((error: unknown): Decision => ({
-      verdict: { ok: false, reason: `The check failed: ${messageOf(error)}` },
+      verdict: {
+        ok: false,
+        reason: `The check failed: ${messageOf(error)}`,
+        unavailable: true,
+      },
       final: false,
     }))
     .then(({ verdict, final }) => {

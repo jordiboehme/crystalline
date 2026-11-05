@@ -38,6 +38,7 @@ import {
 import type {
   DirectiveLine,
   EdgeKey,
+  FlowCreated,
   FlowModel,
   FlowNode,
   Shape,
@@ -79,7 +80,11 @@ function encodedFor(text: string, shape: Shape): string {
   return encodeLabel(text, shape.quoted);
 }
 
-function rename(model: FlowModel, node: FlowNode, text: string): OpResult {
+function rename(
+  model: FlowModel,
+  node: FlowNode,
+  text: string,
+): OpResult<never> {
   const typed = tidyLabel(text);
   if (typed === "" || cannotDraw(typed)) {
     return refused("invalid");
@@ -121,7 +126,7 @@ function changeShape(
   model: FlowModel,
   node: FlowNode,
   name: ShapeName,
-): OpResult {
+): OpResult<never> {
   const target = SHAPES.find((s) => s.name === name);
   const ref = node.refs[0];
   if (target === undefined) {
@@ -224,7 +229,7 @@ function setColour(
   node: FlowNode,
   styleLines: readonly DirectiveLine[],
   name: ColourPreset,
-): OpResult {
+): OpResult<never> {
   const preset = COLOUR_PRESETS[name];
   const field = `${node.id} styles`;
   const colours = `${node.id} colours`;
@@ -304,7 +309,7 @@ function clearColour(
   model: FlowModel,
   node: FlowNode,
   styleLines: readonly DirectiveLine[],
-): OpResult {
+): OpResult<never> {
   const whole: number[] = [];
   const parts: Span[] = [];
   for (const directive of styleLines) {
@@ -337,7 +342,7 @@ function colour(
   model: FlowModel,
   node: FlowNode,
   name: ColourPreset | null,
-): OpResult {
+): OpResult<never> {
   const styleLines = model.directives.filter(
     (d) => d.kind === "style" && d.targets[0]?.id === node.id,
   );
@@ -346,7 +351,7 @@ function colour(
     : setColour(model, node, styleLines, name);
 }
 
-function direction(model: FlowModel, value: "TD" | "LR"): OpResult {
+function direction(model: FlowModel, value: "TD" | "LR"): OpResult<never> {
   const written = model.direction;
   if (readDirection(written?.value) === readDirection(value)) {
     return { edits: [] };
@@ -551,7 +556,7 @@ function insertLine(
   place: Place,
   text: string,
   { box, edge }: Addition,
-): OpResult {
+): OpResult<never> {
   const edit = newLineAfter(
     model,
     place.line,
@@ -577,7 +582,7 @@ function insertLine(
   return checked(model, edits, changes);
 }
 
-function withBox(result: OpResult, id: string): OpResult {
+function withBox(result: OpResult<never>, id: string): OpResult<FlowCreated> {
   return "edits" in result
     ? { ...result, created: { kind: "node", id } }
     : result;
@@ -601,7 +606,7 @@ function firstParent(model: FlowModel, node: FlowNode): FlowNode | null {
   return null;
 }
 
-function addUnder(model: FlowModel, parent: FlowNode): OpResult {
+function addUnder(model: FlowModel, parent: FlowNode): OpResult<FlowCreated> {
   const id = newNodeId(model);
   return withBox(
     insertLine(
@@ -614,7 +619,7 @@ function addUnder(model: FlowModel, parent: FlowNode): OpResult {
   );
 }
 
-function addSibling(model: FlowModel, node: FlowNode): OpResult {
+function addSibling(model: FlowModel, node: FlowNode): OpResult<FlowCreated> {
   const parent = firstParent(model, node);
   if (parent !== null) {
     return addUnder(model, parent);
@@ -634,7 +639,11 @@ function addSibling(model: FlowModel, node: FlowNode): OpResult {
  * an end that no earlier subgraph holds a member of that subgraph, so when the
  * self-check refuses that, the arrow goes in the nearest subgraph around both.
  */
-function connect(model: FlowModel, from: FlowNode, to: FlowNode): OpResult {
+function connect(
+  model: FlowModel,
+  from: FlowNode,
+  to: FlowNode,
+): OpResult<never> {
   // Mermaid's layout gives every loop on a box the same helper nodes, so the
   // last one replaces the others in the drawing and their style is lost. The db
   // cannot see this, so no check downstream would.
@@ -661,7 +670,7 @@ function connect(model: FlowModel, from: FlowNode, to: FlowNode): OpResult {
     : insertLine(model, closingPlace(model, common), text, addition);
 }
 
-function addBox(model: FlowModel): OpResult {
+function addBox(model: FlowModel): OpResult<FlowCreated> {
   const id = newNodeId(model);
   return withBox(
     insertLine(model, closingPlace(model, null), newBoxRef(id), {
@@ -678,7 +687,10 @@ function addBox(model: FlowModel): OpResult {
  * read back as exactly the change `invalid`. A subgraph id is no box (R4).
  * No edits at all means the source already says this.
  */
-export function compileFlowOp(model: FlowModel, op: FlowOp): OpResult {
+export function compileFlowOp(
+  model: FlowModel,
+  op: FlowOp,
+): OpResult<FlowCreated> {
   if (!model.understood) {
     return refused("unsupported");
   }

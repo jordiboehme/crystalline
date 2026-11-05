@@ -77,6 +77,7 @@ describe("mermaid failing to load", () => {
       expect(first.reason).toMatch(/could not be loaded/);
       // vitest wraps the factory's error, so the message's text is its own.
       expect(first.reason).not.toMatch(/refuses/);
+      expect(first.unavailable).toBe(true);
     }
     expect(verdictFor(body)).toBe(undefined);
 
@@ -102,6 +103,7 @@ describe("the diagram chunk failing to load inside mermaid", () => {
       expect(first.ok).toBe(false);
       if (!first.ok) {
         expect(first.reason).toMatch(/could not be loaded/);
+        expect(first.unavailable).toBe(true);
       }
       expect(verdictFor(body)).toBe(undefined);
       const second = await requestVerdict(body, false);
@@ -135,6 +137,7 @@ describe("the diagram chunk failing to load inside mermaid", () => {
     load.rejectOnce = new Error("No such shape: foo.");
     const verdict = await requestVerdict(body, false);
     expect(verdict.ok).toBe(false);
+    expect(verdict).not.toHaveProperty("unavailable");
     expect(verdictFor(body)).toBe(verdict);
   });
 

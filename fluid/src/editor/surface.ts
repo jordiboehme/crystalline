@@ -17,6 +17,7 @@ import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
 import { codeBlocks } from "./codeBlocks";
 import { copyAsHtml } from "./copyHtml";
+import { diagramAnchors } from "./diagramAnchors";
 import { elementContextListener } from "./elementContext";
 import type { ElementEdit } from "./elementEdit";
 import { elementEditListener } from "./elementEdit";
@@ -221,6 +222,9 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // And for the callout and status segments: a callout's kind is text in
     // Raw mode too.
     elementContextListener(options.onElementContext),
+    // Where a diagram op's fence has gone while the op is being verified.
+    // Outside the preview compartment: Raw turning on must not lose it.
+    diagramAnchors,
     // And for the floating action bar. Outside the preview compartment: a
     // selection is a selection in Raw mode too, and the screen decides
     // there whether the bar draws.

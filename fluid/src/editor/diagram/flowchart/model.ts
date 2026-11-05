@@ -217,6 +217,12 @@ export interface FlowModel {
 }
 
 /** An edge named the way an op names it, stable across unrelated edits. */
+/** What an op that adds a box says it made. */
+export interface FlowCreated {
+  kind: "node";
+  id: string;
+}
+
 export interface EdgeKey {
   start: string;
   end: string;

@@ -133,7 +133,7 @@ function changed(
   index: number,
   edits: TextEdit[],
   change: ArrowChange,
-): OpResult {
+): OpResult<never> {
   return checked(
     model,
     edits,
@@ -147,7 +147,7 @@ export function lineStyle(
   model: FlowModel,
   key: EdgeKey,
   line: "solid" | "dotted" | "thick",
-): OpResult {
+): OpResult<never> {
   const found = oneArrow(model, key);
   if ("refused" in found) {
     return found;
@@ -175,7 +175,7 @@ export function arrowhead(
   model: FlowModel,
   key: EdgeKey,
   head: "arrow" | "none" | "both",
-): OpResult {
+): OpResult<never> {
   const found = oneArrow(model, key);
   if ("refused" in found) {
     return found;
@@ -202,7 +202,11 @@ function isMarkdownLabel(raw: string): boolean {
   return raw.startsWith('"`') && raw.endsWith('`"') && raw.length >= 4;
 }
 
-function removeLabel(model: FlowModel, index: number, arrow: Arrow): OpResult {
+function removeLabel(
+  model: FlowModel,
+  index: number,
+  arrow: Arrow,
+): OpResult<never> {
   if (arrow.label === null) {
     return { edits: [] };
   }
@@ -239,7 +243,7 @@ export function edgeLabel(
   model: FlowModel,
   key: EdgeKey,
   text: string,
-): OpResult {
+): OpResult<never> {
   const found = oneArrow(model, key);
   if ("refused" in found) {
     return found;
@@ -260,7 +264,7 @@ export function edgeLabel(
     return { edits: [] };
   }
   const markdown = raw !== null && isMarkdownLabel(raw);
-  let result: OpResult = refused("invalid");
+  let result: OpResult<never> = refused("invalid");
   for (const written of labelForms(arrow, typed, markdown)) {
     // A net (R42): 1.9 million generated texts found no input that trips this
     // today, so no test can show it. It stays for the day the encoder and the
@@ -279,7 +283,7 @@ export function edgeLabel(
   return result;
 }
 
-export function reverse(model: FlowModel, key: EdgeKey): OpResult {
+export function reverse(model: FlowModel, key: EdgeKey): OpResult<never> {
   const edge = edgeByKey(model, key);
   const chain = model.chains[edge?.chain ?? -1];
   if (edge === null || chain === undefined) {
