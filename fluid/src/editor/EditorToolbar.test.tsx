@@ -26,6 +26,7 @@ import { JOIN_SECTIONS, reflectionAdapter } from "./adapter";
 import { AttachButton } from "./AttachButton";
 import { EditorToolbar } from "./EditorToolbar";
 import { frontmatterFold } from "./frontmatterFold";
+import { imagePreviews } from "./imagePreviews";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import { MERMAID_SKELETON } from "./toolbar";
 import type { Format } from "./marks/formatting";
@@ -966,10 +967,11 @@ describe("the pressed format buttons", () => {
   afterEach(cleanupMarkViews);
 
   /** A hidden-mode buffer with the bar drawing what the buffer reports. */
-  function pressedBar(doc: string): EditorView {
+  function pressedBar(doc: string, images?: Extension): EditorView {
     let formats: ReadonlySet<Format> = new Set();
     let redraw: ((formats: ReadonlySet<Format>) => void) | null = null;
     const v = markView(doc, {
+      ...(images ? { images } : {}),
       onFormatState: (next) => {
         formats = next as ReadonlySet<Format>;
         redraw?.(formats);
@@ -1018,6 +1020,32 @@ describe("the pressed format buttons", () => {
       keys(v, "Mod-b");
     });
     expect(pressed("Bold")).toBe("true");
+  });
+
+  // P21: nothing is refused silently. A picture has no words to format, so
+  // the format buttons are off on it and say why.
+  test("on a selected picture the format buttons are off and say why", () => {
+    const doc = "a ![x](assets/a.png) b\n";
+    const v = pressedBar(doc, imagePreviews("eng"));
+    const names = ["Bold", "Italic", "Strikethrough", "Inline code"];
+    act(() => {
+      v.dispatch({ selection: EditorSelection.range(2, 20) });
+    });
+    for (const name of names) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(
+        "A picture has no text to format.",
+      );
+    }
+    act(() => {
+      setCaret(v, 1);
+    });
+    for (const name of names) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeEnabled();
+      expect(button).not.toHaveAttribute("aria-describedby");
+    }
   });
 
   test("with no formats told (the MANIFEST), the buttons are not toggles", () => {

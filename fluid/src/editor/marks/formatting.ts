@@ -79,6 +79,23 @@ const CONTINUING = new Set<Format>(["strong", "em", "strike"]);
 /** What a refused format says. */
 export const CANNOT_FORMAT = "This text cannot be formatted here.";
 
+/** What a format on a selected picture says (P21: nothing refused silently). */
+export const PICTURE_NOT_FORMATTED = "A picture has no text to format.";
+
+/**
+ * Why no format can be set on `state`'s selection now, or null. A selection
+ * that is exactly one picture drawn in place has no words to format: its alt
+ * text is hidden behind the picture, so a mark written there is a change
+ * nobody sees (and asterisks a screen reader reads out). The sticky bar
+ * draws its format buttons off with this sentence; the keys announce it.
+ */
+export function formatRefusal(state: EditorState): string | null {
+  const picture = selectedPicture(state);
+  return picture !== null && pictureInline(state, picture)
+    ? PICTURE_NOT_FORMATTED
+    : null;
+}
+
 /**
  * Asked first by every format command: a sentence the buffer says instead,
  * when it cannot take a format yet, or null. A table cell whose row is not
@@ -710,12 +727,11 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
       return true;
     }
   }
-  // A selection that is exactly one drawn picture has no words to format:
-  // its alt text is hidden behind the picture, so a mark written there is a
-  // change nobody sees (and asterisks a screen reader reads out). Handled,
-  // so no other binding of the key moves the selection off the picture.
-  const picture = selectedPicture(view.state);
-  if (picture !== null && pictureInline(view.state, picture)) {
+  // Handled, so no other binding of the key moves the selection off the
+  // picture, and said why.
+  const refusal = formatRefusal(view.state);
+  if (refusal !== null) {
+    refuse(view, refusal);
     return true;
   }
   const marker = FORMAT_MARKER[format];
@@ -1223,7 +1239,10 @@ function report(hub: FormatHub): void {
     target && !isDestroyed(target)
       ? formatsOfSelection(target.state)
       : new Set<Format>();
-  const key = FORMATS.filter((format) => formats.has(format)).join(" ");
+  // A refusal is part of the key, so the bar draws its buttons off and on.
+  const refused =
+    target && !isDestroyed(target) ? formatRefusal(target.state) : null;
+  const key = `${FORMATS.filter((format) => formats.has(format)).join(" ")}|${refused ?? ""}`;
   if (key === hub.last) {
     return;
   }

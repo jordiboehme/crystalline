@@ -53,6 +53,8 @@ const SOURCES = [
   "a [b](https://x.y) c",
   "snake_case_name",
   "a < b",
+  "a <https://x.y> b",
+  "mail <me@x.y> now",
   "plain words",
 ];
 

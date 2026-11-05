@@ -269,19 +269,49 @@ describe.each(
  * marks. A single `*` moved to the next line would start a list item there,
  * so no place that makes a block mark out of a format mark is taken.
  */
-describe.each([false, true])(
-  "Enter at the end of a format, hidden mode, room %s",
-  (room) => {
+describe.each(
+  (["hidden", "show"] as const).flatMap((mode) =>
+    [false, true].map((room) => ({ mode, room })),
+  ),
+)("Enter at the end of a format, $mode mode, room $room", ({ mode, room }) => {
+  it.each([
+    ["*a word* z", 7, "*a word*\n z"],
+    ["_a word_ z", 7, "_a word_\n z"],
+    ["**a word** z", 8, "**a word**\n z"],
+    ["~~a word~~ z", 8, "~~a word~~\n z"],
+    ["x *a word*", 9, "x *a word*\n"],
+    ["- *a word* z", 9, "- *a word*\n-  z"],
+  ])("%j, Enter at %i", (text, at, want) => {
+    const view = markView(text, { mode, room });
+    setCaret(view, at);
+    keys(view, "Enter");
+    expect(bytes(view.state)).toBe(want);
+    undoOnce(view);
+    expect(bytes(view.state)).toBe(text);
+  });
+});
+
+/**
+ * A real list line still continues as a list when Enter is judged (P48),
+ * with marks on it or none, in both modes.
+ */
+describe.each(
+  (["hidden", "show"] as const).flatMap((mode) =>
+    [false, true].map((room) => ({ mode, room })),
+  ),
+)(
+  "Enter at the end of a list line, $mode mode, room $room",
+  ({ mode, room }) => {
     it.each([
-      ["*a word* z", 7, "*a word*\n z"],
-      ["_a word_ z", 7, "_a word_\n z"],
-      ["**a word** z", 8, "**a word**\n z"],
-      ["~~a word~~ z", 8, "~~a word~~\n z"],
-      ["x *a word*", 9, "x *a word*\n"],
-      ["- *a word* z", 9, "- *a word*\n-  z"],
-    ])("%j, Enter at %i", (text, at, want) => {
-      const view = markView(text, { room });
-      setCaret(view, at);
+      ["* item", "* item\n* "],
+      ["- item", "- item\n- "],
+      ["1. item", "1. item\n2. "],
+      ["* *item*", "* *item*\n* "],
+      ["- **item**", "- **item**\n- "],
+      ["1. ~~item~~", "1. ~~item~~\n2. "],
+    ])("%j", (text, want) => {
+      const view = markView(text, { mode, room });
+      setCaret(view, text.length);
       keys(view, "Enter");
       expect(bytes(view.state)).toBe(want);
       undoOnce(view);

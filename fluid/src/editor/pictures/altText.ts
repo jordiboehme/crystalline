@@ -3,8 +3,8 @@
  * field shows.
  *
  * The field shows the words the reading page gives the image (M3): the alt
- * is read as inline Markdown, its emphasis, strikethrough and code marks and
- * a link's brackets and address are left out, character references are
+ * is read as inline Markdown, its emphasis, strikethrough and code marks, a
+ * link's brackets and address and an autolink's angle brackets are left out, character references are
  * decoded and backslash escapes taken out. An edit writes back only the part
  * that changed, worked out in display space and mapped to the source, so
  * untouched characters keep their bytes, marks and escapes included. What is
@@ -94,6 +94,15 @@ function rewrites(
         const linked =
           (kind === "Link" || kind === "Image") &&
           children.some((child) => name(child) === "URL");
+        if (kind === "Autolink") {
+          // `<https://x.y>` reads as its address: the brackets go.
+          for (const child of children) {
+            if (name(child) === "LinkMark") {
+              out.push({ from: child.from, to: child.to, text: "" });
+            }
+          }
+          continue;
+        }
         walk(children, linked);
       }
     }

@@ -8,7 +8,7 @@
  */
 
 import { Compartment, EditorSelection, StateEffect } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import { beforeAll, afterEach, describe, expect, it } from "vitest";
 
 import { copyHtmlOf } from "../copyHtml";
@@ -379,6 +379,23 @@ describe("what the delete check and the format commands read at a drawn picture"
   });
 });
 
+/** What `view` announces from now on. */
+function announced(view: EditorView): string[] {
+  const said: string[] = [];
+  view.dispatch({
+    effects: StateEffect.appendConfig.of(
+      EditorView.updateListener.of((update) => {
+        for (const tr of update.transactions) {
+          for (const effect of tr.effects) {
+            if (effect.is(EditorView.announce)) said.push(effect.value);
+          }
+        }
+      }),
+    ),
+  });
+  return said;
+}
+
 /**
  * A format key or button on a selected picture writes nothing (I3): the
  * picture's alt text is hidden behind it, so marks written there would be a
@@ -419,7 +436,10 @@ describe.each(
         view.dispatch({
           selection: EditorSelection.range(from, from + PIC.length),
         });
+        const said = announced(view);
         keys(view, key);
+        // Refused, and said why (P21).
+        expect(said).toEqual(["A picture has no text to format."]);
         expect(bytes(view.state)).toBe(text);
         expect(view.state.selection.main.from).toBe(from);
         expect(view.state.selection.main.to).toBe(from + PIC.length);

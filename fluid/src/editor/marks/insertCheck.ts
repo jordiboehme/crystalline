@@ -22,8 +22,8 @@
  * A pair the insert leaves with nothing visible inside loses its marks
  * (D6). Where no place keeps the pairs, the insert is written as it landed:
  * a paste is never refused, and neither is typing. Only lines whose marks
- * are hidden are judged, and a paste where they show (P45): elsewhere on a
- * line that shows its marks the person sees what they write.
+ * are hidden are judged, and a paste (P45) and Enter (P48) where they show:
+ * elsewhere on a line that shows its marks the person sees what they write.
  */
 
 import type {
@@ -46,7 +46,8 @@ import { canonical } from "./caret";
 import type { Lines, Range } from "./deleteCheck";
 import { blockLines, carried, linesOf, merged, readsSame } from "./deleteCheck";
 import { droppable, judgedElsewhere } from "./deleting";
-import { marksOnLine, runAt } from "./hiddenMarks";
+import type { MarkRun } from "./hiddenMarks";
+import { marksOnLine, runAt, runsOf } from "./hiddenMarks";
 import { marksHiddenOnLine } from "./mode";
 import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 import type { Deadline } from "./parse";
@@ -139,14 +140,32 @@ function blockShape(
   return { shape: out.join("|"), formatMade };
 }
 
+/**
+ * The run of marks at `pos` on a line whose marks show: read from the marks
+ * the line has whether they show or not, so Enter there finds the same
+ * places as where they are hidden (P48).
+ */
+function shownRunAt(state: EditorState, pos: number): MarkRun | null {
+  const line = state.doc.lineAt(pos).number;
+  return (
+    runsOf(marksOnLine(state, line, { always: true })).find(
+      (run) => run.from <= pos && pos <= run.to,
+    ) ?? null
+  );
+}
+
 /** The places to try for `text` put in at `at` (after `deleted` went). */
 function places(state: EditorState, at: number, text: string): Place[] {
   const out: Place[] = [{ pieces: [{ at, insert: text }] }];
-  const run = runAt(state, at);
+  const breaks = /[\r\n]/.test(text);
+  const run =
+    breaks && !marksHiddenOnLine(state, state.doc.lineAt(at).number)
+      ? shownRunAt(state, at)
+      : runAt(state, at);
   if (!run) {
     return out;
   }
-  if (/[\r\n]/.test(text)) {
+  if (breaks) {
     // Text that breaks the line is never split across a run (D55): it goes
     // whole to the run's far side, after a closing run, or before the
     // formats an opening run holds (after a line's block marks). A run that
@@ -461,7 +480,10 @@ export const checkedInsert: Extension = State.transactionFilter.of((tr) => {
     // Pasted or dropped text leaves out its own marks of the formats it
     // lands in; typing, Enter and completions write what they write.
     {
-      shown: event === "input.paste",
+      // Enter where the marks show too (P48): a line break never splits a
+      // pair or makes a list item of a closing `*`. Everything else typed
+      // on a shown line is written as typed.
+      shown: event === "input.paste" || event === "input",
       ownMarks: event === "input.paste" || event === "input.drop",
     },
   );
