@@ -1253,6 +1253,9 @@ pub struct Engine {
     // a `connect` landing later - in this process or a standalone CLI writing
     // the same keychain item - is picked up on the very next call.
     github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    // Personal tokens a status read did not find, and when: see
+    // `Engine::personal_token_for_report`.
+    github_tokens_missing: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     // One lock per account whose App user token is being refreshed, so two
     // shares that find it expiring refresh it once: GitHub spends a refresh
     // token on use, and a second exchange of the same one would be refused
@@ -1872,6 +1875,9 @@ fn personal_identity(account: &str) -> Result<TokenIdentity> {
     Ok(TokenIdentity::Personal(account.to_string()))
 }
 
+/// How long a status read remembers that a personal token was not there.
+const TOKEN_MISSING_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The [`Engine::github_tokens`] cache key for one credential on one host.
 ///
 /// A unit separator joins the parts because an identity name can never contain
@@ -1893,7 +1899,7 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 ///
 /// Matched on the frozen text rather than on a variant of its own, because that
 /// text IS the distinguishing fact - [`PERSONAL_TOKEN_MISSING`] is produced at
-/// exactly one place ([`Engine::resolve_share_credential`]), its App
+/// exactly one place ([`Engine::resolve_share_credential_in`]), its App
 /// counterpart [`PERSONAL_LINK_MISSING`] only where an App user token is
 /// missing or gone (`Engine::personal_user_token`), and every other
 /// refusal a preview can meet (an unset agent identity, a name no credential can
@@ -2522,6 +2528,7 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             github_tokens: Arc::default(),
+            github_tokens_missing: std::sync::Mutex::default(),
             personal_refresh: std::sync::Mutex::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
@@ -12375,7 +12382,7 @@ mod share_actor_tests {
         // and this slice stops being its body - so move the pattern with it.
         let body = &rest[..rest.find("\n    }").unwrap_or(rest.len())];
         assert!(
-            body.contains("self.resolve_share_credential(actor)?"),
+            body.contains("self.resolve_share_credential_in(actor, effective.mode)?"),
             "the provider resolves the same credential: {body}"
         );
         assert!(
@@ -12537,6 +12544,11 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
+        // A status remembers a missing token for a moment; the CLI tells the
+        // daemon when it writes one.
+        engine
+            .forget_cached_credential(Some(OWNER_IDENTITY_NAME))
+            .unwrap();
         let status = engine
             .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
@@ -12594,6 +12606,7 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
+        engine.forget_cached_credential(Some("share-bot")).unwrap();
         let status = engine
             .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await

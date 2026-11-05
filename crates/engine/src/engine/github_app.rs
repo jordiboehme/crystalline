@@ -639,7 +639,7 @@ pub(crate) enum AppSlot {
 ///
 /// Holds one HTTP client, cloned into every per-call [`GitHubProvider`]: a
 /// client build loads the platform trust store (see the note above
-/// `Engine::resolve_share_credential`), so it is built once per App, not
+/// `Engine::resolve_share_credential_in`), so it is built once per App, not
 /// once per call. A call refused with [`RemoteError::AuthExpired`] (a 401:
 /// the token was revoked or expired early) forgets that installation's token
 /// and runs once more on a fresh one. A 401 means GitHub did not act on the
@@ -1188,6 +1188,15 @@ impl Engine {
             return EffectiveShareIdentity::resolve(setting, GithubAppPresence::None);
         }
         EffectiveShareIdentity::resolve(None, slot_presence(&self.github_app_slot()))
+    }
+
+    /// Whether every share is refused for the App's own reason: a refused App
+    /// where `personal` is only the default (`Engine::resolve_share_provider`).
+    /// Never waits for the store. What keeps `can_share` from promising a share
+    /// an editor cannot make.
+    pub fn github_app_refuses_shares(&self) -> bool {
+        self.share_identity_effective().is_default()
+            && matches!(self.github_app_slot_settled(), Some(AppSlot::Refused(_)))
     }
 
     /// Whether an App may be configured, from what is cheap to read: the

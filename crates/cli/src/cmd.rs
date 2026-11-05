@@ -3655,6 +3655,11 @@ pub async fn connect_github(
     // actionable. `github.enabled` is left to the instance connect to hint at:
     // turning collaboration on is an instance-wide decision, not something a
     // person connecting their own identity is making.
+    if !instance {
+        // A running daemon remembers for a short time that this token was
+        // missing; this ends that.
+        let _ = notify_daemon_forgot(identity).await;
+    }
     let share_identity = share_identity_here(&loaded, cfg);
     let personal_mode = matches!(
         share_identity.mode,
@@ -5254,10 +5259,6 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
     Ok(value)
 }
 
-/// Where this CLI process finds and keeps the GitHub App: the effective
-/// `github.api_url` of `loaded`, and the state directory beside the token
-/// store, or only the file under `token_store_dir` (the test seam, see
-/// [`test_token_store_dir`]).
 /// The share identity mode in effect for this process, which has no engine:
 /// the App is asked of what is cheap to read.
 fn share_identity_here(
@@ -5274,6 +5275,10 @@ fn share_identity_here(
     )
 }
 
+/// Where this CLI process finds and keeps the GitHub App: the effective
+/// `github.api_url` of `loaded`, and the state directory beside the token
+/// store, or only the file under `token_store_dir` (the test seam, see
+/// [`test_token_store_dir`]).
 fn app_home(
     loaded: &crystalline_service::LoadedConfig,
     token_store_dir: Option<&Path>,

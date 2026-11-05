@@ -2118,7 +2118,10 @@ pub async fn me(
     // the surfaces just opened to them.
     let can_share = identity
         .may_share(state.engine.share_identity_mode())
-        .is_ok();
+        .is_ok()
+        // A refused App refuses every share of a person. An admin keeps the
+        // surface, because that is where the App's reason is read and fixed.
+        && (identity.require_admin().is_ok() || !state.engine.github_app_refuses_shares());
     Ok((
         jar,
         no_store(),

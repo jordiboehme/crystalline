@@ -802,7 +802,8 @@ pub struct GitHubConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacks: Option<bool>,
     /// Whose GitHub identity shares run under, `instance` or `personal`.
-    /// Absent means `instance`. Read through
+    /// Absent means `personal` with a GitHub App configured and `instance`
+    /// without one ([`EffectiveShareIdentity`]). Read through
     /// [`GlobalConfig::github_share_identity_setting`], which is tolerant of a value
     /// it does not know; the settings registry refuses one on a write. See
     /// the `configure` tool.
@@ -2062,8 +2063,9 @@ mod tests {
         assert!(config.github_stacks());
     }
 
-    /// Absent means the instance token does everything (today's behavior), and
-    /// only the exact word `personal` selects the split. Anything else - a
+    /// Absent says nothing, so the mode follows the App
+    /// ([`EffectiveShareIdentity`]), and only the exact word `personal` selects
+    /// the split. Anything else - a
     /// typo, or a spelling from a newer build - reads as `Instance`: a config
     /// file is hand-edited, so a mistyped value must not silently move an
     /// instance into or out of the stricter mode. The settings registry is

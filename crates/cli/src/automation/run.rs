@@ -229,22 +229,32 @@ pub(super) async fn run_one(
     // The share and the record, with the lease kept fresh beside them until
     // the record answers.
     let finish = async {
-        let share = if share_it {
+        let (share, share_error) = if share_it {
             share_changes(&lease, &text, stop.clone()).await
         } else {
-            None
+            (None, None)
+        };
+        // A refused share is in the recorded run, first so the summary's cap
+        // never cuts it: on a server nobody reads this run's stderr.
+        let recorded_summary = match &share_error {
+            Some(error) => format!("{error}\n\n{text}"),
+            None => text.clone(),
         };
         let report = json!({
             "started_at": started.to_rfc3339(),
             "outcome": outcome,
             "done": done,
-            "summary": text,
+            "summary": recorded_summary,
         });
-        (share, lease.record(&report, stop.clone()).await)
+        (
+            share,
+            share_error,
+            lease.record(&report, stop.clone()).await,
+        )
     };
     tokio::pin!(finish);
     let mut lost_at_end = None;
-    let (share, record) = if renewing {
+    let (share, share_error, record) = if renewing {
         tokio::select! {
             finished = &mut finish => finished,
             why = renewer.as_mut() => {
@@ -279,6 +289,7 @@ pub(super) async fn run_one(
                 "exit_code": exit,
                 "log": log_path,
                 "share": share,
+                "share_error": share_error,
                 "run": record["run"],
             })
         );
@@ -295,12 +306,13 @@ pub(super) async fn run_one(
 }
 
 /// Share the run's changes as a pull request: the share's answer, or `None`
-/// when it failed or a stop signal came first.
+/// when it failed or a stop signal came first, and for a failure what to record
+/// about it.
 async fn share_changes(
     lease: &Lease<'_>,
     summary: &str,
     mut stop: watch::Receiver<bool>,
-) -> Option<Value> {
+) -> (Option<Value>, Option<String>) {
     let share = lease.client.verb(
         "automation_share",
         lease.lp,
@@ -308,17 +320,33 @@ async fn share_changes(
     );
     tokio::select! {
         answer = share => match answer {
-            Ok(answer) => Some(answer),
+            Ok(answer) => (Some(answer), None),
             Err(e) => {
                 eprintln!("Sharing the run's changes failed: {e:#}");
-                None
+                (None, Some(share_failure(lease.domain, &format!("{e:#}"))))
             }
         },
         _ = stop.wait_for(|stopped| *stopped) => {
             eprintln!("Stopped before the run's changes were shared.");
-            None
+            (None, None)
         }
     }
+}
+
+/// What a recorded run says about a share that failed: that the changes stayed
+/// here, why, and the fix for an admin. Later runs do not pick these files up,
+/// so the last sentence is the way they still reach the team.
+fn share_failure(domain: &str, error: &str) -> String {
+    let mut text = format!("The run's changes were not shared and stay on this machine: {error}");
+    if error.contains("personal GitHub identities") {
+        text.push_str(
+            " An admin can also set github.share_identity to instance, so the instance credential opens the proposals.",
+        );
+    }
+    text.push_str(&format!(
+        " Once that is fixed, share them with: crystalline origin share {domain}"
+    ));
+    text
 }
 
 /// A take refusal that means "not now": a run is going, or the loop runs on
@@ -817,6 +845,20 @@ pub(super) fn stop_signal() -> watch::Receiver<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_share_names_why_and_the_way_out() {
+        let text = share_failure(
+            "kb",
+            "This instance shares with personal GitHub identities through its GitHub App.",
+        );
+        assert!(text.contains("not shared"), "{text}");
+        assert!(text.contains("through its GitHub App"), "{text}");
+        assert!(text.contains("github.share_identity to instance"), "{text}");
+        assert!(text.ends_with("crystalline origin share kb"), "{text}");
+        let other = share_failure("kb", "GitHub could not be reached");
+        assert!(!other.contains("github.share_identity"), "{other}");
+    }
 
     fn summary(done: u64) -> RunSummary {
         RunSummary {

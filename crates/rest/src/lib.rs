@@ -1427,6 +1427,10 @@ pub(crate) async fn refuse_off_write_list(
     Ok(())
 }
 
+/// Why an account with no GitHub link may not change a domain GitHub governs: a
+/// person reads this, so it names the fix without a command line or a setting.
+pub(crate) const LINK_GITHUB_TO_WRITE: &str = "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+
 /// The caller, when the request may mutate content in `domain`.
 ///
 /// Three refusals in the order they have to happen:
@@ -1495,6 +1499,12 @@ pub(crate) async fn require_domain_write(
         })?;
     if right < DomainRight::Write {
         refuse_off_write_list(state, identity, domain, None).await?;
+        if let Caller::Account(user) = &caller
+            && state.access.governs(domain)
+            && matches!(state.access.github_link_of(&user.name).await, Ok(None))
+        {
+            return Err(ApiError::forbidden(LINK_GITHUB_TO_WRITE));
+        }
         return Err(ApiError::forbidden(format!(
             "your membership on this domain is {}, and editor access is required",
             member_level_word(right)

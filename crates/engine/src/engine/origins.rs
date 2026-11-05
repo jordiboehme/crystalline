@@ -1,5 +1,6 @@
 use super::*;
 use crate::params::Readers;
+use crystalline_core::config::EffectiveShareIdentity;
 
 /// What a connect to GitHub on an instance with a GitHub App is told when
 /// it does not say who may read the domain. Access there follows GitHub, so
@@ -2145,7 +2146,7 @@ impl Engine {
     ///
     /// `actor` is who the share runs as, which decides the credential the
     /// forge writes go out on (see `Engine::resolve_share_provider`); it is
-    /// inert while `github.share_identity` is `instance`, the default.
+    /// inert while the share identity mode is `instance`.
     ///
     /// The login that credential was connected as is recorded on the proposal
     /// this share creates or rewrites, in both modes
@@ -3997,14 +3998,17 @@ impl Engine {
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
-        if let Some(app) = self.instance_share_app()? {
+        // Once, here: the steps below must agree, or a personal share could
+        // fall back to the instance credential when the mode moves between them.
+        let effective = self.share_identity_loaded();
+        if let Some(app) = self.instance_share_app(effective)? {
             let app = self.app_share_router(app, actor, repo).await;
             let login = app.bot_login();
             return Ok((app, login));
         }
-        let (api_url, token) = match self.personal_app_identity(actor)? {
+        let (api_url, token) = match self.personal_app_identity(actor, effective)? {
             Some(name) => (self.share_api_url(), self.personal_user_token(&name).await?),
-            None => self.resolve_share_credential(actor)?,
+            None => self.resolve_share_credential_in(actor, effective.mode)?,
         };
         let login = token.user_display().map(str::to_string);
         Ok((
@@ -4022,28 +4026,59 @@ impl Engine {
         if self.origin_provider_override.is_some() {
             return Some(self.origin_provider_override_login.clone());
         }
-        match self.instance_share_app() {
+        let effective = self.share_identity_loaded();
+        match self.instance_share_app(effective) {
             Ok(Some(app)) => return Some(app.bot_login()),
             Ok(None) => {}
             Err(_) => return None,
         }
-        let (_, token) = self.resolve_share_credential(actor).ok()?;
+        if effective.mode == ShareIdentityMode::Personal {
+            // A status asks this on every read, so a token that is not there is
+            // not looked for again each time.
+            let agent = self
+                .config
+                .read()
+                .unwrap()
+                .github_agent_identity()
+                .map(str::to_string);
+            let name = self.acting_identity_name(actor, agent).ok()?;
+            let token = self.personal_token_for_report(&name)?;
+            return Some(token.user_display().map(str::to_string));
+        }
+        let (_, token) = self
+            .resolve_share_credential_in(actor, effective.mode)
+            .ok()?;
         Some(token.user_display().map(str::to_string))
+    }
+
+    /// [`Engine::resolve_share_credential_in`] on the mode in effect, for the
+    /// tests that exercise its matrix.
+    #[cfg(test)]
+    pub(super) fn resolve_share_credential(
+        &self,
+        actor: &ShareActor,
+    ) -> Result<(Option<String>, StoredToken)> {
+        let mode = self.share_identity_loaded().mode;
+        self.resolve_share_credential_in(actor, mode)
     }
 
     /// The personal identity a share by `actor` runs under when it goes out
     /// on a GitHub App user token: in `personal` mode with a usable App. That
     /// token is renewed before use ([`Engine::personal_user_token`]); without
     /// an App, or with one that cannot be used, the personal credential is
-    /// read as before ([`Engine::resolve_share_credential`]).
-    fn personal_app_identity(&self, actor: &ShareActor) -> Result<Option<String>> {
+    /// read as before ([`Engine::resolve_share_credential_in`]).
+    fn personal_app_identity(
+        &self,
+        actor: &ShareActor,
+        effective: EffectiveShareIdentity,
+    ) -> Result<Option<String>> {
         let agent_identity = self
             .config
             .read()
             .unwrap()
             .github_agent_identity()
             .map(str::to_string);
-        if self.share_identity_loaded().mode != ShareIdentityMode::Personal
+        if effective.mode != ShareIdentityMode::Personal
             || !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
         {
             return Ok(None);
@@ -4070,8 +4105,10 @@ impl Engine {
     /// when `personal` is only the default: telling a person to link GitHub
     /// through an App that cannot link anybody would send them nowhere. An
     /// admin who set `personal` by name keeps the personal credential.
-    fn instance_share_app(&self) -> Result<Option<Arc<github_app::AppRouter>>> {
-        let effective = self.share_identity_loaded();
+    fn instance_share_app(
+        &self,
+        effective: EffectiveShareIdentity,
+    ) -> Result<Option<Arc<github_app::AppRouter>>> {
         match self.github_app_slot() {
             github_app::AppSlot::Refused(detail)
                 if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
@@ -4093,9 +4130,10 @@ impl Engine {
     /// mechanical, and because a `reqwest` client build loads the platform
     /// trust store, which is slow enough to be worth keeping out of the tests
     /// that exercise this matrix.
-    pub(super) fn resolve_share_credential(
+    fn resolve_share_credential_in(
         &self,
         actor: &ShareActor,
+        mode: ShareIdentityMode,
     ) -> Result<(Option<String>, StoredToken)> {
         let (api_url, agent_identity) = {
             let config = self.config.read().unwrap();
@@ -4104,7 +4142,7 @@ impl Engine {
                 config.github_agent_identity().map(str::to_string),
             )
         };
-        let identity = match self.share_identity_loaded().mode {
+        let identity = match mode {
             ShareIdentityMode::Instance => TokenIdentity::Instance,
             ShareIdentityMode::Personal => {
                 TokenIdentity::Personal(self.acting_identity_name(actor, agent_identity)?)
@@ -4258,11 +4296,10 @@ impl Engine {
     /// than failing the whole status read: this is a report, and every other
     /// line of it survives an unreadable credential store.
     ///
-    /// The cost, stated rather than hidden: only a PRESENT token is cached
-    /// ([`Engine::github_credential_for`]), so an instance in personal mode
-    /// whose owner has connected nothing pays one credential-store read per
-    /// `origin status` - deliberate, since it is also what lets a standalone
-    /// `crystalline connect github --personal` be seen without a restart.
+    /// A token that is not there is looked for at most once per
+    /// [`TOKEN_MISSING_FOR`] ([`Engine::personal_token_for_report`]), so a
+    /// standalone `crystalline connect github --personal` is seen when it tells
+    /// the daemon, or at the latest when that memory runs out.
     async fn origin_status_connection(&self) -> Result<Value> {
         let mut connection = self.origin_connection_json().await?;
         let agent = self
@@ -4323,12 +4360,7 @@ impl Engine {
                 Value::Null,
             )
         } else {
-            let identity = TokenIdentity::Personal(account.to_string());
-            let host = self.github_token_host();
-            let token = self
-                .github_credential_for(&identity, host.as_deref())
-                .ok()
-                .and_then(|(_store, token)| token);
+            let token = self.personal_token_for_report(account);
             (
                 token.is_some(),
                 json!(token.as_ref().and_then(|t| t.user_display())),
@@ -4339,6 +4371,50 @@ impl Engine {
             "connected": connected,
             "user": user,
         })
+    }
+
+    /// One personal token for a status read, which asks on every poll: a token
+    /// the store just did not have is remembered as missing for
+    /// [`TOKEN_MISSING_FOR`], so a server whose owner never connected does not
+    /// read the store each time. A saved token is in the cache and wins at once,
+    /// and the CLI tells a running daemon about a token it wrote
+    /// (`forget_cached_credential`). The write paths never read this memory.
+    pub(super) fn personal_token_for_report(&self, account: &str) -> Option<StoredToken> {
+        let identity = TokenIdentity::Personal(account.to_string());
+        let host = self.github_token_host();
+        let key = credential_cache_key(&identity, host.as_deref());
+        if let Some(cached) = self.github_tokens.lock().unwrap().get(&key) {
+            return Some(cached.token.clone());
+        }
+        let now = (self.app_clock)();
+        let remembered = self
+            .github_tokens_missing
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|at| now.saturating_duration_since(*at) < TOKEN_MISSING_FOR);
+        if remembered {
+            return None;
+        }
+        // A store that cannot be read is not remembered: it may answer next.
+        let (_store, token) = self
+            .github_credential_for(&identity, host.as_deref())
+            .ok()?;
+        let mut missing = self.github_tokens_missing.lock().unwrap();
+        if token.is_none() {
+            missing.insert(key, now);
+        } else {
+            missing.remove(&key);
+        }
+        token
+    }
+
+    /// Forgets every remembered missing token whose key starts with `prefix`.
+    pub(super) fn forget_token_missing(&self, prefix: &str) {
+        self.github_tokens_missing
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(prefix));
     }
 
     /// The INSTANCE GitHub token store for `host` and the token it holds -

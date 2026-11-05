@@ -150,6 +150,11 @@ pub async fn list(
                     super::domains_admin::require_share_role_on(&state, &identity, name)
                         .await
                         .is_ok()
+                        // What the share route asks next, so the row promises
+                        // only what the route serves.
+                        && crate::require_domain_write(&state, &identity, name)
+                            .await
+                            .is_ok()
                         // An archived repository takes no share at all.
                         && state.engine.github_archived_repo(name).is_none()
                 }

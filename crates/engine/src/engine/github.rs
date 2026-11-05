@@ -912,6 +912,7 @@ impl Engine {
             .lock()
             .unwrap()
             .retain(|key, _| !key.starts_with(&prefix));
+        self.forget_token_missing(&prefix);
         self.clear_pending_for(&identity);
         // The CLI sends this when it removes an account, so a single-use
         // link that account still holds goes with it.
@@ -1291,6 +1292,40 @@ impl Engine {
                 );
                 false
             }
+        }
+    }
+
+    /// An account was removed: its personal GitHub token goes with it, so an
+    /// account made later under the same name cannot write on it. The token is
+    /// revoked at GitHub when an App can do that, deleted where it lives, and
+    /// every cached slot, device flow and single-use link of the name dropped.
+    ///
+    /// Best effort in every direction, because the account is already gone: a
+    /// failure is logged, never a refusal of the removal. A name no credential
+    /// can be addressed by never had one. `crystalline users remove` does the
+    /// same in the CLI process and tells a running daemon over the control
+    /// socket (`sweep_personal_credential`), without the revoke.
+    pub async fn forget_removed_account(&self, account: &str) {
+        let Ok(identity) = personal_identity(account) else {
+            return;
+        };
+        let host = self.github_token_host();
+        match self.github_credential_for(&identity, host.as_deref()) {
+            Ok((_, Some(token))) => {
+                if matches!(self.github_app_slot(), super::github_app::AppSlot::Ready(_)) {
+                    self.revoke_user_token(account, &token).await;
+                }
+            }
+            Ok((_, None)) => {}
+            Err(e) => tracing::warn!("the GitHub token of {account} could not be read: {e}"),
+        }
+        if let Err(e) = self.forget_personal_token(&identity, host.as_deref()) {
+            tracing::warn!(
+                "the GitHub token of the removed account {account} could not be deleted: {e}; an account made under that name would inherit it, so delete it by hand"
+            );
+        }
+        if let Err(e) = self.forget_cached_credential(Some(account)) {
+            tracing::warn!("the cached GitHub token of {account} could not be dropped: {e}");
         }
     }
 

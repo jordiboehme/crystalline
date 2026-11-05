@@ -1619,7 +1619,7 @@ async fn personal_sharing_opens_no_governed_domain_beyond_github() {
         }
         assert_eq!(fx.eng.share_identity_mode().as_str(), "personal");
         let routes = [
-            (reqwest::Method::GET, "sync".to_string(), None),
+            (reqwest::Method::GET, "sync/changes".to_string(), None),
             (
                 reqwest::Method::POST,
                 "sync/share".to_string(),
@@ -1754,10 +1754,21 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             "{commit}"
         );
     }
-    // The three share reads beside them: a GitHub writer passes the gate, a
-    // GitHub reader does not.
+    // The share reads beside them: a GitHub writer passes the gate, a GitHub
+    // reader does not. The report itself a reader may read, with `may_share`
+    // false.
     let vwrite = login(fx.addr, "vwrite").await.unwrap();
     let gread = login(fx.addr, "gread").await.unwrap();
+    let (status, report) = send(
+        &fx,
+        Some(&gread),
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{SHARED}/sync"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["may_share"], false, "{report}");
     for path in [
         format!("/api/v1/domains/{SHARED}/sync"),
         format!("/api/v1/domains/{SHARED}/sync/changes"),
@@ -1768,6 +1779,9 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             ![401, 403].contains(&status),
             "vwrite passes the gate of {path}: {status} {answer}"
         );
+        if path.ends_with("/sync") {
+            continue;
+        }
         let (status, answer) = send(&fx, Some(&gread), reqwest::Method::GET, &path, None).await;
         assert_eq!(status, 403, "a GitHub reader is refused {path}: {answer}");
     }
@@ -2068,14 +2082,14 @@ async fn the_listing_says_per_domain_what_the_write_and_share_routes_serve() {
                 &fx,
                 session.as_ref(),
                 reqwest::Method::GET,
-                &format!("/api/v1/domains/{d}/sync"),
+                &format!("/api/v1/domains/{d}/sync/changes"),
                 None,
             )
             .await;
             let served = ![401, 403].contains(&status);
             if row["may_share"] != json!(served) {
                 wrong.push(format!(
-                    "{who} / {d}: may_share {} but the sync route answered {status}",
+                    "{who} / {d}: may_share {} but the share gate answered {status}",
                     row["may_share"]
                 ));
             }

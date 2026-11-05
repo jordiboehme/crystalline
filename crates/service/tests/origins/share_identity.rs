@@ -16,10 +16,10 @@ use crystalline_core::config::{AuthConfig, GitHubConfig, GlobalConfig, ServiceCo
 use crystalline_index::TursoStore;
 use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError, UserTokenGrant};
 use crystalline_service::daemon::http_router;
-use crystalline_service::engine::{ConfigureAction, EngineError, ShareActor};
+use crystalline_service::engine::{ConfigureAction, EngineError, Invalidate, ShareActor};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{DomainAccess, Engine, EnvOverlay, Scope};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::github_app::{
@@ -48,6 +48,7 @@ fn expected_personal(app: App, key: Option<&str>) -> bool {
 struct Case {
     forge: Arc<Forge>,
     eng: Arc<Engine>,
+    auth: Arc<AuthStore>,
     addr: std::net::SocketAddr,
     tmp: tempfile::TempDir,
 }
@@ -69,6 +70,19 @@ fn credentials(host: &str) -> AppCredentials {
 /// and `vic` (viewer), and the JSON API served. A refused App is a saved App
 /// for another host from the moment the domain is connected on.
 async fn case(app: App, key: Option<&str>) -> Case {
+    case_with_clock(
+        app,
+        key,
+        Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+    )
+    .await
+}
+
+async fn case_with_clock(
+    app: App,
+    key: Option<&str>,
+    now: Arc<std::sync::Mutex<std::time::Instant>>,
+) -> Case {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (forge, url) = spawn_forge(
@@ -110,7 +124,8 @@ async fn case(app: App, key: Option<&str>) -> Case {
     .with_origins_dir(root.join("origins"))
     .with_state_dir(root.to_path_buf())
     .with_token_store_dir(root.join("tokens"))
-    .with_env_overlay(overlay);
+    .with_env_overlay(overlay)
+    .with_app_clock(Arc::new(move || *now.lock().unwrap()));
     let broken = Arc::new(AtomicBool::new(false));
     if app != App::None {
         let host = url.trim_start_matches("http://").to_string();
@@ -156,7 +171,9 @@ async fn case(app: App, key: Option<&str>) -> Case {
             .await
             .unwrap();
     }
-    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth.clone()).with_governor(eng.knowledge_governor()),
+    ));
     let router = http_router(
         eng.clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -180,6 +197,7 @@ async fn case(app: App, key: Option<&str>) -> Case {
     Case {
         forge,
         eng,
+        auth,
         addr,
         tmp,
     }
@@ -264,9 +282,12 @@ async fn the_share_gate_follows_the_mode_in_every_cell() {
             let fx = case(app, key).await;
             let personal = expected_personal(app, key);
             assert!(can_share(&fx, "root").await, "admin, {app:?} by {key:?}");
+            // A refused App refuses every share when personal is only the
+            // default, so the role answer would promise what the share refuses.
+            let editor = personal && !(app == App::Refused && key.is_none());
             assert_eq!(
                 can_share(&fx, "ada").await,
-                personal,
+                editor,
                 "editor, {app:?} by {key:?}"
             );
             assert!(!can_share(&fx, "vic").await, "viewer, {app:?} by {key:?}");
@@ -479,4 +500,418 @@ async fn the_settings_row_shows_the_effective_value_and_where_it_comes_from() {
     assert_eq!(row["value"], "personal", "{row}");
     assert_eq!(row["source"], "default", "{row}");
     assert_eq!(fx.eng.share_identity_mode().as_str(), "personal");
+}
+
+// --- the JSON API with the gate in the path ------------------------------------
+
+async fn rest(
+    fx: &Case,
+    session: Option<&(String, String)>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut request = with_session(
+        client().request(method, format!("http://{}{path}", fx.addr)),
+        session,
+    );
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let resp = request.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+const SHARE: &str = "/api/v1/domains/kb/sync/share";
+const ADA_GH: u64 = 1001;
+
+/// Gives `ada` the token `ghu_ada`: linked through the App with GitHub write,
+/// or connected as a personal token with no App.
+async fn give_ada_a_token(fx: &Case, app: App) {
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("ghu_ada".to_string(), (ADA_GH, "ada-gh".to_string()));
+    fx.forge.collaborators.lock().unwrap().insert(
+        "acme/kb".to_string(),
+        vec![json!({"id": ADA_GH, "login": "ada-gh", "role_name": "write"})],
+    );
+    if app == App::None {
+        crystalline_remote::TokenStore::file_fallback_for(
+            &crystalline_remote::TokenIdentity::Personal("ada".to_string()),
+            &fx.tmp.path().join("tokens"),
+        )
+        .unwrap()
+        .save(&stored("ghu_ada"))
+        .unwrap();
+    } else {
+        fx.eng.link_github("ada", grant("ghu_ada")).await.unwrap();
+    }
+    fx.eng.invalidate_github_access(Invalidate::All);
+}
+
+fn stored(token: &str) -> crystalline_remote::StoredToken {
+    crystalline_remote::StoredToken {
+        access_token: token.to_string(),
+        host: "github.com".to_string(),
+        user: format!("{token}-gh"),
+        created_at: Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
+    }
+}
+
+fn change(fx: &Case, name: &str) {
+    std::fs::write(
+        fx.tmp.path().join("kb/notes").join(format!("{name}.md")),
+        engram(name, name, "more content"),
+    )
+    .unwrap();
+}
+
+fn token_files(fx: &Case) -> Vec<String> {
+    std::fs::read_dir(fx.tmp.path().join("tokens"))
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| name.contains("ada"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A new person under a removed account's name never writes on that account's
+/// token: the token and its cache entry go with the account. Through the JSON
+/// API, the old person's real share first so the cache is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_account_under_a_freed_name_never_writes_on_the_old_token() {
+    for (app, key) in [(App::Ready, None), (App::None, Some("personal"))] {
+        for role in [Role::Admin, Role::Editor] {
+            let label = format!("{app:?} by {key:?}, new {role:?}");
+            let fx = case(app, key).await;
+            give_ada_a_token(&fx, app).await;
+            let old = login(fx.addr, "ada").await.unwrap();
+            let (status, answer) = rest(
+                &fx,
+                Some(&old),
+                reqwest::Method::POST,
+                SHARE,
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(status, 200, "{label}: the old person shares: {answer}");
+            let before = writes(&fx.forge);
+            assert!(
+                !before.is_empty() && before.iter().all(|a| *a == bearer("ghu_ada")),
+                "{label}: {before:?}"
+            );
+
+            let root = login(fx.addr, "root").await.unwrap();
+            let (status, answer) = rest(
+                &fx,
+                Some(&root),
+                reqwest::Method::DELETE,
+                "/api/v1/users/ada",
+                None,
+            )
+            .await;
+            assert_eq!(status, 204, "{label}: {answer}");
+            assert_eq!(token_files(&fx), Vec::<String>::new(), "{label}");
+            if app == App::Ready {
+                let revokes = fx.forge.revokes.lock().unwrap().clone();
+                assert_eq!(revokes.len(), 1, "{label}: revoked at GitHub: {revokes:?}");
+                assert_eq!(revokes[0].1, "ghu_ada", "{label}");
+            }
+
+            fx.auth
+                .add_user("ada", "Another Ada", None, role, PASSWORD)
+                .await
+                .unwrap();
+            change(&fx, "other");
+            let new = login(fx.addr, "ada").await.unwrap();
+            let (status, answer) = rest(
+                &fx,
+                Some(&new),
+                reqwest::Method::POST,
+                SHARE,
+                Some(json!({})),
+            )
+            .await;
+            assert_ne!(status, 200, "{label}: {answer}");
+            assert_eq!(writes(&fx.forge), before, "{label}: nothing new went out");
+        }
+    }
+}
+
+/// An unlinked editor on a governed domain reads the report with `may_share`
+/// false, so a dialog can show the link fix, and the refusal names the link in
+/// words with no command line and no config key. Writes stay closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlinked_person_reads_the_report_and_is_told_to_link() {
+    let fx = case(App::Ready, None).await;
+    let ada = login(fx.addr, "ada").await.unwrap();
+    let (status, report) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["may_share"], false, "{report}");
+    assert_eq!(
+        report["connection"]["share_identity"], "personal",
+        "{report}"
+    );
+
+    let (status, refusal) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::POST,
+        SHARE,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 403, "{refusal}");
+    let detail = refusal["detail"].as_str().unwrap();
+    assert!(detail.contains("link"), "{detail}");
+    assert!(detail.contains("profile"), "{detail}");
+    assert!(
+        !detail.contains("crystalline "),
+        "no command line: {detail}"
+    );
+    assert!(!detail.contains("github."), "no config key: {detail}");
+    assert!(!detail.contains("membership"), "{detail}");
+    for (method, path, body) in [
+        (
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/sync/changes",
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/domains/kb/sync/proposals/1/withdraw",
+            Some(json!({})),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/domains/kb/sync/conflicts/nope/resolve",
+            Some(json!({ "resolution": "theirs" })),
+        ),
+    ] {
+        let (status, answer) = rest(&fx, Some(&ada), method, path, body).await;
+        assert_eq!(status, 403, "{path}: {answer}");
+    }
+    assert!(writes(&fx.forge).is_empty());
+
+    // Once linked with GitHub write, the same person may share.
+    give_ada_a_token(&fx, App::Ready).await;
+    let (status, report) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["may_share"], true, "{report}");
+
+    // Nobody signed in, and no App: nothing opened.
+    let (status, answer) = rest(
+        &fx,
+        None,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        None,
+    )
+    .await;
+    assert_eq!(status, 401, "{answer}");
+    let plain = case(App::None, None).await;
+    let ada = login(plain.addr, "ada").await.unwrap();
+    let (status, answer) = rest(
+        &plain,
+        Some(&ada),
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "no App changes nothing: {answer}");
+}
+
+/// A fresh engine with an App saved and the slot not read: the share loads it
+/// before it decides, so a linked person's write never goes out through the App.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_loads_the_app_before_it_decides() {
+    let fx = case(App::Ready, None).await;
+    give_ada_a_token(&fx, App::Ready).await;
+    fx.eng.reset_github_app();
+    let answer = share_as_ada(&fx.eng).await.unwrap();
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let all = writes(&fx.forge);
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|a| *a == bearer("ghu_ada")), "{all:?}");
+}
+
+/// What names a config key or the machine owner's connection is an admin's:
+/// the two status routes leave it out for anybody else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_admin_reads_the_reason_and_the_owner_slot() {
+    let fx = case(App::Ready, Some("personal")).await;
+    give_ada_a_token(&fx, App::Ready).await;
+    for (name, admin) in [("ada", false), ("root", true)] {
+        let session = login(fx.addr, name).await.unwrap();
+        for path in ["/api/v1/sync", "/api/v1/domains/kb/sync"] {
+            let (status, answer) =
+                rest(&fx, Some(&session), reqwest::Method::GET, path, None).await;
+            assert_eq!(status, 200, "{name} {path}: {answer}");
+            let connection = &answer["connection"];
+            assert_eq!(connection["share_identity"], "personal", "{connection}");
+            assert_eq!(connection["share_identity_default"], false, "{connection}");
+            for key in ["share_identity_reason", "owner_identity"] {
+                assert_eq!(
+                    connection.get(key).is_some(),
+                    admin,
+                    "{name} {path} {key}: {connection}"
+                );
+            }
+        }
+    }
+}
+
+/// The row asks what the route asks: no App, explicit personal, an editor off
+/// the write list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_listing_row_says_what_the_share_route_serves() {
+    let fx = case(App::None, Some("personal")).await;
+    let ada = login(fx.addr, "ada").await.unwrap();
+    let row = |listing: &Value| {
+        listing["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "kb")
+            .unwrap()["may_share"]
+            .clone()
+    };
+    let (_, listing) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::GET,
+        "/api/v1/domains",
+        None,
+    )
+    .await;
+    assert_eq!(row(&listing), true, "{listing}");
+    fx.auth
+        .set_write_list("ada", &["elsewhere".to_string()])
+        .await
+        .unwrap();
+    let (_, listing) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::GET,
+        "/api/v1/domains",
+        None,
+    )
+    .await;
+    assert_eq!(row(&listing), false, "{listing}");
+    let (status, answer) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::POST,
+        SHARE,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 403, "{answer}");
+}
+
+/// A status read does not ask the store again for a token it just did not find,
+/// and a token saved here is seen at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_read_remembers_a_missing_token_for_a_short_time() {
+    let now = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let fx = case_with_clock(App::Ready, None, now.clone()).await;
+    let owner = async |fx: &Case| {
+        fx.eng
+            .origin_status(None, false, false, &Scope::Unrestricted)
+            .await
+            .unwrap()["connection"]["owner_identity"]["connected"]
+            .clone()
+    };
+    assert_eq!(owner(&fx).await, false);
+    // Another process writes the token and nobody says so: not seen yet.
+    let store = crystalline_remote::TokenStore::file_fallback_for(
+        &crystalline_remote::TokenIdentity::Personal("owner".to_string()),
+        &fx.tmp.path().join("tokens"),
+    )
+    .unwrap();
+    store.save(&stored("ghu_owner")).unwrap();
+    assert_eq!(owner(&fx).await, false, "remembered");
+    // Being told ends it, as the CLI tells a daemon.
+    fx.eng.forget_cached_credential(Some("owner")).unwrap();
+    assert_eq!(owner(&fx).await, true, "told");
+
+    // And time ends it.
+    fx.eng.forget_cached_credential(Some("owner")).unwrap();
+    store.delete().unwrap();
+    assert_eq!(owner(&fx).await, false);
+    store.save(&stored("ghu_owner")).unwrap();
+    *now.lock().unwrap() += std::time::Duration::from_secs(120);
+    assert_eq!(owner(&fx).await, true, "the memory ran out");
+
+    // A person's link is seen at once.
+    let status_for_ada = fx.eng.github_link_status("ada").await.unwrap();
+    assert!(!status_for_ada.linked);
+    assert!(share_as_ada(&fx.eng).await.is_err());
+    give_ada_a_token(&fx, App::Ready).await;
+    assert_eq!(share_as_ada(&fx.eng).await.unwrap()["outcome"], "proposed");
+}
+
+/// Amending and withdrawing in the default mode go out on the person's token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn amend_and_withdraw_by_default_run_on_the_persons_token() {
+    let fx = case(App::Ready, None).await;
+    give_ada_a_token(&fx, App::Ready).await;
+    let ada = login(fx.addr, "ada").await.unwrap();
+    let (status, shared) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::POST,
+        SHARE,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 200, "{shared}");
+    let number = shared["number"].as_u64().unwrap();
+    change(&fx, "amended");
+    let (status, amended) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::POST,
+        SHARE,
+        Some(json!({ "proposal": number })),
+    )
+    .await;
+    assert_eq!(status, 200, "{amended}");
+    assert_eq!(amended["outcome"], "updated", "{amended}");
+    let (status, withdrawn) = rest(
+        &fx,
+        Some(&ada),
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/kb/sync/proposals/{number}/withdraw"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 200, "{withdrawn}");
+    let all = writes(&fx.forge);
+    assert!(all.len() > 3, "{all:?}");
+    assert!(all.iter().all(|a| *a == bearer("ghu_ada")), "{all:?}");
 }

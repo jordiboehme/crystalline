@@ -72,13 +72,36 @@ pub(crate) async fn require_share_role_on(
     match role {
         Ok(caller) if identity.require_admin().is_ok() => Ok(caller),
         Ok(_) => crate::require_domain_write(state, identity, domain).await,
+        // The refusal that names the link comes only after the domain was found
+        // readable, so it says nothing about a domain the caller may not see.
         Err(e) if e.status == axum::http::StatusCode::FORBIDDEN => {
             crate::require_domain_write(state, identity, domain)
                 .await
-                .map_err(|_| e)
+                .map_err(|refused| {
+                    if refused.detail == crate::LINK_GITHUB_TO_WRITE {
+                        refused
+                    } else {
+                        e
+                    }
+                })
         }
         Err(e) => Err(e),
     }
+}
+
+/// What a status route leaves out of the `connection` block for a non-admin: the
+/// reason names a setting, and the owner's and the agent's slots are about who
+/// else this instance shares as. The mode stays, because the share surfaces
+/// branch on it.
+fn connection_for(identity: &Identity, mut connection: Value) -> Value {
+    if identity.require_admin().is_err()
+        && let Value::Object(map) = &mut connection
+    {
+        map.remove("share_identity_reason");
+        map.remove("owner_identity");
+        map.remove("agent_identity");
+    }
+    connection
 }
 
 /// Refuse a share surface that changes something (the preview, the share,
@@ -913,6 +936,13 @@ fn single_domain(
                            yours`. It is null when the request carries no \
                            session account or the domain's origin state cannot \
                            be read, which is a different thing from zero; \
+                           `may_share` says whether this caller may share here: \
+                           on a domain GitHub governs, an account that may read \
+                           the domain gets this report with `may_share` false \
+                           when it may not share, so a client can say what is \
+                           missing (often only a GitHub link). In `connection`, \
+                           `share_identity_reason`, `owner_identity` and \
+                           `agent_identity` are for an instance admin only; \
                            `probe_error` is set when the live check could not \
                            reach GitHub and the rest of the report came from \
                            local state alone; `connection.connected` is false \
@@ -1051,8 +1081,26 @@ pub async fn sync_status(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     // The share verbs' own gate: whoever may share reads the report they would
-    // be sharing into. See the doc comment.
-    let caller = require_share_role_on(&state, &identity, &domain).await?;
+    // be sharing into. See the doc comment. On a domain GitHub governs an account
+    // that may read the domain reads it too, with `may_share` false, so a share
+    // dialog can say what is missing: often only a GitHub link. Every share verb
+    // stays closed to it. Where GitHub does not govern, nothing changes.
+    let (caller, may_share) = match require_share_role_on(&state, &identity, &domain).await {
+        Ok(caller) => (caller, true),
+        Err(e) if e.status == StatusCode::FORBIDDEN && state.access.governs(&domain) => {
+            let Ok(account) = identity.require_account() else {
+                return Err(e);
+            };
+            if require_domain_read(&state, &identity, &domain)
+                .await
+                .is_err()
+            {
+                return Err(e);
+            }
+            (Caller::Account(account), false)
+        }
+        Err(e) => return Err(e),
+    };
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -1086,8 +1134,12 @@ pub async fn sync_status(
     // degraded: `connected: false` is "connect GitHub", while a set
     // `probe_error` on a connected instance is "could not reach it".
     if let Some(connection) = connection {
-        report.insert("connection".to_string(), connection);
+        report.insert(
+            "connection".to_string(),
+            connection_for(&identity, connection),
+        );
     }
+    report.insert("may_share".to_string(), Value::from(may_share));
     Ok(Json(Value::Object(report)))
 }
 
@@ -1286,7 +1338,10 @@ pub async fn sync_summary(
         domains.push(summarize_origin_domain(entry, owned));
     }
     Ok(Json(serde_json::json!({
-        "connection": aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        "connection": connection_for(
+            &identity,
+            aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        ),
         "domains": domains,
         "errors": aggregate
             .get("errors")
