@@ -1168,7 +1168,7 @@ async fn a_401_mid_share_renews_the_installation_token_once() {
         &[(1, "ghs_test")],
     )
     .await;
-    let eng = engine(tmp.path(), &url, &app_env()).await;
+    let eng = engine(tmp.path(), &url, &instance_share_env()).await;
     let root = tmp.path().join("kb");
     connect(&eng, "acme/kb", "kb", &root).await;
     std::fs::create_dir_all(root.join("notes")).unwrap();
@@ -1205,8 +1205,16 @@ async fn a_401_mid_share_renews_the_installation_token_once() {
     );
 }
 
+/// [`app_env`] on an instance whose admin chose that the App opens proposals:
+/// without the key an App means every person shares on their own identity.
+fn instance_share_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = app_env();
+    env.push(("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "instance"));
+    env
+}
+
 /// A connected `kb` domain on an App instance with one new engram waiting
-/// to be shared.
+/// to be shared, the App opening the proposals.
 async fn app_share_setup(tmp: &Path) -> (Arc<Forge>, Engine) {
     let mock = repo_with_manifest("");
     let (forge, url) = spawn_forge(
@@ -1215,7 +1223,7 @@ async fn app_share_setup(tmp: &Path) -> (Arc<Forge>, Engine) {
         &[(1, "ghs_test")],
     )
     .await;
-    let eng = engine(tmp, &url, &app_env()).await;
+    let eng = engine(tmp, &url, &instance_share_env()).await;
     let root = tmp.join("kb");
     connect(&eng, "acme/kb", "kb", &root).await;
     std::fs::create_dir_all(root.join("notes")).unwrap();

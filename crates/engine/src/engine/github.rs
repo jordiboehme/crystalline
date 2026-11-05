@@ -322,8 +322,12 @@ impl Engine {
     /// ([`settings::agent_snapshot`]); the CLI reads the full
     /// [`settings::snapshot`] through `ConfigureAction::Show`.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
-        let file = self.file_config.read().unwrap();
-        Ok(json!({ "settings": settings::agent_snapshot(&file, &self.overlay), "github": github }))
+        let views = {
+            let file = self.file_config.read().unwrap();
+            settings::agent_snapshot(&file, &self.overlay)
+        };
+        let views = settings::with_effective_share_identity(views, self.share_identity_effective());
+        Ok(json!({ "settings": views, "github": github }))
     }
 
     /// The `configure` tool's plain snapshot: every setting an agent may

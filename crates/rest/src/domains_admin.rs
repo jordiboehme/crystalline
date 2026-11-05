@@ -54,17 +54,25 @@ fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, 
 /// GitHub governs the share follows the same right as a save (R27): the
 /// GitHub role and the write list decide through `require_domain_write`,
 /// whatever the instance role and the share mode say, and the engine's own
-/// checks on the share stay as they are. A caller that also fails that gets
-/// the share role's own refusal, so a governed domain it may not see
-/// answers as every other domain does here.
+/// checks on the share stay as they are. Only an instance admin keeps the role
+/// gate there. Personal mode lets every instance editor past the role gate, and
+/// that must not let one past GitHub's answer on a governed domain. A caller
+/// the role gate refused and that also fails that gets the share role's own
+/// refusal, so a governed domain it may not see answers as every other domain
+/// does here.
 pub(crate) async fn require_share_role_on(
     state: &RestState,
     identity: &Identity,
     domain: &str,
 ) -> Result<Caller, ApiError> {
-    match require_share_role(state, identity) {
-        Ok(caller) => Ok(caller),
-        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN && state.access.governs(domain) => {
+    let role = require_share_role(state, identity);
+    if !state.access.governs(domain) {
+        return role;
+    }
+    match role {
+        Ok(caller) if identity.require_admin().is_ok() => Ok(caller),
+        Ok(_) => crate::require_domain_write(state, identity, domain).await,
+        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN => {
             crate::require_domain_write(state, identity, domain)
                 .await
                 .map_err(|_| e)

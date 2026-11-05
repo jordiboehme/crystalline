@@ -4615,9 +4615,9 @@ impl Engine {
         self.config.read().unwrap().auth_mcp()
     }
 
-    /// Whose GitHub identity a share on this instance runs as, read live from
-    /// the effective config: `instance` (the default, one credential does
-    /// everything) or `personal` (the acting identity's own).
+    /// Whose GitHub identity a share on this instance runs as, read live:
+    /// `instance` (one credential does everything) or `personal` (the acting
+    /// identity's own). [`Engine::share_identity_effective`] says why.
     ///
     /// Public because it is a fact about the instance that surfaces branch on
     /// before they ever reach a credential - the REST share routes pick their
@@ -4625,7 +4625,7 @@ impl Engine {
     /// one that carries its own accountability), and Fluid renders a different
     /// share dialog.
     pub fn share_identity_mode(&self) -> ShareIdentityMode {
-        self.config.read().unwrap().github_share_identity()
+        self.share_identity_effective().mode
     }
 
     /// The open `subscriptions/listen` streams a moved tool list is announced

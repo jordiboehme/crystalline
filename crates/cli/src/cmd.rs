@@ -2693,11 +2693,15 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
         // No index on this machine yet: the same "nothing synced" report the
         // direct path used to build for an absent database file.
         IndexRoute::Absent(db) => {
-            return Ok(serde_json::json!({
+            let mut report = serde_json::json!({
                 "indexed": false,
                 "db_path": db.display().to_string(),
                 "registered": registered,
-            }));
+            });
+            if let Some(share_identity) = share_identity_report(cfg) {
+                report["share_identity"] = share_identity;
+            }
+            return Ok(report);
         }
         IndexRoute::Unreachable(why) => return Err(index_unreachable("status", &why)),
         // The dispatch renders the daemon's own report and never sends one
@@ -2806,6 +2810,9 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             "lines_eligible": null,
         },
     });
+    if let Some(share_identity) = share_identity_report(cfg) {
+        report["share_identity"] = share_identity;
+    }
     // The daemon's two reflection keys, under its rule: only while a
     // Reflection holds a chunk, so the output stays byte-stable without one.
     if reflection.total_chunks > 0
@@ -2821,6 +2828,46 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
         );
     }
     Ok(report)
+}
+
+/// The `share_identity` block of a direct `status`, as the daemon's report has
+/// it: only where shares exist at all. No engine here and no keychain read on a
+/// status: the App is asked of what is cheap to read.
+fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
+    if !cfg.github_enabled() {
+        return None;
+    }
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    let home = match test_token_store_dir() {
+        Some(dir) => Some(crystalline_service::engine::AppHome::new(
+            api_url, dir, true,
+        )),
+        None => config::origins_state_dir()
+            .ok()
+            .map(|dir| crystalline_service::engine::AppHome::new(api_url, dir, false)),
+    };
+    let app = home.map_or(crystalline_core::config::GithubAppPresence::None, |home| {
+        home.presence(&crystalline_service::EnvOverlay::from_process_env().unwrap_or_default())
+    });
+    let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        app,
+    );
+    Some(serde_json::json!({
+        "mode": share_identity.mode.as_str(),
+        "default": share_identity.is_default(),
+        "reason": share_identity.reason_text(),
+    }))
+}
+
+/// One human line for a report's `share_identity` block, when it has one.
+fn print_share_identity(data: &serde_json::Value) {
+    if let Some(mode) = data["share_identity"]["mode"].as_str() {
+        println!(
+            "Shares run on: {mode} identity ({})",
+            data["share_identity"]["reason"].as_str().unwrap_or("?")
+        );
+    }
 }
 
 /// The one-line reason the contradiction check is not simply "N pairs
@@ -2977,6 +3024,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     use serde_json::Value;
 
     println!("Daemon: {daemon_note}");
+    print_share_identity(data);
     // Only the daemon's own report carries these; a direct index read has no
     // daemon to describe, so the line is absent rather than guessed at. The
     // phrasing says "asked to bind" on purpose: these are the exposure facts
@@ -3045,7 +3093,6 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         data["fts_mode"].as_str().unwrap_or("unknown")
     );
     println!("{}", embeddings_line(&data["embeddings"]));
-
     // What a host move left only on another instance of a shared
     // database: one line per domain, until a walk finds the files or a
     // sync with --accept-disk drops their rows.
@@ -3608,8 +3655,9 @@ pub async fn connect_github(
     // actionable. `github.enabled` is left to the instance connect to hint at:
     // turning collaboration on is an instance-wide decision, not something a
     // person connecting their own identity is making.
+    let share_identity = share_identity_here(&loaded, cfg);
     let personal_mode = matches!(
-        cfg.github_share_identity(),
+        share_identity.mode,
         crystalline_core::config::ShareIdentityMode::Personal
     );
     if json {
@@ -3621,7 +3669,7 @@ pub async fn connect_github(
         if !instance {
             report["identity"] = serde_json::json!("personal");
             report["account"] = serde_json::json!(identity_label(identity));
-            report["share_identity"] = serde_json::json!(cfg.github_share_identity().as_str());
+            report["share_identity"] = serde_json::json!(share_identity.mode.as_str());
         }
         println!("{report}");
     } else if instance {
@@ -3804,8 +3852,13 @@ impl PersonalApp<'_> {
         // A running daemon may hold an older token of this identity in its
         // cache; a relink replaces it.
         let told = notify_daemon_forgot(self.identity).await;
+        // This path runs on the App, so an absent key means personal.
+        let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+            self.cfg.github_share_identity_setting(),
+            crystalline_core::config::GithubAppPresence::Configured,
+        );
         let personal_mode = matches!(
-            self.cfg.github_share_identity(),
+            share_identity.mode,
             crystalline_core::config::ShareIdentityMode::Personal
         );
         if json {
@@ -3815,7 +3868,7 @@ impl PersonalApp<'_> {
                 "github_enabled": self.cfg.github_enabled(),
                 "identity": "personal",
                 "account": identity_label(self.identity),
-                "share_identity": self.cfg.github_share_identity().as_str(),
+                "share_identity": share_identity.mode.as_str(),
                 "github_app": true,
                 "linked": accounts.is_some(),
                 "daemon": told.as_str(),
@@ -5205,6 +5258,22 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
 /// `github.api_url` of `loaded`, and the state directory beside the token
 /// store, or only the file under `token_store_dir` (the test seam, see
 /// [`test_token_store_dir`]).
+/// The share identity mode in effect for this process, which has no engine:
+/// the App is asked of what is cheap to read.
+fn share_identity_here(
+    loaded: &crystalline_service::LoadedConfig,
+    cfg: &GlobalConfig,
+) -> crystalline_core::config::EffectiveShareIdentity {
+    let app = match app_home(loaded, test_token_store_dir().as_deref()) {
+        Ok(home) => home.presence(&loaded.overlay),
+        Err(_) => crystalline_core::config::GithubAppPresence::None,
+    };
+    crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        app,
+    )
+}
+
 fn app_home(
     loaded: &crystalline_service::LoadedConfig,
     token_store_dir: Option<&Path>,

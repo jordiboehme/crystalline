@@ -413,6 +413,10 @@ pub struct GithubDoctor {
     /// a keychain that could not be read). Absent without an App.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AppDoctor>,
+    /// Whose identity shares run on: `instance` or `personal`.
+    pub share_identity: String,
+    /// Why, in words: the key, or the default and what it followed.
+    pub share_identity_reason: String,
 }
 
 /// What `doctor` found out about this instance's GitHub App. No secret is
@@ -4445,12 +4449,22 @@ async fn check_github(
     }
 
     let app = check_github_app(cfg, overlay).await;
+    let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        if app.is_some() {
+            crystalline_core::config::GithubAppPresence::Configured
+        } else {
+            crystalline_core::config::GithubAppPresence::None
+        },
+    );
     // An App GitHub accepts is a connection of its own: reading, pulling and
     // sharing go through it without an instance token.
     let app_connected = app
         .as_ref()
         .is_some_and(|a| a.problem.is_none() && a.jwt_accepted == Some(true));
     Ok(GithubDoctor {
+        share_identity: share_identity.mode.as_str().to_string(),
+        share_identity_reason: share_identity.reason_text().to_string(),
         connected: token.is_some() || app_connected,
         connected_through_app: token.is_none() && app_connected,
         user: token
@@ -5635,6 +5649,11 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(g) = &report.github {
         let _ = writeln!(out, "github:");
+        let _ = writeln!(
+            out,
+            "  shares run on: {} identity ({})",
+            g.share_identity, g.share_identity_reason
+        );
         if g.connected_through_app {
             let _ = writeln!(
                 out,

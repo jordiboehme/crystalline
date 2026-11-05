@@ -2337,9 +2337,7 @@ pub async fn configure(
     // path, so no environment value ever bakes into the saved file.
     let loaded = overlay::load(config_path)?;
     match action {
-        "show" => Ok(json!({
-            "settings": crate::settings::snapshot(&loaded.file, &loaded.overlay)
-        })),
+        "show" => Ok(json!({ "settings": standalone_snapshot(&loaded.file, &loaded.overlay) })),
         "set" => {
             if loaded.effective.read_only() {
                 anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
@@ -2365,6 +2363,27 @@ pub async fn configure(
     }
 }
 
+/// [`crate::settings::snapshot`] with no engine to ask: the App is asked of what
+/// is cheap to read, so the `github.share_identity` row says the mode in effect.
+fn standalone_snapshot(
+    file: &crystalline_core::config::GlobalConfig,
+    overlay: &overlay::EnvOverlay,
+) -> Vec<crate::settings::SettingView> {
+    let effective = overlay.apply(file);
+    let api_url = effective.github.as_ref().and_then(|g| g.api_url.clone());
+    let app = match crystalline_core::config::origins_state_dir() {
+        Ok(dir) => crate::engine::AppHome::new(api_url, dir, false).presence(overlay),
+        Err(_) => crystalline_core::config::GithubAppPresence::None,
+    };
+    crate::settings::with_effective_share_identity(
+        crate::settings::snapshot(file, overlay),
+        crystalline_core::config::EffectiveShareIdentity::resolve(
+            effective.github_share_identity_setting(),
+            app,
+        ),
+    )
+}
+
 /// The just-applied setting's snapshot entry, as a JSON value, with a `note`
 /// field attached when [`crate::settings::change_note`] has one (a
 /// startup-effective reminder, an active env override, or both). `file` is the
@@ -2377,7 +2396,7 @@ fn setting_view(
     key: &str,
     overlay: &overlay::EnvOverlay,
 ) -> Value {
-    crate::settings::snapshot(file, overlay)
+    standalone_snapshot(file, overlay)
         .into_iter()
         .find(|v| v.key == key)
         .map(|v| {

@@ -1591,10 +1591,9 @@ impl Engine {
         // A probe is best-effort: no connection, or a provider that fails to
         // build, must never turn a status call into a hard failure.
         let probe = self.resolve_origin_provider().ok();
-        let settle_owed_link = {
-            let config = self.config.read().unwrap();
-            config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
-        };
+        let stacks = self.config.read().unwrap().github_stacks();
+        let settle_owed_link =
+            stacks && self.share_identity_loaded().mode == ShareIdentityMode::Instance;
         let change_detail = || {
             let mut block = detail
                 .then(|| origin::local_change_detail(&root, &state_dir, reflection))
@@ -3968,8 +3967,11 @@ impl Engine {
     /// false`, so a mode flipped through `configure` is honoured by the very
     /// next share with no restart.
     ///
-    /// - `instance` (the default): byte for byte what the read side does, the
-    ///   one instance credential, whoever the actor is.
+    /// With the key absent the mode follows the App
+    /// ([`Engine::share_identity_effective`]).
+    ///
+    /// - `instance`: byte for byte what the read side does, the one instance
+    ///   credential, whoever the actor is.
     /// - `personal`: the actor's own credential -
     ///   [`ShareActor::Owner`] the fixed `owner` slot, [`ShareActor::Account`]
     ///   that account's, [`ShareActor::HttpAgent`] the account
@@ -4035,14 +4037,13 @@ impl Engine {
     /// an App, or with one that cannot be used, the personal credential is
     /// read as before ([`Engine::resolve_share_credential`]).
     fn personal_app_identity(&self, actor: &ShareActor) -> Result<Option<String>> {
-        let (mode, agent_identity) = {
-            let config = self.config.read().unwrap();
-            (
-                config.github_share_identity(),
-                config.github_agent_identity().map(str::to_string),
-            )
-        };
-        if mode != ShareIdentityMode::Personal
+        let agent_identity = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        if self.share_identity_loaded().mode != ShareIdentityMode::Personal
             || !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
         {
             return Ok(None);
@@ -4062,17 +4063,25 @@ impl Engine {
 
     /// The App a share goes out through, when it goes out through one: in
     /// `instance` mode with an App configured, the same
-    /// [`github_app::AppRouter`] the read side uses, and an unusable App
-    /// refuses. `personal` mode never takes the App: a person's write runs
-    /// on that person's own credential, as before.
+    /// [`github_app::AppRouter`] the read side uses. `personal` mode never
+    /// takes the App: a person's write runs on that person's own credential.
+    ///
+    /// An unusable App refuses with its own reason, in `instance` mode and also
+    /// when `personal` is only the default: telling a person to link GitHub
+    /// through an App that cannot link anybody would send them nowhere. An
+    /// admin who set `personal` by name keeps the personal credential.
     fn instance_share_app(&self) -> Result<Option<Arc<github_app::AppRouter>>> {
-        if self.config.read().unwrap().github_share_identity() != ShareIdentityMode::Instance {
-            return Ok(None);
-        }
+        let effective = self.share_identity_loaded();
         match self.github_app_slot() {
-            github_app::AppSlot::Ready(router) => Ok(Some(router)),
-            github_app::AppSlot::Refused(detail) => Err(github_app::app_refusal(detail)),
-            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => Ok(None),
+            github_app::AppSlot::Refused(detail)
+                if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
+            {
+                Err(github_app::app_refusal(detail))
+            }
+            github_app::AppSlot::Ready(router) if effective.mode == ShareIdentityMode::Instance => {
+                Ok(Some(router))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -4088,15 +4097,14 @@ impl Engine {
         &self,
         actor: &ShareActor,
     ) -> Result<(Option<String>, StoredToken)> {
-        let (api_url, mode, agent_identity) = {
+        let (api_url, agent_identity) = {
             let config = self.config.read().unwrap();
             (
                 config.github.as_ref().and_then(|g| g.api_url.clone()),
-                config.github_share_identity(),
                 config.github_agent_identity().map(str::to_string),
             )
         };
-        let identity = match mode {
+        let identity = match self.share_identity_loaded().mode {
             ShareIdentityMode::Instance => TokenIdentity::Instance,
             ShareIdentityMode::Personal => {
                 TokenIdentity::Personal(self.acting_identity_name(actor, agent_identity)?)
@@ -4128,7 +4136,7 @@ impl Engine {
     /// [`Engine::resolve_share_provider`], one call after it, so the two agree
     /// about which credential the call in flight actually used.
     fn personal_write_login(&self, login: Option<&str>) -> Option<String> {
-        match self.config.read().unwrap().github_share_identity() {
+        match self.share_identity_loaded().mode {
             ShareIdentityMode::Personal => login.map(str::to_string),
             ShareIdentityMode::Instance => None,
         }
@@ -4257,14 +4265,17 @@ impl Engine {
     /// `crystalline connect github --personal` be seen without a restart.
     async fn origin_status_connection(&self) -> Result<Value> {
         let mut connection = self.origin_connection_json().await?;
-        let (mode, agent) = {
-            let config = self.config.read().unwrap();
-            (
-                config.github_share_identity(),
-                config.github_agent_identity().map(str::to_string),
-            )
-        };
+        let agent = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        let effective = self.share_identity_loaded();
+        let mode = effective.mode;
         connection["share_identity"] = json!(mode.as_str());
+        connection["share_identity_default"] = json!(effective.is_default());
+        connection["share_identity_reason"] = json!(effective.reason_text());
         // A configured App that cannot be used refuses every origin
         // operation; this is where the status says why.
         if let github_app::AppSlot::Refused(detail) = self.github_app_slot() {
