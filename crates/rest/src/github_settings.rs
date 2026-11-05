@@ -74,7 +74,8 @@ pub struct GithubStatusResponse {
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "The instance's GitHub App: which App it is, where it \
                         comes from and where an owner installs it. No secret, \
-                        ever: only whether the webhook secret is set.")]
+                        ever: only whether the client secret and the webhook \
+                        secret are set.")]
 pub struct GithubAppView {
     /// The numeric App id, when the App could be read.
     #[schema(example = 123456)]
@@ -85,6 +86,14 @@ pub struct GithubAppView {
     /// keyring | file | environment.
     #[schema(example = "keyring")]
     pub source: Option<String>,
+    /// The App's client id, when the App could be read. Not a secret: it
+    /// goes into the authorize URL of every sign-in.
+    #[schema(example = "Iv23liExample")]
+    pub client_id: Option<String>,
+    /// Whether a client secret is set. Without one nobody can link their
+    /// GitHub account. False while the App is still loading.
+    #[schema(example = true)]
+    pub client_secret_set: bool,
     /// Where an owner installs the App on repositories. Null while the App
     /// cannot be used or its slug is not known yet.
     #[schema(example = "https://github.com/apps/crystalline-kb-example-com/installations/new")]
@@ -100,25 +109,35 @@ pub struct GithubAppView {
     pub loading: bool,
 }
 
+/// The view of a saved App that is still being loaded: nothing is known,
+/// so the client secret reads as not set and no identifier is sent.
+fn loading_view() -> GithubAppView {
+    GithubAppView {
+        app_id: None,
+        slug: None,
+        source: None,
+        client_id: None,
+        client_secret_set: false,
+        install_url: None,
+        webhook_secret_set: false,
+        error: None,
+        loading: true,
+    }
+}
+
 /// The App part of the status, read locally and without waiting for the
 /// App to load: the screen polls this route, so GitHub is never asked here,
 /// and a saved App still loading reads as loading, never as none.
 fn app_view(state: &RestState) -> Option<GithubAppView> {
     match state.engine.github_app_settled_status() {
         crate::engine::SettledApp::None => None,
-        crate::engine::SettledApp::Loading => Some(GithubAppView {
-            app_id: None,
-            slug: None,
-            source: None,
-            install_url: None,
-            webhook_secret_set: false,
-            error: None,
-            loading: true,
-        }),
+        crate::engine::SettledApp::Loading => Some(loading_view()),
         crate::engine::SettledApp::Known(app) => Some(GithubAppView {
             app_id: app.app_id,
             slug: app.slug,
             source: app.source,
+            client_id: app.client_id,
+            client_secret_set: app.client_secret_set,
             install_url: state.engine.github_app_install_url(),
             webhook_secret_set: app.webhook_secret_set,
             error: app.error,
@@ -509,5 +528,14 @@ mod tests {
         let text = format!("{body:?}");
         assert!(!text.contains("ghp_secret"), "{text}");
         assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn an_app_still_loading_reads_as_no_client_secret() {
+        let json = serde_json::to_value(loading_view()).unwrap();
+        assert_eq!(json["loading"], true);
+        assert_eq!(json["client_secret_set"], false);
+        assert!(json["client_id"].is_null());
+        assert!(json["app_id"].is_null());
     }
 }
