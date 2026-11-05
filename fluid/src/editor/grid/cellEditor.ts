@@ -64,11 +64,12 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
-import { deletionOutcome } from "../marks/deleteCheck";
+import { budgetOf, deletionOutcome } from "../marks/deleteCheck";
 import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage, editorHighlight } from "../setup";
 import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
+import { PARSE_BUDGET } from "../marks/parse";
 import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
@@ -986,16 +987,31 @@ function rowUnread(state: EditorState): boolean {
 }
 
 /**
- * When the watchdog fired before the parse reached the row, the cell opens
- * with no marks hidden and no atoms drawn: a delete then could split a
+ * Whether the row stays unread after `budget` milliseconds of parsing: a
+ * tree a reparse left short is no reason to refuse (D35). Reads the parse
+ * itself, as a filter cannot publish it; what judges the edit next parses its
+ * own state.
+ */
+function rowUnreadAfter(state: EditorState, budget: number): boolean {
+  if (!rowUnread(state)) return false;
+  const cell = state.field(rangeField);
+  return ensureSyntaxTree(state, cell.to, budget) === null;
+}
+
+/**
+ * When a press's own parse did not reach the row (its budget, D35, ran out),
+ * the cell has no marks hidden and no atoms drawn: a delete then could split a
  * label or leave a lone mark, and a format command would wrap raw marks.
  * Every delete and every command edit (a bare `input`: the format keys and
  * bar, links, popover commits) is refused, and so is a format waiting for
- * typing, with one sentence each, until the background parse has read the
- * row (D13). The format commands ask first (`formatGate`), so they say it
- * before they read the short tree themselves. Typing or a paste over a selection deletes that selection, so
- * it is refused like a delete (D17). Typing at a caret stays, and so does a
- * composition, which is the browser's to finish.
+ * typing, with one sentence each, until a parse has read the row (D13). A
+ * tree that only stops short (the watchdog at opening, or a reparse after a
+ * document change, which stops after 20 ms) gets its chance first: the press
+ * parses before this reads. The format commands ask first (`formatGate`), so
+ * they say it before they read the short tree themselves. Typing or a paste
+ * over a selection deletes that selection, so it is refused like a delete
+ * (D17). Typing at a caret stays, and so does a composition, which is the
+ * browser's to finish.
  */
 const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
   if (!rowUnread(tr.startState)) return tr;
@@ -1012,6 +1028,14 @@ const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
     (tr.startState.field(pendingFormat, false) ?? null) === null &&
     (tr.state.field(pendingFormat, false) ?? null) !== null;
   if (!command && !waiting) return tr;
+  // The bound the check after this one gets for the same press (D35).
+  const event = tr.annotation(Transaction.userEvent) ?? "";
+  const budget = tr.isUserEvent("delete")
+    ? budgetOf(event)
+    : event === "input.type"
+      ? PARSE_BUDGET.key
+      : PARSE_BUDGET.gesture;
+  if (!rowUnreadAfter(tr.startState, budget)) return tr;
   return {
     selection: tr.startState.selection,
     effects: [

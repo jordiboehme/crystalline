@@ -10,7 +10,7 @@
 
 import { EditorSelection, EditorState, Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   cleanupMarkViews,
@@ -18,7 +18,7 @@ import {
   setCaret,
   setShowMarks,
 } from "../test/markKit";
-import { parsedState } from "../test/parse";
+import { parsedState, parsedView } from "../test/parse";
 import { frontmatterRegion } from "./frontmatterRegion";
 import { hiddenMarkLayer } from "./marks";
 import { marksOnEditLine } from "./marks/mode";
@@ -226,7 +226,10 @@ describe("live preview", () => {
     box?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     // `docText`, never `doc.toString()`: the read-back is the file's bytes.
     expect(docText(view.state)).toContain("- [x] a task");
-    // And back again, off the freshly drawn box.
+    // And back again, off the freshly drawn box. The box is drawn off the
+    // tree, and the reparse of that edit stops after 20 ms of wall clock: on a
+    // loaded machine the box comes with the next parse, which this asks for.
+    parsedView(view);
     const checked = view.dom.querySelector<HTMLInputElement>(
       "input.cm-task-toggle",
     );
@@ -273,6 +276,30 @@ describe("live preview", () => {
       expect(docText(view.state)).toBe(doc);
       view.destroy();
     }
+  });
+});
+
+describe("a checkbox redrawn after a short reparse", () => {
+  it("comes back when the parse catches up, and the bytes are right", () => {
+    const view = editor(DOC, 0);
+    const now = Date.now.bind(Date);
+    let ahead = 0;
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => {
+      ahead += 1_000;
+      return now() + ahead;
+    });
+    view.dom
+      .querySelector<HTMLInputElement>("input.cm-task-toggle")
+      ?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    spy.mockImplementation(() => now() + ahead);
+    expect(docText(view.state)).toContain("- [x] a task");
+    expect(view.dom.querySelector("input.cm-task-toggle")).toBeNull();
+    parsedView(view);
+    expect(
+      view.dom.querySelector<HTMLInputElement>("input.cm-task-toggle")?.checked,
+    ).toBe(true);
+    spy.mockRestore();
+    view.destroy();
   });
 });
 

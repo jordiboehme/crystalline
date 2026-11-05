@@ -719,7 +719,7 @@ export function judgeDeletion(
 }
 
 /** The bound of one press of `event` (D35). */
-function budgetOf(event: string): number {
+export function budgetOf(event: string): number {
   return event === "delete.selection" ||
     event === "delete.cut" ||
     event === "delete.picture"
