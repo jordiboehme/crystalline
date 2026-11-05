@@ -13,11 +13,22 @@
 
 import { describe, expect, test } from "vitest";
 
+import { MERMAID_STARTER_GROUPS } from "../mermaidStarters";
 import { MERMAID_SKELETON } from "../toolbar";
-import { type FlowDbView, flowDbOf } from "./mermaidDb";
+import {
+  type FlowDbView,
+  type SequenceDbView,
+  flowDbOf,
+  sequenceDbOf,
+} from "./mermaidDb";
+import { decodeSeqText, parseSequence } from "./sequence/parse";
 
 const FLOWCHART = import.meta.glob<string>(
   "../fixtures/diagrams/flowchart/*.mmd",
+  { query: "?raw", import: "default", eager: true },
+);
+const SEQUENCE = import.meta.glob<string>(
+  "../fixtures/diagrams/sequence/*.mmd",
   { query: "?raw", import: "default", eager: true },
 );
 const FALLBACK = import.meta.glob<string>(
@@ -45,7 +56,10 @@ function byName(files: Record<string, string>): Map<string, string> {
 const flowcharts = byName(FLOWCHART);
 const fallbacks = byName(FALLBACK);
 const svgs = byName(SVG);
-const corpus = new Map([...flowcharts, ...fallbacks]);
+const sequences = byName(SEQUENCE);
+const corpus = new Map(
+  [...flowcharts, ...fallbacks].filter(([name]) => !name.startsWith("y")),
+);
 
 function fixture(name: string): string {
   const text = corpus.get(name);
@@ -77,7 +91,9 @@ describe("the corpus", () => {
     ]) {
       expect(flowcharts.has(name)).toBe(true);
     }
-    expect([...fallbacks.keys()].sort()).toEqual([
+    expect(
+      [...fallbacks.keys()].filter((n) => n.startsWith("x")).sort(),
+    ).toEqual([
       "x01-multiline-at-shape",
       "x02-multiline-markdown-label",
       "x03-unknown-statement",
@@ -427,4 +443,349 @@ describe("the recorded SVGs agree with the db", () => {
       view.edges.map((e) => e.id).sort(),
     );
   });
+});
+
+async function seqDb(body: string): Promise<SequenceDbView> {
+  const view = await sequenceDbOf(body, false);
+  if ("error" in view) {
+    throw new Error(`mermaid refused: ${String(view.error)}`);
+  }
+  return view;
+}
+
+function sequenceSvg(name: string): HTMLElement {
+  const div = document.createElement("div");
+  div.innerHTML = svgs.get(name) ?? "";
+  return div;
+}
+
+describe("the sequence corpus", () => {
+  test("s01 is the toolbar's Sequence starter, byte for byte", () => {
+    const starter = MERMAID_STARTER_GROUPS.flatMap((g) => g.starters).find(
+      (s) => s.label === "Sequence",
+    );
+    expect(sequences.get("s01-starter")).toBe(
+      `${(starter?.lines ?? []).join("\n")}\n`,
+    );
+  });
+
+  test("every other file carries a whole-line %% comment (R3 keeps s01 as it is)", () => {
+    const sequenceFallbacks = [...fallbacks].filter(([n]) => n.startsWith("y"));
+    expect(sequenceFallbacks.length).toBe(2);
+    for (const [name, text] of [...sequences, ...sequenceFallbacks]) {
+      if (name !== "s01-starter") {
+        expect(/^[ \t]*%%(?!\{)[^\n]+/m.test(text), name).toBe(true);
+      }
+    }
+  });
+
+  test("every file and y01 have a recording, y02 has none", () => {
+    expect([...svgs.keys()].filter((n) => /^[scy]\d/.test(n)).sort()).toEqual(
+      [...sequences.keys(), "y01-unknown-statement"].sort(),
+    );
+  });
+
+  test("mermaid draws y01 and refuses y02", async () => {
+    const drawn = fallbacks.get("y01-unknown-statement") ?? "";
+    expect("error" in (await sequenceDbOf(drawn, false))).toBe(false);
+    const refused = fallbacks.get("y02-mermaid-rejects") ?? "";
+    expect("error" in (await sequenceDbOf(refused, false))).toBe(true);
+  });
+});
+
+describe("mermaid 12.2.0 sequence records", () => {
+  const S = "sequenceDiagram\n";
+  const shape = (view: SequenceDbView) =>
+    view.records.map((r) => [r.id, r.from, r.to, r.type]);
+
+  test("a new db per diagram", async () => {
+    await seqDb(`${S}  A->>B: x`);
+    const view = await seqDb(`${S}  C->>D: y`);
+    expect(view.actors.map((a) => a.name)).toEqual(["C", "D"]);
+    expect(view.records.length).toBe(1);
+  });
+
+  test("the type of each arrow token", async () => {
+    const view = await seqDb(
+      `${S}  A->B: x\n  A-->B: x\n  A->>B: x\n  A-->>B: x\n  A<<->>B: x\n  A<<-->>B: x\n  A-xB: x\n  A--xB: x\n  A-)B: x\n  A--)B: x`,
+    );
+    expect(view.records.map((r) => r.type)).toEqual([
+      5, 6, 0, 1, 33, 34, 3, 4, 24, 25,
+    ]);
+  });
+
+  test("+ adds ACTIVE_START on the receiver, - ACTIVE_END on the sender", async () => {
+    const view = await seqDb(`${S}  A->>+B: x\n  B-->>-A: y`);
+    expect(shape(view)).toEqual([
+      ["0", "A", "B", 0],
+      ["1", "B", undefined, 17],
+      ["2", "B", "A", 1],
+      ["3", "B", undefined, 18],
+    ]);
+  });
+
+  test("activate and deactivate add one record each and declare nobody", async () => {
+    const view = await seqDb(
+      `${S}  participant A\n  activate A\n  deactivate A\n  activate Z`,
+    );
+    expect(view.actors.map((a) => a.name)).toEqual(["A"]);
+    expect(shape(view)).toEqual([
+      ["0", "A", undefined, 17],
+      ["1", "A", undefined, 18],
+      ["2", "Z", undefined, 17],
+    ]);
+  });
+
+  test("a note is a record, with both ends and its placement", async () => {
+    const view = await seqDb(
+      `${S}  Note left of A: l\n  Note right of A: r\n  Note over A,B: o\n  Note over B: p`,
+    );
+    expect(
+      view.records.map((r) => [r.from, r.to, r.type, r.placement]),
+    ).toEqual([
+      ["A", "A", 2, 0],
+      ["A", "A", 2, 1],
+      ["A", "B", 2, 2],
+      ["B", "B", 2, 2],
+    ]);
+  });
+
+  test("autonumber's record has no text and its numbers apart", async () => {
+    const view = await seqDb(
+      `${S}  autonumber 10 5\n  autonumber off\n  autonumber 3\n  autonumber`,
+    );
+    expect(view.records.map((r) => [r.type, r.message, r.autonumber])).toEqual([
+      [26, "", { start: 10, step: 5, visible: true }],
+      [26, "", { visible: false }],
+      [26, "", { start: 3, step: 1, visible: true }],
+      [26, "", { visible: true }],
+    ]);
+  });
+
+  test("every block keyword's records, with the text on the opening ones", async () => {
+    const view = await seqDb(
+      `${S}  rect rgb(1,2,3)\n  end\n  alt a\n  else b\n  end\n  opt o\n  end\n  par p\n  and q\n  end\n  par_over r\n  end\n  critical c\n  option d\n  end\n  break e\n  end\n  loop l\n  end`,
+    );
+    expect(view.records.map((r) => [r.type, r.message])).toEqual([
+      [22, "rgb(1,2,3)"],
+      [23, ""],
+      [12, "a"],
+      [13, "b"],
+      [14, ""],
+      [15, "o"],
+      [16, ""],
+      [19, "p"],
+      [20, "q"],
+      [21, ""],
+      [32, "r"],
+      [21, ""],
+      [27, "c"],
+      [28, "d"],
+      [29, ""],
+      [30, "e"],
+      [31, ""],
+      [10, "l"],
+      [11, ""],
+    ]);
+  });
+
+  test("central connections add one or two records, half arrows have their own types", async () => {
+    const view = await seqDb(
+      `${S}  A->>()B: c\n  A()->>B: d\n  A()->>()B: e\n  A-|\\B: f\n  A--//B: g`,
+    );
+    expect(shape(view)).toEqual([
+      ["0", "A", "B", 0],
+      ["1", "B", undefined, 59],
+      ["2", "A", "B", 0],
+      ["3", "A", undefined, 60],
+      ["4", "A", "B", 0],
+      ["5", "B", undefined, 59],
+      ["6", "A", undefined, 60],
+      ["7", "A", "B", 41],
+      ["8", "A", "B", 54],
+    ]);
+  });
+
+  test("a later declaration without an alias changes neither type nor label", async () => {
+    const view = await seqDb(
+      `${S}  participant A\n  participant A as X\n  participant A\n  actor A\n  B->>A: y\n  actor B as Bee\n  actor C\n  participant C as Sea\n  actor D as E\n  participant D`,
+    );
+    expect(view.actors).toEqual([
+      { name: "A", description: "X", type: "participant" },
+      { name: "B", description: "Bee", type: "actor" },
+      { name: "C", description: "Sea", type: "participant" },
+      { name: "D", description: "E", type: "actor" },
+    ]);
+  });
+
+  test("create and destroy keep the record index of the next message", async () => {
+    const view = await seqDb(
+      `${S}  create actor X as Y\n  A->>X: hi\n  destroy X\n  X-->>A: bye`,
+    );
+    expect(view.created).toEqual([["X", 0]]);
+    expect(view.destroyed).toEqual([["X", 1]]);
+  });
+
+  test("boxes list their members in order", async () => {
+    const view = await seqDb(
+      `${S}  box Aqua x\n  participant A\n  actor B\n  end\n  participant C`,
+    );
+    expect(view.boxes).toEqual([{ actors: ["A", "B"] }]);
+  });
+
+  test("a # cuts a text and a %% stays in it", async () => {
+    const view = await seqDb(`${S}  A->>B: Issue #12 open\n  A->>B: x %% y`);
+    expect(view.records.map((r) => r.message)).toEqual(["Issue", "x %% y"]);
+  });
+
+  test("a bare %%, a single % and a # line are comments, and a %{ is not", async () => {
+    const view = await seqDb(`${S}%%\n% one\n# two\n  A->>B: x`);
+    expect(view.records.length).toBe(1);
+    expect(view.actors.map((a) => a.name)).toEqual(["A", "B"]);
+  });
+
+  test("a name after an ID keyword takes a trailing comment with it", async () => {
+    const view = await seqDb(`${S}  participant A %% y\n  participant B # z`);
+    expect(view.actors.map((a) => a.name)).toEqual(["A %% y", "B # z"]);
+  });
+
+  test("a x%% at a statement's start hides the whole line", async () => {
+    const view = await seqDb(`${S}  A%% y\n  B->>C: x`);
+    expect(view.actors.map((a) => a.name)).toEqual(["B", "C"]);
+  });
+
+  test("a ; ends a statement inside quotes too, unless it is an entity's", async () => {
+    expect("error" in (await sequenceDbOf(`${S}  A->>B: "a;b"`, false))).toBe(
+      true,
+    );
+    const view = await seqDb(`${S}  A->>B: a#59;b; B->>A: c`);
+    expect(view.records.map((r) => r.message)).toEqual([
+      "a\uFB02\xB0\xB059\xB6\xDFb",
+      "c",
+    ]);
+  });
+
+  test("encodeEntities drops a ; here too, so the next statement joins the text", async () => {
+    const view = await seqDb(`${S}  A->>B: style a:x#f00; B->>A: y`);
+    expect(view.records.length).toBe(1);
+  });
+
+  test("keywords go first in any case, ended by a word boundary", async () => {
+    expect(
+      "error" in (await sequenceDbOf(`${S}  end-point->>B: x`, false)),
+    ).toBe(true);
+    const view = await seqDb(`${S}  LOOP l\n  End\n  endpoint->>loopback: x`);
+    expect(view.records.map((r) => r.type)).toEqual([10, 11, 0]);
+    expect(view.actors.map((a) => a.name)).toEqual(["endpoint", "loopback"]);
+  });
+
+  test("a diagram that is no sequence diagram is an error", async () => {
+    const view = await sequenceDbOf("flowchart TD\n  A --> B", false);
+    expect("error" in view).toBe(true);
+    expect(view).not.toHaveProperty("unavailable");
+  });
+
+  test("a wrap prefix is stripped from each text, in lower case only", async () => {
+    const view = await seqDb(
+      `${S}  A->>B:wrap:x\n  A->>B: nowrap: y\n  A->>B: Wrap: z`,
+    );
+    expect(view.records.map((r) => r.message)).toEqual(["x", "y", "Wrap: z"]);
+  });
+});
+
+describe("the recorded sequence SVGs agree with the db", () => {
+  test("s05: the id of every message line is the record of that message", () => {
+    const body = sequences.get("s05-activation") ?? "";
+    const model = parseSequence(body);
+    const drawn = [
+      ...sequenceSvg("s05-activation").querySelectorAll('[data-et="message"]'),
+    ];
+    expect(drawn.map((e) => e.getAttribute("data-id"))).toEqual(
+      model.messages.map((m) => `i${String(m.record)}`),
+    );
+    expect(
+      drawn.map((e) => [
+        e.getAttribute("data-from"),
+        e.getAttribute("data-to"),
+      ]),
+    ).toEqual(model.messages.map((m) => [m.from, m.to]));
+  });
+
+  const recorded = [...sequences.keys()];
+
+  test.each(recorded)(
+    "%s: messages, participants, life lines, notes and blocks",
+    async (name) => {
+      const body = sequences.get(name) ?? "";
+      const model = parseSequence(body);
+      const view = await seqDb(body);
+      const svg = sequenceSvg(name);
+      expect(svg.querySelector("svg")?.id).toBe(`rec-${name}`);
+      const attr = (selector: string, key = "data-id") =>
+        [...svg.querySelectorAll(selector)].map(
+          (e) => e.getAttribute(key) ?? "",
+        );
+
+      // Only the top box has the attributes, one per participant; a self message is a path.
+      expect(attr('[data-et="participant"]').sort()).toEqual(
+        [...model.order].sort(),
+      );
+      expect(attr('[data-et="life-line"]').sort()).toEqual(
+        [...model.order].sort(),
+      );
+      expect(attr('[data-et="message"]')).toEqual(
+        model.messages.map((m) => `i${String(m.record)}`),
+      );
+      for (const element of svg.querySelectorAll('[data-et="message"]')) {
+        const message = model.messages.find(
+          (m) => `i${String(m.record)}` === element.getAttribute("data-id"),
+        );
+        expect(element.tagName.toLowerCase()).toBe(
+          message?.from === message?.to ? "path" : "line",
+        );
+      }
+
+      // Notes carry their own record; a block carries the record of its `end`,
+      // and a rect (LINETYPE 23 at its end) is drawn with no attributes at all.
+      const noted = view.records
+        .filter((r) => r.type === 2)
+        .map((r) => `i${r.id}`);
+      expect(attr('[data-et="note"]').sort()).toEqual(noted.sort());
+      const ends = model.statements
+        .filter((s) => s.kind === "blockEnd")
+        .map((s) => s.records[0])
+        .filter((r) => view.records[r ?? -1]?.type !== 23)
+        .map((r) => `i${String(r)}`);
+      expect(attr('[data-et="control-structure"]').sort()).toEqual(ends.sort());
+    },
+  );
+
+  test.each(recorded)(
+    "%s: each .messageText precedes its own message's line",
+    (name) => {
+      const body = sequences.get(name) ?? "";
+      const model = parseSequence(body);
+      const svg = sequenceSvg(name);
+      const texts = [...svg.querySelectorAll("text.messageText")];
+      const seen = new Map<string, string[]>();
+      for (const text of texts) {
+        let next = text.nextElementSibling;
+        while (next && next.getAttribute("data-et") !== "message") {
+          next = next.nextElementSibling;
+        }
+        const id = next?.getAttribute("data-id") ?? "none";
+        seen.set(id, [...(seen.get(id) ?? []), text.textContent]);
+      }
+      for (const message of model.messages) {
+        const raw = message.text
+          ? body.slice(message.text.from, message.text.to)
+          : "";
+        const lines = decodeSeqText(raw).split("\n");
+        const drawn = seen.get(`i${String(message.record)}`) ?? [];
+        // An empty text draws one zero width space.
+        expect(drawn.map((t) => t.replace(/\u200B/g, ""))).toEqual(lines);
+      }
+      expect([...seen.keys()]).not.toContain("none");
+    },
+  );
 });

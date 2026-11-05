@@ -3,8 +3,8 @@
  * mermaid's element ids back to our node ids for one that may.
  *
  * A fence is drawable only when our parser understands every line and
- * mermaid's own db agrees with our model (`agreesFlow`). The db is read
- * asynchronously (`flowDbOf` loads mermaid on demand), so the verdict is
+ * mermaid's own db agrees with our model (`agreesFlow`, `agreesSequence`). The
+ * db is read asynchronously (mermaid loads on demand), so the verdict is
  * asked for with `requestVerdict` and read back synchronously with
  * `verdictFor` once it has settled. Both are keyed by the body text and
  * kept in one LRU of 256 entries.
@@ -16,13 +16,24 @@
 import { parseFlowchart } from "./flowchart/parse";
 import type { FlowModel } from "./flowchart/model";
 import { CLASSIC_SHAPES } from "./flowchart/model";
-import { type FlowDbView, flowDbOf } from "./mermaidDb";
+import {
+  type FlowDbView,
+  type SequenceDbView,
+  flowDbOf,
+  sequenceDbOf,
+} from "./mermaidDb";
+import { ARROW_TYPES, type SeqArrow, type SeqModel } from "./sequence/model";
+import { decodeSeqText, parseSequence } from "./sequence/parse";
 
 export type Verdict =
   | {
       ok: true;
       kind: "flowchart" | "sequence";
-      /** db domId (without the `<svg id>-` prefix) to node id; boxes only, no clusters. */
+      /**
+       * Flowchart: db domId (without the `<svg id>-` prefix) to node id; boxes
+       * only, no clusters. Sequence: a participant's `data-id` to its name,
+       * which are the same string.
+       */
       domIds: Map<string, string>;
     }
   | { ok: false; reason: string };
@@ -293,6 +304,123 @@ export function agreesFlow(model: FlowModel, db: FlowDbView): string | null {
   return null;
 }
 
+function arrowType(arrow: SeqArrow): number | undefined {
+  return ARROW_TYPES.find(
+    (t) =>
+      t.line === arrow.line && t.head === arrow.head && t.both === arrow.both,
+  )?.type;
+}
+
+function sameEntries(
+  a: Iterable<readonly [string, number]>,
+  b: Iterable<readonly [string, number]>,
+): boolean {
+  const key = (entries: Iterable<readonly [string, number]>) =>
+    JSON.stringify([...entries]);
+  return key(a) === key(b);
+}
+
+/**
+ * Whether `model` and mermaid's `db` describe the same sequence diagram: null
+ * when they agree, else the first difference in words.
+ *
+ * Compared: the participant names in order, with each label and type; the
+ * record list, whose indices are what the drawing carries, with each record's
+ * id, ends, type, text, autonumber numbers and note placement; that the
+ * statements' `records` list exactly that list in order; each message against
+ * its record, with the arrow's shape against the record's type; who is created
+ * and destroyed and where; each box's members. A box's colour and title are not
+ * compared: mermaid decides them with the DOM's CSS support.
+ */
+export function agreesSequence(
+  model: SeqModel,
+  db: SequenceDbView,
+): string | null {
+  if (!model.understood) {
+    return model.reasons[0] ?? "The parser does not understand the diagram.";
+  }
+  const body = model.body;
+  const textOf = (span: { from: number; to: number } | null): string =>
+    span ? normalizeLabel(body.slice(span.from, span.to)) : "";
+  if (
+    !sameList(
+      model.order,
+      db.actors.map((a) => a.name),
+    )
+  ) {
+    return "The participants differ.";
+  }
+  for (const actor of db.actors) {
+    const participant = model.participants.get(actor.name);
+    if (
+      participant?.label !== decodeSeqText(normalizeLabel(actor.description))
+    ) {
+      return `The label of ${actor.name} differs.`;
+    }
+    if (participant.type !== actor.type) {
+      return `The type of ${actor.name} differs.`;
+    }
+  }
+
+  if (model.records.length !== db.records.length) {
+    return `There are ${String(model.records.length)} records here and ${String(db.records.length)} in mermaid.`;
+  }
+  const listed = model.statements.flatMap((s) => s.records);
+  if (
+    listed.length !== model.records.length ||
+    listed.some((record, i) => record !== i)
+  ) {
+    return "The statements' record list is not the list of records.";
+  }
+  for (const [i, record] of model.records.entries()) {
+    const theirs = db.records[i];
+    const auto = record.autonumber;
+    if (
+      theirs === undefined ||
+      theirs.id !== String(i) ||
+      theirs.from !== record.from ||
+      theirs.to !== record.to ||
+      theirs.type !== record.type ||
+      normalizeLabel(theirs.message) !== textOf(record.text) ||
+      theirs.placement !== record.placement ||
+      theirs.autonumber?.start !== auto?.start ||
+      theirs.autonumber?.step !== auto?.step ||
+      theirs.autonumber?.visible !== auto?.visible
+    ) {
+      return `Record ${String(i)} differs.`;
+    }
+  }
+  for (const [i, message] of model.messages.entries()) {
+    const theirs = db.records[message.record];
+    if (
+      theirs?.from !== message.from ||
+      theirs.to !== message.to ||
+      normalizeLabel(theirs.message) !== textOf(message.text)
+    ) {
+      return `Message ${String(i)} (${message.from} to ${message.to}) differs.`;
+    }
+    if (theirs.type !== arrowType(message.arrow)) {
+      return `Message ${String(i)} (${message.from} to ${message.to}) is drawn differently.`;
+    }
+  }
+
+  if (!sameEntries(model.created, db.created)) {
+    return "Who is created differs.";
+  }
+  if (!sameEntries(model.destroyed, db.destroyed)) {
+    return "Who is destroyed differs.";
+  }
+  if (
+    model.boxes.length !== db.boxes.length ||
+    model.boxes.some(
+      (box, i) => !sameList(box.actors, db.boxes[i]?.actors ?? []),
+    )
+  ) {
+    return "The boxes differ.";
+  }
+  return null;
+}
+
 function remember(body: string, verdict: Verdict): void {
   settled.delete(body);
   settled.set(body, verdict);
@@ -329,22 +457,50 @@ async function decide(body: string, dark: boolean): Promise<Decision> {
     verdict: { ok: false, reason },
     final: true,
   });
+  /** What a failed db read says, a load failure being no verdict. */
+  const noDb = (db: { error: unknown; unavailable?: true }): Decision =>
+    db.unavailable
+      ? {
+          verdict: {
+            ok: false,
+            reason: `mermaid could not be loaded: ${messageOf(db.error)}`,
+          },
+          final: false,
+        }
+      : refused(`mermaid refuses it: ${messageOf(db.error)}`);
+
+  // The keyword is spelled exactly for mermaid's detector too, so a body without
+  // it never pays for a second scan. `parseSequence` sets the keyword only for a
+  // body under the size limit; a body past it goes on to the flowchart parser's
+  // own refusal.
+  const sequence = body.includes("sequenceDiagram")
+    ? parseSequence(body)
+    : null;
+  if (sequence?.scan.keyword === "sequenceDiagram") {
+    if (!sequence.understood) {
+      return refused(
+        sequence.reasons[0] ?? "The parser does not understand it.",
+      );
+    }
+    const db = await sequenceDbOf(body, dark);
+    if ("error" in db) {
+      return noDb(db);
+    }
+    const difference = agreesSequence(sequence, db);
+    if (difference !== null) {
+      return refused(difference);
+    }
+    const domIds = new Map(sequence.order.map((name) => [name, name] as const));
+    return { verdict: { ok: true, kind: "sequence", domIds }, final: true };
+  }
+
   const model = parseFlowchart(body);
   if (!model.understood) {
     return refused(model.reasons[0] ?? "The parser does not understand it.");
   }
   const db = await flowDbOf(body, dark);
   if ("error" in db) {
-    if (db.unavailable) {
-      return {
-        verdict: {
-          ok: false,
-          reason: `mermaid could not be loaded: ${messageOf(db.error)}`,
-        },
-        final: false,
-      };
-    }
-    return refused(`mermaid refuses it: ${messageOf(db.error)}`);
+    return noDb(db);
   }
   const difference = agreesFlow(model, db);
   if (difference !== null) {
@@ -360,8 +516,9 @@ async function decide(body: string, dark: boolean): Promise<Decision> {
 }
 
 /**
- * The verdict for `body`: parse, mermaid's db (`flowDbOf` with the asking
- * view's `dark`) and `agreesFlow`. Cached by body; a request while one is
+ * The verdict for `body`: parse, mermaid's db (`flowDbOf` or `sequenceDbOf`
+ * with the asking view's `dark`) and the agreement check, dispatched on the
+ * header's keyword. Cached by body; a request while one is
  * running for the same body gets the same promise. A check that could not
  * run (mermaid failing to load, an unexpected throw) answers `ok: false` with
  * the cause but is no verdict: it is not cached, and the next request tries

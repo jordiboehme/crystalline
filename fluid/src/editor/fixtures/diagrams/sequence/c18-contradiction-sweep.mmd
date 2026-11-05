@@ -1,0 +1,16 @@
+sequenceDiagram
+    %% the contradiction check over engrams that are near each other
+    participant sweep as Sweep
+    participant index as Index
+    participant nli as NLI model
+    participant store as Findings
+    sweep->>index: next engram pair
+    activate sweep
+    index-->>sweep: two engrams
+    sweep->>+nli: premise and hypothesis
+    nli-->>-sweep: contradiction 0.93
+    opt above the threshold
+        sweep->>store: keep the finding
+    end
+    deactivate sweep
+    Note over sweep,store: a reflection reads the findings later

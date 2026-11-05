@@ -1,0 +1,14 @@
+sequenceDiagram
+    %% an upload through a connected server, with its timeout
+    participant cli as CLI
+    participant local as Local daemon
+    participant remote as Connected server
+    cli->>local: upload a file
+    local->>+remote: POST with the bearer token
+    alt answered in time
+        remote-->>-local: 201
+        local-->>cli: stored
+    else no answer for 30 s
+        local--xremote: abort
+        local-->>cli: timed out, nothing stored
+    end

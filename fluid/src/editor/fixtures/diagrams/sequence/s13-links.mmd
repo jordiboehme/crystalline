@@ -1,0 +1,12 @@
+sequenceDiagram
+    %% the actor menu lines
+    participant api as API
+    participant db as Database
+    link api: Dashboard @ https://example.com/dashboard
+    link api: Logs @ https://example.com/logs
+    links db: {"Runbook": "https://example.com/runbook", "Alerts": "https://example.com/alerts"}
+    properties api: {"class": "external"}
+    api->>db: query
+    title Links on participants
+    accTitle: A query with menus
+    accDescr: The api asks the database

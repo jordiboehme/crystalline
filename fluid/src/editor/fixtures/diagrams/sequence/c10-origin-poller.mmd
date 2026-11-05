@@ -1,0 +1,22 @@
+sequenceDiagram
+    %% the origin poller merges what changed on GitHub
+    participant poller as Origin poller
+    participant gh as GitHub
+    participant merge as merge_file
+    participant engine as Engine
+    loop every tick
+        poller->>gh: list the changes since the last commit
+        gh-->>poller: changed files
+        opt something changed
+            poller->>gh: fetch the files
+            gh-->>poller: contents
+            poller->>merge: base, ours, theirs
+            alt merges cleanly
+                merge-->>poller: merged text
+                poller->>engine: apply
+            else conflict
+                merge-->>poller: conflict
+                Note right of poller: kept for the person to decide
+            end
+        end
+    end

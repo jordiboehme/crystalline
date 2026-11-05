@@ -1,0 +1,18 @@
+sequenceDiagram
+    %% write_reflection with its source check
+    actor agent as Agent
+    participant mcp as MCP server
+    participant engine as Engine
+    actor person as Person
+    agent->>mcp: write_reflection
+    mcp->>engine: check the sources
+    critical every source is readable
+        engine->>engine: read each source
+    option a source is too wide
+        engine-->>mcp: too wide
+        mcp-->>agent: ask the person
+        agent->>person: narrow it down?
+        person-->>agent: yes, this folder
+    end
+    engine-->>mcp: stored
+    mcp-->>agent: reflection id

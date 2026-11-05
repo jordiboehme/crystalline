@@ -1,0 +1,13 @@
+sequenceDiagram
+    %% participants that start and stop during the diagram
+    participant host
+    host->>host: prepare
+    create participant worker
+    host->>worker: spawn
+    create actor reviewer as Reviewer
+    worker->>reviewer: ask
+    reviewer-->>worker: ok
+    destroy reviewer
+    reviewer-->>host: leaves
+    destroy worker
+    host-xworker: stop

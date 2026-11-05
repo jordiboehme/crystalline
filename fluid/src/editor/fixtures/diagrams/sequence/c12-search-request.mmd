@@ -1,0 +1,18 @@
+sequenceDiagram
+    %% search with embeddings and salience
+    participant caller as Caller
+    participant engine as Engine
+    participant embed as Embedder
+    participant index as Index
+    caller->>+engine: search_engrams
+    engine->>+embed: embed the query
+    embed-->>-engine: vector
+    par by text
+        engine->>index: full text
+        index-->>engine: rows
+    and by meaning
+        engine->>index: nearest vectors
+        index-->>engine: rows
+    end
+    engine->>engine: rank, lift by salience
+    engine-->>-caller: hits with snippets

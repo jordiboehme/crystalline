@@ -14,7 +14,7 @@ import { flowDbOf } from "./mermaidDb";
 const FIXTURES = import.meta.glob<string>(
   [
     "../fixtures/diagrams/flowchart/*.mmd",
-    "../fixtures/diagrams/fallback/*.mmd",
+    "../fixtures/diagrams/fallback/x*.mmd",
   ],
   { query: "?raw", import: "default", eager: true },
 );

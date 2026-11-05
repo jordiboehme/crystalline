@@ -1,0 +1,21 @@
+sequenceDiagram
+    %% a headless reflect run that shares its writes in a pull request
+    participant cron as Schedule
+    participant run as crystalline reflect run
+    participant agent as Harness
+    participant mcp as MCP server
+    participant gh as GitHub
+    cron->>run: start
+    create participant agent2 as Harness session
+    run->>agent2: prompt
+    agent2->>mcp: write_engram
+    mcp->>mcp: note_run_writes
+    mcp-->>agent2: written
+    destroy agent2
+    agent2-->>run: finished
+    opt the run wrote something
+        run->>gh: open a pull request
+        gh-->>run: pull request number
+    end
+    run-->>cron: exit 0
+    agent->>agent: unused here

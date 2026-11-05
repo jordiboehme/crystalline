@@ -1,0 +1,17 @@
+sequenceDiagram
+    %% the participant shapes of the @{ } form
+    participant edge@{ "type": "boundary" }
+    participant ctl@{ "type": "control" }
+    participant model@{ "type": "entity" }
+    participant store@{ "type": "database" } as Store
+    participant all@{ "type": "collections" }
+    participant jobs@{ "type": "queue", "alias": "Job queue" }
+    participant someone@{ "type": "actor" }
+    participant plain@{ "type": "participant" }
+    someone->>edge: ask
+    edge->>ctl: route
+    ctl->>model: load
+    model->>store: read
+    ctl->>all: list
+    ctl->>jobs: enqueue
+    ctl->>plain: tell

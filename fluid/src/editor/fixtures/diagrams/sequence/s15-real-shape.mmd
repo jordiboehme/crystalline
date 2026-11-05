@@ -1,0 +1,35 @@
+---
+title: Order checkout
+---
+sequenceDiagram
+    %% an API flow of the kind colleagues write
+    autonumber
+    actor user as Customer
+    participant web as Web app
+    participant api as Checkout API
+    participant pay as Payment provider
+    participant db as Orders DB
+
+    user->>web: Click "Pay now"
+    web->>+api: POST /checkout
+    api->>db: Load basket
+    db-->>api: Basket
+    alt basket is empty
+        api-->>web: 400 Empty basket
+        web-->>user: Show error
+    else basket has items
+        api->>+pay: Charge card
+        Note right of pay: May take a few seconds
+        alt card accepted
+            pay-->>api: Accepted
+            api->>db: Save order
+            api-->>web: 201 Created
+            web-->>user: Show receipt
+        else card declined
+            pay--xapi: Declined
+            api-->>web: 402 Declined
+            web-->>user: Ask for another card
+        end
+        deactivate pay
+    end
+    deactivate api
