@@ -1,6 +1,6 @@
 // NO vi.mock("mermaid") here: the verdicts come from mermaid 12.2.0's real db.
 
-import { EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, test } from "vitest";
 
@@ -26,11 +26,14 @@ const bodies = Object.entries(FIXTURES).map(
 
 let view: EditorView | null = null;
 
+/** The caret sits after the document: a fence the caret is in is held (R52). */
 function mount(doc: string): EditorView {
+  const text = `${doc}\n\nend`;
   view = new EditorView({
     state: parsedState(
       EditorState.create({
-        doc,
+        doc: text,
+        selection: EditorSelection.cursor(text.length),
         extensions: [...baseExtensions(false), diagramExtension()],
       }),
     ),

@@ -49,8 +49,13 @@ vi.mock("./intent", () => ({ closeDiagramIntent }));
 
 // Imported after the mocks.
 const { diagramExtension } = await import("./index");
-const { verdictArrived, diagramField, carryFences, drawUnderCaret } =
-  await import("./field");
+const {
+  verdictArrived,
+  diagramField,
+  carryFences,
+  drawUnderCaret,
+  POINTER_GRACE_MS,
+} = await import("./field");
 
 const OK: Verdict = { ok: true, kind: "flowchart", domIds: new Map() };
 const NO: Verdict = { ok: false, reason: "no" };
@@ -366,5 +371,141 @@ describe("a removed fence passes on nothing", () => {
       changes: { from: v.state.doc.toString().indexOf("B"), insert: "z" },
     });
     expect(v.state.facet(drawnDiagrams)).toEqual([3]);
+  });
+});
+
+describe("a pointer selection (R58)", () => {
+  const press = (v: EditorView) =>
+    v.contentDOM.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+  const fire = (type: string, target: EventTarget = document) =>
+    target.dispatchEvent(new Event(type, { bubbles: true }));
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function held() {
+    const doc = `Top\n\n${fence(SKELETON)}\n\nBelow`;
+    const inside = doc.indexOf("B\n```") + 1;
+    const v = mount(doc, false, inside);
+    kit.settled.set(SKELETON, OK);
+    v.dispatch({ effects: verdictArrived.of(SKELETON) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    return v;
+  }
+
+  it("keeps a fence held while the pointer selects, and draws a grace after mouse up", () => {
+    const v = held();
+    press(v);
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    // A hand move during the press selects, and still draws nothing.
+    v.dispatch({ selection: EditorSelection.range(0, 2) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    fire("mouseup");
+    vi.advanceTimersByTime(POINTER_GRACE_MS - 1);
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("keeps the hold through a double click: a second press inside the grace", () => {
+    const v = held();
+    press(v);
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    fire("mouseup");
+    vi.advanceTimersByTime(300);
+    press(v);
+    v.dispatch({ selection: EditorSelection.range(0, 3) });
+    fire("mouseup");
+    vi.advanceTimersByTime(POINTER_GRACE_MS - 1);
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("a mouse up outside the editor counts too (the listener is on the document)", () => {
+    const v = held();
+    press(v);
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    document.body.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    vi.advanceTimersByTime(POINTER_GRACE_MS);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it.each([
+    ["pointercancel", document],
+    ["dragend", document],
+    ["contextmenu", document],
+    ["blur", window],
+  ])("a %s ends the press at once, so a hold cannot stick", (type, target) => {
+    const v = held();
+    press(v);
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    fire(type, target);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("ends the press on a mouse move that shows no button down (a missed mouse up)", () => {
+    const v = held();
+    press(v);
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    document.dispatchEvent(new MouseEvent("mousemove", { buttons: 0 }));
+    vi.advanceTimersByTime(POINTER_GRACE_MS);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("does not hold a keyboard move", () => {
+    const v = held();
+    v.dispatch({ selection: EditorSelection.cursor(0) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("does not draw a fence whose verdict arrives during the press until the release", () => {
+    const v = mount(`Top\n\n${fence(SKELETON)}\n\nBelow`, false, 0);
+    press(v);
+    kit.settled.set(SKELETON, OK);
+    v.dispatch({ effects: verdictArrived.of(SKELETON) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    fire("mouseup");
+    vi.advanceTimersByTime(POINTER_GRACE_MS);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("stops listening and drops its timer when the view is destroyed", () => {
+    const v = held();
+    press(v);
+    fire("mouseup");
+    v.destroy();
+    expect(() => {
+      fire("mouseup");
+      vi.advanceTimersByTime(POINTER_GRACE_MS);
+    }).not.toThrow();
+  });
+});
+
+describe("a verdict the cache evicted", () => {
+  it("is asked for again when an edit brings its body back", async () => {
+    const v = mount(fence(SKELETON));
+    await settle(SKELETON, OK);
+    expect(v.state.facet(drawnDiagrams)).toEqual([0]);
+    const at = v.state.doc.toString().indexOf("B");
+    v.dispatch({ changes: { from: at, to: at + 1, insert: "C" } });
+    await settle("flowchart TD\n  A --> C", NO);
+    // 300 other bodies push the old verdicts out.
+    for (let i = 0; i < 300; i += 1) {
+      kit.settled.set(`other ${String(i)}`, OK);
+      kit.settled.delete(`other ${String(i - 256)}`);
+    }
+    kit.settled.delete(SKELETON);
+    kit.settled.delete("flowchart TD\n  A --> C");
+    const asks = () => kit.requested.filter((r) => r.body === SKELETON).length;
+    expect(asks()).toBe(1);
+    // Undo to the old body.
+    v.dispatch({ changes: { from: at, to: at + 1, insert: "B" } });
+    expect(asks()).toBe(2);
   });
 });

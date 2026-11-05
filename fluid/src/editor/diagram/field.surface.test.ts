@@ -114,29 +114,32 @@ describe("in a room", () => {
 });
 
 describe("past the parse reach (D58)", () => {
-  it("keeps a drawn fence drawn at its mapped place while the new tree stops short of it", async () => {
-    const prose = "Some prose in a paragraph.\n\n".repeat(20000);
-    const text = `Top\n\n${prose}${fence(BODY)}\n\nEnd`;
-    const view = markView(text, { adapter: "engram" });
-    await prefetchDiagrams();
-    await vi.waitFor(() => {
-      expect(kit.requested.length).toBeGreaterThan(0);
-    });
-    await settle(BODY, OK);
-    const at = text.indexOf("```mermaid");
-    expect(view.state.facet(drawnDiagrams)).toEqual([at]);
-    // Everything above the fence is replaced (a paste or an undo): the new
-    // tree gets a short budget and stops short of the fence, which then comes
-    // from the carry, at its mapped place.
-    const other = "Other words for another paragraph.\n\n".repeat(21000);
-    view.dispatch({ changes: { from: 3, to: at - 2, insert: other } });
-    const moved = 3 + other.length + 2;
-    expect(syntaxTree(view.state).length).toBeLessThan(moved);
-    expect(view.state.facet(drawnDiagrams)).toEqual([moved]);
-    // The parse catches up: the tree decides again and agrees.
-    ensureSyntaxTree(view.state, view.state.doc.length, 30_000);
-    view.dispatch({ effects: verdictArrived.of(BODY) });
-    expect(syntaxTree(view.state).length).toBe(view.state.doc.length);
-    expect(view.state.facet(drawnDiagrams)).toEqual([moved]);
-  });
+  // The document before the change is tiny. The change inserts about 1.5 MB of
+  // prose above the fence, which no machine parses inside the 20 ms slice the
+  // new state's tree gets, so the tree stops short of the fence whatever the
+  // load: a slower machine only stops shorter.
+  it(
+    "keeps a drawn fence drawn at its mapped place while the new tree stops short of it",
+    { timeout: 120_000 },
+    async () => {
+      const text = `Top\n\n${fence(BODY)}\n\nEnd`;
+      const view = markView(text);
+      await prefetchDiagrams();
+      await vi.waitFor(() => {
+        expect(kit.requested.length).toBeGreaterThan(0);
+      });
+      await settle(BODY, OK);
+      expect(view.state.facet(drawnDiagrams)).toEqual([5]);
+      const other = "Other words for another paragraph.\n\n".repeat(43000);
+      view.dispatch({ changes: { from: 3, insert: other } });
+      const moved = 5 + other.length;
+      expect(syntaxTree(view.state).length).toBeLessThan(moved);
+      expect(view.state.facet(drawnDiagrams)).toEqual([moved]);
+      // The parse catches up: the tree decides again and agrees.
+      ensureSyntaxTree(view.state, view.state.doc.length, 100_000);
+      view.dispatch({ effects: verdictArrived.of(BODY) });
+      expect(syntaxTree(view.state).length).toBe(view.state.doc.length);
+      expect(view.state.facet(drawnDiagrams)).toEqual([moved]);
+    },
+  );
 });

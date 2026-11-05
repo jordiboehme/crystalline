@@ -9,7 +9,12 @@
 import type { Extension } from "@codemirror/state";
 
 import { diagramLoaded, drawnDiagrams } from "./draws";
-import { diagramField, diagramTheme, verdictWatcher } from "./field";
+import {
+  diagramField,
+  diagramTheme,
+  pointerWatcher,
+  verdictWatcher,
+} from "./field";
 
 export function diagramExtension(): Extension {
   return [
@@ -19,6 +24,7 @@ export function diagramExtension(): Extension {
       state.field(diagramField).fences.map((fence) => fence.from),
     ),
     verdictWatcher,
+    pointerWatcher,
     diagramTheme,
   ];
 }

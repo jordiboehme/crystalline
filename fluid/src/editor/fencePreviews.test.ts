@@ -810,9 +810,29 @@ describe("what the preview hands mermaid", () => {
       "graph TD; A-->B\nB-->C",
     ],
     [
-      "a list item's fence keeps its indent",
+      "a list item's fence loses the list item's indent",
       "- ```mermaid\n  graph TD; A-->B\n  ```",
-      "  graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, closed",
+      "- > ```mermaid\n  > graph TD; A-->B\n  > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, unclosed",
+      "- > ```mermaid\n  > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, closed",
+      "1. > ```mermaid\n   > graph TD; A-->B\n   > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, unclosed",
+      "1. > ```mermaid\n   > graph TD; A-->B",
+      "graph TD; A-->B",
     ],
   ])("%s", async (_name, doc, source) => {
     expect(await renderedFor(doc)).toEqual([source]);

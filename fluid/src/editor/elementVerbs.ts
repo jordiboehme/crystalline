@@ -1099,13 +1099,21 @@ export function mermaidFence(
   if (last <= info.open) {
     return null;
   }
-  // The quote marks of the fence's lines are not part of the diagram: the
-  // page hands mermaid the text without them (indentation stays, as mermaid
-  // accepts it).
-  const depth = quoteDepth(doc.line(info.open).text);
+  // The container marks in front of the fence (quote marks, list markers'
+  // indentation) are not part of the diagram: the page hands mermaid the
+  // text without them. They run as far as the opening mark's column and are
+  // made of spaces, tabs and `>`, which also covers a quote on a list item's
+  // line (`- > ```mermaid`) and a list item's own indentation.
+  const openLine = doc.line(info.open);
+  const column = info.marks.from - openLine.from;
   const lines: string[] = [];
   for (let number = info.open + 1; number <= last; number += 1) {
-    lines.push(unquoted(doc.line(number).text, depth));
+    const text = doc.line(number).text;
+    let at = 0;
+    while (at < column && at < text.length && " \t>".includes(text[at] ?? "")) {
+      at += 1;
+    }
+    lines.push(text.slice(at));
   }
   // An unclosed fence on a page read section by section ends at the next
   // section heading (the page does not draw it, as for math).
