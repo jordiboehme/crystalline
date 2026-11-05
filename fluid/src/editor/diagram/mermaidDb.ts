@@ -56,6 +56,9 @@ export interface FlowEdgeView {
   stroke: string | undefined;
   length: number | undefined;
   labelType: string | undefined;
+  /** What a numeric `linkStyle` line gave this edge, undefined for none. */
+  style: string[] | undefined;
+  interpolate: string | undefined;
 }
 
 export interface FlowSubgraphView {
@@ -108,6 +111,8 @@ interface RawFlowDb {
     stroke?: string;
     length?: number;
     labelType?: string;
+    style?: string[];
+    interpolate?: string;
   }[];
   getSubGraphs(): {
     id: string;
@@ -198,6 +203,8 @@ export async function flowDbOf(
         stroke: e.stroke,
         length: e.length,
         labelType: e.labelType,
+        style: e.style && [...e.style],
+        interpolate: e.interpolate,
       })),
       subgraphs: db.getSubGraphs().map((s) => ({
         id: s.id,

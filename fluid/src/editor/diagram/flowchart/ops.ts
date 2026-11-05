@@ -42,6 +42,7 @@ import {
   type Shape,
   type ShapeName,
 } from "./model";
+import { lineDeletions, shiftLinkStyles } from "./linkStyle";
 import { parseFlowchart } from "./parse";
 
 export type FlowOp =
@@ -106,6 +107,51 @@ function coloursOf(styles: readonly string[]): (string | null)[] {
   });
 }
 
+/** One row of the `arrows` field per edge, what a reading of the arrow must keep. */
+function arrowRows(model: FlowModel): unknown[][] {
+  const body = model.body;
+  return model.edges.map((edge) => {
+    const arrow = model.chains[edge.chain]?.links[edge.link]?.arrow;
+    return [
+      edge.start,
+      edge.end,
+      edge.mermaidId,
+      arrow?.line,
+      arrow?.start,
+      arrow?.end,
+      arrow?.length,
+      arrow?.label ? body.slice(arrow.label.from, arrow.label.to) : null,
+    ];
+  });
+}
+
+/** The `subgraphs` field, with `added` as one more member of the subgraph `into`. */
+function subgraphRows(
+  model: FlowModel,
+  into: string | null = null,
+  added = "",
+): string {
+  return JSON.stringify(
+    model.subgraphs.map((s) => [
+      s.id,
+      s.parent,
+      (s.id === into ? [...s.members, added] : [...s.members]).sort(),
+    ]),
+  );
+}
+
+/** Which arrow each `linkStyle` index means, line by line. */
+function linkStyleRows(model: FlowModel): unknown[] {
+  return model.directives
+    .filter((d) => d.kind === "linkStyle")
+    .map((d) =>
+      d.indices.map(({ n }) => {
+        const edge = model.edges[n];
+        return [edge?.start, edge?.end, edge?.occurrence];
+      }),
+    );
+}
+
 /**
  * The model as named fields, the same parts `agreesFlow` compares, so that two
  * models can be compared field by field.
@@ -117,30 +163,9 @@ function fieldsOf(model: FlowModel): Map<string, string> {
   const fields = new Map<string, string>([
     ["direction", readDirection(model.direction?.value)],
     ["boxes", JSON.stringify(model.nodeOrder)],
-    [
-      "arrows",
-      JSON.stringify(
-        model.edges.map((edge) => {
-          const arrow = model.chains[edge.chain]?.links[edge.link]?.arrow;
-          return [
-            edge.start,
-            edge.end,
-            edge.mermaidId,
-            arrow?.line,
-            arrow?.start,
-            arrow?.end,
-            arrow?.length,
-            arrow?.label ? body.slice(arrow.label.from, arrow.label.to) : null,
-          ];
-        }),
-      ),
-    ],
-    [
-      "subgraphs",
-      JSON.stringify(
-        model.subgraphs.map((s) => [s.id, s.parent, [...s.members].sort()]),
-      ),
-    ],
+    ["arrows", JSON.stringify(arrowRows(model))],
+    ["subgraphs", subgraphRows(model)],
+    ["linkStyles", JSON.stringify(linkStyleRows(model))],
   ]);
   for (const [id, node] of model.nodes) {
     const shape = node.defining?.shape ?? null;
@@ -212,15 +237,25 @@ function dropsNewSemicolon(
   });
 }
 
+/** What a changed field must hold: this value, any value (null), or what this test accepts. */
+type Wanted = string | null | ((value: string) => boolean);
+
+function holds(wanted: Wanted, value: string): boolean {
+  return typeof wanted === "function"
+    ? wanted(value)
+    : wanted === null || wanted === value;
+}
+
 /**
  * `edits`, when applying them leaves a body that is understood and differs from
- * `model` only in the fields `changes` names, each then holding the value named
- * there (null: any value). Otherwise `invalid`.
+ * `model` only in the fields `changes` names, each then holding what is named
+ * there. A field that was not there before must be named, and no field may go.
+ * Otherwise `invalid`.
  */
 export function checked(
   model: FlowModel,
   edits: TextEdit[],
-  changes: Readonly<Record<string, string | null>>,
+  changes: Readonly<Record<string, Wanted>>,
 ): OpResult {
   if (edits.length === 0) {
     return { edits };
@@ -231,15 +266,15 @@ export function checked(
   }
   const before = fieldsOf(model);
   const now = fieldsOf(after);
-  if (before.size !== now.size) {
-    return refused("invalid");
+  for (const field of before.keys()) {
+    if (!now.has(field)) {
+      return refused("invalid");
+    }
   }
   for (const [field, value] of now) {
     const wanted = changes[field];
     if (
-      wanted === undefined
-        ? before.get(field) !== value
-        : wanted !== null && wanted !== value
+      wanted === undefined ? before.get(field) !== value : !holds(wanted, value)
     ) {
       return refused("invalid");
     }
@@ -454,28 +489,6 @@ function entryDeletions(line: DirectiveLine): Span[] {
   return out;
 }
 
-/** The ranges that delete whole lines with one line break each. */
-function lineDeletions(model: FlowModel, indices: readonly number[]): Span[] {
-  const lines = model.scan.lines;
-  const sorted = [...indices].sort((a, b) => a - b);
-  const out: Span[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    const first = sorted[i] ?? 0;
-    let last = first;
-    while (sorted[i + 1] === last + 1) {
-      last++;
-      i++;
-    }
-    const next = lines[last + 1];
-    const from = next ? lines[first]?.from : lines[first - 1]?.to;
-    const to = next ? next.from : lines[last]?.to;
-    if (from !== undefined && to !== undefined) {
-      out.push({ from, to });
-    }
-  }
-  return out;
-}
-
 function clearColour(
   model: FlowModel,
   node: FlowNode,
@@ -543,6 +556,310 @@ function direction(model: FlowModel, value: "TD" | "LR"): OpResult {
   return checked(model, [{ from: at, to: at, insert: ` ${value}` }], changes);
 }
 
+/** The label of a box an op makes. Task 10 opens the rename field on it. */
+const NEW_BOX_LABEL = "New box";
+
+/**
+ * The id for a new box. It never takes an id the source already gives a meaning
+ * to: a subgraph, an arrow, or a `class` or `click` line that would style or link
+ * the box (those two make no box of their own, so the id is not among the nodes).
+ * Neither one letter nor `n<k>` is a reserved word.
+ */
+export function newNodeId(model: FlowModel): string {
+  const ids = [...model.nodes.keys()];
+  const taken = new Set<string>([
+    ...ids,
+    ...model.subgraphs.map((s) => s.id),
+    ...model.edges.map((e) => e.mermaidId),
+    ...model.chains.flatMap((chain) =>
+      chain.links.flatMap(({ arrow }) =>
+        arrow.idSpan
+          ? [model.body.slice(arrow.idSpan.from, arrow.idSpan.to)]
+          : [],
+      ),
+    ),
+    ...model.directives.flatMap((d) =>
+      d.kind === "classDef" ? [] : d.targets.map((t) => t.id),
+    ),
+  ]);
+  if (ids.every((id) => /^[A-Z]$/.test(id))) {
+    const first = "A".charCodeAt(0);
+    const highest = Math.max(first - 1, ...ids.map((id) => id.charCodeAt(0)));
+    for (let code = highest + 1; code <= "Z".charCodeAt(0); code++) {
+      const letter = String.fromCharCode(code);
+      if (!taken.has(letter)) {
+        return letter;
+      }
+    }
+  }
+  for (let k = 1; ; k++) {
+    if (!taken.has(`n${String(k)}`)) {
+      return `n${String(k)}`;
+    }
+  }
+}
+
+/** Where a new line goes: after the line `line`, inside the subgraph `group`. */
+interface Place {
+  line: number;
+  group: string | null;
+}
+
+/**
+ * The subgraph a new line after `line` would sit in. `subgraphs` is in close
+ * order, so the first that spans the line is the innermost. The opening line
+ * counts as inside and the `end` line as outside, whatever else those lines hold.
+ */
+function scopeAfter(model: FlowModel, line: number): string | null {
+  return (
+    model.subgraphs.find((s) => s.openLine <= line && line < s.endLine)?.id ??
+    null
+  );
+}
+
+/** Every line that names the box: its refs and its `style`, `class` and `click` lines. */
+function linesNaming(model: FlowModel, node: FlowNode): number[] {
+  return [
+    ...node.refs.map((ref) => ref.line),
+    ...model.directives
+      .filter(
+        (d) => d.kind !== "classDef" && d.targets.some((t) => t.id === node.id),
+      )
+      .map((d) => d.line),
+  ];
+}
+
+function endOfBody(model: FlowModel): number {
+  return model.scan.lines.findLastIndex((line) => line.kind !== "blank");
+}
+
+/** Just before the `end` of `group`, or the end of the body for the top level. */
+function closingPlace(model: FlowModel, group: string | null): Place {
+  const subgraph = model.subgraphs.find((s) => s.id === group);
+  return {
+    line: subgraph ? subgraph.endLine - 1 : endOfBody(model),
+    group,
+  };
+}
+
+/** After the last line that names `node` and lies in its own subgraph. */
+function placeBy(model: FlowModel, node: FlowNode): Place {
+  const own = linesNaming(model, node).filter(
+    (line) => scopeAfter(model, line) === node.subgraph,
+  );
+  return own.length > 0
+    ? { line: Math.max(...own), group: node.subgraph }
+    : closingPlace(model, node.subgraph);
+}
+
+/** The subgraphs around `group`, innermost first, `group` itself included. */
+function scopesAround(model: FlowModel, group: string | null): string[] {
+  const out: string[] = [];
+  let at = model.subgraphs.find((s) => s.id === group);
+  while (at !== undefined) {
+    out.push(at.id);
+    const parent = at.parent;
+    at = model.subgraphs.find((s) => s.id === parent);
+  }
+  return out;
+}
+
+function indentFor(model: FlowModel, place: Place): string {
+  const lines = model.scan.lines;
+  const opening = model.subgraphs.find((s) => s.id === place.group)?.openLine;
+  const inGroup = (index: number, kind: string): boolean =>
+    kind === "statement" &&
+    index !== opening &&
+    scopeAfter(model, index) === place.group;
+  const followed = lines[place.line];
+  if (followed && inGroup(followed.index, followed.kind)) {
+    return followed.indent;
+  }
+  const first = (test: (index: number, kind: string) => boolean) =>
+    lines.find((line) => test(line.index, line.kind))?.indent;
+  return (
+    (place.group !== null ? first(inGroup) : undefined) ??
+    first((_, kind) => kind === "statement") ??
+    "    "
+  );
+}
+
+/** What a new line adds, besides itself. */
+interface Addition {
+  box: string | null;
+  edge: { start: string; end: string } | null;
+}
+
+/** The fields a new box adds, each as it must read. */
+function newBoxFields(
+  model: FlowModel,
+  id: string,
+  group: string | null,
+): Record<string, Wanted> {
+  const without = JSON.stringify(model.nodeOrder);
+  return {
+    boxes: (value) =>
+      JSON.stringify(
+        (JSON.parse(value) as string[]).filter((box) => box !== id),
+      ) === without,
+    subgraphs: subgraphRows(model, group, id),
+    [`${id} label`]: NEW_BOX_LABEL,
+    [`${id} markdown`]: "false",
+    [`${id} shape`]: "rect",
+    [`${id} styles`]: "[]",
+    [`${id} colours`]: JSON.stringify([null, null, null]),
+    [`${id} classes`]: "[]",
+  };
+}
+
+/** The `arrows` field with one plain new arrow at `index`. */
+function arrowsWith(
+  model: FlowModel,
+  edge: { start: string; end: string },
+  index: number,
+): string {
+  const earlier = model.edges
+    .slice(0, index)
+    .filter((e) => e.start === edge.start && e.end === edge.end).length;
+  const id = `L_${edge.start}_${edge.end}_${earlier === 0 ? 0 : earlier + 1}`;
+  const rows = arrowRows(model);
+  rows.splice(index, 0, [
+    edge.start,
+    edge.end,
+    id,
+    "solid",
+    "none",
+    "arrow",
+    1,
+    null,
+  ]);
+  return JSON.stringify(rows);
+}
+
+/**
+ * The new line `text` at `place`, with the `linkStyle` digits that must follow
+ * when a new arrow lands before the last one (mermaid numbers edges in source
+ * order).
+ */
+function insertLine(
+  model: FlowModel,
+  place: Place,
+  text: string,
+  { box, edge }: Addition,
+): OpResult {
+  const line = model.scan.lines[place.line];
+  if (line === undefined) {
+    return refused("invalid");
+  }
+  const edits: TextEdit[] = [
+    {
+      from: line.to,
+      to: line.to,
+      insert: `\n${indentFor(model, place)}${text}`,
+    },
+  ];
+  const changes: Record<string, Wanted> = {};
+  if (box !== null) {
+    Object.assign(changes, newBoxFields(model, box, place.group));
+  }
+  if (edge !== null) {
+    const index = model.edges.filter(
+      (e) => (model.chains[e.chain]?.line ?? 0) <= place.line,
+    ).length;
+    if (index < model.edges.length) {
+      edits.push(...shiftLinkStyles(model, index, 1));
+    }
+    changes.arrows = arrowsWith(model, edge, index);
+  }
+  return checked(model, edits, changes);
+}
+
+function withBox(result: OpResult, id: string): OpResult {
+  return "edits" in result
+    ? { ...result, created: { kind: "node", id } }
+    : result;
+}
+
+/** A new box's ref: the id and the label through the rename encoder. */
+function newBoxRef(id: string): string {
+  return `${id}[${encodeLabel(NEW_BOX_LABEL, false)}]`;
+}
+
+/** The first parent in source order: a box, so no subgraph (R4), and not `node` itself. */
+function firstParent(model: FlowModel, node: FlowNode): FlowNode | null {
+  for (const edge of model.edges) {
+    if (edge.end === node.id && edge.start !== node.id) {
+      const parent = model.nodes.get(edge.start);
+      if (parent !== undefined) {
+        return parent;
+      }
+    }
+  }
+  return null;
+}
+
+function addUnder(model: FlowModel, parent: FlowNode): OpResult {
+  const id = newNodeId(model);
+  return withBox(
+    insertLine(
+      model,
+      placeBy(model, parent),
+      `${parent.id} --> ${newBoxRef(id)}`,
+      { box: id, edge: { start: parent.id, end: id } },
+    ),
+    id,
+  );
+}
+
+function addSibling(model: FlowModel, node: FlowNode): OpResult {
+  const parent = firstParent(model, node);
+  if (parent !== null) {
+    return addUnder(model, parent);
+  }
+  const id = newNodeId(model);
+  return withBox(
+    insertLine(model, placeBy(model, node), newBoxRef(id), {
+      box: id,
+      edge: null,
+    }),
+    id,
+  );
+}
+
+/**
+ * `from --> to` after the later of the two. Inside a subgraph the line would make
+ * an end that no earlier subgraph holds a member of that subgraph, so when the
+ * self-check refuses that, the arrow goes in the nearest subgraph around both.
+ */
+function connect(model: FlowModel, from: FlowNode, to: FlowNode): OpResult {
+  const a = placeBy(model, from);
+  const b = placeBy(model, to);
+  const place = a.line >= b.line ? a : b;
+  const addition = { box: null, edge: { start: from.id, end: to.id } };
+  const text = `${from.id} --> ${to.id}`;
+  const result = insertLine(model, place, text, addition);
+  if ("edits" in result || from.subgraph === to.subgraph) {
+    return result;
+  }
+  const around = scopesAround(model, to.subgraph);
+  const common =
+    scopesAround(model, from.subgraph).find((s) => around.includes(s)) ?? null;
+  return common === place.group
+    ? result
+    : insertLine(model, closingPlace(model, common), text, addition);
+}
+
+function addBox(model: FlowModel): OpResult {
+  const id = newNodeId(model);
+  return withBox(
+    insertLine(model, closingPlace(model, null), newBoxRef(id), {
+      box: id,
+      edge: null,
+    }),
+    id,
+  );
+}
+
 /**
  * The edits for `op`, or why there are none: a body it does not understand is
  * `unsupported`, a box that is not there `gone`, and a result that would not
@@ -570,9 +887,25 @@ export function compileFlowOp(model: FlowModel, op: FlowOp): OpResult {
     case "direction":
       return direction(model, op.value);
     case "addChild":
-    case "addSibling":
-    case "connect":
+    case "addSibling": {
+      const node = model.nodes.get(op.id);
+      if (node === undefined) {
+        return refused("gone");
+      }
+      return op.op === "addChild"
+        ? addUnder(model, node)
+        : addSibling(model, node);
+    }
+    case "connect": {
+      const from = model.nodes.get(op.from);
+      const to = model.nodes.get(op.to);
+      if (from === undefined || to === undefined) {
+        return refused("gone");
+      }
+      return connect(model, from, to);
+    }
     case "addBox":
+      return addBox(model);
     case "deleteNode":
     case "deleteEdge":
     case "edgeLabel":

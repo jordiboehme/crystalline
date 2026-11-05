@@ -33,7 +33,7 @@ function readAs(labelType: string | undefined): string {
  *   `linkTarget`, `tooltip`
  * - `edge <n> added`, `edge <n> removed` (by position in the edge list)
  * - `edge <n> id`, `start`, `end`, `text`, `type`, `stroke`, `length`,
- *   `labelType`
+ *   `labelType`, `style`, `interpolate`
  * - `subgraph <id> added`, `removed`, `title`, `nodes`, `dir`, `labelType`
  * - `classDef <id> added`, `removed`, `styles`, `textStyles`
  *
@@ -107,10 +107,14 @@ export function dbDelta(before: FlowDbView, after: FlowDbView): string[] {
         "type",
         "stroke",
         "length",
+        "interpolate",
       ] as const) {
         if (old[field] !== edge[field]) {
           out.push(`edge ${n} ${field}`);
         }
+      }
+      if (old.style?.join("\n") !== edge.style?.join("\n")) {
+        out.push(`edge ${n} style`);
       }
       if (readAs(old.labelType) !== readAs(edge.labelType)) {
         out.push(`edge ${n} labelType`);

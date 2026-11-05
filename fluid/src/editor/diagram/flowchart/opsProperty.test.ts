@@ -118,6 +118,7 @@ async function broken(
   beforeDb: FlowDbView,
   edits: readonly TextEdit[],
   delta: readonly string[],
+  deltaOf: (before: FlowDbView, after: FlowDbView) => string[] = dbDelta,
 ): Promise<{ problem: string } | { after: string; db: FlowDbView }> {
   const after = applyEdits(before, edits);
   if (!onlyEditedBytes(before, after, edits)) {
@@ -142,7 +143,7 @@ async function broken(
   if (difference !== null) {
     return { problem: `disagrees: ${difference}` };
   }
-  const got = dbDelta(beforeDb, db);
+  const got = deltaOf(beforeDb, db);
   if (JSON.stringify(got) !== JSON.stringify(delta)) {
     return {
       problem: `delta ${JSON.stringify(got)}, wanted ${JSON.stringify(delta)}`,
@@ -842,6 +843,379 @@ describe("labels at the edges of the grammar, with real mermaid", () => {
   );
 });
 
+type InsertName = "addChild" | "addSibling" | "connect" | "addBox";
+
+interface InsertTally {
+  applied: Record<InsertName, number>;
+  shifted: number;
+  refused: string[];
+  failures: string[];
+}
+
+/** Which arrow each `linkStyle` index means in `body`, as `start end occurrence`. */
+function linkStyleTargets(body: string): string[][] {
+  const model = parseFlowchart(body);
+  return model.directives
+    .filter((d) => d.kind === "linkStyle")
+    .map((d) =>
+      d.indices.map(({ n }) => {
+        const edge = model.edges[n];
+        return `${String(edge?.start)} ${String(edge?.end)} ${String(edge?.occurrence)}`;
+      }),
+    );
+}
+
+/** The one arrow in `after` that `before` does not have: the first place the ids part. */
+function newEdgeIndex(before: FlowDbView, after: FlowDbView): number {
+  const at = before.edges.findIndex((e, i) => after.edges[i]?.id !== e.id);
+  return at === -1 ? before.edges.length : at;
+}
+
+/** Every op that adds something on `body`, each against mermaid's db. */
+async function checkInserts(body: string): Promise<InsertTally> {
+  const tally: InsertTally = {
+    applied: { addChild: 0, addSibling: 0, connect: 0, addBox: 0 },
+    shifted: 0,
+    refused: [],
+    failures: [],
+  };
+  const beforeDb = await flowDbFor(body);
+  const model = parseFlowchart(body);
+  const targets = JSON.stringify(linkStyleTargets(body));
+
+  const attempt = async (
+    what: string,
+    name: InsertName,
+    op: FlowOp,
+    anchor: string | null,
+    text: (id: string) => string,
+    edge: boolean,
+  ): Promise<void> => {
+    const fail = (problem: string) => {
+      tally.failures.push(`${what}: ${problem}\n--- body\n${body}`);
+    };
+    const result = compileFlowOp(model, op);
+    if ("refused" in result) {
+      tally.refused.push(`${what} ${result.refused}`);
+      return;
+    }
+    const made = result.created as { kind: string; id: string } | undefined;
+    if ((op.op === "connect") !== (made === undefined)) {
+      fail(`created ${JSON.stringify(made)}`);
+      return;
+    }
+    if (made !== undefined && made.kind !== "node") {
+      fail(`created ${JSON.stringify(made)}`);
+      return;
+    }
+    const id = made?.id ?? "";
+    const group =
+      anchor === null ? null : (model.nodes.get(anchor)?.subgraph ?? null);
+    let added: FlowDbView["edges"][number] | undefined;
+    const checked = await broken(
+      body,
+      beforeDb,
+      result.edits,
+      [
+        ...(made ? [`vertex ${id} added`] : []),
+        ...(made && group !== null ? [`subgraph ${group} nodes`] : []),
+      ],
+      (before, after) => {
+        // Without the one new arrow, every arrow must read as it did, position
+        // by position, its id and its linkStyle included.
+        if (!edge) {
+          return dbDelta(before, after);
+        }
+        const at = newEdgeIndex(before, after);
+        added = after.edges[at];
+        return dbDelta(before, {
+          ...after,
+          edges: after.edges.filter((_, i) => i !== at),
+        });
+      },
+    );
+    if ("problem" in checked) {
+      fail(checked.problem);
+      return;
+    }
+    const inserted = result.edits.filter((e) => e.insert.startsWith("\n"));
+    if (inserted.length !== 1 || inserted[0]?.insert.trim() !== text(id)) {
+      fail(`the new line is not ${text(id)}: ${JSON.stringify(inserted)}`);
+    }
+    if (made) {
+      const holder = checked.db.subgraphs.find((s) => s.nodes.includes(id));
+      if ((holder?.id ?? null) !== group) {
+        fail(`${id} is in ${String(holder?.id)}, wanted ${String(group)}`);
+      }
+      const vertex = checked.db.vertices.find((v) => v.id === id);
+      if (vertex?.text !== "New box" || vertex.type !== "square") {
+        fail(`the box reads ${JSON.stringify(vertex)}`);
+      }
+    }
+    if (
+      edge &&
+      (added?.type !== "arrow_point" ||
+        added.stroke !== "normal" ||
+        added.text !== "" ||
+        added.style !== undefined)
+    ) {
+      fail(`the arrow reads ${JSON.stringify(added)}`);
+    }
+    if (JSON.stringify(linkStyleTargets(checked.after)) !== targets) {
+      fail(`a linkStyle index moved: ${checked.after}`);
+    }
+    if (result.edits.length > 1) {
+      tally.shifted++;
+    }
+    tally.applied[name]++;
+  };
+
+  for (const id of model.nodeOrder) {
+    await attempt(
+      `${id} addChild`,
+      "addChild",
+      { op: "addChild", id },
+      id,
+      (made) => `${id} --> ${made}[New box]`,
+      true,
+    );
+    const parent = model.edges.find(
+      (e) => e.end === id && e.start !== id && model.nodes.has(e.start),
+    )?.start;
+    await attempt(
+      `${id} addSibling`,
+      "addSibling",
+      { op: "addSibling", id },
+      parent ?? id,
+      (made) =>
+        parent === undefined
+          ? `${made}[New box]`
+          : `${parent} --> ${made}[New box]`,
+      parent !== undefined,
+    );
+  }
+  const first = model.nodeOrder.slice(0, 5);
+  for (const from of first) {
+    for (const to of first) {
+      if (from !== to) {
+        await attempt(
+          `${from} connect ${to}`,
+          "connect",
+          { op: "connect", from, to },
+          null,
+          () => `${from} --> ${to}`,
+          true,
+        );
+      }
+    }
+  }
+  await attempt(
+    "addBox",
+    "addBox",
+    { op: "addBox" },
+    null,
+    (made) => `${made}[New box]`,
+    false,
+  );
+  return tally;
+}
+
+const insertTallies = new Map<string, Promise<InsertTally>>();
+
+function insertTallyOf(name: string, body: string): Promise<InsertTally> {
+  let tally = insertTallies.get(name);
+  if (tally === undefined) {
+    tally = checkInserts(body);
+    insertTallies.set(name, tally);
+  }
+  return tally;
+}
+
+/** Cases the corpus does not hold, each next to a place a new line could go wrong. */
+const INSERT_EXTRA: readonly (readonly [string, string])[] = [
+  ...EXTRA,
+  ["a peer's comment", "flowchart TD\n  A --> B\n    %% peer note\n  B --> C"],
+  [
+    "arrows after a linkStyle",
+    "flowchart TD\n  A --> B\n  linkStyle 0 stroke:#000\n  B --> C\n  linkStyle 1 stroke:#111\n  C --> A",
+  ],
+  [
+    "a linkStyle in a subgraph",
+    "flowchart TD\n  X --> Y\n  subgraph s\n    A --> B\n    linkStyle 1 stroke:#000\n    B --> C\n  end\n  C --> X",
+  ],
+  [
+    "an arrow into a subgraph",
+    "flowchart TD\n  subgraph s\n    A --> B\n  end\n  C --> s\n  s --> D",
+  ],
+  [
+    "style above the first ref",
+    "flowchart TD\n  style C fill:#fff\n  A --> B\n  B --> C",
+  ],
+  ["a tabbed body", "flowchart TD\n\tA --> B\n\tsubgraph s\n\t\tC\n\tend"],
+  ["no direction, no statement line", "graph TD; A --> B; B --> C"],
+];
+
+/**
+ * Every refusal of an op that adds something, as `<fixture> <what> <code>`.
+ * Asserted whole (R28).
+ */
+const EXPECTED_INSERT_REFUSALS: readonly string[] = [
+  // `call` draws only with its shape right after the id: a bare `call --> x`
+  // is a parse error in mermaid, pinned below. `each`'s parent is `call`.
+  "r14-reflection-write call addChild invalid",
+  "r14-reflection-write each addSibling invalid",
+  "r14-reflection-write call connect each invalid",
+  "r14-reflection-write call connect readable invalid",
+  "r14-reflection-write call connect hidden invalid",
+  "r14-reflection-write call connect wide invalid",
+  "r14-reflection-write each connect call invalid",
+  "r14-reflection-write readable connect call invalid",
+  "r14-reflection-write hidden connect call invalid",
+  "r14-reflection-write wide connect call invalid",
+];
+
+describe("every op that adds something, on the corpus", () => {
+  test.each(corpus)(
+    "%s",
+    async (name, body) => {
+      const tally = await insertTallyOf(name, body);
+      expect(tally.failures).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test.each(INSERT_EXTRA)(
+    "%s",
+    async (name, body) => {
+      const tally = await insertTallyOf(`extra ${name}`, body);
+      expect(tally.failures).toEqual([]);
+      expect(tally.applied.addChild).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the refusals over the corpus are these (R28)",
+    async () => {
+      const refused: string[] = [];
+      for (const [name, body] of corpus) {
+        const tally = await insertTallyOf(name, body);
+        refused.push(...tally.refused.map((r) => `${name} ${r}`));
+      }
+      expect(refused).toEqual(EXPECTED_INSERT_REFUSALS);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "each op applies on the named fixtures, so no suite passes by refusing (R28)",
+    async () => {
+      let shifted = 0;
+      const applied = { addChild: 0, addSibling: 0, connect: 0, addBox: 0 };
+      for (const [name, body] of corpus) {
+        if (name.startsWith("f")) {
+          const tally = await insertTallyOf(name, body);
+          shifted += tally.shifted;
+          for (const op of Object.keys(applied) as InsertName[]) {
+            applied[op] += tally.applied[op];
+          }
+        }
+      }
+      expect(applied.addBox).toBe(24);
+      expect(applied.addChild).toBeGreaterThanOrEqual(24);
+      expect(applied.addSibling).toBeGreaterThanOrEqual(24);
+      expect(applied.connect).toBeGreaterThanOrEqual(24);
+      expect(shifted).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test.each([
+    "o",
+    "x",
+    "v",
+    "default",
+    "end1",
+    "style1",
+    "graph_a",
+    "1",
+    "A-1",
+    "subgraphs",
+    "TD",
+    "LR",
+    "direction",
+    "directions",
+    "n",
+    "L_A_B_0",
+    "href1",
+    "_self1",
+    "click1",
+  ])(
+    "the id %s next to a new line, each result read by mermaid or refused",
+    async (id) => {
+      const body = `flowchart TD\n  ${id} --> Q1\n  Q1 --> R1\n  R1 --> ${id}`;
+      if (!parseFlowchart(body).understood) {
+        return;
+      }
+      await flowDbFor(body);
+      const tally = await checkInserts(body);
+      expect(tally.failures).toEqual([]);
+      expect(tally.refused).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a bare call really is one mermaid refuses",
+    async () => {
+      expect(
+        await flowDbOf("flowchart TD\n  call[x]", false),
+      ).not.toHaveProperty("error");
+      expect(
+        await flowDbOf("flowchart TD\n  call[x]\n  call --> B", false),
+      ).toHaveProperty("error");
+    },
+    TIMEOUT,
+  );
+
+  test.each(["f10-linkstyle", "f13-subgraphs", "r05-slab-apply"])(
+    "%s saves with its own line breaks",
+    (name) => {
+      const lf = corpus.find(([n]) => n === name)?.[1] ?? "";
+      const crlf = lf.replaceAll("\n", "\r\n");
+      const state = EditorState.create({
+        doc: crlf,
+        extensions: lineSeparatorFor(crlf),
+      });
+      const body = state.doc.sliceString(0, state.doc.length);
+      const model = parseFlowchart(body);
+      const ops: FlowOp[] = [
+        { op: "addBox" },
+        ...model.nodeOrder.flatMap((id): FlowOp[] => [
+          { op: "addChild", id },
+          { op: "addSibling", id },
+          { op: "connect", from: id, to: model.nodeOrder[0] ?? id },
+        ]),
+      ];
+      for (const op of ops) {
+        const result = compileFlowOp(model, op);
+        if ("refused" in result) {
+          throw new Error(`refused: ${JSON.stringify(op)} ${result.refused}`);
+        }
+        const saved = docText(
+          state.update({
+            changes: toChanges(0, result.edits, state.lineBreak),
+          }).state,
+        );
+        expect(saved).toBe(
+          applyEdits(body, result.edits).replaceAll("\n", "\r\n"),
+        );
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
 
 test.skipIf(folder === undefined)(
@@ -865,7 +1239,15 @@ test.skipIf(folder === undefined)(
       }
       drawn++;
       const tally = await checkBody(body);
-      failures.push(...tally.failures.map((f) => `${file}: ${f}`));
+      const inserts = await checkInserts(body);
+      failures.push(
+        ...[...tally.failures, ...inserts.failures].map((f) => `${file}: ${f}`),
+      );
+      for (const refusal of inserts.refused) {
+        const words = refusal.split(" ");
+        const key = `${words.at(-2) === "connect" ? "connect" : (words.at(1) ?? "")} ${words.at(-1) ?? ""}`;
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
       for (const refusal of tally.refused) {
         const words = refusal.split(" ");
         const key = `${words[1] === "colour" || words[1] === "shape" ? words[1] : (words[0] ?? "")} ${words.at(-1) ?? ""}`;
