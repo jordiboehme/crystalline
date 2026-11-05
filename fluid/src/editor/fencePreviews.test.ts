@@ -5,14 +5,17 @@
  * own DOM while confirming the buffer itself is untouched.
  */
 
-import { EditorSelection, EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../test/parse";
 import { describeMermaidError, fencePreviews } from "./fencePreviews";
+import { drawnDiagrams } from "./diagram/draws";
 import { gridLoaded } from "./grid/draws";
+import { mathSections } from "./mathBlocks";
 import { baseExtensions } from "./setup";
 
 vi.mock("mermaid", () => ({
@@ -705,5 +708,145 @@ describe("the table preview and the grid", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
     view.destroy();
+  });
+});
+
+describe("the hand-over to the diagram layer", () => {
+  const FLOW = "```mermaid\nflowchart TD\n  A --> B\n```";
+
+  function withDrawn(doc: string, drawn: readonly number[]) {
+    const compartment = new Compartment();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            compartment.of(drawnDiagrams.of(drawn)),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    return { v, compartment };
+  }
+
+  it("gives a drawn fence no preview and an undrawn one keeps it", () => {
+    const doc = `${FLOW}\n\n${FLOW}`;
+    const { v } = withDrawn(doc, [0]);
+    expect(v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(1);
+    v.destroy();
+    const none = withDrawn(doc, []);
+    expect(none.v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(2);
+    none.v.destroy();
+  });
+
+  it("takes the preview away and gives it back when the set of drawn fences changes", () => {
+    const { v, compartment } = withDrawn(FLOW, []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([0])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.destroy();
+  });
+
+  it("draws an unclosed mermaid fence as text plus a drawing, as the page does (D43)", () => {
+    const { v } = withDrawn("```mermaid\nflowchart TD\n  A --> B", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    expect(v.state.doc.toString()).toBe("```mermaid\nflowchart TD\n  A --> B");
+    v.destroy();
+  });
+
+  it("draws nothing for an unclosed fence with no body", () => {
+    const { v } = withDrawn("```mermaid", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.destroy();
+  });
+});
+
+describe("what the preview hands mermaid", () => {
+  async function renderedFor(doc: string, extra: Extension[] = []) {
+    vi.mocked(mermaid.render).mockClear();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            ...extra,
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const sources = vi.mocked(mermaid.render).mock.calls.map((call) => call[1]);
+    v.destroy();
+    return sources;
+  }
+
+  it.each([
+    [
+      "a closed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B\n> ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a nested quote",
+      "> > ```mermaid\n> > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed top-level fence",
+      "```mermaid\ngraph TD; A-->B\nB-->C",
+      "graph TD; A-->B\nB-->C",
+    ],
+    [
+      "a list item's fence loses the list item's indent",
+      "- ```mermaid\n  graph TD; A-->B\n  ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, closed",
+      "- > ```mermaid\n  > graph TD; A-->B\n  > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, unclosed",
+      "- > ```mermaid\n  > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, closed",
+      "1. > ```mermaid\n   > graph TD; A-->B\n   > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, unclosed",
+      "1. > ```mermaid\n   > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+  ])("%s", async (_name, doc, source) => {
+    expect(await renderedFor(doc)).toEqual([source]);
+  });
+
+  it("draws no preview for a fence in the frontmatter", async () => {
+    const doc =
+      "---\nnote: |\n  ```mermaid\n  graph TD; A-->B\n  ```\n---\n\nbody";
+    expect(await renderedFor(doc)).toEqual([]);
+  });
+
+  it("stops an unclosed fence at a section heading only where the page reads sections", async () => {
+    const doc = "```mermaid\ngraph TD; A-->B\n\n## Next\n\nmore";
+    expect(await renderedFor(doc, [mathSections.of(true)])).toEqual([]);
+    expect(await renderedFor(doc)).toHaveLength(1);
   });
 });

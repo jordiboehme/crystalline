@@ -99,8 +99,8 @@ export function unpadded(text: string): string {
 export const SECTION_HEADING = /^##(?:[ \t]|$)/;
 
 /**
- * The formula a `FencedCode` node holds when it is a `math` fence the page
- * draws as one block, or null. Shared with the code box, which leaves to
+ * The formula a `FencedCode` node holds when it is a closed `math` fence the
+ * page draws as one block, or null. Shared with the code box, which leaves to
  * this layer exactly the fences it draws.
  */
 export function mathFence(
@@ -108,15 +108,42 @@ export function mathFence(
   node: SyntaxNode,
   sections = state.facet(mathSections),
 ): MathBlock | null {
+  return readFence(state, node, sections, false);
+}
+
+/**
+ * The formula an UNCLOSED `math` fence holds, or null (D43). The page reads
+ * everything to the end of the fence's container as the formula and draws it;
+ * the editor keeps the text as written and draws the formula after it. Its
+ * `close` is the last line of the fence, which is no closing mark.
+ */
+export function openMathFence(
+  state: EditorState,
+  node: SyntaxNode,
+  sections = state.facet(mathSections),
+): MathBlock | null {
+  return readFence(state, node, sections, true);
+}
+
+function readFence(
+  state: EditorState,
+  node: SyntaxNode,
+  sections: boolean,
+  unclosed: boolean,
+): MathBlock | null {
   const doc = state.doc;
   // The info word as the page reads it (`fenceInfo`): "``` math", a tilde
   // fence and info after the word are math there too.
   const info = fenceInfo(doc, node);
-  if (info === null || info.name !== "math" || info.close === null) {
+  if (
+    info === null ||
+    info.name !== "math" ||
+    (info.close === null) !== unclosed
+  ) {
     return null;
   }
   const first = doc.line(info.open);
-  const last = doc.line(info.close);
+  const last = info.close === null ? doc.lineAt(node.to) : doc.line(info.close);
   const depth = quoteDepth(first.text);
   const quoted: string[] = [];
   for (let number = first.number; number <= last.number; number += 1) {
@@ -132,9 +159,13 @@ export function mathFence(
   });
   // A fence that follows a list marker on its line stays source: its
   // block would have to start mid-line.
-  const fence = (lines[0] ?? "").startsWith(marks)
-    ? [lines.join("\n"), lines.slice(1, -1).join("\n")]
-    : null;
+  const body = unclosed ? lines.slice(1) : lines.slice(1, -1);
+  // An unclosed fence is no such case: its formula is a widget after the
+  // source and replaces nothing, so the page's reading is the one to follow.
+  const fence =
+    unclosed || (lines[0] ?? "").startsWith(marks)
+      ? [lines.join("\n"), body.join("\n")]
+      : null;
   // On a page read section by section, a fence that runs over a section
   // heading is not one block on the page: draw none.
   const crosses =
@@ -157,6 +188,27 @@ export function mathFence(
     close: last.number,
     depth,
   };
+}
+
+/** Every unclosed `math` fence of `state` with something to draw (D43). */
+export function openMathFences(
+  state: EditorState,
+  sections = state.facet(mathSections),
+): MathBlock[] {
+  const found: MathBlock[] = [];
+  syntaxTree(state).iterate({
+    enter: (node) => {
+      if (node.name !== "FencedCode") {
+        return undefined;
+      }
+      const block = openMathFence(state, node.node, sections);
+      if (block !== null) {
+        found.push(block);
+      }
+      return false;
+    },
+  });
+  return found;
 }
 
 /** Every display formula of `state`, in document order of their ends. */

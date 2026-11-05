@@ -26,6 +26,7 @@ import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
 import type { FloatingContext } from "./floatingContext";
 import { floatingContextListener } from "./floatingContext";
+import { diagramLayer } from "./diagram/loader";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
@@ -178,6 +179,10 @@ export function previewConfig(
         // comes first: an arrow at a line's visible edge, with hidden marks
         // up to the raw edge, goes over the line break.
         crossEdge,
+        // Before the read-only previews: the diagram layer takes over the
+        // editable mermaid fences once its chunk is in and a fence's verdict
+        // is ok, and `fencePreviews` then leaves those fences alone.
+        diagramLayer(),
         fencePreviews(dark),
         // The code box: a fence's lines drawn as a box with a header, in
         // the main view only (a table cell holds no fence).

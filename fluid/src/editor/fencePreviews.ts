@@ -32,6 +32,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
 import { mermaidConfig } from "../theme/mermaid";
+import { drawnDiagrams } from "./diagram/draws";
 import { mermaidFence } from "./elementVerbs";
 import { gridDraws, gridLoaded, gridUnavailable } from "./grid/draws";
 import { parseAdvanced } from "./parseProgress";
@@ -435,12 +436,15 @@ function buildPreviews(state: EditorState, dark: boolean): DecorationSet {
   const doc = state.doc;
   const grid = state.facet(gridLoaded);
   const unavailable = state.facet(gridUnavailable);
+  // The fences the diagram layer draws as an editable diagram need no
+  // read-only preview below them.
+  const drawn = state.facet(drawnDiagrams);
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name === "FencedCode") {
         // The test the code box shares, so a fence is drawn once.
         const body = mermaidFence(state, node.node);
-        if (body !== null) {
+        if (body !== null && !drawn.includes(node.from)) {
           widgets.push(
             Decoration.widget({
               // The body starts on the line after the opening delimiter, which
@@ -526,7 +530,9 @@ export function fencePreviews(dark: boolean): Extension {
       tr.docChanged ||
       parseAdvanced(tr) ||
       tr.startState.facet(gridLoaded) !== tr.state.facet(gridLoaded) ||
-      tr.startState.facet(gridUnavailable) !== tr.state.facet(gridUnavailable)
+      tr.startState.facet(gridUnavailable) !==
+        tr.state.facet(gridUnavailable) ||
+      tr.startState.facet(drawnDiagrams) !== tr.state.facet(drawnDiagrams)
         ? buildPreviews(tr.state, dark)
         : value,
     provide: (f) => EditorView.decorations.from(f),
