@@ -1146,7 +1146,6 @@ class Parser {
         ) {
           refuse(`The alias on line ${line} is empty or has outer space.`);
         }
-        out.alias = value;
         if (match[3] !== undefined) {
           const at =
             content.from + start + match[0].lastIndexOf(`"${value}"`) + 1;
@@ -1155,8 +1154,9 @@ class Parser {
           const at =
             content.from + start + match[0].lastIndexOf(value.trimEnd());
           out.aliasSpan = this.span(at, at + value.trimEnd().length);
-          out.alias = value.trimEnd();
         }
+        // From the body: the lexed text has its entity forms hidden.
+        out.alias = this.model.body.slice(out.aliasSpan.from, out.aliasSpan.to);
       }
     }
     return out;

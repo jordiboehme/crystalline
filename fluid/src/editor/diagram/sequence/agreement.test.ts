@@ -419,6 +419,8 @@ const EDGE_CASES: [string, EdgeState][] = [
   [`${S}  A%% y\n  A->>B: x`, "refused"],
   [`${S}  A->>B: x %%{init: {}}%%`, "refused"],
   [`${S}  %%{ }%%\n  A->>B: x`, "refused"],
+  // An entity form in a config's alias is read from the source, as an `as` alias is.
+  [`${S}  participant A@{ "alias": "x#35;y#59;z" }`, "agrees"],
   // A `;` ends a statement whatever surrounds it.
   [`${S}  A->>B: "a;b"\n`, "refused"],
   [`${S}  A->>B: a; B->>A: b`, "agrees"],

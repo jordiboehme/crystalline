@@ -4,7 +4,12 @@
  * op did not mean shows up even when our own parser reads past it.
  */
 
-import { type FlowDbView, flowDbOf } from "../editor/diagram/mermaidDb";
+import {
+  type FlowDbView,
+  type SequenceDbView,
+  flowDbOf,
+  sequenceDbOf,
+} from "../editor/diagram/mermaidDb";
 
 /** Mermaid's db for `body`; a refusal is a throw, which fails the test. */
 export async function flowDbFor(body: string): Promise<FlowDbView> {
@@ -178,4 +183,123 @@ export async function flowDelta(
   after: string,
 ): Promise<string[]> {
   return dbDelta(await flowDbFor(before), await flowDbFor(after));
+}
+
+/** Mermaid's sequence db for `body`; a refusal is a throw, which fails the test. */
+export async function seqDbFor(body: string): Promise<SequenceDbView> {
+  const view = await sequenceDbOf(body, false);
+  if ("error" in view) {
+    throw new Error(`mermaid refused: ${String(view.error)}\n${body}`);
+  }
+  return view;
+}
+
+/**
+ * Every difference between two sequence dbs, one string per difference, in a
+ * fixed order, so a suite can assert the exact list:
+ *
+ * - `actor <name> added`, `actor <name> removed`, `actor order`
+ * - `actor <name> description`, `actor <name> type`
+ * - `record <n> added`, `record <n> removed` (by position in the list)
+ * - `record <n> id`, `from`, `to`, `message`, `type`, `placement`, `autonumber`
+ * - `box <n> added`, `box <n> removed`, `box <n> actors`
+ * - `created <name>`, `destroyed <name>`, for an entry added, removed or moved
+ *
+ * Records are compared by position, so a delete reports every record after it. A
+ * suite states a delete by building the db it means and asking for no difference.
+ */
+export function seqDbDelta(
+  before: SequenceDbView,
+  after: SequenceDbView,
+): string[] {
+  const out: string[] = [];
+  const was = new Map(before.actors.map((a) => [a.name, a]));
+  const now = new Map(after.actors.map((a) => [a.name, a]));
+  for (const name of was.keys()) {
+    if (!now.has(name)) {
+      out.push(`actor ${name} removed`);
+    }
+  }
+  for (const [name, actor] of now) {
+    const old = was.get(name);
+    if (old === undefined) {
+      out.push(`actor ${name} added`);
+      continue;
+    }
+    if (old.description !== actor.description) {
+      out.push(`actor ${name} description`);
+    }
+    if (old.type !== actor.type) {
+      out.push(`actor ${name} type`);
+    }
+  }
+  const kept = (
+    list: SequenceDbView["actors"],
+    other: Map<string, unknown>,
+  ): string =>
+    JSON.stringify(list.filter((a) => other.has(a.name)).map((a) => a.name));
+  if (kept(before.actors, now) !== kept(after.actors, was)) {
+    out.push("actor order");
+  }
+
+  const records = Math.max(before.records.length, after.records.length);
+  for (let n = 0; n < records; n++) {
+    const old = before.records[n];
+    const record = after.records[n];
+    if (old === undefined) {
+      out.push(`record ${n} added`);
+    } else if (record === undefined) {
+      out.push(`record ${n} removed`);
+    } else {
+      for (const field of [
+        "id",
+        "from",
+        "to",
+        "message",
+        "type",
+        "placement",
+      ] as const) {
+        if (old[field] !== record[field]) {
+          out.push(`record ${n} ${field}`);
+        }
+      }
+      if (
+        JSON.stringify(old.autonumber) !== JSON.stringify(record.autonumber)
+      ) {
+        out.push(`record ${n} autonumber`);
+      }
+    }
+  }
+
+  const boxes = Math.max(before.boxes.length, after.boxes.length);
+  for (let n = 0; n < boxes; n++) {
+    const old = before.boxes[n];
+    const box = after.boxes[n];
+    if (old === undefined) {
+      out.push(`box ${n} added`);
+    } else if (box === undefined) {
+      out.push(`box ${n} removed`);
+    } else if (old.actors.join("\n") !== box.actors.join("\n")) {
+      out.push(`box ${n} actors`);
+    }
+  }
+
+  for (const field of ["created", "destroyed"] as const) {
+    const old = new Map(before[field]);
+    const entries = new Map(after[field]);
+    for (const name of new Set([...old.keys(), ...entries.keys()])) {
+      if (old.get(name) !== entries.get(name)) {
+        out.push(`${field} ${name}`);
+      }
+    }
+  }
+  return out;
+}
+
+/** `seqDbDelta` of the two bodies. Throws when mermaid refuses either. */
+export async function seqDelta(
+  before: string,
+  after: string,
+): Promise<string[]> {
+  return seqDbDelta(await seqDbFor(before), await seqDbFor(after));
 }

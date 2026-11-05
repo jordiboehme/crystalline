@@ -29,7 +29,13 @@ export interface TextEdit {
 
 /** Why an op made no change. */
 export type RefusalCode =
-  "stale" | "gone" | "invalid" | "group" | "chain" | "unsupported";
+  | "stale"
+  | "gone"
+  | "invalid"
+  | "group"
+  | "chain"
+  | "unsupported"
+  | "emptiesBlock";
 
 /** What an op compiler returns: the edits (and what they create) or a refusal. */
 export type OpResult =
@@ -45,6 +51,8 @@ export const NOTICES: Record<RefusalCode, string> = {
   chain: "This arrow is part of a chain, so it cannot be reversed on its own.",
   unsupported:
     "This diagram uses something the editor does not know yet, so it was not changed.",
+  emptiesBlock:
+    "That would leave a block with nothing in it, so it was not deleted.",
 };
 
 /**

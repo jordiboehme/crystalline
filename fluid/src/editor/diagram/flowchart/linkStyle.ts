@@ -9,7 +9,7 @@ import type { FlowModel } from "./model";
 
 /** The ranges that delete whole lines with one line break each. */
 export function lineDeletions(
-  model: FlowModel,
+  model: Pick<FlowModel, "scan">,
   indices: readonly number[],
 ): Span[] {
   const lines = model.scan.lines;
