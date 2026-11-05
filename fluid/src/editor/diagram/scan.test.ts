@@ -387,13 +387,51 @@ describe("scanFence against mermaid 12.2", () => {
 
   test("the predicates read the statements after an accDescr block", () => {
     const body =
-      "flowchart TD\n  accDescr { direction LR }\n  accDescr { x } A --> B %% n\n  accDescr { y } C --> D direction LR";
+      "flowchart TD\naccDescr { direction LR }\n  accDescr { x } A --> B %% n\n  accDescr { y } C --> D direction LR";
     const scan = scanFence(body);
     expect(isDirectionLine(body, line(scan, 1))).toBe(false);
     expect(hasStrayComment(body, line(scan, 1))).toBe(false);
     expect(hasStrayComment(body, line(scan, 2))).toBe(true);
     expect(isDirectionLine(body, line(scan, 3))).toBe(true);
     expect(texts(body, line(scan, 3))).toEqual(["C --> D direction LR"]);
+  });
+
+  test("an indented acc line with a direction is a direction line, a flush one is not", () => {
+    for (const text of [
+      "accTitle: direction LR",
+      "accDescr: direction LR",
+      "accDescr { direction BT }",
+      "accDescr { direction BT } A --> B",
+    ]) {
+      const indented = `flowchart TD\n  ${text}`;
+      expect(
+        isDirectionLine(indented, line(scanFence(indented), 1)),
+        text,
+      ).toBe(true);
+      if (!text.endsWith("A --> B")) {
+        const flush = `flowchart TD\n${text}`;
+        expect(isDirectionLine(flush, line(scanFence(flush), 1)), text).toBe(
+          false,
+        );
+      }
+    }
+  });
+
+  test("an indented acc line whose direction runs onto the next line is not understood", () => {
+    const scan = scanFence("flowchart TD\n  accTitle: direction\n  LR\n  A");
+    expect(scan.understood).toBe(false);
+  });
+
+  test("the text inside an accDescr block is no direction line", () => {
+    const body = "flowchart TD\n  accDescr {\n    direction BT\n  }\n  A";
+    expect(isDirectionLine(body, line(scanFence(body), 2))).toBe(false);
+  });
+
+  test("a long line without a ; costs no regex backtracking", () => {
+    const body = `flowchart TD\n  A[style ${":#".repeat(2000)}]`;
+    const from = performance.now();
+    scanFence(body);
+    expect(performance.now() - from).toBeLessThan(500);
   });
 
   test("an accDescr block's close with nothing after it has no statements", async () => {

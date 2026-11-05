@@ -184,7 +184,9 @@ export interface DirectiveLine {
  * without one, numbered in the order the blocks close). `members` is the
  * list mermaid's db gives it, as a set: the ids its own statements name
  * plus its child subgraphs, without ids an earlier closed subgraph already
- * holds.
+ * holds. `parent` is the nesting in the source, not mermaid's list: an edge
+ * that names a subgraph inside a sibling moves it to that sibling's members
+ * and leaves `parent` as written. It is not part of the agreement check.
  */
 export interface Subgraph {
   id: string;

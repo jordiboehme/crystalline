@@ -27,9 +27,6 @@ export type Verdict =
     }
   | { ok: false; reason: string };
 
-/** The diagram keywords that have an editor. */
-const FLOW_KEYWORDS = new Set(["flowchart", "graph"]);
-
 const CACHE_SIZE = 256;
 const settled = new Map<string, Verdict>();
 const pending = new Map<string, Promise<Verdict>>();
@@ -41,10 +38,11 @@ const pending = new Map<string, Promise<Verdict>>();
  * they are mapped back to the `#name;` form the source uses; every way of
  * writing a line break (`<br/>`, `<br />`, `<BR>`) becomes `<br>`, the form
  * mermaid's sanitizer stores; and outer whitespace is dropped (mermaid
- * trims labels).
+ * trims labels). A db label need not be a string (`@{ label: 1 }` reads as
+ * a number), so any value is taken and read as text.
  */
-export function normalizeLabel(text: string): string {
-  return text
+export function normalizeLabel(text: unknown): string {
+  return (typeof text === "string" ? text : String(text))
     .replace(/\uFB02\xB0\xB0(\w+)\xB6\xDF/g, "#$1;")
     .replace(/\uFB02\xB0(\w+)\xB6\xDF/g, "#$1;")
     .replace(/<br\s*\/?>/gi, "<br>")
@@ -84,6 +82,81 @@ function edgeType(start: string, end: string): string {
   return start === "none" ? `arrow_${name}` : `double_arrow_${name}`;
 }
 
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/** Each box's `style` entries in source order, as the db lists them. */
+function stylesOf(model: FlowModel): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const directive of model.directives) {
+    const id = directive.targets[0]?.id;
+    if (directive.kind === "style" && id !== undefined) {
+      const entries = directive.props.map((p) =>
+        model.body.slice(p.entry.from, p.entry.to),
+      );
+      out.set(id, [...(out.get(id) ?? []), ...entries]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Each box's classes as mermaid's db collects them, in source order:
+ * `setClass` skips an id with no vertex yet, so a `class` or `click` line
+ * only counts after the box's first ref or `style` line. A `click` line adds
+ * `clickable`.
+ */
+function classesOf(model: FlowModel): Map<string, string[]> {
+  const steps: { at: number; run: () => void }[] = [];
+  const known = new Set<string>();
+  const out = new Map<string, string[]>();
+  const add = (id: string, name: string) => {
+    if (known.has(id)) {
+      out.set(id, [...(out.get(id) ?? []), name]);
+    }
+  };
+  for (const chain of model.chains) {
+    for (const group of chain.groups) {
+      for (const ref of group.refs) {
+        steps.push({
+          at: ref.span.from,
+          run: () => {
+            known.add(ref.id);
+            if (ref.classSpan) {
+              add(
+                ref.id,
+                model.body.slice(ref.classSpan.from, ref.classSpan.to),
+              );
+            }
+          },
+        });
+      }
+    }
+  }
+  for (const directive of model.directives) {
+    steps.push({
+      at: directive.span.from,
+      run: () => {
+        for (const target of directive.targets) {
+          if (directive.kind === "style") {
+            known.add(target.id);
+          } else if (directive.kind === "class" && directive.className) {
+            add(target.id, directive.className.name);
+          } else if (directive.kind === "click") {
+            add(target.id, "clickable");
+          }
+        }
+      },
+    });
+  }
+  steps.sort((a, b) => a.at - b.at);
+  for (const step of steps) {
+    step.run();
+  }
+  return out;
+}
+
 function sameSet(a: Iterable<string>, b: Iterable<string>): boolean {
   const left = new Set(a);
   const right = new Set(b);
@@ -98,8 +171,8 @@ function sameSet(a: Iterable<string>, b: Iterable<string>): boolean {
  * subgraph id is the cluster, never a box, R4); the edge sequence with each
  * edge's start, end, id, type, stroke, length and label; the subgraph ids
  * and member sets (the db lists members in reverse, R9); and each box's
- * label (through `normalizeLabel`, R6) and type (the classic table, or the
- * `@{ shape }` name as written, R9).
+ * label (through `normalizeLabel`, R6), type (the classic table, or the
+ * `@{ shape }` name as written, R9), styles and classes.
  */
 export function agreesFlow(model: FlowModel, db: FlowDbView): string | null {
   if (!model.understood) {
@@ -141,6 +214,8 @@ export function agreesFlow(model: FlowModel, db: FlowDbView): string | null {
   ) {
     return "The box ids differ.";
   }
+  const styles = stylesOf(model);
+  const classes = classesOf(model);
   for (const vertex of boxes) {
     const node = model.nodes.get(vertex.id);
     if (!node) {
@@ -162,6 +237,17 @@ export function agreesFlow(model: FlowModel, db: FlowDbView): string | null {
           : DB_TYPE.get(shape.name);
     if (type !== vertex.type) {
       return `The shape of ${node.id} differs.`;
+    }
+    if (
+      !sameList(
+        styles.get(node.id) ?? [],
+        vertex.styles.map((entry) => entry.trim()),
+      )
+    ) {
+      return `The styles of ${node.id} differ.`;
+    }
+    if (!sameList(classes.get(node.id) ?? [], vertex.classes)) {
+      return `The classes of ${node.id} differ.`;
     }
   }
 
@@ -228,28 +314,41 @@ export function verdictFor(body: string): Verdict | undefined {
   return verdict;
 }
 
-async function decide(body: string, dark: boolean): Promise<Verdict> {
+/** A verdict, or an answer that says nothing about the body (`final: false`). */
+interface Decision {
+  verdict: Verdict;
+  final: boolean;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function decide(body: string, dark: boolean): Promise<Decision> {
+  const refused = (reason: string): Decision => ({
+    verdict: { ok: false, reason },
+    final: true,
+  });
   const model = parseFlowchart(body);
-  if (!FLOW_KEYWORDS.has(model.keyword)) {
-    return { ok: false, reason: "This kind of diagram has no editor yet." };
-  }
   if (!model.understood) {
-    return {
-      ok: false,
-      reason: model.reasons[0] ?? "The parser does not understand it.",
-    };
+    return refused(model.reasons[0] ?? "The parser does not understand it.");
   }
   const db = await flowDbOf(body, dark);
   if ("error" in db) {
-    const error = db.error;
-    return {
-      ok: false,
-      reason: `mermaid refuses it: ${error instanceof Error ? error.message : String(error)}`,
-    };
+    if (db.unavailable) {
+      return {
+        verdict: {
+          ok: false,
+          reason: `mermaid could not be loaded: ${messageOf(db.error)}`,
+        },
+        final: false,
+      };
+    }
+    return refused(`mermaid refuses it: ${messageOf(db.error)}`);
   }
   const difference = agreesFlow(model, db);
   if (difference !== null) {
-    return { ok: false, reason: difference };
+    return refused(difference);
   }
   const clusters = new Set(db.subgraphs.map((s) => s.id));
   const domIds = new Map(
@@ -257,13 +356,16 @@ async function decide(body: string, dark: boolean): Promise<Verdict> {
       .filter((v) => !clusters.has(v.id))
       .map((v) => [v.domId, v.id] as const),
   );
-  return { ok: true, kind: "flowchart", domIds };
+  return { verdict: { ok: true, kind: "flowchart", domIds }, final: true };
 }
 
 /**
  * The verdict for `body`: parse, mermaid's db (`flowDbOf` with the asking
  * view's `dark`) and `agreesFlow`. Cached by body; a request while one is
- * running for the same body gets the same promise.
+ * running for the same body gets the same promise. A check that could not
+ * run (mermaid failing to load, an unexpected throw) answers `ok: false` with
+ * the cause but is no verdict: it is not cached, and the next request tries
+ * again.
  */
 export function requestVerdict(body: string, dark: boolean): Promise<Verdict> {
   const known = verdictFor(body);
@@ -275,13 +377,15 @@ export function requestVerdict(body: string, dark: boolean): Promise<Verdict> {
     return running;
   }
   const promise = decide(body, dark)
-    .catch((error: unknown): Verdict => ({
-      ok: false,
-      reason: `The check failed: ${error instanceof Error ? error.message : String(error)}`,
+    .catch((error: unknown): Decision => ({
+      verdict: { ok: false, reason: `The check failed: ${messageOf(error)}` },
+      final: false,
     }))
-    .then((verdict) => {
+    .then(({ verdict, final }) => {
       pending.delete(body);
-      remember(body, verdict);
+      if (final) {
+        remember(body, verdict);
+      }
       return verdict;
     });
   pending.set(body, promise);

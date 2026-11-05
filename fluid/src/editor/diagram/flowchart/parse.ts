@@ -17,7 +17,9 @@
  * cannot split into refs and links, a reserved word as an id, an unbalanced
  * `subgraph`/`end`, the ellipse `(-x-)` (R5), a direction line other than a
  * plain `direction XX` inside a subgraph (R7), a bare or trailing `%%` (R8),
- * a `linkStyle` index past the edges so far (R9) and `flowchart-elk` (R30).
+ * a `linkStyle` index past the edges so far (R9), `flowchart-elk` (R30), a
+ * body or an edge count past mermaid's limits, two edges with one id, and
+ * what mermaid accepts but cannot draw (`@{ shape: icon }`).
  *
  * It never throws: a body it trips over comes back not understood.
  */
@@ -51,6 +53,22 @@ import {
 const KEYWORDS = new Set(["flowchart", "graph"]);
 
 /**
+ * mermaid's `maxTextSize`: `render` replaces a longer text with its "Maximum
+ * text size" diagram, while the db read of the verdict does not notice.
+ */
+export const MAX_TEXT_SIZE = 50_000;
+/** mermaid's `maxEdges`: the db throws on one edge more. */
+export const MAX_EDGES = 500;
+
+/**
+ * `@{ shape }` names mermaid accepts that draw no `g.node`, so a click could
+ * not map back to the box. Checked in Chromium over all 140 documented names
+ * and the lowercase undocumented ones (`state`, `choice`, `note`, `composite`,
+ * `anchor`, `doublecircle` draw one; `image` is refused by the db).
+ */
+const SHAPES_WITHOUT_BOX = new Set(["icon"]);
+
+/**
  * mermaid's NODE_STRING (rule 106), plus any other non-space character
  * outside ASCII for UNICODE_TEXT (rule 108), so an id ends where mermaid's
  * does; `PLAIN_ID` then decides whether it is one this parser keeps.
@@ -62,9 +80,6 @@ const PLAIN_ID = /^[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*$/;
 /** Lexer rules that come before NODE_STRING and take a word as a keyword. */
 const RESERVED =
   /^(?:style|linkStyle|interpolate|classDef|class|flowchart-elk|swimlane-beta|graph|flowchart|subgraph|end|_self|_blank|_parent|_top|accTitle|accDescr)\b|^(?:call|href|click)(?:\s|$)/;
-/** mermaid's LINK_ID (rule 61). */
-const LINK_ID = /[^\s"]+@(?=[^{"])/y;
-
 /** The link rules in lexer order (70, 71, 73, 74, 76, 77, 79). */
 interface LinkRule {
   re: RegExp;
@@ -154,24 +169,40 @@ interface OpenSubgraph {
 type VertexEvent = { id: string; ref: NodeRef | null };
 
 export function parseFlowchart(body: string): FlowModel {
-  const scan = scanFence(body);
   const model: FlowModel = {
     kind: "flowchart",
-    keyword: scan.keyword ?? "",
+    keyword: "",
     direction: null,
-    headerLine: scan.header?.index ?? -1,
+    headerLine: -1,
     nodes: new Map(),
     nodeOrder: [],
     edges: [],
     chains: [],
     directives: [],
     subgraphs: [],
-    scan,
+    scan: {
+      lines: [],
+      header: null,
+      keyword: null,
+      understood: false,
+      reasons: [],
+    },
     body,
     understood: false,
-    reasons: [...scan.reasons],
+    reasons: [],
   };
+  if (body.length > MAX_TEXT_SIZE) {
+    model.reasons.push(
+      `The diagram is too long: mermaid draws at most ${String(MAX_TEXT_SIZE)} characters.`,
+    );
+    return model;
+  }
   try {
+    const scan = scanFence(body);
+    model.scan = scan;
+    model.keyword = scan.keyword ?? "";
+    model.headerLine = scan.header?.index ?? -1;
+    model.reasons.push(...scan.reasons);
     new Parser(body, model).run();
   } catch (error) {
     model.reasons.push(
@@ -199,6 +230,8 @@ class Parser {
   private readonly stack: OpenSubgraph[] = [];
   private readonly all: OpenSubgraph[] = [];
   private readonly closed: Subgraph[] = [];
+  /** Everything the closed subgraphs hold: mermaid's `makeUniq` skips these. */
+  private readonly held = new Set<string>();
   private readonly usedEdgeIds = new Set<string>();
   private readonly pairCount = new Map<string, number>();
   private statement = -1;
@@ -224,14 +257,14 @@ class Parser {
     }
     for (const line of model.scan.lines) {
       if (
-        line.statements.length === 0 ||
-        (line.kind !== "header" &&
-          line.kind !== "statement" &&
-          line.kind !== "acc")
+        line.kind === "header" ||
+        line.kind === "statement" ||
+        line.kind === "acc"
       ) {
-        continue;
+        if (line.statements.length > 0 || isDirectionLine(this.body, line)) {
+          this.line(line);
+        }
       }
-      this.line(line);
     }
     for (const open of this.stack) {
       model.reasons.push(
@@ -412,12 +445,11 @@ class Parser {
     if (this.closed.some((s) => s.id === id)) {
       refuse(`the subgraph id ${id} is used twice.`);
     }
-    const earlier = new Set(this.closed.flatMap((s) => s.members));
-    const members: string[] = [];
-    for (const member of open.direct) {
-      if (member !== id && !earlier.has(member) && !members.includes(member)) {
-        members.push(member);
-      }
+    const members = [
+      ...new Set(open.direct.filter((m) => m !== id && !this.held.has(m))),
+    ];
+    for (const member of members) {
+      this.held.add(member);
     }
     const subgraph: Subgraph = {
       id,
@@ -472,6 +504,13 @@ class Parser {
     return { word, rest };
   }
 
+  /** A class name mermaid reads whole: its NUM rule would end one after leading digits. */
+  private className(name: string): void {
+    if (!PLAIN_ID.test(name) || /^\d/.test(name)) {
+      refuse(`the class name ${name} is not one it knows.`);
+    }
+  }
+
   /** `a,b,c` as ids with their spans. */
   private list(span: Span, what: string): { id: string; span: Span }[] {
     const out: { id: string; span: Span }[] = [];
@@ -489,7 +528,9 @@ class Parser {
   /** CSS `key:value,key:value` entries. */
   private props(span: Span): DirectiveLine["props"] {
     const text = this.text(span);
-    if (/[\\"]/.test(text)) {
+    // A `;` here is one `encodeEntities` removes, which joins what follows
+    // into this value: a whole second statement can sit in a value span.
+    if (/[\\";]/.test(text)) {
       refuse("a style it cannot read.");
     }
     const out: DirectiveLine["props"] = [];
@@ -538,6 +579,9 @@ class Parser {
     }
     const directive = this.directive("classDef", span, line);
     directive.targets = this.list(word, "class name");
+    for (const target of directive.targets) {
+      this.className(target.id);
+    }
     directive.props = this.props(rest);
   }
 
@@ -547,9 +591,7 @@ class Parser {
       refuse("a class line it cannot read.");
     }
     const name = this.text(rest);
-    if (!PLAIN_ID.test(name)) {
-      refuse(`the class name ${name} is not one it knows.`);
-    }
+    this.className(name);
     const directive = this.directive("class", span, line);
     directive.targets = this.list(word, "id");
     directive.className = { name, span: rest };
@@ -649,6 +691,9 @@ class Parser {
     const firstEnd = right.refs[0]?.id;
     for (const s of left.refs) {
       for (const e of right.refs) {
+        if (this.model.edges.length >= MAX_EDGES) {
+          refuse(`more than ${String(MAX_EDGES)} arrows.`);
+        }
         const pair = `${s.id}\u0000${e.id}`;
         const k = this.pairCount.get(pair) ?? 0;
         const wanted =
@@ -689,7 +734,20 @@ class Parser {
     }
     model.subgraphs = this.closed;
     const clusters = new Set(this.closed.map((s) => s.id));
-    const edgeIds = new Set(model.edges.map((e) => e.mermaidId));
+    const edgeIds = new Set<string>();
+    for (const { mermaidId } of model.edges) {
+      // mermaid's render throws on two edges with one id, and an edge that
+      // shares a subgraph's id shares its DOM id.
+      if (edgeIds.has(mermaidId)) {
+        model.reasons.push(`Two arrows have the id ${mermaidId}.`);
+      }
+      if (clusters.has(mermaidId)) {
+        model.reasons.push(
+          `The id ${mermaidId} names an arrow and a subgraph.`,
+        );
+      }
+      edgeIds.add(mermaidId);
+    }
     for (const { id, ref } of this.events) {
       if (edgeIds.has(id)) {
         model.reasons.push(`The id ${id} names both a box and an arrow.`);
@@ -736,6 +794,7 @@ class ChainReader {
   private readonly statement: number;
   private readonly line: number;
   private i = 0;
+  private linkIdTable: Int32Array | null = null;
 
   constructor(body: string, span: Span, statement: number, line: number) {
     this.text = body.slice(span.from, span.to);
@@ -751,6 +810,42 @@ class ChainReader {
   private sticky(re: RegExp, i: number): RegExpExecArray | null {
     re.lastIndex = i;
     return re.exec(this.text);
+  }
+
+  /**
+   * Where mermaid's LINK_ID (rule 61, `[^\s"]+@(?=[^{"])`) ends when it starts
+   * at `i`, or -1. The regex would rescan the rest of the run at every ref, so
+   * the last usable `@` of each run is looked up once per statement.
+   */
+  private linkIdEnd(i: number): number {
+    if (this.linkIdTable === null) {
+      const text = this.text;
+      const table = new Int32Array(text.length).fill(-1);
+      if (text.includes("@")) {
+        let last = -1;
+        for (let k = text.length - 1; k >= 0; k--) {
+          const c = text.charAt(k);
+          if (c === '"' || /\s/.test(c)) {
+            last = -1;
+            continue;
+          }
+          const next = text[k + 1];
+          if (
+            last === -1 &&
+            c === "@" &&
+            next !== undefined &&
+            next !== "{" &&
+            next !== '"'
+          ) {
+            last = k;
+          }
+          table[k] = last;
+        }
+      }
+      this.linkIdTable = table;
+    }
+    const at = this.linkIdTable[i] ?? -1;
+    return at > i ? at + 1 : -1;
   }
 
   read(): { groups: Group[]; arrows: Arrow[] } {
@@ -797,7 +892,7 @@ class ChainReader {
       );
     }
     if (
-      this.sticky(LINK_ID, start) ||
+      this.linkIdEnd(start) !== -1 ||
       LINK_RULES.some((r) => this.sticky(r.re, start))
     ) {
       refuse("an arrow or arrow id where a box id should be.");
@@ -830,7 +925,9 @@ class ChainReader {
         refuse("a class after @{ } shape data.");
       }
       const name = this.sticky(ID_TOKEN, this.i + 3);
-      if (!name || !PLAIN_ID.test(name[0])) {
+      // mermaid's NUM rule ends a token after its leading digits, so a name
+      // that starts with one is not the name it looks like.
+      if (!name || !PLAIN_ID.test(name[0]) || /^\d/.test(name[0])) {
         refuse("a ::: without a class name it knows.");
       }
       classSpan = {
@@ -951,17 +1048,21 @@ class ChainReader {
     for (const piece of splitOutsideQuotes(
       text.slice(openFrom + 2, closeFrom),
     )) {
-      const match = /^(\s*)(\w+)(\s*:\s*)(.*?)\s*$/.exec(piece);
-      if (!match) {
+      const colon = piece.indexOf(":");
+      const key = piece.slice(0, Math.max(colon, 0)).trim();
+      if (!/^\w+$/.test(key)) {
         refuse("shape data it cannot read.");
       }
-      const key = match[2] ?? "";
-      const value = match[4] ?? "";
-      const from =
-        at + (match[1] ?? "").length + key.length + (match[3] ?? "").length;
+      const after = piece.slice(colon + 1);
+      const value = after.trim();
+      const from = at + colon + 1 + (after.length - after.trimStart().length);
       const span = { from: this.at(from), to: this.at(from + value.length) };
       if (key === "shape") {
-        if (shapeSpan !== null || !/^[a-z][a-z0-9-]*$/.test(value)) {
+        if (
+          shapeSpan !== null ||
+          !/^[a-z][a-z0-9-]*$/.test(value) ||
+          SHAPES_WITHOUT_BOX.has(value)
+        ) {
           refuse(`the shape ${value} is not one it knows.`);
         }
         shapeSpan = span;
@@ -974,7 +1075,9 @@ class ChainReader {
           quoted = true;
         } else if (
           !/^[A-Za-z][A-Za-z0-9 _.-]*$/.test(value) ||
-          /^(?:true|false|null)$/.test(value)
+          // YAML's JSON schema reads every casing of these as a boolean or
+          // null, and mermaid stores that as the label.
+          /^(?:true|false|null)$/i.test(value)
         ) {
           refuse(`the label value ${value} is not one it knows.`);
         }
@@ -1012,14 +1115,14 @@ class ChainReader {
       while (start < text.length && /[ \t]/.test(text.charAt(start))) {
         start++;
       }
-      const id = this.sticky(LINK_ID, start);
-      if (id) {
-        const name = id[0].slice(0, -1);
+      const idEnd = this.linkIdEnd(start);
+      if (idEnd !== -1) {
+        const name = text.slice(start, idEnd - 1);
         if (!PLAIN_ID.test(name)) {
           refuse(`the arrow id ${name} is not one it knows.`);
         }
         idSpan = { from: this.at(start), to: this.at(start + name.length) };
-        start += id[0].length;
+        start = idEnd;
       }
       rule = this.ruleAt(start);
     }
@@ -1067,6 +1170,11 @@ class ChainReader {
         /[[\](){}|"~]/.test(text.charAt(j))
       ) {
         refuse("an arrow label it cannot read.");
+      }
+      // The closing rule starts with `\s*`: having failed at the start of a
+      // run of whitespace, it fails at every later place in that run.
+      while (/\s/.test(text.charAt(j)) && /\s/.test(text.charAt(j + 1))) {
+        j++;
       }
     }
     if (!closeMatch) {

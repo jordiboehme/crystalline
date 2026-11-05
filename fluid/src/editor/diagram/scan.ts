@@ -260,7 +260,10 @@ function runOnDirections(
   reasons: string[],
 ): void {
   for (const line of lines) {
-    if (line.statements.length === 0) {
+    if (
+      line.statements.length === 0 &&
+      !indentedAccOpener(body.slice(line.from, line.to), line)
+    ) {
       continue;
     }
     if (!/direction\s*$/.test(body.slice(line.from, line.to))) {
@@ -281,12 +284,32 @@ function runOnDirections(
 }
 
 /**
+ * An `acc` line that opens with its keyword after an indent. The lexer's acc
+ * rules match only at the token's start, and its `.*direction` rule also
+ * takes the indent, so on such a line the direction rule goes first; on a
+ * flush line the acc rule does.
+ */
+function indentedAccOpener(text: string, line: ScannedLine): boolean {
+  return (
+    line.kind === "acc" &&
+    line.indent !== "" &&
+    /^\s+acc(?:Title\s*:|Descr\s*[:{])/.test(text)
+  );
+}
+
+/**
  * Whether `line` is one mermaid's flowchart lexer reads as a direction
  * statement: it holds `direction` and one of the five directions anywhere,
- * even inside a label, and the line's other content vanishes. Only header
- * and statement lines are lexed; a removed line never is.
+ * even inside a label, and the line's other content vanishes. Header and
+ * statement lines are lexed whole, the text after an `accDescr` block's `}`
+ * too, and so is an indented acc line (`indentedAccOpener`); a removed line
+ * never is.
  */
 export function isDirectionLine(body: string, line: ScannedLine): boolean {
+  const whole = body.slice(line.from, line.to);
+  if (indentedAccOpener(whole, line) && DIRECTION.test(whole)) {
+    return true;
+  }
   const text = lexedText(body, line);
   return text !== null && DIRECTION.test(text);
 }
@@ -382,6 +405,10 @@ function spans(offset: number, text: string, pieces: Span[]): Span[] {
  */
 function droppedSemicolons(text: string): Set<number> {
   const all = new Set<number>();
+  // Both regexes need a `;`, and without one they backtrack for nothing.
+  if (!text.includes(";")) {
+    return all;
+  }
   const style = /style.*:\S*#.*;/.exec(text);
   let styleAt = -1;
   let rest = text;

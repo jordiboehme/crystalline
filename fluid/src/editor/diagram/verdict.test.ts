@@ -101,4 +101,31 @@ describe("the diagram verdict", () => {
     expect(verdictFor(body(0))).toBeDefined();
     expect(verdictFor(body(256))).toBeDefined();
   });
+
+  test("a duplicate edge id, which mermaid cannot draw, is not drawable", async () => {
+    const verdict = await requestVerdict(
+      "flowchart TD\n  A_B --> C\n  A --> B_C",
+      false,
+    );
+    expect(verdict.ok).toBe(false);
+  });
+
+  test("an @{ shape: icon }, which draws no g.node, is not drawable", async () => {
+    const verdict = await requestVerdict(
+      'flowchart TD\n  A@{ shape: icon, label: "x" }',
+      false,
+    );
+    expect(verdict.ok).toBe(false);
+  });
+
+  test("a body past mermaid's text limit is not drawable", async () => {
+    const verdict = await requestVerdict(
+      `flowchart TD\n  A\n  %% ${"x".repeat(50_000)}`,
+      false,
+    );
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/too long/);
+    }
+  });
 });

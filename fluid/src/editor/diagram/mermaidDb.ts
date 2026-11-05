@@ -104,14 +104,20 @@ const FLOW_TYPES = new Set(["flowchart-v2", "flowchart", "flowchart-elk"]);
  * render of that view set, or it would switch the theme under it.
  *
  * A body mermaid refuses, or one that is not a flowchart, comes back as
- * `{ error }`; this never throws.
+ * `{ error }`. mermaid failing to load says nothing about the body, so it
+ * comes back with `unavailable: true` as well. This never throws.
  */
 export async function flowDbOf(
   body: string,
   dark: boolean,
-): Promise<FlowDbView | { error: unknown }> {
+): Promise<FlowDbView | { error: unknown; unavailable?: true }> {
+  let mermaid: (typeof import("mermaid"))["default"];
   try {
-    const { default: mermaid } = await import("mermaid");
+    ({ default: mermaid } = await import("mermaid"));
+  } catch (error) {
+    return { error, unavailable: true };
+  }
+  try {
     mermaid.initialize(mermaidConfig(dark));
     const diagram = await mermaid.mermaidAPI.getDiagramFromText(body);
     const type = diagram.type;

@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { defined } from "../../../test/assert";
 import type { Span } from "../edits";
 import type { FlowModel, NodeRef } from "./model";
-import { edgeByKey, parseFlowchart } from "./parse";
+import { MAX_TEXT_SIZE, edgeByKey, parseFlowchart } from "./parse";
 
 const FLOWCHART = import.meta.glob<string>(
   "../../fixtures/diagrams/flowchart/*.mmd",
@@ -403,6 +403,63 @@ describe("parseFlowchart refusals", () => {
         expect(() => parseFlowchart(text.slice(0, i))).not.toThrow();
       }
     }
+  });
+});
+
+describe("parseFlowchart on large bodies", () => {
+  /** The best of three runs, in ms. */
+  function fastest(body: string): number {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const from = performance.now();
+      parseFlowchart(body);
+      best = Math.min(best, performance.now() - from);
+    }
+    return best;
+  }
+
+  test("a body at mermaid's text limit is read, one past it is refused", () => {
+    const head = "flowchart TD\n  A\n  %% ";
+    const at = head + "x".repeat(MAX_TEXT_SIZE - head.length);
+    expect(parseFlowchart(at).understood).toBe(true);
+    const past = parseFlowchart(`${at}x`);
+    expect(past.understood).toBe(false);
+    expect(past.reasons.join(" ")).toMatch(/too long/);
+  });
+
+  test("a body that would overflow the scanner's regex comes back refused", () => {
+    const body = `%%{init: "${"x".repeat(16_000_000)}`;
+    expect(parseFlowchart(body).understood).toBe(false);
+  });
+
+  test("a huge & group stops at mermaid's edge limit", () => {
+    const names = (c: string) =>
+      Array.from({ length: 1500 }, (_, i) => `${c}${String(i)}`).join(" & ");
+    const model = parseFlowchart(
+      `flowchart TD\n  ${names("a")} --> ${names("b")}`,
+    );
+    expect(model.understood).toBe(false);
+    expect(model.edges.length).toBeLessThanOrEqual(500);
+  });
+
+  test.each([
+    [
+      "a chain without spaces",
+      () =>
+        `flowchart TD\n  ${Array.from({ length: 6000 }, (_, i) => `N${String(i)}`).join("-->")}`,
+    ],
+    [
+      "spaces inside a text label",
+      () => `flowchart TD\n  A -- a${" ".repeat(49000)}b --> B`,
+    ],
+    [
+      "spaces inside shape data",
+      () => `flowchart TD\n  A@{ shape: rect, label: x${" ".repeat(49000)}y }`,
+    ],
+  ])("%s is read in linear time", (_name, make) => {
+    const body = make();
+    expect(body.length).toBeLessThan(MAX_TEXT_SIZE);
+    expect(fastest(body)).toBeLessThan(250);
   });
 });
 
