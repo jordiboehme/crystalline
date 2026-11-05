@@ -23,7 +23,7 @@
 
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Range, Transaction } from "@codemirror/state";
-import { StateEffect, StateField } from "@codemirror/state";
+import { MapMode, StateEffect, StateField } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 import {
   Decoration,
@@ -50,9 +50,22 @@ export interface DrawnFence {
 /** A body whose verdict settled: the field draws again. */
 export const verdictArrived = StateEffect.define<string>();
 
+/**
+ * The hook for a fence that may be drawn although the main selection is in
+ * it (R52): Task 11's starter insert puts the caret inside the fence it just
+ * wrote and still wants it drawn. The value is the fence's `from` in the
+ * document the transaction produces. The exemption follows the fence through
+ * changes and ends once the fence is drawn or is no fence any more.
+ */
+export const drawUnderCaret = StateEffect.define<number>();
+
 interface DiagramFieldValue {
   fences: DrawnFence[];
   decorations: DecorationSet;
+  /** Whether a fence with an ok verdict is withheld because the caret is in it. */
+  held: boolean;
+  /** `from` of the fences exempt from that hold (`drawUnderCaret`). */
+  exempt: number[];
 }
 
 /** The placeholder until Task 9's widget: the skeleton box the fence became. */
@@ -139,19 +152,59 @@ function build(
   state: EditorState,
   wasDrawn: (from: number) => boolean,
   carried: (candidates: DrawnFence[]) => DrawnFence[],
+  exempt: readonly number[],
 ): DiagramFieldValue {
   const candidates = candidateFences(state);
+  const { from: head, to: tail } = state.selection.main;
+  let held = false;
   const fences = candidates.filter((fence) => {
     const verdict = verdictFor(fence.body);
-    return verdict === undefined ? wasDrawn(fence.from) : verdict.ok;
+    if (wasDrawn(fence.from)) {
+      // An edit keeps a drawn fence drawn, whatever its new verdict is until
+      // it arrives; a refusal takes it back.
+      return verdict === undefined || verdict.ok;
+    }
+    if (verdict === undefined || !verdict.ok) {
+      return false;
+    }
+    // R52: typing into a fence must not take the source away under the caret.
+    // It is drawn when the caret leaves (the field rebuilds on a selection
+    // move while one is held), unless `drawUnderCaret` exempted it.
+    if (
+      head <= fence.to &&
+      tail >= fence.from &&
+      !exempt.includes(fence.from)
+    ) {
+      held = true;
+      return false;
+    }
+    return true;
   });
   fences.push(...carried(candidates));
   fences.sort((a, b) => a.from - b.from);
-  return { fences, decorations: decorate(state, fences) };
+  const drawn = new Set(fences.map((fence) => fence.from));
+  return {
+    fences,
+    decorations: decorate(state, fences),
+    held,
+    exempt: exempt.filter(
+      (from) =>
+        !drawn.has(from) && candidates.some((fence) => fence.from === from),
+    ),
+  };
 }
 
 function arrived(tr: Transaction): boolean {
   return tr.effects.some((effect) => effect.is(verdictArrived));
+}
+
+/**
+ * Where the fence at `from` is after `changes`, or null when a change removed
+ * or replaced it: an insert at `from` and an edit inside the body keep it
+ * (`TrackAfter` asks whether the character after `from` survives).
+ */
+function placeAfter(tr: Transaction, from: number): number | null {
+  return tr.changes.mapPos(from, 1, MapMode.TrackAfter);
 }
 
 export const diagramField = StateField.define<DiagramFieldValue>({
@@ -160,19 +213,34 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       state,
       () => false,
       () => [],
+      [],
     ),
   update: (value, tr) => {
-    if (!tr.docChanged && !parseAdvanced(tr) && !arrived(tr)) {
+    const exemptNow = [
+      ...value.exempt.flatMap((from) => placeAfter(tr, from) ?? []),
+      ...tr.effects.flatMap((effect) =>
+        effect.is(drawUnderCaret) ? [effect.value] : [],
+      ),
+    ];
+    if (
+      !tr.docChanged &&
+      !parseAdvanced(tr) &&
+      !arrived(tr) &&
+      !(value.held && tr.selection !== undefined) &&
+      exemptNow.length === value.exempt.length &&
+      !tr.effects.some((effect) => effect.is(drawUnderCaret))
+    ) {
       return value;
     }
     const before = new Set(
-      value.fences.map((f) => tr.changes.mapPos(f.from, 1)),
+      value.fences.flatMap((f) => placeAfter(tr, f.from) ?? []),
     );
     return build(
       tr.state,
       (from) => before.has(from),
       (candidates) =>
         carryFences(value.fences, tr, syntaxTree(tr.state).length, candidates),
+      exemptNow,
     );
   },
   provide: (field) => [
@@ -190,8 +258,13 @@ export const diagramField = StateField.define<DiagramFieldValue>({
  */
 export const verdictWatcher = ViewPlugin.fromClass(
   class {
-    /** Bodies a request is running for. */
-    readonly running = new Set<string>();
+    /**
+     * Bodies this view asked about. A body leaves it only when its check
+     * could not run; otherwise it is never asked again, so a cache that
+     * evicts verdicts (256 entries, shared by every view) cannot start the
+     * asking over.
+     */
+    readonly asked = new Set<string>();
     gone = false;
     readonly view: EditorView;
 
@@ -201,20 +274,23 @@ export const verdictWatcher = ViewPlugin.fromClass(
     }
 
     update(update: ViewUpdate): void {
-      const moved =
-        update.docChanged ||
-        parseAdvanced(update) ||
-        update.transactions.some(arrived);
-      if (!moved) {
+      const edited = update.docChanged || parseAdvanced(update);
+      if (!edited && !update.transactions.some(arrived)) {
         return;
       }
-      this.ask();
+      // A settled verdict (`verdictArrived`) is no reason to ask again.
+      if (edited) {
+        this.ask();
+      }
       const now = new Set(
         update.state.field(diagramField).fences.map((fence) => fence.from),
       );
       const lost = update.startState
         .field(diagramField)
-        .fences.some((fence) => !now.has(update.changes.mapPos(fence.from, 1)));
+        .fences.some((fence) => {
+          const at = update.changes.mapPos(fence.from, 1, MapMode.TrackAfter);
+          return at === null || !now.has(at);
+        });
       if (lost) {
         // Not inside the update: the real teardown dispatches.
         queueMicrotask(() => {
@@ -229,21 +305,22 @@ export const verdictWatcher = ViewPlugin.fromClass(
       const { state } = this.view;
       const dark = state.facet(EditorView.darkTheme);
       for (const { body } of candidateFences(state)) {
-        if (verdictFor(body) !== undefined || this.running.has(body)) {
+        if (verdictFor(body) !== undefined || this.asked.has(body)) {
           continue;
         }
-        this.running.add(body);
+        this.asked.add(body);
         requestVerdict(body, dark).then(
           () => {
-            this.running.delete(body);
             // A check that could not run left no verdict: nothing to report,
             // and the next edit asks again.
-            if (!this.gone && verdictFor(body) !== undefined) {
+            if (verdictFor(body) === undefined) {
+              this.asked.delete(body);
+            } else if (!this.gone) {
               this.view.dispatch({ effects: verdictArrived.of(body) });
             }
           },
           () => {
-            this.running.delete(body);
+            this.asked.delete(body);
           },
         );
       }

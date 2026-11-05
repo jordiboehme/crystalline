@@ -19,7 +19,7 @@ import type { StatusColour } from "../markdown/directives";
 import { isIdLine } from "../reflectionText";
 import { STATUS_OPEN } from "./dialectHighlight";
 import { calloutAt, statusAround, statusColourChanges } from "./elementContext";
-import { fenceBody, fenceInfo } from "./fenceInfo";
+import { fenceInfo } from "./fenceInfo";
 import { frontmatterRegion } from "./frontmatterRegion";
 import {
   SECTION_HEADING,
@@ -27,6 +27,7 @@ import {
   mathBlocks,
   mathFence,
   mathSections,
+  quoteDepth,
   quotePrefix,
   unpadded,
   unquoted,
@@ -1083,17 +1084,43 @@ export function mermaidFence(
   state: EditorState,
   node: SyntaxNode,
 ): string | null {
-  const info = fenceInfo(state.doc, node);
+  const doc = state.doc;
+  const info = fenceInfo(doc, node);
   if (info?.name !== "mermaid") {
     return null;
   }
-  const doc = state.doc;
-  const body =
-    info.close !== null
-      ? fenceBody(doc, info)
-      : doc.lineAt(node.to).number > info.open
-        ? doc.sliceString(doc.line(info.open + 1).from, doc.lineAt(node.to).to)
-        : "";
+  // A fence in the frontmatter is YAML text, as `codeFenceOf` has it.
+  const region = frontmatterRegion(doc);
+  if (region !== null && node.from <= region.to) {
+    return null;
+  }
+  const last =
+    info.close !== null ? info.close - 1 : doc.lineAt(node.to).number;
+  if (last <= info.open) {
+    return null;
+  }
+  // The quote marks of the fence's lines are not part of the diagram: the
+  // page hands mermaid the text without them (indentation stays, as mermaid
+  // accepts it).
+  const depth = quoteDepth(doc.line(info.open).text);
+  const lines: string[] = [];
+  for (let number = info.open + 1; number <= last; number += 1) {
+    lines.push(unquoted(doc.line(number).text, depth));
+  }
+  // An unclosed fence on a page read section by section ends at the next
+  // section heading (the page does not draw it, as for math).
+  if (
+    info.close === null &&
+    state.facet(mathSections) &&
+    lines.some(
+      (text, index) =>
+        quoteDepth(doc.line(info.open + 1 + index).text) === 0 &&
+        SECTION_HEADING.test(text),
+    )
+  ) {
+    return null;
+  }
+  const body = lines.join("\n");
   return body.trim() === "" ? null : body;
 }
 

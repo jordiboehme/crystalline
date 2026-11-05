@@ -5,6 +5,7 @@
  * own DOM while confirming the buffer itself is untouched.
  */
 
+import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
@@ -14,6 +15,7 @@ import { parsedState } from "../test/parse";
 import { describeMermaidError, fencePreviews } from "./fencePreviews";
 import { drawnDiagrams } from "./diagram/draws";
 import { gridLoaded } from "./grid/draws";
+import { mathSections } from "./mathBlocks";
 import { baseExtensions } from "./setup";
 
 vi.mock("mermaid", () => ({
@@ -761,5 +763,70 @@ describe("the hand-over to the diagram layer", () => {
     const { v } = withDrawn("```mermaid", []);
     expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
     v.destroy();
+  });
+});
+
+describe("what the preview hands mermaid", () => {
+  async function renderedFor(doc: string, extra: Extension[] = []) {
+    vi.mocked(mermaid.render).mockClear();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            ...extra,
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const sources = vi.mocked(mermaid.render).mock.calls.map((call) => call[1]);
+    v.destroy();
+    return sources;
+  }
+
+  it.each([
+    [
+      "a closed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B\n> ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a nested quote",
+      "> > ```mermaid\n> > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed top-level fence",
+      "```mermaid\ngraph TD; A-->B\nB-->C",
+      "graph TD; A-->B\nB-->C",
+    ],
+    [
+      "a list item's fence keeps its indent",
+      "- ```mermaid\n  graph TD; A-->B\n  ```",
+      "  graph TD; A-->B",
+    ],
+  ])("%s", async (_name, doc, source) => {
+    expect(await renderedFor(doc)).toEqual([source]);
+  });
+
+  it("draws no preview for a fence in the frontmatter", async () => {
+    const doc =
+      "---\nnote: |\n  ```mermaid\n  graph TD; A-->B\n  ```\n---\n\nbody";
+    expect(await renderedFor(doc)).toEqual([]);
+  });
+
+  it("stops an unclosed fence at a section heading only where the page reads sections", async () => {
+    const doc = "```mermaid\ngraph TD; A-->B\n\n## Next\n\nmore";
+    expect(await renderedFor(doc, [mathSections.of(true)])).toEqual([]);
+    expect(await renderedFor(doc)).toHaveLength(1);
   });
 });

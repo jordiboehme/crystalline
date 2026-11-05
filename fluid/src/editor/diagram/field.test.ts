@@ -4,7 +4,7 @@
  * and flips to text on a refusal. The real verdicts are `field.real.test.ts`.
  */
 
-import { EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -20,6 +20,8 @@ const kit = vi.hoisted(() => {
     settled,
     waiting,
     requested: [] as { body: string; dark: boolean }[],
+    /** Answer at once with ok, and keep 256 verdicts like the real cache. */
+    auto: false,
   };
 });
 
@@ -27,6 +29,15 @@ vi.mock("./verdict", () => ({
   verdictFor: (body: string) => kit.settled.get(body),
   requestVerdict: (body: string, dark: boolean) => {
     kit.requested.push({ body, dark });
+    if (kit.auto) {
+      const verdict = { ok: true, kind: "flowchart", domIds: new Map() };
+      kit.settled.delete(body);
+      kit.settled.set(body, verdict);
+      while (kit.settled.size > 256) {
+        kit.settled.delete(kit.settled.keys().next().value as string);
+      }
+      return Promise.resolve(verdict);
+    }
     return new Promise((resolve) => {
       kit.waiting.set(body, resolve);
     });
@@ -38,7 +49,8 @@ vi.mock("./intent", () => ({ closeDiagramIntent }));
 
 // Imported after the mocks.
 const { diagramExtension } = await import("./index");
-const { verdictArrived, diagramField, carryFences } = await import("./field");
+const { verdictArrived, diagramField, carryFences, drawUnderCaret } =
+  await import("./field");
 
 const OK: Verdict = { ok: true, kind: "flowchart", domIds: new Map() };
 const NO: Verdict = { ok: false, reason: "no" };
@@ -48,11 +60,14 @@ const fence = (body: string) => `\`\`\`mermaid\n${body}\n\`\`\``;
 
 let view: EditorView | null = null;
 
-function mount(doc: string, dark = false): EditorView {
+/** The caret sits after the document (R52 holds a fence the caret is in). */
+function mount(doc: string, dark = false, caret?: number): EditorView {
+  const text = `${doc}\n\nend`;
   view = new EditorView({
     state: parsedState(
       EditorState.create({
-        doc,
+        doc: text,
+        selection: EditorSelection.cursor(caret ?? text.length),
         extensions: [...baseExtensions(dark), diagramExtension()],
       }),
     ),
@@ -77,6 +92,7 @@ beforeEach(() => {
   kit.settled.clear();
   kit.waiting.clear();
   kit.requested.length = 0;
+  kit.auto = false;
   closeDiagramIntent.mockClear();
 });
 
@@ -95,7 +111,7 @@ describe("the diagram field", () => {
     expect(v.dom.querySelector(".cm-diagram")).not.toBeNull();
     expect(v.state.facet(drawnDiagrams)).toEqual([0]);
     expect(v.contentDOM.textContent).not.toContain("flowchart TD");
-    expect(v.state.doc.toString()).toBe(fence(SKELETON));
+    expect(v.state.doc.toString()).toBe(`${fence(SKELETON)}\n\nend`);
   });
 
   it("asks with the dark the surface was built with, and only once per body", () => {
@@ -227,5 +243,128 @@ describe("carryFences", () => {
       { ...drawn, from: 102, to: 142 },
     ]);
     expect(held).toEqual([]);
+  });
+});
+
+describe("asking for verdicts ends", () => {
+  const many = (prefix: string, count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      fence(`flowchart TD\n  ${prefix}${String(i)} --> B`),
+    ).join("\n\n");
+
+  it("settles for 257 distinct fences: one request each, then quiet", async () => {
+    kit.auto = true;
+    const v = mount(many("L", 257));
+    for (let turn = 0; turn < 5; turn += 1) {
+      await flush();
+    }
+    expect(kit.requested).toHaveLength(257);
+    await flush();
+    expect(kit.requested).toHaveLength(257);
+    // The first fences lost their verdicts to the cache but stay drawn.
+    expect(v.state.facet(drawnDiagrams).length).toBeGreaterThan(200);
+  });
+
+  it("settles for two views that exceed the cache together", async () => {
+    kit.auto = true;
+    const one = mount(many("P", 130));
+    const first = one;
+    view = null;
+    const two = mount(many("Q", 130));
+    for (let turn = 0; turn < 5; turn += 1) {
+      await flush();
+    }
+    expect(kit.requested).toHaveLength(260);
+    await flush();
+    expect(kit.requested).toHaveLength(260);
+    first.destroy();
+    two.destroy();
+  });
+});
+
+describe("a fence under the caret (R52)", () => {
+  it("is not newly drawn while the caret is in it, and is drawn when the caret leaves", async () => {
+    const doc = `Top\n\n${fence(SKELETON)}\n\nBelow`;
+    const inside = doc.indexOf("B\n```") + 1;
+    const v = mount(doc, false, inside);
+    await settle(SKELETON, OK);
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    expect(v.contentDOM.textContent).toContain("flowchart TD");
+    v.dispatch({ changes: { from: inside, insert: "C" } });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    v.dispatch({ selection: EditorSelection.cursor(v.state.doc.length) });
+    // The edited body has no verdict yet; the old one settled for the old body.
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    await settle("flowchart TD\n  A --> BC", OK);
+    expect(v.state.facet(drawnDiagrams)).toEqual([5]);
+  });
+
+  it("is never drawn while a line is typed into it key by key", async () => {
+    kit.auto = true;
+    const v = mount("```mermaid\n\n```", false, 11);
+    const typed = "graph LR\n  A --> B\n  B --> C";
+    const states: number[] = [];
+    for (const char of typed) {
+      const at = v.state.selection.main.head;
+      v.dispatch({
+        changes: { from: at, insert: char },
+        selection: EditorSelection.cursor(at + 1),
+      });
+      await flush();
+      states.push(v.state.facet(drawnDiagrams).length);
+    }
+    expect(states.every((n) => n === 0)).toBe(true);
+    expect(v.contentDOM.textContent).toContain("graph LR");
+    // The caret leaves: now it draws.
+    v.dispatch({ selection: EditorSelection.cursor(v.state.doc.length) });
+    expect(v.state.facet(drawnDiagrams)).toEqual([0]);
+  });
+
+  it("is drawn under the caret when the starter hook says so", async () => {
+    const v = mount(fence(SKELETON), false, 14);
+    v.dispatch({ effects: drawUnderCaret.of(0) });
+    await settle(SKELETON, OK);
+    expect(v.state.facet(drawnDiagrams)).toEqual([0]);
+    // And it follows the fence through an insert above.
+    v.dispatch({ changes: { from: 0, insert: "x\n\n" } });
+    expect(v.state.facet(drawnDiagrams)).toEqual([3]);
+  });
+});
+
+describe("a removed fence passes on nothing", () => {
+  it("does not draw an unchecked fence that took the place of a drawn one", async () => {
+    const other = "flowchart LR\n  X --> Y";
+    const v = mount(`${fence(SKELETON)}\n\n${fence(other)}`);
+    await settle(SKELETON, OK);
+    expect(v.state.facet(drawnDiagrams)).toEqual([0]);
+    v.dispatch({ changes: { from: 0, to: fence(SKELETON).length + 2 } });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    expect(closeDiagramIntent).not.toHaveBeenCalled();
+    await flush();
+    expect(closeDiagramIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not draw an unchecked fence when the whole document is replaced", async () => {
+    const v = mount(fence(SKELETON));
+    await settle(SKELETON, OK);
+    v.dispatch({
+      changes: {
+        from: 0,
+        to: v.state.doc.length,
+        insert: fence("graph TD\n  P --> Q"),
+      },
+    });
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+  });
+
+  it("keeps a fence for an insert at its start and an edit inside its body", async () => {
+    const v = mount(fence(SKELETON));
+    await settle(SKELETON, OK);
+    v.dispatch({ changes: { from: 0, insert: "a\n\n" } });
+    expect(v.state.facet(drawnDiagrams)).toEqual([3]);
+    v.dispatch({
+      changes: { from: v.state.doc.toString().indexOf("B"), insert: "z" },
+    });
+    expect(v.state.facet(drawnDiagrams)).toEqual([3]);
   });
 });

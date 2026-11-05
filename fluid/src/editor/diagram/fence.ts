@@ -1,10 +1,12 @@
 /**
  * The mermaid fences of a document, with the positions the diagram layer
- * edits through. Which fences count is not decided here: `mermaidFence`
- * (`elementVerbs.ts`, built on `fenceInfo`) is the one rule the preview, the
- * code box and the reading page share, so a closed fence with the info word
- * `mermaid` and a non-blank body, tildes and info text included. An unclosed
- * or empty fence is never one of these.
+ * edits through. Whether a fence draws at all is `mermaidFence`'s rule
+ * (`elementVerbs.ts`, built on `fenceInfo`; the preview, the code box and the
+ * reading page share it: the info word `mermaid` with tildes and info text
+ * included, a non-blank body, not in the frontmatter). This module adds that
+ * only a CLOSED fence is one of these: an unclosed fence is drawn by the
+ * read-only preview and is never an editable diagram (D43). `body` is the raw
+ * text between the fence lines; for a top-level fence it is what mermaid gets.
  *
  * Positions are document positions; the body is read with
  * `state.doc.sliceString`, so it is an LF string in a CRLF document too, and

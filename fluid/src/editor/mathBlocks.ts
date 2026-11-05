@@ -160,9 +160,12 @@ function readFence(
   // A fence that follows a list marker on its line stays source: its
   // block would have to start mid-line.
   const body = unclosed ? lines.slice(1) : lines.slice(1, -1);
-  const fence = (lines[0] ?? "").startsWith(marks)
-    ? [lines.join("\n"), body.join("\n")]
-    : null;
+  // An unclosed fence is no such case: its formula is a widget after the
+  // source and replaces nothing, so the page's reading is the one to follow.
+  const fence =
+    unclosed || (lines[0] ?? "").startsWith(marks)
+      ? [lines.join("\n"), body.join("\n")]
+      : null;
   // On a page read section by section, a fence that runs over a section
   // heading is not one block on the page: draw none.
   const crosses =
