@@ -49,7 +49,8 @@ const BLOCK_MARKS = new Set<MarkKind>(["list", "task", "quote"]);
 /**
  * An image with no alt text where its marks are hidden: a small box with the
  * width of a letter, so a caret on either side of it is a place of its own.
- * The picture itself is drawn under the line (`imagePreviews.ts`).
+ * Where the picture layer draws the picture in its place (`imagePreviews.ts`)
+ * the span is the picture's, and no box is drawn (`drawnAsPicture`).
  */
 class ImageAtomWidget extends WidgetType {
   override eq(): boolean {
@@ -222,7 +223,9 @@ export function linkPressed(event: MouseEvent, view: EditorView): boolean {
   ) {
     return false;
   }
-  const el = event.target.closest(".cm-link-text");
+  // A linked picture is drawn in place of the link's words, and the link
+  // keeps the press on it (`imagePreviews.ts` hands it over).
+  const el = event.target.closest(".cm-link-text, .cm-picture");
   if (!el || !view.contentDOM.contains(el)) {
     return false;
   }

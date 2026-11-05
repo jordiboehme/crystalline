@@ -7,6 +7,7 @@
  */
 
 import { undo, undoDepth } from "@codemirror/commands";
+import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
 import { QueryClient } from "@tanstack/react-query";
@@ -17,6 +18,7 @@ import * as Y from "yjs";
 import type { DocumentAdapter } from "../editor/adapter";
 import { engramAdapter, reflectionAdapter } from "../editor/adapter";
 import type { ElementEdit } from "../editor/elementEdit";
+import type { FloatingContext } from "../editor/floatingContext";
 import { marksOnEditLine } from "../editor/marks/mode";
 import { roomUndo } from "../editor/roomUndo";
 import { previewConfig, surfaceExtensions } from "../editor/surface";
@@ -34,6 +36,8 @@ export interface MarkViewOptions {
   raw?: boolean;
   /** Told the formats the format buttons show as pressed. */
   onFormatState?: (formats: ReadonlySet<string>) => void;
+  /** Told what the floating action bar stands by. */
+  onFloatingContext?: (context: FloatingContext) => void;
   /** Told the element edit a click, Mod-k or Shift+F10 asked for. */
   onElementEdit?: (edit: ElementEdit | null, view: EditorView) => void;
   /** The room's shared text, for a second peer (`markPeers`). */
@@ -49,6 +53,13 @@ export interface MarkViewOptions {
    * for a test of what a press does on a short tree.
    */
   parsed?: boolean;
+  /**
+   * The picture layer the screen hands the preview compartment
+   * (`imagePreviews(...)`). Left out, none: the view draws no pictures.
+   */
+  images?: Extension;
+  /** The paste and drop upload handlers (`attachmentUploads`). Left out, none. */
+  uploads?: Extension;
 }
 
 const views = new Set<EditorView>();
@@ -57,7 +68,7 @@ const roomTexts = new WeakMap<EditorView, Y.Text>();
 const markCompartments = new WeakMap<EditorView, Compartment>();
 const previews = new WeakMap<
   EditorView,
-  { compartment: Compartment; adapter: DocumentAdapter }
+  { compartment: Compartment; adapter: DocumentAdapter; images: Extension }
 >();
 
 /** Destroys every view `markView` built; call in `afterEach`. */
@@ -118,12 +129,12 @@ export function markView(
           screen,
           preview,
           raw: options.raw ?? false,
-          images: [],
-          uploads: [],
+          images: options.images ?? [],
+          uploads: options.uploads ?? [],
           onTableContext: () => {},
           onImageContext: () => {},
           onElementContext: () => {},
-          onFloatingContext: () => {},
+          onFloatingContext: options.onFloatingContext ?? (() => {}),
           ...(options.onFormatState
             ? { onFormatState: options.onFormatState }
             : {}),
@@ -139,7 +150,11 @@ export function markView(
   });
   views.add(view);
   markCompartments.set(view, marks);
-  previews.set(view, { compartment: preview, adapter });
+  previews.set(view, {
+    compartment: preview,
+    adapter,
+    images: options.images ?? [],
+  });
   if (undoManager) {
     undoManagers.set(view, undoManager);
   }
@@ -187,8 +202,10 @@ export function markPeers(
     ...options,
     ytext: localDoc.getText("content"),
   });
+  // The local view's listeners are the local view's: the peer has none.
   const peer = markView(text, {
     ...options,
+    onFloatingContext: () => {},
     ytext: peerDoc.getText("content"),
   });
   return {
@@ -228,7 +245,7 @@ export function setRaw(view: EditorView, raw: boolean): void {
   }
   view.dispatch({
     effects: preview.compartment.reconfigure(
-      previewConfig(raw, false, [], preview.adapter),
+      previewConfig(raw, false, preview.images, preview.adapter),
     ),
   });
 }

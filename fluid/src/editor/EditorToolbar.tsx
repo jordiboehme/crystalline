@@ -43,7 +43,7 @@ import {
 } from "lucide-react";
 import { AlertDialog, DropdownMenu } from "radix-ui";
 import type { MouseEvent, ReactElement, ReactNode } from "react";
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import { CALLOUT_WORDS } from "../components/calloutFace";
 import { ITEM_CLASSES, MENU_CLASSES, MENU_SEPARATOR } from "../components/menu";
@@ -64,7 +64,7 @@ import { linkVerb } from "./elementEdit";
 import { verbTarget } from "./floatingContext";
 import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
-import { toggleFormat } from "./marks/formatting";
+import { formatRefusal, toggleFormat } from "./marks/formatting";
 import { mainSelectionParked } from "./parkedSelection";
 import { stepOffIdLines } from "./hiddenIdLines";
 import { InsertMenu, TRIGGER } from "./InsertMenu";
@@ -432,7 +432,8 @@ export function EditorToolbar({
   /**
    * Whether the caret is on an attachment image right now. Drawn rather than
    * disabled, like the table segment beside it: a menu that has nothing to act
-   * on is one more thing to read past on the way to the verbs that do.
+   * on is one more thing to read past on the way to the verbs that do. Only
+   * in Raw: elsewhere the floating bar has the picture's options.
    */
   imageActive?: boolean;
   /**
@@ -500,6 +501,17 @@ export function EditorToolbar({
   const cellNow = cellOpen || parked;
   /** Off for the verbs that act on main's line or insert into main. */
   const lineOff = off || cellNow;
+  /**
+   * Why the format buttons are off on the view a format verb acts on (a
+   * selected picture has no text to format), said as their description so
+   * nothing is refused silently (P21). The bar draws again when it changes:
+   * the buffer's format state reports it.
+   */
+  const target = view === null ? null : verbTarget(view);
+  const formatWhy = target === null ? null : formatRefusal(target.state);
+  const formatOff = off || formatWhy !== null;
+  const whyId = useId();
+  const formatHint = formatWhy === null ? {} : { "aria-describedby": whyId };
   /** The heading change waiting for the person's answer, if any. */
   const [asking, setAsking] = useState<{
     level: StyleLevel;
@@ -594,31 +606,40 @@ export function EditorToolbar({
         <IconButton
           label="Bold"
           icon={Bold}
-          disabled={off}
+          disabled={formatOff}
+          {...formatHint}
           {...pressed("strong")}
           onClick={actInline((v) => toggleFormat(v, "strong"))}
         />
         <IconButton
           label="Italic"
           icon={Italic}
-          disabled={off}
+          disabled={formatOff}
+          {...formatHint}
           {...pressed("em")}
           onClick={actInline((v) => toggleFormat(v, "em"))}
         />
         <IconButton
           label="Strikethrough"
           icon={Strikethrough}
-          disabled={off}
+          disabled={formatOff}
+          {...formatHint}
           {...pressed("strike")}
           onClick={actInline((v) => toggleFormat(v, "strike"))}
         />
         <IconButton
           label="Inline code"
           icon={Code}
-          disabled={off}
+          disabled={formatOff}
+          {...formatHint}
           {...pressed("code")}
           onClick={actInline((v) => toggleFormat(v, "code"))}
         />
+        {formatWhy !== null && (
+          <span id={whyId} className="sr-only">
+            {formatWhy}
+          </span>
+        )}
         <TextStyleMenu
           view={view}
           disabled={lineOff}
@@ -703,11 +724,13 @@ export function EditorToolbar({
             disabled={lineOff || attachDisabled}
           />
         )}
-        {imageActive && !cellNow && (
+        {imageActive && raw && !cellNow && (
           <>
             {/*
             The same hairline, in front of the one menu that acts on the image
-            the caret is on rather than on the document at large.
+            the caret is on rather than on the document at large. Raw only:
+            outside it the picture is drawn, a press selects it, and the
+            floating bar holds its options (ruling 15).
           */}
             <Divider />
             <DropdownMenu.Root>

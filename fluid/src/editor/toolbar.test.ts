@@ -23,6 +23,7 @@ import {
   MERMAID_SKELETON,
   ORDERED_ITEM,
   TABLE_SKELETON,
+  blockInsertion,
   cycleHeading,
   formattingKeymap,
   insertBlock,
@@ -292,6 +293,36 @@ describe("insertBlock", () => {
     const line = v.state.doc.lineAt(head);
     expect(line.text).toBe("| Column | Column |");
     expect(head).toBe(line.to);
+  });
+});
+
+describe("blockInsertion", () => {
+  test("leads a block below a line with text by one blank line", () => {
+    const state = EditorState.create({ doc: "prose\nnext" });
+    const line = state.doc.line(1);
+    expect(blockInsertion(state, line, ["![x](a.png)"])).toEqual({
+      change: { from: 5, insert: "\n\n![x](a.png)\n" },
+      start: 7,
+    });
+  });
+
+  test("writes a block into an empty line with no lead", () => {
+    const state = EditorState.create({ doc: "a\n\nb" });
+    expect(blockInsertion(state, state.doc.line(2), ["X", "Y"])).toEqual({
+      change: { from: 2, insert: "X\nY\n" },
+      start: 2,
+    });
+  });
+
+  test("writes the state's own separator and counts a break as one position", () => {
+    const state = EditorState.create({
+      doc: "top\r\nbottom",
+      extensions: lineSeparatorFor("top\r\nbottom"),
+    });
+    expect(blockInsertion(state, state.doc.line(1), ["X"])).toEqual({
+      change: { from: 3, insert: "\r\n\r\nX\r\n" },
+      start: 5,
+    });
   });
 });
 

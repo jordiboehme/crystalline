@@ -1,5 +1,5 @@
 /**
- * The eight image-format glyphs, pinned shape for shape.
+ * The ten image-format glyphs, pinned shape for shape.
  *
  * Every number below is a decision somebody made looking at the rendered
  * picture, so this suite is not a test of svg - it is the record of what was
@@ -17,6 +17,8 @@ import {
   ImageFloatRightIcon,
   ImageFormatMenuIcon,
   ImageFullIcon,
+  ImageOriginalIcon,
+  ImageRemoveIcon,
   ImageWidth25Icon,
   ImageWidth50Icon,
   ImageWidth75Icon,
@@ -185,6 +187,33 @@ describe("the image-format glyphs", () => {
         height: "2",
         rx: "0.5",
       }),
+    ]);
+  });
+
+  test("the original size is one to one in the same bar, nothing filled", () => {
+    expect(parts(<ImageOriginalIcon />)).toEqual([
+      outline({
+        kind: "rect",
+        x: "4",
+        y: "9",
+        width: "16",
+        height: "6",
+        rx: "1",
+      }),
+      { kind: "path", d: "M9.5 11v2" },
+      { kind: "path", d: "M14.5 11v2" },
+      solid({ kind: "circle", cx: "12", cy: "11.25", r: "0.6" }),
+      solid({ kind: "circle", cx: "12", cy: "12.75", r: "0.6" }),
+    ]);
+  });
+
+  test("remove is a bin with a lid and two lines down it", () => {
+    expect(parts(<ImageRemoveIcon />)).toEqual([
+      { kind: "path", d: "M5 7h14" },
+      { kind: "path", d: "M10 7V5h4v2" },
+      { kind: "path", d: "M7 7l1 12h8l1-12" },
+      { kind: "path", d: "M10.5 10.5v5" },
+      { kind: "path", d: "M13.5 10.5v5" },
     ]);
   });
 

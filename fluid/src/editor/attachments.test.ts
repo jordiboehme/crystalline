@@ -6,6 +6,7 @@
  * maintenance sweep would then have to flag).
  */
 
+import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -20,7 +21,11 @@ import {
   transferFiles,
   uploadAttachments,
 } from "./attachments";
+import { bytes, cleanupCells, roomMain, soloMain } from "../test/cellKit";
 import { frontmatterFold } from "./frontmatterFold";
+import { gridExtension } from "./grid/index";
+import { openCellField } from "./grid/openCell";
+import { hiddenIdLines } from "./hiddenIdLines";
 
 vi.mock("../api/files", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/files")>();
@@ -992,5 +997,188 @@ describe("a buffer that is gone when the upload ends", () => {
     );
     // The file arrived; only its link is missing.
     expect(kinds.at(-1)).toBe("unlinked");
+  });
+});
+
+/**
+ * Where a dropped file lands: below the whole block under the pointer
+ * (`dropLanding`), the place the drop line marks, never inside a table the
+ * grid draws or between a Reflection heading and its id line.
+ */
+describe("a file dropped over a block", () => {
+  const LINK = "![shot.png](../assets/2026/10/shot.png)";
+  const home: AssetHome = {
+    key: ["fake"],
+    list: () => Promise.resolve([]),
+    upload: (path) =>
+      Promise.resolve({ path, mime: "image/png", size: 8, sha256: "a" }),
+    remove: () => Promise.resolve(),
+    url: (path) => `/fake/${path}`,
+    resolve: () => null,
+    refused: () => null,
+    linkTo: (path) => `../${path}`,
+  };
+
+  afterEach(cleanupCells);
+
+  /** A drop of one picture file at a point on the screen. */
+  function dropAt(target: EditorView): Event {
+    const event = new MouseEvent("drop", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 12,
+      clientY: 34,
+    });
+    Object.defineProperty(event, "dataTransfer", {
+      value: {
+        files: [fileOf("shot.png")],
+        types: ["Files"],
+        getData: () => "",
+      },
+    });
+    target.contentDOM.dispatchEvent(event);
+    return event;
+  }
+
+  /**
+   * A buffer with the grid and the upload handlers, `at` the position the
+   * pointer names; resolves with the document once the dropped file is in.
+   */
+  async function dropped(
+    doc: string,
+    at: number,
+    extra: Extension[] = [],
+  ): Promise<{ main: EditorView; events: string[] }> {
+    const uploads: Promise<number>[] = [];
+    const events: string[] = [];
+    let main: EditorView | null = null;
+    main = soloMain(doc, [
+      gridExtension(),
+      ...extra,
+      EditorView.updateListener.of((update) => {
+        for (const tr of update.transactions) {
+          if (tr.isUserEvent("select.drop")) events.push("select.drop");
+        }
+      }),
+      attachmentUploads((files) => {
+        if (!main) return;
+        uploads.push(
+          uploadAttachments({
+            home,
+            files,
+            view: main,
+            onError: () => undefined,
+            now: new Date(2026, 9, 15),
+          }),
+        );
+      }),
+    ]);
+    const posAtCoords = vi.spyOn(main, "posAtCoords").mockReturnValue(at);
+    const event = dropAt(main);
+    expect(event.defaultPrevented).toBe(true);
+    expect(posAtCoords).toHaveBeenCalledWith({ x: 12, y: 34 }, false);
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(await Promise.all(uploads)).toEqual([1]);
+    return { main, events };
+  }
+
+  it("lands after a drawn table, and no cell opens", async () => {
+    const doc = "intro\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nend\n";
+    const { main, events } = await dropped(doc, doc.indexOf("1 |"));
+    expect(bytes(main.state)).toBe(
+      `intro\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\n${LINK}\n\n\nend\n`,
+    );
+    expect(events).toEqual(["select.drop"]);
+    expect(main.state.field(openCellField)).toBeNull();
+  });
+
+  it("lands after a drawn table whose last line ends inside a cell", async () => {
+    const doc = "intro\n\n| a | b\n| --- | ---\n| 1 | 2\n\nend\n";
+    const { main } = await dropped(doc, doc.indexOf("| 2") + 2);
+    expect(bytes(main.state)).toBe(
+      `intro\n\n| a | b\n| --- | ---\n| 1 | 2\n\n${LINK}\n\n\nend\n`,
+    );
+    expect(main.state.field(openCellField)).toBeNull();
+  });
+
+  it("lands below a Reflection heading's id line", async () => {
+    const doc = "## H\n<!-- r:7f3a9c2e -->\n\nBody.\n";
+    const { main } = await dropped(doc, 1, [hiddenIdLines()]);
+    expect(bytes(main.state)).toBe(
+      `## H\n<!-- r:7f3a9c2e -->\n\n${LINK}\n\n\nBody.\n`,
+    );
+  });
+
+  it("lands over a plain line where it always did", async () => {
+    const doc = "# Title\n\nBody line.\n\nend\n";
+    const { main } = await dropped(doc, doc.indexOf("line"));
+    expect(bytes(main.state)).toBe(
+      `# Title\n\nBody line.\n\n${LINK}\n\n\nend\n`,
+    );
+  });
+
+  it("lands after the whole paragraph, so a bold over two lines stays whole", async () => {
+    const doc = "**a\nb**\n\nend\n";
+    const { main } = await dropped(doc, 1);
+    expect(bytes(main.state)).toBe(`**a\nb**\n\n${LINK}\n\n\nend\n`);
+  });
+
+  it("goes below the caret's line when the person placed it after the drop", async () => {
+    const doc = "one\n\ntwo\n\nthree\n";
+    const started: (() => Promise<number>)[] = [];
+    const main = soloMain(doc, [
+      attachmentUploads((files) => {
+        started.push(() =>
+          uploadAttachments({
+            home,
+            files,
+            view: main,
+            onError: () => undefined,
+            now: new Date(2026, 9, 15),
+          }),
+        );
+      }),
+    ]);
+    vi.spyOn(main, "posAtCoords").mockReturnValue(1);
+    dropAt(main);
+    main.dispatch({
+      selection: { anchor: doc.indexOf("three") },
+      userEvent: "select.pointer",
+    });
+    expect(started).toHaveLength(1);
+    await started[0]?.();
+    expect(bytes(main.state)).toBe(`one\n\ntwo\n\nthree\n\n${LINK}\n\n`);
+  });
+
+  it("follows the place through a peer's edit above it", async () => {
+    const doc = "one\n\ntwo\n";
+    const { main, rtext } = roomMain(doc, [
+      attachmentUploads((files) => {
+        void uploadAttachments({
+          home,
+          files,
+          view: main,
+          onError: () => undefined,
+          now: new Date(2026, 9, 15),
+        });
+      }),
+    ]);
+    vi.spyOn(main, "posAtCoords").mockReturnValue(1);
+    dropAt(main);
+    rtext.insert(0, "zero\n\n");
+    await vi.waitFor(() => {
+      expect(bytes(main.state)).toBe(`zero\n\none\n\n${LINK}\n\n\ntwo\n`);
+    });
+  });
+
+  it("cancels a dragover that names files it cannot list yet", () => {
+    // During a dragover Chromium lists no files, only the type "Files".
+    const main = soloMain("x\n", [attachmentUploads(() => undefined)]);
+    const event = new Event("dragover", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", {
+      value: { files: [], types: ["Files"], getData: () => "" },
+    });
+    main.contentDOM.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
   });
 });

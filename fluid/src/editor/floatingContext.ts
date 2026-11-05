@@ -1,6 +1,7 @@
 /**
- * What the floating action bar stands by: a text selection outside any
- * table, the caret or a selection in the open table cell, or nothing.
+ * What the floating action bar stands by: a selected picture, a text
+ * selection outside any table, the caret or a selection in the open table
+ * cell, or nothing.
  *
  * Eager and small on purpose. It imports nothing from `grid/`, which is the
  * lazy chunk: the cell editor reaches in instead, through `floatingCell(main)`,
@@ -16,14 +17,29 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState, Extension } from "@codemirror/state";
+import type { ChangeDesc, EditorState, Extension } from "@codemirror/state";
 import { Prec } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
+import { picturesDrawn } from "./marks/mode";
 import { mainSelectionParked, parkingChanged } from "./parkedSelection";
+import { selectedPicture } from "./pictures/refs";
 
 export type FloatingContext =
+  /**
+   * A drawn picture selected whole, outside a link and a table. `rect` is
+   * the image's box (or its caption's, for a picture not drawn as an
+   * image); `from` and `to` are its reference; `formattable` says whether
+   * its size and place can be set, which only an attachment's can.
+   */
+  | {
+      kind: "image";
+      rect: DOMRect;
+      from: number;
+      to: number;
+      formattable: boolean;
+    }
   /** A non-empty main selection outside tables. */
   | { kind: "text"; rect: DOMRect }
   /**
@@ -50,6 +66,41 @@ interface Hub {
 }
 
 const hubs = new WeakMap<EditorView, Hub>();
+
+/**
+ * Told every change main's document takes, or null when main's state was
+ * replaced (`setState`), where no change maps the old positions.
+ */
+export type DocWatcher = (changes: ChangeDesc | null) => void;
+
+/** The watchers per main view; kept apart from the hub, which a rebuild replaces. */
+const watchers = new WeakMap<EditorView, Set<DocWatcher>>();
+
+/**
+ * Hands `watch` every change of `main`'s document, as it is dispatched,
+ * until the returned stop is called: the picture controls keep the place of
+ * the picture whose alt text is being typed with it.
+ */
+export function watchDocChanges(
+  main: EditorView,
+  watch: DocWatcher,
+): () => void {
+  let set = watchers.get(main);
+  if (!set) {
+    set = new Set();
+    watchers.set(main, set);
+  }
+  set.add(watch);
+  return () => {
+    watchers.get(main)?.delete(watch);
+  };
+}
+
+function tellWatchers(main: EditorView, changes: ChangeDesc | null): void {
+  const set = watchers.get(main);
+  if (!set) return;
+  for (const watch of [...set]) watch(changes);
+}
 
 /** What the bar registers to be focused by Alt+F10, per main view. */
 const focusers = new WeakMap<EditorView, (origin: EditorView) => boolean>();
@@ -158,6 +209,21 @@ function toRect(box: {
   );
 }
 
+/**
+ * The box of the selected picture as drawn: its image, or the caption a
+ * picture that is not loaded shows. Null where none is drawn or laid out.
+ */
+function pictureBox(main: EditorView): DOMRect | null {
+  for (const box of main.contentDOM.querySelectorAll(".cm-picture-selected")) {
+    // A cell editor's own pictures are not main's.
+    if (box.closest(".cm-content") !== main.contentDOM) continue;
+    const drawn = box.querySelector(":scope > img, :scope > .cm-image-error");
+    const rect = drawn?.getBoundingClientRect();
+    if (rect && (rect.width > 0 || rect.height > 0)) return rect;
+  }
+  return null;
+}
+
 function isDestroyed(view: EditorView): boolean {
   return (view as unknown as { destroyed?: unknown }).destroyed === true;
 }
@@ -191,6 +257,21 @@ function derive(hub: Hub): FloatingContext {
   if (main.state.facet(mainSelectionParked) && !mainFocused(main)) return null;
   const range = main.state.selection.main;
   if (range.empty) return null;
+  // A selected picture is a non-empty selection too, so it is asked first.
+  const picture = main.state.facet(picturesDrawn)
+    ? selectedPicture(main.state)
+    : null;
+  if (picture !== null && !picture.inLink && !picture.inCell) {
+    return {
+      kind: "image",
+      rect: toRect(
+        pictureBox(main) ?? rangeBox(main, range.from, range.to) ?? EMPTY,
+      ),
+      from: picture.from,
+      to: picture.to,
+      formattable: picture.kind === "attachment",
+    };
+  }
   if (touchesTable(main.state, range.from, range.to)) return null;
   return {
     kind: "text",
@@ -212,6 +293,13 @@ function same(a: FloatingContext, b: FloatingContext): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "cell" && b.kind === "cell") {
     if (a.selection !== b.selection || !sameRect(a.caret, b.caret)) {
+      return false;
+    }
+  }
+  // A picture that moved with its rect unchanged (jsdom, a peer's edit on
+  // another line) is a new place all the same (D8).
+  if (a.kind === "image" && b.kind === "image") {
+    if (a.from !== b.from || a.to !== b.to || a.formattable !== b.formattable) {
       return false;
     }
   }
@@ -330,10 +418,13 @@ export function floatingContextListener(
           moves: 0,
         };
         hubs.set(view, this.hub);
+        // A rebuilt state: what a watcher holds no change maps any more.
+        tellWatchers(view, null);
         schedule(this.hub);
       }
 
       update(update: ViewUpdate): void {
+        if (update.docChanged) tellWatchers(update.view, update.changes);
         if (selectedByHand(update)) this.hub.moves += 1;
         if (changed(update)) schedule(this.hub);
       }
