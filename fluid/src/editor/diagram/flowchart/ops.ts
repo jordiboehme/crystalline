@@ -393,7 +393,29 @@ function changeShape(
   );
 }
 
-/** Where a new `style` line for `node` goes, as the end of the line it follows. */
+/**
+ * The edit that adds `text` as a new line after line `index`. It goes in front of
+ * the next line and brings its own break, so in a document with both line breaks
+ * every old break stays on its own line (R51). Only a last line with no break
+ * gets one put after it.
+ */
+function newLineAfter(
+  model: FlowModel,
+  index: number,
+  text: string,
+): TextEdit | null {
+  const lines = model.scan.lines;
+  const line = lines[index];
+  if (line === undefined) {
+    return null;
+  }
+  const next = lines[index + 1];
+  return next
+    ? { from: next.from, to: next.from, insert: `${text}\n` }
+    : { from: line.to, to: line.to, insert: `\n${text}` };
+}
+
+/** The line a new `style` line for `node` follows. */
 function styleLineAnchor(model: FlowModel, node: FlowNode): number {
   const lines = model.scan.lines;
   const firstRef = node.refs[0]?.line ?? -1;
@@ -408,7 +430,7 @@ function styleLineAnchor(model: FlowModel, node: FlowNode): number {
   if (anchor < firstRef || anchor < 0) {
     anchor = lines.findLastIndex((line) => line.kind !== "blank");
   }
-  return lines[anchor]?.to ?? model.body.length;
+  return anchor;
 }
 
 function setColour(
@@ -426,16 +448,19 @@ function setColour(
     const indent =
       model.scan.lines.find((line) => line.kind === "statement")?.indent ??
       "    ";
-    const at = styleLineAnchor(model, node);
     const line = `style ${node.id} fill:${preset.fill},stroke:${preset.stroke},color:${preset.color}`;
-    return checked(
+    const edit = newLineAfter(
       model,
-      [{ from: at, to: at, insert: `\n${indent}${line}` }],
-      {
-        [field]: null,
-        [colours]: landed,
-      },
+      styleLineAnchor(model, node),
+      `${indent}${line}`,
     );
+    if (edit === null) {
+      return refused("invalid");
+    }
+    return checked(model, [edit], {
+      [field]: null,
+      [colours]: landed,
+    });
   }
   const edits: TextEdit[] = [];
   let appended = "";
@@ -570,14 +595,8 @@ export function newNodeId(model: FlowModel): string {
   const taken = new Set<string>([
     ...ids,
     ...model.subgraphs.map((s) => s.id),
+    // An explicit arrow id is here too, a repeated one through its first use.
     ...model.edges.map((e) => e.mermaidId),
-    ...model.chains.flatMap((chain) =>
-      chain.links.flatMap(({ arrow }) =>
-        arrow.idSpan
-          ? [model.body.slice(arrow.idSpan.from, arrow.idSpan.to)]
-          : [],
-      ),
-    ),
     ...model.directives.flatMap((d) =>
       d.kind === "classDef" ? [] : d.targets.map((t) => t.id),
     ),
@@ -747,17 +766,15 @@ function insertLine(
   text: string,
   { box, edge }: Addition,
 ): OpResult {
-  const line = model.scan.lines[place.line];
-  if (line === undefined) {
+  const edit = newLineAfter(
+    model,
+    place.line,
+    `${indentFor(model, place)}${text}`,
+  );
+  if (edit === null) {
     return refused("invalid");
   }
-  const edits: TextEdit[] = [
-    {
-      from: line.to,
-      to: line.to,
-      insert: `\n${indentFor(model, place)}${text}`,
-    },
-  ];
+  const edits: TextEdit[] = [edit];
   const changes: Record<string, Wanted> = {};
   if (box !== null) {
     Object.assign(changes, newBoxFields(model, box, place.group));
@@ -832,6 +849,15 @@ function addSibling(model: FlowModel, node: FlowNode): OpResult {
  * self-check refuses that, the arrow goes in the nearest subgraph around both.
  */
 function connect(model: FlowModel, from: FlowNode, to: FlowNode): OpResult {
+  // Mermaid's layout gives every loop on a box the same helper nodes, so the
+  // last one replaces the others in the drawing and their style is lost. The db
+  // cannot see this, so no check downstream would.
+  if (
+    from === to &&
+    model.edges.some((e) => e.start === from.id && e.end === from.id)
+  ) {
+    return refused("invalid");
+  }
   const a = placeBy(model, from);
   const b = placeBy(model, to);
   const place = a.line >= b.line ? a : b;

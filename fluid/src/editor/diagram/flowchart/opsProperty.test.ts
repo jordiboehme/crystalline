@@ -938,7 +938,7 @@ async function checkInserts(body: string): Promise<InsertTally> {
       fail(checked.problem);
       return;
     }
-    const inserted = result.edits.filter((e) => e.insert.startsWith("\n"));
+    const inserted = result.edits.filter((e) => e.insert.includes("\n"));
     if (inserted.length !== 1 || inserted[0]?.insert.trim() !== text(id)) {
       fail(`the new line is not ${text(id)}: ${JSON.stringify(inserted)}`);
     }
@@ -1154,9 +1154,7 @@ describe("every op that adds something, on the corpus", () => {
     "the id %s next to a new line, each result read by mermaid or refused",
     async (id) => {
       const body = `flowchart TD\n  ${id} --> Q1\n  Q1 --> R1\n  R1 --> ${id}`;
-      if (!parseFlowchart(body).understood) {
-        return;
-      }
+      expect(parseFlowchart(body).understood).toBe(true);
       await flowDbFor(body);
       const tally = await checkInserts(body);
       expect(tally.failures).toEqual([]);

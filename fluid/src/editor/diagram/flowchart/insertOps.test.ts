@@ -152,6 +152,14 @@ describe("addChild", () => {
     );
   });
 
+  test("a classDef named like the box is no line that names the box", () => {
+    const body =
+      "flowchart TD\n  A --> B\n  C --> D\n  classDef A fill:#f00\n  E --> F";
+    expect(run(body, { op: "addChild", id: "A" })).toBe(
+      "flowchart TD\n  A --> B\n  A --> G[New box]\n  C --> D\n  classDef A fill:#f00\n  E --> F",
+    );
+  });
+
   test("never takes an accDescr block's } with it (R33)", async () => {
     const body = "flowchart TD\n  accDescr {\n    x\n  } A --> B; C --> D";
     const after = run(body, { op: "addChild", id: "A" });
@@ -298,6 +306,19 @@ describe("connect", () => {
     expect(await flowDelta(SKELETON, after)).toEqual(["edge 1 added"]);
   });
 
+  test("a second arrow from a box to itself is refused: the drawing keeps only one", () => {
+    const body = "flowchart TD\n  A --> A\n  linkStyle 0 stroke:#ff0000";
+    expect(refusal(body, { op: "connect", from: "A", to: "A" })).toBe(
+      "invalid",
+    );
+    expect(refusal(body, { op: "addChild", id: "A" })).toBe(null);
+    const chain = "flowchart TD\n  A & B --> A & C";
+    expect(refusal(chain, { op: "connect", from: "A", to: "A" })).toBe(
+      "invalid",
+    );
+    expect(refusal(chain, { op: "connect", from: "B", to: "B" })).toBe(null);
+  });
+
   test("an end that would move into the other's subgraph keeps the arrow outside", async () => {
     // Inside s, `B --> A` would make B a member of s.
     const body = "flowchart TD\n  B\n  subgraph s\n    A --> C\n  end";
@@ -368,6 +389,9 @@ describe("newNodeId", () => {
     ],
     ["past an arrow id", "flowchart TD\n  A B@--> A", "C"],
     ["past a generated arrow id", "flowchart TD\n  A --> A", "B"],
+    ["past an arrow id on a group", "flowchart TD\n  A & B C@--> A", "D"],
+    ["past a repeated arrow id", "flowchart TD\n  A C@--> A\n  B C@--> A", "D"],
+    ["a class name is free", "flowchart TD\n  A\n  classDef B fill:#f00", "B"],
     ["past a class target", "flowchart TD\n  A\n  class B hot", "C"],
     ["past a click target", 'flowchart TD\n  A\n  click B "https://x.y/"', "C"],
     ["n1 when Z is taken", "flowchart TD\n  Z", "n1"],
@@ -594,6 +618,81 @@ describe("a CRLF document", () => {
   });
 });
 
+describe("a document with both line breaks keeps every old break on its line (R51)", () => {
+  const MIXED =
+    "flowchart TD\r\n  A --> B\n  B --> C\r\n  C --> D\n  linkStyle 2 stroke:#00f";
+  const STYLED =
+    "flowchart TD\r\n  A --> B\n  style A fill:#fff\n  B --> C\r\n  C --> D";
+
+  test.each<[string, string, FlowOp, string]>([
+    [
+      "addChild, a line that ends in \\n",
+      MIXED,
+      { op: "addChild", id: "A" },
+      "flowchart TD\r\n  A --> B\n  A --> E[New box]\r\n  B --> C\r\n  C --> D\n  linkStyle 3 stroke:#00f",
+    ],
+    [
+      "addChild, a line that ends in \\r\\n",
+      MIXED,
+      { op: "addChild", id: "C" },
+      "flowchart TD\r\n  A --> B\n  B --> C\r\n  C --> D\n  C --> E[New box]\r\n  linkStyle 2 stroke:#00f",
+    ],
+    [
+      "connect",
+      MIXED,
+      { op: "connect", from: "B", to: "A" },
+      "flowchart TD\r\n  A --> B\n  B --> C\r\n  B --> A\r\n  C --> D\n  linkStyle 3 stroke:#00f",
+    ],
+    [
+      "addBox after a last line with no break",
+      MIXED,
+      { op: "addBox" },
+      `${MIXED}\r\n  E[New box]`,
+    ],
+    [
+      "addBox before a last break",
+      "flowchart TD\r\n  A --> B\n",
+      { op: "addBox" },
+      "flowchart TD\r\n  A --> B\n  C[New box]\r\n",
+    ],
+    [
+      "connect after a last line with no break",
+      "flowchart TD\r\n  A --> B\n  B --> C",
+      { op: "connect", from: "C", to: "A" },
+      "flowchart TD\r\n  A --> B\n  B --> C\r\n  C --> A",
+    ],
+    [
+      "a new style line in the middle",
+      STYLED,
+      { op: "colour", id: "B", colour: "blue" },
+      "flowchart TD\r\n  A --> B\n  style A fill:#fff\n  style B fill:#1d4ed8,stroke:#1e3a8a,color:#ffffff\r\n  B --> C\r\n  C --> D",
+    ],
+    [
+      "a new style line after a class line",
+      "flowchart TD\r\n  A --> B\n  class A hot\n  B --> C\r\n  C --> D",
+      { op: "colour", id: "A", colour: "blue" },
+      "flowchart TD\r\n  A --> B\n  class A hot\n  style A fill:#1d4ed8,stroke:#1e3a8a,color:#ffffff\r\n  B --> C\r\n  C --> D",
+    ],
+  ])("%s", (_, doc, op, saved) => {
+    const state = EditorState.create({
+      doc,
+      extensions: lineSeparatorFor(doc),
+    });
+    expect(state.lineBreak).toBe("\r\n");
+    const body = state.doc.sliceString(0, state.doc.length);
+    const result = compileFlowOp(parseFlowchart(body), op);
+    if ("refused" in result) {
+      throw new Error(result.refused);
+    }
+    expect(
+      docText(
+        state.update({ changes: toChanges(0, result.edits, state.lineBreak) })
+          .state,
+      ),
+    ).toBe(saved);
+  });
+});
+
 describe("shiftLinkStyles", () => {
   const FIVE =
     "flowchart LR\n    A --> B --> C\n    C --> D\n    D --> E\n    E --> A";
@@ -660,6 +759,51 @@ describe("shiftLinkStyles", () => {
     expect(shifted(acc, 0, -1, new Set([0]))).toBe(
       "flowchart LR\n    A --> B\n    accDescr {\n      x\n    } ",
     );
+  });
+
+  describe("two removed statements on one line", () => {
+    const one = "linkStyle 0 stroke-width:2px";
+    const two = "linkStyle 1 stroke-width:3px";
+    const three = "linkStyle 2 stroke-width:4px";
+
+    test("a line left with nothing goes with its line break", () => {
+      const line = `    ${one}; ${two}`;
+      expect(shifted(`${FIVE}\n${line}`, 0, -1, new Set([0, 1]))).toBe(FIVE);
+      expect(
+        shifted(`${FIVE}\n${line}\n    %% note`, 0, -1, new Set([0, 1])),
+      ).toBe(`${FIVE}\n    %% note`);
+    });
+
+    test.each([
+      ["the first two", new Set([0, 1]), "linkStyle 0 stroke-width:4px"],
+      ["the last two", new Set([1, 2]), one],
+      ["the outer two", new Set([0, 2]), "linkStyle 0 stroke-width:3px"],
+    ])("%s of three keep the third", (_, removed, kept) => {
+      const body = `${FIVE}\n    ${one}; ${two}; ${three}`;
+      const at = Math.min(...removed);
+      expect(shifted(body, at, -1, removed)).toBe(`${FIVE}\n    ${kept}`);
+    });
+
+    test("beside a chain the chain stays", () => {
+      const body = `${FIVE}\n    E --> B; ${one}; ${two}`;
+      expect(shifted(body, 0, -1, new Set([0, 1]))).toBe(
+        `${FIVE}\n    E --> B`,
+      );
+    });
+
+    test("after an accDescr's } the } stays (R33)", () => {
+      const acc = `flowchart LR\n    A --> B --> C\n    accDescr {\n      x\n    } ${one}; ${two}`;
+      expect(shifted(acc, 0, -1, new Set([0, 1]))).toBe(
+        "flowchart LR\n    A --> B --> C\n    accDescr {\n      x\n    } ",
+      );
+    });
+
+    test("one line of two statements and the next line both go", () => {
+      const body = `${FIVE}\n    ${one}; ${two}\n    ${three}\n    %% note`;
+      expect(shifted(body, 0, -1, new Set([0, 1, 2]))).toBe(
+        `${FIVE}\n    %% note`,
+      );
+    });
   });
 
   test("linkStyle default is never touched", () => {
