@@ -262,6 +262,9 @@ export function edgeLabel(
   const markdown = raw !== null && isMarkdownLabel(raw);
   let result: OpResult = refused("invalid");
   for (const written of labelForms(arrow, typed, markdown)) {
+    // A net (R42): 1.9 million generated texts found no input that trips this
+    // today, so no test can show it. It stays for the day the encoder and the
+    // decoder part ways, since the self-check compares written bytes only.
     if (tidyLabel(decodeLabel(written, written.startsWith('"'))) !== typed) {
       continue;
     }

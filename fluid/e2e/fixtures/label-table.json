@@ -315,5 +315,78 @@
    "label": "#92;",
    "shown": "\\"
   }
+ ],
+ "arrows": [
+  {
+   "texts": [
+    "a\"a\"a\"a\"a",
+    "a\"a\"a\"a\"a\"a\"a\"a\"a\"a\"a\"a",
+    "#a;#b;#c;#d;#e;#f;#g;#h;",
+    "x\\y\\z\\x\\y\\z\\x\\y\\z",
+    "see \"this\" and \"that\" as well",
+    "aaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaaaaaa\"b",
+    "aaaaaaaaaaaaaaaaaaaaaaaaa\"b"
+   ],
+   "body": "flowchart TD\n  E0 -->|\"a#quot;a#quot;a#quot;a#quot;a\"| F0\n  E1 -->|\"a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a#quot;a\"| F1\n  E2 -->|\"#35;a;#35;b;#35;c;#35;d;#35;e;#35;f;#35;g;#35;h;\"| F2\n  E3 -->|\"x#92;y#92;z#92;x#92;y#92;z#92;x#92;y#92;z\"| F3\n  E4 -->|\"see #quot;this#quot; and #quot;that#quot; as well\"| F4\n  E5 -->|\"aaaaaaaaaaaaaa#quot;b\"| F5\n  E6 -->|\"aaaaaaaaaaaaaaa#quot;b\"| F6\n  E7 -->|\"aaaaaaaaaaaaaaaa#quot;b\"| F7\n  E8 -->|\"aaaaaaaaaaaaaaaaa#quot;b\"| F8\n  E9 -->|\"aaaaaaaaaaaaaaaaaa#quot;b\"| F9\n  E10 -->|\"aaaaaaaaaaaaaaaaaaa#quot;b\"| F10\n  E11 -->|\"aaaaaaaaaaaaaaaaaaaa#quot;b\"| F11\n  E12 -->|\"aaaaaaaaaaaaaaaaaaaaa#quot;b\"| F12\n  E13 -->|\"aaaaaaaaaaaaaaaaaaaaaa#quot;b\"| F13\n  E14 -->|\"aaaaaaaaaaaaaaaaaaaaaaa#quot;b\"| F14\n  E15 -->|\"aaaaaaaaaaaaaaaaaaaaaaaa#quot;b\"| F15\n  E16 -->|\"aaaaaaaaaaaaaaaaaaaaaaaaa#quot;b\"| F16"
+  },
+  {
+   "texts": [
+    "~~s~~",
+    "a:a:a:a:a",
+    "a:a:a:a:a:a:a:a:a:a:a:a",
+    "aaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaaaaaa:b",
+    "aaaaaaaaaaaaaaaaaaaaaaaaa:b"
+   ],
+   "body": "flowchart TD\n  E0 -->|\"`#126;#126;s#126;#126;`\"| F0\n  E1 -->|\"`a#58;a#58;a#58;a#58;a`\"| F1\n  E2 -->|\"`a#58;a#58;a#58;a#58;a#58;a#58;a#58;a#58;a#58;a#58;a#58;a`\"| F2\n  E3 -->|\"`aaaaaaaaaaaaaa#58;b`\"| F3\n  E4 -->|\"`aaaaaaaaaaaaaaa#58;b`\"| F4\n  E5 -->|\"`aaaaaaaaaaaaaaaa#58;b`\"| F5\n  E6 -->|\"`aaaaaaaaaaaaaaaaa#58;b`\"| F6\n  E7 -->|\"`aaaaaaaaaaaaaaaaaa#58;b`\"| F7\n  E8 -->|\"`aaaaaaaaaaaaaaaaaaa#58;b`\"| F8\n  E9 -->|\"`aaaaaaaaaaaaaaaaaaaa#58;b`\"| F9\n  E10 -->|\"`aaaaaaaaaaaaaaaaaaaaa#58;b`\"| F10\n  E11 -->|\"`aaaaaaaaaaaaaaaaaaaaaa#58;b`\"| F11\n  E12 -->|\"`aaaaaaaaaaaaaaaaaaaaaaa#58;b`\"| F12\n  E13 -->|\"`aaaaaaaaaaaaaaaaaaaaaaaa#58;b`\"| F13\n  E14 -->|\"`aaaaaaaaaaaaaaaaaaaaaaaaa#58;b`\"| F14"
+  },
+  {
+   "texts": [
+    "aaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaaaaaa&plain",
+    "aaaaaaaaaaaaaaaaaaaaaaaaa&bogus;b",
+    "aaaaaaaaaaaaaaaaaaaaaaaaa&plain"
+   ],
+   "body": "flowchart TD\n  E0 -->|\"aaaaaaaaaaaaaa&bogus;b\"| F0\n  E1 -->|\"aaaaaaaaaaaaaa&plain\"| F1\n  E2 -->|\"aaaaaaaaaaaaaaa&bogus;b\"| F2\n  E3 -->|\"aaaaaaaaaaaaaaa&plain\"| F3\n  E4 -->|\"aaaaaaaaaaaaaaaa&bogus;b\"| F4\n  E5 -->|\"aaaaaaaaaaaaaaaa&plain\"| F5\n  E6 -->|\"aaaaaaaaaaaaaaaaa&bogus;b\"| F6\n  E7 -->|\"aaaaaaaaaaaaaaaaa&plain\"| F7\n  E8 -->|\"aaaaaaaaaaaaaaaaaa&bogus;b\"| F8\n  E9 -->|\"aaaaaaaaaaaaaaaaaa&plain\"| F9\n  E10 -->|\"aaaaaaaaaaaaaaaaaaa&bogus;b\"| F10\n  E11 -->|\"aaaaaaaaaaaaaaaaaaa&plain\"| F11\n  E12 -->|\"aaaaaaaaaaaaaaaaaaaa&bogus;b\"| F12\n  E13 -->|\"aaaaaaaaaaaaaaaaaaaa&plain\"| F13\n  E14 -->|\"aaaaaaaaaaaaaaaaaaaaa&bogus;b\"| F14\n  E15 -->|\"aaaaaaaaaaaaaaaaaaaaa&plain\"| F15\n  E16 -->|\"aaaaaaaaaaaaaaaaaaaaaa&bogus;b\"| F16\n  E17 -->|\"aaaaaaaaaaaaaaaaaaaaaa&plain\"| F17\n  E18 -->|\"aaaaaaaaaaaaaaaaaaaaaaa&bogus;b\"| F18\n  E19 -->|\"aaaaaaaaaaaaaaaaaaaaaaa&plain\"| F19\n  E20 -->|\"aaaaaaaaaaaaaaaaaaaaaaaa&bogus;b\"| F20\n  E21 -->|\"aaaaaaaaaaaaaaaaaaaaaaaa&plain\"| F21\n  E22 -->|\"aaaaaaaaaaaaaaaaaaaaaaaaa&bogus;b\"| F22\n  E23 -->|\"aaaaaaaaaaaaaaaaaaaaaaaaa&plain\"| F23"
+  }
  ]
 }

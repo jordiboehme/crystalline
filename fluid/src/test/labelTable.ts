@@ -193,3 +193,35 @@ export const HAND_WRITTEN_LABELS: readonly string[] = [
   "#35;",
   "#92;",
 ];
+
+/** How many characters come before the form, so that a row ends at every place in it. */
+const WRAP_POINTS = [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
+
+/**
+ * Texts `edgeLabel` writes on a plain arrow label, drawn in a browser (R59). Mermaid
+ * wraps an arrow's long word by its measured width, which can split a form.
+ */
+export const EDGE_LABEL_TEXTS: readonly string[] = [
+  'a"a"a"a"a',
+  'a"a"a"a"a"a"a"a"a"a"a"a',
+  "#a;#b;#c;#d;#e;#f;#g;#h;",
+  "x\\y\\z\\x\\y\\z\\x\\y\\z",
+  'see "this" and "that" as well',
+  ...WRAP_POINTS.map((n) => `${"a".repeat(n)}"b`),
+];
+
+/** Texts `edgeLabel` writes on a markdown arrow label, where more marks are forms. */
+export const EDGE_MARKDOWN_TEXTS: readonly string[] = [
+  "~~s~~",
+  "a:a:a:a:a",
+  "a:a:a:a:a:a:a:a:a:a:a:a",
+  ...WRAP_POINTS.map((n) => `${"a".repeat(n)}:b`),
+];
+
+/**
+ * Arrow labels written by hand, each drawn as written: a row that ends in `&` with
+ * no form to finish must not be touched, wherever the wrap falls.
+ */
+export const EDGE_HAND_WRITTEN_LABELS: readonly string[] = WRAP_POINTS.flatMap(
+  (n) => [`${"a".repeat(n)}&bogus;b`, `${"a".repeat(n)}&plain`],
+);

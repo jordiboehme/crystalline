@@ -8,6 +8,9 @@ import { describe, expect, test } from "vitest";
 import { STATUS_COLOURS } from "../../../markdown/directives";
 import { onlyEditedBytes, untouchedLinesEqual } from "../../../test/fidelity";
 import {
+  EDGE_HAND_WRITTEN_LABELS,
+  EDGE_LABEL_TEXTS,
+  EDGE_MARKDOWN_TEXTS,
   HAND_WRITTEN_LABELS,
   LABEL_HOLDERS,
   LABEL_TEXTS,
@@ -641,7 +644,42 @@ describe("the table the browser draws", () => {
       label,
       shown: decodeLabel(`"${label}"`, true),
     }));
-    return `${JSON.stringify({ drawn: texts.map(tidyLabel), markup, bodies, handWritten }, null, 1)}\n`;
+    /** Each text through `edgeLabel` on one arrow per text. */
+    const arrowBody = (texts: readonly string[], old: string): string => {
+      let body = "flowchart TD";
+      texts.forEach((_, i) => {
+        body += `\n  E${String(i)} -->|${old}| F${String(i)}`;
+      });
+      texts.forEach((text, i) => {
+        const result = compileFlowOp(parseFlowchart(body), {
+          op: "edgeLabel",
+          edge: { start: `E${String(i)}`, end: `F${String(i)}`, occurrence: 0 },
+          text,
+        });
+        if ("refused" in result) {
+          throw new Error(`refused ${JSON.stringify(text)}`);
+        }
+        body = applyEdits(body, result.edits);
+      });
+      return body;
+    };
+    const arrows = [
+      { texts: EDGE_LABEL_TEXTS, body: arrowBody(EDGE_LABEL_TEXTS, "old") },
+      {
+        texts: EDGE_MARKDOWN_TEXTS,
+        body: arrowBody(EDGE_MARKDOWN_TEXTS, '"`old`"'),
+      },
+      {
+        texts: EDGE_HAND_WRITTEN_LABELS,
+        body: [
+          "flowchart TD",
+          ...EDGE_HAND_WRITTEN_LABELS.map(
+            (label, i) => `  E${String(i)} -->|"${label}"| F${String(i)}`,
+          ),
+        ].join("\n"),
+      },
+    ];
+    return `${JSON.stringify({ drawn: texts.map(tidyLabel), markup, bodies, handWritten, arrows }, null, 1)}\n`;
   }
 
   test("is what the op writes today", { timeout: TIMEOUT }, () => {
@@ -1670,6 +1708,65 @@ const EXPECTED_REMOVAL_REFUSALS: Readonly<Record<string, number>> = {
   "reverse group": 19,
 };
 
+/** Every refusal on `REMOVAL_EXTRA`, as `<body>: <what> <code>`. Asserted whole (R28). */
+const EXPECTED_EXTRA_REFUSALS: readonly string[] = [
+  "a shared class line: A>B#0 reverse chain",
+  "a shared class line: B>C#0 reverse chain",
+  "a shared click line: A>B#0 reverse chain",
+  "a shared click line: B>C#0 reverse chain",
+  "an id on a group: B deleteNode invalid",
+  "an id on a group: C deleteNode invalid",
+  "an id on a group: A>C#0 deleteEdge group",
+  "an id on a group: A>C#0 label group",
+  "an id on a group: A>C#0 noLabel group",
+  "an id on a group: A>C#0 lineStyle solid group",
+  "an id on a group: A>C#0 lineStyle dotted group",
+  "an id on a group: A>C#0 lineStyle thick group",
+  "an id on a group: A>C#0 arrowhead arrow group",
+  "an id on a group: A>C#0 arrowhead none group",
+  "an id on a group: A>C#0 arrowhead both group",
+  "an id on a group: A>C#0 reverse group",
+  "an id on a group: A>D#0 deleteEdge group",
+  "an id on a group: A>D#0 label group",
+  "an id on a group: A>D#0 noLabel group",
+  "an id on a group: A>D#0 lineStyle solid group",
+  "an id on a group: A>D#0 lineStyle dotted group",
+  "an id on a group: A>D#0 lineStyle thick group",
+  "an id on a group: A>D#0 arrowhead arrow group",
+  "an id on a group: A>D#0 arrowhead none group",
+  "an id on a group: A>D#0 arrowhead both group",
+  "an id on a group: A>D#0 reverse group",
+  "an id on a group: B>C#0 deleteEdge group",
+  "an id on a group: B>C#0 label group",
+  "an id on a group: B>C#0 noLabel group",
+  "an id on a group: B>C#0 lineStyle solid group",
+  "an id on a group: B>C#0 lineStyle dotted group",
+  "an id on a group: B>C#0 lineStyle thick group",
+  "an id on a group: B>C#0 arrowhead arrow group",
+  "an id on a group: B>C#0 arrowhead none group",
+  "an id on a group: B>C#0 arrowhead both group",
+  "an id on a group: B>C#0 reverse group",
+  "an id on a group: B>D#0 deleteEdge group",
+  "an id on a group: B>D#0 label group",
+  "an id on a group: B>D#0 noLabel group",
+  "an id on a group: B>D#0 lineStyle solid group",
+  "an id on a group: B>D#0 lineStyle dotted group",
+  "an id on a group: B>D#0 lineStyle thick group",
+  "an id on a group: B>D#0 arrowhead arrow group",
+  "an id on a group: B>D#0 arrowhead none group",
+  "an id on a group: B>D#0 arrowhead both group",
+  "an id on a group: B>D#0 reverse group",
+  "every arrow kind: A>B#6 arrowhead arrow unsupported",
+  "every arrow kind: A>B#6 arrowhead both unsupported",
+  "every label form: A>B#9 arrowhead arrow unsupported",
+  "every label form: A>B#9 arrowhead both unsupported",
+  "tight ids with o and x: A>xray#0 arrowhead none invalid",
+  "tight ids with o and x: B>oauth#0 arrowhead none invalid",
+  "tight ids with o and x: C>xo#0 arrowhead none invalid",
+  "tight ids with o and x: xray>x#0 arrowhead none invalid",
+  "tight ids with o and x: xray>x#0 reverse invalid",
+];
+
 function refusalCounts(refusals: readonly string[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const refusal of refusals) {
@@ -1735,6 +1832,19 @@ describe("every removal and arrow op, on the corpus", () => {
       const tally = await removalTallyOf(`extra ${name}`, body);
       expect(tally.failures).toEqual([]);
       expect(tally.applied.deleteNode).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the refusals over the extra bodies are these (R28)",
+    async () => {
+      const refused: string[] = [];
+      for (const [name, body] of REMOVAL_EXTRA) {
+        const tally = await removalTallyOf(`extra ${name}`, body);
+        refused.push(...tally.refused.map((r) => `${name}: ${r}`));
+      }
+      expect(refused).toEqual(EXPECTED_EXTRA_REFUSALS);
     },
     TIMEOUT,
   );

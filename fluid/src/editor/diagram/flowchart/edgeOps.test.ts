@@ -12,6 +12,7 @@ import {
 import { flowDbFor } from "../../../test/mermaidOracle";
 import { docText, lineSeparatorFor } from "../../setup";
 import { applyEdits, toChanges } from "../edits";
+import { flowDbOf } from "../mermaidDb";
 import { agreesFlow } from "../verdict";
 import { decodeLabel, tidyLabel } from "./labels";
 import { parseFlowchart } from "./parse";
@@ -451,6 +452,24 @@ describe("reverse", () => {
         edge: { start: "xray", end: "A", occurrence: 0 },
       }),
     ).toBe("invalid");
+  });
+
+  test("a @{ } box cannot go in front of an arrow id with a space, mermaid refuses that", async () => {
+    const key = { start: "B", end: "A", occurrence: 0 };
+    const op: FlowOp = { op: "reverse", edge: key };
+    expect(refusal('B e1@--> A@{ shape: diam, label: "x" }', op)).toBe(
+      "invalid",
+    );
+    expect(
+      await flowDbOf(
+        'flowchart TD\n  A@{ shape: diam, label: "x" } e1@--> B',
+        false,
+      ),
+    ).toHaveProperty("error");
+    // No id, no problem, and the box's bytes stay.
+    expect(on('B --> A@{ shape: diam, label: "x" }', op)).toBe(
+      'A@{ shape: diam, label: "x" } --> B',
+    );
   });
 
   test("the linkStyle stays on the arrow", async () => {

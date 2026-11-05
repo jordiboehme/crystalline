@@ -795,6 +795,8 @@ class ChainReader {
   private readonly line: number;
   private i = 0;
   private linkIdTable: Int32Array | null = null;
+  /** The last ref read has `@{ }` shape data. */
+  private afterShapeData = false;
 
   constructor(body: string, span: Span, statement: number, line: number) {
     this.text = body.slice(span.from, span.to);
@@ -936,6 +938,7 @@ class ChainReader {
       };
       this.i += 3 + name[0].length;
     }
+    this.afterShapeData = shape?.form === "at";
     return {
       id,
       idSpan,
@@ -1117,6 +1120,12 @@ class ChainReader {
       }
       const idEnd = this.linkIdEnd(start);
       if (idEnd !== -1) {
+        // Mermaid's lexer takes the space after shape data as its own token and
+        // then refuses the id (`Expecting 'AMP', got 'LINK_ID'`). Written tight
+        // it reads, and so does a space after any other kind of box.
+        if (this.afterShapeData && start > this.i) {
+          refuse("an arrow id after a space after @{ } shape data.");
+        }
         const name = text.slice(start, idEnd - 1);
         if (!PLAIN_ID.test(name)) {
           refuse(`the arrow id ${name} is not one it knows.`);
