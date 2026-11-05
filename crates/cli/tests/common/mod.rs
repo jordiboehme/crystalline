@@ -396,6 +396,9 @@ pub fn stop_processes_under(dir: &Path, within: std::time::Duration) -> Stopped 
 #[cfg(unix)]
 fn kill_hard(pid: u32) {
     if pid > 1 && pid != std::process::id() {
+        // SAFETY: `kill` only sends a signal. The pid was found under a
+        // test's own folder or in its owner record a moment ago, and 0, 1 and
+        // this process are refused above.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
@@ -434,38 +437,48 @@ pub struct Leftovers(pub PathBuf);
 
 #[cfg(unix)]
 impl Leftovers {
-    pub fn stop_now(&self) {
-        let Stopped {
-            found,
-            left,
-            scanned,
-        } = stop_processes_under(&self.0, std::time::Duration::from_secs(10));
-        for (pid, command) in &found {
-            eprintln!(
-                "note: stopped pid {pid} still running under {}: {command}",
-                self.0.display()
-            );
-        }
-        if !scanned && !std::thread::panicking() {
-            panic!(
-                "could not look for processes under {} (the scan did not run), so only the \
-                 owner record's pid was stopped",
-                self.0.display()
-            );
-        }
-        if !left.is_empty() && !std::thread::panicking() {
-            panic!(
-                "processes still running under {} after the test: {left:?}",
-                self.0.display()
-            );
-        }
+    /// Stop now rather than at the end of the scope. Consumes the guard, so
+    /// its drop does not run the stop a second time.
+    pub fn stop_now(self) {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let dir = std::mem::take(&mut this.0);
+        stop_leftovers(&dir);
     }
 }
 
 #[cfg(unix)]
 impl Drop for Leftovers {
     fn drop(&mut self) {
-        self.stop_now();
+        stop_leftovers(&self.0);
+    }
+}
+
+/// The work of [`Leftovers`]: stop, report and fail as its doc says.
+#[cfg(unix)]
+fn stop_leftovers(dir: &Path) {
+    let Stopped {
+        found,
+        left,
+        scanned,
+    } = stop_processes_under(dir, std::time::Duration::from_secs(10));
+    for (pid, command) in &found {
+        eprintln!(
+            "note: stopped pid {pid} still running under {}: {command}",
+            dir.display()
+        );
+    }
+    if !scanned && !std::thread::panicking() {
+        panic!(
+            "could not look for processes under {} (the scan did not run), so only the \
+             owner record's pid was stopped",
+            dir.display()
+        );
+    }
+    if !left.is_empty() && !std::thread::panicking() {
+        panic!(
+            "processes still running under {} after the test: {left:?}",
+            dir.display()
+        );
     }
 }
 

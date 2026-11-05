@@ -955,6 +955,8 @@ fn a_daemon_exits_cleanly_on_sigterm_and_sigint() {
         env.wait_ready();
 
         let pid = libc::pid_t::try_from(daemon.id()).unwrap();
+        // SAFETY: `kill` only sends a signal; `pid` is this test's own child,
+        // not yet waited for, so the pid cannot name another process.
         assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "{name} was sent");
         let sent = Instant::now();
         let status = loop {
@@ -1019,12 +1021,17 @@ fn an_autostarted_daemon_exits_on_sigterm() {
         }
 
         let pid = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: `kill` only sends a signal. `pid` is the daemon this test's
+        // bridge started a moment ago and published in this test's own
+        // folder, and it is still running, so the pid is not reused yet.
         assert_eq!(
             unsafe { libc::kill(pid, libc::SIGTERM) },
             0,
             "SIGTERM was sent"
         );
         let sent = Instant::now();
+        // SAFETY: signal 0 sends nothing; `kill` only checks that `pid`
+        // still exists.
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(
                 sent.elapsed() < SIGNAL_EXIT_BOUND,
@@ -1045,9 +1052,11 @@ fn an_autostarted_daemon_exits_on_sigterm() {
 
 /// The leak of 2026-11-04 as it happened: `ctl shutdown` while the test's
 /// bridge is still attached. The bridge reconnects and spawns a successor,
-/// which has not published its record when the test ends. `Env`'s drop finds
-/// it by its folder and stops it, so nothing runs under the folder once the
-/// `Env` is gone, whichever moment the test ended in.
+/// which under load has not published its record when the test ends. The
+/// test waits for the successor and then deletes its record, so the drop
+/// meets exactly that state: a kill of the record's pid finds nothing, and
+/// only the folder scan in `Env`'s drop can stop the successor. Nothing may
+/// run under the folder once the `Env` is gone.
 #[test]
 fn a_successor_the_bridge_spawns_at_the_end_of_a_test_is_stopped_with_it() {
     let dir;
@@ -1072,8 +1081,14 @@ fn a_successor_the_bridge_spawns_at_the_end_of_a_test_is_stopped_with_it() {
             std::thread::sleep(Duration::from_millis(20));
         }
         drop(client);
+        // As if the successor had not published yet: no record names it.
+        std::fs::remove_file(env.info_path()).unwrap();
     }
     let left = crate::common::processes_under(&dir).expect("the process scan runs");
+    if !left.is_empty() {
+        // Stop the successor before failing, so a failing run leaves nothing.
+        let _ = crate::common::stop_processes_under(&dir, Duration::from_secs(10));
+    }
     assert!(
         left.is_empty(),
         "still running under {}: {left:?}",
