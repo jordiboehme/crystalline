@@ -1,11 +1,11 @@
 /**
  * Flowchart ops compiled to minimal text edits: an op changes only the bytes
  * it means, every other line stays as written, and when that cannot be
- * promised it refuses.
+ * promised it refuses. Removals are in `remove.ts`, the arrow ops in `edgeOps.ts`.
  *
- * Every compile checks itself before it answers: the edits are applied, the
- * result is parsed again, and it must be understood and differ from the model
- * in exactly the field the op names. A shape change that would turn `A(/x/)`
+ * Every compile checks itself before it answers (`checked.ts`): the edits are
+ * applied, the result is parsed again, and it must be understood and differ from
+ * the model in exactly the field the op names. A shape change that would turn `A(/x/)`
  * into the lean shape `A[/x/]`, or a rename that would put a `direction LR` in
  * a line (R7), comes back `invalid` here, before mermaid is asked. The apply
  * layer then asks mermaid's db as well.
@@ -13,37 +13,40 @@
  * Spans are read from `model.body`, the string they point into.
  */
 
+import type { OpResult, Span, TextEdit } from "../edits";
 import {
-  type OpResult,
-  type RefusalCode,
-  type Span,
-  type TextEdit,
-  applyEdits,
-  sortedEdits,
-} from "../edits";
-import { droppedSemicolons } from "../scan";
-import { classesOf, stylesOf } from "../verdict";
+  COLOUR_KEYS,
+  type Wanted,
+  arrowRows,
+  checked,
+  readDirection,
+  refused,
+  shownLabel,
+  subgraphRows,
+} from "./checked";
+import { arrowhead, edgeLabel, lineStyle, reverse } from "./edgeOps";
 import {
   COLOUR_PRESETS,
   cannotDraw,
   type ColourPreset,
   SHAPES,
-  decodeLabel,
   encodeAtLabel,
   encodeLabel,
   encodeMarkdownLabel,
   tidyLabel,
 } from "./labels";
-import {
-  type DirectiveLine,
-  type EdgeKey,
-  type FlowModel,
-  type FlowNode,
-  type Shape,
-  type ShapeName,
+import type {
+  DirectiveLine,
+  EdgeKey,
+  FlowModel,
+  FlowNode,
+  Shape,
+  ShapeName,
 } from "./model";
 import { lineDeletions, shiftLinkStyles } from "./linkStyle";
-import { parseFlowchart } from "./parse";
+import { deleteEdge, deleteNode } from "./remove";
+
+export { checked } from "./checked";
 
 export type FlowOp =
   | { op: "rename"; id: string; text: string }
@@ -61,225 +64,8 @@ export type FlowOp =
   | { op: "arrowhead"; edge: EdgeKey; head: "arrow" | "none" | "both" }
   | { op: "reverse"; edge: EdgeKey };
 
-const refused = (code: RefusalCode): OpResult => ({ refused: code });
-
-const COLOUR_KEYS = ["fill", "stroke", "color"] as const;
-
 function isColourKey(key: string): boolean {
   return (COLOUR_KEYS as readonly string[]).includes(key.toLowerCase());
-}
-
-/** The direction a header value reads as: `TD`, `v` and none are `TB`. */
-function readDirection(value: string | undefined): string {
-  return value === undefined
-    ? "TB"
-    : ({ TD: "TB", v: "TB", ">": "LR", "<": "RL", "^": "BT" }[value] ?? value);
-}
-
-/** The text of a label as written, as the rename field shows it. */
-function shownLabel(body: string, shape: Shape): string {
-  return decodeLabel(
-    body.slice(shape.label.from, shape.label.to),
-    shape.quoted,
-  );
-}
-
-/** What the shape field of a box reads: its name, or the `@{ }` name as written. */
-function shownShape(body: string, node: FlowNode): string {
-  const shape = node.defining?.shape;
-  if (!shape) {
-    return "";
-  }
-  return shape.atShape
-    ? `at:${body.slice(shape.atShape.from, shape.atShape.to)}`
-    : `${shape.name}`;
-}
-
-/** The fill, stroke and color a box draws with: the last value of each, as CSS reads them. */
-function coloursOf(styles: readonly string[]): (string | null)[] {
-  return COLOUR_KEYS.map((key) => {
-    const entry = styles.findLast(
-      (s) => s.slice(0, s.indexOf(":")).trim().toLowerCase() === key,
-    );
-    return entry === undefined
-      ? null
-      : entry.slice(entry.indexOf(":") + 1).trim();
-  });
-}
-
-/** One row of the `arrows` field per edge, what a reading of the arrow must keep. */
-function arrowRows(model: FlowModel): unknown[][] {
-  const body = model.body;
-  return model.edges.map((edge) => {
-    const arrow = model.chains[edge.chain]?.links[edge.link]?.arrow;
-    return [
-      edge.start,
-      edge.end,
-      edge.mermaidId,
-      arrow?.line,
-      arrow?.start,
-      arrow?.end,
-      arrow?.length,
-      arrow?.label ? body.slice(arrow.label.from, arrow.label.to) : null,
-    ];
-  });
-}
-
-/** The `subgraphs` field, with `added` as one more member of the subgraph `into`. */
-function subgraphRows(
-  model: FlowModel,
-  into: string | null = null,
-  added = "",
-): string {
-  return JSON.stringify(
-    model.subgraphs.map((s) => [
-      s.id,
-      s.parent,
-      (s.id === into ? [...s.members, added] : [...s.members]).sort(),
-    ]),
-  );
-}
-
-/** Which arrow each `linkStyle` index means, line by line. */
-function linkStyleRows(model: FlowModel): unknown[] {
-  return model.directives
-    .filter((d) => d.kind === "linkStyle")
-    .map((d) =>
-      d.indices.map(({ n }) => {
-        const edge = model.edges[n];
-        return [edge?.start, edge?.end, edge?.occurrence];
-      }),
-    );
-}
-
-/**
- * The model as named fields, the same parts `agreesFlow` compares, so that two
- * models can be compared field by field.
- */
-function fieldsOf(model: FlowModel): Map<string, string> {
-  const body = model.body;
-  const styles = stylesOf(model);
-  const classes = classesOf(model);
-  const fields = new Map<string, string>([
-    ["direction", readDirection(model.direction?.value)],
-    ["boxes", JSON.stringify(model.nodeOrder)],
-    ["arrows", JSON.stringify(arrowRows(model))],
-    ["subgraphs", subgraphRows(model)],
-    ["linkStyles", JSON.stringify(linkStyleRows(model))],
-  ]);
-  for (const [id, node] of model.nodes) {
-    const shape = node.defining?.shape ?? null;
-    fields.set(`${id} label`, shape ? shownLabel(body, shape) : id);
-    fields.set(`${id} markdown`, String(shape?.markdown ?? false));
-    fields.set(`${id} shape`, shownShape(body, node));
-    fields.set(`${id} styles`, JSON.stringify(styles.get(id) ?? []));
-    fields.set(
-      `${id} colours`,
-      JSON.stringify(coloursOf(styles.get(id) ?? [])),
-    );
-    fields.set(`${id} classes`, JSON.stringify(classes.get(id) ?? []));
-  }
-  return fields;
-}
-
-/** The offsets of the `;`s mermaid's `encodeEntities` drops from `model`, with the end of each one's line. */
-function droppedIn(model: FlowModel): { at: number; lineEnd: number }[] {
-  const out: { at: number; lineEnd: number }[] = [];
-  for (const line of model.scan.lines) {
-    if (
-      line.kind === "statement" ||
-      line.kind === "header" ||
-      line.kind === "acc"
-    ) {
-      const text = model.body.slice(line.from, line.to);
-      for (const i of droppedSemicolons(text)) {
-        out.push({ at: line.from + i, lineEnd: line.to });
-      }
-    }
-  }
-  return out;
-}
-
-/** Where `at` of the edited text was before `edits`, null inside an inserted text. */
-function beforeEdits(edits: readonly TextEdit[], at: number): number | null {
-  let shift = 0;
-  for (const edit of sortedEdits(edits, Number.MAX_SAFE_INTEGER)) {
-    const from = edit.from + shift;
-    if (at < from) {
-      break;
-    }
-    if (at < from + edit.insert.length) {
-      return null;
-    }
-    shift += edit.insert.length - (edit.to - edit.from);
-  }
-  return at - shift;
-}
-
-/**
- * Whether the edited text makes mermaid drop a `;` the body kept, with more
- * than space after it on the line. Nothing in the source says so and the db
- * shows it only in fields far from the edit: a rename to `style:#b` takes the
- * `;` out of a click URL, a tooltip or a subgraph title on the same line (R9).
- */
-function dropsNewSemicolon(
-  before: FlowModel,
-  after: FlowModel,
-  edits: readonly TextEdit[],
-): boolean {
-  const kept = new Set(droppedIn(before).map((d) => d.at));
-  return droppedIn(after).some(({ at, lineEnd }) => {
-    if (after.body.slice(at + 1, lineEnd).trim() === "") {
-      return false;
-    }
-    const was = beforeEdits(edits, at);
-    return was === null || !kept.has(was);
-  });
-}
-
-/** What a changed field must hold: this value, any value (null), or what this test accepts. */
-type Wanted = string | null | ((value: string) => boolean);
-
-function holds(wanted: Wanted, value: string): boolean {
-  return typeof wanted === "function"
-    ? wanted(value)
-    : wanted === null || wanted === value;
-}
-
-/**
- * `edits`, when applying them leaves a body that is understood and differs from
- * `model` only in the fields `changes` names, each then holding what is named
- * there. A field that was not there before must be named, and no field may go.
- * Otherwise `invalid`.
- */
-export function checked(
-  model: FlowModel,
-  edits: TextEdit[],
-  changes: Readonly<Record<string, Wanted>>,
-): OpResult {
-  if (edits.length === 0) {
-    return { edits };
-  }
-  const after = parseFlowchart(applyEdits(model.body, edits));
-  if (!after.understood || dropsNewSemicolon(model, after, edits)) {
-    return refused("invalid");
-  }
-  const before = fieldsOf(model);
-  const now = fieldsOf(after);
-  for (const field of before.keys()) {
-    if (!now.has(field)) {
-      return refused("invalid");
-    }
-  }
-  for (const [field, value] of now) {
-    const wanted = changes[field];
-    if (
-      wanted === undefined ? before.get(field) !== value : !holds(wanted, value)
-    ) {
-      return refused("invalid");
-    }
-  }
-  return { edits };
 }
 
 /** The label to write for `text` in a place that holds `shape`. */
@@ -393,7 +179,29 @@ function changeShape(
   );
 }
 
-/** Where a new `style` line for `node` goes, as the end of the line it follows. */
+/**
+ * The edit that adds `text` as a new line after line `index`. It goes in front of
+ * the next line and brings its own break, so in a document with both line breaks
+ * every old break stays on its own line (R51). Only a last line with no break
+ * gets one put after it.
+ */
+function newLineAfter(
+  model: FlowModel,
+  index: number,
+  text: string,
+): TextEdit | null {
+  const lines = model.scan.lines;
+  const line = lines[index];
+  if (line === undefined) {
+    return null;
+  }
+  const next = lines[index + 1];
+  return next
+    ? { from: next.from, to: next.from, insert: `${text}\n` }
+    : { from: line.to, to: line.to, insert: `\n${text}` };
+}
+
+/** The line a new `style` line for `node` follows. */
 function styleLineAnchor(model: FlowModel, node: FlowNode): number {
   const lines = model.scan.lines;
   const firstRef = node.refs[0]?.line ?? -1;
@@ -408,7 +216,7 @@ function styleLineAnchor(model: FlowModel, node: FlowNode): number {
   if (anchor < firstRef || anchor < 0) {
     anchor = lines.findLastIndex((line) => line.kind !== "blank");
   }
-  return lines[anchor]?.to ?? model.body.length;
+  return anchor;
 }
 
 function setColour(
@@ -426,16 +234,19 @@ function setColour(
     const indent =
       model.scan.lines.find((line) => line.kind === "statement")?.indent ??
       "    ";
-    const at = styleLineAnchor(model, node);
     const line = `style ${node.id} fill:${preset.fill},stroke:${preset.stroke},color:${preset.color}`;
-    return checked(
+    const edit = newLineAfter(
       model,
-      [{ from: at, to: at, insert: `\n${indent}${line}` }],
-      {
-        [field]: null,
-        [colours]: landed,
-      },
+      styleLineAnchor(model, node),
+      `${indent}${line}`,
     );
+    if (edit === null) {
+      return refused("invalid");
+    }
+    return checked(model, [edit], {
+      [field]: null,
+      [colours]: landed,
+    });
   }
   const edits: TextEdit[] = [];
   let appended = "";
@@ -570,14 +381,8 @@ export function newNodeId(model: FlowModel): string {
   const taken = new Set<string>([
     ...ids,
     ...model.subgraphs.map((s) => s.id),
+    // An explicit arrow id is here too, a repeated one through its first use.
     ...model.edges.map((e) => e.mermaidId),
-    ...model.chains.flatMap((chain) =>
-      chain.links.flatMap(({ arrow }) =>
-        arrow.idSpan
-          ? [model.body.slice(arrow.idSpan.from, arrow.idSpan.to)]
-          : [],
-      ),
-    ),
     ...model.directives.flatMap((d) =>
       d.kind === "classDef" ? [] : d.targets.map((t) => t.id),
     ),
@@ -747,17 +552,15 @@ function insertLine(
   text: string,
   { box, edge }: Addition,
 ): OpResult {
-  const line = model.scan.lines[place.line];
-  if (line === undefined) {
+  const edit = newLineAfter(
+    model,
+    place.line,
+    `${indentFor(model, place)}${text}`,
+  );
+  if (edit === null) {
     return refused("invalid");
   }
-  const edits: TextEdit[] = [
-    {
-      from: line.to,
-      to: line.to,
-      insert: `\n${indentFor(model, place)}${text}`,
-    },
-  ];
+  const edits: TextEdit[] = [edit];
   const changes: Record<string, Wanted> = {};
   if (box !== null) {
     Object.assign(changes, newBoxFields(model, box, place.group));
@@ -832,6 +635,15 @@ function addSibling(model: FlowModel, node: FlowNode): OpResult {
  * self-check refuses that, the arrow goes in the nearest subgraph around both.
  */
 function connect(model: FlowModel, from: FlowNode, to: FlowNode): OpResult {
+  // Mermaid's layout gives every loop on a box the same helper nodes, so the
+  // last one replaces the others in the drawing and their style is lost. The db
+  // cannot see this, so no check downstream would.
+  if (
+    from === to &&
+    model.edges.some((e) => e.start === from.id && e.end === from.id)
+  ) {
+    return refused("invalid");
+  }
   const a = placeBy(model, from);
   const b = placeBy(model, to);
   const place = a.line >= b.line ? a : b;
@@ -906,13 +718,20 @@ export function compileFlowOp(model: FlowModel, op: FlowOp): OpResult {
     }
     case "addBox":
       return addBox(model);
-    case "deleteNode":
+    case "deleteNode": {
+      const node = model.nodes.get(op.id);
+      return node === undefined ? refused("gone") : deleteNode(model, node);
+    }
     case "deleteEdge":
+      return deleteEdge(model, op.edge);
     case "edgeLabel":
+      return edgeLabel(model, op.edge, op.text);
     case "lineStyle":
+      return lineStyle(model, op.edge, op.line);
     case "arrowhead":
+      return arrowhead(model, op.edge, op.head);
     case "reverse":
-      return refused("unsupported");
+      return reverse(model, op.edge);
     default: {
       const unknown: never = op;
       return unknown;

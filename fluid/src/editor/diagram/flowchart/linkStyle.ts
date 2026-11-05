@@ -5,7 +5,7 @@
  */
 
 import type { Span, TextEdit } from "../edits";
-import type { DirectiveLine, FlowModel } from "./model";
+import type { FlowModel } from "./model";
 
 /** The ranges that delete whole lines with one line break each. */
 export function lineDeletions(
@@ -33,37 +33,90 @@ export function lineDeletions(
 }
 
 /**
- * The range that takes one statement out of a line that keeps something else:
- * its neighbour's `;` goes too, and no other statement and no accDescr `}` goes
- * with it (R33).
+ * The ranges that take the statements `gone` (by their `from`) out of a line that
+ * keeps something else. Neighbours go as one run, with the `;` beside the run, and
+ * no other statement and no accDescr `}` goes with them (R33).
  */
-function statementDeletion(model: FlowModel, directive: DirectiveLine): Span {
-  const statements = model.scan.lines[directive.line]?.statements ?? [];
-  const at = statements.findIndex((s) => s.from === directive.span.from);
-  const next = statements[at + 1];
-  const previous = statements[at - 1];
-  return next
-    ? { from: directive.span.from, to: next.from }
-    : previous
-      ? { from: previous.to, to: directive.span.to }
-      : directive.span;
+function statementDeletions(
+  statements: readonly Span[],
+  gone: ReadonlySet<number>,
+): Span[] {
+  const out: Span[] = [];
+  for (let i = 0; i < statements.length; i++) {
+    const first = statements[i];
+    if (first === undefined || !gone.has(first.from)) {
+      continue;
+    }
+    let end = i;
+    while (gone.has(statements[end + 1]?.from ?? -1)) {
+      end++;
+    }
+    const last = statements[end] ?? first;
+    const next = statements[end + 1];
+    const previous = statements[i - 1];
+    out.push(
+      next
+        ? { from: first.from, to: next.from }
+        : previous
+          ? { from: previous.to, to: last.to }
+          : { from: first.from, to: last.to },
+    );
+    i = end;
+  }
+  return out;
+}
+
+/** Per line, the `from` of each statement that goes. */
+export type GoneStatements = Map<number, Set<number>>;
+
+/** Marks one statement of a line as going. */
+export function markGone(
+  gone: GoneStatements,
+  line: number,
+  statementFrom: number,
+): void {
+  gone.set(line, (gone.get(line) ?? new Set<number>()).add(statementFrom));
 }
 
 /**
- * Digit edits for every numeric `linkStyle` index `>= at`: each moves by `delta`,
- * and with `removed` by `delta` once per removed index below it, so one call
- * renumbers a removal of several edges. A removed index goes with one adjacent
- * comma. A line whose indices are all removed goes with its line break, and when
- * the line holds anything else only the statement goes. `linkStyle default` has
- * no indices and is never touched.
+ * The ranges that take every statement of `gone` out of the body. A line left
+ * with nothing goes with its line break, through one `lineDeletions` call so that
+ * neighbouring lines cannot overlap. When the line holds anything else, only the
+ * statements go.
  */
-export function shiftLinkStyles(
+export function goneStatementRanges(
+  model: FlowModel,
+  gone: GoneStatements,
+): Span[] {
+  const wholeLines: number[] = [];
+  const parts: Span[] = [];
+  for (const [index, statements] of gone) {
+    const line = model.scan.lines[index];
+    if (
+      line?.kind === "statement" &&
+      line.statements.every((s) => statements.has(s.from))
+    ) {
+      wholeLines.push(index);
+    } else {
+      parts.push(...statementDeletions(line?.statements ?? [], statements));
+    }
+  }
+  return [...lineDeletions(model, wholeLines), ...parts];
+}
+
+/**
+ * The digit edits of `shiftLinkStyles`. A statement whose indices are all removed
+ * is added to `gone` instead, so a caller that removes other statements too can
+ * take them all out in one go.
+ */
+export function shiftedIndices(
   model: FlowModel,
   at: number,
   delta: number,
-  removed?: ReadonlySet<number>,
+  removed: ReadonlySet<number> | undefined,
+  gone: GoneStatements,
 ): TextEdit[] {
-  const gone = removed ?? new Set<number>();
+  const removedIndices = removed ?? new Set<number>();
   const moved = (n: number): number => {
     if (n < at) {
       return n;
@@ -71,22 +124,16 @@ export function shiftLinkStyles(
     if (removed === undefined) {
       return n + delta;
     }
-    return n + delta * [...gone].filter((r) => r < n).length;
+    return n + delta * [...removedIndices].filter((r) => r < n).length;
   };
   const edits: TextEdit[] = [];
-  const wholeLines: number[] = [];
   for (const directive of model.directives) {
     if (directive.kind !== "linkStyle" || directive.indices.length === 0) {
       continue;
     }
     const indices = directive.indices;
-    if (indices.every((index) => gone.has(index.n))) {
-      const line = model.scan.lines[directive.line];
-      if (line?.kind === "statement" && line.statements.length === 1) {
-        wholeLines.push(directive.line);
-      } else {
-        edits.push({ ...statementDeletion(model, directive), insert: "" });
-      }
+    if (indices.every((index) => removedIndices.has(index.n))) {
+      markGone(gone, directive.line, directive.span.from);
       continue;
     }
     for (let i = 0; i < indices.length; i++) {
@@ -94,9 +141,9 @@ export function shiftLinkStyles(
       if (index === undefined) {
         continue;
       }
-      if (gone.has(index.n)) {
+      if (removedIndices.has(index.n)) {
         let last = i;
-        while (gone.has(indices[last + 1]?.n ?? -1)) {
+        while (removedIndices.has(indices[last + 1]?.n ?? -1)) {
           last++;
         }
         const next = indices[last + 1];
@@ -113,9 +160,28 @@ export function shiftLinkStyles(
       }
     }
   }
+  return edits;
+}
+
+/**
+ * Digit edits for every numeric `linkStyle` index `>= at`: each moves by `delta`,
+ * and with `removed` by `delta` once per removed index below it, so one call
+ * renumbers a removal of several edges. A removed index goes with one adjacent
+ * comma. A line left with nothing goes with its line break, and when the line
+ * holds anything else only the statements go. `linkStyle default` has no indices
+ * and is never touched.
+ */
+export function shiftLinkStyles(
+  model: FlowModel,
+  at: number,
+  delta: number,
+  removed?: ReadonlySet<number>,
+): TextEdit[] {
+  const gone: GoneStatements = new Map();
+  const edits = shiftedIndices(model, at, delta, removed, gone);
   return [
     ...edits,
-    ...lineDeletions(model, wholeLines).map((span) => ({
+    ...goneStatementRanges(model, gone).map((span) => ({
       ...span,
       insert: "",
     })),
