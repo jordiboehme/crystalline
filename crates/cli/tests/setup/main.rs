@@ -15,8 +15,15 @@ mod daemon_env;
 mod remote_server;
 
 mod configure;
+// The task seam is read only in debug builds, so a release test build would
+// ask the real Task Scheduler.
+#[cfg(debug_assertions)]
 mod daemon_task;
 mod desktop_bundle;
+// Plants a Claude Desktop package folder, so doctor checks the daemon task on
+// Windows, and one test needs the package seam: both seams are read only in
+// debug builds.
+#[cfg(debug_assertions)]
 mod desktop_state;
 // The update opens the extension: like install_desktop below, only in debug
 // builds, where the open seam is read.

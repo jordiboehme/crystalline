@@ -58,7 +58,11 @@ impl DaemonEnv {
             .env("CRYSTALLINE_SERVICE_HTTP", "false")
             .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
             .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
-            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB);
+            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB)
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            );
     }
 
     /// Start the daemon against this environment's config and wait until it
@@ -163,15 +167,10 @@ impl DaemonEnv {
 impl Drop for DaemonEnv {
     fn drop(&mut self) {
         self.shutdown();
-        if let Ok(text) = std::fs::read_to_string(self.info_path())
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-            && let Some(pid) = v.get("pid").and_then(Value::as_u64)
-        {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status();
-        }
+        // Whatever the shutdown left: every process under this folder, not
+        // only the pid in the owner record, which misses a daemon that has not
+        // published one yet (see `crate::common::Leftovers`).
+        crate::common::Leftovers(self.dir.clone()).stop_now();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

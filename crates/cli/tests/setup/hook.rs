@@ -43,7 +43,11 @@ fn isolate(cmd: &mut Command, home: &Path) {
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
+        .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
+        .env(
+            crate::common::TEST_PARENT_PID_VAR,
+            crate::common::parent_pid(),
+        );
 }
 
 /// A minimal config file registering one domain, enough to make the hook's

@@ -15,11 +15,18 @@ mod daemon_env;
 #[cfg(unix)]
 mod automation;
 
+// The package and task seams are read only in debug builds, so a release test
+// build of these would ask the real package check and the real Task Scheduler.
+#[cfg(debug_assertions)]
 mod bridge;
 #[cfg(unix)]
 mod mcp_stub;
+// The same two seams as bridge above.
+#[cfg(debug_assertions)]
 mod packaged;
 #[cfg(unix)]
 mod service;
-#[cfg(windows)]
+// The task seam is read only in debug builds, so a release test build would
+// start the real daemon through the real Task Scheduler.
+#[cfg(all(windows, debug_assertions))]
 mod service_windows;

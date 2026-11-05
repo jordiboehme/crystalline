@@ -2,6 +2,9 @@
 //! `CRYSTALLINE_TEST_DAEMON_TASK`. Windows only: the check runs only there,
 //! and only when the task concerns the machine, which a `Packages\Claude_*`
 //! folder under the isolated `LOCALAPPDATA` makes it do.
+//!
+//! Debug builds only (see `main.rs`): a release binary does not read the task
+//! seam, so `doctor` here would ask the real Task Scheduler.
 #![cfg(windows)]
 
 use std::path::Path;

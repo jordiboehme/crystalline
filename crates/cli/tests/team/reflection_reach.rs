@@ -204,6 +204,9 @@ fn the_embedded_stack_refuses_a_source_fewer_people_may_read() {
 #[test]
 fn a_daemon_with_http_off_refuses_a_source_fewer_people_may_read() {
     let home = workspace();
+    // Stops the daemon below even when an assert fails before `ctl shutdown`.
+    #[cfg(unix)]
+    let _leftovers = crate::common::Leftovers(home.path().to_path_buf());
     let h = home.path();
     let mut daemon = child(h, &["serve", "--http", "off"]);
     let start = Instant::now();
@@ -322,6 +325,9 @@ fn daemon(h: &Path) -> Child {
 #[test]
 fn a_person_is_asked_through_the_bridge_and_their_yes_lands_the_write() {
     let home = workspace();
+    // Stops the daemon below even when an assert fails before `ctl shutdown`.
+    #[cfg(unix)]
+    let _leftovers = crate::common::Leftovers(home.path().to_path_buf());
     let h = home.path();
     let mut serving = daemon(h);
     let (asked, answer) = cite_eliciting(child(h, &["mcp"]), true);
@@ -337,6 +343,9 @@ fn a_person_is_asked_through_the_bridge_and_their_yes_lands_the_write() {
 #[test]
 fn an_unattended_session_through_the_bridge_is_never_asked() {
     let home = workspace();
+    // Stops the daemon below even when an assert fails before `ctl shutdown`.
+    #[cfg(unix)]
+    let _leftovers = crate::common::Leftovers(home.path().to_path_buf());
     let h = home.path();
     let mut serving = daemon(h);
     let (asked, answer) = cite_eliciting(child(h, &["mcp", "--unattended"]), true);

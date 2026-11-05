@@ -5,6 +5,10 @@
 //! (USERPROFILE, APPDATA, LOCALAPPDATA, which etcetera's Windows strategy
 //! reads). It compiles to an empty test binary on every other platform, so the
 //! coverage rides the windows-latest CI leg without touching local runs.
+//!
+//! Debug builds only (see `main.rs`): a release binary does not read the task
+//! seam, so a refused breakaway here would start the real daemon through the
+//! real Task Scheduler.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -68,6 +72,11 @@ impl Env {
             // The model hub is unreachable as well (`crate::common::NO_HUB`),
             // beside the unresolvable provider the config names.
             .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB)
+            // A daemon started here stops once this test process is gone.
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            )
             // A models cache named in the developer's shell must not be
             // reached by `doctor --fix`.
             .env_remove("CRYSTALLINE_MODELS_DIR");
