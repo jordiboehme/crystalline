@@ -100,7 +100,13 @@ impl Env {
             .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
             // No daemon here downloads a model unless the test asked for it
             // (`Env::downloading`); see `crate::common::NO_HUB`.
-            .env(crate::common::HUB_ENDPOINT_VAR, self.hub);
+            .env(crate::common::HUB_ENDPOINT_VAR, self.hub)
+            // A daemon started here stops once this test process is gone,
+            // even when it was killed and ran no drop.
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            );
         if let Some(workers) = self.workers {
             cmd.env("TOKIO_WORKER_THREADS", workers);
         }
@@ -488,8 +494,8 @@ impl Mcp {
     ///
     /// The daemon inherits this process's environment, so a knob the *daemon*
     /// has to see has to be set here, where it is started, and not on the `ctl`
-    /// client that later asks it to do the work. The only user is the rebuild
-    /// hold, below.
+    /// client that later asks it to do the work. The users are the rebuild
+    /// hold, below, and the parent seam test.
     fn spawn_with_env(env: &Env, key: &str, value: &str) -> Mcp {
         Mcp::spawn_configured(env, false, Some((key, value)))
     }
@@ -1138,6 +1144,149 @@ fn the_guard_stops_a_process_that_published_no_record() {
             .expect("the process scan runs")
             .is_empty()
     );
+}
+
+/// A stand-in for a test process: a `sleep` this test started and ends
+/// itself. Its pid is what a daemon under test is told its parent is.
+#[cfg(debug_assertions)]
+struct StandInParent(Child);
+
+#[cfg(debug_assertions)]
+impl StandInParent {
+    fn start() -> StandInParent {
+        StandInParent(
+            Command::new("sleep")
+                .arg("120")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pid(&self) -> String {
+        self.0.id().to_string()
+    }
+
+    /// End it and reap it: an exited child that is not waited for stays a
+    /// zombie, and `kill(pid, 0)` still finds a zombie.
+    fn end(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for StandInParent {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// What a daemon logs when it stops because its test parent is gone.
+#[cfg(debug_assertions)]
+const PARENT_GONE_LINE: &str = "stopping (the test process that started it ended)";
+
+/// A test process killed outright (a nextest timeout) runs no drop, so the
+/// daemon it started is stopped by nobody. With `CRYSTALLINE_TEST_PARENT_PID`
+/// set, a debug daemon checks every second that the process is still there
+/// and stops as it does on `SIGTERM` once it is not. First a daemon started
+/// directly, then one a bridge started, which proves the bridge passes the
+/// variable on. The seam exists only in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+fn a_daemon_stops_once_its_test_parent_is_gone() {
+    // Direct: the daemon is this test's own child, so its exit is read with
+    // `try_wait`.
+    {
+        let env = Env::new("parent-gone");
+        env.setup_domain("eng");
+        let mut parent = StandInParent::start();
+        let stderr_path = env.dir.join("serve.stderr");
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.env(crate::common::TEST_PARENT_PID_VAR, parent.pid());
+        let mut daemon = cmd
+            .args(["serve", "--daemon"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        env.wait_ready();
+        // Two checks pass while the parent is there, and the daemon stays.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "the daemon stopped while its parent was still running:\n{}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+
+        parent.end();
+        let ended = Instant::now();
+        let status = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break Some(status);
+            }
+            if ended.elapsed() > SIGNAL_EXIT_BOUND {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let Some(status) = status else {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!(
+                "the daemon was still running {:?} after its parent ended; its stderr:\n{stderr}",
+                ended.elapsed()
+            );
+        };
+        assert!(status.success(), "a clean exit: {status:?}\n{stderr}");
+        assert!(stderr.contains(PARENT_GONE_LINE), "{stderr}");
+        assert!(!stderr.contains("did not finish in"), "{stderr}");
+        assert!(!env.info_path().exists(), "record removed");
+        assert!(!env.lock_path().exists(), "lock file removed");
+        let left = crate::common::processes_under(&env.dir).expect("the process scan runs");
+        assert!(left.is_empty(), "still running: {left:?}");
+    }
+
+    // Through a bridge: the daemon it autostarts is nobody's child here, so
+    // its exit is read from `kill(pid, 0)`.
+    {
+        let env = Env::new("parent-gone-auto");
+        env.setup_domain("eng");
+        let mut parent = StandInParent::start();
+        let mut client =
+            Mcp::spawn_with_env(&env, crate::common::TEST_PARENT_PID_VAR, &parent.pid());
+        client.initialize();
+        env.wait_ready();
+        let pid = env.lock_pid().expect("the daemon published its pid");
+        // The bridge goes first, or it would reconnect and start a successor.
+        drop(client);
+        let pid = libc::pid_t::try_from(pid).unwrap();
+
+        parent.end();
+        let ended = Instant::now();
+        // SAFETY: signal 0 sends nothing; `kill` only checks that `pid`
+        // still exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                ended.elapsed() < SIGNAL_EXIT_BOUND,
+                "the autostarted daemon (pid {pid}) was still running {:?} after its parent ended:\n{}",
+                ended.elapsed(),
+                env.daemon_lifecycle_lines()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let log = env.daemon_lifecycle_lines();
+        assert!(log.contains(PARENT_GONE_LINE), "{log}");
+        assert!(!log.contains("did not finish in"), "{log}");
+        assert!(!env.info_path().exists(), "record removed");
+        let left = crate::common::processes_under(&env.dir).expect("the process scan runs");
+        assert!(left.is_empty(), "still running: {left:?}");
+    }
 }
 
 /// How long a signalled daemon may take to be gone: the shutdown deadline

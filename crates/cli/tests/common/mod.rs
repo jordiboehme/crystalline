@@ -65,7 +65,10 @@ pub fn fixtures_dir() -> PathBuf {
 /// would fetch the embedding or contradiction model (about 220 MB and 550 MB,
 /// into this test's empty cache) fails the fetch at once and goes on
 /// text-only, as it does offline. See [`NO_HUB`].
-pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 10] {
+///
+/// [`TEST_PARENT_PID_VAR`] names this test process, so a debug daemon any
+/// child starts stops once the test process is gone. See [`parent_pid`].
+pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 11] {
     [
         ("HOME", home.to_path_buf()),
         ("XDG_CONFIG_HOME", home.join("config")),
@@ -77,7 +80,23 @@ pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 10] {
         ("CRYSTALLINE_TEST_NO_KEYCHAIN", PathBuf::from("1")),
         ("CRYSTALLINE_TEST_DAEMON_TASK", PathBuf::from("missing")),
         (HUB_ENDPOINT_VAR, PathBuf::from(NO_HUB)),
+        (TEST_PARENT_PID_VAR, PathBuf::from(parent_pid())),
     ]
+}
+
+/// The debug seam that ties a test daemon to the test process that started
+/// it (`crystalline_service::daemon::TEST_PARENT_PID_ENV`).
+pub const TEST_PARENT_PID_VAR: &str = "CRYSTALLINE_TEST_PARENT_PID";
+
+/// This test process's pid, the value of [`TEST_PARENT_PID_VAR`]. A test's
+/// drop stops the daemons its folder started, but a test process that is
+/// killed outright (a nextest timeout) runs no drop. With this set, a daemon
+/// started by a debug build notices within about a second that the test
+/// process is gone and stops as it does on `SIGTERM`. A bridge passes the
+/// variable on to the daemon it starts, since that daemon inherits its
+/// environment. A release build ignores it.
+pub fn parent_pid() -> String {
+    std::process::id().to_string()
 }
 
 /// The variable the model downloader (hf-hub) reads its hub address from.

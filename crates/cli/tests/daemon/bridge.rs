@@ -1,6 +1,9 @@
 //! The real `crystalline mcp` as a packaged bridge, through the two debug
 //! seams: `CRYSTALLINE_TEST_PACKAGE` says "this process is inside an app
 //! package" and `CRYSTALLINE_TEST_DAEMON_TASK` stands in for Task Scheduler.
+//!
+//! Debug builds only (see `main.rs`): a release binary reads neither seam, so
+//! these tests would ask the real package check and the real Task Scheduler.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

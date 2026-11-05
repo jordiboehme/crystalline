@@ -58,7 +58,11 @@ impl DaemonEnv {
             .env("CRYSTALLINE_SERVICE_HTTP", "false")
             .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
             .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
-            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB);
+            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB)
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            );
     }
 
     /// Start the daemon against this environment's config and wait until it

@@ -144,6 +144,11 @@ pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
 /// a blocking thread instead of loading; see `held_nli_load` in the engine.
 pub const NLI_LOAD_HOLD_ENV: &str = "CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS";
 
+/// The test-only variable naming the test process that started a daemon; a
+/// debug build's daemon stops once that process is gone. See
+/// `test_parent_gone` in the service crate's daemon.
+pub const TEST_PARENT_PID_ENV: &str = "CRYSTALLINE_TEST_PARENT_PID";
+
 /// Variables that live outside the settings registry and are read elsewhere.
 /// They are skipped silently rather than warned about, so a legitimate
 /// deployment does not get a spurious warning for a variable Crystalline
@@ -193,6 +198,10 @@ pub const RESERVED_VARS: &[&str] = &[
     // the same shutdown test family uses to keep a load on a blocking thread
     // while the daemon is asked to stop. Read straight from the environment.
     NLI_LOAD_HOLD_ENV,
+    // The test process a daemon belongs to (`test_parent_gone` in the
+    // service crate's daemon): every test child carries it, so it is
+    // reserved like the two above. Only a debug build reads it.
+    TEST_PARENT_PID_ENV,
     // The install-channel marker (see [`CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the
@@ -1399,6 +1408,7 @@ mod tests {
                 "Claude_1.0.0.0_x64__pzs8sxrjxfjjc",
             ),
             ("CRYSTALLINE_TEST_DAEMON_TASK", "missing"),
+            (TEST_PARENT_PID_ENV, "1"),
         ])
         .unwrap();
         assert!(
@@ -1408,6 +1418,7 @@ mod tests {
         assert!(is_reserved("CRYSTALLINE_ACCELERATION"));
         assert!(is_reserved("CRYSTALLINE_TEST_PACKAGE"));
         assert!(is_reserved("CRYSTALLINE_TEST_DAEMON_TASK"));
+        assert!(is_reserved("CRYSTALLINE_TEST_PARENT_PID"));
     }
 
     #[test]

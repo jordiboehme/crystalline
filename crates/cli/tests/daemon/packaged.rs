@@ -6,6 +6,9 @@
 //! command sends its writes to the daemon or refuses (issue 153). No seam
 //! can simulate the redirection itself; these tests pin that the client
 //! process writes nothing.
+//!
+//! Debug builds only (see `main.rs`): a release binary reads neither seam, so
+//! these tests would ask the real package check and the real Task Scheduler.
 
 use std::collections::BTreeMap;
 use std::io::Read;
