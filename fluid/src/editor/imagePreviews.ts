@@ -61,28 +61,51 @@ const CENTERED: ImageFormat = { align: "center" };
 /** The corners a selected attachment shows a handle on, in drawing order. */
 const CORNERS = ["nw", "ne", "sw", "se"] as const;
 
+/**
+ * The corners a handle is drawn on for a placement. A float's outer edge is
+ * pinned to the column, so a handle there would stay put while the pointer
+ * moved away from it: a float shows the handles of its free edge only, the
+ * two that follow the pointer (M1).
+ */
+function cornersOf(format: ImageFormat): readonly string[] {
+  if (format.align === "right") return ["nw", "sw"];
+  if (format.align === "left") return ["ne", "se"];
+  return CORNERS;
+}
+
 /** The events a widget hands to the editor: a file dragged over or dropped. */
 const DRAG_EVENTS = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
+/** Where each handle of a box goes, in pixels from the box's corner. */
+type HandlePlaces = { handle: HTMLElement; left: number; top: number }[];
+
 /**
- * Puts the handles on the corners of the image's own box. The wrapper can be
- * wider than the image (a centered or floated one), so the corners are read
- * from where the image stands in it. Before the image has a box the handles
- * stay at the wrapper's corners (the stylesheet).
+ * Where the handles go on the corners of the image's own box. The wrapper
+ * can be wider than the image (a centered or floated one), so the corners
+ * are read from where the image stands in it. Null before the image has a
+ * box: the handles stay at the wrapper's corners (the stylesheet). A layout
+ * read: never called from inside CodeMirror's update (M4).
  */
-function placeHandles(box: HTMLElement): void {
+function readHandles(box: HTMLElement): HandlePlaces | null {
   const image = box.querySelector("img");
   if (!image || image.offsetWidth === 0 || image.offsetHeight === 0) {
-    return;
+    return null;
   }
-  for (const handle of box.querySelectorAll<HTMLElement>(
-    ".cm-picture-handle",
-  )) {
-    const corner = handle.dataset["corner"] ?? "";
-    const left =
-      image.offsetLeft + (corner.endsWith("e") ? image.offsetWidth : 0);
-    const top =
-      image.offsetTop + (corner.startsWith("s") ? image.offsetHeight : 0);
+  return [...box.querySelectorAll<HTMLElement>(".cm-picture-handle")].map(
+    (handle) => {
+      const corner = handle.dataset["corner"] ?? "";
+      return {
+        handle,
+        left: image.offsetLeft + (corner.endsWith("e") ? image.offsetWidth : 0),
+        top:
+          image.offsetTop + (corner.startsWith("s") ? image.offsetHeight : 0),
+      };
+    },
+  );
+}
+
+function writeHandles(places: HandlePlaces | null): void {
+  for (const { handle, left, top } of places ?? []) {
     handle.style.left = `${String(left)}px`;
     handle.style.top = `${String(top)}px`;
     handle.style.right = "auto";
@@ -91,8 +114,35 @@ function placeHandles(box: HTMLElement): void {
   }
 }
 
-/** The images whose box the handles already follow. */
-const followed = new WeakSet<HTMLImageElement>();
+/** Puts the handles on the image's corners now, outside an update. */
+function placeHandles(box: HTMLElement): void {
+  writeHandles(readHandles(box));
+}
+
+/** Puts the handles on the image's corners in the view's next measure. */
+function placeHandlesLater(view: EditorView, box: HTMLElement): void {
+  view.requestMeasure({
+    key: box,
+    read: () => readHandles(box),
+    write: writeHandles,
+  });
+}
+
+/** The images whose load already places the handles. */
+const loading = new WeakSet<HTMLImageElement>();
+
+/**
+ * The observer that keeps a selected image's handles on its corners while
+ * its box moves (the column, a resize), let go when it is deselected or
+ * drawn no more (M5).
+ */
+const observers = new WeakMap<HTMLImageElement, ResizeObserver>();
+
+function letGo(image: HTMLImageElement | null): void {
+  if (!image) return;
+  observers.get(image)?.disconnect();
+  observers.delete(image);
+}
 
 /** The widget that last drew each picture element, for `updateDOM`. */
 const drawnBy = new WeakMap<HTMLElement, PictureWidget>();
@@ -153,7 +203,7 @@ class PictureWidget extends WidgetType {
     );
   }
 
-  override toDOM(): HTMLElement {
+  override toDOM(view: EditorView): HTMLElement {
     const box = document.createElement(this.block ? "div" : "span");
     // A drag always starts on the wrapper, never on the image inside it.
     box.setAttribute("draggable", "true");
@@ -170,24 +220,29 @@ class PictureWidget extends WidgetType {
       // is being typed, and a browser's own broken-image glyph tears the line
       // up. The alt text and one quiet sentence instead, in its place.
       image.addEventListener("error", () => {
+        letGo(image);
         image.remove();
         this.fallback(box, UNAVAILABLE);
       });
       box.appendChild(image);
     }
-    this.paint(box);
+    this.paint(box, view);
     drawnBy.set(box, this);
     return box;
   }
 
-  override updateDOM(dom: HTMLElement): boolean {
+  override updateDOM(dom: HTMLElement, view: EditorView): boolean {
     const before = drawnBy.get(dom);
     if (!before?.sameImage(this)) {
       return false;
     }
-    this.paint(dom);
+    this.paint(dom, view);
     drawnBy.set(dom, this);
     return true;
+  }
+
+  override destroy(dom: HTMLElement): void {
+    letGo(dom.querySelector("img"));
   }
 
   /** The alt text and the reason, in the muted caption style, before any handle. */
@@ -206,7 +261,7 @@ class PictureWidget extends WidgetType {
   }
 
   /** The class, the image's placement and the handles, drawn or patched. */
-  paint(box: HTMLElement): void {
+  paint(box: HTMLElement, view: EditorView): void {
     box.className = [
       "cm-image-preview",
       "cm-picture",
@@ -231,14 +286,14 @@ class PictureWidget extends WidgetType {
       }
     }
     if (dragging) {
-      placeHandles(box);
+      placeHandlesLater(view, box);
       return;
     }
     for (const handle of box.querySelectorAll(".cm-picture-handle")) {
       handle.remove();
     }
     if (this.selected && this.kind === "attachment") {
-      for (const corner of CORNERS) {
+      for (const corner of cornersOf(this.format)) {
         const handle = document.createElement("span");
         handle.className = "cm-picture-handle";
         handle.dataset["corner"] = corner;
@@ -246,19 +301,27 @@ class PictureWidget extends WidgetType {
         handle.setAttribute("draggable", "false");
         box.appendChild(handle);
       }
-      placeHandles(box);
-      if (image && !followed.has(image)) {
-        // The image's box moves with its load, the column and a resize.
-        followed.add(image);
+      placeHandlesLater(view, box);
+      // The image's box moves with its load, the column and a resize.
+      if (image && !loading.has(image)) {
+        loading.add(image);
         image.addEventListener("load", () => {
           placeHandles(box);
         });
-        if (typeof ResizeObserver !== "undefined") {
-          new ResizeObserver(() => {
-            placeHandles(box);
-          }).observe(image);
-        }
       }
+      if (
+        image &&
+        !observers.has(image) &&
+        typeof ResizeObserver !== "undefined"
+      ) {
+        const observer = new ResizeObserver(() => {
+          placeHandles(box);
+        });
+        observer.observe(image);
+        observers.set(image, observer);
+      }
+    } else {
+      letGo(image);
     }
   }
 
@@ -284,10 +347,27 @@ interface Drawn {
   inline: DecorationSet;
 }
 
+/**
+ * The line of a picture floated left or right (P44). The float is contained
+ * in its line (`display: flow-root`), so the text after it continues below
+ * the picture: a float that overflowed its line would reflow the text beside
+ * it as soon as CodeMirror drops that line from the viewport. The reading
+ * page keeps wrapping; `imageStyle` is the same for both.
+ */
+const FLOAT_LINE = Decoration.line({ class: "cm-picture-float-line" });
+
+/** Whether `ref` is drawn floated: an attachment set left or right. */
+function floated(ref: PictureRef): boolean {
+  const align = ref.format?.align;
+  return ref.kind === "attachment" && (align === "left" || align === "right");
+}
+
 function decorate(state: EditorState, refs: readonly PictureRef[]): Drawn {
   const selected = selectedPicture(state);
   const all: Range<Decoration>[] = [];
   const inline: Range<Decoration>[] = [];
+  /** The lines already holding a float. */
+  const floatLines = new Set<number>();
   for (const ref of refs) {
     const alt = altDisplay(state.doc.sliceString(ref.altFrom, ref.altTo));
     const chosen = selected?.from === ref.from && selected.to === ref.to;
@@ -298,6 +378,11 @@ function decorate(state: EditorState, refs: readonly PictureRef[]): Drawn {
       }).range(ref.from, ref.to);
       all.push(range);
       inline.push(range);
+      const line = state.doc.lineAt(ref.from);
+      if (floated(ref) && !floatLines.has(line.from)) {
+        floatLines.add(line.from);
+        all.push(FLOAT_LINE.range(line.from));
+      }
     } else {
       // The edited line shows its source; the picture goes under the line.
       all.push(
@@ -429,7 +514,7 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         this.pending = {
           from: ref.from,
           to: ref.to,
-          text: this.view.state.sliceDoc(ref.from, ref.to),
+          text: this.view.state.doc.sliceString(ref.from, ref.to),
         };
       };
 
@@ -445,7 +530,7 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
         if (
           now?.from !== ref.from ||
           now.to !== ref.to ||
-          this.view.state.sliceDoc(now.from, now.to) !== ref.text
+          this.view.state.doc.sliceString(now.from, now.to) !== ref.text
         ) {
           return;
         }
@@ -512,10 +597,12 @@ function pointerPlugin(field: StateField<Drawn>): Extension {
  */
 const previewTheme = EditorView.baseTheme({
   ".cm-picture": { position: "relative" },
+  // Both hold a floated image (P44): the text after it continues below it.
   ".cm-image-preview.cm-picture-block": {
-    display: "block",
+    display: "flow-root",
     padding: "0.5rem 0.75rem",
   },
+  ".cm-line.cm-picture-float-line": { display: "flow-root" },
   ".cm-picture-alt": { marginRight: "0.5em" },
   ".cm-picture-selected > img, .cm-picture-selected > .cm-image-error": {
     outline: "2px solid var(--color-accent-600)",

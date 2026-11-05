@@ -379,6 +379,67 @@ describe("what the delete check and the format commands read at a drawn picture"
   });
 });
 
+/**
+ * A format key or button on a selected picture writes nothing (I3): the
+ * picture's alt text is hidden behind it, so marks written there would be a
+ * change nobody saw, and asterisks in the alt a screen reader reads out.
+ */
+describe.each(
+  (["hidden", "show"] as const).flatMap((mode) =>
+    [false, true].map((room) => ({ mode, room })),
+  ),
+)(
+  "a format on a selected picture, $mode mode, room $room",
+  ({ mode, room }) => {
+    const PIC = "![x](assets/a.png)";
+    // The caret starts on the last line, so in show mode the picture is drawn
+    // in place when it is selected (one selected under its edited line shows
+    // its source, and formats as any text the person sees).
+    it.each([
+      `*a ${PIC}* z\n\nend`,
+      `**a ${PIC}** z\n\nend`,
+      `~~a ${PIC}~~ z\n\nend`,
+      `a ${PIC} z\n\nend`,
+    ])("%j keeps its bytes and its selection", (text) => {
+      for (const format of ["strong", "em", "strike", "code"] as const) {
+        const view = drawn(text, { mode, room });
+        setCaret(view, text.length);
+        const from = text.indexOf("![");
+        const range = EditorSelection.range(from, from + PIC.length);
+        view.dispatch({ selection: range });
+        expect(toggleFormat(view, format)).toBe(true);
+        expect(bytes(view.state)).toBe(text);
+        expect(view.state.selection.main.from).toBe(range.from);
+        expect(view.state.selection.main.to).toBe(range.to);
+      }
+      for (const key of ["Mod-b", "Mod-i"]) {
+        const view = drawn(text, { mode, room });
+        setCaret(view, text.length);
+        const from = text.indexOf("![");
+        view.dispatch({
+          selection: EditorSelection.range(from, from + PIC.length),
+        });
+        keys(view, key);
+        expect(bytes(view.state)).toBe(text);
+        expect(view.state.selection.main.from).toBe(from);
+        expect(view.state.selection.main.to).toBe(from + PIC.length);
+      }
+    });
+  },
+);
+
+/** A copied picture pasted into a pair keeps its bytes, marks in its alt too. */
+describe.each([false, true])("a picture pasted into bold, room %s", (room) => {
+  it("goes in as copied", () => {
+    const view = drawn("**word a** z\n\nend", { room });
+    view.dispatch({ selection: EditorSelection.cursor(4) });
+    view.dispatch(view.state.replaceSelection("![**x**](assets/a.png)"), {
+      userEvent: "input.paste",
+    });
+    expect(bytes(view.state)).toBe("**wo![**x**](assets/a.png)rd a** z\n\nend");
+  });
+});
+
 describe("a picture swaps between in place and under its line", () => {
   it("when the setting flips with the caret on its line", () => {
     const view = drawn(DOC, { mode: "show" });

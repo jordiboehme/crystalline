@@ -34,6 +34,7 @@ import type { IconComponent } from "../components/primitives";
 import { FIELD, IconButton } from "../components/primitives";
 import type { FloatingContext } from "./floatingContext";
 import { watchDocChanges } from "./floatingContext";
+import { focusBack } from "./focusBack";
 import {
   ImageCenterIcon,
   ImageFloatLeftIcon,
@@ -133,7 +134,7 @@ function placeOf(main: EditorView, context: PictureContext): Place {
   return {
     from: context.from,
     to: context.to,
-    text: main.state.sliceDoc(context.from, context.to),
+    text: main.state.doc.sliceString(context.from, context.to),
   };
 }
 
@@ -206,7 +207,7 @@ export function PictureControls({
       if (at !== null) {
         if (changes === null) {
           // A rebuilt state: the picture is there only as it was written.
-          if (main.state.sliceDoc(at.from, at.to) !== at.text) {
+          if (main.state.doc.sliceString(at.from, at.to) !== at.text) {
             place.current = null;
           }
         } else {
@@ -215,7 +216,7 @@ export function PictureControls({
           place.current =
             from === null || to === null || to <= from
               ? null
-              : { from, to, text: main.state.sliceDoc(from, to) };
+              : { from, to, text: main.state.doc.sliceString(from, to) };
         }
       }
       if (mounted.current) {
@@ -253,7 +254,7 @@ export function PictureControls({
     place.current = {
       from: contextFrom,
       to: contextTo,
-      text: main.state.sliceDoc(contextFrom, contextTo),
+      text: main.state.doc.sliceString(contextFrom, contextTo),
     };
     // Drawn from the new place.
     setDrawnAt(contextFrom);
@@ -263,7 +264,7 @@ export function PictureControls({
   const run = (verb: (view: EditorView, pos: number) => boolean) => {
     commit();
     verb(main, (place.current?.from ?? context.from) + 1);
-    main.focus();
+    focusBack(main);
   };
 
   const here = drawnAt ?? context.from;
@@ -273,7 +274,7 @@ export function PictureControls({
   const shown =
     picture === null
       ? ""
-      : altDisplay(main.state.sliceDoc(picture.altFrom, picture.altTo));
+      : altDisplay(main.state.doc.sliceString(picture.altFrom, picture.altTo));
 
   const onFieldKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     // A key that confirms or cancels an input method's composition is the
@@ -283,7 +284,7 @@ export function PictureControls({
       event.preventDefault();
       event.stopPropagation();
       commit();
-      main.focus();
+      focusBack(main);
     } else if (event.key === "Escape") {
       // Put back before the focus leaves, so the blur writes nothing; the
       // bar then hands the focus back.

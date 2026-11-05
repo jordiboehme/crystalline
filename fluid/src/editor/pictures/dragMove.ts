@@ -111,7 +111,7 @@ const listeners = ViewPlugin.fromClass(
       ) {
         return;
       }
-      const text = view.state.sliceDoc(ref.from, ref.to);
+      const text = view.state.doc.sliceString(ref.from, ref.to);
       const token = freshToken();
       slot = { view, from: ref.from, to: ref.to, text, token };
       if (main.from !== ref.from || main.to !== ref.to) {
@@ -169,7 +169,7 @@ const listeners = ViewPlugin.fromClass(
       if (
         ref?.from !== taken.from ||
         ref.to !== taken.to ||
-        view.state.sliceDoc(ref.from, ref.to) !== taken.text
+        view.state.doc.sliceString(ref.from, ref.to) !== taken.text
       ) {
         view.dispatch({ effects: EditorView.announce.of(PICTURE_CHANGED) });
         return;

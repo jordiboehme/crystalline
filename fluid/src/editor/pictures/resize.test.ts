@@ -131,7 +131,7 @@ describe.each([
     const view = ready();
     const steps = undoSteps(view);
     const selection = view.state.selection.main;
-    const down = drag(view, "se", [150, 200]);
+    const down = drag(view, "sw", [50, 0]);
     expect(down.defaultPrevented).toBe(true);
     expect(bytes(view.state)).toBe(at("![x](assets/p.png#right,w=75%)"));
     expect(undoSteps(view)).toBe(steps + 1);
@@ -148,13 +148,13 @@ describe.each([
     const image = box(view).querySelector("img");
     drag(
       view,
-      "se",
-      Array.from({ length: 10 }, (_, i) => 110 + i * 10),
+      "sw",
+      Array.from({ length: 10 }, (_, i) => 90 - i * 10),
       false,
     );
     expect(bytes(view.state)).toBe(before);
     expect(image?.style.width).toBe("300px");
-    pointer(document, "pointerup", 200);
+    pointer(document, "pointerup", 0);
   });
 
   it("the west handles grow to the left", () => {
@@ -165,18 +165,18 @@ describe.each([
 
   it("clamps to 10 and 100 percent", () => {
     const small = ready();
-    drag(small, "se", [-300]);
+    drag(small, "sw", [500]);
     expect(bytes(small.state)).toBe(at("![x](assets/p.png#right,w=10%)"));
     cleanupMarkViews();
     const big = ready();
-    drag(big, "se", [900]);
+    drag(big, "sw", [-700]);
     expect(bytes(big.state)).toBe(at("![x](assets/p.png#right,w=100%)"));
   });
 
   it("writes nothing when the width does not change", () => {
     const view = ready();
     const steps = undoSteps(view);
-    drag(view, "se", [100]);
+    drag(view, "sw", [100]);
     expect(bytes(view.state)).toBe(PAGE);
     expect(undoSteps(view)).toBe(steps);
   });
@@ -185,14 +185,14 @@ describe.each([
     const view = ready();
     const image = box(view).querySelector("img");
     const was = image?.style.width;
-    drag(view, "se", [150, 220], false);
+    drag(view, "sw", [50, -20], false);
     expect(image?.style.width).toBe("320px");
     document.dispatchEvent(
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
     );
     expect(image?.style.width).toBe(was);
     expect(box(view).dataset["resizing"]).toBeUndefined();
-    pointer(document, "pointerup", 220);
+    pointer(document, "pointerup", -20);
     expect(bytes(view.state)).toBe(PAGE);
   });
 
@@ -200,19 +200,19 @@ describe.each([
     const view = ready();
     const image = box(view).querySelector("img");
     const was = image?.style.width;
-    drag(view, "se", [150], false);
-    handle(view, "se").dispatchEvent(new Event("lostpointercapture"));
+    drag(view, "sw", [50], false);
+    handle(view, "sw").dispatchEvent(new Event("lostpointercapture"));
     expect(image?.style.width).toBe(was);
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(PAGE);
   });
 
   it("Raw toggled mid-drag ends it with nothing written", () => {
     const view = ready();
     const steps = undoSteps(view);
-    drag(view, "se", [150, 200], false);
+    drag(view, "sw", [50, 0], false);
     setRaw(view, true);
-    pointer(document, "pointerup", 200);
+    pointer(document, "pointerup", 0);
     expect(bytes(view.state)).toBe(PAGE);
     expect(undoSteps(view)).toBe(steps);
   });
@@ -222,9 +222,9 @@ describe.each([
     const view = build(PAGE, mode, true);
     selectPicture(view, P);
     layout(view, 200);
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     remoteInsert(view, 0, "Peer. ");
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(
       `Peer. ${at("![x](assets/p.png#right,w=63%)")}`,
     );
@@ -233,7 +233,7 @@ describe.each([
   it("a press on a handle does not change the selection or start a move", () => {
     const view = ready();
     const selection = view.state.selection.main;
-    const down = pointer(handle(view, "se"), "pointerdown", 100);
+    const down = pointer(handle(view, "sw"), "pointerdown", 100);
     expect(down.defaultPrevented).toBe(true);
     expect(view.state.selection.main.eq(selection)).toBe(true);
     pointer(document, "pointerup", 100);
@@ -283,7 +283,7 @@ describe("the percent base is the image's containing block (P41)", () => {
       layout(view, 200);
       pad(view, 400, 15);
       // The base is 370: 200 + 100 pixels is 81 percent, not the 75 of 400.
-      drag(view, "se", [200]);
+      drag(view, "sw", [0]);
       expect(bytes(view.state)).toBe(doc.replace("w=50%", "w=81%"));
     },
   );
@@ -297,7 +297,7 @@ describe("the percent base is the image's containing block (P41)", () => {
     selectPicture(view, ref);
     layout(view, 200);
     pad(view, 400, 12);
-    drag(view, "se", [200]);
+    drag(view, "sw", [0]);
     expect(bytes(view.state)).toBe(doc.replace("w=50%", "w=80%"));
   });
 });
@@ -322,7 +322,7 @@ describe("a drag follows the picture and its peers", () => {
     layout(view, 200);
     const steps = undoSteps(view);
     // 201 of 400 pixels still rounds to 50.
-    drag(view, "se", [101]);
+    drag(view, "sw", [99]);
     expect(bytes(view.state)).toBe(PAGE);
     expect(undoSteps(view)).toBe(steps);
   });
@@ -333,7 +333,7 @@ describe("a drag follows the picture and its peers", () => {
     layout(view, 200);
     const image = box(view).querySelector("img");
     const was = image?.style.width;
-    drag(view, "se", [150, 220], false);
+    drag(view, "sw", [50, -20], false);
     expect(image?.style.width).toBe("320px");
     view.setState(EditorState.create({ doc: PAGE, extensions: [] }));
     expect(image?.style.width).toBe(was);
@@ -343,11 +343,11 @@ describe("a drag follows the picture and its peers", () => {
     const view = build(PAGE, "hidden", false);
     selectPicture(view, P);
     layout(view, 200);
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     const from = PAGE.indexOf(P);
     view.dispatch({ changes: { from, to: from + P.length } });
     const after = bytes(view.state);
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(after);
   });
 
@@ -355,7 +355,7 @@ describe("a drag follows the picture and its peers", () => {
     const view = build(PAGE, "hidden", false);
     selectPicture(view, P);
     layout(view, 200);
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     const from = PAGE.indexOf("assets/p.png#right,w=50%");
     view.dispatch({
       changes: {
@@ -365,7 +365,7 @@ describe("a drag follows the picture and its peers", () => {
       },
     });
     const after = bytes(view.state);
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(after);
   });
 
@@ -373,12 +373,12 @@ describe("a drag follows the picture and its peers", () => {
     const view = build(PAGE, "hidden", false);
     selectPicture(view, P);
     layout(view, 200);
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     // What a redraw into a new element does to the one the drag holds.
     box(view).remove();
     view.dispatch({ changes: { from: 0, insert: "Peer. " } });
     const after = bytes(view.state);
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(after);
   });
 
@@ -386,10 +386,10 @@ describe("a drag follows the picture and its peers", () => {
     const view = build(PAGE, "hidden", false);
     selectPicture(view, P);
     layout(view, 200);
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     const at = PAGE.indexOf("![x]") + 2;
     view.dispatch({ changes: { from: at, insert: "long" } });
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(
       at_(PAGE, "![longx](assets/p.png#right,w=63%)"),
     );
@@ -400,12 +400,12 @@ describe("a drag follows the picture and its peers", () => {
     selectPicture(view, P);
     layout(view, 200);
     const image = box(view).querySelector("img");
-    drag(view, "se", [150], false);
+    drag(view, "sw", [50], false);
     const at = PAGE.indexOf("#right") + 1;
     view.dispatch({ changes: { from: at, to: at + 5, insert: "left" } });
     expect(box(view).querySelector("img")).toBe(image);
     expect(image?.style.width).toBe("250px");
-    pointer(document, "pointerup", 150);
+    pointer(document, "pointerup", 50);
     expect(bytes(view.state)).toBe(at_(PAGE, "![x](assets/p.png#left,w=63%)"));
   });
 });

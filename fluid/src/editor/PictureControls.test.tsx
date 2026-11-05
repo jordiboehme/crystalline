@@ -548,6 +548,92 @@ describe("the alt text field", () => {
   });
 });
 
+/**
+ * The focus comes back with the document selection already in the editor,
+ * at the editor's own selection (I1). Chrome puts the caret at the start of
+ * a contenteditable focused while the document selection is outside it, and
+ * when CodeMirror's cached DOM selection still reads the picture, its focus
+ * writes nothing and its observer then reads that caret as the person's.
+ */
+describe("the focus handed back from the bar", () => {
+  /** Where the document selection stood each time main was focused. */
+  function watchFocus(main: EditorView): { at: (number | null)[][] } {
+    const seen: { at: (number | null)[][] } = { at: [] };
+    const focus = main.focus.bind(main);
+    vi.spyOn(main, "focus").mockImplementation(() => {
+      const selection = document.getSelection();
+      const anchor = selection?.anchorNode ?? null;
+      const head = selection?.focusNode ?? null;
+      seen.at.push(
+        anchor !== null &&
+          head !== null &&
+          main.contentDOM.contains(anchor) &&
+          main.contentDOM.contains(head)
+          ? [
+              main.posAtDOM(anchor, selection?.anchorOffset ?? 0),
+              main.posAtDOM(head, selection?.focusOffset ?? 0),
+            ]
+          : [null],
+      );
+      focus();
+    });
+    return seen;
+  }
+
+  /** The field focused, and the document selection outside the editor. */
+  function intoField(): HTMLInputElement {
+    const field = altField();
+    act(() => {
+      field.focus();
+    });
+    document.getSelection()?.collapse(bar(), 0);
+    return field;
+  }
+
+  test("Escape from the field", async () => {
+    const h = harness();
+    const from = await selectPicture(h);
+    h.show();
+    const seen = watchFocus(h.main);
+    const field = intoField();
+    fireEvent.change(field, { target: { value: "Something else" } });
+    fireEvent.keyDown(field, { key: "Escape" });
+    await settle();
+    expect(seen.at).toEqual([[from, from + PICTURE.length]]);
+    expect(h.main.state.selection.main).toMatchObject({
+      from,
+      to: from + PICTURE.length,
+    });
+  });
+
+  test("Enter in the field", async () => {
+    const h = harness();
+    const from = await selectPicture(h);
+    h.show();
+    const seen = watchFocus(h.main);
+    const field = intoField();
+    fireEvent.change(field, { target: { value: "Chart 2" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    await settle();
+    const end = from + "![Chart 2](assets/c.png)".length;
+    expect(seen.at).toEqual([[from, end]]);
+  });
+
+  test("a button pressed after typing in the field", async () => {
+    const h = harness();
+    const from = await selectPicture(h);
+    h.show();
+    const seen = watchFocus(h.main);
+    const field = intoField();
+    fireEvent.change(field, { target: { value: "Chart 2" } });
+    fireEvent.click(control("Small"));
+    await settle();
+    const { main } = h.main.state.selection;
+    expect(main.from).toBe(from);
+    expect(seen.at.at(-1)).toEqual([main.anchor, main.head]);
+  });
+});
+
 describe("a picture that is not attached", () => {
   const EXTERNAL = "![Map](https://example.com/m.png)";
 

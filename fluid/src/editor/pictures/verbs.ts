@@ -97,7 +97,7 @@ function reformat(
     return false;
   }
   const token = buildImageTarget(ref.written, next(ref.format));
-  const old = view.state.sliceDoc(ref.targetFrom, ref.targetTo);
+  const old = view.state.doc.sliceString(ref.targetFrom, ref.targetTo);
   if (token === old) {
     return false;
   }
@@ -181,7 +181,10 @@ export function setPictureAlt(
   if (ref === null) {
     return false;
   }
-  const edit = altEdit(view.state.sliceDoc(ref.altFrom, ref.altTo), next);
+  const edit = altEdit(
+    view.state.doc.sliceString(ref.altFrom, ref.altTo),
+    next,
+  );
   if (edit === null) {
     return false;
   }
@@ -291,7 +294,7 @@ function moveChanges(
       removal = judged.changes;
   }
   const mid = state.update({ changes: removal, filter: false }).state;
-  const picture = state.sliceDoc(ref.from, ref.to);
+  const picture = state.doc.sliceString(ref.from, ref.to);
   const after = mid.doc.lineAt(removal.mapPos(line.to, -1));
   const { change, start } = blockInsertion(mid, after, [picture]);
   let insert = mid.changes(change);

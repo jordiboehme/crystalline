@@ -181,6 +181,150 @@ describe("the editor's attachment previews", () => {
   });
 });
 
+/**
+ * A left or right picture's line holds its float (P44): the text continues
+ * below the picture in the editor, so nothing reflows when that line leaves
+ * CodeMirror's viewport. The reading page keeps wrapping (`imageStyle` is
+ * untouched); only the editor's line is contained.
+ */
+/**
+ * The handles are placed from a measure, never from inside CodeMirror's
+ * update (M4), and the observer that keeps them on the image's corners is
+ * let go with the image (M5).
+ */
+describe("the handles' layout", () => {
+  const SIZES: [string, number][] = [
+    ["offsetWidth", 120],
+    ["offsetHeight", 60],
+    ["offsetLeft", 10],
+    ["offsetTop", 4],
+  ];
+
+  /** Layout reads, each with the view's update state when it was made. */
+  function watchLayout(view: () => EditorView | null): number[] {
+    const states: number[] = [];
+    for (const [name, value] of SIZES) {
+      vi.spyOn(
+        HTMLElement.prototype,
+        name as "offsetWidth",
+        "get",
+      ).mockImplementation(() => {
+        const now = view();
+        states.push(
+          now === null
+            ? -1
+            : (now as unknown as { updateState: number }).updateState,
+        );
+        return value;
+      });
+    }
+    return states;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("reads the image's box in a measure, after the update", async () => {
+    let current: EditorView | null = null;
+    const states = watchLayout(() => current);
+    const view = editor("a ![x](assets/a.png) b");
+    current = view;
+    view.dispatch({ selection: EditorSelection.range(2, 20) });
+    // Nothing read while the selection was drawn.
+    expect(states.filter((state) => state === 2)).toEqual([]);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(states.filter((state) => state === 2)).toEqual([]);
+    const se = nth(view).querySelector<HTMLElement>(
+      ".cm-picture-handle[data-corner=se]",
+    );
+    expect(se?.style.left).toBe("130px");
+    expect(se?.style.top).toBe("64px");
+  });
+
+  it("lets the image's observer go when the picture is deselected or gone", () => {
+    // The images' observers only: CodeMirror keeps one of its own.
+    const observed: Element[] = [];
+    const watching = new WeakMap<ResizeObserver, Element>();
+    let disconnected = 0;
+    vi.spyOn(ResizeObserver.prototype, "observe").mockImplementation(function (
+      this: ResizeObserver,
+      target: Element,
+    ) {
+      if (target instanceof HTMLImageElement) {
+        observed.push(target);
+        watching.set(this, target);
+      }
+    });
+    vi.spyOn(ResizeObserver.prototype, "disconnect").mockImplementation(
+      function (this: ResizeObserver) {
+        if (watching.has(this)) disconnected += 1;
+      },
+    );
+    const view = editor("a ![x](assets/a.png) b\n");
+    view.dispatch({ selection: EditorSelection.range(2, 20) });
+    expect(observed).toHaveLength(1);
+    view.dispatch({ selection: EditorSelection.cursor(0) });
+    expect(disconnected).toBe(1);
+    view.dispatch({ selection: EditorSelection.range(2, 20) });
+    expect(observed).toHaveLength(2);
+    view.dispatch({ changes: { from: 2, to: 20 } });
+    expect(disconnected).toBe(2);
+  });
+});
+
+describe("a floated picture's line", () => {
+  const DOC = [
+    "A ![L](assets/l.png#left) here.",
+    "",
+    "![C](assets/c.png)",
+    "",
+    "B ![R](assets/r.png#right,w=25%) b",
+    "",
+    "![Out](https://example.com/o.png#right)",
+    "",
+  ].join("\n");
+
+  const contained = (view: EditorView) =>
+    [...view.contentDOM.querySelectorAll<HTMLElement>(".cm-line")]
+      .filter((line) => line.classList.contains("cm-picture-float-line"))
+      .map((line) => line.textContent);
+
+  it("is contained for an attachment set left or right, and only then", () => {
+    const view = editor(DOC);
+    expect(contained(view)).toEqual(["A  here.", "B  b"]);
+    const line = view.contentDOM.querySelector<HTMLElement>(
+      ".cm-picture-float-line",
+    );
+    expect(line && getComputedStyle(line).display).toBe("flow-root");
+    // The image keeps the float the reading page gives it.
+    expect(
+      line?.querySelector<HTMLImageElement>(".cm-picture img")?.style.float,
+    ).toBe("left");
+  });
+
+  it("follows the placement as it is set and taken away", () => {
+    const view = editor("A ![L](assets/l.png) here.\n");
+    expect(contained(view)).toEqual([]);
+    view.dispatch({ changes: { from: 19, insert: "#right" } });
+    expect(contained(view)).toEqual(["A  here."]);
+    view.dispatch({ changes: { from: 19, to: 25 } });
+    expect(contained(view)).toEqual([]);
+  });
+
+  it("holds a float drawn under the edited line too", () => {
+    const view = markView("A ![L](assets/l.png#left) here.\n\nend", {
+      mode: "show",
+      images: imagePreviews("eng"),
+    });
+    const block =
+      view.contentDOM.querySelector<HTMLElement>(".cm-picture-block");
+    expect(block).not.toBeNull();
+    expect(block && getComputedStyle(block).display).toBe("flow-root");
+  });
+});
+
 describe("a picture in place of its reference", () => {
   const FOUR = [
     "A ![Shot](assets/a.png#left) here.",
@@ -406,6 +550,31 @@ describe("a picture in place of its reference", () => {
     expect(plain.classList.contains("cm-picture-selected")).toBe(false);
     expect(plain.querySelector(".cm-picture-handle")).toBeNull();
     expect(plain.querySelector("img")).toBe(image);
+  });
+
+  it("draws a float's handles on its free edge only, where they follow the pointer", () => {
+    const corners = (doc: string, from: number, to: number) => {
+      const view = editor(doc);
+      view.dispatch({ selection: EditorSelection.range(from, to) });
+      return [
+        ...nth(view).querySelectorAll<HTMLElement>(".cm-picture-handle"),
+      ].map((h) => h.dataset["corner"]);
+    };
+    // A right float's east edge is pinned to the column: its handles are west.
+    expect(corners("a ![x](assets/a.png#right) b", 2, 26)).toEqual([
+      "nw",
+      "sw",
+    ]);
+    expect(corners("a ![x](assets/a.png#left,w=40%) b", 2, 31)).toEqual([
+      "ne",
+      "se",
+    ]);
+    expect(corners("a ![x](assets/a.png#w=40%) b", 2, 26)).toEqual([
+      "nw",
+      "ne",
+      "sw",
+      "se",
+    ]);
   });
 
   it("frames an external picture without handles", () => {

@@ -171,6 +171,52 @@ describe.each([false, true])(
 );
 
 /**
+ * A paste of text that holds marks into a pair, in hidden and show mode: the
+ * pasted marks of a format the place already has are left out, so `**q**`
+ * pasted into bold is a bold `q` and the pair around it stays one pair.
+ */
+describe.each(
+  (["hidden", "show"] as const).flatMap((mode) =>
+    [false, true].map((room) => ({ mode, room })),
+  ),
+)(
+  "a paste with marks into a pair, $mode mode, room $room",
+  ({ mode, room }) => {
+    it.each([
+      ["**word a** z", 2, "**q**", "**qword a** z"],
+      ["**word a** z", 4, "**q**", "**woqrd a** z"],
+      ["**word a** z", 8, "**q**", "**word aq** z"],
+      ["*word a* z", 1, "*q*", "*qword a* z"],
+      ["~~word a~~ z", 2, "~~q~~", "~~qword a~~ z"],
+      ["**word a** z", 4, "**q** r", "**woq rrd a** z"],
+      ["**word a** z", 4, "*q*", "**wo*q*rd a** z"],
+      ["a word z", 2, "**q**", "a **q**word z"],
+      // A picture's or a link's own marks are its bytes, kept as copied.
+      [
+        "**word a** z",
+        4,
+        "![**x**](assets/a.png)",
+        "**wo![**x**](assets/a.png)rd a** z",
+      ],
+      [
+        "**word a** z",
+        4,
+        "[**x**](https://u.v)",
+        "**wo[**x**](https://u.v)rd a** z",
+      ],
+    ])("%j, at %i, %j", (text, at, pasted, want) => {
+      const view = markView(text, { mode, room });
+      setCaret(view, at);
+      view.dispatch({ selection: EditorSelection.cursor(at) });
+      paste(view, pasted);
+      expect(bytes(view.state)).toBe(want);
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(text);
+    });
+  },
+);
+
+/**
  * Enter on a bold line (D55): the line break is never split across a run.
  * It goes whole after the closing marks at an item's end, and before the
  * format's marks at the text's start, so the new line starts the same
@@ -216,6 +262,33 @@ describe.each(
     expect(bytes(view.state)).toBe(text);
   });
 });
+
+/**
+ * Enter at the end of a format, with the caret before its closing marks
+ * (where the caret is drawn in hidden mode): the line break goes after the
+ * marks. A single `*` moved to the next line would start a list item there,
+ * so no place that makes a block mark out of a format mark is taken.
+ */
+describe.each([false, true])(
+  "Enter at the end of a format, hidden mode, room %s",
+  (room) => {
+    it.each([
+      ["*a word* z", 7, "*a word*\n z"],
+      ["_a word_ z", 7, "_a word_\n z"],
+      ["**a word** z", 8, "**a word**\n z"],
+      ["~~a word~~ z", 8, "~~a word~~\n z"],
+      ["x *a word*", 9, "x *a word*\n"],
+      ["- *a word* z", 9, "- *a word*\n-  z"],
+    ])("%j, Enter at %i", (text, at, want) => {
+      const view = markView(text, { room });
+      setCaret(view, at);
+      keys(view, "Enter");
+      expect(bytes(view.state)).toBe(want);
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(text);
+    });
+  },
+);
 
 /**
  * Enter between two formats that touch (D61): the run there closes one

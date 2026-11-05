@@ -175,7 +175,7 @@ const cut = EditorView.domEventHandlers({
       return false;
     }
     data.clearData();
-    data.setData("text/plain", state.sliceDoc(ref.from, ref.to));
+    data.setData("text/plain", state.doc.sliceString(ref.from, ref.to));
     removePicture(view, ref.from + 1);
     return true;
   },

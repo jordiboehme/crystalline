@@ -4,8 +4,8 @@
  * A format is a set of visible characters, so the commands change which
  * visible characters have it and write whatever marks that takes:
  *
- * - On a selection (hidden mode) the visible characters picked get the
- *   format, or lose it when every one of them has it already. Marks of the
+ * - On a selection (hidden and show mode) the visible characters picked
+ *   get the format, or lose it when every one of them has it already. Marks of the
  *   format inside the selection go, a pair the selection starts or ends in is
  *   merged with, and a mark right beside it is moved rather than written
  *   twice. The changed line is parsed again before anything is sent: when
@@ -13,8 +13,10 @@
  *   the person is told so.
  * - With no selection nothing is written. The format waits at the caret
  *   (`pendingFormat`) and the next typed text gets it, in hidden and show
- *   mode alike. Raw, a show-mode selection and a table cell (which has no
- *   hidden marks yet) keep the source view's wrap, `toggleInline`.
+ *   mode alike. Raw and a table cell (which has no hidden marks yet) keep
+ *   the source view's wrap, `toggleInline`. A shown mark inside a selection
+ *   is read as the mark it is, so a pair the selection falls inside is split
+ *   rather than broken by a wrap.
  * - Typing at the edge of a format continues it (`formatInput`): a letter at
  *   the end of bold is bold, a space goes after the marks and the next
  *   letter is bold again, and a closing mark typed by hand ends the format,
@@ -51,7 +53,8 @@ import { canonical, composing, snapRange } from "./caret";
 import { partnerAcrossLines } from "./deleting";
 import type { Mark, MarkRun } from "./hiddenMarks";
 import { marksOnLine, runsOf } from "./hiddenMarks";
-import { hiddenMarkLayerOn, marksHiddenOnLine } from "./mode";
+import { selectedPicture } from "../pictures/refs";
+import { hiddenMarkLayerOn, marksHiddenOnLine, pictureInline } from "./mode";
 import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 import type { Deadline } from "./parse";
 
@@ -688,11 +691,12 @@ function formatSelection(view: EditorView, format: Format): void {
 
 /**
  * Bold, Italic, Strikethrough or Inline code, from a button or Mod-b and
- * Mod-i. Where marks are hidden: a selection changes the format of its
- * visible characters, and no selection makes the format wait for typing (in
- * show mode too). Raw, a selection on a line whose marks show and a buffer
- * without the hidden-mark layer (a table cell) keep `toggleInline`. A page
- * that is not writable takes nothing.
+ * Mod-i. With the hidden-mark layer, in hidden and show mode: a selection
+ * changes the format of its visible characters, and no selection makes the
+ * format wait for typing. Raw and a buffer without the hidden-mark layer (a
+ * table cell) keep `toggleInline`. A page
+ * that is not writable takes nothing, and neither does a selection that is
+ * exactly one drawn picture.
  */
 export function toggleFormat(view: EditorView, format: Format): boolean {
   judgeBeforeCommand(view);
@@ -705,6 +709,14 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
       view.dispatch({ effects: EditorView.announce.of(said) });
       return true;
     }
+  }
+  // A selection that is exactly one drawn picture has no words to format:
+  // its alt text is hidden behind the picture, so a mark written there is a
+  // change nobody sees (and asterisks a screen reader reads out). Handled,
+  // so no other binding of the key moves the selection off the picture.
+  const picture = selectedPicture(view.state);
+  if (picture !== null && pictureInline(view.state, picture)) {
+    return true;
   }
   const marker = FORMAT_MARKER[format];
   if (!view.state.facet(hiddenMarkLayerOn)) {
@@ -725,13 +737,8 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
     view.focus();
     return true;
   }
-  const first = state.doc.lineAt(range.from).number;
-  const last = state.doc.lineAt(range.to).number;
-  for (let number = first; number <= last; number++) {
-    if (!marksHiddenOnLine(state, number)) {
-      return toggleInline(view, marker);
-    }
-  }
+  // Where the marks show too: the visible characters picked change format,
+  // so a pair the selection falls inside is split, never broken by a wrap.
   formatSelection(view, format);
   view.focus();
   return true;

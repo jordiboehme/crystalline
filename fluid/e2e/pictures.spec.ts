@@ -151,6 +151,7 @@ const madePages: { page: string; assets: string[] }[] = [];
 async function attached(
   page: Page,
   alt = "harbor",
+  data: Buffer = PNG,
 ): Promise<{ path: string; reference: string }> {
   unique += 1;
   const path = `assets/e2e/pic-${String(Date.now())}-${String(unique)}.png`;
@@ -161,7 +162,7 @@ async function attached(
         "X-CSRF-Token": await csrf(page),
         "Content-Type": "image/png",
       },
-      data: PNG,
+      data,
     },
   );
   expect(put.ok(), await put.text()).toBeTruthy();
@@ -411,6 +412,8 @@ test.describe("pictures", () => {
       await expect(picture).toHaveClass(/cm-picture-selected/);
       const handle = picture.locator(".cm-picture-handle[data-corner=se]");
       await expect(handle).toBeVisible();
+      // The handles go on the image's corners in the editor's next measure.
+      await settled(page);
       const grip = await middleOf(handle);
       const before = await held(page);
       await page.mouse.move(grip.x, grip.y);
@@ -575,8 +578,11 @@ test.describe("pictures", () => {
     const bar = page.getByRole("toolbar", { name: "Picture options" });
     const alt = bar.getByRole("textbox", { name: "Alt text" });
 
-    /** Caret before the picture, ArrowRight, Alt+F10, arrows to the field. */
-    const toAltField = async (): Promise<void> => {
+    /**
+     * Caret before the picture, ArrowRight, Alt+F10, arrows to the field.
+     * Answers the picture's range.
+     */
+    const toAltField = async (): Promise<[number, number]> => {
       const { doc } = await held(page);
       const from = doc.indexOf("![");
       const end = doc.indexOf(")", from) + 1;
@@ -589,6 +595,7 @@ test.describe("pictures", () => {
         await page.keyboard.press("ArrowRight");
       }
       await expect(alt).toBeFocused();
+      return [from, end];
     };
 
     await toAltField();
@@ -599,12 +606,12 @@ test.describe("pictures", () => {
     await expect.poll(async () => await text(page)).toBe(renamed);
     await expect(source).toBeFocused();
 
-    await toAltField();
+    const range = await toAltField();
     await page.keyboard.type(" abandoned");
     await page.keyboard.press("Escape");
     await expect(source).toBeFocused();
-    // Where the selection rests after Escape is not asserted: it reads the
-    // picture in most runs and the start of the page in some (see the report).
+    // The selection is the picture again, and stays there (I1).
+    await steady(page, range);
     // The abandoned text never reaches the page, however late a blur is.
     for (let frames = 0; frames < 6; frames += 1) {
       await settled(page);
@@ -619,6 +626,87 @@ test.describe("pictures", () => {
         { timeout: 20_000 },
       )
       .toBe(renamed);
+  });
+
+  test("a tall right float holds its line: the text below it keeps its line boxes when the float scrolls out (P44)", async ({
+    page,
+  }) => {
+    const { path } = await attached(page, "Tall", makePng(160, 1200));
+    const reference = `![Tall](${path}#right,w=30%)`;
+    const permalink = await createEngram(
+      page,
+      `# Tall float\n\n${reference}\n\n${LONG.repeat(20)}\n\nThe end.\n`,
+    );
+    // The wrapper of a floated image has no box of its own: the image does.
+    const { source, picture } = await edit(
+      page,
+      permalink,
+      false,
+      "Tall float",
+    );
+    await expect(picture.locator("img")).toBeVisible();
+    await expect
+      .poll(
+        async () => (await picture.locator("img").boundingBox())?.height ?? 0,
+      )
+      .toBeGreaterThan(800);
+
+    /** The paragraph's line boxes, relative to its own line element. */
+    const boxes = () =>
+      page.evaluate(() => {
+        const line = [
+          ...document.querySelectorAll<HTMLElement>(".cm-content > .cm-line"),
+        ].find((each) => each.textContent.includes("The harbor master"));
+        if (!line) return null;
+        const range = document.createRange();
+        range.selectNodeContents(line);
+        const at = line.getBoundingClientRect();
+        return {
+          top: at.top,
+          rects: [...range.getClientRects()].map((rect) =>
+            [rect.top - at.top, rect.left - at.left, rect.width].map(
+              Math.round,
+            ),
+          ),
+        };
+      });
+
+    await page.mouse.click(0, 0);
+    await settled(page);
+    const viewport = page.viewportSize();
+    await page.mouse.move(
+      (viewport?.width ?? 1280) / 2,
+      (viewport?.height ?? 720) / 2,
+    );
+    // Down until the paragraph is drawn, with the picture's line still drawn.
+    for (let step = 0; step < 40; step += 1) {
+      if ((await boxes()) !== null) break;
+      await page.mouse.wheel(0, 200);
+      await settled(page);
+    }
+    await expect(source.locator(".cm-picture")).toHaveCount(1);
+    const before = await boxes();
+    expect(before).not.toBeNull();
+    // The text starts below the picture, not beside it.
+    const pictureBottom = (await picture.locator("img").boundingBox()) ?? {
+      y: 0,
+      height: 0,
+    };
+    // Soft, so a run without the containment also reports the jump below.
+    expect
+      .soft(before?.top ?? 0)
+      .toBeGreaterThanOrEqual(pictureBottom.y + pictureBottom.height - 1);
+
+    // On down until CodeMirror has dropped the picture's line.
+    for (let step = 0; step < 40; step += 1) {
+      if ((await source.locator(".cm-picture").count()) === 0) break;
+      await page.mouse.wheel(0, 200);
+      await settled(page);
+    }
+    await expect(source.locator(".cm-picture")).toHaveCount(0);
+    await settled(page);
+    const after = await boxes();
+    expect(after?.rects).toEqual(before?.rects);
   });
 
   for (const selectFirst of [false, true]) {
@@ -724,6 +812,8 @@ test.describe("pictures", () => {
     await page.mouse.click(at.x, at.y);
     await expect(picture).toHaveClass(/cm-picture-selected/);
     const handle = picture.locator(".cm-picture-handle[data-corner=se]");
+    // The handles go on the image's corners in the editor's next measure.
+    await settled(page);
     const grip = await middleOf(handle);
     // The share is of the line the picture stands in.
     const column = await picture.evaluate((el) => {

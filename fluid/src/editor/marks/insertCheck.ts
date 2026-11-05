@@ -16,10 +16,14 @@
  * 3. at the caret's drawn place (inside a closing run, continuing its
  *    format), then on the far side of the run.
  *
+ * Before any place is tried, a single-line paste or drop drops its own pairs
+ * of a format the place is already in (`**q**` pasted into bold goes in as
+ * `q`), outside any picture or link it holds, which keep their bytes.
  * A pair the insert leaves with nothing visible inside loses its marks
  * (D6). Where no place keeps the pairs, the insert is written as it landed:
  * a paste is never refused, and neither is typing. Only lines whose marks
- * are hidden are judged; where they show, the person sees what they write.
+ * are hidden are judged, and a paste where they show (P45): elsewhere on a
+ * line that shows its marks the person sees what they write.
  */
 
 import type {
@@ -34,6 +38,8 @@ import {
   StateEffect,
   Transaction,
 } from "@codemirror/state";
+
+import { syntaxTree } from "@codemirror/language";
 
 import { composing } from "./caret";
 import { canonical } from "./caret";
@@ -65,40 +71,72 @@ function isSpace(char: string): boolean {
   return /\s/.test(char);
 }
 
+/** The inline formats whose marks never become a block mark of a new line. */
+const FORMAT_KINDS = new Set(["strong", "em", "strike", "code"]);
+
 /**
  * The block marks (bullet, number, task box, quote mark) each line the
- * pieces start begins with in `trial`, as one comparable word.
+ * pieces start begins with in `trial`, as one comparable word, and whether
+ * one of them is made of a format mark of `start` (a closing `*` moved to
+ * the start of the new line reads as a bullet there). Such a mark is left
+ * out of the word: it is no block the person asked for.
  */
 function blockShape(
+  start: EditorState,
   trial: EditorState,
   changes: ChangeSet,
   pieces: Place["pieces"],
   deadline: Deadline,
-): string {
+): { shape: string; formatMade: boolean } {
   const starts: number[] = [];
+  const inserted: Range[] = [];
   for (const piece of pieces) {
     const at = changes.mapPos(piece.at, -1);
+    inserted.push({ from: at, to: at + piece.insert.length });
     for (const found of piece.insert.matchAll(/\r?\n/g)) {
       starts.push(
         Math.min(at + (found.index ?? 0) + found[0].length, trial.doc.length),
       );
     }
   }
+  const back = changes.invert(start.doc);
+  /** Whether `pos` of `trial` was a character of a format mark in `start`. */
+  const ofFormatMark = (pos: number): boolean => {
+    if (inserted.some((range) => range.from <= pos && pos < range.to)) {
+      return false;
+    }
+    const was = back.mapPos(pos, 1);
+    if (was >= start.doc.length) return false;
+    const line = start.doc.lineAt(was).number;
+    return marksOnLine(start, line, { always: true }).some(
+      (mark) =>
+        FORMAT_KINDS.has(mark.kind) && mark.from <= was && was < mark.to,
+    );
+  };
   const last = Math.max(0, ...starts);
   const parsed = parsedTo(trial, trial.doc.lineAt(last).to, deadline) ?? trial;
   const out: string[] = [];
+  let formatMade = false;
   for (const pos of starts) {
     const line = parsed.doc.lineAt(pos);
     const kinds: string[] = [];
     let end = line.from;
     for (const mark of marksOnLine(parsed, line.number, { always: true })) {
       if (mark.side !== "prefix" || mark.from > end) break;
-      kinds.push(`${mark.kind}:${parsed.sliceDoc(mark.from, mark.to)}`);
       end = mark.to;
+      let made = false;
+      for (let at = mark.from; at < mark.to && !made; at += 1) {
+        made = ofFormatMark(at);
+      }
+      if (made) {
+        formatMade = true;
+        continue;
+      }
+      kinds.push(`${mark.kind}:${parsed.sliceDoc(mark.from, mark.to)}`);
     }
     out.push(kinds.join(" "));
   }
-  return out.join("|");
+  return { shape: out.join("|"), formatMade };
 }
 
 /** The places to try for `text` put in at `at` (after `deleted` went). */
@@ -208,6 +246,75 @@ function emptied(
   return out;
 }
 
+/**
+ * `text` without its own pairs of a format the place `from`..`to` is
+ * already in: `**q**` pasted into bold is a bold `q`, where its marks would
+ * otherwise end the bold around it and open it again (or, beside a mark,
+ * make a run of four the parser reads as no mark at all). Text that breaks
+ * the line, or holds no mark character, is left as it is.
+ */
+function withoutOwnMarks(
+  start: EditorState,
+  lines: Lines,
+  removed: readonly Range[],
+  insert: { from: number; to: number; text: string },
+  deadline: Deadline,
+): string {
+  const { text } = insert;
+  if (/[\r\n]/.test(text) || !/[*_~`]/.test(text)) return text;
+  const cut = (span: Range) =>
+    removed.some((r) => r.from < span.to && span.from < r.to);
+  const around = new Set<string>(
+    lines.pairs
+      .filter(
+        (pair) =>
+          FORMAT_KINDS.has(pair.kind) &&
+          !cut(pair.open) &&
+          !cut(pair.close) &&
+          pair.open.to <= insert.from &&
+          insert.to <= pair.close.from,
+      )
+      .map((pair) => pair.kind),
+  );
+  if (around.size === 0) return text;
+  // The text read on its own, with the page's own parser.
+  const alone = parsedTo(
+    start.update({
+      changes: { from: 0, to: start.doc.length, insert: text },
+      filter: false,
+    }).state,
+    text.length,
+    deadline,
+  );
+  if (!alone) return text;
+  // A picture's or a link's own text is its bytes, kept as copied.
+  const kept: Range[] = [];
+  syntaxTree(alone).iterate({
+    enter: (node) => {
+      if (node.name === "Image" || node.name === "Link") {
+        kept.push({ from: node.from, to: node.to });
+        return false;
+      }
+      return undefined;
+    },
+  });
+  const drop = marksOnLine(alone, 1, { always: true }).filter(
+    (mark) =>
+      around.has(mark.kind) &&
+      (mark.side === "open" || mark.side === "close") &&
+      mark.partner !== null &&
+      !kept.some((range) => range.from <= mark.from && mark.to <= range.to),
+  );
+  if (drop.length === 0) return text;
+  let out = "";
+  let at = 0;
+  for (const mark of drop) {
+    out += text.slice(at, mark.from);
+    at = mark.to;
+  }
+  return out + text.slice(at);
+}
+
 /** Where an insert goes instead of where it landed, and its text's end. */
 export interface InsertJudgement {
   changes: ChangeSet;
@@ -228,15 +335,18 @@ export function judgeInsert(
   deletions: readonly Range[],
   insert: { from: number; to: number; text: string },
   deadline: Deadline,
+  options: { shown?: boolean; ownMarks?: boolean } = {},
 ): InsertJudgement | null {
   const start = parsedTo(begin, begin.doc.lineAt(insert.to).to, deadline);
   // Short of time: written as it landed, never refused.
   if (!start) return null;
+  const judged = (n: number) =>
+    options.shown === true || marksHiddenOnLine(start, n);
   const line = start.doc.lineAt(insert.from).number;
-  if (!marksHiddenOnLine(start, line)) return null;
+  if (!judged(line)) return null;
   const { first, last } = blockLines(start, insert.from, insert.to);
   for (let n = first; n <= last; n += 1) {
-    if (!marksHiddenOnLine(start, n)) return null;
+    if (!judged(n)) return null;
   }
   const lines = linesOf(start, first, last);
   if (lines.marks.length === 0) return null;
@@ -244,16 +354,18 @@ export function judgeInsert(
     ...deletions,
     ...(insert.from < insert.to ? [{ from: insert.from, to: insert.to }] : []),
   ];
+  const text =
+    options.ownMarks === true
+      ? withoutOwnMarks(start, lines, removed, insert, deadline)
+      : insert.text;
   const breaks = /[\r\n]/.test(insert.text);
   // The block marks each new line starts with where the text lands as put:
   // a place elsewhere must start them the same (D55), or Enter in a list
-  // item would make a line that is no item.
+  // item would make a line that is no item. No place, the landed one
+  // included, may make a block mark out of a format mark: Enter before the
+  // closing `*` of `*a word* z` must not start a list item with it.
   let shape: string | null = null;
-  for (const [index, place] of places(
-    start,
-    insert.from,
-    insert.text,
-  ).entries()) {
+  for (const [index, place] of places(start, insert.from, text).entries()) {
     const deleted = merged([
       ...removed,
       ...emptied(start, lines, removed, place.pieces),
@@ -281,13 +393,19 @@ export function judgeInsert(
     );
     if (reads === null) return null;
     if (breaks) {
-      const read = blockShape(trial, changes, place.pieces, deadline);
-      if (index === 0) shape = read;
-      else if (read !== shape) continue;
+      const read = blockShape(start, trial, changes, place.pieces, deadline);
+      if (index === 0) shape = read.shape;
+      if (read.formatMade || read.shape !== shape) continue;
     }
     if (!reads) continue;
     // The text as it landed, keeping its pairs: nothing to change.
-    if (index === 0 && deleted.length === merged(removed).length) return null;
+    if (
+      index === 0 &&
+      deleted.length === merged(removed).length &&
+      text === insert.text
+    ) {
+      return null;
+    }
     const lastPiece = place.pieces.at(-1);
     const firstPiece = place.pieces[0];
     if (!lastPiece || !firstPiece) return null;
@@ -338,6 +456,14 @@ export const checkedInsert: Extension = State.transactionFilter.of((tr) => {
     deadlineIn(
       event === "input.type" ? PARSE_BUDGET.key : PARSE_BUDGET.gesture,
     ),
+    // A paste is judged where the marks show too (P45): the person sees the
+    // marks, but a pasted `**q**` must not break the pair it lands in.
+    // Pasted or dropped text leaves out its own marks of the formats it
+    // lands in; typing, Enter and completions write what they write.
+    {
+      shown: event === "input.paste",
+      ownMarks: event === "input.paste" || event === "input.drop",
+    },
   );
   if (!judged) return tr;
   const selection = tr.newSelection.main.empty

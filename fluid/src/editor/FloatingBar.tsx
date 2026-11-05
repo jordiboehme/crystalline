@@ -88,6 +88,7 @@ import {
 import type { Format } from "./marks/formatting";
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { toggleFormat } from "./marks/formatting";
+import { focusBack } from "./focusBack";
 import { PictureControls, pictureLabels } from "./PictureControls";
 import { insertWikilink } from "./toolbar";
 
@@ -399,7 +400,7 @@ export default function FloatingBar({
     const to = origin.current ?? verbTarget(main) ?? main;
     origin.current = null;
     dismiss();
-    to.focus();
+    focusBack(to);
   };
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
