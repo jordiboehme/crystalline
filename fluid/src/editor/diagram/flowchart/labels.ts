@@ -178,6 +178,21 @@ export function encodeMarkdownLabel(text: string): string {
 }
 
 /**
+ * The label to write for `text` on an arrow: as on a box, and a `|` as its entity
+ * form, because the parser and mermaid's pipe form end the label at the next `|`.
+ * An arrow's label is markdown only when its wrapper says so.
+ */
+export function encodeEdgeLabel(
+  text: string,
+  keepQuoted: boolean,
+  markdown: boolean,
+): string {
+  return (
+    markdown ? encodeMarkdownLabel(text) : encodeLabel(text, keepQuoted)
+  ).replaceAll("|", "#124;");
+}
+
+/**
  * The `@{ label: }` value for `text`. mermaid reads this form as markdown whether
  * or not anybody wrote markdown, so every mark is an entity form here too. A value
  * stays bare only when it is the parser's bare value, the one YAML cannot read as

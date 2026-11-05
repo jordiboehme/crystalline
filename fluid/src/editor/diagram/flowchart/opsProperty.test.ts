@@ -1214,6 +1214,652 @@ describe("every op that adds something, on the corpus", () => {
   );
 });
 
+type RemovalName =
+  | "deleteNode"
+  | "deleteEdge"
+  | "label"
+  | "noLabel"
+  | "lineStyle"
+  | "arrowhead"
+  | "reverse";
+
+interface RemovalTally {
+  applied: Record<RemovalName, number>;
+  /** `<what> <code>`, one per refused op. */
+  refused: string[];
+  /** Applied results where mermaid meets the kept boxes in another order. */
+  reordered: number;
+  failures: string[];
+}
+
+/** `db` without the box and the arrows an op took away, member lists as sets. */
+function withoutGone(
+  db: FlowDbView,
+  box: string | null,
+  arrows: ReadonlySet<number>,
+  clusters: ReadonlySet<string>,
+): FlowDbView {
+  return {
+    ...db,
+    vertices: db.vertices.filter((v) => v.id !== box && !clusters.has(v.id)),
+    edges: db.edges.filter((_, i) => !arrows.has(i)),
+    subgraphs: db.subgraphs.map((s) => ({
+      ...s,
+      nodes: s.nodes.filter((n) => n !== box).toSorted(),
+    })),
+  };
+}
+
+const LINE_STROKES = {
+  solid: "normal",
+  dotted: "dotted",
+  thick: "thick",
+} as const;
+
+const HEAD_TYPES = {
+  arrow: "arrow_point",
+  none: "arrow_open",
+  both: "double_arrow_point",
+} as const;
+
+function generatedId(id: string, start: string, end: string): boolean {
+  const prefix = `L_${start}_${end}_`;
+  return id.startsWith(prefix) && /^\d+$/.test(id.slice(prefix.length));
+}
+
+/**
+ * The removals and arrow ops on `body`, each against mermaid's db. A refusal must
+ * have the reason its op can have: `group` only on a link that makes more than one
+ * arrow, `chain` only in a chain, `unsupported` only on an invisible link. The db
+ * after a result must be the db before with exactly the intended change: the box
+ * and its arrows gone, or the one field of the one arrow. A kept box keeps its
+ * text, type, styles, classes, link and subgraph; a kept arrow its ends, label,
+ * look and style. What can move: the order mermaid meets the boxes in (the plan's
+ * own `A --> B` removal moves it), and the number in a generated id of a later
+ * arrow of the same pair.
+ */
+async function checkRemovals(body: string): Promise<RemovalTally> {
+  const tally: RemovalTally = {
+    applied: {
+      deleteNode: 0,
+      deleteEdge: 0,
+      label: 0,
+      noLabel: 0,
+      lineStyle: 0,
+      arrowhead: 0,
+      reverse: 0,
+    },
+    refused: [],
+    reordered: 0,
+    failures: [],
+  };
+  const beforeDb = await flowDbFor(body);
+  const model = parseFlowchart(body);
+  const clusterIds = model.subgraphs.map((s) => s.id);
+
+  const attempt = async (
+    what: string,
+    name: RemovalName,
+    op: FlowOp,
+    codes: readonly string[],
+    wanted: readonly string[],
+    box: string | null,
+    arrows: ReadonlySet<number>,
+    alsoNoOp: boolean,
+    after: ((db: FlowDbView) => string | null) | null = null,
+    /** How an arrow of the after db reads as its old self, for `reverse`. */
+    restore: (db: FlowDbView) => FlowDbView = (db) => db,
+  ): Promise<void> => {
+    const fail = (problem: string) => {
+      tally.failures.push(`${what}: ${problem}\n--- body\n${body}`);
+    };
+    const result = compileFlowOp(model, op);
+    if ("refused" in result) {
+      if (!codes.includes(result.refused)) {
+        fail(`refused ${result.refused}`);
+      }
+      tally.refused.push(`${what} ${result.refused}`);
+      return;
+    }
+    if (result.edits.length === 0) {
+      if (!alsoNoOp) {
+        fail("no edits");
+      }
+      return;
+    }
+    let reordered = false;
+    const checked = await broken(
+      body,
+      beforeDb,
+      result.edits,
+      wanted,
+      (dbBefore, dbAfter) => {
+        const clusters = new Set(
+          clusterIds.filter((id) => !dbAfter.vertices.some((v) => v.id === id)),
+        );
+        const was = withoutGone(dbBefore, box, arrows, clusters);
+        const now = withoutGone(restore(dbAfter), box, new Set(), clusters);
+        return dbDelta(was, now).filter((difference) => {
+          if (difference === "vertex order") {
+            reordered = true;
+            return false;
+          }
+          const id = /^edge (\d+) id$/.exec(difference);
+          if (id === null) {
+            return true;
+          }
+          const a = was.edges[Number(id[1])];
+          const b = now.edges[Number(id[1])];
+          return !(
+            a !== undefined &&
+            b !== undefined &&
+            generatedId(a.id, a.start, a.end) &&
+            generatedId(b.id, b.start, b.end)
+          );
+        });
+      },
+    );
+    if ("problem" in checked) {
+      fail(checked.problem);
+      return;
+    }
+    const problem = after?.(checked.db) ?? null;
+    if (problem !== null) {
+      fail(problem);
+      return;
+    }
+    if (reordered) {
+      tally.reordered++;
+    }
+    tally.applied[name]++;
+  };
+
+  for (const id of model.nodeOrder) {
+    const gone = new Set(
+      model.edges
+        .filter((e) => e.start === id || e.end === id)
+        .map((e) => e.index),
+    );
+    await attempt(
+      `${id} deleteNode`,
+      "deleteNode",
+      { op: "deleteNode", id },
+      ["invalid"],
+      [],
+      id,
+      gone,
+      false,
+      (db) =>
+        db.vertices.some((v) => v.id === id)
+          ? "the box is still there"
+          : db.edges.some((e) => e.start === id || e.end === id)
+            ? "an arrow of the box is still there"
+            : null,
+    );
+  }
+
+  for (const edge of model.edges) {
+    const name = `${edge.start}>${edge.end}#${edge.occurrence}`;
+    const key = {
+      start: edge.start,
+      end: edge.end,
+      occurrence: edge.occurrence,
+    };
+    const chain = model.chains[edge.chain];
+    const link = chain?.links[edge.link];
+    if (chain === undefined || link === undefined) {
+      continue;
+    }
+    const grouped = link.edges.length > 1;
+    const inGroup = grouped ? ["group", "invalid"] : ["invalid"];
+    const n = edge.index;
+    const old = beforeDb.edges[n];
+    if (old === undefined) {
+      continue;
+    }
+    const keep = new Set<number>();
+
+    await attempt(
+      `${name} deleteEdge`,
+      "deleteEdge",
+      { op: "deleteEdge", edge: key },
+      inGroup,
+      [],
+      null,
+      new Set([n]),
+      false,
+      (db) =>
+        db.edges.length === beforeDb.edges.length - 1
+          ? null
+          : "not one arrow fewer",
+    );
+
+    await attempt(
+      `${name} label`,
+      "label",
+      { op: "edgeLabel", edge: key, text: "Label" },
+      inGroup,
+      [`edge ${n} text`],
+      null,
+      keep,
+      old.text === "Label",
+      (db) =>
+        db.edges[n]?.text === "Label"
+          ? null
+          : `the label reads ${String(db.edges[n]?.text)}`,
+    );
+
+    await attempt(
+      `${name} noLabel`,
+      "noLabel",
+      { op: "edgeLabel", edge: key, text: "" },
+      inGroup,
+      old.labelType === "markdown"
+        ? [`edge ${n} text`, `edge ${n} labelType`]
+        : [`edge ${n} text`],
+      null,
+      keep,
+      old.text === "",
+      (db) =>
+        db.edges[n]?.text === ""
+          ? null
+          : `the label reads ${String(db.edges[n]?.text)}`,
+    );
+
+    for (const line of ["solid", "dotted", "thick"] as const) {
+      const invisible = old.stroke === "invisible";
+      await attempt(
+        `${name} lineStyle ${line}`,
+        "lineStyle",
+        { op: "lineStyle", edge: key, line },
+        inGroup,
+        [
+          ...(invisible && old.type !== "arrow_point"
+            ? [`edge ${n} type`]
+            : []),
+          ...(old.stroke === LINE_STROKES[line] ? [] : [`edge ${n} stroke`]),
+        ],
+        null,
+        keep,
+        old.stroke === LINE_STROKES[line],
+        (db) =>
+          db.edges[n]?.stroke === LINE_STROKES[line]
+            ? null
+            : `the stroke reads ${String(db.edges[n]?.stroke)}`,
+      );
+    }
+
+    for (const head of ["arrow", "none", "both"] as const) {
+      const invisible = old.stroke === "invisible";
+      await attempt(
+        `${name} arrowhead ${head}`,
+        "arrowhead",
+        { op: "arrowhead", edge: key, head },
+        invisible ? [...inGroup, "unsupported"] : inGroup,
+        [`edge ${n} type`],
+        null,
+        keep,
+        old.type === HEAD_TYPES[head],
+        (db) =>
+          db.edges[n]?.type === HEAD_TYPES[head]
+            ? null
+            : `the type reads ${String(db.edges[n]?.type)}`,
+      );
+    }
+
+    const loop = edge.start === edge.end;
+    await attempt(
+      `${name} reverse`,
+      "reverse",
+      { op: "reverse", edge: key },
+      chain.links.length > 1 ? ["chain"] : grouped ? ["group"] : ["invalid"],
+      [],
+      null,
+      keep,
+      loop,
+      (db) =>
+        db.edges[n]?.start === edge.end && db.edges[n]?.end === edge.start
+          ? null
+          : "the arrow does not run the other way",
+      (db) => ({
+        ...db,
+        edges: db.edges.map((e, i) =>
+          i === n
+            ? {
+                ...e,
+                start: old.start,
+                end: old.end,
+                id:
+                  generatedId(e.id, e.start, e.end) || e.id === old.id
+                    ? old.id
+                    : e.id,
+              }
+            : e,
+        ),
+      }),
+    );
+  }
+  return tally;
+}
+
+const removalTallies = new Map<string, Promise<RemovalTally>>();
+
+function removalTallyOf(name: string, body: string): Promise<RemovalTally> {
+  let tally = removalTallies.get(name);
+  if (tally === undefined) {
+    tally = checkRemovals(body);
+    removalTallies.set(name, tally);
+  }
+  return tally;
+}
+
+/** Cases the corpus does not hold, each next to a place a removal could go wrong. */
+const REMOVAL_EXTRA: readonly (readonly [string, string])[] = [
+  ...INSERT_EXTRA,
+  ["a loop", "flowchart TD\n  A --> A\n  A --> B\n  B --> B"],
+  ["only a loop", "flowchart TD\n  A --> A"],
+  [
+    "a pair twice, styled",
+    "flowchart TD\n  A --> B\n  A --> B\n  A --> B\n  linkStyle 1 stroke:#f00\n  linkStyle 2 stroke:#00f",
+  ],
+  [
+    "a shared class line",
+    "flowchart TD\n  A --> B --> C\n  class A,B x\n  class B,C y\n  classDef x fill:#fff",
+  ],
+  [
+    "a shared click line",
+    'flowchart TD\n  A --> B --> C\n  click A,B "https://x.y"\n  click C "https://x.y" "tip"',
+  ],
+  [
+    "a click URL with a ;",
+    'flowchart TD\n  A --> B; click A "https://x.y/?a=1;b=2"\n  B --> C',
+  ],
+  [
+    "statements side by side",
+    "flowchart TD\n  A --> B; B --> C; style B stroke-width:1px; linkStyle 0 stroke-width:2px; linkStyle 1 stroke-width:3px",
+  ],
+  [
+    "an accDescr block",
+    "flowchart TD\n  accDescr {\n    words\n  } A --> B; B --> C\n  C --> D",
+  ],
+  [
+    "an accDescr block with one statement",
+    "flowchart TD\n  accDescr {\n    words\n  } A --> B\n  A --> C",
+  ],
+  [
+    "one-line subgraphs",
+    "flowchart TD\n  subgraph s; A --> B; end\n  subgraph t; B --> C; C; end",
+  ],
+  [
+    "a box two subgraphs name",
+    "flowchart TD\n  subgraph s\n    A --> B\n  end\n  subgraph t\n    B --> C\n  end",
+  ],
+  [
+    "nested, the last box",
+    "flowchart TD\n  subgraph outer\n    subgraph inner\n      A\n    end\n    B\n  end\n  B --> inner",
+  ],
+  [
+    "a subgraph moved by an arrow",
+    "flowchart TD\n  subgraph s\n    A\n  end\n  subgraph t\n    B --> s\n    C\n  end",
+  ],
+  [
+    "a direction in a subgraph",
+    "flowchart TD\n  subgraph s\n    direction LR\n    A --> B\n  end\n  B --> C",
+  ],
+  [
+    "a class before the box",
+    "flowchart TD\n  A --> B\n  class B hot\n  B --> C",
+  ],
+  [
+    "a click before the box",
+    'flowchart TD\n  A --> B\n  click B "https://x.y"\n  B --> C',
+  ],
+  [
+    "a box defined twice",
+    "flowchart TD\n  A[x] --> B\n  A[y] --> C\n  B --> C",
+  ],
+  [
+    "explicit arrow ids",
+    "flowchart TD\n  A e1@--> B\n  B e2@-.->|x| C\n  C e3@-- y --> A",
+  ],
+  ["an id on a group", "flowchart TD\n  A & B e1@--> C & D"],
+  [
+    "every arrow kind",
+    "flowchart TD\n  A --- B\n  A --> B\n  A -.- B\n  A -.-> B\n  A === B\n  A ==> B\n  A ~~~ B\n  A --o B\n  A --x B\n  A o--o B\n  A x--x B\n  A <--> B\n  A <-.-> B\n  A <==> B\n  A ---> B\n  A -..-> B\n  A ===> B",
+  ],
+  [
+    "every label form",
+    'flowchart TD\n  A -->|p| B\n  A -->|"q"| B\n  A -->|"`m`"| B\n  A -- t --> B\n  A -- "u" --> B\n  A -. d .-> B\n  A == h ==> B\n  A <-- b --> B\n  A o-- c --o B\n  A ~~~|i| B',
+  ],
+  [
+    "tight ids with o and x",
+    "flowchart TD\n  A-->xray\n  B==>oauth\n  C-.->xo\n  xray---ox\n  ox-->A",
+  ],
+  [
+    "a trailing ; and a style",
+    "flowchart TD\n  A --> B;\n  B --> C;\n  style B fill:#fff;\n  linkStyle 0 stroke:#f00",
+  ],
+  [
+    "a comment on every side",
+    "flowchart TD\n  %% before\n  A --> B\n  %% between\n  B --> C\n  %% after",
+  ],
+  ["a trailing break and blanks", "flowchart TD\n\n  A --> B\n\n  B --> C\n\n"],
+  [
+    "frontmatter and a directive",
+    "---\ntitle: x\n---\n%%{init: {}}%%\nflowchart TD\n  A --> B\n  B --> C",
+  ],
+  [
+    "ids a removal can leave side by side",
+    "flowchart TD\n  A --> direction\n  B --> C\n  LR --> D",
+  ],
+];
+
+/**
+ * How many results refuse over the corpus, per op and code. Asserted whole (R28),
+ * so a suite that refuses more goes red, and each is checked above to have the
+ * reason its op can have. Printed by the opt-in path too.
+ */
+const EXPECTED_REMOVAL_REFUSALS: Readonly<Record<string, number>> = {
+  "arrowhead group": 57,
+  "arrowhead unsupported": 4,
+  "deleteEdge group": 19,
+  "label group": 19,
+  "lineStyle group": 57,
+  "noLabel group": 19,
+  "reverse chain": 9,
+  "reverse group": 19,
+};
+
+function refusalCounts(refusals: readonly string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const refusal of refusals) {
+    const words = refusal.split(" ");
+    const key = `${words[1] ?? ""} ${words.at(-1) ?? ""}`;
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Whether every line no edit overlaps keeps its own line break in `saved`. */
+function ownBreaksKept(
+  doc: string,
+  edits: readonly TextEdit[],
+  saved: string,
+): string | null {
+  const lineBreaks = (text: string) =>
+    [...text.matchAll(/([^\r\n]*)(\r\n|\n|$)/g)]
+      .slice(0, text.endsWith("\n") ? undefined : -1)
+      .map((m) => ({ text: m[1] ?? "", end: m[2] ?? "" }));
+  const before = lineBreaks(doc);
+  const now = lineBreaks(saved);
+  let from = 0;
+  let at = 0;
+  for (const line of before) {
+    const to = from + line.text.length;
+    const whole = !edits.some(
+      (e) =>
+        e.from < to + 1 && e.to > from && e.to - e.from + e.insert.length > 0,
+    );
+    from = to + 1;
+    if (!whole) {
+      continue;
+    }
+    while (at < now.length && now[at]?.text !== line.text) {
+      at++;
+    }
+    const kept = now[at];
+    if (kept === undefined) {
+      return `the line ${JSON.stringify(line.text)} is gone`;
+    }
+    if (at < now.length - 1 && line.end !== "" && kept.end !== line.end) {
+      return `the line ${JSON.stringify(line.text)} ends in ${JSON.stringify(kept.end)}`;
+    }
+    at++;
+  }
+  return null;
+}
+
+describe("every removal and arrow op, on the corpus", () => {
+  test.each(corpus)(
+    "%s",
+    async (name, body) => {
+      const tally = await removalTallyOf(name, body);
+      expect(tally.failures).toEqual([]);
+    },
+    TIMEOUT,
+  );
+
+  test.each(REMOVAL_EXTRA)(
+    "%s",
+    async (name, body) => {
+      const tally = await removalTallyOf(`extra ${name}`, body);
+      expect(tally.failures).toEqual([]);
+      expect(tally.applied.deleteNode).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the refusals over the corpus are these (R28)",
+    async () => {
+      const refused: string[] = [];
+      for (const [name, body] of corpus) {
+        const tally = await removalTallyOf(name, body);
+        refused.push(...tally.refused);
+      }
+      expect(refusalCounts(refused)).toEqual(EXPECTED_REMOVAL_REFUSALS);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "each op applies on the named fixtures, so no suite passes by refusing (R28)",
+    async () => {
+      const applied: Record<RemovalName, number> = {
+        deleteNode: 0,
+        deleteEdge: 0,
+        label: 0,
+        noLabel: 0,
+        lineStyle: 0,
+        arrowhead: 0,
+        reverse: 0,
+      };
+      let reordered = 0;
+      for (const [name, body] of corpus) {
+        if (name.startsWith("f")) {
+          const tally = await removalTallyOf(name, body);
+          reordered += tally.reordered;
+          for (const op of Object.keys(applied) as RemovalName[]) {
+            applied[op] += tally.applied[op];
+          }
+        }
+      }
+      expect(applied.deleteNode).toBeGreaterThanOrEqual(110);
+      expect(applied.deleteEdge).toBeGreaterThanOrEqual(91);
+      expect(applied.label).toBeGreaterThanOrEqual(91);
+      expect(applied.noLabel).toBeGreaterThanOrEqual(11);
+      expect(applied.lineStyle).toBeGreaterThanOrEqual(183);
+      expect(applied.arrowhead).toBeGreaterThanOrEqual(182);
+      expect(applied.reverse).toBeGreaterThanOrEqual(82);
+      expect(reordered).toBeGreaterThan(0);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a refusal really is one: without the trap's check the arrow would change ends",
+    async () => {
+      const db = await flowDbFor("flowchart TD\n  A---xray");
+      expect(db.edges[0]?.end).toBe("ray");
+      expect(db.edges[0]?.type).toBe("arrow_cross");
+    },
+    TIMEOUT,
+  );
+
+  test.each([
+    "f10-linkstyle",
+    "f13-subgraphs",
+    "f11-style-class",
+    "r05-slab-apply",
+  ])(
+    "%s keeps every line's own break, in one kind and in both",
+    (name) => {
+      const lf = corpus.find(([n]) => n === name)?.[1] ?? "";
+      const crlf = lf.replaceAll("\n", "\r\n");
+      let k = 0;
+      const mixed = lf.replaceAll("\n", () => (k++ % 2 === 0 ? "\r\n" : "\n"));
+      const model = parseFlowchart(lf);
+      const ops: FlowOp[] = [
+        ...model.nodeOrder.map((id): FlowOp => ({ op: "deleteNode", id })),
+        ...model.edges.flatMap((e): FlowOp[] => {
+          const edge = {
+            start: e.start,
+            end: e.end,
+            occurrence: e.occurrence,
+          };
+          return [
+            { op: "deleteEdge", edge },
+            { op: "edgeLabel", edge, text: "Label" },
+            { op: "edgeLabel", edge, text: "" },
+            { op: "lineStyle", edge, line: "thick" },
+            { op: "arrowhead", edge, head: "both" },
+            { op: "reverse", edge },
+          ];
+        }),
+      ];
+      let applied = 0;
+      for (const op of ops) {
+        const result = compileFlowOp(model, op);
+        if ("refused" in result || result.edits.length === 0) {
+          continue;
+        }
+        applied++;
+        const of = (doc: string) => {
+          const state = EditorState.create({
+            doc,
+            extensions: lineSeparatorFor(doc),
+          });
+          return docText(
+            state.update({
+              changes: toChanges(0, result.edits, state.lineBreak),
+            }).state,
+          );
+        };
+        expect(of(crlf)).toBe(
+          applyEdits(lf, result.edits).replaceAll("\n", "\r\n"),
+        );
+        const saved = of(mixed);
+        expect(saved.replaceAll("\r\n", "\n")).toBe(
+          applyEdits(lf, result.edits),
+        );
+        expect(ownBreaksKept(mixed, result.edits, saved)).toBeNull();
+      }
+      expect(applied).toBeGreaterThan(10);
+    },
+    TIMEOUT,
+  );
+});
+
 const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
 
 test.skipIf(folder === undefined)(
@@ -1238,9 +1884,17 @@ test.skipIf(folder === undefined)(
       drawn++;
       const tally = await checkBody(body);
       const inserts = await checkInserts(body);
+      const removals = await checkRemovals(body);
       failures.push(
-        ...[...tally.failures, ...inserts.failures].map((f) => `${file}: ${f}`),
+        ...[...tally.failures, ...inserts.failures, ...removals.failures].map(
+          (f) => `${file}: ${f}`,
+        ),
       );
+      for (const [key, count] of Object.entries(
+        refusalCounts(removals.refused),
+      )) {
+        counts[key] = (counts[key] ?? 0) + count;
+      }
       for (const refusal of inserts.refused) {
         const words = refusal.split(" ");
         const key = `${words.at(-2) === "connect" ? "connect" : (words.at(1) ?? "")} ${words.at(-1) ?? ""}`;
