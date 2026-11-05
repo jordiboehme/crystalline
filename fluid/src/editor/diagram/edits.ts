@@ -35,7 +35,8 @@ export type RefusalCode =
   | "group"
   | "chain"
   | "unsupported"
-  | "emptiesBlock";
+  | "emptiesBlock"
+  | "leavesActive";
 
 /** What an op compiler returns: the edits (and what they create) or a refusal. */
 export type OpResult =
@@ -53,6 +54,7 @@ export const NOTICES: Record<RefusalCode, string> = {
     "This diagram uses something the editor does not know yet, so it was not changed.",
   emptiesBlock:
     "That would leave a block with nothing in it, so it was not deleted.",
+  leavesActive: "That would leave an activation open, so it was not deleted.",
 };
 
 /**

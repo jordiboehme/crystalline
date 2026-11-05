@@ -7,17 +7,24 @@
  * applied, the result is parsed again, and it must be understood and read exactly
  * as the op says: the order of the participants, their labels and types, each
  * record, who is created and destroyed, and each box. That is what refuses a
- * delete that would move or lose an undeclared participant, or take the message a
- * `create` waits for. The apply layer then asks mermaid's db as well, which is the
- * only layer that sees an activation left unbalanced: the parser does not count
- * them.
+ * delete that would take the message a `create` waits for. A delete that would
+ * leave more activations open than before refuses here too, from the `+` and `-`
+ * markers and the `activate` lines. The apply layer then asks mermaid's db as well,
+ * which is the only layer that sees the other way round, a `-` with no `+` left:
+ * mermaid throws on it.
+ *
+ * mermaid builds its chain of neighbours (`prevActor`, `nextActor`) as participants
+ * are first read, and a message's width reaches a gap only through it. A second
+ * `addActor` with a label resets that actor's links and its menu, so a label is
+ * never added below a first mention: an op writes declarations on top instead,
+ * bare ones for the participants before it, which keep the order and the chain.
  *
  * Spans are read from `model.body`, the string they point into.
  */
 
 import type { OpResult, RefusalCode, Span, TextEdit } from "../edits";
 import { applyEdits } from "../edits";
-import { lineDeletions } from "../flowchart/linkStyle";
+import { lineDeletions, statementDeletions } from "../flowchart/linkStyle";
 import {
   drawsOtherwise,
   encodeConfigAlias,
@@ -49,7 +56,9 @@ export type SeqOp =
       head?: SeqHead | "both";
     }
   | { op: "deleteMessage"; target: MessageTarget }
-  | { op: "deleteParticipant"; name: string };
+  | { op: "deleteParticipant"; name: string }
+  /** The block's number among `blocksOf`. */
+  | { op: "removeBlock"; block: number };
 
 const NEW_PARTICIPANT = "New participant";
 const NEW_MESSAGE = "New message";
@@ -68,9 +77,8 @@ interface RecordRow {
 }
 
 /** What a body reads as, the parts `agreesSequence` proves against mermaid. */
-interface Reading {
-  order: string[];
-  /** Per participant, in `order`: its label and type. */
+export interface Reading {
+  /** Per participant, in mermaid's order: its label and type. */
   people: Map<string, { label: string; type: string }>;
   records: RecordRow[];
   boxes: string[][];
@@ -78,9 +86,8 @@ interface Reading {
   destroyed: Map<string, number>;
 }
 
-function readingOf(model: SeqModel): Reading {
+export function readingOf(model: SeqModel): Reading {
   return {
-    order: [...model.order],
     people: new Map(
       model.order.map((name) => {
         const p = model.participants.get(name);
@@ -108,10 +115,9 @@ function sortedEntries(map: ReadonlyMap<string, unknown>): unknown[] {
   return [...map].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-function sameReading(a: Reading, b: Reading): boolean {
+export function sameReading(a: Reading, b: Reading): boolean {
   const flat = (r: Reading): string =>
     JSON.stringify([
-      r.order,
       [...r.people],
       r.records,
       r.boxes,
@@ -292,15 +298,14 @@ function aliasEdit(
   };
 }
 
-/** The statement of a participant's first mention, when no declaration came first. */
-function firstMention(model: SeqModel, name: string): SeqStatement | undefined {
-  const line = model.participants.get(name)?.firstLine;
+/** The statement where mermaid first adds a participant. `activate` and `destroy` add nobody. */
+function firstAdd(model: SeqModel, name: string): SeqStatement | undefined {
   return model.statements.find(
     (s) =>
-      s.line === line &&
-      s.kind !== "activate" &&
-      s.kind !== "deactivate" &&
-      s.kind !== "destroy" &&
+      (s.kind === "declaration" ||
+        s.kind === "message" ||
+        s.kind === "note" ||
+        s.kind === "link") &&
       s.actors.some((actor) => actor.name === name),
   );
 }
@@ -319,6 +324,79 @@ function outermost(model: SeqModel, statement: SeqStatement): SeqStatement {
           s.depth === 0 && (s.kind === "blockStart" || s.kind === "boxStart"),
       ) ?? statement
   );
+}
+
+/**
+ * The line declarations for a mention in `statement` go above: the outermost block
+ * around it, or a `destroy` that waits for this very message.
+ */
+function topLine(model: SeqModel, statement: SeqStatement): number {
+  const holder = outermost(model, statement);
+  const previous = model.statements[model.statements.indexOf(holder) - 1];
+  return previous?.kind === "destroy" ? previous.line : holder.line;
+}
+
+/**
+ * A bare declaration per name not read yet at line `line`, which keeps mermaid's
+ * order and chain as they were. Null when one cannot take it: its own first
+ * statement is a declaration with a label, which would then be a second `addActor`,
+ * or a `create` of someone already there. A type that would be lost shows in the check.
+ */
+function bareDeclarations(
+  model: SeqModel,
+  names: readonly string[],
+  line: number,
+): string[] | null {
+  const out: string[] = [];
+  for (const name of names) {
+    const participant = model.participants.get(name);
+    if (participant === undefined || participant.firstLine < line) {
+      continue;
+    }
+    const first = firstAdd(model, name);
+    if (first?.kind === "declaration") {
+      const declared = participant.declarations[0];
+      if (
+        declared === undefined ||
+        declared.create ||
+        declared.alias !== null
+      ) {
+        return null;
+      }
+    }
+    out.push(`participant ${name}`);
+  }
+  return out;
+}
+
+/**
+ * The edit that puts `texts` as lines above line `line`, at its indent. When that
+ * line goes too and it is the body's last, its start lies inside the range that takes
+ * it, so they go in front of the range and the state's break comes with them.
+ */
+function linesAbove(
+  model: SeqModel,
+  line: number,
+  texts: readonly string[],
+  removed: readonly Span[] = [],
+): TextEdit | null {
+  const start = model.scan.lines[line]?.from;
+  if (start === undefined) {
+    return null;
+  }
+  const indent = indentOf(model, line);
+  const inside = removed.find((r) => r.from < start && start < r.to);
+  return inside
+    ? {
+        from: inside.from,
+        to: inside.from,
+        insert: texts.map((text) => `\n${indent}${text}`).join(""),
+      }
+    : {
+        from: start,
+        to: start,
+        insert: texts.map((text) => `${indent}${text}\n`).join(""),
+      };
 }
 
 function renameParticipant(
@@ -366,7 +444,11 @@ function renameParticipant(
   }
   const encoded = encodeSeqText(text);
   const declared = participant.declarations[0];
-  if (declared) {
+  const first = firstAdd(model, name);
+  if (first === undefined) {
+    return refused("invalid");
+  }
+  if (declared && first.kind === "declaration") {
     const after = declared.config?.to ?? declared.nameSpan.to;
     return checkedSeq(
       model,
@@ -374,40 +456,36 @@ function renameParticipant(
       wanted,
     );
   }
-  const mention = firstMention(model, name);
-  if (mention === undefined) {
+  // A label on a declaration below a first mention is a second `addActor`, which
+  // resets the chain and takes a menu line above it out of the drawing (R69). So the
+  // label goes on top. With a menu line standing before the declaration, it refuses.
+  if (declared && menuBefore(model, name, declared)) {
     return refused("invalid");
   }
-  const line = `participant ${name} as ${encoded}`;
-  const holder = outermost(model, mention);
-  const start = model.scan.lines[holder.line]?.from;
-  if (start !== undefined) {
-    const before = checkedSeq(
-      model,
-      [
-        {
-          from: start,
-          to: start,
-          insert: `${indentOf(model, holder.line)}${line}\n`,
-        },
-      ],
-      wanted,
-    );
-    if (!("refused" in before)) {
-      return before;
-    }
-  }
-  // Up there it would go left of a participant first mentioned after that point, or
-  // come between a `create` or `destroy` and its message. A declaration after the
-  // mention only sets the label, and the order stays as it was.
-  const after = newLineAfter(
+  const line = topLine(model, first);
+  const earlier = bareDeclarations(
     model,
-    mention.line,
-    `${indentOf(model, mention.line)}${line}`,
+    model.order.slice(0, model.order.indexOf(name)),
+    line,
   );
-  return after === null
-    ? refused("invalid")
-    : checkedSeq(model, [after], wanted);
+  const edit =
+    earlier &&
+    linesAbove(model, line, [...earlier, `participant ${name} as ${encoded}`]);
+  return edit ? checkedSeq(model, [edit], wanted) : refused("invalid");
+}
+
+/** Whether a `link`, `links`, `properties` or `details` line of `name` stands before `declared`. */
+function menuBefore(
+  model: SeqModel,
+  name: string,
+  declared: Declaration,
+): boolean {
+  return model.statements.some(
+    (s) =>
+      s.kind === "link" &&
+      s.span.from < declared.span.from &&
+      s.actors.some((actor) => actor.name === name),
+  );
 }
 
 function freeParticipantId(model: SeqModel): string {
@@ -430,16 +508,17 @@ function newParticipantPlace(model: SeqModel): {
   const end = { line: lastLine(model), indent: topLevelIndent(model) };
   const firstMessage = model.messages[0]?.line ?? Number.POSITIVE_INFINITY;
   const everyDeclared = model.order.every((name) => {
-    const p = model.participants.get(name);
-    const first = p?.declarations[0];
-    return (
-      first !== undefined &&
-      !first.create &&
-      first.line === p?.firstLine &&
-      first.line < firstMessage
-    );
+    const first = model.participants.get(name)?.declarations[0];
+    return first !== undefined && !first.create && first.line < firstMessage;
   });
   const statements = model.statements;
+  // A declaration below the first message reads the actor again, and the new line
+  // above it would change its neighbours.
+  if (
+    statements.some((s) => s.kind === "declaration" && s.line >= firstMessage)
+  ) {
+    return end;
+  }
   const declarationOf = (s: SeqStatement): Declaration | undefined =>
     model.participants
       .get(s.actors[0]?.name ?? "")
@@ -473,7 +552,6 @@ function addParticipant(model: SeqModel): OpResult {
     return refused("invalid");
   }
   const wanted = readingOf(model);
-  wanted.order.push(name);
   wanted.people.set(name, { label: NEW_PARTICIPANT, type: "participant" });
   return checkedSeq(model, [edit], wanted, { kind: "participant", name });
 }
@@ -647,27 +725,14 @@ function statementRemovals(
       wholeLines.push(index);
       continue;
     }
-    for (let i = 0; i < statements.length; i++) {
-      const first = statements[i];
-      if (first === undefined || !gone.has(first)) {
-        continue;
-      }
-      let end = i;
-      while (gone.has(statements[end + 1] as SeqStatement)) {
-        end++;
-      }
-      const last = statements[end] ?? first;
-      const next = statements[end + 1];
-      const previous = statements[i - 1];
-      parts.push(
-        next
-          ? { from: first.span.from, to: next.span.from }
-          : previous
-            ? { from: previous.span.to, to: last.span.to }
-            : { from: first.span.from, to: last.span.to },
-      );
-      i = end;
-    }
+    parts.push(
+      ...statementDeletions(
+        statements.map((statement) => statement.span),
+        new Set(
+          statements.filter((st) => gone.has(st)).map((st) => st.span.from),
+        ),
+      ),
+    );
   }
   return [...lineDeletions(model, wholeLines), ...parts];
 }
@@ -685,6 +750,92 @@ function withoutRecords(wanted: Reading, gone: ReadonlySet<number>): void {
   );
 }
 
+/** Per participant, the activations left open by the statements that are not in `gone`. */
+function openActivations(
+  model: SeqModel,
+  gone: ReadonlySet<SeqStatement>,
+): Map<string, number> {
+  const open = new Map<string, number>();
+  const add = (name: string | undefined, by: number): void => {
+    if (name !== undefined) {
+      open.set(name, (open.get(name) ?? 0) + by);
+    }
+  };
+  for (const statement of model.statements) {
+    if (gone.has(statement)) {
+      continue;
+    }
+    if (statement.kind === "activate") {
+      add(statement.actors[0]?.name, 1);
+    } else if (statement.kind === "deactivate") {
+      add(statement.actors[0]?.name, -1);
+    }
+  }
+  for (const message of model.messages) {
+    const statement =
+      model.statements[model.records[message.record]?.statement ?? -1];
+    const sign = message.arrow.activation;
+    if (statement && !gone.has(statement) && sign) {
+      if (model.body.slice(sign.from, sign.to) === "+") {
+        add(message.to, 1);
+      } else {
+        add(message.from, -1);
+      }
+    }
+  }
+  return open;
+}
+
+/**
+ * Whether taking `gone` away leaves anybody with more activations open: the source
+ * would keep its `+`, and its bar would go from the drawing without a word.
+ */
+function raisesActivations(
+  model: SeqModel,
+  gone: ReadonlySet<SeqStatement>,
+): boolean {
+  const before = openActivations(model, new Set());
+  for (const [name, count] of openActivations(model, gone)) {
+    if (count > (before.get(name) ?? 0)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * `ranges` out of the body. When that would move or lose a participant that was first
+ * read in `gone`, bare declarations on top keep it where it was (R69).
+ */
+function checkedRemoval(
+  model: SeqModel,
+  gone: ReadonlySet<SeqStatement>,
+  ranges: readonly Span[],
+  wanted: Reading,
+  leaving?: string,
+): OpResult {
+  const edits = ranges.map((span) => ({ ...span, insert: "" }));
+  const plain = checkedSeq(model, edits, wanted);
+  if (!("refused" in plain)) {
+    return plain;
+  }
+  const names = model.order.filter((name) => name !== leaving);
+  const first = (name: string) => firstAdd(model, name) as SeqStatement;
+  const needed = names.filter((name) => gone.has(first(name)));
+  const last = needed.at(-1);
+  if (last === undefined) {
+    return plain;
+  }
+  const line = Math.min(...needed.map((name) => topLine(model, first(name))));
+  const lines = bareDeclarations(
+    model,
+    names.slice(0, names.indexOf(last) + 1),
+    line,
+  );
+  const edit = lines && linesAbove(model, line, lines, ranges);
+  return edit ? checkedSeq(model, [edit, ...edits], wanted) : plain;
+}
+
 function deleteMessage(model: SeqModel, target: MessageTarget): OpResult {
   const message = messageAt(model, target);
   const statement = message
@@ -697,8 +848,45 @@ function deleteMessage(model: SeqModel, target: MessageTarget): OpResult {
   if (emptiesSection(model, gone)) {
     return refused("emptiesBlock");
   }
+  if (raisesActivations(model, gone)) {
+    return refused("leavesActive");
+  }
   const wanted = readingOf(model);
   withoutRecords(wanted, new Set(statement.records));
+  return checkedRemoval(model, gone, statementRemovals(model, gone), wanted);
+}
+
+/**
+ * Each block's own statements (its start, each `else`, `and` or `option`, its `end`),
+ * in source order of the starts. A `box` is no block. The records on these are what
+ * the drawing names: `control-structure` carries the record of a block's end.
+ */
+export function blocksOf(model: SeqModel): SeqStatement[][] {
+  const blocks: SeqStatement[][] = [];
+  const open: SeqStatement[][] = [];
+  for (const statement of model.statements) {
+    if (statement.kind === "blockStart") {
+      const block = [statement];
+      blocks.push(block);
+      open.push(block);
+    } else if (statement.kind === "blockMiddle") {
+      open.at(-1)?.push(statement);
+    } else if (statement.kind === "blockEnd") {
+      open.pop()?.push(statement);
+    }
+  }
+  return blocks;
+}
+
+/** R66: only the block's own keyword lines go. What it holds stays, with its indent. */
+function removeBlock(model: SeqModel, index: number): OpResult {
+  const own = blocksOf(model)[index];
+  if (own === undefined) {
+    return refused("gone");
+  }
+  const gone = new Set(own);
+  const wanted = readingOf(model);
+  withoutRecords(wanted, new Set(own.flatMap((s) => s.records)));
   return checkedSeq(
     model,
     statementRemovals(model, gone).map((span) => ({ ...span, insert: "" })),
@@ -744,19 +932,20 @@ function deleteParticipant(model: SeqModel, name: string): OpResult {
   if (emptiesSection(model, gone)) {
     return refused("emptiesBlock");
   }
+  if (raisesActivations(model, gone)) {
+    return refused("leavesActive");
+  }
   withoutRecords(wanted, new Set([...gone].flatMap((s) => s.records)));
-  wanted.order = wanted.order.filter((n) => n !== name);
   wanted.people.delete(name);
   wanted.boxes = wanted.boxes.map((box) => box.filter((n) => n !== name));
   wanted.created.delete(name);
   wanted.destroyed.delete(name);
-  return checkedSeq(
+  return checkedRemoval(
     model,
-    [...statementRemovals(model, gone), ...cuts].map((span) => ({
-      ...span,
-      insert: "",
-    })),
+    gone,
+    [...statementRemovals(model, gone), ...cuts],
     wanted,
+    name,
   );
 }
 
@@ -765,9 +954,11 @@ function deleteParticipant(model: SeqModel, name: string): OpResult {
  * `created` is the new participant's or message's target. `{ edits: [] }` means the
  * source already says this.
  *
- * Refusal codes: `gone` for a name or target not there; `emptiesBlock` for a delete
- * that would leave a block section empty (R56); `unsupported` for a body that is not
- * understood and a rename of a name with a space (R61); `invalid` for all the rest.
+ * Refusal codes: `gone` for a name, target or block not there; `emptiesBlock` for a
+ * delete that would leave a block section empty (R56), which `removeBlock` then opens;
+ * `leavesActive` for a delete that would leave more activations open; `unsupported`
+ * for a body that is not understood and a rename of a name with a space (R61);
+ * `invalid` for all the rest.
  */
 export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult {
   if (!model.understood) {
@@ -788,5 +979,7 @@ export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult {
       return deleteMessage(model, op.target);
     case "deleteParticipant":
       return deleteParticipant(model, op.name);
+    case "removeBlock":
+      return removeBlock(model, op.block);
   }
 }

@@ -1,16 +1,23 @@
 // Exact text for each op, then the holes the earlier reviews found: what the
 // check after the op has to see, what must refuse and what must stay as written.
 
+import { history, undo } from "@codemirror/commands";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, test } from "vitest";
 
-import { seqDbFor } from "../../../test/mermaidOracle";
+import { seqDbDelta, seqDbFor } from "../../../test/mermaidOracle";
 import { docText, lineSeparatorFor } from "../../setup";
 import { NOTICES, applyEdits, toChanges } from "../edits";
 import { requestVerdict } from "../verdict";
 import { encodeSeqText } from "./labels";
 import type { SeqTarget } from "./model";
-import { type SeqOp, compileSeqOp } from "./ops";
+import {
+  type SeqOp,
+  blocksOf,
+  compileSeqOp,
+  readingOf,
+  sameReading,
+} from "./ops";
 import { parseSequence } from "./parse";
 
 const FIXTURES = import.meta.glob<string>(
@@ -212,6 +219,8 @@ describe("encodeSeqText", () => {
   test.each<[string, string]>([
     ["plain", "plain"],
     ["one\ntwo", "one<br>two"],
+    ["a\r\nb", "a<br>b"],
+    ["a\rb", "a<br>b"],
     ["a;b", "a#59;b"],
     // R55: every #, since a bare one cuts the text.
     ["Issue #12", "Issue #35;12"],
@@ -333,43 +342,154 @@ describe("renameParticipant", () => {
     expect(run(body, { op: "renameParticipant", name, text })).toBe(want);
   });
 
+  // R69: a second addActor breaks mermaid's chain of neighbours, and a message then
+  // loses its room, so the earlier participants are declared on top with it.
   test.each<[string, string, string, string]>([
     [
-      "the receiver of the very first message would go left of its sender",
+      "the receiver of the very first message",
       "sequenceDiagram\n  a->>b: x\n  b->>a: y",
       "b",
-      "sequenceDiagram\n  a->>b: x\n  participant b as New\n  b->>a: y",
+      "sequenceDiagram\n  participant a\n  participant b as New\n  a->>b: x\n  b->>a: y",
     ],
     [
       "another undeclared one comes first inside the block",
       "sequenceDiagram\n  loop l\n    x->>y: 1\n    a->>b: 2\n  end",
       "b",
-      "sequenceDiagram\n  loop l\n    x->>y: 1\n    a->>b: 2\n    participant b as New\n  end",
+      "sequenceDiagram\n  participant x\n  participant y\n  participant a\n  participant b as New\n  loop l\n    x->>y: 1\n    a->>b: 2\n  end",
     ],
     [
-      "the line before waits for this message (create)",
-      "sequenceDiagram\n  create participant w\n  a->>w: x",
-      "a",
-      "sequenceDiagram\n  create participant w\n  a->>w: x\n  participant a as New",
+      "only those not read yet",
+      "sequenceDiagram\n  a->>a: 1\n  b->>c: 2",
+      "c",
+      "sequenceDiagram\n  a->>a: 1\n  participant b\n  participant c as New\n  b->>c: 2",
     ],
     [
-      "the line before waits for this message (destroy)",
+      "a later statement on the same line",
+      "sequenceDiagram\n  a->>b: x;c->>d: y",
+      "d",
+      "sequenceDiagram\n  participant a\n  participant b\n  participant c\n  participant d as New\n  a->>b: x;c->>d: y",
+    ],
+    [
+      "a sender with a space takes a bare declaration",
+      "sequenceDiagram\n  Web App->>B: x",
+      "B",
+      "sequenceDiagram\n  participant Web App\n  participant B as New\n  Web App->>B: x",
+    ],
+    [
+      "above a destroy, which waits for this message",
       "sequenceDiagram\n  participant w\n  destroy w\n  a->>w: x\n  a->>a: y",
       "a",
-      "sequenceDiagram\n  participant w\n  destroy w\n  a->>w: x\n  participant a as New\n  a->>a: y",
+      "sequenceDiagram\n  participant w\n  participant a as New\n  destroy w\n  a->>w: x\n  a->>a: y",
     ],
-  ])(
-    "undeclared, with the order at stake: after the mention, because %s",
-    async (_, body, name, want) => {
-      const after = run(body, { op: "renameParticipant", name, text: "New" });
-      expect(after).toBe(want);
-      const [before, now] = [await seqDbFor(body), await seqDbFor(after)];
-      expect(now.actors.map((a) => a.name)).toEqual(
-        before.actors.map((a) => a.name),
-      );
-      expect(now.actors.find((a) => a.name === name)?.description).toBe("New");
-    },
-  );
+    [
+      "a late bare declaration stays as written",
+      "sequenceDiagram\n  a->>b: long\n  participant b\n  b->>a: y",
+      "b",
+      "sequenceDiagram\n  participant a\n  participant b as New\n  a->>b: long\n  participant b\n  b->>a: y",
+    ],
+    [
+      "a late declaration on the mention's own line",
+      "sequenceDiagram\n  a->>b: x; participant b",
+      "b",
+      "sequenceDiagram\n  participant a\n  participant b as New\n  a->>b: x; participant b",
+    ],
+    [
+      "a menu line that comes first, with no declaration, stays read",
+      "sequenceDiagram\n  a->>b: 1; link b: D @ https://e.com\n  b->>a: 2",
+      "b",
+      "sequenceDiagram\n  participant a\n  participant b as New\n  a->>b: 1; link b: D @ https://e.com\n  b->>a: 2",
+    ],
+  ])("undeclared: %s", async (_, body, name, want) => {
+    const after = run(body, { op: "renameParticipant", name, text: "New" });
+    expect(after).toBe(want);
+    const [before, now] = [await seqDbFor(body), await seqDbFor(after)];
+    // Only the label: the chain and the menus are in this delta.
+    expect(seqDbDelta(before, now)).toEqual([`actor ${name} description`]);
+  });
+
+  test.each<[string, string, string]>([
+    [
+      "a create's message: its sender goes right of the created one",
+      "sequenceDiagram\n  create participant w\n  a->>w: x",
+      "a",
+    ],
+    [
+      "an earlier one created inside the block",
+      "sequenceDiagram\n  loop l\n    create participant w\n    a->>w: x\n    a->>b: y\n  end",
+      "b",
+    ],
+    [
+      "an earlier one with its type inside the block",
+      'sequenceDiagram\n  loop l\n    participant x@{ "type": "queue" }\n    x->>b: y\n  end',
+      "b",
+    ],
+    [
+      "an earlier actor inside the block",
+      "sequenceDiagram\n  loop l\n    actor x\n    x->>b: y\n  end",
+      "b",
+    ],
+    [
+      "an earlier one with its alias inside the block",
+      "sequenceDiagram\n  loop l\n    participant x as X\n    x->>b: y\n  end",
+      "b",
+    ],
+    [
+      "a body with its statement on the header line",
+      "sequenceDiagram; a->>b: x",
+      "b",
+    ],
+  ])("undeclared, with no room on top: %s refuses", (_, body, name) => {
+    expect(code(body, { op: "renameParticipant", name, text: "New" })).toBe(
+      "invalid",
+    );
+  });
+
+  // R69, finding 2.
+  test.each<[string, string]>([
+    ["link", "link b: D @ https://e.com"],
+    ["links", 'links b: {"D": "https://e.com"}'],
+    ["properties", 'properties b: {"class": "k"}'],
+    ["details", "details b: d"],
+  ])("a %s line before the declaration refuses the alias", (_, menu) => {
+    const late = `sequenceDiagram\n  a->>b: 1\n  ${menu}\n  participant b\n  b->>a: 2`;
+    expect(
+      code(late, { op: "renameParticipant", name: "b", text: "New" }),
+    ).toBe("invalid");
+    const first = `sequenceDiagram\n  ${menu}\n  participant b`;
+    expect(
+      code(first, { op: "renameParticipant", name: "b", text: "New" }),
+    ).toBe("invalid");
+  });
+
+  test("a late declaration with its menu line below it goes on top", async () => {
+    const body =
+      "sequenceDiagram\n  a->>b: 1\n  participant b\n  link b: D @ https://e.com";
+    const after = run(body, {
+      op: "renameParticipant",
+      name: "b",
+      text: "New",
+    });
+    expect(after).toBe(
+      "sequenceDiagram\n  participant a\n  participant b as New\n  a->>b: 1\n  participant b\n  link b: D @ https://e.com",
+    );
+    expect(seqDbDelta(await seqDbFor(body), await seqDbFor(after))).toEqual([
+      "actor b description",
+    ]);
+  });
+
+  test("a menu line after the declaration stays read", async () => {
+    const body =
+      "sequenceDiagram\n  participant b\n  link b: D @ https://e.com";
+    const after = run(body, {
+      op: "renameParticipant",
+      name: "b",
+      text: "New",
+    });
+    expect(after).toContain("participant b as New\n");
+    expect(seqDbDelta(await seqDbFor(body), await seqDbFor(after))).toEqual([
+      "actor b description",
+    ]);
+  });
 
   test("s02: every implicit participant keeps the db's order", async () => {
     const body = fixture("s02");
@@ -407,13 +527,17 @@ describe("renameParticipant", () => {
     );
   });
 
-  test("an alias on a later actor line would turn a participant into an actor: it refuses", () => {
-    // mermaid ignores `actor c` here, since it brings no label. With one it counts.
+  test("a later actor line, which mermaid ignores, stays ignored", async () => {
+    // With ` as L` on that line it would count, and turn `c` into an actor.
     const body = "sequenceDiagram\n  c->>a: x\n  actor c";
     expect(parseSequence(body).participants.get("c")?.type).toBe("participant");
-    expect(code(body, { op: "renameParticipant", name: "c", text: "L" })).toBe(
-      "invalid",
+    const after = run(body, { op: "renameParticipant", name: "c", text: "L" });
+    expect(after).toBe(
+      "sequenceDiagram\n  participant c as L\n  c->>a: x\n  actor c",
     );
+    expect(seqDbDelta(await seqDbFor(body), await seqDbFor(after))).toEqual([
+      "actor c description",
+    ]);
   });
 
   test("a name the declaration form reads otherwise refuses", () => {
@@ -970,19 +1094,109 @@ describe("deleteMessage", () => {
     ).toBe("invalid");
   });
 
-  test.each<[string, string, MessageTarget]>([
+  // R69: the participants stay, on top, where they were read until now.
+  test.each<[string, string, MessageTarget, string]>([
+    [
+      "the only message",
+      "sequenceDiagram\n    Alice->>Bob: hi",
+      message("Alice", "Bob", "hi"),
+      "sequenceDiagram\n    participant Alice\n    participant Bob",
+    ],
     [
       "an undeclared participant would move",
       "sequenceDiagram\n  a->>b: x\n  b->>a: y",
       message("a", "b", "x"),
+      "sequenceDiagram\n  participant a\n  participant b\n  b->>a: y",
     ],
     [
       "an undeclared participant would vanish",
       "sequenceDiagram\n  participant a\n  a->>b: x\n  a->>a: y",
       message("a", "b", "x"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>a: y",
     ],
-  ])("%s: it refuses, nothing moves on its own", (_, body, target) => {
-    expect(code(body, { op: "deleteMessage", target })).toBe("invalid");
+    [
+      "inside a block: above the block",
+      "sequenceDiagram\n  loop l\n    x->>y: 1\n    a->>b: 2\n    b->>x: 3\n  end",
+      message("x", "y", "1"),
+      "sequenceDiagram\n  participant x\n  participant y\n  loop l\n    a->>b: 2\n    b->>x: 3\n  end",
+    ],
+    [
+      "those read before it in the block go on top with it",
+      "sequenceDiagram\n  loop l\n    x->>y: 1\n    a->>b: 2\n    b->>x: 3\n  end",
+      message("a", "b", "2"),
+      "sequenceDiagram\n  participant x\n  participant y\n  participant a\n  participant b\n  loop l\n    x->>y: 1\n    b->>x: 3\n  end",
+    ],
+    [
+      "on a shared line, the rest stays",
+      "sequenceDiagram\n  a->>b: 1;b->>a: 2",
+      message("a", "b", "1"),
+      "sequenceDiagram\n  participant a\n  participant b\n  b->>a: 2",
+    ],
+  ])(
+    "%s: the delete applies and the order stays",
+    async (_, body, target, want) => {
+      const after = run(body, { op: "deleteMessage", target });
+      expect(after).toBe(want);
+      const [before, now] = [await seqDbFor(body), await seqDbFor(after)];
+      expect(now.actors).toEqual(before.actors);
+      expect(now.facts).toEqual(before.facts);
+    },
+  );
+
+  test("no lines are added when nothing would move", () => {
+    expect(
+      run("sequenceDiagram\n  a->>b: 1\n  a->>b: 2", {
+        op: "deleteMessage",
+        target: message("a", "b", "1"),
+      }),
+    ).toBe("sequenceDiagram\n  a->>b: 2");
+  });
+
+  // R69, finding 3: the source would keep its `+` and the bar would go from the drawing.
+  test.each<[string, string, MessageTarget]>([
+    [
+      "the - of a +",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: ask\n  b-->>-a: reply\n  a->>b: later\n  b->>a: much later",
+      message("b", "a", "reply"),
+    ],
+    [
+      "one of two stacked",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>+b: 2\n  b-->>-a: 3\n  b-->>-a: 4",
+      message("b", "a", "3"),
+    ],
+    [
+      "the - of an activate line",
+      "sequenceDiagram\n  participant a\n  participant b\n  activate b\n  b-->>-a: x\n  a->>b: y",
+      message("b", "a", "x"),
+    ],
+  ])(
+    "a delete that leaves more open activations refuses: %s",
+    (_, body, target) => {
+      expect(code(body, { op: "deleteMessage", target })).toBe("leavesActive");
+    },
+  );
+
+  test.each<[string, string, MessageTarget, string]>([
+    [
+      "a + with its later - stays: mermaid's verify answers that one",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>b: 2",
+      message("a", "b", "1"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: 2",
+    ],
+    [
+      "a plain message beside an open activation",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>b: 2\n  b-->>-a: 3",
+      message("a", "b", "2"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  b-->>-a: 3",
+    ],
+  ])("no more open than before: %s", (_, body, target, want) => {
+    expect(run(body, { op: "deleteMessage", target })).toBe(want);
+  });
+
+  test("the notice for it is plain", () => {
+    expect(NOTICES.leavesActive).toBe(
+      "That would leave an activation open, so it was not deleted.",
+    );
   });
 
   // R56.
@@ -1190,16 +1404,10 @@ describe("deleteParticipant", () => {
       "invalid",
     ],
     [
-      "s02's proxy: the others would vanish",
-      fixture("s02"),
-      "proxy",
-      "invalid",
-    ],
-    [
-      "another undeclared would move",
-      "sequenceDiagram\n  a->>b: 1\n  c->>b: 2",
-      "a",
-      "invalid",
+      "the - that closes another's +",
+      "sequenceDiagram\n  participant a\n  participant b\n  participant c\n  a->>+b: 1\n  b-->>-c: 2\n  a->>b: 3",
+      "c",
+      "leavesActive",
     ],
     [
       "R56: its message is the last in a block",
@@ -1215,6 +1423,30 @@ describe("deleteParticipant", () => {
     ],
   ])("%s", (_, body, name, want) => {
     expect(code(body, { op: "deleteParticipant", name })).toBe(want);
+  });
+
+  // R69: the others stay, on top.
+  test.each<[string, string, string, string]>([
+    [
+      "the only message",
+      "sequenceDiagram\n    Alice->>Bob: hi",
+      "Alice",
+      "sequenceDiagram\n    participant Bob",
+    ],
+    [
+      "another undeclared would move",
+      "sequenceDiagram\n  a->>b: 1\n  c->>b: 2",
+      "a",
+      "sequenceDiagram\n  participant b\n  c->>b: 2",
+    ],
+    [
+      "s02's proxy: the others would vanish",
+      fixture("s02"),
+      "proxy",
+      "sequenceDiagram\n    %% nobody is declared, the order comes from the first mention\n    participant browser\n    participant daemon",
+    ],
+  ])("%s: the delete applies", (_, body, name, want) => {
+    expect(run(body, { op: "deleteParticipant", name })).toBe(want);
   });
 
   test("a note over two in a block keeps the section", () => {
@@ -1277,12 +1509,20 @@ describe("R51: every remaining line keeps its own break, through a real state", 
     );
   });
 
-  test("a declaration inserted after a line", () => {
+  test("declarations on top, each with the state's break", () => {
     const doc = "sequenceDiagram\r\n  a->>b: x\n  b->>a: y\r\n  b->>b: z";
     expect(
       saved(doc, { op: "renameParticipant", name: "b", text: "New" }),
     ).toBe(
-      "sequenceDiagram\r\n  a->>b: x\n  participant b as New\r\n  b->>a: y\r\n  b->>b: z",
+      "sequenceDiagram\r\n  participant a\r\n  participant b as New\r\n  a->>b: x\n  b->>a: y\r\n  b->>b: z",
+    );
+  });
+
+  test("removeBlock: each keyword line goes with its own break", () => {
+    const doc =
+      "sequenceDiagram\r\n  participant a\n  loop l\r\n    a->>a: x\n  end\r\n  a->>a: y";
+    expect(saved(doc, { op: "removeBlock", block: 0 })).toBe(
+      "sequenceDiagram\r\n  participant a\n    a->>a: x\n  a->>a: y",
     );
   });
 
@@ -1328,4 +1568,191 @@ describe("R51: every remaining line keeps its own break, through a real state", 
       "sequenceDiagram\r\n    participant caller as Caller\n    caller->>caller: Last",
     );
   });
+});
+
+describe("removeBlock (R66)", () => {
+  const P = "sequenceDiagram\n  participant a\n  participant b\n";
+
+  test.each<[string, string, string]>([
+    ["loop", `${P}  loop l\n    a->>b: x\n  end\n`, `${P}    a->>b: x\n`],
+    ["opt", `${P}  opt l\n    a->>b: x\n  end\n`, `${P}    a->>b: x\n`],
+    ["break", `${P}  break l\n    a->>b: x\n  end\n`, `${P}    a->>b: x\n`],
+    [
+      "rect",
+      `${P}  rect rgb(1,2,3)\n    a->>b: x\n  end\n`,
+      `${P}    a->>b: x\n`,
+    ],
+    [
+      "alt with sections",
+      `${P}  alt one\n    a->>b: x\n  else two\n    Note over a: n\n  else\n    b->>a: y\n  end\n`,
+      `${P}    a->>b: x\n    Note over a: n\n    b->>a: y\n`,
+    ],
+    [
+      "par with sections",
+      `${P}  par one\n    a->>b: x\n  and two\n    b->>a: y\n  end\n`,
+      `${P}    a->>b: x\n    b->>a: y\n`,
+    ],
+    [
+      "par over",
+      `${P}  par_over one\n    a->>b: x\n  and two\n    b->>a: y\n  end\n`,
+      `${P}    a->>b: x\n    b->>a: y\n`,
+    ],
+    [
+      "critical with sections",
+      `${P}  critical one\n    a->>b: x\n  option two\n    b->>a: y\n  end\n`,
+      `${P}    a->>b: x\n    b->>a: y\n`,
+    ],
+    ["empty by hand", `${P}  loop l\n  end\n  a->>b: x`, `${P}  a->>b: x`],
+    [
+      "on one line with its messages",
+      `${P}  loop l; a->>b: z; b->>a: w; end\n  a->>b: x`,
+      `${P}  a->>b: z; b->>a: w\n  a->>b: x`,
+    ],
+    [
+      "comments inside stay",
+      `${P}  loop l\n    %% one\n    a->>b: x\n    %% two\n  end %% tail\n`,
+      `${P}    %% one\n    a->>b: x\n    %% two\n   %% tail\n`,
+    ],
+  ])("%s", async (_, body, want) => {
+    const after = run(body, { op: "removeBlock", block: 0 });
+    expect(after).toBe(want);
+    const [before, now] = [await seqDbFor(body), await seqDbFor(after)];
+    const kept = (list: typeof before.records) =>
+      list
+        .filter((r) => r.from !== undefined)
+        .map((r) => [r.from, r.to, r.message, r.type, r.placement]);
+    expect(kept(now.records)).toEqual(kept(before.records));
+    expect(now.actors).toEqual(before.actors);
+  });
+
+  test("nested: only the one named goes, in source order of the starts", () => {
+    const body = `${P}  loop outer\n    a->>b: 1\n    opt inner\n      a->>b: 2\n    end\n    a->>b: 3\n  end`;
+    expect(blocksOf(parseSequence(body))).toHaveLength(2);
+    expect(run(body, { op: "removeBlock", block: 0 })).toBe(
+      `${P}    a->>b: 1\n    opt inner\n      a->>b: 2\n    end\n    a->>b: 3`,
+    );
+    expect(run(body, { op: "removeBlock", block: 1 })).toBe(
+      `${P}  loop outer\n    a->>b: 1\n      a->>b: 2\n    a->>b: 3\n  end`,
+    );
+  });
+
+  test("blocksOf holds each block's own statements, with the records the drawing names", () => {
+    const body = `${P}  alt one\n    a->>b: 1\n  else two\n    a->>b: 2\n  end\n  loop l\n    a->>b: 3\n  end`;
+    const model = parseSequence(body);
+    const blocks = blocksOf(model);
+    expect(blocks.map((own) => own.map((s) => s.kind))).toEqual([
+      ["blockStart", "blockMiddle", "blockEnd"],
+      ["blockStart", "blockEnd"],
+    ]);
+    expect(blocks.map((own) => own.flatMap((s) => s.records))).toEqual([
+      [0, 2, 4],
+      [5, 7],
+    ]);
+  });
+
+  test.each([1, -1, 0.5])("block %d is gone", (block) => {
+    expect(
+      code(`${P}  loop l\n    a->>b: x\n  end`, { op: "removeBlock", block }),
+    ).toBe("gone");
+  });
+
+  test("a box is no block", () => {
+    const body = "sequenceDiagram\n  box L\n    participant a\n  end";
+    expect(code(body, { op: "removeBlock", block: 0 })).toBe("gone");
+  });
+
+  test("the route R56 promises: the block goes first, then its last message", () => {
+    const body = `${P}  loop l\n    a->>b: x\n  end`;
+    const target = message("a", "b", "x");
+    expect(code(body, { op: "deleteMessage", target })).toBe("emptiesBlock");
+    const open = run(body, { op: "removeBlock", block: 0 });
+    expect(run(open, { op: "deleteMessage", target })).toBe(
+      "sequenceDiagram\n  participant a\n  participant b",
+    );
+  });
+
+  test("one undo step", () => {
+    const doc = `${P}  alt one\n    a->>b: x\n  else two\n    b->>a: y\n  end`;
+    const state = EditorState.create({ doc, extensions: [history()] });
+    const { edits } = compiled(doc, { op: "removeBlock", block: 0 });
+    expect(edits.length).toBeGreaterThan(1);
+    const after = state.update({
+      changes: toChanges(0, edits, state.lineBreak),
+    }).state;
+    expect(after.doc.toString()).toBe(`${P}    a->>b: x\n    b->>a: y`);
+    let undone = after;
+    undo({
+      state: after,
+      dispatch: (tr) => {
+        undone = tr.state;
+      },
+    });
+    expect(undone.doc.toString()).toBe(doc);
+  });
+});
+
+describe("sameReading compares each field", () => {
+  const BODY =
+    "sequenceDiagram\n  box L\n    participant a as A\n  end\n  participant b\n  autonumber\n  a->>b: x\n  Note over a: n\n  create participant c\n  a->>c: y\n  destroy c\n  a-xc: z";
+
+  test.each<[string, (r: ReturnType<typeof readingOf>) => void]>([
+    [
+      "a label",
+      (r) => (
+        r.people.set("a", { label: "Z", type: "participant" }),
+        undefined
+      ),
+    ],
+    [
+      "a type",
+      (r) => (r.people.set("a", { label: "A", type: "actor" }), undefined),
+    ],
+    [
+      "the order",
+      (r) => {
+        r.people = new Map([...r.people].reverse());
+      },
+    ],
+    ["one person fewer", (r) => void r.people.delete("b")],
+    ["one record fewer", (r) => void r.records.pop()],
+    ["a record's from", (r) => recordAt(r, "x", (x) => (x.from = "b"))],
+    ["a record's to", (r) => recordAt(r, "x", (x) => (x.to = "a"))],
+    ["a record's type", (r) => recordAt(r, "x", (x) => (x.type = 1))],
+    ["a record's text", (r) => recordAt(r, "x", (x) => (x.text = "other"))],
+    ["a record's placement", (r) => recordAt(r, "n", (x) => (x.placement = 0))],
+    [
+      "an autonumber",
+      (r) => {
+        const row = r.records[0];
+        if (row) {
+          row.autonumber = "null";
+        }
+      },
+    ],
+    ["a box's members", (r) => void r.boxes[0]?.push("b")],
+    ["a box fewer", (r) => void r.boxes.pop()],
+    ["who is created", (r) => void r.created.delete("c")],
+    ["where it is created", (r) => void r.created.set("c", 0)],
+    ["who is destroyed", (r) => void r.destroyed.delete("c")],
+    ["where it is destroyed", (r) => void r.destroyed.set("c", 0)],
+  ])("%s", (_, tamper) => {
+    const model = parseSequence(BODY);
+    expect(model.reasons).toEqual([]);
+    expect(sameReading(readingOf(model), readingOf(model))).toBe(true);
+    const tampered = readingOf(model);
+    tamper(tampered);
+    expect(sameReading(tampered, readingOf(model))).toBe(false);
+  });
+
+  function recordAt(
+    reading: ReturnType<typeof readingOf>,
+    text: string,
+    change: (row: ReturnType<typeof readingOf>["records"][number]) => void,
+  ): void {
+    const row = reading.records.find((r) => r.text === text);
+    expect(row).toBeDefined();
+    if (row) {
+      change(row);
+    }
+  }
 });

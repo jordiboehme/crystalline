@@ -247,8 +247,23 @@ export interface SequenceRecordView {
   placement?: number;
 }
 
+/**
+ * What else mermaid keeps on an actor, in `actors` order. The drawing uses both: a
+ * message's width reaches a gap only through `prevActor` and `nextActor`, and the
+ * menu comes from `links` and `properties`. A second `addActor` with a label resets
+ * them, which no other field of this view shows.
+ */
+export interface SequenceActorFacts {
+  name: string;
+  prevActor: string | undefined;
+  nextActor: string | undefined;
+  links: Record<string, unknown>;
+  properties: Record<string, unknown>;
+}
+
 export interface SequenceDbView {
   actors: SequenceActorView[];
+  facts: SequenceActorFacts[];
   records: SequenceRecordView[];
   /** Each box's members. Its colour and title depend on the DOM's CSS support, so they are left out. */
   boxes: { actors: string[] }[];
@@ -260,7 +275,18 @@ export interface SequenceDbView {
 
 /** The part of mermaid's SequenceDB this module reads. */
 interface RawSequenceDb {
-  getActors(): Map<string, { name: string; description: string; type: string }>;
+  getActors(): Map<
+    string,
+    {
+      name: string;
+      description: string;
+      type: string;
+      prevActor?: string;
+      nextActor?: string;
+      links?: Record<string, unknown>;
+      properties?: Record<string, unknown>;
+    }
+  >;
   getMessages(): {
     id: string;
     from?: string;
@@ -302,6 +328,13 @@ export async function sequenceDbOf(
         name: a.name,
         description: a.description,
         type: a.type,
+      })),
+      facts: [...db.getActors().values()].map((a) => ({
+        name: a.name,
+        prevActor: a.prevActor,
+        nextActor: a.nextActor,
+        links: { ...a.links },
+        properties: { ...a.properties },
       })),
       records: db.getMessages().map((m) => ({
         id: m.id,

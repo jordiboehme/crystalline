@@ -37,7 +37,7 @@ export function lineDeletions(
  * keeps something else. Neighbours go as one run, with the `;` beside the run, and
  * no other statement and no accDescr `}` goes with them (R33).
  */
-function statementDeletions(
+export function statementDeletions(
   statements: readonly Span[],
   gone: ReadonlySet<number>,
 ): Span[] {

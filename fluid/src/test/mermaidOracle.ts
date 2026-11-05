@@ -200,6 +200,7 @@ export async function seqDbFor(body: string): Promise<SequenceDbView> {
  *
  * - `actor <name> added`, `actor <name> removed`, `actor order`
  * - `actor <name> description`, `actor <name> type`
+ * - `actor <name> prevActor`, `nextActor`, `links`, `properties`
  * - `record <n> added`, `record <n> removed` (by position in the list)
  * - `record <n> id`, `from`, `to`, `message`, `type`, `placement`, `autonumber`
  * - `box <n> added`, `box <n> removed`, `box <n> actors`
@@ -231,6 +232,20 @@ export function seqDbDelta(
     }
     if (old.type !== actor.type) {
       out.push(`actor ${name} type`);
+    }
+    const oldFacts = before.facts.find((f) => f.name === name);
+    const facts = after.facts.find((f) => f.name === name);
+    for (const field of ["prevActor", "nextActor"] as const) {
+      if (oldFacts?.[field] !== facts?.[field]) {
+        out.push(`actor ${name} ${field}`);
+      }
+    }
+    for (const field of ["links", "properties"] as const) {
+      if (
+        JSON.stringify(oldFacts?.[field]) !== JSON.stringify(facts?.[field])
+      ) {
+        out.push(`actor ${name} ${field}`);
+      }
     }
   }
   const kept = (

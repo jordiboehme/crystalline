@@ -12,7 +12,7 @@ import { type SequenceDbView, sequenceDbOf } from "../mermaidDb";
 import { agreesSequence, normalizeLabel } from "../verdict";
 import { drawsOtherwise, tidySeqText } from "./labels";
 import type { SeqHead, SeqModel, SeqTarget } from "./model";
-import { type SeqOp, compileSeqOp } from "./ops";
+import { type SeqOp, blocksOf, compileSeqOp } from "./ops";
 import { decodeSeqText, parseSequence } from "./parse";
 
 const TIMEOUT = 300_000;
@@ -173,7 +173,8 @@ type OpName =
   | "deleteMessage"
   | "deleteParticipant"
   | "addParticipant"
-  | "addMessage";
+  | "addMessage"
+  | "removeBlock";
 
 interface Tally {
   applied: Record<OpName, number>;
@@ -196,6 +197,7 @@ function emptyTally(): Tally {
       deleteParticipant: 0,
       addParticipant: 0,
       addMessage: 0,
+      removeBlock: 0,
     },
     refused: [],
     verifyRefused: [],
@@ -297,6 +299,7 @@ function dbWithout(
   return {
     ...out,
     actors: out.actors.filter((a) => a.name !== name),
+    facts: out.facts.filter((f) => f.name !== name),
     boxes: out.boxes.map((b) => ({
       actors: b.actors.filter((a) => a !== name),
     })),
@@ -322,10 +325,12 @@ function occurrencesIn(model: SeqModel, db: SequenceDbView): number[] {
 }
 
 interface Wanted {
-  /** The exact differences from the db before. */
-  delta?: readonly string[];
+  /** The exact differences from the db before, which take in the chain and the menus. */
+  delta?: readonly string[] | ((after: SequenceDbView) => readonly string[]);
   /** Or: the db the result must be. */
   db?: SequenceDbView;
+  /** Leave the chain out of that: a participant that goes changes its neighbours'. */
+  chainMoves?: boolean;
   /** A last look at the db after. */
   holds?: (after: SequenceDbView) => string | null;
 }
@@ -345,10 +350,14 @@ async function broken(
   if (moved.length > 0) {
     return `untouched lines changed: ${JSON.stringify(moved)}`;
   }
-  if (
-    JSON.stringify(commentLines(before)) !== JSON.stringify(commentLines(after))
-  ) {
-    return "a %% line changed";
+  // Each stays, in order. `end %% tail` without its `end` is one more comment line.
+  const left = commentLines(after);
+  let found = 0;
+  for (const line of commentLines(before)) {
+    found = left.indexOf(line, found) + 1;
+    if (found === 0) {
+      return "a %% line changed";
+    }
   }
   const model = parseSequence(after);
   if (!model.understood) {
@@ -365,10 +374,24 @@ async function broken(
   if (difference !== null) {
     return `disagrees: ${difference}`;
   }
+  const noChain = (view: SequenceDbView): SequenceDbView => ({
+    ...view,
+    facts: view.facts.map((f) => ({
+      ...f,
+      prevActor: undefined,
+      nextActor: undefined,
+    })),
+  });
   const delta = wanted.db
-    ? seqDbDelta(wanted.db, db)
+    ? wanted.chainMoves
+      ? seqDbDelta(noChain(wanted.db), noChain(db))
+      : seqDbDelta(wanted.db, db)
     : seqDbDelta(beforeDb, db);
-  const expected = wanted.db ? [] : wanted.delta;
+  const expected = wanted.db
+    ? []
+    : typeof wanted.delta === "function"
+      ? wanted.delta(db)
+      : wanted.delta;
   if (expected && JSON.stringify(delta) !== JSON.stringify(expected)) {
     return `delta ${JSON.stringify(delta)}, wanted ${JSON.stringify(expected)}`;
   }
@@ -448,8 +471,8 @@ async function checkBody(body: string): Promise<Tally> {
       `delete ${name}`,
       "deleteParticipant",
       { op: "deleteParticipant", name },
-      { db: dbWithout(model, db, name) },
-      ["invalid", "emptiesBlock"],
+      { db: dbWithout(model, db, name), chainMoves: true },
+      ["invalid", "emptiesBlock", "leavesActive"],
     );
   }
 
@@ -502,7 +525,29 @@ async function checkBody(body: string): Promise<Tally> {
       "deleteMessage",
       { op: "deleteMessage", target },
       { db: withoutRecords(db, new Set(recordsOfLine(model, record))) },
-      ["invalid", "emptiesBlock"],
+      ["invalid", "emptiesBlock", "leavesActive"],
+    );
+  }
+
+  for (const [block, own] of blocksOf(model).entries()) {
+    await runOp(
+      tally,
+      body,
+      db,
+      `remove block ${String(block)}`,
+      "removeBlock",
+      { op: "removeBlock", block },
+      {
+        db: withoutRecords(db, new Set(own.flatMap((s) => s.records))),
+        holds: (after) => {
+          const kept = (list: SequenceDbView["records"]) =>
+            list.filter((r) => r.from !== undefined).length;
+          return kept(after.records) === kept(db.records)
+            ? null
+            : "a message or note went with the block";
+        },
+      },
+      [],
     );
   }
 
@@ -521,7 +566,13 @@ async function checkBody(body: string): Promise<Tally> {
     "addParticipant",
     { op: "addParticipant" },
     {
-      delta: [`actor ${free} added`],
+      // The one mermaid read last now has it as its neighbour.
+      delta: (after) => {
+        const before = after.facts.find((f) => f.name === free)?.prevActor;
+        return before === undefined
+          ? [`actor ${free} added`]
+          : [`actor ${before} nextActor`, `actor ${free} added`];
+      },
       holds: (after) => {
         const last = after.actors.at(-1);
         return last?.name === free &&
@@ -601,10 +652,12 @@ describe("every op on the corpus", () => {
     expect(total.applied.renameParticipant).toBeGreaterThanOrEqual(126);
     expect(total.applied.renameMessage).toBeGreaterThanOrEqual(243);
     expect(total.applied.arrowStyle).toBeGreaterThanOrEqual(2187);
-    expect(total.applied.deleteMessage).toBeGreaterThanOrEqual(211);
-    expect(total.applied.deleteParticipant).toBeGreaterThanOrEqual(92);
+    expect(total.applied.deleteMessage).toBeGreaterThanOrEqual(203);
+    expect(total.applied.deleteParticipant).toBeGreaterThanOrEqual(94);
     expect(total.applied.addParticipant).toBe(corpus.length);
     expect(total.applied.addMessage).toBeGreaterThanOrEqual(249);
+    // Every block of the corpus.
+    expect(total.applied.removeBlock).toBe(31);
     // Each message has one arrow out of ten that it already is.
     expect(total.noEdit).toBe(243);
   });
@@ -804,6 +857,60 @@ describe("a text lands as typed, on every holder", () => {
   );
 });
 
+describe("the table the browser draws (R69)", () => {
+  const FILE = "e2e/fixtures/sequence-room.json";
+  const LONG = "Could you please send me the signed contract today";
+  const LONGER = "and the second copy of the same contract to the other office";
+  const ROWS: readonly (readonly [string, string, string])[] = [
+    [
+      "the receiver of the first message",
+      `sequenceDiagram\n    Alice->>Bob: ${LONG}`,
+      "Bob",
+    ],
+    [
+      "a participant between two long messages",
+      `sequenceDiagram\n    a->>b: ${LONG}\n    b->>c: ${LONGER}`,
+      "b",
+    ],
+    [
+      "a late bare declaration",
+      `sequenceDiagram\n    a->>b: ${LONG}\n    participant b\n    b->>a: y`,
+      "b",
+    ],
+    [
+      "first mentioned inside a block",
+      `sequenceDiagram\n    loop l\n        x->>y: ${LONG}\n        y->>z: ${LONGER}\n    end`,
+      "z",
+    ],
+  ];
+
+  function table(): string {
+    const rows = ROWS.map(([name, body, participant]) => {
+      const result = compileSeqOp(parseSequence(body), {
+        op: "renameParticipant",
+        name: participant,
+        text: "Robert",
+      });
+      if ("refused" in result) {
+        throw new Error(`${name}: refused ${result.refused}`);
+      }
+      return { name, body, after: applyEdits(body, result.edits) };
+    });
+    return `${JSON.stringify(rows, null, 2)}\n`;
+  }
+
+  test("is what the op writes today", () => {
+    // Regenerate with FLUID_WRITE_SEQUENCE_ROOM=1.
+    const fs = node.process.getBuiltinModule("node:fs") as Fs & {
+      writeFileSync: (path: string, text: string) => void;
+    };
+    if (node.process.env.FLUID_WRITE_SEQUENCE_ROOM !== undefined) {
+      fs.writeFileSync(FILE, table());
+    }
+    expect(fs.readFileSync(FILE, "utf8")).toBe(table());
+  });
+});
+
 const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
 
 test.skipIf(folder === undefined)(
@@ -846,16 +953,17 @@ test.skipIf(folder === undefined)(
 
 /**
  * addMessage: s10's two destroyed participants, in eight of its nine pairs.
- * emptiesBlock: R56. deleteMessage invalid: a message a `create` or `destroy` waits
- * for, and s02's first message, whose loss would move `browser`. deleteParticipant
- * invalid: a participant others are mentioned only with.
+ * emptiesBlock: R56. leavesActive: the `-` of a `+` that would stay open. invalid: a
+ * message a `create` or `destroy` waits for, on the delete of a message and of s10's
+ * host and worker.
  */
 const CORPUS_REFUSALS: Record<string, number> = {
   "addMessage invalid": 8,
   "deleteMessage emptiesBlock": 13,
-  "deleteMessage invalid": 8,
+  "deleteMessage invalid": 7,
+  "deleteMessage leavesActive": 9,
   "deleteParticipant emptiesBlock": 29,
-  "deleteParticipant invalid": 4,
+  "deleteParticipant invalid": 2,
 };
 /** An activation left unbalanced, which only mermaid's db sees. */
 const CORPUS_VERIFY_REFUSALS: Record<string, number> = {
@@ -865,11 +973,13 @@ const CORPUS_VERIFY_REFUSALS: Record<string, number> = {
 const EXTRA_REFUSALS: Record<string, number> = {
   "addMessage invalid": 15,
   "deleteMessage emptiesBlock": 4,
-  "deleteMessage invalid": 19,
+  "deleteMessage invalid": 7,
+  "deleteMessage leavesActive": 2,
   "deleteParticipant emptiesBlock": 10,
-  "deleteParticipant invalid": 27,
-  // `x@y`, which the declaration form reads otherwise.
-  "renameParticipant invalid": 1,
+  "deleteParticipant invalid": 9,
+  // `x@y`, which the declaration form reads otherwise; a `create`'s undeclared sender,
+  // which cannot go on top of the created one; the two names on a header's own line.
+  "renameParticipant invalid": 4,
   // R61: `Web App`, `User One` and the `Web App` of the body with an alias beside it.
   "renameParticipant unsupported": 3,
 };
