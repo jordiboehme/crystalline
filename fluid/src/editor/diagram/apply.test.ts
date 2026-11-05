@@ -10,7 +10,7 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import { EditorState, StateEffect } from "@codemirror/state";
+import { EditorState, StateEffect, Transaction } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -20,6 +20,7 @@ import {
   bytes,
   cleanupMarkViews,
   markView,
+  redoOnce,
   setRaw,
   undoOnce,
   undoSteps,
@@ -132,17 +133,138 @@ describe.each([
   });
 
   test("the op is one undo step, whatever was typed just before", async () => {
-    const view = viewOf(DOC, room);
+    // The clock the manager and the history read stands still, so the typing
+    // and the op are inside the capture window however slow the machine is.
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    try {
+      const view = viewOf(DOC, room);
+      const { kind } = withVerify(() => OK);
+      typeAt(view, 0, "x");
+      await runDiagramOp(view, ANCHOR + 1, kind, RENAME);
+      expect(bytes(view.state)).toBe(`x${RENAMED}`);
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(`x${DOC}`);
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(DOC);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test("an op of several edits is one undo step, and redo brings it all back", async () => {
+    const body = [
+      "flowchart TD",
+      "    A --> B",
+      "    B --> C",
+      "    C --> B",
+      "    style B fill:#fff",
+      "    D --> E",
+    ].join("\n");
+    const text = `${fenced(body)}\n`;
+    const op: FlowOp = { op: "deleteNode", id: "B" };
+    const compiled = compileFlowOp(parseFlowchart(body), op);
+    expect("edits" in compiled && compiled.edits.length).toBeGreaterThan(1);
+    const view = viewOf(text, room);
     const { kind } = withVerify(() => OK);
-    const start = performance.now();
-    typeAt(view, 0, "x");
-    await runDiagramOp(view, ANCHOR + 1, kind, RENAME);
-    expect(performance.now() - start).toBeLessThan(400);
-    expect(bytes(view.state)).toBe(`x${RENAMED}`);
+    const before = undoSteps(view);
+    await runDiagramOp(view, 0, kind, op);
+    const after = bytes(view.state);
+    expect(after).not.toBe(text);
+    expect(undoSteps(view)).toBe(before + 1);
     undoOnce(view);
-    expect(bytes(view.state)).toBe(`x${DOC}`);
+    expect(bytes(view.state)).toBe(text);
+    redoOnce(view);
+    expect(bytes(view.state)).toBe(after);
     undoOnce(view);
+    expect(bytes(view.state)).toBe(text);
+  });
+
+  test("the write says input.diagram", async () => {
+    const view = viewOf(DOC, room);
+    const events: (string | undefined)[] = [];
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            if (tr.docChanged)
+              events.push(tr.annotation(Transaction.userEvent));
+          }
+        }),
+      ),
+    });
+    const { kind } = withVerify(() => OK);
+    await runDiagramOp(view, ANCHOR, kind, RENAME);
+    expect(events).toEqual(["input.diagram"]);
+  });
+
+  test("edits that do not fit the body refuse rather than reject", async () => {
+    const view = viewOf(DOC, room);
+    const { kind, asked } = withVerify(() => OK);
+    const overlapping = {
+      ...kind,
+      compile: () => ({
+        edits: [
+          { from: 0, to: 5, insert: "a" },
+          { from: 2, to: 3, insert: "b" },
+        ],
+      }),
+    };
+    await expect(
+      runDiagramOp(view, ANCHOR, overlapping, RENAME),
+    ).resolves.toEqual({ applied: false, refused: "invalid" });
+    expect(asked).toEqual([]);
     expect(bytes(view.state)).toBe(DOC);
+    expect(tracked(view)).toBe(0);
+  });
+
+  test("a page that ended during verify says nothing, whatever else went wrong", async () => {
+    for (const verify of [
+      () => Promise.reject<Verdict>(new Error("no mermaid")),
+      () => Promise.resolve<Verdict>({ ok: false, reason: "no" }),
+    ]) {
+      const view = viewOf(DOC, room);
+      const { kind, asked } = withVerify(() => {
+        view.dispatch({
+          effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+        });
+        return verify();
+      });
+      await expect(runDiagramOp(view, ANCHOR, kind, RENAME)).resolves.toEqual({
+        applied: false,
+        noop: true,
+      });
+      expect(asked).toHaveLength(1);
+    }
+  });
+
+  test("a page that ended while the body changed compiles nothing more", async () => {
+    const view = viewOf(DOC, room);
+    const { kind, asked } = withVerify(() => {
+      view.dispatch({
+        changes: { from: DOC.indexOf("First"), insert: "x" },
+        effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+      });
+      return OK;
+    });
+    await expect(runDiagramOp(view, ANCHOR, kind, RENAME)).resolves.toEqual({
+      applied: false,
+      noop: true,
+    });
+    expect(asked).toHaveLength(1);
+  });
+
+  test("a fence inside a list is not a body this layer edits", async () => {
+    const text = `- item\n\n  \`\`\`mermaid\n  flowchart TD\n    A --> B\n  \`\`\`\n`;
+    const view = viewOf(text, room);
+    const { kind, asked } = withVerify(() => OK);
+    await expect(
+      runDiagramOp(view, text.indexOf("flowchart"), kind, {
+        op: "addChild",
+        id: "A",
+      }),
+    ).resolves.toEqual({ applied: false, refused: "unsupported" });
+    expect(asked).toEqual([]);
+    expect(bytes(view.state)).toBe(text);
   });
 
   test("typing right after the op, right beside its edit, is a step of its own", async () => {
@@ -529,6 +651,20 @@ describe.each([
     expect(seen).toEqual([false]);
   });
 
+  test("a dark view's verdict is asked in dark", async () => {
+    const view = viewOf(DOC, room);
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(EditorView.darkTheme.of(true)),
+    });
+    const seen: boolean[] = [];
+    const { kind } = withVerify((_body, dark) => {
+      seen.push(dark);
+      return OK;
+    });
+    await runDiagramOp(view, ANCHOR, kind, RENAME);
+    expect(seen).toEqual([true]);
+  });
+
   test("a parse that stopped short of the fence is carried on, not read as gone", async () => {
     const filler = "A paragraph of words that fills the page.\n\n".repeat(4000);
     const text = `${filler}${fenced(BODY)}\n`;
@@ -598,6 +734,87 @@ describe("line breaks through a real view (R51)", () => {
     );
   });
 
+  describe("deleting a body's last line (R68)", () => {
+    const LAST = [
+      "```mermaid\r\n",
+      "flowchart TD\r\n",
+      "    A --> B\n",
+      "    B --> A\r\n",
+      "```\r\n",
+    ].join("");
+
+    test("deleteEdge leaves the line before it its own break", async () => {
+      const view = viewOf(LAST, false, { lineSeparator: "\r\n" });
+      await expect(
+        runDiagramOp(view, 0, flowKind, {
+          op: "deleteEdge",
+          edge: { start: "B", end: "A", occurrence: 0 },
+        }),
+      ).resolves.toEqual({ applied: true });
+      expect(bytes(view.state)).toBe(LAST.replace("    B --> A\r\n", ""));
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(LAST);
+    });
+
+    test("deleteNode leaves the line before it its own break", async () => {
+      const text = LAST.replace("    B --> A", "    C");
+      const view = viewOf(text, false, { lineSeparator: "\r\n" });
+      await expect(
+        runDiagramOp(view, 0, flowKind, { op: "deleteNode", id: "C" }),
+      ).resolves.toEqual({ applied: true });
+      expect(bytes(view.state)).toBe(text.replace("    C\r\n", ""));
+      undoOnce(view);
+      expect(bytes(view.state)).toBe(text);
+    });
+
+    test("deleteEdge in an all-CRLF and an LF document stays exact", async () => {
+      const crlfDoc = LAST.replace("B\n", "B\r\n");
+      for (const [text, lineSeparator] of [
+        [crlfDoc, "\r\n"],
+        [crlfDoc.replaceAll("\r\n", "\n"), "\n"],
+      ] as const) {
+        const view = viewOf(text, false, { lineSeparator });
+        await runDiagramOp(view, 0, flowKind, {
+          op: "deleteEdge",
+          edge: { start: "B", end: "A", occurrence: 0 },
+        });
+        expect(bytes(view.state)).toBe(
+          text.replace(`    B --> A${lineSeparator}`, ""),
+        );
+      }
+    });
+
+    test("the verified text is what lands", async () => {
+      const view = viewOf(LAST, false, { lineSeparator: "\r\n" });
+      const { kind, asked } = withVerify(() => OK);
+      await runDiagramOp(view, 0, kind, {
+        op: "deleteEdge",
+        edge: { start: "B", end: "A", occurrence: 0 },
+      });
+      expect(asked).toEqual(["flowchart TD\n    A --> B"]);
+      expect(view.state.doc.toString()).toContain(
+        `flowchart TD\n    A --> B\n\`\`\``,
+      );
+    });
+  });
+
+  test("in a room a CRLF text keeps its returns in the lines, so no fence is offered and none is written", async () => {
+    // The screens pin LF in a room, so a line ends in `\r`.
+    for (const op of [
+      RENAME,
+      ADD,
+      { op: "deleteNode", id: "B" },
+      { op: "direction", value: "LR" },
+    ] satisfies FlowOp[]) {
+      const view = markView(crlf, { ...modeOptions(), room: true });
+      await expect(runDiagramOp(view, ANCHOR, flowKind, op)).resolves.toEqual({
+        applied: false,
+        refused: "gone",
+      });
+      expect(bytes(view.state)).toBe(crlf);
+    }
+  });
+
   test("a fence framed by lone breaks in a CRLF document is no fence, and is left alone", async () => {
     const text = `a\r\nb\n\`\`\`mermaid\n${BODY}\n\`\`\`\n`;
     const view = viewOf(text, false, { lineSeparator: "\r\n" });
@@ -631,6 +848,26 @@ describe("a waiting composition (D60)", () => {
     await runDiagramOp(view, ANCHOR, kind, RENAME);
     expect(seen.length).toBeGreaterThan(0);
     expect(bytes(view.state)).toBe(RENAMED);
+    view.destroy();
+  });
+
+  test("whose judge changes the fence is judged before the first compile", async () => {
+    let waiting = true;
+    const view = judged((v) => {
+      if (waiting) {
+        waiting = false;
+        v.dispatch({
+          changes: { from: DOC.indexOf("First"), insert: "Very " },
+        });
+      }
+    });
+    const { kind, asked } = withVerify(() => OK);
+    await expect(runDiagramOp(view, ANCHOR, kind, RENAME)).resolves.toEqual({
+      applied: true,
+    });
+    expect(asked).toEqual([
+      BODY.replace("First", "Very First").replace("Next step", "Done"),
+    ]);
     view.destroy();
   });
 

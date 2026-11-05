@@ -90,6 +90,50 @@ const stubbed = (verify: () => Verdict) => ({
   verify: () => Promise.resolve(verify()),
 });
 
+test("an op of several edits is one Y transaction and one stack item", async () => {
+  const body = [
+    "flowchart TD",
+    "    A --> B",
+    "    B --> C",
+    "    C --> B",
+    "    style B fill:#fff",
+    "    D --> E",
+  ].join("\n");
+  const text = `\`\`\`mermaid\n${body}\n\`\`\`\n`;
+  const room = roomMain(text, [diagramAnchors]);
+  let transactions = 0;
+  room.local.on("afterTransaction", () => {
+    transactions++;
+  });
+  const items = room.undoManager.undoStack.length;
+  await runDiagramOp(
+    room.main,
+    0,
+    stubbed(() => OK),
+    { op: "deleteNode", id: "B" },
+  );
+  expect(bytes(room.main.state)).not.toBe(text);
+  expect(transactions).toBe(1);
+  expect(room.undoManager.undoStack.length).toBe(items + 1);
+  room.undoManager.undo();
+  expect(bytes(room.main.state)).toBe(text);
+  expect(room.rtext.toJSON()).toBe(text);
+  room.undoManager.redo();
+  expect(bytes(room.main.state)).not.toBe(text);
+  expect(room.rtext.toJSON()).toBe(bytes(room.main.state));
+});
+
+test("a CRLF text in a room's two peers refuses gone, and neither peer changes", async () => {
+  const crlf = DOC.replaceAll("\n", "\r\n");
+  const { local, peer, sync } = markPeers(crlf);
+  await expect(
+    runDiagramOp(local, ANCHOR, flowKind, { op: "addChild", id: "A" }),
+  ).resolves.toEqual({ applied: false, refused: "gone" });
+  sync();
+  expect(bytes(local.state)).toBe(crlf);
+  expect(bytes(peer.state)).toBe(crlf);
+});
+
 describe.each([
   ["markPeers", surfaceRoom],
   ["roomMain", cellKitRoom],

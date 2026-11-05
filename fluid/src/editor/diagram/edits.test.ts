@@ -57,6 +57,29 @@ describe("applyEdits", () => {
 });
 
 describe("toChanges", () => {
+  test("with the body, a deletion of the last lines takes the last line's break instead of the first's", () => {
+    const body = "a\nb\nc";
+    expect(toChanges(10, [{ from: 3, to: 5, insert: "" }], "\n", body)).toEqual(
+      [{ from: 14, to: 16, insert: "" }],
+    );
+    expect(toChanges(10, [{ from: 1, to: 5, insert: "" }], "\n", body)).toEqual(
+      [{ from: 12, to: 16, insert: "" }],
+    );
+  });
+
+  test("with the body, any other edit stays where it is", () => {
+    const body = "a\nb\nc;d";
+    for (const edit of [
+      { from: 1, to: 3, insert: "" }, // not to the body's end
+      { from: 3, to: 7, insert: "x" }, // not a pure deletion
+      { from: 5, to: 7, insert: "" }, // does not start at a line break
+    ]) {
+      expect(toChanges(10, [edit], "\n", body)).toEqual([
+        { from: 10 + edit.from, to: 10 + edit.to, insert: edit.insert },
+      ]);
+    }
+  });
+
   test("shifts by the body start and writes the document's line break", () => {
     expect(toChanges(10, [{ from: 1, to: 1, insert: "\nx" }], "\r\n")).toEqual([
       { from: 11, to: 11, insert: "\r\nx" },

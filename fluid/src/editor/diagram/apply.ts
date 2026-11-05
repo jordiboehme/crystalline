@@ -68,6 +68,14 @@ const refusal = (refused: RefusalCode) =>
   ({ applied: false, refused }) as const;
 const NOOP = { applied: false, noop: true } as const;
 
+/**
+ * Whether an IME is composing. The judge stands back then, and a write would
+ * end the composition's log unjudged, so the person would lose their Bold.
+ */
+function composingNow(view: EditorView): boolean {
+  return view.composing || view.compositionStarted;
+}
+
 /** Whether the page takes a write: an ended Reflection does not. */
 function writable(view: EditorView): boolean {
   const { state } = view;
@@ -135,9 +143,12 @@ function trackedFence(view: EditorView, ticket: number): MermaidFence | null {
 }
 
 /**
- * Runs `op` on the mermaid fence at `anchor`. It does not reject. A page that
- * takes no writes, or stopped taking them while the op waited, gives `noop`:
- * no page offers an op there, and every other writer does nothing on one.
+ * Runs `op` on the mermaid fence at `anchor`, a position in the text as it
+ * stands when this is called. It does not reject. A page that takes no writes,
+ * or stopped taking them while the op waited, gives `noop`: no page offers an op
+ * there, and every other writer does nothing on one. A running composition gives
+ * `stale`. A fence that is not top level gives `unsupported`: its body carries
+ * prefixes, and no page offers it.
  */
 export async function runDiagramOp<M, O, Created>(
   view: EditorView,
@@ -148,13 +159,26 @@ export async function runDiagramOp<M, O, Created>(
   if (!writable(view)) {
     return NOOP;
   }
-  judgeBeforeCommand(view);
-  let fence = readFence(view, anchor);
-  if (fence === null) {
-    return refusal("gone");
+  if (composingNow(view)) {
+    return refusal("stale");
   }
-  let ticket: number | null = null;
+  // From before the judge: its correction moves what the caller pointed at.
+  const ticket = ++lastTicket;
+  view.dispatch({ effects: trackAnchor.of({ ticket, pos: anchor }) });
   try {
+    judgeBeforeCommand(view);
+    let fence = trackedFence(view, ticket);
+    if (fence === null) {
+      return refusal("gone");
+    }
+    if (!fence.topLevel) {
+      return refusal("unsupported");
+    }
+    // Inside the body: an insert right before the fence or right at the body
+    // stays clear of it, and a deletion of the fence runs across it.
+    view.dispatch({
+      effects: trackAnchor.of({ ticket, pos: fence.bodyFrom }),
+    });
     for (let pass = 0; pass < 2; pass++) {
       const result = compiled(kind, fence.body, op);
       if ("refused" in result) {
@@ -167,23 +191,24 @@ export async function runDiagramOp<M, O, Created>(
       if (next === null) {
         return refusal("invalid");
       }
-      if (ticket === null) {
-        // Inside the body: an insert right before the fence or right at the
-        // body stays clear of it, and a deletion of the fence runs across it.
-        ticket = ++lastTicket;
-        view.dispatch({
-          effects: trackAnchor.of({ ticket, pos: fence.bodyFrom }),
-        });
-      }
       const verdict = await verdictOn(
         kind,
         next,
         view.state.facet(EditorView.darkTheme),
       );
+      if (!writable(view)) {
+        return NOOP;
+      }
+      if (composingNow(view)) {
+        return refusal("stale");
+      }
       judgeBeforeCommand(view);
       const now = trackedFence(view, ticket);
       if (now === null) {
         return refusal("gone");
+      }
+      if (!now.topLevel) {
+        return refusal("unsupported");
       }
       if (now.body !== fence.body) {
         fence = now;
@@ -192,11 +217,13 @@ export async function runDiagramOp<M, O, Created>(
       if (!verdict.ok) {
         return refusal(verdict.unavailable ? "unchecked" : "invalid");
       }
-      if (!writable(view)) {
-        return NOOP;
-      }
       dispatchIsolated(view, {
-        changes: toChanges(now.bodyFrom, result.edits, view.state.lineBreak),
+        changes: toChanges(
+          now.bodyFrom,
+          result.edits,
+          view.state.lineBreak,
+          now.body,
+        ),
         userEvent: "input.diagram",
       });
       return result.created === undefined
@@ -206,7 +233,6 @@ export async function runDiagramOp<M, O, Created>(
     return refusal("stale");
   } finally {
     if (
-      ticket !== null &&
       view.dom.isConnected &&
       view.state.field(diagramAnchors, false)?.has(ticket)
     ) {

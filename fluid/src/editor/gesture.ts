@@ -23,7 +23,8 @@ import { dispatchIsolated } from "./roomUndo";
  * Dispatches `spec` as one undo step of its own, and says whether it did.
  * A caller reads the text after its own `judgeBeforeCommand` call; if the
  * judge here still changed the text, the spec's positions are stale and
- * nothing is dispatched (false).
+ * nothing is dispatched (false). Nothing is dispatched while an IME composes
+ * either (false).
  */
 export function dispatchGesture(
   view: EditorView,
@@ -32,6 +33,11 @@ export function dispatchGesture(
   const before = view.state.doc;
   judgeBeforeCommand(view);
   if (view.state.doc !== before) {
+    return false;
+  }
+  // The judge stands back while an IME composes, and a write would end the
+  // composition's log unjudged: the person's Bold would be lost.
+  if (view.composing || view.compositionStarted) {
     return false;
   }
   dispatchIsolated(view, spec);

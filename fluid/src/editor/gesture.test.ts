@@ -12,9 +12,15 @@ import {
   Transaction,
 } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { bytes, cleanupMarkViews, markView, undoOnce } from "../test/markKit";
+import {
+  bytes,
+  cleanupMarkViews,
+  keys,
+  markView,
+  undoOnce,
+} from "../test/markKit";
 import { commandJudge } from "./marks/commandJudge";
 import { dispatchGesture } from "./gesture";
 import { setPictureAlign, setPictureSize } from "./pictures/verbs";
@@ -54,6 +60,48 @@ describe("dispatchGesture", () => {
       undoOnce(view);
       expect(bytes(view.state)).toBe(states[0]);
     });
+  }
+
+  for (const mode of ["hidden", "show"] as const) {
+    for (const room of [false, true]) {
+      it(`writes nothing during a composition, and the person's Bold survives (${mode}, room ${room})`, () => {
+        vi.useFakeTimers();
+        try {
+          const view = markView(`ab\n\n${DOC}`, { mode, room });
+          view.dispatch({
+            selection: EditorSelection.cursor(2),
+            userEvent: "select.pointer",
+          });
+          keys(view, "Mod-b");
+          let on = true;
+          for (const name of ["composing", "compositionStarted"]) {
+            Object.defineProperty(view, name, {
+              configurable: true,
+              get: () => on,
+            });
+          }
+          view.dispatch({
+            changes: { from: 2, insert: "cd" },
+            selection: EditorSelection.cursor(4),
+            userEvent: "input.type.compose.start",
+          });
+          expect(
+            dispatchGesture(view, {
+              changes: { from: 0, insert: "y" },
+              userEvent: "input.format",
+            }),
+          ).toBe(false);
+          on = false;
+          view.contentDOM.dispatchEvent(
+            new Event("compositionend", { bubbles: true }),
+          );
+          vi.advanceTimersByTime(60);
+          expect(bytes(view.state)).toBe(`ab**cd**\n\n${DOC}`);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    }
   }
 
   it("judges a waiting composition before it dispatches", () => {
