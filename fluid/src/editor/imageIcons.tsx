@@ -1,6 +1,7 @@
 /**
- * The eight glyphs the image-format menu is built from: the trigger, the four
- * placements and the three width presets.
+ * The ten glyphs the image-format menu and the picture options are built
+ * from: the trigger, the four placements, the three width presets, the
+ * original size and the removal.
  *
  * Drawn here rather than taken from the icon set, for the reason the table
  * glyphs and the paperclip are: they stand in the same row at the same 24-unit
@@ -107,6 +108,28 @@ const IMAGE_WIDTH_50: Shape[] = [
 const IMAGE_WIDTH_75: Shape[] = [
   WIDTH_FRAME,
   { kind: "rect", x: 6, y: 11, width: 9.5, height: 2, rx: 0.5, filled: true },
+];
+
+/** Its own size: a one to one in the same bar, no share of it filled. */
+const IMAGE_ORIGINAL: Shape[] = [
+  WIDTH_FRAME,
+  { kind: "path", d: "M9.5 11v2" },
+  { kind: "path", d: "M14.5 11v2" },
+  { kind: "circle", cx: 12, cy: 11.25, r: 0.6, filled: true },
+  { kind: "circle", cx: 12, cy: 12.75, r: 0.6, filled: true },
+];
+
+/**
+ * Remove: a bin with its lid and two lines down it. Drawn here rather than
+ * taken from the icon set, so the bar's chunk needs no shared icon chunk of
+ * its own, and so it stands at the family's own weight beside the others.
+ */
+const IMAGE_REMOVE: Shape[] = [
+  { kind: "path", d: "M5 7h14" },
+  { kind: "path", d: "M10 7V5h4v2" },
+  { kind: "path", d: "M7 7l1 12h8l1-12" },
+  { kind: "path", d: "M10.5 10.5v5" },
+  { kind: "path", d: "M13.5 10.5v5" },
 ];
 
 interface GlyphProps {
@@ -223,4 +246,14 @@ export function ImageWidth50Icon(props: GlyphProps): ReactElement {
 /** A three-quarter-width bar. */
 export function ImageWidth75Icon(props: GlyphProps): ReactElement {
   return <Glyph name="image-width-75" shapes={IMAGE_WIDTH_75} {...props} />;
+}
+
+/** The picture at its own size, read as one to one. */
+export function ImageOriginalIcon(props: GlyphProps): ReactElement {
+  return <Glyph name="image-original" shapes={IMAGE_ORIGINAL} {...props} />;
+}
+
+/** Remove the picture. */
+export function ImageRemoveIcon(props: GlyphProps): ReactElement {
+  return <Glyph name="image-remove" shapes={IMAGE_REMOVE} {...props} />;
 }

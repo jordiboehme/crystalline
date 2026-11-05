@@ -587,10 +587,13 @@ jobs:
 
   # The Claude Desktop launcher and the two bundle manifests. The launcher
   # is plain Node, so its tests run here on every change rather than only
-  # when a release packs it.
+  # when a release packs it. The hollow bundle is built on the user's machine
+  # by `crystalline install claude-desktop`; CI stages the same source with
+  # the hidden `desktop-bundle` command and checks it, so it needs the
+  # binary built first.
   mcpb:
     name: mcpb
-    timeout-minutes: 10
+    timeout-minutes: 30
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
@@ -598,6 +601,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The ubuntu test leg's entry (same profile, same target dir). Read only.
+          shared-key: test
+          save-if: false
+
+      - name: Build crystalline
+        run: cargo build -p crystalline --locked
 
       # The same pin and major as the fluid job.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -608,21 +623,29 @@ jobs:
         run: node --test packaging/mcpb/shim/
 
       - name: Both manifests carry what they must
+        env:
+          CRYSTALLINE_BIN: target/debug/crystalline
         run: bash packaging/mcpb/tests/check-manifests.sh
 
       # The packer is pinned like the release's. validate checks the schema
       # and the icon only, never a binary, so the Desktop-only stage gets a
-      # placeholder file.
-      - name: Both bundles validate and the standard one packs
+      # placeholder file. The hollow stage is packed by mcpb (what a user's
+      # machine builds); the zip our own writer makes is unpacked and
+      # validated too.
+      - name: Both bundles validate and the hollow one packs
         shell: bash
         run: |
           set -euo pipefail
-          packaging/mcpb/generate-manifest.sh standard 0.0.0 bundle/standard
-          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/standard
-          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle/standard crystalline-claude-desktop-v0.0.0.mcpb
+          crystalline=target/debug/crystalline
+          "$crystalline" desktop-bundle hollow bundle/hollow --binary /opt/homebrew/bin/crystalline --pack bundle/own.mcpb
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/hollow
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle/hollow bundle/hollow.mcpb
+          mkdir -p bundle/own
+          unzip -q bundle/own.mcpb -d bundle/own
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/own
+          "$crystalline" desktop-bundle desktop-only bundle/desktop-only
           mkdir -p bundle/desktop-only/server
           printf 'placeholder\n' > bundle/desktop-only/server/crystalline
-          packaging/mcpb/generate-manifest.sh desktop-only 0.0.0 bundle/desktop-only
           npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/desktop-only
 
   # The browser smoke: the built bundle, a real daemon and a real browser. It

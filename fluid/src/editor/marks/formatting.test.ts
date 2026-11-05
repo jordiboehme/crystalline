@@ -393,6 +393,32 @@ describe.each([
     keys(v, "Mod-b");
     expect(bytes(v.state)).toBe("hello");
   });
+
+  // A format on a selection changes its visible characters where the marks
+  // show too, so a pair it falls inside is split rather than broken.
+  it.each([
+    // The selection after the press holds the word, not its new marks.
+    ["**a word** z", 4, 8, "Mod-b", "**a** word z", [6, 10]],
+    ["*a word* z", 3, 7, "Mod-i", "*a* word z", [4, 8]],
+    ["**word a** z", 2, 6, "Mod-b", "word **a** z", [0, 4]],
+    ["a **word** z", 2, 10, "Mod-b", "a word z", [2, 6]],
+    ["a word z", 2, 6, "Mod-b", "a **word** z", [4, 8]],
+    // The selected space before the word stays selected, outside the marks.
+    ["a word z", 1, 6, "Mod-b", "a **word** z", [1, 8]],
+    ["**a** word z", 6, 10, "Mod-b", "**a** **word** z", [8, 12]],
+  ] as const)(
+    "%j, %i to %i, %s keeps the pairs",
+    (text, from, to, key, want, after) => {
+      const v = markView(text, { mode: "show", room });
+      select(v, from, to);
+      keys(v, key);
+      expect(bytes(v.state)).toBe(want);
+      const { main } = v.state.selection;
+      expect([main.from, main.to]).toEqual(after);
+      undoOnce(v);
+      expect(bytes(v.state)).toBe(text);
+    },
+  );
 });
 
 describe("Raw", () => {

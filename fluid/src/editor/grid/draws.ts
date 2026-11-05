@@ -1,15 +1,17 @@
 /**
  * What the eager side of the table grid shares with the lazy chunk: the test
- * for which tables the grid draws, and the two facets the chunk and the
- * preview layers talk through. Eager, so it imports only types from the
- * syntax tree and the table parser - never `./index`.
+ * for which tables the grid draws, and the facets the chunk, the preview
+ * layers and the picture drop landing talk through. Eager, so it imports
+ * only types from the syntax tree and the grid's structure, and the table
+ * parser - never `./index`.
  */
 
-import type { Extension } from "@codemirror/state";
+import type { EditorState, Extension } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
 import type { SyntaxNodeRef } from "@lezer/common";
 
 import { parseTable } from "../tableModel";
+import type { GridTable } from "./structure";
 
 /** The slice of a document `gridDraws` reads the table's text through. */
 export interface TextSource {
@@ -56,3 +58,15 @@ export function gridDraws(node: SyntaxNodeRef, doc: TextSource): boolean {
   }
   return parseTable(doc.sliceString(node.from, node.to)) !== null;
 }
+
+/**
+ * The tables the grid draws in a state. Past where the parse reaches, the
+ * grid keeps the tables it drew, read again at their mapped places (D58):
+ * the open cell is read from those until the tree reaches them, and a
+ * picture dropped over one lands below it rather than inside its source. The
+ * grid provides it; it lives here, on the eager side, so neither the open
+ * cell nor the drop landing imports the grid, and the landing pulls nothing
+ * of the lazy chunk into the eager bundle.
+ */
+export const drawnGridTables =
+  Facet.define<(state: EditorState) => readonly GridTable[]>();

@@ -36,6 +36,7 @@ import {
   WidgetType,
 } from "@codemirror/view";
 
+import type { AssetResolver } from "../../api/files";
 import type { WikilinkResolver } from "../../wikilinks";
 import { elementEditCell } from "../elementEdit";
 import { floatingCell } from "../floatingContext";
@@ -44,11 +45,13 @@ import { hidesIdLines } from "../hiddenIdLines";
 import { formatCell } from "../marks/formatting";
 import { PARSE_BUDGET } from "../marks/parse";
 import { parseAdvanced } from "../parseProgress";
+import { pictureAssets } from "../pictures/refs";
 import { parseTable } from "../tableModel";
 import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
+import { drawnGridTables } from "./draws";
 import {
   disposeChrome,
   mapChromeMenus,
@@ -58,7 +61,6 @@ import {
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import { cellPaste } from "./gridPaste";
 import {
-  drawnGridTables,
   gridWritable,
   mountedCell,
   onCellClosed,
@@ -77,6 +79,8 @@ const mainOf = new WeakMap<HTMLElement, EditorView>();
 const shownOf = new WeakMap<HTMLElement, GridTable>();
 /** The resolver a grid root's chips were drawn with. */
 const resolverOf = new WeakMap<HTMLElement, WikilinkResolver | undefined>();
+/** The page's picture resolver a grid root's images were drawn with. */
+const assetsOf = new WeakMap<HTMLElement, AssetResolver>();
 /** The text each static cell element was drawn from. */
 const drawnOf = new WeakMap<HTMLElement, string>();
 /** The cell element hosting the cell editor, per main view. */
@@ -208,12 +212,14 @@ function drawStatic(
   text: string,
   resolve: WikilinkResolver | undefined,
   extras: CellExtras,
+  assets: AssetResolver,
 ): void {
   el.classList.remove(HOSTING);
   renderCellContent(text, el, {
     ...(resolve ? { resolve } : {}),
     notes: extras.notes,
     hideComments: extras.hideComments,
+    assets,
   });
   drawnOf.set(el, `${extras.key}\u0000${text}`);
 }
@@ -230,9 +236,13 @@ function patch(root: HTMLElement, main: EditorView): void {
   waiting.delete(root);
   const table = shownOf.get(root);
   const resolve = chipResolver(main.state);
+  const assets = main.state.facet(pictureAssets);
   if (!table) return;
-  const redrawAll = resolverOf.has(root) && resolverOf.get(root) !== resolve;
+  const redrawAll =
+    (resolverOf.has(root) && resolverOf.get(root) !== resolve) ||
+    (assetsOf.has(root) && assetsOf.get(root) !== assets);
   resolverOf.set(root, resolve);
+  assetsOf.set(root, assets);
   const label = gridLabel(table);
   const grid = root.querySelector("table");
   if (grid && grid.getAttribute("aria-label") !== label) {
@@ -250,7 +260,7 @@ function patch(root: HTMLElement, main: EditorView): void {
       drawnOf.get(el) !== `${extras.key}\u0000${text}` ||
       el.classList.contains(HOSTING)
     )
-      drawStatic(el, text, resolve, extras);
+      drawStatic(el, text, resolve, extras, assets);
   }
 }
 
@@ -351,6 +361,7 @@ function restore(main: EditorView, el: HTMLElement): void {
     cell?.text ?? "",
     chipResolver(main.state),
     extrasOf(main.state, cell),
+    main.state.facet(pictureAssets),
   );
 }
 
@@ -500,16 +511,20 @@ export class GridWidget extends WidgetType {
   readonly resolve: WikilinkResolver | undefined;
   /** The footnote numbers its references are drawn with (`notesKey`). */
   readonly notes: string;
+  /** The page's picture resolver its images are drawn with, if one is known. */
+  readonly assets: AssetResolver | null;
 
   constructor(
     table: GridTable,
     resolve: WikilinkResolver | undefined,
     notes = "",
+    assets: AssetResolver | null = null,
   ) {
     super();
     this.table = table;
     this.resolve = resolve;
     this.notes = notes;
+    this.assets = assets;
   }
 
   /** Same shape, same alignments, same cell texts and footnote numbers. */
@@ -519,7 +534,8 @@ export class GridWidget extends WidgetType {
       sameAligns(this.table, other.table) &&
       sameTexts(this.table, other.table) &&
       this.resolve === other.resolve &&
-      this.notes === other.notes
+      this.notes === other.notes &&
+      this.assets === other.assets
     );
   }
 
@@ -764,7 +780,12 @@ function build(
   const ranges: Range<Decoration>[] = tables.map((table) =>
     Decoration.replace({
       block: true,
-      widget: new GridWidget(table, resolve, notesKey(state, table)),
+      widget: new GridWidget(
+        table,
+        resolve,
+        notesKey(state, table),
+        state.facet(pictureAssets),
+      ),
     }).range(doc.lineAt(table.from).from, doc.lineAt(table.to).to),
   );
   return Decoration.set(ranges, true);
@@ -807,6 +828,8 @@ export const gridField = StateField.define<DecorationSet>({
     parseAdvanced(tr) ||
     tr.startState.facet(wikilinkResolverFacet) !==
       tr.state.facet(wikilinkResolverFacet) ||
+    // The page's picture resolver changed: the cells' images are drawn anew.
+    tr.startState.facet(pictureAssets) !== tr.state.facet(pictureAssets) ||
     // A footnote read settled: the closed cells draw its numbers.
     footnoteVersion(tr.startState) !== footnoteVersion(tr.state)
       ? rebuild(value, tr)

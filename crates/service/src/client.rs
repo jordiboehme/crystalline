@@ -203,6 +203,17 @@ pub async fn run_mcp(
     }
     let embedded = embedded && !packaged;
 
+    // A newer Crystalline under an older Claude Desktop extension offers the
+    // extension update, off the session's path (`desktop_update`). Outside
+    // a package this process does it on a thread of its own; inside one it
+    // asks the daemon once that is attached, below.
+    let older_extension = crate::desktop_update::older_extension();
+    if let Some(launcher) = &older_extension
+        && !packaged
+    {
+        crate::desktop_update::offer_on_thread(launcher.clone());
+    }
+
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
     // than afterwards.
@@ -263,7 +274,24 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                return pump_stdio(stream, stdin, db, config_path, read_only, harness_gate).await;
+                // Never waits for the offer: inside a package the request
+                // to the daemon goes out on a task of its own.
+                let update_offered =
+                    crate::desktop_update::offer_for_bridge(older_extension.as_deref(), packaged);
+                let note = onboarding_note(
+                    launcher_note_from_env(update_offered),
+                    split_note_here().await,
+                );
+                return pump_stdio(
+                    stream,
+                    stdin,
+                    db,
+                    config_path,
+                    read_only,
+                    harness_gate,
+                    note,
+                )
+                .await;
             }
             Err(e) if packaged => {
                 let bridge = crate::daemon_task::BridgeFailure::of(&e);
@@ -318,12 +346,17 @@ pub async fn run_mcp(
 /// numeric triple. Raised only when a launcher fix matters: the launcher hands
 /// every message to the installed binary, so users update Crystalline, not the
 /// extension, and this is how the binary says when the extension itself needs
-/// an update.
+/// an update. After a raise the user runs `crystalline install claude-desktop`,
+/// which builds a launcher of this binary's own version.
 pub const MINIMUM_LAUNCHER: (u32, u32, u32) = (0, 24, 0);
 
 /// The line the bridge adds to the onboarding instructions when the launcher
 /// that started it is older than [`MINIMUM_LAUNCHER`].
-const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to install the newest Claude Desktop extension from https://github.com/jordiboehme/crystalline/releases/latest.";
+const LAUNCHER_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Ask the user to run `crystalline install claude-desktop` in a terminal, then confirm the install dialog in Claude Desktop.";
+
+/// The launcher note when this Crystalline's extension update was offered
+/// in Claude Desktop and Claude Desktop took it (`desktop_update`).
+const LAUNCHER_OFFERED_NOTE: &str = "The Claude Desktop extension that starts Crystalline is older than this Crystalline supports. Crystalline offered the extension update in Claude Desktop. Ask the user to confirm the update dialog there. If no dialog shows, ask them to run `crystalline install claude-desktop` in a terminal.";
 
 /// The numeric triple of a launcher version such as `0.25.1` or
 /// `0.26.0-rc.1`, read like the launcher's own `parseVersion`: a pre-release
@@ -363,12 +396,30 @@ fn launcher_too_old(env_value: Option<&str>, channel: Option<&str>) -> bool {
     version < MINIMUM_LAUNCHER
 }
 
+/// The launcher note for a launcher of `env_value` on `channel`: none when
+/// it is not too old, else [`LAUNCHER_OFFERED_NOTE`] when `update_offered`
+/// and [`LAUNCHER_NOTE`] otherwise.
+fn launcher_note(
+    env_value: Option<&str>,
+    channel: Option<&str>,
+    update_offered: bool,
+) -> Option<&'static str> {
+    if !launcher_too_old(env_value, channel) {
+        return None;
+    }
+    Some(if update_offered {
+        LAUNCHER_OFFERED_NOTE
+    } else {
+        LAUNCHER_NOTE
+    })
+}
+
 /// The note to add to this session's onboarding instructions, read once from
 /// this process's environment when the bridge starts.
-fn launcher_note_from_env() -> Option<&'static str> {
+fn launcher_note_from_env(update_offered: bool) -> Option<&'static str> {
     let version = std::env::var(overlay::LAUNCHER_VERSION_ENV).ok();
     let channel = std::env::var(overlay::CHANNEL_ENV).ok();
-    launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
+    launcher_note(version.as_deref(), channel.as_deref(), update_offered)
 }
 
 /// How long the bridge waits for the daemon's `status` behind the split
@@ -701,12 +752,13 @@ async fn pump_stdio<R>(
     config_path: Option<&Path>,
     read_only: bool,
     harness_gate: HarnessGate,
+    launcher_note: Option<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: onboarding_note(launcher_note_from_env(), split_note_here().await),
+        launcher_note,
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();
@@ -3152,6 +3204,20 @@ mod tests {
             assert!(!launcher_too_old(Some("0.1.0"), channel), "{channel:?}");
             assert!(!launcher_too_old(None, channel), "{channel:?}");
         }
+    }
+
+    #[test]
+    fn the_launcher_note_says_when_the_update_was_offered() {
+        assert_eq!(
+            launcher_note(Some("0.23.0"), Some("desktop"), false),
+            Some(LAUNCHER_NOTE)
+        );
+        assert_eq!(
+            launcher_note(Some("0.23.0"), Some("desktop"), true),
+            Some(LAUNCHER_OFFERED_NOTE)
+        );
+        assert_eq!(launcher_note(Some("0.25.1"), Some("desktop"), true), None);
+        assert_eq!(launcher_note(Some("0.23.0"), Some("mcpb"), true), None);
     }
 
     const LAUNCHER_INIT: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#;

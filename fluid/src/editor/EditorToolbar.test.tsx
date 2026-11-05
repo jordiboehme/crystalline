@@ -26,6 +26,7 @@ import { JOIN_SECTIONS, reflectionAdapter } from "./adapter";
 import { AttachButton } from "./AttachButton";
 import { EditorToolbar } from "./EditorToolbar";
 import { frontmatterFold } from "./frontmatterFold";
+import { imagePreviews } from "./imagePreviews";
 import { baseExtensions, docText, lineSeparatorFor } from "./setup";
 import { MERMAID_SKELETON } from "./toolbar";
 import type { Format } from "./marks/formatting";
@@ -627,9 +628,10 @@ describe("the attach verb", () => {
 });
 
 /**
- * The image-format menu is context too: it is drawn only where the caret is
- * actually on an attachment image, and every row of it edits the target of
- * that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
+ * The image-format menu is context too: it is drawn only in Raw, where the
+ * caret is on an attachment image's reference text (outside Raw the picture
+ * is selected and the floating bar holds its options), and every row of it
+ * edits the target of that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
  * under test here is that each label reaches the verb it promises.
  */
 describe("the image-format menu", () => {
@@ -648,7 +650,7 @@ describe("the image-format menu", () => {
       ),
       parent: document.body,
     });
-    bar = render(<EditorToolbar view={view} imageActive />, {
+    bar = render(<EditorToolbar view={view} imageActive raw />, {
       wrapper: Tooltips,
     });
     return view;
@@ -662,11 +664,19 @@ describe("the image-format menu", () => {
   }
 
   test("is there only while the caret is on an image", () => {
-    const { rerender } = render(<EditorToolbar view={null} />, {
+    const { rerender } = render(<EditorToolbar view={null} raw />, {
       wrapper: Tooltips,
     });
     expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
-    rerender(<EditorToolbar view={null} imageActive />);
+    rerender(<EditorToolbar view={null} imageActive raw />);
+    expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
+  });
+
+  test("is Raw's only: with the pictures drawn the floating bar has them", () => {
+    mountOnImage();
+    bar?.rerender(<EditorToolbar view={view} imageActive raw={false} />);
+    expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
+    bar?.rerender(<EditorToolbar view={view} imageActive raw />);
     expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
   });
 
@@ -957,10 +967,11 @@ describe("the pressed format buttons", () => {
   afterEach(cleanupMarkViews);
 
   /** A hidden-mode buffer with the bar drawing what the buffer reports. */
-  function pressedBar(doc: string): EditorView {
+  function pressedBar(doc: string, images?: Extension): EditorView {
     let formats: ReadonlySet<Format> = new Set();
     let redraw: ((formats: ReadonlySet<Format>) => void) | null = null;
     const v = markView(doc, {
+      ...(images ? { images } : {}),
       onFormatState: (next) => {
         formats = next as ReadonlySet<Format>;
         redraw?.(formats);
@@ -1009,6 +1020,32 @@ describe("the pressed format buttons", () => {
       keys(v, "Mod-b");
     });
     expect(pressed("Bold")).toBe("true");
+  });
+
+  // P21: nothing is refused silently. A picture has no words to format, so
+  // the format buttons are off on it and say why.
+  test("on a selected picture the format buttons are off and say why", () => {
+    const doc = "a ![x](assets/a.png) b\n";
+    const v = pressedBar(doc, imagePreviews("eng"));
+    const names = ["Bold", "Italic", "Strikethrough", "Inline code"];
+    act(() => {
+      v.dispatch({ selection: EditorSelection.range(2, 20) });
+    });
+    for (const name of names) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(
+        "A picture has no text to format.",
+      );
+    }
+    act(() => {
+      setCaret(v, 1);
+    });
+    for (const name of names) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeEnabled();
+      expect(button).not.toHaveAttribute("aria-describedby");
+    }
   });
 
   test("with no formats told (the MANIFEST), the buttons are not toggles", () => {

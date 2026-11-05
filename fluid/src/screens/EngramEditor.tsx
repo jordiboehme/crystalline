@@ -77,6 +77,7 @@ import {
   refreshPreviews,
   setPreviewVersions,
 } from "../editor/imagePreviews";
+import { prefetchPictureTools } from "../editor/pictures/loader";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
@@ -504,6 +505,11 @@ function Surface({
    * never set again.
    */
   const [preview] = useState(() => new Compartment());
+  // The picture tools' chunk, warmed on mount, so the first key around a
+  // picture finds its keys in.
+  useEffect(() => {
+    void prefetchPictureTools();
+  }, []);
   /**
    * The marks setting's switch, outside the preview compartment: a flip
    * reconfigures this alone, so Raw and the previews are never rebuilt.

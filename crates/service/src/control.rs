@@ -8,8 +8,8 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, domain_register, routing_config, maintenance_stamp, forget_domain,
-//! forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! provision, domain_register, routing_config, maintenance_stamp, desktop_offer,
+//! forget_domain, forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
@@ -919,6 +919,16 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
             (envelope_ok(json!({ "stamped": true })), false)
         }
+        // The Claude Desktop extension update for a bridge inside Claude
+        // Desktop's app package, which may not write the build or the record
+        // under AppData itself (`desktop_update`). Answers at once; the offer
+        // runs on a thread of its own.
+        crate::desktop_update::DESKTOP_OFFER_COMMAND => {
+            match crate::desktop_update::answer_ctl(req) {
+                Ok(data) => (envelope_ok(data), false),
+                Err(msg) => (envelope_err(msg), false),
+            }
+        }
         // The configuration `prompt system` builds its routing block from,
         // for a CLI inside Claude Desktop's app package: its own read of the
         // config file can open the package's private copy (issue 153).
@@ -1019,7 +1029,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, \
+                 desktop_offer, forget_domain or shutdown"
             )),
             false,
         ),

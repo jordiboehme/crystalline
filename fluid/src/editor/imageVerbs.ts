@@ -23,36 +23,16 @@ import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { EditorView as View, ViewPlugin } from "@codemirror/view";
-import type { SyntaxNode } from "@lezer/common";
 
 import type { ImageAlign, ImageFormat, ImageRef } from "./imageFormat";
 import { buildImageTarget, imageRefsIn } from "./imageFormat";
+import { dispatchGesture } from "./gesture";
+import { judgeBeforeCommand } from "./marks/commandJudge";
+import { imageNodeAt, pictureAssets } from "./pictures/refs";
 import { clearOfFoldedFrontmatter } from "./toolbar";
 
 /** One attachment image the caret is on, in document terms. */
 export type ImageContext = ImageRef;
-
-/**
- * The innermost enclosing `Image` node at `pos`, or null.
- *
- * Both sides are tried, for the reason `tableVerbs` states: a position is a
- * gap BETWEEN two characters, and at the reference's first character only a
- * look to the right finds it while one position past its last only a look to
- * the left does.
- */
-function imageNodeAt(state: EditorState, pos: number): SyntaxNode | null {
-  const tree = syntaxTree(state);
-  for (const side of [-1, 1] as const) {
-    let node: SyntaxNode | null = tree.resolveInner(pos, side);
-    while (node !== null) {
-      if (node.name === "Image") {
-        return node;
-      }
-      node = node.parent;
-    }
-  }
-  return null;
-}
 
 /**
  * The attachment image the caret sits on, or null.
@@ -60,18 +40,30 @@ function imageNodeAt(state: EditorState, pos: number): SyntaxNode | null {
  * Null for an external image and for a link to a document as well as for
  * prose: neither is a picture this app places, so the menu has nothing to
  * offer about either. `resolve` says which targets are attachments; absent,
- * it is the engram kind's (`imageRefsIn`'s default).
+ * it is the page kind's own, the resolver `pictureAssets` holds (the engram
+ * kind's `assetPath` unless a screen provides another).
  */
 export function imageContextAt(
   state: EditorState,
   resolve?: (target: string) => string | null,
 ): ImageContext | null {
-  const pos = state.selection.main.head;
+  return contextAt(state, state.selection.main.head, resolve);
+}
+
+/** {@link imageContextAt} at `pos` instead of the caret. */
+function contextAt(
+  state: EditorState,
+  pos: number,
+  resolve?: (target: string) => string | null,
+): ImageContext | null {
   const node = imageNodeAt(state, pos);
   if (node === null) {
     return null;
   }
-  const [ref] = imageRefsIn(state.doc.sliceString(node.from, node.to), resolve);
+  const [ref] = imageRefsIn(
+    state.doc.sliceString(node.from, node.to),
+    resolve ?? state.facet(pictureAssets).resolve,
+  );
   if (ref === undefined) {
     return null;
   }
@@ -87,20 +79,22 @@ export function imageContextAt(
 }
 
 /**
- * Rewrite the target of the image the caret is on, or refuse.
+ * Rewrite the target of the image at `at` (the caret when omitted), or
+ * refuse.
  *
- * One dispatch tagged `input` rather than `input.type`: the history joins
- * adjacent events only for typing, so a format change is one undo step of its
- * own and never merges into the words around it.
+ * One gesture tagged `input.format` (`dispatchGesture`): one undo step of its
+ * own, solo and in a room, that never merges into the words around it.
  */
 function rewrite(
   view: EditorView,
   next: (format: ImageFormat) => ImageFormat,
+  at: number | undefined,
 ): boolean {
   if (!clearOfFoldedFrontmatter(view)) {
     return false;
   }
-  const context = imageContextAt(view.state);
+  judgeBeforeCommand(view);
+  const context = contextAt(view.state, at ?? view.state.selection.main.head);
   if (context === null) {
     return false;
   }
@@ -116,24 +110,31 @@ function rewrite(
     view.focus();
     return true;
   }
-  view.dispatch({
+  const dispatched = dispatchGesture(view, {
     changes: {
       from: context.targetFrom,
       to: context.targetTo,
       insert: target,
     },
-    userEvent: "input",
+    userEvent: "input.format",
   });
   // The bar cancels its own mousedown so the caret never left the buffer;
   // the menu that opened over it did take focus, and this hands it back.
   view.focus();
-  return true;
+  return dispatched;
 }
 
 /** Place the image, keeping whatever width it already carries. */
-export function setImageAlign(view: EditorView, align: ImageAlign): boolean {
-  return rewrite(view, (format) =>
-    format.width === undefined ? { align } : { align, width: format.width },
+export function setImageAlign(
+  view: EditorView,
+  align: ImageAlign,
+  at?: number,
+): boolean {
+  return rewrite(
+    view,
+    (format) =>
+      format.width === undefined ? { align } : { align, width: format.width },
+    at,
   );
 }
 
@@ -146,14 +147,21 @@ export function setImageAlign(view: EditorView, align: ImageAlign): boolean {
  * and changed their mind means "as it was", and a centered image still
  * carrying `w=25%` is not what an upload wrote.
  */
-export function clearImageFormat(view: EditorView): boolean {
-  return rewrite(view, () => ({ align: "center" }));
+export function clearImageFormat(view: EditorView, at?: number): boolean {
+  return rewrite(view, () => ({ align: "center" }), at);
 }
 
 /** Size the image, keeping wherever it already stands. `null` clears the width. */
-export function setImageWidth(view: EditorView, width: string | null): boolean {
-  return rewrite(view, (format) =>
-    width === null ? { align: format.align } : { align: format.align, width },
+export function setImageWidth(
+  view: EditorView,
+  width: string | null,
+  at?: number,
+): boolean {
+  return rewrite(
+    view,
+    (format) =>
+      width === null ? { align: format.align } : { align: format.align, width },
+    at,
   );
 }
 

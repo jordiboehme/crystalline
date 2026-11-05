@@ -57,7 +57,7 @@ import {
 } from "./caret";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
-import { marksHiddenOnLine } from "./mode";
+import { marksHiddenOnLine, pictureForKeys } from "./mode";
 import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 
 type HeadingQuestion = (
@@ -377,6 +377,10 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
   let removal: Range;
   if (forward) {
     const q = run ? run.to : head;
+    if (pictureForKeys(state, q, true) !== null) {
+      // The picture tools select it first (P3).
+      return false;
+    }
     if (q >= segment.to) {
       return deleteAtEdge(view, segment.to, true);
     }
@@ -393,6 +397,9 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
     }
   } else {
     const q = run ? run.from : head;
+    if (pictureForKeys(state, q, false) !== null) {
+      return false;
+    }
     if (q <= start) {
       return blockRule(view, start);
     }
@@ -658,6 +665,8 @@ const PERSON_REPLACES = new Set([
   "input.complete",
   "delete.selection",
   "delete.cut",
+  // A picture's removal from its tools (P7).
+  "delete.picture",
   "move.drop",
   // The word and line deletes (Mod/Alt/Cmd+Backspace and Delete), and the
   // plain keys where they fall through to CodeMirror's own command. A
@@ -706,11 +715,15 @@ export function partnerAcrossLines(
   return { from: other.from, to: other.to };
 }
 
-/** The hidden marks of every line from `from`'s to `to`'s. */
+/**
+ * The hidden marks of every line from `from`'s to `to`'s, a drawn picture's
+ * marks among them, so a picture inside a pair is judged as Part 2 judges an
+ * image (never an empty pair, `droppable`).
+ */
 function marksBetween(state: EditorState, from: number, to: number): Mark[] {
   const first = state.doc.lineAt(from).number;
   const last = state.doc.lineAt(to).number;
-  return scanMarks(state, first, last).lines.flat();
+  return scanMarks(state, first, last, { pictures: true }).lines.flat();
 }
 
 /**
@@ -733,7 +746,9 @@ function marksOfLines(
       end += 1;
     }
     const first = sorted[start] ?? 1;
-    const scan = scanMarks(state, first, sorted[end] ?? first);
+    const scan = scanMarks(state, first, sorted[end] ?? first, {
+      pictures: true,
+    });
     scan.lines.forEach((marks, i) => out.set(first + i, marks));
     start = end + 1;
   }

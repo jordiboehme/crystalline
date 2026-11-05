@@ -8485,33 +8485,22 @@ async fn tool_descriptions_teach_a_domain_rows_read_only() {
     }
 }
 
-/// The tool names `packaging/mcpb/generate-manifest.sh` writes into the
-/// Claude Desktop manifest's `"tools"` block. Only the names are read: the
-/// descriptions there are short hand-written summaries.
+/// The tool names `crystalline_core::desktop_extension::TOOLS` writes into
+/// the Claude Desktop manifest's `"tools"` block, for both bundles. Only the
+/// names are compared: the descriptions there are short hand-written
+/// summaries.
 fn desktop_manifest_tool_names() -> Vec<String> {
-    let script =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/mcpb/generate-manifest.sh");
-    let text = std::fs::read_to_string(&script).unwrap();
-    // The block opens on its key and closes on the first `]` at the
-    // two-space indentation of a top-level manifest key.
-    const BLOCK_START: &str = "\"tools\": [";
-    const BLOCK_END: &str = "\n  ]";
-    let start = text
-        .find(BLOCK_START)
-        .expect("the manifest has a tools block");
-    let block = &text[start..];
-    let block = &block[..block.find(BLOCK_END).expect("the tools block ends")];
-    block
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("\"name\": \""))
-        .map(|rest| rest.trim_end_matches(['"', ',']).to_string())
+    crystalline_core::desktop_extension::TOOLS
+        .iter()
+        .map(|(name, _)| name.to_string())
         .collect()
 }
 
-/// The Claude Desktop manifest names exactly the tools the binary lists.
-/// The default configuration is what is compared: `github.enabled` is off,
-/// so the six collaboration tools it gates are withheld here and are left out
-/// of the Desktop manifest too.
+/// `crystalline_core::desktop_extension::TOOLS`, the tools block of the
+/// Claude Desktop manifest, names exactly the tools the binary lists. The
+/// default configuration is what is compared: `github.enabled` is off, so the
+/// six collaboration tools it gates are withheld here and are left out of
+/// `TOOLS` too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_desktop_manifest_names_the_tools_a_default_install_lists() {
     let h = Harness::new(&["eng"]).await;
@@ -8523,7 +8512,7 @@ async fn the_desktop_manifest_names_the_tools_a_default_install_lists() {
     manifest.sort();
     assert_eq!(
         manifest, listed,
-        "packaging/mcpb/generate-manifest.sh's tools block differs from the binary's tool list"
+        "crystalline_core::desktop_extension::TOOLS differs from the binary's tool list"
     );
 }
 

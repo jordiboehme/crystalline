@@ -346,7 +346,9 @@ interface RawRef {
  * spaces of indent, then three or more backticks or tildes. Returns the
  * character, its run length and the offset the run starts at.
  */
-function fenceMarker(line: string): { char: string; count: number } | null {
+export function fenceMarker(
+  line: string,
+): { char: string; count: number } | null {
   const indent = line.length - line.replace(/^ +/, "").length;
   if (indent > 3) {
     return null;
@@ -466,6 +468,24 @@ function lineRefs(line: string): RawRef[] {
 }
 
 /**
+ * Whether `line` closes the fence `open` started: the same character, at
+ * least as long a run, and nothing else on the line (the rule
+ * {@link eachLiveLine} states).
+ */
+export function closesFence(
+  open: { char: string; count: number },
+  line: string,
+): boolean {
+  const marker = fenceMarker(line);
+  return (
+    marker !== null &&
+    marker.char === open.char &&
+    marker.count >= open.count &&
+    line.trimStart().slice(marker.count).trim() === ""
+  );
+}
+
+/**
  * Walk a document line by line, skipping fenced code, and hand each live line
  * to `visit` with its own offset into the text.
  *
@@ -491,12 +511,7 @@ function eachLiveLine(
         continue;
       }
     } else {
-      if (
-        marker !== null &&
-        marker.char === fence.char &&
-        marker.count >= fence.count &&
-        line.trimStart().slice(marker.count).trim() === ""
-      ) {
+      if (closesFence(fence, line)) {
         fence = null;
       }
       offset += raw.length + 1;
@@ -600,4 +615,44 @@ export function imageRefsIn(
     }
   });
   return refs;
+}
+
+/**
+ * One inline `![alt](target)` reference, whatever it points at. Offsets are
+ * relative to the text handed in, as {@link ImageRef}'s are.
+ */
+export interface ImageSpan {
+  /** The whole `![alt](target)` span. */
+  from: number;
+  to: number;
+  /** The target token alone, as written. */
+  targetFrom: number;
+  targetTo: number;
+  /** The token as written: fragment, `./` and percent escapes included. */
+  token: string;
+}
+
+/**
+ * Every inline image reference in this text, attachment or not, in the order
+ * written: the same scanner ({@link lineRefs}) and fence rule
+ * ({@link eachLiveLine}) {@link imageRefsIn} reads, without its question of
+ * what the target is. The picture model classifies these tokens itself.
+ */
+export function imageSpansIn(text: string): ImageSpan[] {
+  const spans: ImageSpan[] = [];
+  eachLiveLine(text, (line, offset) => {
+    for (const ref of lineRefs(line)) {
+      if (!ref.image) {
+        continue;
+      }
+      spans.push({
+        from: offset + ref.from,
+        to: offset + ref.to,
+        targetFrom: offset + ref.targetFrom,
+        targetTo: offset + ref.targetTo,
+        token: ref.token,
+      });
+    }
+  });
+  return spans;
 }
