@@ -55,6 +55,11 @@
 //! `crystalline.json` there: entirely its own by name, created on install
 //! and deleted on uninstall (unless a person added their own entries into
 //! it, which survive like any foreign data).
+//!
+//! `crystalline install claude-desktop` does not come through here. Claude
+//! Desktop is not a harness: it gets an extension built on this machine
+//! instead of an MCP entry, hooks and skill copies, and keeps its own record
+//! instead of a receipt row. That flow lives in `install_desktop.rs`.
 
 use std::path::Path;
 

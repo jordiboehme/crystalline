@@ -1375,6 +1375,7 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
@@ -1401,6 +1402,7 @@ dependencies = [
  "walkdir",
  "whoami",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

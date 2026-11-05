@@ -125,24 +125,10 @@ pub const AGENT_FILES_RELEASE: &str = "0.31.0";
 /// not sent to one.
 pub const WRITE_CHECKSUM_RELEASE: &str = "0.32.0";
 
-/// Whether a `major.minor.patch` version is at least `min`. A pre-release or
-/// build suffix after the patch is ignored, and a version that does not parse
-/// is never enough: a guard is not handed to a server on a guess.
-pub fn version_at_least(version: &str, min: &str) -> bool {
-    fn parts(v: &str) -> Option<(u64, u64, u64)> {
-        let core = v.trim().trim_start_matches('v');
-        let core = core.split(['-', '+']).next()?;
-        let mut it = core.split('.');
-        let major = it.next()?.parse().ok()?;
-        let minor = it.next()?.parse().ok()?;
-        let patch = it.next()?.parse().ok()?;
-        it.next().is_none().then_some((major, minor, patch))
-    }
-    match (parts(version), parts(min)) {
-        (Some(have), Some(need)) => have >= need,
-        _ => false,
-    }
-}
+/// Whether a `major.minor.patch` version is at least `min`; it lives in core
+/// so the Claude Desktop extension update (the service crate's `desktop_offer`) compares the same
+/// way.
+pub use crystalline_core::version::version_at_least;
 
 /// The largest answer to a [`FILE_COMMAND`] this client reads: the base64 of
 /// the largest file a domain holds ([`crystalline_core::MAX_ATTACHMENT_BYTES`],
