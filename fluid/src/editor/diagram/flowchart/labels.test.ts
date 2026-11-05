@@ -79,7 +79,46 @@ describe("encodeLabel and decodeLabel", () => {
   test("the field shows what is drawn for labels already in a diagram", () => {
     expect(decodeLabel('"#9829; #infin; #lt;"', true)).toBe("\u2665 \u221E <");
     expect(decodeLabel("a &amp; b", false)).toBe("a & b");
-    expect(decodeLabel('"#bogus;"', true)).toBe("#bogus;");
+    expect(decodeLabel('"#bogus;"', true)).toBe("&bogus;");
+  });
+
+  // R45: the drawing cannot tell these from #quot;, so they draw as the
+  // character, and the field says what is drawn.
+  test.each([
+    ["&amp;quot;", '"'],
+    ["&amp;lt;b&amp;gt;", "<b>"],
+    ["#amp;quot;", '"'],
+    ["&amp;amp;", "&"],
+    ["&amp;", "&"],
+    ["#amp;", "&"],
+    ["#lt;b#gt;", "<b>"],
+    ["&lt;b", "<b"],
+  ])("%j shows as %j, which is what is drawn", (raw, shown) => {
+    expect(decodeLabel(`"${raw}"`, true)).toBe(shown);
+  });
+
+  test.each([
+    ["#38;quot;", "&quot;"],
+    ["#35;quot;", "#quot;"],
+    ["#38;amp;", "&amp;"],
+  ])("%j is still the way to show the text %j", (raw, shown) => {
+    expect(decodeLabel(`"${raw}"`, true)).toBe(shown);
+  });
+
+  test.each(["A & B\nC", "a&b\nc", "&\n&"])(
+    "every & of %j is an entity form, with a line break in the text (R46)",
+    (text) => {
+      const encoded = encodeLabel(text, false);
+      expect(encoded.replaceAll("#38;", "")).not.toContain("&");
+      expect(encodeMarkdownLabel(text).replaceAll("#38;", "")).not.toContain(
+        "&",
+      );
+      expect(decodeLabel(encodeLabel(text, true), true)).toBe(text);
+    },
+  );
+
+  test("a & without a line break stays as it is", () => {
+    expect(encodeLabel("A & B", false)).toBe('"A & B"');
   });
 
   test("a written <br> is text, a <br> in the source is a line break", () => {

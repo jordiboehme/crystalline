@@ -26,6 +26,14 @@ export const REFUSED_LABELS: readonly string[] = [
   // R42: mermaid takes it out of the text as a directive.
   "%%{init}%%",
   "a %%{b: c",
+  // With a line break in the label its text is parsed as HTML once more, so an
+  // entity form is read one level deeper and nothing can show these as typed.
+  "x &amp; y\nz",
+  "&quot;\nz",
+  "&#35;\nz",
+  "C:\\new\nz",
+  "\u00B6\u00DF\nz",
+  "\uFB02\u00B0\nz",
 ];
 
 /**
@@ -104,6 +112,16 @@ export const LABEL_TEXTS: readonly string[] = [
   "K\u00F6ln",
   "a  b",
   "one\ntwo",
+  "A & B\nC",
+  "a&b\nc",
+  "&\n&",
+  "#quot;\nz",
+  "#9829;\nz",
+  "<b>\n</b>",
+  "<script>x</script>\nz",
+  "a`b\nz",
+  "<br>\nz",
+  'AT&T\n<b> & "q"',
   " a",
   "a ",
   "'a'",
@@ -146,4 +164,32 @@ export const MARKDOWN_TEXTS: readonly string[] = [
   "a: b",
   "[y]",
   "x [y] z",
+];
+
+/**
+ * Labels as somebody wrote them by hand, between quotes. The rename field must
+ * show what each one draws, whatever way it was written (R45).
+ */
+export const HAND_WRITTEN_LABELS: readonly string[] = [
+  "#quot;",
+  "#35;quot;",
+  "#38;quot;",
+  "#amp;quot;",
+  "&amp;quot;",
+  "&amp;lt;b&amp;gt;",
+  "&amp;",
+  "&amp;amp;",
+  "#amp;",
+  "#amp;amp;",
+  "#lt;b#gt;",
+  "&lt;b&gt;",
+  "#9829;",
+  "#infin;",
+  "#bogus;",
+  "&bogus;",
+  "R&D;x",
+  "A & B",
+  "a#b",
+  "#35;",
+  "#92;",
 ];

@@ -198,6 +198,22 @@ describe("MermaidDiagram", () => {
     ).not.toBeNull();
   });
 
+  it("draws a label's entity forms on the printer's copy too", async () => {
+    localStorage.setItem("fluid-theme", "dark");
+    renderDiagram.mockImplementation(() =>
+      Promise.resolve({
+        svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+        diagramType: "flowchart-v2",
+      }),
+    );
+    const { container } = draw("graph TD; A-->B;");
+    await waitFor(() => {
+      expect(container.querySelector("[data-print] tspan")?.textContent).toBe(
+        'say "hi"',
+      );
+    });
+  });
+
   it("draws no printer copy on a light screen", async () => {
     const { container } = draw("graph TD; A-->B;");
     await waitFor(() => {

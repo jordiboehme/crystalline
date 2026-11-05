@@ -8,6 +8,7 @@ import { describe, expect, test } from "vitest";
 import { STATUS_COLOURS } from "../../../markdown/directives";
 import { onlyEditedBytes, untouchedLinesEqual } from "../../../test/fidelity";
 import {
+  HAND_WRITTEN_LABELS,
   LABEL_HOLDERS,
   LABEL_TEXTS,
   MARKDOWN_MARKUP,
@@ -21,7 +22,7 @@ import { docText, lineSeparatorFor } from "../../setup";
 import { type TextEdit, applyEdits, toChanges } from "../edits";
 import { type FlowDbView, flowDbOf } from "../mermaidDb";
 import { agreesFlow } from "../verdict";
-import { COLOUR_PRESETS, SHAPES, tidyLabel } from "./labels";
+import { COLOUR_PRESETS, SHAPES, decodeLabel, tidyLabel } from "./labels";
 import { parseFlowchart } from "./parse";
 import { type FlowOp, compileFlowOp } from "./ops";
 
@@ -635,10 +636,14 @@ describe("the table the browser draws", () => {
     const markup = texts.flatMap((text, i) =>
       MARKDOWN_MARKUP.includes(text) ? [i] : [],
     );
-    return `${JSON.stringify({ drawn: texts.map(tidyLabel), markup, bodies }, null, 1)}\n`;
+    const handWritten = HAND_WRITTEN_LABELS.map((label) => ({
+      label,
+      shown: decodeLabel(`"${label}"`, true),
+    }));
+    return `${JSON.stringify({ drawn: texts.map(tidyLabel), markup, bodies, handWritten }, null, 1)}\n`;
   }
 
-  test("is what the op writes today", () => {
+  test("is what the op writes today", { timeout: TIMEOUT }, () => {
     // Regenerate with FLUID_WRITE_LABEL_TABLE=1.
     const fs = node.process.getBuiltinModule("node:fs") as Fs & {
       writeFileSync: (path: string, text: string) => void;
@@ -649,16 +654,20 @@ describe("the table the browser draws", () => {
     expect(fs.readFileSync(FILE, "utf8")).toBe(table());
   });
 
-  test("every body is one mermaid and the parser read the same way", async () => {
-    const { bodies } = JSON.parse(table()) as {
-      bodies: Record<string, string>;
-    };
-    for (const body of Object.values(bodies)) {
-      expect(agreesFlow(parseFlowchart(body), await flowDbFor(body))).toBe(
-        null,
-      );
-    }
-  });
+  test(
+    "every body is one mermaid and the parser read the same way",
+    { timeout: TIMEOUT },
+    async () => {
+      const { bodies } = JSON.parse(table()) as {
+        bodies: Record<string, string>;
+      };
+      for (const body of Object.values(bodies)) {
+        expect(agreesFlow(parseFlowchart(body), await flowDbFor(body))).toBe(
+          null,
+        );
+      }
+    },
+  );
 });
 
 describe("labels at the edges of the grammar, with real mermaid", () => {

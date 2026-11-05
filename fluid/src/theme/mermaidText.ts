@@ -8,8 +8,19 @@
  * `drawnLabels` is the step every surface runs on what `mermaid.render` gives
  * back: it decodes those forms in the drawn text.
  *
- * The result goes in through text nodes and comes out through the serializer,
- * which escapes it, so a label reading `<script>` stays the text `<script>`.
+ * This runs after mermaid's sanitizer and nothing sanitizes its result, so its
+ * safety rests on what it touches and not on what mermaid lets through. It
+ * decodes only text whose parent is an SVG-namespace text element (`text`,
+ * `tspan`, ...). The HTML serializer always escapes such text, so a label reading
+ * `<script>` stays the text `<script>`. The serializer does not escape the text of
+ * an HTML `style`, `xmp` and the like, which is why nothing under a
+ * `foreignObject` is touched, and an SVG `style` or `script` is left alone too.
+ *
+ * A cost, accepted (R45): by this point a double-escaped form is the same text
+ * as a plain one. `&amp;quot;` and `#quot;` both arrive as `&quot;`, so both draw
+ * `"`, and a label written the HTML way to show the text `&quot;` shows the
+ * character instead. `#38;quot;` or `#35;quot;` show the text.
+ *
  * The module is small and only ever loads beside mermaid.
  */
 
@@ -61,10 +72,30 @@ export function entityText(name: string): string | null {
   return character ? String.fromCodePoint(code) : null;
 }
 
+/** `text` with its entity forms decoded, one pass, as a drawn label's text is. */
+export function decodeDrawn(text: string): string {
+  return text.replace(
+    /&(#\d+|\w+);/g,
+    (form, name: string) => entityText(name) ?? form,
+  );
+}
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+/** Whether a text node's parent is an element whose text is drawn and always escaped. */
+function isDrawnText(parent: Element | null): boolean {
+  return (
+    parent?.namespaceURI === SVG_NAMESPACE &&
+    parent.localName !== "style" &&
+    parent.localName !== "script"
+  );
+}
+
 /**
  * `svg` with the entity forms in its drawn text decoded, one pass per text
- * node. Styles, attributes, titles and foreign objects stay as they are. An svg
- * with nothing to decode comes back as the same string.
+ * node (see the file header for what counts as drawn text). Styles, attributes,
+ * titles and foreign objects stay as they are. An svg with nothing to decode
+ * comes back as the same string.
  */
 export function drawnLabels(svg: string): string {
   // The text `&quot;` serializes as `&amp;quot;`, so without this there is no form.
@@ -78,13 +109,16 @@ export function drawnLabels(svg: string): string {
   }
   let changed = false;
   for (const text of root.querySelectorAll("text")) {
+    if (text.namespaceURI !== SVG_NAMESPACE) {
+      continue;
+    }
     const walker = doc.createTreeWalker(text, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (!isDrawnText(node.parentElement)) {
+        continue;
+      }
       const before = node.textContent ?? "";
-      const after = before.replace(
-        /&(#\d+|\w+);/g,
-        (form, name: string) => entityText(name) ?? form,
-      );
+      const after = decodeDrawn(before);
       if (after !== before) {
         node.textContent = after;
         changed = true;

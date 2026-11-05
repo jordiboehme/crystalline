@@ -25,6 +25,7 @@ import { droppedSemicolons } from "../scan";
 import { classesOf, stylesOf } from "../verdict";
 import {
   COLOUR_PRESETS,
+  cannotDraw,
   type ColourPreset,
   SHAPES,
   decodeLabel,
@@ -259,8 +260,7 @@ function encodedFor(text: string, shape: Shape): string {
 
 function rename(model: FlowModel, node: FlowNode, text: string): OpResult {
   const typed = tidyLabel(text);
-  // `%%{` is a directive to mermaid wherever it stands, so it would leave the label.
-  if (typed === "" || typed.includes("%%{")) {
+  if (typed === "" || cannotDraw(typed)) {
     return refused("invalid");
   }
   const shape = node.defining?.shape ?? null;

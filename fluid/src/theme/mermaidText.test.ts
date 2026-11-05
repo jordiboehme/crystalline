@@ -60,6 +60,32 @@ describe("drawnLabels", () => {
     expect(host.querySelector("tspan")?.textContent).toMatch(/^</);
   });
 
+  // The decode runs after mermaid's sanitizer, and the HTML serializer does not
+  // escape these elements' text, so their text must never be decoded (R44).
+  test.each([
+    "<svg><foreignObject><text><style>&lt;/style&gt;&lt;img src=x onerror=alert(1)&gt; &amp;</style></text></foreignObject></svg>",
+    "<svg><foreignObject><text><xmp>&lt;/xmp&gt;&lt;img src=x onerror=alert(1)&gt; &amp;</xmp></text></foreignObject></svg>",
+    "<svg><foreignObject><text>&amp;quot;</text></foreignObject></svg>",
+    "<svg><text><foreignObject><div>&amp;quot;</div></foreignObject></text></svg>",
+    "<svg><text><style>&amp;lt;img src=x onerror=y&amp;gt;</style></text></svg>",
+    "<svg><text><script>&amp;lt;img src=x onerror=y&amp;gt;</script></text></svg>",
+  ])("text outside SVG's own text elements stays as it is: %s", (svg) => {
+    const out = drawnLabels(svg);
+    expect(out).toBe(svg);
+    const host = document.createElement("div");
+    host.innerHTML = out;
+    expect(host.querySelectorAll("img").length).toBe(0);
+  });
+
+  test("an SVG text beside an HTML one is still decoded, and only it", () => {
+    const host = document.createElement("div");
+    host.innerHTML = drawnLabels(
+      "<svg><foreignObject><text><xmp>&amp;quot;</xmp></text></foreignObject><text><tspan>&amp;quot;</tspan></text></svg>",
+    );
+    expect(host.querySelector("tspan")?.textContent).toBe('"');
+    expect(host.querySelector("xmp")?.textContent).toBe("&amp;quot;");
+  });
+
   test("only drawn text changes: no style, attribute or foreign object", () => {
     const svg =
       '<svg aria-label="&amp;quot;"><style>.a::after{content:"&amp;quot;"}</style>' +

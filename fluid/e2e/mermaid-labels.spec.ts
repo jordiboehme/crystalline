@@ -23,6 +23,8 @@ const TABLE = JSON.parse(
   markup: number[];
   /** Per holder, the body after `rename` wrote each text. */
   bodies: Record<string, string>;
+  /** Labels written by hand, and what the rename field shows for each. */
+  handWritten: { label: string; shown: string }[];
 };
 
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
@@ -62,6 +64,23 @@ function drawnBoxes(page: Page): Promise<Record<string, string>[]> {
   );
 }
 
+/** Has the engram's one fence hold `bodies` instead, for this page only. */
+async function replaceFences(page: Page, bodies: string[]): Promise<void> {
+  await page.route(
+    `**/api/v1/domains/*/engrams/diagram-labels`,
+    async (route) => {
+      const response = await route.fetch();
+      const json = (await response.json()) as { content: string };
+      json.content = json.content.replace(
+        /```mermaid[\s\S]*```/,
+        // A function: the labels hold `$`, which a replacement string would read.
+        () => bodies.map((b) => `\`\`\`mermaid\n${b}\n\`\`\``).join("\n\n"),
+      );
+      await route.fulfill({ response, json });
+    },
+  );
+}
+
 test("a #quot; label already in a diagram reads right on the reading page", async ({
   page,
 }) => {
@@ -84,19 +103,9 @@ test("every text in the table draws as typed", async ({ page }) => {
   test.setTimeout(240_000);
   const holders = Object.entries(TABLE.bodies);
   await logIn(page);
-  await page.route(
-    `**/api/v1/domains/*/engrams/diagram-labels`,
-    async (route) => {
-      const response = await route.fetch();
-      const json = (await response.json()) as { content: string };
-      json.content = json.content.replace(
-        /```mermaid[\s\S]*```/,
-        // A function: the labels hold `$`, which a replacement string would read.
-        () =>
-          holders.map(([, b]) => `\`\`\`mermaid\n${b}\n\`\`\``).join("\n\n"),
-      );
-      await route.fulfill({ response, json });
-    },
+  await replaceFences(
+    page,
+    holders.map(([, b]) => b),
   );
   await page.goto(`d/${DOMAIN}/e/diagram-labels`);
   await expect
@@ -127,4 +136,29 @@ test("every text in the table draws as typed", async ({ page }) => {
   await expect(
     page.locator("article svg script, article svg text img"),
   ).toHaveCount(0);
+});
+
+test("the rename field shows what a hand-written label draws", async ({
+  page,
+}) => {
+  const body = [
+    "flowchart TD",
+    ...TABLE.handWritten.map((row, i) => `  H${String(i)}["${row.label}"]`),
+  ].join("\n");
+  await logIn(page);
+  await replaceFences(page, [body]);
+  await page.goto(`d/${DOMAIN}/e/diagram-labels`);
+  await expect
+    .poll(async () => (await drawnBoxes(page))[0]?.H0 !== undefined, {
+      timeout: 30_000,
+    })
+    .toBe(true);
+  const drawn = (await drawnBoxes(page))[0];
+  const wrong = TABLE.handWritten.flatMap((row, i) => {
+    const got = drawn?.[`H${String(i)}`];
+    return got === row.shown
+      ? []
+      : [`${row.label} shows ${row.shown}, drew ${String(got)}`];
+  });
+  expect(wrong).toEqual([]);
 });

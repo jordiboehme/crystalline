@@ -8,23 +8,33 @@
  */
 
 import type { StatusColour } from "../../../markdown/directives";
-import { entityText } from "../../../theme/mermaidText";
+import { decodeDrawn, entityText } from "../../../theme/mermaidText";
 import { AT_SHAPE_NAMES, CLASSIC_SHAPES, type ShapeName } from "./model";
 
 /** A colour preset's name: the same six the status labels use. */
 export type ColourPreset = StatusColour;
 
-/** What a word after `#` in the source stands for: `9829` is a number, `quot` a name. */
-function sourceEntity(word: string): string | null {
-  return entityText(/^\d+$/.test(word) ? `#${word}` : word);
+/**
+ * What mermaid leaves in a label's text node for a form in the source: a number
+ * or a name as `&...;`, except that its sanitizer has already turned `amp`, `lt`
+ * and `gt` into the character, as it does for `&amp;`, `&lt;` and `&gt;` written
+ * directly.
+ */
+function reachesTextNode(word: string): string {
+  if (word === "amp" || word === "lt" || word === "gt") {
+    return entityText(word) ?? word;
+  }
+  return /^\d+$/.test(word) ? `&#${word};` : `&${word};`;
 }
 
 /**
  * A label's text as the rename field shows it, which is what is drawn: no
- * quotes, no markdown wrapper, every `<br>` form as a line break and each
- * entity form as its character. One pass, so `#35;quot;` is the text `#quot;`.
- * An entity with a name `entityText` does not know stays as written. An
- * unquoted label loses its outer spaces, which mermaid does not keep either.
+ * quotes, no markdown wrapper, every `<br>` form as a line break and each form
+ * as what it draws. This follows the drawing's two steps: what mermaid leaves in
+ * the text node, then `decodeDrawn`, so `#35;quot;` is the text `#quot;` and
+ * `&amp;quot;` is `"` (R45). A name `entityText` does not know shows as the
+ * drawing does, `&name;`. An unquoted label loses its outer spaces, which mermaid
+ * does not keep either.
  */
 export function decodeLabel(raw: string, quoted: boolean): string {
   let text = raw.trim();
@@ -35,14 +45,16 @@ export function decodeLabel(raw: string, quoted: boolean): string {
         ? inner.slice(1, -1)
         : inner;
   }
-  return text.replace(
-    /<br\s*\/?>|#(\w+);|&(#\d+|\w+);/gi,
-    (form, word: string | undefined, drawn: string | undefined) => {
-      if (word !== undefined) {
-        return sourceEntity(word) ?? form;
-      }
-      return drawn === undefined ? "\n" : (entityText(drawn) ?? form);
-    },
+  return decodeDrawn(
+    text.replace(
+      /<[bB][rR]\s*\/?>|#(\w+);|&(amp|lt|gt);/g,
+      (_, word: string | undefined, direct: string | undefined) =>
+        word !== undefined
+          ? reachesTextNode(word)
+          : direct !== undefined
+            ? reachesTextNode(direct)
+            : "\n",
+    ),
   );
 }
 
@@ -105,9 +117,14 @@ const AS_PLAIN_MARKDOWN = new RegExp(
 
 /** The text as it goes between quotes: `marks` as entity forms, `\n` as `<br>`. */
 function quotedText(text: string, marks: RegExp = IN_STRING): string {
-  return text
-    .replace(marks, (c) => ENTITY_FORMS[c] ?? `#${String(c.codePointAt(0))};`)
-    .replace(/\n/g, "<br>");
+  const written = text.replace(
+    marks,
+    (c) => ENTITY_FORMS[c] ?? `#${String(c.codePointAt(0))};`,
+  );
+  // With a `<br>` in the label `sanitizeText` stores a plain `&` as `&amp;`.
+  return (
+    text.includes("\n") ? written.replace(/&/g, "#38;") : written
+  ).replace(/\n/g, "<br>");
 }
 
 /**
@@ -121,6 +138,25 @@ export function tidyLabel(text: string): string {
     .map((line) => line.replace(/[ \t]+/g, " ").trim())
     .join("\n")
     .replace(/^\n+|\n+$/g, "");
+}
+
+/**
+ * What cannot sit beside a line break: with a `<br>` in the label its text is
+ * parsed as HTML once more, so an entity form is read one level deeper. A literal
+ * `&amp;` would draw `&`, a backslash and `n` would break the line, and
+ * `decodeEntities` would read its own two markers.
+ */
+const LOST_BESIDE_A_BREAK = /&#?\w+;|\\n|\xB6\xDF|\uFB02\xB0/;
+
+/**
+ * Whether a tidied text cannot be drawn as typed, whatever is written: `%%{` is
+ * a directive to mermaid wherever it stands, and see `LOST_BESIDE_A_BREAK`.
+ */
+export function cannotDraw(typed: string): boolean {
+  return (
+    typed.includes("%%{") ||
+    (typed.includes("\n") && LOST_BESIDE_A_BREAK.test(typed))
+  );
 }
 
 /**
