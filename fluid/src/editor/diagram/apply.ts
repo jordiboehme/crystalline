@@ -19,6 +19,7 @@
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import type { EditorState, Line } from "@codemirror/state";
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
@@ -36,7 +37,6 @@ import { type MermaidFence, fenceAt } from "./fence";
 import type { FlowCreated, FlowModel } from "./flowchart/model";
 import { type FlowOp, compileFlowOp } from "./flowchart/ops";
 import { parseFlowchart } from "./flowchart/parse";
-import { opensBlock } from "./intent";
 import { type Verdict, requestVerdict } from "./verdict";
 
 /**
@@ -174,11 +174,11 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
     const last = doc.lineAt(fence.to);
     const below = last.number < doc.lines ? doc.line(last.number + 1) : null;
     const from = first.from;
-    // With a plain line below it takes the caret. With a block below, or nothing,
-    // there is none to stand on, so the fence's line stays, empty, and what is
-    // typed next has a line of its own (R83).
+    // A plain line below takes the caret. Any other block below starts with a mark
+    // a letter would break, so the fence's line stays, empty, and what is typed
+    // next has a line of its own (R83).
     const to =
-      below === null || opensBlock(state, below) ? last.to : below.from;
+      below === null || !plainLine(state, below) ? last.to : below.from;
     dispatchIsolated(view, {
       changes: { from, to },
       selection: EditorSelection.cursor(from),
@@ -196,6 +196,17 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
       view.dispatch({ effects: untrackAnchor.of(ticket) });
     }
   }
+}
+
+/** Whether a letter at the start of `line` is only a letter: blank, or a paragraph. */
+function plainLine(state: EditorState, line: Line): boolean {
+  if (line.text.trim() === "") {
+    return true;
+  }
+  return (
+    !/^\s*\$\$/.test(line.text) &&
+    syntaxTree(state).topNode.childAfter(line.from)?.name === "Paragraph"
+  );
 }
 
 /**

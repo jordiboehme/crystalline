@@ -343,3 +343,151 @@ test("holding Delete on a box takes only that box", async ({ page }) => {
   await expect.poll(() => docText(page)).toBe(before);
   await expect(box(page).locator("g.node")).toHaveCount(3);
 });
+
+const SENTENCE = "That would break a diagram here, so nothing was changed.";
+
+/** Whether the sentence stands inside the window, where a person can read it. */
+const sentenceInWindow = (page: Page) =>
+  page.evaluate(
+    (sentence) =>
+      [...document.querySelectorAll('[role="status"]')].some((el) => {
+        const rect = el.getBoundingClientRect();
+        return (
+          el.textContent === sentence &&
+          rect.height > 0 &&
+          rect.top >= 0 &&
+          rect.bottom <= window.innerHeight
+        );
+      }),
+    SENTENCE,
+  );
+
+/** Replace all of `mermaid`, through the real search panel. */
+async function replaceAllMermaid(page: Page): Promise<void> {
+  await page.keyboard.press("ControlOrMeta+f");
+  await page.locator('.cm-search input[name="search"]').fill("mermaid");
+  await page.locator('.cm-search input[name="replace"]').fill("chart");
+  await page.locator('.cm-search button[name="replaceAll"]').click();
+}
+
+const fillers = (count: number) =>
+  Array.from({ length: count }, (_, n) => `Line ${String(n)}\n`).join("\n");
+
+for (const [name, doc, start] of [
+  [
+    "below the window",
+    `Above mermaid\n${fillers(17)}\n${FENCE}\nEnd\n`,
+    "Above mermaid",
+  ],
+  [
+    "above the window",
+    `${FENCE}\n${fillers(17)}\nLast mermaid\n`,
+    "Last mermaid",
+  ],
+  [
+    "far off, its box not mounted",
+    `Above mermaid\n${fillers(150)}\n${FENCE}\nEnd\n`,
+    "Above mermaid",
+  ],
+] as const) {
+  test(`Replace all refused with the fence ${name}: the sentence shows, and the page stays`, async ({
+    page,
+  }) => {
+    await openEditor(page, doc);
+    const here = line(page, start);
+    if (start === "Last mermaid") {
+      // Far down the page, so not in the DOM until the caret goes there.
+      await page.locator(".cm-content").focus();
+      await page.keyboard.press("ControlOrMeta+End");
+    } else {
+      await here.click();
+      await page.keyboard.press("End");
+    }
+    await expect(here).toBeInViewport();
+    // Long enough for the verdict: a fence not drawn yet would take the edit.
+    await page.waitForTimeout(1_500);
+    const before = await docText(page);
+    await replaceAllMermaid(page);
+    const top = (await here.boundingBox())?.y;
+    await expect.poll(() => sentenceInWindow(page)).toBe(true);
+    expect(await docText(page)).toBe(before);
+    expect((await here.boundingBox())?.y).toBe(top);
+  });
+}
+
+/** A hit taken with main focused: the box stays drawn, the selection in its body. */
+async function hitWithMainFocused(page: Page): Promise<string> {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ControlOrMeta+f");
+  await page.keyboard.type("Second");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+Home");
+  await page.keyboard.press("F3");
+  await expect(box(page).locator("svg")).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.activeElement?.classList.contains("cm-content") ?? false,
+    ),
+  ).toBe(true);
+  return docText(page);
+}
+
+test("after a hit taken with main focused, a letter writes nothing and the box takes the keyboard", async ({
+  page,
+}) => {
+  const before = await hitWithMainFocused(page);
+  await page.keyboard.press("q");
+  await expect.poll(() => focusedIsBox(page)).toBe(true);
+  expect(await docText(page)).toBe(before);
+  await expect(page.locator(".cm-content")).not.toContainText("qBelow");
+});
+
+test("after a hit taken with main focused, Enter writes nothing", async ({
+  page,
+}) => {
+  const before = await hitWithMainFocused(page);
+  await page.keyboard.press("Enter");
+  await expect.poll(() => focusedIsBox(page)).toBe(true);
+  expect(await docText(page)).toBe(before);
+});
+
+test("after a hit taken with main focused, a paste writes nothing", async ({
+  page,
+}) => {
+  const before = await hitWithMainFocused(page);
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "pasted");
+    document.querySelector(".cm-content")?.dispatchEvent(
+      new ClipboardEvent("paste", {
+        clipboardData: data,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+  await expect.poll(() => focusedIsBox(page)).toBe(true);
+  expect(await docText(page)).toBe(before);
+});
+
+test("a press held after the canvas delete takes nothing more", async ({
+  page,
+}) => {
+  await openEditor(page, `Para above\n${FENCE}\nBelow\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: /^Below$/ }).click();
+  await page.keyboard.press("Home");
+  const before = await docText(page);
+  await page.keyboard.press("Backspace");
+  expect(await focusedIsBox(page)).toBe(true);
+  for (let n = 0; n < 12; n += 1) {
+    await page.keyboard.down("Backspace");
+  }
+  await page.keyboard.up("Backspace");
+  await expect.poll(() => docText(page)).toBe(before.replace(`${FENCE}\n`, ""));
+});

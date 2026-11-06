@@ -30,7 +30,7 @@ import { registerStopAction } from "./focus";
 import { diagramIntent, intentStale } from "./intent";
 import { prefetchDiagrams } from "./loader";
 import { requestVerdict } from "./verdict";
-import { forgetDrawings } from "./widget";
+import { forgetDrawings, NOTICE_MS } from "./widget";
 
 const kit = vi.hoisted(() => ({
   /** Whether renders wait for the test to let them go. */
@@ -142,6 +142,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   for (const release of kit.held) release();
   cleanupMarkViews();
 });
@@ -923,6 +924,18 @@ describe("main taking the focus with its selection in a drawn fence (R80)", () =
       expect(text(view)).toBe(DOC);
     });
 
+    it("refuses an edit elsewhere too: the browser's caret is not the selection (N2)", async () => {
+      const { view } = await hit();
+      const below = DOC.indexOf("Below");
+      view.dispatch({
+        changes: { from: below, insert: "Q" },
+        userEvent: "input.type",
+      });
+      await flush();
+      expect(text(view)).toBe(DOC);
+      expect(active()).toBe(box(view));
+    });
+
     it("lets the search panel's Replace through: the person asked for that text", async () => {
       const { view, at } = await hit();
       view.dispatch({
@@ -1006,6 +1019,26 @@ describe("a held key never crosses a boundary (R81)", () => {
   });
 });
 
+describe("a press held after the canvas delete (N6)", () => {
+  it("takes nothing more from the text, and a new press works again", async () => {
+    const view = await drawn();
+    setCaret(view, DOC.indexOf("Below"));
+    keys(view, "Backspace");
+    press("Backspace");
+    expect(text(view)).toBe("Above\nBelow\n");
+    await flush();
+    expect(active()).toBe(view.contentDOM);
+    setCaret(view, 5);
+    pressMain(view, "Backspace", true);
+    expect(text(view)).toBe("Above\nBelow\n");
+    view.contentDOM.dispatchEvent(
+      new KeyboardEvent("keyup", { key: "Backspace", bubbles: true }),
+    );
+    pressMain(view, "Backspace");
+    expect(text(view)).toBe("Abov\nBelow\n");
+  });
+});
+
 describe("a refused edit says so (R82)", () => {
   const SAID = NOTICES.breaksFence;
 
@@ -1076,7 +1109,10 @@ describe("a refused edit says so (R82)", () => {
     expect(noticeOf(view)).toBe("");
   });
 
-  it("brings a box off screen into view to say it", async () => {
+  const panelText = (view: EditorView) =>
+    view.dom.querySelector(".cm-diagram-refusal")?.textContent;
+
+  it("says it in a panel for a box not mounted, and does not scroll", async () => {
     const doc = `${"Line of text\n\n".repeat(8000)}${REPLACED}`;
     const view = markView(doc, modeOptions());
     await prefetchDiagrams();
@@ -1084,11 +1120,55 @@ describe("a refused edit says so (R82)", () => {
       expect(view.state.facet(drawnFenceLines)).toHaveLength(1);
     });
     expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+    const dispatch = vi.spyOn(view, "dispatch");
     replaceAll(view, doc);
     await flush();
-    (view as unknown as { measure(): void }).measure();
-    await flush();
     expect(text(view)).toBe(doc);
+    expect(panelText(view)).toBe(SAID);
+    expect(
+      dispatch.mock.calls
+        .flat()
+        .some((spec) => JSON.stringify(spec).includes("scrollIntoView")),
+    ).toBe(false);
+    expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+  });
+
+  it("says it in a panel for a box mounted outside the window", async () => {
+    const view = await drawn(REPLACED);
+    const notice = box(view).querySelector(".cm-diagram-notice");
+    vi.spyOn(notice as Element, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, window.innerHeight + 500, 100, 20),
+    );
+    replaceAll(view, REPLACED);
+    await flush();
+    expect(panelText(view)).toBe(SAID);
+    expect(noticeOf(view)).toBe("");
+  });
+
+  it("takes the panel away after the notice's time", async () => {
+    const view = await drawn(REPLACED);
+    const notice = box(view).querySelector(".cm-diagram-notice");
+    vi.spyOn(notice as Element, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, -500, 100, 20),
+    );
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    replaceAll(view, REPLACED);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(panelText(view)).toBe(SAID);
+    await vi.advanceTimersByTimeAsync(NOTICE_MS);
+    expect(panelText(view)).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it("refuses a Replace that would close the fence early (N5)", async () => {
+    const view = await drawn();
+    const at = DOC.indexOf("Next");
+    view.dispatch({
+      changes: { from: at, to: at + 4, insert: "x]\n```\n" },
+      userEvent: "input.replace",
+    });
+    await flush();
+    expect(text(view)).toBe(DOC);
     expect(noticeOf(view)).toBe(SAID);
   });
 });
@@ -1137,6 +1217,15 @@ describe("after a canvas delete, the next letter is on a line of its own (R83)",
       `Top\n${fence(BODY)}\n| a |\n|---|\n| 1 |\n`,
       `Top\nQ\n| a |\n|---|\n| 1 |\n`,
     ],
+    ["a rule below", `Top\n${fence(BODY)}\n---\nEnd\n`, `Top\nQ\n---\nEnd\n`],
+    ["math below", `Top\n${fence(BODY)}\n$$\nx\n$$\n`, `Top\nQ\n$$\nx\n$$\n`],
+    [
+      "an HTML block below",
+      `Top\n${fence(BODY)}\n<div>\nx\n</div>\n`,
+      `Top\nQ\n<div>\nx\n</div>\n`,
+    ],
+    ["a quote below", `Top\n${fence(BODY)}\n> q\n`, `Top\nQ\n> q\n`],
+    ["a heading below", `Top\n${fence(BODY)}\n## H\n`, `Top\nQ\n## H\n`],
     [
       "a horizontal rule above, no final line break",
       `Top\n\n---\n${fence(BODY)}`,
@@ -1213,8 +1302,10 @@ describe("an arrow as a stop (R84)", () => {
       box(view).focus();
       await flush();
       press("End");
+      await flush();
       if (occurrence === 1) {
         press("ArrowLeft");
+        await flush();
       }
       expect(view.state.field(diagramIntent)?.target).toEqual({
         kind: "edge",
@@ -1227,6 +1318,37 @@ describe("an arrow as a stop (R84)", () => {
       );
       undoOnce(view);
       expect(text(view)).toBe(doc);
+    },
+  );
+});
+
+describe("a click on one of duplicate arrows", () => {
+  const DUPLICATES =
+    "flowchart LR\n    A -->|one| B\n    A -->|two| B\n    A -->|three| B";
+
+  it.each([
+    ['g.label[data-id="L_A_B_2"]', 1, "A -->|one| B\n    A -->|three| B"],
+    ['[data-hit-for="L_A_B_2"]', 1, "A -->|one| B\n    A -->|three| B"],
+    ['g.label[data-id="L_A_B_3"]', 2, "A -->|one| B\n    A -->|two| B"],
+    ['[data-hit-for="L_A_B_3"]', 2, "A -->|one| B\n    A -->|two| B"],
+  ])(
+    "%s holds occurrence %i, and Delete takes that one",
+    async (selector, occurrence, rest) => {
+      const doc = `Above\n${fence(DUPLICATES)}\nBelow\n`;
+      const view = await drawn(doc);
+      box(view)
+        .querySelector(selector)
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await flush();
+      expect(view.state.field(diagramIntent)?.target).toEqual({
+        kind: "edge",
+        key: { start: "A", end: "B", occurrence },
+      });
+      press("Delete");
+      await settled(
+        view,
+        `Above\n${fence(`flowchart LR\n    ${rest}`)}\nBelow\n`,
+      );
     },
   );
 });

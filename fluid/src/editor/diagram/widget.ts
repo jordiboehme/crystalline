@@ -572,6 +572,17 @@ export const diagramTheme = View.baseTheme({
   ".cm-diagram-overlay > *": { pointerEvents: "auto" },
   // The ring is the look of the focus; the browser's own outline would double it.
   ".cm-diagram:focus, .cm-diagram svg [tabindex]:focus": { outline: "none" },
+  ".cm-diagram-refusal": {
+    padding: "0.25rem 0.75rem",
+    color: "var(--color-slate-700)",
+    backgroundColor: "var(--color-slate-100)",
+    fontSize: "var(--text-caption, 0.75rem)",
+    lineHeight: "var(--text-caption--line-height, 1rem)",
+  },
+  "&dark .cm-diagram-refusal": {
+    color: "var(--color-slate-200)",
+    backgroundColor: "var(--color-slate-800)",
+  },
   ".cm-diagram-overlay > .cm-diagram-focus-ring": {
     position: "absolute",
     pointerEvents: "none",

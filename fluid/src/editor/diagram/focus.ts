@@ -17,13 +17,14 @@
 
 import { forceParsing, syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
-import { EditorState, Prec, StateEffect } from "@codemirror/state";
+import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
 import type { Command, ViewUpdate } from "@codemirror/view";
 import {
   EditorView,
   ViewPlugin,
   keymap,
   runScopeHandlers,
+  showPanel,
 } from "@codemirror/view";
 
 import { writable } from "../elementEdit";
@@ -31,6 +32,7 @@ import { stepVisible, viewAtoms } from "../marks/caret";
 import { flowKind, removeFence, runDiagramOp } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
+import { NOTICES } from "./edits";
 import { fenceAt } from "./fence";
 import {
   diagramField,
@@ -56,7 +58,7 @@ import {
 import type { Verdict } from "./verdict";
 import { verdictFor } from "./verdict";
 import type { DiagramHost } from "./widget";
-import { hostOf, onBoxMounted, onDiagramDrawn } from "./widget";
+import { hostOf, NOTICE_MS, onBoxMounted, onDiagramDrawn } from "./widget";
 
 const CANVAS: TargetKey = { kind: "canvas" };
 const FOCUS_CLASS = "cm-diagram-focus";
@@ -233,6 +235,9 @@ export function focusTarget(
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
 const held = new WeakMap<EditorView, boolean>();
 
+/** Views whose held key just took a fence: its repeats take nothing more (N6). */
+const spentHold = new WeakSet<EditorView>();
+
 /**
  * The chunk's side of the hand-off from the hidden-mark keys (R13). A held key
  * is spent here: it stops at the fence, and only a new press goes in.
@@ -296,6 +301,9 @@ async function deleteStop(
   if (target.kind === "canvas") {
     const outcome = removeFence(main, from);
     refused = "refused" in outcome ? outcome.refused : undefined;
+    if (outcome.applied) {
+      spentHold.add(main);
+    }
   } else {
     const op =
       target.kind === "node"
@@ -510,15 +518,64 @@ function stopAtPos(host: DiagramHost, offset: number): TargetKey {
   return CANVAS;
 }
 
+/** Whether a sentence in this box's status line stands inside the window. */
+function noticeInWindow(host: DiagramHost): boolean {
+  const status = host.container.querySelector(".cm-diagram-notice");
+  if (status === null) {
+    return false;
+  }
+  const { top, bottom } = status.getBoundingClientRect();
+  if (top < 0 || bottom > window.innerHeight) {
+    return false;
+  }
+  for (let el = status.parentElement; el !== null; el = el.parentElement) {
+    if (/auto|scroll|hidden/.test(getComputedStyle(el).overflowY)) {
+      const clip = el.getBoundingClientRect();
+      if (clip.height > 0 && (top < clip.top || bottom > clip.bottom)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+const refusalShown = StateEffect.define<string | null>();
+
+/** The sentence of a refusal whose fence is out of the window, in a panel. */
+const refusalPanel = StateField.define<string | null>({
+  create: () => null,
+  update: (value, tr) => {
+    let next = value;
+    for (const effect of tr.effects) {
+      if (effect.is(refusalShown)) {
+        next = effect.value;
+      }
+    }
+    return next;
+  },
+  provide: (field) =>
+    showPanel.from(field, (sentence) =>
+      sentence === null
+        ? null
+        : () => {
+            const dom = document.createElement("div");
+            dom.className = "cm-diagram-refusal";
+            dom.setAttribute("role", "status");
+            dom.textContent = sentence;
+            return { dom };
+          },
+    ),
+});
+
 /** Keeps the keyboard's places and the look current, and takes the DOM events. */
-export const diagramFocus: Extension = ViewPlugin.fromClass(
+const focusPlugin = ViewPlugin.fromClass(
   class {
     readonly view: EditorView;
     readonly stop: (() => void)[];
     /** The box wearing a search hit's look. */
     lookOn: DiagramHost | null = null;
-    /** Where a refusal's sentence waits for a box off screen to arrive. */
-    owedNotice: number | null = null;
+    /** Takes a refusal's panel away again. */
+    panelTimer: ReturnType<typeof setTimeout> | null = null;
 
     readonly mousedown = (event: Event): void => {
       // The click decides; a press alone moves neither focus nor selection.
@@ -595,8 +652,15 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
     };
     readonly noteKey = (event: KeyboardEvent): void => {
       held.set(this.view, event.repeat);
+      if (!event.repeat) {
+        spentHold.delete(this.view);
+      } else if (spentHold.has(this.view)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
     };
     readonly keyUp = (): void => {
+      spentHold.delete(this.view);
       if (held.get(this.view) === true) {
         held.set(this.view, false);
         this.ruleOnSelection();
@@ -650,13 +714,6 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
         }),
         onBoxMounted(view, (host) => {
           settle(view, host);
-          if (
-            this.owedNotice !== null &&
-            hostOf(view, this.owedNotice) === host
-          ) {
-            this.owedNotice = null;
-            host.notice("breaksFence");
-          }
         }),
       ];
     }
@@ -825,16 +882,29 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
       }
       if (say) {
         const host = hostOf(view, at);
-        if (host !== null) {
+        if (host !== null && noticeInWindow(host)) {
           host.notice("breaksFence");
         } else {
-          // Off screen, nothing shows why the command did nothing: go and say so.
-          this.owedNotice = at;
-          view.dispatch({
-            effects: EditorView.scrollIntoView(at, { y: "center" }),
-          });
+          this.sayInPanel();
         }
       }
+    }
+
+    /**
+     * The fence is not where the person is looking, and a refusal must still
+     * reach them: a panel of the editor stays in the window, as the search panel
+     * does, and the page does not move for it (R89).
+     */
+    sayInPanel(): void {
+      const { view } = this;
+      view.dispatch({ effects: refusalShown.of(NOTICES.breaksFence) });
+      if (this.panelTimer !== null) {
+        clearTimeout(this.panelTimer);
+      }
+      this.panelTimer = setTimeout(() => {
+        this.panelTimer = null;
+        view.dispatch({ effects: refusalShown.of(null) });
+      }, NOTICE_MS);
     }
 
     redecorate(): void {
@@ -889,9 +959,14 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
       for (const stop of this.stop) {
         stop();
       }
+      if (this.panelTimer !== null) {
+        clearTimeout(this.panelTimer);
+      }
     }
   },
 );
+
+export const diagramFocus: Extension = [focusPlugin, refusalPanel];
 
 /** An empty caret at the visible edge of its line, or null. */
 function edgeOf(view: EditorView, forward: boolean): number | null {
@@ -998,9 +1073,8 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
         tr.isUserEvent("delete.forward")) &&
         selection.ranges.every((range) => range.empty));
     for (const fence of tr.startState.facet(drawnFenceLines)) {
-      if (tr.changes.touchesRange(fence.from, fence.to) === false) {
-        continue;
-      }
+      // Before anything about where the change lands: the browser's caret is not
+      // this selection, so a letter can arrive on the line below (R90).
       if (
         !tr.isUserEvent("input.replace") &&
         selection.ranges.some(
@@ -1018,6 +1092,9 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
           }),
         };
       }
+      if (tr.changes.touchesRange(fence.from, fence.to) === false) {
+        continue;
+      }
       let whole = false;
       tr.changes.iterChanges((fromA, toA) => {
         whole ||= fromA <= fence.from && fence.to <= toA;
@@ -1025,11 +1102,17 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
       if (whole) {
         continue;
       }
+      // A fence mark written into the body ends the fence early.
+      let closes = false;
+      tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+        closes ||= /(?:^|\n)[ \t]*(?:`{3,}|~{3,})/.test(inserted.toString());
+      });
       const from = tr.changes.mapPos(fence.from, 1);
       const to = tr.changes.mapPos(fence.to, -1);
       const first = tr.newDoc.lineAt(from);
       const last = tr.newDoc.lineAt(to);
       if (
+        closes ||
         first.from !== from ||
         last.to !== to ||
         first.text !== doc.lineAt(fence.from).text ||
