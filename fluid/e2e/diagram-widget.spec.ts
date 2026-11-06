@@ -14,7 +14,10 @@
  * - RESERVED_SLACK_PX: a plain chain with nothing to reuse, first drawn in the
  *   window: what its reserved height was off by.
  * - The flip back to text: the page ends where the source and the caption put it,
- *   in at most 3 positions.
+ *   in at most 2 positions: the box's height holds until the caption is there. It
+ *   was 3 positions, jumping twice (591.06, 496.16, 528.16).
+ * - The flip back with the drawing unchanged (R80): at most 2 positions, moved by the
+ *   source lines within FLIP_SLACK_PX, and no empty frame in the preview.
  * - SCROLL_JUMP_PX: a line in the window, any frame of a scroll over diagrams not
  *   drawn yet, against the same walk with no diagram. Measured: 4, in the frame a
  *   600 px wheel step applied in. With the scroller's correction taken out: 12.
@@ -691,6 +694,19 @@ test("a first draw in the window: how far a diagram that is no chain moves the t
   expect(wide.reserved).toBeGreaterThan(48);
 });
 
+/** How many places a line stood in, leaving out moves within STILL_PX. */
+function positions(tops: number[]): number {
+  let count = 0;
+  let last = Number.NaN;
+  for (const top of tops) {
+    if (!(Math.abs(top - last) <= STILL_PX)) {
+      count += 1;
+      last = top;
+    }
+  }
+  return count;
+}
+
 test("the flip back to text ends where the source and the caption put the page", async ({
   page,
 }, info) => {
@@ -740,7 +756,48 @@ test("the flip back to text ends where the source and the caption put the page",
   expect(Math.abs(moved - (source + preview - boxHeight))).toBeLessThanOrEqual(
     STILL_PX,
   );
-  expect(tops.length).toBeLessThanOrEqual(3);
+  expect(positions(tops)).toBeLessThanOrEqual(2);
+});
+
+test("the flip back with its body unchanged moves the page by the source lines, in one step", async ({
+  page,
+}, info) => {
+  await openEditor(
+    page,
+    "Above\n\n```mermaid\nflowchart TD\n  A --> B\n  B --> C\n```\n\nBelow marker\n\nLast line\n",
+  );
+  await expect(page.locator(".cm-diagram svg")).toBeVisible();
+  await settle(page);
+  // A search hit in the fence, left with Escape: R80's route, by real keys.
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ControlOrMeta+f");
+  await page.keyboard.type("B --> C");
+  await page.keyboard.press("Enter");
+  await settle(page, 300);
+  // The search panel stands above the text and closes in the same step.
+  const panel =
+    (await page.locator(".cm-panels-top").boundingBox())?.height ?? 0;
+  await sampleFrames(page, "Below marker");
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".cm-diagram")).toHaveCount(0);
+  await expect(page.locator(".cm-mermaid-preview svg")).toBeVisible();
+  await settle(page, 800);
+  const source = await page.evaluate(() =>
+    [...document.querySelectorAll(".cm-content > .cm-line")]
+      .filter((el) => el.classList.contains("cm-fence-mono"))
+      .reduce((sum, el) => sum + el.getBoundingClientRect().height, 0),
+  );
+  const frames = await framesOf(page);
+  const tops = frames
+    .map((frame) => frame.top)
+    .filter((top, i, all) => top !== all[i - 1]);
+  const moved = (tops.at(-1) ?? 0) - (tops[0] ?? 0);
+  info.annotations.push({
+    type: "flip back, same body",
+    description: JSON.stringify({ source, panel, tops, moved }),
+  });
+  expect(Math.abs(moved - (source - panel))).toBeLessThanOrEqual(FLIP_SLACK_PX);
+  expect(positions(tops)).toBeLessThanOrEqual(2);
 });
 
 test("a label goes through drawnLabels, a fence coming back has its drawing at once, and nothing is left behind", async ({

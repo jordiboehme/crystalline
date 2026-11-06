@@ -127,6 +127,34 @@ function arrowLabel(model: FlowModel, edge: FlowEdge): string {
 }
 
 /**
+ * What the rename field shows for `target`, which is what is drawn: a box with no
+ * label of its own shows its id, an arrow with none is empty. Null when the source
+ * has no such box or arrow, so a target a peer took away can be told.
+ */
+export function flowLabelOf(
+  model: FlowModel,
+  target: FlowTarget,
+): string | null {
+  if (target.kind === "node") {
+    return model.nodes.has(target.id) ? boxLabel(model, target.id) : null;
+  }
+  if (target.kind === "edge") {
+    const edge = model.edges.find((e) => sameEdge(e, target.key));
+    const arrow = edge && model.chains[edge.chain]?.links[edge.link]?.arrow;
+    if (arrow === undefined) {
+      return null;
+    }
+    return arrow.label === null
+      ? ""
+      : decodeLabel(
+          model.body.slice(arrow.label.from, arrow.label.to),
+          arrow.labelQuoted,
+        );
+  }
+  return null;
+}
+
+/**
  * Makes the drawing's boxes and arrows stops: out of the tab order until the
  * focus code gives one `tabindex="0"`, named for a screen reader, and each arrow
  * with a wide transparent path beside it, so a thin line can be hit.

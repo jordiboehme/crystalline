@@ -135,7 +135,10 @@ async function settled(view: EditorView, doc: string): Promise<void> {
   await flush();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  // A click here is about the stop. What it opens has its own suite.
+  await prefetchDiagrams();
+  registerStopAction("rename", () => undefined);
   kit.hold.value = false;
   kit.held.length = 0;
   forgetDrawings();
@@ -1403,6 +1406,15 @@ describe("after a canvas delete, the next letter is on a line of its own (R83)",
     if (second === undefined) throw new Error("no second box");
     await deleteAndType(view, second, `Top\n${fence(BODY)}\nQ`, doc);
   });
+
+  it.each(["===", "--", "  ==="])(
+    "a paragraph line %j below, which would make the line above a heading",
+    async (below) => {
+      const doc = `Above\n${fence(BODY)}\n${below}\n`;
+      const view = await drawn(doc);
+      await deleteAndType(view, box(view), `Above\nQ\n${below}\n`, doc);
+    },
+  );
 
   it("a plain line above, no final line break", async () => {
     const doc = `Above\n${fence(BODY)}`;

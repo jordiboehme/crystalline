@@ -178,6 +178,17 @@ export function remoteInsert(view: EditorView, at: number, text: string): void {
   }, "peer");
 }
 
+/** A peer's delete in a room view built by `markView`, as `remoteInsert`'s. */
+export function roomDelete(view: EditorView, at: number, length: number): void {
+  const ytext = roomTexts.get(view);
+  if (!ytext) {
+    throw new Error("roomDelete takes a room view built by markView");
+  }
+  ytext.doc?.transact(() => {
+    ytext.delete(at, length);
+  }, "peer");
+}
+
 /**
  * Two peers of one room on `text`, each a view built by `markView`. What one
  * peer writes reaches the other only on `sync()`, so a test can let both

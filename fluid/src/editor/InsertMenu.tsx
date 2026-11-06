@@ -123,7 +123,10 @@ export function InsertMenu({
           // inserted something or having pressed Escape.
           onCloseAutoFocus={(event) => {
             event.preventDefault();
-            view?.focus();
+            // Not over a field the insert opened in the text, as a starter's does.
+            if (!view?.dom.contains(document.activeElement)) {
+              view?.focus();
+            }
           }}
         >
           {sub("Callout", of("Callout").map(item))}

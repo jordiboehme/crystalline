@@ -1337,3 +1337,21 @@ describe("Raw and two views", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 });
+
+describe("a peer's line at the fence's first mark", () => {
+  it("keeps the box element, and what its overlay holds", async () => {
+    const view = await drawn(DOC, { room: true });
+    const before = view.dom.querySelector<HTMLElement>(".cm-diagram");
+    const held = document.createElement("textarea");
+    view.dom.querySelector(".cm-diagram-overlay")?.append(held);
+    held.focus();
+    remoteInsert(view, DOC.indexOf("```"), "peer line\n\n");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(view.dom.querySelector(".cm-diagram")).toBe(before);
+    expect(held.isConnected).toBe(true);
+    expect(document.activeElement).toBe(held);
+    const moved = view.state.doc.toString().indexOf("```");
+    expect(hostOf(view, moved)?.container).toBe(before);
+    expect(view.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+  });
+});

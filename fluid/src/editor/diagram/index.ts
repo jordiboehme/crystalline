@@ -23,7 +23,8 @@ import {
   fenceMarksGuard,
 } from "./focus";
 import { diagramIntent, intentWatcher } from "./intent";
-import { diagramTheme } from "./widget";
+import { labelEditorPlugin } from "./labelEditor";
+import { diagramTheme, flipBackHold } from "./widget";
 
 export function diagramExtension(): Extension {
   return [
@@ -52,6 +53,8 @@ export function diagramExtension(): Extension {
     verdictWatcher,
     pointerWatcher,
     intentWatcher,
+    labelEditorPlugin,
+    flipBackHold,
     diagramTheme,
   ];
 }

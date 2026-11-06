@@ -139,6 +139,8 @@ test("a click maps to its box, and duplicates and odd ids get their own hit path
   );
   await expect(box(page).locator("svg")).toBeVisible();
   await box(page).locator("g.node", { hasText: "Two" }).click();
+  expect(await focusedLabel(page)).toBe("Box name");
+  await page.keyboard.press("Escape");
   expect(await focusedLabel(page)).toBe("Box: Two");
   const paths = box(page).locator('path[data-et="edge"]');
   await expect(paths).toHaveCount(2);
@@ -176,6 +178,7 @@ test("Delete on a box takes it out, and the focus stays on the drawing", async (
   await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
   await expect(box(page).locator("svg")).toBeVisible();
   await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.press("Escape");
   await page.keyboard.press("Delete");
   await expect(box(page).locator("g.node")).toHaveCount(1);
   await expect
@@ -212,6 +215,8 @@ test("a click on an arrow's wide hit path selects that arrow", async ({
     arrow.x + arrow.width / 2 + 4,
     arrow.y + arrow.height / 2,
   );
+  expect(await focusedLabel(page)).toBe("Arrow label");
+  await page.keyboard.press("Escape");
   expect(await focusedLabel(page)).toBe("Arrow from First to Second");
 });
 
@@ -332,6 +337,7 @@ test("holding Delete on a box takes only that box", async ({ page }) => {
   await expect(box(page).locator("g.node")).toHaveCount(3);
   const before = await docText(page);
   await box(page).locator("g.node", { hasText: "Third" }).click();
+  await page.keyboard.press("Escape");
   await page.keyboard.down("Delete");
   await expect(box(page).locator("g.node")).toHaveCount(2);
   for (let n = 0; n < 8; n += 1) {

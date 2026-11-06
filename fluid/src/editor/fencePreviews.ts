@@ -261,6 +261,52 @@ export function takePreviewDrawing(
   return null;
 }
 
+/** Drawings a diagram box showed, kept for its flip back. */
+const OFFERS_KEPT = 16;
+const offers = new Map<string, { svg: string; id: string }>();
+
+const offerKey = (source: string, dark: boolean) =>
+  `${dark ? "dark" : "light"}\n${source}`;
+
+/**
+ * The other way round: a diagram box says what it has on screen, so a preview of
+ * the same body has it in its first frame when the fence goes back to text, and
+ * the page moves by the source lines only, in one step. The markup, since the box
+ * keeps its own element until it has gone.
+ */
+export function offerPreviewDrawing(
+  source: string,
+  dark: boolean,
+  svg: string,
+  id: string,
+): void {
+  const key = offerKey(source, dark);
+  offers.delete(key);
+  offers.set(key, { svg, id });
+  for (const oldest of offers.keys()) {
+    if (offers.size <= OFFERS_KEPT) {
+      break;
+    }
+    offers.delete(oldest);
+  }
+}
+
+/** For tests: a drawing offered in one test is not at hand in the next. */
+export function forgetPreviewOffers(): void {
+  offers.clear();
+}
+
+/**
+ * Keeps an empty preview at `height` until its drawing or its caption lands, so a
+ * fence going back to text moves the page once, when the answer is there, and not
+ * twice. A preview that has drawn needs no holding.
+ */
+export function holdPreviewHeight(box: HTMLElement, height: number): void {
+  if (box.childElementCount === 0) {
+    box.style.minHeight = `${String(height)}px`;
+  }
+}
+
 class MermaidPreviewWidget extends WidgetType {
   // Assigned in the body rather than declared as constructor parameters: the
   // build erases types, it does not run a TypeScript transform, and
@@ -337,6 +383,11 @@ class MermaidPreviewWidget extends WidgetType {
     previews.set(box, preview);
     mermaidSequence += 1;
     const id = `cm-mermaid-${String(mermaidSequence)}`;
+    const offered = offers.get(offerKey(source, dark));
+    if (offered !== undefined) {
+      box.innerHTML = offered.svg.split(offered.id).join(id);
+      return box;
+    }
     void Promise.all([import("mermaid"), import("../theme/mermaidText")])
       .then(async ([{ default: mermaid }, { drawnLabels }]) => {
         // The same configuration the reading view uses, so a diagram does
@@ -355,6 +406,7 @@ class MermaidPreviewWidget extends WidgetType {
         preview.themeMoved = theme !== mermaidThemeChanges();
         if (box.isConnected || box.childElementCount === 0) {
           box.innerHTML = drawnLabels(rendered.svg);
+          box.style.minHeight = "";
         }
       })
       .catch((cause: unknown) => {
@@ -382,6 +434,7 @@ class MermaidPreviewWidget extends WidgetType {
         // widget that took the box over is the one that knows where it is now.
         caption.textContent = captionFor(preview);
         box.appendChild(caption);
+        box.style.minHeight = "";
       });
     return box;
   }

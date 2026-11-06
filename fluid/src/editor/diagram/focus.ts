@@ -86,9 +86,22 @@ export function registerStopAction(
   stopActions.set(name, action);
 }
 
+type ClickGate = (main: EditorView, target: TargetKey, go: () => void) => void;
+
+let clickGate: ClickGate | null = null;
+
+/**
+ * What stands before a click on a stop: an open rename field writes its draft
+ * first, and `go` then takes the click, unless the field stays open.
+ */
+export function registerClickGate(gate: ClickGate): void {
+  clickGate = gate;
+}
+
 const models = new Map<string, FlowModel>();
 
-function modelOf(body: string): FlowModel {
+/** The model of a fence body, kept for the last few bodies. */
+export function modelOf(body: string): FlowModel {
   let model = models.get(body);
   if (model === undefined) {
     model = parseFlowchart(body);
@@ -151,6 +164,20 @@ function stopElement(
 ): HTMLElement | SVGElement {
   const reading = readingOf(host);
   return (reading && elementOf(reading, target)) ?? host.container;
+}
+
+/** The element `target` has in the drawing on screen, or null. */
+export function targetElement(
+  host: DiagramHost,
+  target: TargetKey,
+): HTMLElement | SVGElement | null {
+  const reading = readingOf(host);
+  return reading && elementOf(reading, target);
+}
+
+/** The look of the focus off the box: the field stands where the ring would. */
+export function clearStopLook(host: DiagramHost): void {
+  paint(host, null);
 }
 
 /** Takes the look off the box, and puts it on `el` when one is given. */
@@ -554,6 +581,9 @@ function mainHoldsFocus(state: EditorState): boolean {
 
 const refusalShown = StateEffect.define<string | null>();
 
+/** A refusal with no box left to say it in: it goes to the panel below. */
+export const sayRefusal = StateEffect.define<RefusalCode>();
+
 /** The sentence of a refusal whose fence is out of the window, in a panel. */
 const refusalPanel = StateField.define<string | null>({
   create: () => null,
@@ -618,13 +648,27 @@ const focusPlugin = ViewPlugin.fromClass(
       }
       const reading = readingOf(place.host);
       const el = event.target as Element;
-      focusTarget(
-        this.view,
-        place.from,
+      const target =
         reading === null
           ? CANVAS
-          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict),
-      );
+          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
+      const { view } = this;
+      const go = () => {
+        const intent = view.state.field(diagramIntent);
+        const from = intent?.anchor ?? place.from;
+        focusTarget(view, from, target);
+        if (target.kind !== "canvas" && writable(view.state)) {
+          const host = hostOf(view, from);
+          if (host !== null) {
+            stopActions.get("rename")?.(view, from, target, host);
+          }
+        }
+      };
+      if (clickGate === null) {
+        go();
+      } else {
+        clickGate(view, target, go);
+      }
     };
     readonly contextmenu = (event: Event): void => {
       const place = this.place(event);
@@ -744,7 +788,13 @@ const focusPlugin = ViewPlugin.fromClass(
       const { view } = this;
       const from = box.isConnected ? fenceFromOf(view, box) : null;
       const host = from === null ? null : hostOf(view, from);
-      if (host === null || from === null || !el.isConnected) {
+      // Gone on already: to the rename field a click opens in the same tick.
+      if (
+        host === null ||
+        from === null ||
+        !el.isConnected ||
+        view.root.activeElement !== el
+      ) {
         return;
       }
       const reading = readingOf(host);
@@ -808,6 +858,12 @@ const focusPlugin = ViewPlugin.fromClass(
       }
       for (const tr of update.transactions) {
         for (const effect of tr.effects) {
+          if (effect.is(sayRefusal)) {
+            const code = effect.value;
+            queueMicrotask(() => {
+              this.sayInPanel(code);
+            });
+          }
           if (effect.is(fenceEditRefused)) {
             const refused = effect.value;
             queueMicrotask(() => {
@@ -874,6 +930,10 @@ const focusPlugin = ViewPlugin.fromClass(
         return;
       }
       const { state } = view;
+      // A field writing its draft has the last word on this box.
+      if (state.field(diagramIntent)?.mode === "rename") {
+        return;
+      }
       const { from, to } = state.selection.main;
       const lines = state
         .facet(drawnFenceLines)
@@ -899,7 +959,7 @@ const focusPlugin = ViewPlugin.fromClass(
         if (host !== null && noticeInWindow(host)) {
           host.notice("breaksFence");
         } else {
-          this.sayInPanel();
+          this.sayInPanel("breaksFence");
         }
       }
     }
@@ -909,14 +969,14 @@ const focusPlugin = ViewPlugin.fromClass(
      * reach them: a panel of the editor stays in the window, as the search panel
      * does, and the page does not move for it (R89).
      */
-    sayInPanel(): void {
+    sayInPanel(code: RefusalCode): void {
       const { view } = this;
       // Announced as well: a live region that arrives with its text is commonly
       // not read, and a second refusal changes nothing in the panel (R92).
       view.dispatch({
         effects: [
-          refusalShown.of(NOTICES.breaksFence),
-          EditorView.announce.of(NOTICES.breaksFence),
+          refusalShown.of(NOTICES[code]),
+          EditorView.announce.of(NOTICES[code]),
         ],
       });
       if (this.panelTimer !== null) {

@@ -73,6 +73,15 @@ export const pointerDown = StateEffect.define<boolean>();
  */
 export const showFenceSource = StateEffect.define<number>();
 
+/**
+ * A fence that stays drawn whatever its verdict says, or null for none: the one
+ * holding an open rename field. A peer's half-typed line is refused by mermaid
+ * on each key, and the person's draft and composition must not go with the box.
+ * What it does for the text: nothing is written while the verdict is against it.
+ * The value is the fence's `from`; it follows the fence through changes.
+ */
+export const keepFenceDrawn = StateEffect.define<number | null>();
+
 interface DiagramFieldValue {
   fences: DrawnFence[];
   /**
@@ -89,6 +98,8 @@ interface DiagramFieldValue {
   exempt: number[];
   /** `from` of the carried fences whose text changed since the tree last read them. */
   behind: readonly number[];
+  /** `from` of the fence `keepFenceDrawn` names. */
+  kept: number | null;
 }
 
 let nextKey = 0;
@@ -172,6 +183,7 @@ function build(
   exempt: readonly number[],
   pointer: boolean,
   behindBefore: readonly number[],
+  keptFence: number | null,
 ): DiagramFieldValue {
   const candidates = candidateFences(state);
   const { from: head, to: tail } = state.selection.main;
@@ -181,7 +193,7 @@ function build(
     if (drawnBefore.has(fence.from)) {
       // An edit keeps a drawn fence drawn, whatever its new verdict is until
       // it arrives; a refusal takes it back.
-      return verdict === undefined || verdict.ok;
+      return verdict === undefined || verdict.ok || fence.from === keptFence;
     }
     if (verdict === undefined || !verdict.ok) {
       return false;
@@ -216,6 +228,7 @@ function build(
       .filter((from) => behindBefore.includes(from)),
     pointer,
     held,
+    kept: keptFence,
     exempt: exempt.filter(
       (from) =>
         !keys.has(from) && candidates.some((fence) => fence.from === from),
@@ -237,7 +250,7 @@ function placeAfter(tr: Transaction, from: number): number | null {
 }
 
 export const diagramField = StateField.define<DiagramFieldValue>({
-  create: (state) => build(state, new Map(), () => [], [], false, []),
+  create: (state) => build(state, new Map(), () => [], [], false, [], null),
   update: (value, tr) => {
     let pointer = value.pointer;
     for (const effect of tr.effects) {
@@ -251,7 +264,16 @@ export const diagramField = StateField.define<DiagramFieldValue>({
         effect.is(drawUnderCaret) ? [effect.value] : [],
       ),
     ];
+    let kept = value.kept === null ? null : tr.changes.mapPos(value.kept, 1);
+    let keptAsked = false;
+    for (const effect of tr.effects) {
+      if (effect.is(keepFenceDrawn)) {
+        kept = effect.value;
+        keptAsked = true;
+      }
+    }
     if (
+      !keptAsked &&
       !tr.docChanged &&
       !parseAdvanced(tr) &&
       !arrived(tr) &&
@@ -300,6 +322,7 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       exemptNow,
       pointer,
       behind,
+      kept,
     );
   },
   provide: (field) => [

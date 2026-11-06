@@ -198,13 +198,18 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
   }
 }
 
-/** Whether a letter at the start of `line` is only a letter: blank, or a paragraph. */
+/**
+ * Whether a letter at the start of `line` is only a letter: blank, or a paragraph.
+ * Not a paragraph of `===` or `--`: moved up under a line of text it would make
+ * that line a heading, with no byte of it changed.
+ */
 function plainLine(state: EditorState, line: Line): boolean {
   if (line.text.trim() === "") {
     return true;
   }
   return (
     !/^\s*\$\$/.test(line.text) &&
+    !/^ {0,3}(?:=+|-+)[ \t]*$/.test(line.text) &&
     syntaxTree(state).topNode.childAfter(line.from)?.name === "Paragraph"
   );
 }

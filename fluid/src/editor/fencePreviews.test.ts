@@ -12,7 +12,12 @@ import mermaid from "mermaid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../test/parse";
-import { describeMermaidError, fencePreviews } from "./fencePreviews";
+import {
+  describeMermaidError,
+  fencePreviews,
+  holdPreviewHeight,
+  offerPreviewDrawing,
+} from "./fencePreviews";
 import { drawnDiagrams } from "./diagram/draws";
 import { gridLoaded } from "./grid/draws";
 import { mathSections } from "./mathBlocks";
@@ -848,5 +853,73 @@ describe("what the preview hands mermaid", () => {
     const doc = "```mermaid\ngraph TD; A-->B\n\n## Next\n\nmore";
     expect(await renderedFor(doc, [mathSections.of(true)])).toEqual([]);
     expect(await renderedFor(doc)).toHaveLength(1);
+  });
+});
+
+describe("the flip back from a drawn diagram", () => {
+  const SOURCE = "flowchart TD\n  A --> B";
+  const doc = `\`\`\`mermaid\n${SOURCE}\n\`\`\`\n`;
+
+  it("draws what the box was showing in the first frame, under an id of its own", () => {
+    offerPreviewDrawing(
+      SOURCE,
+      false,
+      '<svg id="cm-diagram-9"><style>#cm-diagram-9 .a{}</style></svg>',
+      "cm-diagram-9",
+    );
+    const render = vi.mocked(mermaid.render);
+    render.mockClear();
+    const view = editor(doc);
+    const svg = view.dom.querySelector(".cm-mermaid-preview svg");
+    expect(svg).not.toBeNull();
+    expect(svg?.id).toMatch(/^cm-mermaid-/);
+    expect(svg?.outerHTML).not.toContain("cm-diagram-9");
+    expect(render).not.toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it("asks mermaid for a body no box has shown", async () => {
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  X --> Y\n\`\`\`\n`);
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it("gives a held height back when the caption lands, not before", async () => {
+    let fail: (cause: Error) => void = () => undefined;
+    vi.mocked(mermaid.render).mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          fail = reject;
+        }),
+    );
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  P -->\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    });
+    holdPreviewHeight(box, 120);
+    expect(box.style.minHeight).toBe("120px");
+    fail(new Error("no"));
+    await vi.waitFor(() => {
+      expect(box.querySelector(".cm-mermaid-error")).not.toBeNull();
+    });
+    expect(box.style.minHeight).toBe("");
+    view.destroy();
+  });
+
+  it("holds nothing for a preview that has drawn", async () => {
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  Q --> R\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(box.querySelector("svg")).not.toBeNull();
+    });
+    holdPreviewHeight(box, 120);
+    expect(box.style.minHeight).toBe("");
+    view.destroy();
   });
 });

@@ -19,7 +19,14 @@
  * CodeMirror also offers it any unclaimed box of this class, for example the
  * one of a fence that just scrolled away; that box holds another fence's
  * drawing and maybe its open rename field, so a box goes only with the fence
- * it was made for (`key`, kept by the field through changes).
+ * it was made for (`key`, kept by the field through changes). A line inserted
+ * right at the first mark is the one edit CodeMirror offers nothing for and asks
+ * for a new element: `toDOM` hands back the box that fence still has, as a
+ * focused field inside it, and a composition, would not survive a new one.
+ *
+ * Going back to text. A preview has what a box showed in its first frame
+ * (`offerPreviewDrawing`). With a refused body there is nothing to show, so
+ * `flipBackHold` keeps the page still until the caption is there: one move.
  *
  * Render ids are unique across views for the life of the page: mermaid removes
  * any element that holds the id it is given, and works in a temporary `d<id>`
@@ -31,12 +38,18 @@
  * the canvas stop: with those, one place in the page's tab order.
  */
 
-import type { EditorView } from "@codemirror/view";
-import { EditorView as View, WidgetType } from "@codemirror/view";
+import { MapMode } from "@codemirror/state";
+import type { EditorView, ViewUpdate } from "@codemirror/view";
+import { EditorView as View, ViewPlugin, WidgetType } from "@codemirror/view";
 
 import { initializeMermaid, mermaidThemeChanges } from "../../theme/mermaid";
 import { writable } from "../elementEdit";
-import { takePreviewDrawing } from "../fencePreviews";
+import {
+  forgetPreviewOffers,
+  holdPreviewHeight,
+  offerPreviewDrawing,
+  takePreviewDrawing,
+} from "../fencePreviews";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
 import { diagramField } from "./field";
@@ -92,9 +105,15 @@ interface Box {
   retry: ReturnType<typeof setTimeout> | null;
   noticeTimer: ReturnType<typeof setTimeout> | null;
   dead: boolean;
+  /** CodeMirror's elements for this box: a second one while it hands over. */
+  claims: number;
+  /** Its height at the last drawing; 0 before one was measured. */
+  height: number;
 }
 
 const boxes = new WeakMap<HTMLElement, Box>();
+/** Each view's boxes on screen, by their fence's key. */
+const boxesByKey = new WeakMap<EditorView, Map<number, Box>>();
 
 let renders = 0;
 let renderer: Promise<
@@ -111,6 +130,7 @@ const heights = new Map<string, number>();
 export function forgetDrawings(): void {
   drawings.clear();
   heights.clear();
+  forgetPreviewOffers();
 }
 
 function drawKey(body: string, dark: boolean): string {
@@ -252,6 +272,7 @@ function landed(
     write: ({ height, scroller }) => {
       if (height > 0) {
         keep(heights, key, height, HEIGHTS_KEPT);
+        box.height = height;
       }
       if (scroller !== null && before !== null && height !== before) {
         scroller.scrollBy({ top: height - before, behavior: "instant" });
@@ -266,6 +287,7 @@ function paste(box: Box, key: string, body: string, svg: string, id: string) {
     ? box.dom.getBoundingClientRect().height
     : null;
   box.drawing.innerHTML = svg;
+  offerPreviewDrawing(body, box.dark, svg, id);
   landed(box, key, body, id, before);
 }
 
@@ -419,6 +441,8 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
     retry: null,
     noticeTimer: null,
     dead: false,
+    claims: 1,
+    height: 0,
     host: {
       container: dom,
       overlay,
@@ -432,6 +456,9 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
     },
   };
   boxes.set(dom, box);
+  const byKey = boxesByKey.get(view) ?? new Map<number, Box>();
+  boxesByKey.set(view, byKey);
+  byKey.set(widget.key, box);
   return box;
 }
 
@@ -478,6 +505,14 @@ export class DiagramWidget extends WidgetType {
   }
 
   override toDOM(view: EditorView): HTMLElement {
+    const standing = boxesByKey.get(view)?.get(this.key);
+    if (standing !== undefined && !standing.dead) {
+      standing.claims += 1;
+      standing.body = this.body;
+      standing.dark = this.dark;
+      draw(standing);
+      return standing.dom;
+    }
     const box = makeBox(view, this);
     const key = drawKey(this.body, this.dark);
     const taken = takePreviewDrawing(
@@ -497,6 +532,7 @@ export class DiagramWidget extends WidgetType {
         { svg: taken.outerHTML, id: taken.id },
         DRAWINGS_KEPT,
       );
+      offerPreviewDrawing(this.body, this.dark, taken.outerHTML, taken.id);
       landed(box, key, this.body, taken.id, null);
     }
     tell(mountListeners, box);
@@ -519,7 +555,15 @@ export class DiagramWidget extends WidgetType {
     if (box === undefined) {
       return;
     }
+    box.claims -= 1;
+    if (box.claims > 0) {
+      return;
+    }
     box.dead = true;
+    const byKey = boxesByKey.get(box.view);
+    if (byKey?.get(box.key) === box) {
+      byKey.delete(box.key);
+    }
     cancelRetry(box);
     if (box.noticeTimer !== null) {
       clearTimeout(box.noticeTimer);
@@ -556,6 +600,77 @@ export function hostOf(main: EditorView, anchor: number): DiagramHost | null {
   return null;
 }
 
+/** The room a caption usually takes, so one landing moves the text no further. */
+const CAPTION_ROOM = 48;
+
+/**
+ * A fence that stops being drawn (a refused body, or the source shown): its
+ * preview holds the height the box had less the source lines, until its answer is
+ * there, so the page moves once and not twice.
+ */
+export const flipBackHold = ViewPlugin.fromClass(
+  class {
+    readonly view: EditorView;
+
+    constructor(view: EditorView) {
+      this.view = view;
+    }
+
+    update(update: ViewUpdate): void {
+      const before = update.startState.field(diagramField, false)?.fences;
+      const after = update.state.field(diagramField, false)?.fences;
+      if (before === undefined || after === undefined || before === after) {
+        return;
+      }
+      for (const fence of before) {
+        const at = update.changes.mapPos(fence.from, 1, MapMode.TrackAfter);
+        if (at !== null && !after.some((f) => f.from === at)) {
+          // The box as it stood: a carried fence's body is one never drawn.
+          const key = update.startState
+            .field(diagramField)
+            .keys.get(fence.from);
+          const height =
+            key === undefined
+              ? 0
+              : (boxesByKey.get(this.view)?.get(key)?.height ?? 0);
+          if (height > 0) {
+            this.hold(at, height);
+          }
+        }
+      }
+    }
+
+    hold(from: number, height: number): void {
+      const { view } = this;
+      // After the update, whose DOM this reads, and before any frame.
+      queueMicrotask(() => {
+        const { doc } = view.state;
+        if (from > doc.length) {
+          return;
+        }
+        const line = doc.lineAt(from);
+        // The line's own top: a character's stands a little below it.
+        const { node } = view.domAtPos(line.from);
+        const top = (node instanceof Element ? node : node.parentElement)
+          ?.closest(".cm-line")
+          ?.getBoundingClientRect().top;
+        const previewBox = [
+          ...view.contentDOM.querySelectorAll<HTMLElement>(
+            ".cm-mermaid-preview",
+          ),
+        ].find((el) => doc.lineAt(view.posAtDOM(el)).number > line.number);
+        if (top !== undefined && previewBox !== undefined) {
+          const source = previewBox.getBoundingClientRect().top - top;
+          holdPreviewHeight(
+            previewBox,
+            Math.max(height - source, CAPTION_ROOM),
+          );
+        }
+      });
+    }
+  },
+);
+
 export const diagramTheme = View.baseTheme({
   // The preview's padding and no more, so a drawing keeps its size in the flip.
   ".cm-diagram": {
@@ -591,6 +706,29 @@ export const diagramTheme = View.baseTheme({
     borderRadius: "0.25rem",
   },
   "&dark .cm-diagram-overlay > .cm-diagram-focus-ring": {
+    borderColor: "var(--color-accent-300)",
+  },
+  // Over its box or arrow, and over the text below when a long label needs that.
+  ".cm-diagram-overlay > .cm-diagram-label-field": {
+    position: "absolute",
+    zIndex: "1",
+    boxSizing: "border-box",
+    margin: "0",
+    padding: "0.125rem 0.25rem",
+    overflow: "hidden",
+    resize: "none",
+    textAlign: "center",
+    font: "inherit",
+    lineHeight: "1.25",
+    color: "var(--color-slate-900)",
+    backgroundColor: "var(--color-white, #ffffff)",
+    border: "2px solid var(--color-accent-600)",
+    borderRadius: "0.25rem",
+    outline: "none",
+  },
+  "&dark .cm-diagram-overlay > .cm-diagram-label-field": {
+    color: "var(--color-slate-100)",
+    backgroundColor: "var(--color-slate-900)",
     borderColor: "var(--color-accent-300)",
   },
   // Over the drawing, so a notice never moves the text below the box.
