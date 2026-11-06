@@ -947,6 +947,115 @@ describe("main taking the focus with its selection in a drawn fence (R80)", () =
   });
 });
 
+describe("an edit a search hit in a fence has nothing to do with (R91)", () => {
+  /** A hit in the fence, with the focus in another field of the page. */
+  async function hitAndField() {
+    const view = await drawn();
+    const at = DOC.indexOf("Next step");
+    view.dispatch({
+      selection: { anchor: at, head: at + 4 },
+      userEvent: "select.search",
+    });
+    await flush();
+    const field = document.createElement("input");
+    document.body.append(field);
+    field.focus();
+    await flush();
+    return { view, at, field };
+  }
+
+  it.each([
+    "input.type",
+    "input.paste",
+    "input.alt",
+    "input.format",
+    "delete.backward",
+  ])(
+    "%s elsewhere from another field passes, and the focus stays",
+    async (event) => {
+      const { view, field } = await hitAndField();
+      view.dispatch({
+        changes: { from: 0, to: 1, insert: "Z" },
+        userEvent: event,
+      });
+      await flush();
+      expect(text(view)).toBe(`Z${DOC.slice(1)}`);
+      expect(active()).toBe(field);
+      expect(noticeOf(view)).toBe("");
+      field.remove();
+    },
+  );
+
+  it("a verb writing elsewhere with main focused passes: only a letter goes astray", async () => {
+    const view = await drawn();
+    const at = DOC.indexOf("Next step");
+    view.dispatch({
+      selection: { anchor: at, head: at + 4 },
+      userEvent: "select.search",
+    });
+    await flush();
+    expect(active()).toBe(view.contentDOM);
+    view.dispatch({
+      changes: { from: 0, to: 1, insert: "Z" },
+      userEvent: "input.format",
+    });
+    await flush();
+    expect(text(view)).toBe(`Z${DOC.slice(1)}`);
+    expect(active()).toBe(view.contentDOM);
+  });
+
+  it("an edit at the fence from that selection is still refused, wherever the focus is", async () => {
+    const { view, at, field } = await hitAndField();
+    view.dispatch({
+      changes: { from: at, to: at + 4 },
+      userEvent: "delete.cut",
+    });
+    await flush();
+    expect(text(view)).toBe(DOC);
+    field.remove();
+  });
+
+  it("the panel's Replace at the hit passes", async () => {
+    const { view, at, field } = await hitAndField();
+    view.dispatch({
+      changes: { from: at, to: at + 4, insert: "Last" },
+      userEvent: "input.replace",
+    });
+    expect(text(view)).toBe(DOC.replace("Next", "Last"));
+    expect(active()).toBe(field);
+    field.remove();
+  });
+
+  it("an undo and a peer's edit pass", async () => {
+    const view = await drawn(DOC, { room: true });
+    const at = DOC.indexOf("Next step");
+    view.dispatch({
+      selection: { anchor: at, head: at + 4 },
+      userEvent: "select.search",
+    });
+    await flush();
+    remoteInsert(view, 0, "P");
+    expect(text(view)).toBe(`P${DOC}`);
+  });
+
+  it("an undo with the selection in the fence passes", async () => {
+    const view = await drawn();
+    view.contentDOM.blur();
+    view.dispatch({
+      changes: { from: 0, to: 1, insert: "Z" },
+      userEvent: "input.type",
+    });
+    const at = DOC.indexOf("Next step");
+    view.dispatch({
+      selection: { anchor: at, head: at + 4 },
+      userEvent: "select.search",
+    });
+    await flush();
+    undoOnce(view);
+    expect(text(view)).toBe(DOC);
+  });
+});
+
 describe("a held key never crosses a boundary (R81)", () => {
   it("stops Backspace at the fence", async () => {
     const view = await drawn();
@@ -1158,6 +1267,38 @@ describe("a refused edit says so (R82)", () => {
     await vi.advanceTimersByTimeAsync(NOTICE_MS);
     expect(panelText(view)).toBeUndefined();
     vi.useRealTimers();
+  });
+
+  it("announces each refusal in the panel, a second one again (R92)", async () => {
+    const heard: string[] = [];
+    const view = await drawn(REPLACED);
+    const { StateEffect } = await import("@codemirror/state");
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(
+        EditorView.updateListener.of((update) => {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (effect.is(EditorView.announce)) {
+                heard.push(effect.value);
+              }
+            }
+          }
+        }),
+      ),
+    });
+    const notice = box(view).querySelector(".cm-diagram-notice");
+    vi.spyOn(notice as Element, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, window.innerHeight + 500, 100, 20),
+    );
+    replaceAll(view, REPLACED);
+    await flush();
+    expect(heard).toEqual([SAID]);
+    replaceAll(view, REPLACED);
+    await flush();
+    expect(heard).toEqual([SAID, SAID]);
+    expect(
+      view.dom.querySelectorAll(".cm-announced > div").length,
+    ).toBeGreaterThan(0);
   });
 
   it("refuses a Replace that would close the fence early (N5)", async () => {

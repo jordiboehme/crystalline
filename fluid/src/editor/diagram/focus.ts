@@ -539,6 +539,19 @@ function noticeInWindow(host: DiagramHost): boolean {
   return true;
 }
 
+/** The views this layer runs in: a filter has only a state to go by. */
+const liveViews = new Set<EditorView>();
+
+/** Whether the view showing `state` has the focus on its own text. */
+function mainHoldsFocus(state: EditorState): boolean {
+  for (const view of liveViews) {
+    if (view.state === state) {
+      return view.root.activeElement === view.contentDOM;
+    }
+  }
+  return false;
+}
+
 const refusalShown = StateEffect.define<string | null>();
 
 /** The sentence of a refusal whose fence is out of the window, in a panel. */
@@ -698,6 +711,7 @@ const focusPlugin = ViewPlugin.fromClass(
 
     constructor(view: EditorView) {
       this.view = view;
+      liveViews.add(view);
       const dom = view.contentDOM;
       dom.addEventListener("mousedown", this.mousedown);
       view.dom.addEventListener("mousedown", this.pressOutside, true);
@@ -897,7 +911,14 @@ const focusPlugin = ViewPlugin.fromClass(
      */
     sayInPanel(): void {
       const { view } = this;
-      view.dispatch({ effects: refusalShown.of(NOTICES.breaksFence) });
+      // Announced as well: a live region that arrives with its text is commonly
+      // not read, and a second refusal changes nothing in the panel (R92).
+      view.dispatch({
+        effects: [
+          refusalShown.of(NOTICES.breaksFence),
+          EditorView.announce.of(NOTICES.breaksFence),
+        ],
+      });
       if (this.panelTimer !== null) {
         clearTimeout(this.panelTimer);
       }
@@ -946,6 +967,7 @@ const focusPlugin = ViewPlugin.fromClass(
     }
 
     destroy(): void {
+      liveViews.delete(this.view);
       const dom = this.view.contentDOM;
       dom.removeEventListener("mousedown", this.mousedown);
       this.view.dom.removeEventListener("mousedown", this.pressOutside, true);
@@ -1045,7 +1067,7 @@ const fenceEditRefused = StateEffect.define<FenceEditRefusal>();
 /**
  * Refuses a person's edit that would break a drawn fence's marks: a line joined
  * to one, a line moved past one (R73), a prefix or a Replace all that reaches
- * one. Also any edit from a selection inside a drawn fence, except the search
+ * one. Also an edit a selection inside a drawn fence makes, except the search
  * panel's Replace, which names its text: the rest would skip the op layer and
  * its verify (R80). An edit inside the body or across the whole fence passes,
  * and so do a peer's edit and an undo, which carry no such event. A refusal
@@ -1073,10 +1095,15 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
         tr.isUserEvent("delete.forward")) &&
         selection.ranges.every((range) => range.empty));
     for (const fence of tr.startState.facet(drawnFenceLines)) {
-      // Before anything about where the change lands: the browser's caret is not
-      // this selection, so a letter can arrive on the line below (R90).
+      const atFence = tr.changes.touchesRange(fence.from, fence.to) !== false;
+      // Only what main's selection is really making. At the fence that is plain.
+      // Elsewhere it is a typed letter with main holding the focus, as the
+      // browser's caret is not this selection (R90). Any other edit elsewhere (a
+      // table cell, a popover, a drop) has nothing to do with it (R91).
       if (
         !tr.isUserEvent("input.replace") &&
+        (atFence ||
+          (tr.isUserEvent("input.type") && mainHoldsFocus(tr.startState))) &&
         selection.ranges.some(
           (range) =>
             fence.from <= range.from &&
@@ -1092,7 +1119,7 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
           }),
         };
       }
-      if (tr.changes.touchesRange(fence.from, fence.to) === false) {
+      if (!atFence) {
         continue;
       }
       let whole = false;

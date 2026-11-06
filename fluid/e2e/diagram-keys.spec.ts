@@ -491,3 +491,67 @@ test("a press held after the canvas delete takes nothing more", async ({
   await page.keyboard.up("Backspace");
   await expect.poll(() => docText(page)).toBe(before.replace(`${FENCE}\n`, ""));
 });
+
+const WITH_TABLE = `Above\n\n| one | two |\n|---|---|\n| a | b |\n\n${FENCE}\n\nBelow marker\n`;
+
+/** Whether the focus is in a table cell's editor. */
+const focusInCell = (page: Page) =>
+  page.evaluate(() => document.activeElement?.closest(".cm-grid") != null);
+
+for (const [name, query] of [
+  ["no search", null],
+  ["a hit outside the fence", "marker"],
+  ["a hit in the fence", "Second"],
+] as const) {
+  test(`typing in a table cell with ${name} writes there, and the focus stays`, async ({
+    page,
+  }) => {
+    await openEditor(page, WITH_TABLE);
+    await expect(box(page).locator("svg")).toBeVisible();
+    await page.locator(".cm-grid").getByText("one").waitFor();
+    await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+    if (query !== null) {
+      await page.keyboard.press("ControlOrMeta+f");
+      await page.keyboard.type(query);
+      await page.keyboard.press("Enter");
+    }
+    const before = await docText(page);
+    await page.locator(".cm-grid").getByText("one").click();
+    await expect.poll(() => focusInCell(page)).toBe(true);
+    await page.keyboard.type("ZZ");
+    await expect
+      .poll(() => docText(page))
+      .toMatch(/\| o?n?e?ZZo?n?e? \| two \|/);
+    expect(await focusInCell(page)).toBe(true);
+    expect((await docText(page)).replace("ZZ", "")).toBe(before);
+    await expect(box(page).locator("svg")).toBeVisible();
+  });
+}
+
+test("a paste into a table cell with a hit in the fence writes there", async ({
+  page,
+}) => {
+  await openEditor(page, WITH_TABLE);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ControlOrMeta+f");
+  await page.keyboard.type("Second");
+  await page.keyboard.press("Enter");
+  const before = await docText(page);
+  await page.locator(".cm-grid").getByText("one").click();
+  await expect.poll(() => focusInCell(page)).toBe(true);
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData("text/plain", "PP");
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent("paste", {
+        clipboardData: data,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+  await expect.poll(() => docText(page)).toContain("PP");
+  expect(await focusInCell(page)).toBe(true);
+  expect((await docText(page)).replace("PP", "")).toBe(before);
+});
