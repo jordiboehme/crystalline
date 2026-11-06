@@ -26,7 +26,8 @@
 # The daemon takes port 7411 when it is free and the next free port otherwise,
 # and hands the address to vite through CRYSTALLINE_API_TARGET so the /api proxy
 # in front of the browser journeys follows it. FLUID_E2E_PORT pins a port
-# instead.
+# instead. The preview server does the same from 4173, and FLUID_PREVIEW_PORT
+# pins its port, so runs in two worktrees each test their own bundle and daemon.
 #
 #   bash fluid/e2e/run-smoke.sh                 # the whole suite
 #   bash fluid/e2e/run-smoke.sh --headed        # arguments reach playwright
@@ -563,5 +564,21 @@ if [ -n "$FLUID_E2E_BASE_PATH" ]; then
     export FLUID_E2E_BASE_URL="http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH/"
     echo "smoke: running playwright against the embedded UI at $FLUID_E2E_BASE_URL"
 fi
-echo "smoke: running playwright"
+# Picked here, right before playwright starts the server, to keep the gap small.
+# A port taken in that gap fails the run loudly: playwright.config.ts never
+# reuses a server, since one left by another run serves that run's bundle in
+# front of that run's daemon.
+if [ -z "${FLUID_PREVIEW_PORT:-}" ]; then
+    for candidate in $(seq 4173 4193); do
+        if port_is_free "$candidate"; then
+            export FLUID_PREVIEW_PORT="$candidate"
+            break
+        fi
+    done
+    if [ -z "${FLUID_PREVIEW_PORT:-}" ]; then
+        echo "smoke: every port from 4173 to 4193 is taken; free one or set FLUID_PREVIEW_PORT" >&2
+        exit 1
+    fi
+fi
+echo "smoke: running playwright, preview on 127.0.0.1:$FLUID_PREVIEW_PORT"
 pnpm exec playwright test "$@"

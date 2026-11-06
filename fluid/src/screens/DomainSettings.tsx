@@ -10,6 +10,7 @@
  * the one the front page drew, under the same gates.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -54,6 +55,7 @@ export default function DomainSettings() {
   // the front page asks: a 404 is a wrong address or a Reflection-only
   // reader, and both are answered as the front page answers them.
   const tree = useQuery(treeQuery(domain, ""));
+  usePageTitle(isMissing(tree.error) ? null : `${domain} settings`);
   if (isMissing(tree.error)) {
     return <MissingOrReflection domain={domain} />;
   }

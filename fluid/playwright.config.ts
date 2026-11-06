@@ -76,7 +76,9 @@ export default defineConfig({
       // it to the address the tests use makes the two the same one.
       command: `pnpm exec vite preview --host 127.0.0.1 --port ${String(PORT)} --strictPort`,
       url: BASE_URL,
-      reuseExistingServer: !process.env.CI,
+      // Never reused: a server already on this port belongs to another run, and
+      // the journeys would test its bundle against its daemon without saying so.
+      reuseExistingServer: false,
       timeout: 60_000,
       stdout: "pipe",
       stderr: "pipe",

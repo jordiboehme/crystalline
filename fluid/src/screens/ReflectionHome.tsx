@@ -8,6 +8,7 @@
  * the way out of the domain.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { BookOpen, ChevronDown, Inbox, Search } from "lucide-react";
@@ -73,6 +74,9 @@ export default function ReflectionHome(): ReactElement {
   const { domain = "" } = useParams();
   const status = useReflectionStatus(domain);
   useHeadingFocusRequest(!status.isPending);
+  usePageTitle(
+    status.isPending || status.error ? null : `${domain} Reflection`,
+  );
   if (status.isPending) {
     return (
       <Loading

@@ -14,6 +14,7 @@
  * contributor: the server leaves the field out, and so does this page.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import type { QueryClient } from "@tanstack/react-query";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { KeyboardEvent, ReactElement } from "react";
@@ -317,6 +318,7 @@ function PageBody({
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   useHeadingFocusRequest(doc.data !== undefined);
+  usePageTitle(doc.error ? null : doc.data?.title);
   const remove = useMutation({
     mutationFn: () => deleteReflection(domain, path),
     onSuccess: () => {

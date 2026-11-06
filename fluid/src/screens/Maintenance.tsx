@@ -59,6 +59,7 @@
  * is exactly the domain somebody needs to be able to ask about.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { Link } from "react-router";
@@ -117,6 +118,7 @@ interface FindingGroup {
 }
 
 export default function Maintenance() {
+  usePageTitle("Maintenance");
   const [domain, setDomain] = useState(EVERY_DOMAIN);
   // Empty is every family, which is what the engine reads an empty filter as.
   // Kept as the catalog's own values rather than a set of booleans, because it
