@@ -16,6 +16,7 @@ import {
   enterDrawnFence,
 } from "./draws";
 import { diagramField, pointerWatcher, verdictWatcher } from "./field";
+import { flowActions } from "./flowchart/actions";
 import {
   diagramEntryKeys,
   diagramFocus,
@@ -54,6 +55,7 @@ export function diagramExtension(): Extension {
     pointerWatcher,
     intentWatcher,
     labelEditorPlugin,
+    flowActions,
     flipBackHold,
     diagramTheme,
   ];

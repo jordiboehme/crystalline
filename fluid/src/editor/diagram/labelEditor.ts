@@ -65,12 +65,8 @@ import {
   verdictArrived,
   showFenceSource,
 } from "./field";
-import {
-  flowEdgeAt,
-  flowEdgeSpanOf,
-  flowLabelOf,
-  flowPairCount,
-} from "./flowchart/hit";
+import { flowEdgeSpanOf, flowLabelOf, flowPairCount } from "./flowchart/hit";
+import { heldTarget } from "./flowchart/heldArrow";
 import { tidyLabel } from "./flowchart/labels";
 import type { FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
@@ -81,6 +77,7 @@ import {
   modelOf,
   registerClickGate,
   registerStopAction,
+  sayAt,
   sayRefusal,
   targetElement,
 } from "./focus";
@@ -141,45 +138,11 @@ const fields = new WeakMap<EditorView, OpenField>();
 const sameTarget = (a: TargetKey, b: TargetKey) =>
   JSON.stringify(a) === JSON.stringify(b);
 
-/** Says a refusal where it can be seen: the box, or the panel with no box. */
-function say(main: EditorView, code: RefusalCode, host: DiagramHost | null) {
-  if (host === null) {
-    main.dispatch({ effects: sayRefusal.of(code) });
-  } else {
-    host.notice(code);
-  }
-}
-
-/**
- * The arrow's key in `model`, by the place the field holds. A box's target stands
- * as it is, and `flowLabelOf` says whether it is there.
- */
-function heldTarget(
-  main: EditorView,
-  target: TargetKey,
-  arrow: number | null,
-  sole: boolean,
-  model: FlowModel,
-  bodyFrom: number,
-): TargetKey | "stale" | "gone" {
-  if (target.kind !== "edge") {
-    return target;
-  }
-  const pos =
-    arrow === null
-      ? undefined
-      : main.state.field(diagramAnchors, false)?.get(arrow);
-  const edge = flowEdgeAt(
-    model,
-    target.key,
-    pos === undefined ? null : pos - bodyFrom,
-    sole,
-  );
-  return typeof edge === "string" ? edge : { kind: "edge", key: edge };
-}
-
 /** The fence at `anchor` on a tree that reaches it, or null. */
-function fenceNow(main: EditorView, anchor: number): MermaidFence | null {
+export function fenceNow(
+  main: EditorView,
+  anchor: number,
+): MermaidFence | null {
   if (syntaxTree(main.state).length < main.state.doc.length) {
     forceParsing(main, main.state.doc.length, PARSE_MS);
   }
@@ -188,7 +151,7 @@ function fenceNow(main: EditorView, anchor: number): MermaidFence | null {
 }
 
 /** The model of the fence as it stands, when it is one the verdict can read. */
-function modelNow(fence: MermaidFence): FlowModel | null {
+export function modelNow(fence: MermaidFence): FlowModel | null {
   const model = modelOf(fence.body);
   return model.understood ? model : null;
 }
@@ -559,7 +522,6 @@ function commit(open: OpenField, way: Way): Promise<void> {
 function goneNow(open: OpenField): void {
   const { main, anchor, el } = open;
   const held = main.root.activeElement === el;
-  const host = hostOf(main, anchor);
   if (held) {
     focusTarget(main, anchor, CANVAS);
   } else {
@@ -568,7 +530,7 @@ function goneNow(open: OpenField): void {
     });
   }
   detach(open);
-  say(main, "gone", host);
+  sayAt(main, anchor, "gone");
 }
 
 /** A peer's edit, a new drawing or the end of a composition: is this still right? */
@@ -836,13 +798,13 @@ export function openLabelEditor(
     intentStaleAt(main, fence) ||
     !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
   ) {
-    say(main, "stale", host);
+    sayAt(main, anchor, "stale");
     return;
   }
   const model = modelNow(fence);
   const label = model && flowLabelOf(model, target);
   if (model === null || label === null || label === undefined) {
-    say(main, "gone", host);
+    sayAt(main, anchor, "gone");
     return;
   }
   // No use typing a label the arrow cannot take on its own.
@@ -853,7 +815,7 @@ export function openLabelEditor(
       text: label === "x" ? "y" : "x",
     });
     if ("refused" in tried && tried.refused === "group") {
-      say(main, "group", host);
+      sayAt(main, anchor, "group");
       return;
     }
   }
@@ -936,7 +898,7 @@ export async function addWithName(
   const outcome = await runDiagramOp(main, anchor, flowKind, op);
   const place = main.state.field(diagramIntent, false)?.anchor ?? anchor;
   if ("refused" in outcome) {
-    say(main, outcome.refused, hostOf(main, place));
+    sayAt(main, place, outcome.refused);
   } else if (outcome.applied && outcome.created !== undefined) {
     openLabelEditor(main, place, outcome.created, { selectAll: true });
   }
@@ -949,7 +911,9 @@ function onClosing(
   intent: DiagramIntent,
 ): void {
   const open = fields.get(main);
-  if (open === undefined) {
+  // Not this field's: a stop on another fence, whose close comes after a click on
+  // this fence's box has opened the field. A field's own intent is always "rename".
+  if (open === undefined || intent.mode !== "rename") {
     return;
   }
   open.anchor = intent.anchor;
@@ -1613,6 +1577,16 @@ export const labelEditorPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate): void {
       const { view } = this;
       const open = fields.get(view);
+      // Here and not in the microtask: two edits in one tick, a duplicate and then
+      // the person's own arrow going, must not pass as one (R94).
+      if (open !== undefined && update.docChanged) {
+        const at = update.state.field(diagramIntent)?.anchor;
+        const fence = at === undefined ? null : fenceAt(update.state, at);
+        const model = fence && modelNow(fence);
+        if (model !== null) {
+          noteDuplicates(open, model);
+        }
+      }
       // Whatever changes what is drawn: an edit, the caret leaving a fence it held
       // as text, a verdict landing (N3).
       if (

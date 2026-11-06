@@ -2,6 +2,8 @@
  * The keyboard and the pointer on a drawn diagram. A diagram is one composite
  * widget with a roving tabindex (WAI-ARIA): one Tab stop, the arrow keys walk
  * canvas, boxes and arrows in source order, Home and End jump, Escape leaves.
+ * Shift+F10 or a right click opens a stop's menu, and while connect mode waits its
+ * keys walk the boxes alone and Enter or a click chooses (`flowchart/actions.ts`).
  *
  * The listeners sit on the content element, not in CodeMirror's handlers: the
  * widget's `ignoreEvent` keeps every event in a box away from those, which is
@@ -46,7 +48,9 @@ import {
   flowStops,
   flowTargetOf,
 } from "./flowchart/hit";
+import { heldEdge, holdArrow, letGoOfArrow } from "./flowchart/heldArrow";
 import type { FlowModel } from "./flowchart/model";
+import type { FlowOp } from "./flowchart/ops";
 import { parseFlowchart } from "./flowchart/parse";
 import type { DiagramIntent, TargetKey } from "./intent";
 import {
@@ -74,6 +78,8 @@ type StopAction = (
   anchor: number,
   target: TargetKey,
   host: DiagramHost,
+  /** Where a pointer asked, in the window's coordinates. */
+  at?: { x: number; y: number },
 ) => void;
 
 const stopActions = new Map<"rename" | "menu", StopAction>();
@@ -96,6 +102,20 @@ let clickGate: ClickGate | null = null;
  */
 export function registerClickGate(gate: ClickGate): void {
   clickGate = gate;
+}
+
+/** What a key or a click does while connect mode waits for its box. */
+export interface ConnectHooks {
+  choose(main: EditorView, id: string): void;
+  cancel(main: EditorView): void;
+  /** A click on an arrow: no box, so the mode says again what it wants. */
+  remind(main: EditorView): void;
+}
+
+let connectHooks: ConnectHooks | null = null;
+
+export function registerConnectHooks(hooks: ConnectHooks): void {
+  connectHooks = hooks;
 }
 
 const models = new Map<string, FlowModel>();
@@ -228,35 +248,50 @@ const wanted = new WeakSet<EditorView>();
 
 /**
  * Puts the keyboard on a stop of the fence at `anchor`, any position in it: the
- * intent holds it in "focus" mode, so it comes back with a remount. A fence off
- * screen is scrolled to, and takes the focus when its box arrives.
+ * intent holds it, in "focus" mode unless connect mode is walking, so it comes back
+ * with a remount. A fence off screen is scrolled to, and takes the focus when its
+ * box arrives.
  */
 export function focusTarget(
   main: EditorView,
   anchor: number,
   target: TargetKey,
+  mode: "focus" | "connect" = "focus",
 ): void {
   const host = hostOf(main, anchor);
   if (host === null) {
     wanted.add(main);
     main.dispatch({
       effects: [
-        setDiagramIntent.of({ anchor, target, mode: "focus" }),
+        setDiagramIntent.of({ anchor, target, mode }),
         EditorView.scrollIntoView(anchor, { y: "center" }),
       ],
     });
     return;
   }
   main.dispatch({
-    effects: setDiagramIntent.of({ anchor, target, mode: "focus" }),
+    effects: setDiagramIntent.of({ anchor, target, mode }),
   });
+  prepareStop(host, target).focus();
+}
+
+/** Gives `target` the roving tabindex and the look, as the place the keys walk from. */
+export function prepareStop(
+  host: DiagramHost,
+  target: TargetKey,
+): HTMLElement | SVGElement {
   const place = stopsOf(readingOf(host)).findIndex((stop) =>
     sameTarget(stop, target),
   );
   lastPlace.set(host.container, Math.max(place, 0));
   const el = rove(host, target);
   paint(host, el);
-  el.focus();
+  return el;
+}
+
+/** The stops connect mode walks: only its boxes. */
+function boxStops(stops: TargetKey[]): TargetKey[] {
+  return stops.filter((stop) => stop.kind === "node");
 }
 
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
@@ -275,15 +310,24 @@ export function enterCanvas(main: EditorView, pos: number): void {
   }
 }
 
-registerIntentReopen("focus", (main, intent, host) => {
+/** A stop's fence is back: its element takes the roving tabindex, and a free focus. */
+export function backOnStop(
+  main: EditorView,
+  host: DiagramHost,
+  target: TargetKey,
+): void {
   const asked = wanted.delete(main);
   const active = main.root.activeElement;
-  const el = rove(host, intent.target);
+  const el = rove(host, target);
   // The focus went when the old box left, so only an unclaimed one comes back.
   if (asked || active === null || active === main.dom.ownerDocument.body) {
     paint(host, el);
     el.focus({ preventScroll: true });
   }
+}
+
+registerIntentReopen("focus", (main, intent, host) => {
+  backOnStop(main, host, intent.target);
 });
 
 /** The drawn fence whose box is `container`, by the line the box stands for. */
@@ -312,35 +356,67 @@ function staleNow(main: EditorView, host: DiagramHost, from: number): boolean {
   }
   const body = fenceAt(main.state, from)?.body;
   if (behind || body === undefined || body !== host.renderedBody()) {
-    host.notice("stale");
+    sayAt(main, from, "stale");
     return true;
   }
   return false;
 }
 
+/** The whole fence goes, and a key still held takes nothing more with it. */
+export function deleteFenceOf(main: EditorView, from: number): void {
+  const outcome = removeFence(main, from);
+  if ("refused" in outcome) {
+    sayAt(main, from, outcome.refused);
+  }
+  if (outcome.applied) {
+    spentHold.add(main);
+  }
+}
+
 async function deleteStop(
   main: EditorView,
-  host: DiagramHost,
   from: number,
   target: TargetKey,
 ): Promise<void> {
-  let refused: RefusalCode | undefined;
   if (target.kind === "canvas") {
-    const outcome = removeFence(main, from);
-    refused = "refused" in outcome ? outcome.refused : undefined;
-    if (outcome.applied) {
-      spentHold.add(main);
-    }
-  } else {
-    const op =
-      target.kind === "node"
-        ? ({ op: "deleteNode", id: target.id } as const)
-        : ({ op: "deleteEdge", edge: target.key } as const);
-    const outcome = await runDiagramOp(main, from, flowKind, op);
-    refused = "refused" in outcome ? outcome.refused : undefined;
+    deleteFenceOf(main, from);
+    return;
   }
-  if (refused !== undefined) {
-    host.notice(refused);
+  const fence = fenceAt(main.state, from);
+  // A peer's duplicate landing during the verify must not move the delete (R94).
+  const hold =
+    target.kind === "edge" && fence !== null
+      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+      : null;
+  try {
+    const outcome = await runDiagramOp(
+      main,
+      from,
+      flowKind,
+      (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
+        if (target.kind === "node") {
+          return { op: "deleteNode", id: target.id };
+        }
+        if (hold === null) {
+          return { refused: "gone" };
+        }
+        const edge = heldEdge(main, hold, model, bodyFrom);
+        return typeof edge === "string"
+          ? { refused: edge }
+          : { op: "deleteEdge", edge };
+      },
+    );
+    if ("refused" in outcome) {
+      sayAt(
+        main,
+        main.state.field(diagramIntent)?.anchor ?? from,
+        outcome.refused,
+      );
+    }
+  } finally {
+    if (hold !== null) {
+      letGoOfArrow(main, hold);
+    }
   }
 }
 
@@ -355,8 +431,10 @@ function walk(
   host: DiagramHost,
   from: number,
   key: string,
+  connecting: boolean,
 ): void {
-  const stops = stopsOf(readingOf(host));
+  const all = stopsOf(readingOf(host));
+  const stops = connecting ? boxStops(all) : all;
   const at = stops.findIndex((stop) =>
     sameTarget(stop, currentTarget(main, from)),
   );
@@ -370,8 +448,14 @@ function walk(
           ? Math.min(here + 1, stops.length - 1)
           : Math.max(here - 1, 0);
   // Home with no box stays where it is.
-  const target = stops[next < 0 ? here : next] ?? CANVAS;
-  focusTarget(main, from, target);
+  const target = stops[next < 0 ? here : next];
+  if (connecting) {
+    if (target !== undefined) {
+      focusTarget(main, from, target, "connect");
+    }
+    return;
+  }
+  focusTarget(main, from, target ?? CANVAS);
 }
 
 const WALK_KEYS = new Set([
@@ -425,9 +509,15 @@ function onKey(
   if (event.shiftKey && !menu) {
     return false;
   }
+  const intent = main.state.field(diagramIntent);
+  const connecting = intent?.mode === "connect" && intent.anchor === from;
   if (key === "Escape") {
     if (!event.repeat) {
-      leave(main, host, main.state.field(diagramIntent));
+      if (connecting) {
+        connectHooks?.cancel(main);
+      } else {
+        leave(main, host, intent);
+      }
     }
     return true;
   }
@@ -441,22 +531,62 @@ function onKey(
   if (event.repeat && !WALK_KEYS.has(key)) {
     return true;
   }
+  // Waiting for its box: a walk or a choice, and no other key takes anything.
+  if (connecting && (menu || remove || key === "F2")) {
+    return true;
+  }
   if (staleNow(main, host, from)) {
     return true;
   }
   const target = currentTarget(main, from);
   if (WALK_KEYS.has(key)) {
-    walk(main, host, from, key);
+    walk(main, host, from, key, connecting);
+  } else if (connecting) {
+    if (target.kind === "node") {
+      connectHooks?.choose(main, target.id);
+    } else {
+      connectHooks?.remind(main);
+    }
   } else if (remove) {
     if (host.writable()) {
-      void deleteStop(main, host, from, target);
+      void deleteStop(main, from, target);
     }
   } else if (menu) {
-    stopActions.get("menu")?.(main, from, target, host);
+    if (host.writable()) {
+      askMenu(
+        main,
+        () => main.state.field(diagramIntent)?.anchor ?? from,
+        target,
+      );
+    }
   } else if (target.kind !== "canvas") {
     stopActions.get("rename")?.(main, from, target, host);
   }
   return true;
+}
+
+/**
+ * A rename field stands first: its draft is written, then the menu may open, on the
+ * fence `where` finds then, as that draft can move it.
+ */
+function askMenu(
+  main: EditorView,
+  where: () => number | null,
+  target: TargetKey,
+  at?: { x: number; y: number },
+): void {
+  const go = () => {
+    const anchor = where();
+    const host = anchor === null ? null : hostOf(main, anchor);
+    if (host !== null && anchor !== null) {
+      stopActions.get("menu")?.(main, anchor, target, host, at);
+    }
+  };
+  if (clickGate === null) {
+    go();
+  } else {
+    clickGate(main, target, go);
+  }
 }
 
 /** The box an event happened in, unless it happened in a field of its overlay. */
@@ -489,11 +619,17 @@ function settle(main: EditorView, host: DiagramHost): void {
     rove(host, CANVAS);
     return;
   }
-  if (intent.mode !== "focus") {
+  if (intent.mode === "rename") {
+    return;
+  }
+  // The new drawing's elements. The menu holds the focus, and only the look moves.
+  if (intent.mode === "menu") {
+    paint(host, rove(host, intent.target));
     return;
   }
   let { target } = intent;
-  const stops = stopsOf(reading);
+  const stops =
+    intent.mode === "connect" ? boxStops(stopsOf(reading)) : stopsOf(reading);
   if (!stops.some((stop) => sameTarget(stop, target))) {
     // The stop went, by a delete or a peer: the one now in its place, never the
     // body, and only a drawing that can be read says it went.
@@ -564,6 +700,34 @@ function noticeInWindow(host: DiagramHost): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Says a refusal where the person can see it: the box's line when that stands in the
+ * window, the panel otherwise, and a screen reader hears it either way (R89, R92). A
+ * view that went has nobody to tell.
+ */
+export function sayAt(
+  main: EditorView,
+  anchor: number,
+  code: RefusalCode,
+): void {
+  if (!main.dom.isConnected) {
+    return;
+  }
+  const host = anchor <= main.state.doc.length ? hostOf(main, anchor) : null;
+  if (host === null || !noticeInWindow(host)) {
+    main.dispatch({ effects: sayRefusal.of(code) });
+    return;
+  }
+  // A live line that does not change is not read again.
+  const same =
+    host.container.querySelector(".cm-diagram-notice")?.textContent ===
+    NOTICES[code];
+  host.notice(code);
+  if (same) {
+    main.dispatch({ effects: EditorView.announce.of(NOTICES[code]) });
+  }
 }
 
 /** The views this layer runs in: a filter has only a state to go by. */
@@ -644,7 +808,13 @@ const focusPlugin = ViewPlugin.fromClass(
     };
     readonly click = (event: Event): void => {
       const place = this.place(event);
-      if (place === null || staleNow(this.view, place.host, place.from)) {
+      if (place === null) {
+        return;
+      }
+      if (this.connectClick(event, place)) {
+        return;
+      }
+      if (staleNow(this.view, place.host, place.from)) {
         return;
       }
       const reading = readingOf(place.host);
@@ -654,9 +824,14 @@ const focusPlugin = ViewPlugin.fromClass(
           ? CANVAS
           : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
       const { view } = this;
+      // Found again from the box, as a rename field's draft may move it. The intent's
+      // own anchor would be the other fence's when the click came from there.
+      const box = place.host.container;
       const go = () => {
-        const intent = view.state.field(diagramIntent);
-        const from = intent?.anchor ?? place.from;
+        const from = box.isConnected ? fenceFromOf(view, box) : null;
+        if (from === null) {
+          return;
+        }
         focusTarget(view, from, target);
         if (target.kind !== "canvas" && writable(view.state)) {
           const host = hostOf(view, from);
@@ -673,31 +848,41 @@ const focusPlugin = ViewPlugin.fromClass(
     };
     readonly contextmenu = (event: Event): void => {
       const place = this.place(event);
-      if (place === null) {
+      // A page that takes no writes has no menu of ours, and keeps the browser's.
+      if (place === null || !place.host.writable()) {
+        return;
+      }
+      if (!stopActions.has("menu")) {
+        return;
+      }
+      event.preventDefault();
+      const intent = this.view.state.field(diagramIntent);
+      if (intent?.mode === "connect" && intent.anchor === place.from) {
+        connectHooks?.cancel(this.view);
         return;
       }
       if (staleNow(this.view, place.host, place.from)) {
-        event.preventDefault();
         return;
       }
-      const action = stopActions.get("menu");
-      if (action !== undefined) {
-        event.preventDefault();
-        const reading = readingOf(place.host);
-        action(
-          this.view,
-          place.from,
-          reading === null
-            ? CANVAS
-            : flowTargetOf(
-                event.target as Element,
-                reading.svgId,
-                reading.model,
-                reading.verdict,
-              ),
-          place.host,
-        );
-      }
+      const reading = readingOf(place.host);
+      const mouse = event as MouseEvent;
+      const box = place.host.container;
+      askMenu(
+        this.view,
+        () => (box.isConnected ? fenceFromOf(this.view, box) : null),
+        reading === null
+          ? CANVAS
+          : flowTargetOf(
+              event.target as Element,
+              reading.svgId,
+              reading.model,
+              reading.verdict,
+            ),
+        // A key's own event has no place of its own.
+        mouse.clientX === 0 && mouse.clientY === 0
+          ? undefined
+          : { x: mouse.clientX, y: mouse.clientY },
+      );
     };
     readonly keydown = (event: KeyboardEvent): void => {
       if (event.defaultPrevented || event.isComposing) {
@@ -777,6 +962,39 @@ const focusPlugin = ViewPlugin.fromClass(
       ];
     }
 
+    /**
+     * A click while connect mode waits: a box is its answer, the canvas cancels and
+     * an arrow is no answer. Cancelling asks nothing of the drawing, as Escape does.
+     */
+    connectClick(
+      event: Event,
+      place: { host: DiagramHost; from: number },
+    ): boolean {
+      const { view } = this;
+      const intent = view.state.field(diagramIntent);
+      if (intent?.mode !== "connect" || intent.anchor !== place.from) {
+        return false;
+      }
+      const reading = readingOf(place.host);
+      const target =
+        reading === null
+          ? CANVAS
+          : flowTargetOf(
+              event.target as Element,
+              reading.svgId,
+              reading.model,
+              reading.verdict,
+            );
+      if (target.kind === "canvas") {
+        connectHooks?.cancel(view);
+      } else if (target.kind === "edge") {
+        connectHooks?.remind(view);
+      } else if (!staleNow(view, place.host, place.from)) {
+        connectHooks?.choose(view, target.id);
+      }
+      return true;
+    }
+
     place(event: Event): { host: DiagramHost; from: number } | null {
       const box = boxOf(event);
       const from = box === null ? null : fenceFromOf(this.view, box);
@@ -804,6 +1022,19 @@ const focusPlugin = ViewPlugin.fromClass(
           ? CANVAS
           : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
       const intent = view.state.field(diagramIntent);
+      // Connect mode keeps its mode, and stands only on a box.
+      if (intent?.mode === "connect" && intent.anchor === from) {
+        if (target.kind === "node" && !sameTarget(intent.target, target)) {
+          view.dispatch({
+            effects: setDiagramIntent.of({ ...intent, target }),
+          });
+        }
+        paint(
+          host,
+          rove(host, target.kind === "node" ? target : intent.target),
+        );
+        return;
+      }
       if (
         intent === null ||
         intent.anchor !== from ||

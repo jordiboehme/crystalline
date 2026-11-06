@@ -75,8 +75,9 @@ export const showFenceSource = StateEffect.define<number>();
 
 /**
  * A fence that stays drawn whatever its verdict says, or null for none: the one
- * holding an open rename field. A peer's half-typed line is refused by mermaid
- * on each key, and the person's draft and composition must not go with the box.
+ * holding an open rename field, menu or connect mode. A peer's half-typed line is
+ * refused by mermaid on each key, and what the person is using must not go with the
+ * box.
  * What it does for the text: nothing is written while the verdict is against it.
  * The value is the fence's `from`; it follows the fence through changes.
  */
