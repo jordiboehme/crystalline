@@ -1,6 +1,9 @@
 //! The real `crystalline mcp` as a packaged bridge, through the two debug
 //! seams: `CRYSTALLINE_TEST_PACKAGE` says "this process is inside an app
 //! package" and `CRYSTALLINE_TEST_DAEMON_TASK` stands in for Task Scheduler.
+//!
+//! Debug builds only (see `main.rs`): a release binary reads neither seam, so
+//! these tests would ask the real package check and the real Task Scheduler.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -110,16 +113,18 @@ impl Bridge {
 /// socket under it, and macOS allows 103 bytes for that path, which a
 /// default temp folder nearly spends on its own (`mcp_stub.rs` uses `/tmp`
 /// for the same reason).
-fn short_home() -> tempfile::TempDir {
+fn short_home() -> crate::common::GuardedHome {
     let base = if cfg!(unix) {
         std::path::PathBuf::from("/tmp")
     } else {
         std::env::temp_dir()
     };
-    tempfile::Builder::new()
-        .prefix("cq-")
-        .tempdir_in(base)
-        .unwrap()
+    crate::common::GuardedHome::new(
+        tempfile::Builder::new()
+            .prefix("cq-")
+            .tempdir_in(base)
+            .unwrap(),
+    )
 }
 
 fn initialize() -> Value {

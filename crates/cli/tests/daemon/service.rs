@@ -100,7 +100,13 @@ impl Env {
             .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
             // No daemon here downloads a model unless the test asked for it
             // (`Env::downloading`); see `crate::common::NO_HUB`.
-            .env(crate::common::HUB_ENDPOINT_VAR, self.hub);
+            .env(crate::common::HUB_ENDPOINT_VAR, self.hub)
+            // A daemon started here stops once this test process is gone,
+            // even when it was killed and ran no drop.
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            );
         if let Some(workers) = self.workers {
             cmd.env("TOKIO_WORKER_THREADS", workers);
         }
@@ -347,10 +353,16 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        // Best-effort: stop any daemon this test left running, then remove the dir.
-        if let Some(pid) = self.lock_pid() {
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
-        }
+        // Stop every process still running under this folder, then remove it.
+        // Not only the pid in the owner record: a bridge that saw its daemon
+        // go reconnects and spawns a successor, and that one has not
+        // published a record yet when the test ends, so a kill of the record's
+        // pid missed it, the folder went away under it and it ran on for days
+        // (the `cq-prompt-virtual-lock-*` daemons of 2026-11-04). A failing
+        // assert unwinds through here too, so its daemon is stopped as well.
+        // The guard fails a passing test when a process is still alive after
+        // that; see `crate::common::Leftovers`.
+        crate::common::Leftovers(self.dir.clone()).stop_now();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -482,8 +494,8 @@ impl Mcp {
     ///
     /// The daemon inherits this process's environment, so a knob the *daemon*
     /// has to see has to be set here, where it is started, and not on the `ctl`
-    /// client that later asks it to do the work. The only user is the rebuild
-    /// hold, below.
+    /// client that later asks it to do the work. The users are the rebuild
+    /// hold, below, and the parent seam test.
     fn spawn_with_env(env: &Env, key: &str, value: &str) -> Mcp {
         Mcp::spawn_configured(env, false, Some((key, value)))
     }
@@ -920,6 +932,367 @@ fn a_stopping_daemon_does_not_wait_for_a_blocking_task() {
         "the index opens right after the daemon left: {stdout}\n{stderr}"
     );
 }
+
+/// A daemon stops cleanly on `SIGTERM` and on `SIGINT`, the signals launchd
+/// and systemd (and a person at a terminal) stop it with, and it does so with
+/// a blocking task still parked, so a task that never ends cannot hold the
+/// signal up. The daemon is this test's own child, so its exit is read with
+/// `try_wait`; the bound is the shutdown deadline plus room for a loaded
+/// machine.
+#[test]
+fn a_daemon_exits_cleanly_on_sigterm_and_sigint() {
+    for (signal, name, tag) in [
+        (libc::SIGTERM, "SIGTERM", "sigterm"),
+        (libc::SIGINT, "SIGINT", "sigint"),
+    ] {
+        let env = Env::new(tag);
+        env.setup_domain("eng");
+        let stderr_path = env.dir.join("serve.stderr");
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.env("CRYSTALLINE_TEST_PARK_BLOCKING_SECS", "60");
+        let mut daemon = cmd
+            .args(["serve", "--daemon"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        env.wait_ready();
+
+        let pid = libc::pid_t::try_from(daemon.id()).unwrap();
+        // SAFETY: `kill` only sends a signal; `pid` is this test's own child,
+        // not yet waited for, so the pid cannot name another process.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "{name} was sent");
+        let sent = Instant::now();
+        let status = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break Some(status);
+            }
+            if sent.elapsed() > SIGNAL_EXIT_BOUND {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let Some(status) = status else {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!(
+                "the daemon was still running {:?} after {name}; its stderr:\n{stderr}",
+                sent.elapsed()
+            );
+        };
+        assert!(
+            status.success(),
+            "a clean exit on {name}: {status:?}\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("stopping ({name})")),
+            "the shutdown names the signal:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("did not finish in"),
+            "the steps finished on their own; the watchdog never fired:\n{stderr}"
+        );
+        assert!(!env.info_path().exists(), "record removed after {name}");
+        assert!(!env.lock_path().exists(), "lock file removed after {name}");
+    }
+}
+
+/// The same for the daemon a client autostarts, the kind the 2026-11-04
+/// leftovers were (`serve --daemon --autostarted`, in a session of its own,
+/// working in its state directory): once its bridge is gone it is nobody's
+/// child here, so its exit is read from `kill(pid, 0)`, and it is reaped by
+/// init. The second round deletes the whole folder under the running daemon
+/// first, its working directory included, as the leaked ones had it; its log
+/// goes with the folder, so that round checks the process only.
+#[test]
+fn an_autostarted_daemon_exits_on_sigterm() {
+    for deleted in [false, true] {
+        let env = Env::new(if deleted {
+            "sigterm-gone"
+        } else {
+            "sigterm-auto"
+        });
+        env.setup_domain("eng");
+        let mut client = Mcp::spawn(&env);
+        client.initialize();
+        env.wait_ready();
+        let pid = env.lock_pid().expect("the daemon published its pid");
+        // The bridge goes first, or it would reconnect and start a successor.
+        drop(client);
+        if deleted {
+            std::fs::remove_dir_all(&env.dir).unwrap();
+        }
+
+        let pid = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: `kill` only sends a signal. `pid` is the daemon this test's
+        // bridge started a moment ago and published in this test's own
+        // folder, and it is still running, so the pid is not reused yet.
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGTERM) },
+            0,
+            "SIGTERM was sent"
+        );
+        let sent = Instant::now();
+        // SAFETY: signal 0 sends nothing; `kill` only checks that `pid`
+        // still exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                sent.elapsed() < SIGNAL_EXIT_BOUND,
+                "the autostarted daemon (pid {pid}, folder deleted: {deleted}) was still running {:?} after SIGTERM:\n{}",
+                sent.elapsed(),
+                env.daemon_lifecycle_lines()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !deleted {
+            let log = env.daemon_lifecycle_lines();
+            assert!(log.contains("stopping (SIGTERM)"), "{log}");
+            assert!(!log.contains("did not finish in"), "{log}");
+            assert!(!env.info_path().exists(), "record removed");
+        }
+    }
+}
+
+/// The leak of 2026-11-04 as it happened: `ctl shutdown` while the test's
+/// bridge is still attached. The bridge reconnects and spawns a successor,
+/// which under load has not published its record when the test ends. The
+/// test waits for the successor and then deletes its record, so the drop
+/// meets exactly that state: a kill of the record's pid finds nothing, and
+/// only the folder scan in `Env`'s drop can stop the successor. Nothing may
+/// run under the folder once the `Env` is gone.
+#[test]
+fn a_successor_the_bridge_spawns_at_the_end_of_a_test_is_stopped_with_it() {
+    let dir;
+    {
+        let env = Env::new("successor");
+        env.setup_domain("eng");
+        dir = env.dir.clone();
+        let mut client = Mcp::spawn(&env);
+        client.initialize();
+        env.wait_ready();
+        let first = env.lock_pid().expect("the daemon published its pid");
+        let (ok, out) = env.run(&["ctl", "shutdown"]);
+        assert!(ok, "ctl shutdown: {out}");
+        // The bridge is still attached: wait until it has started the
+        // successor, so the drop below meets one for certain.
+        let start = Instant::now();
+        while env.lock_pid().is_none_or(|pid| pid == first) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "the bridge never started a successor"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(client);
+        // As if the successor had not published yet: no record names it.
+        std::fs::remove_file(env.info_path()).unwrap();
+    }
+    let left = crate::common::processes_under(&dir).expect("the process scan runs");
+    if !left.is_empty() {
+        // Stop the successor before failing, so a failing run leaves nothing.
+        let _ = crate::common::stop_processes_under(&dir, Duration::from_secs(10));
+    }
+    assert!(
+        left.is_empty(),
+        "still running under {}: {left:?}",
+        dir.display()
+    );
+}
+
+/// The guard stops a process that runs under the folder and published no
+/// owner record, the case a kill of the record's pid missed.
+#[test]
+fn the_guard_stops_a_process_that_published_no_record() {
+    let env = Env::new("guard");
+    // A `write` with no `--content` reads its body from stdin before it does
+    // anything else, so with stdin held open it waits there, under this
+    // folder, without a record. Not `sleep`: macOS shows no other process
+    // the environment of a platform binary, so the scan could not find it.
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut child = cmd
+        .args(["write", "eng", "Held"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _stdin = child.stdin.take();
+    let pid = child.id();
+    let start = Instant::now();
+    while !crate::common::processes_under(&env.dir)
+        .expect("the process scan runs")
+        .iter()
+        .any(|(found, _)| *found == pid)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the scan never found pid {pid} under {}",
+            env.dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(env.lock_pid().is_none(), "no record names it");
+    crate::common::Leftovers(env.dir.clone()).stop_now();
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "the guard stopped it: {status:?}");
+    assert!(
+        crate::common::processes_under(&env.dir)
+            .expect("the process scan runs")
+            .is_empty()
+    );
+}
+
+/// A stand-in for a test process: a `sleep` this test started and ends
+/// itself. Its pid is what a daemon under test is told its parent is.
+#[cfg(debug_assertions)]
+struct StandInParent(Child);
+
+#[cfg(debug_assertions)]
+impl StandInParent {
+    fn start() -> StandInParent {
+        StandInParent(
+            Command::new("sleep")
+                .arg("120")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pid(&self) -> String {
+        self.0.id().to_string()
+    }
+
+    /// End it and reap it: an exited child that is not waited for stays a
+    /// zombie, and `kill(pid, 0)` still finds a zombie.
+    fn end(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for StandInParent {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// What a daemon logs when it stops because its test parent is gone.
+#[cfg(debug_assertions)]
+const PARENT_GONE_LINE: &str = "stopping (the test process that started it ended)";
+
+/// A test process killed outright (a nextest timeout) runs no drop, so the
+/// daemon it started is stopped by nobody. With `CRYSTALLINE_TEST_PARENT_PID`
+/// set, a debug daemon checks every second that the process is still there
+/// and stops as it does on `SIGTERM` once it is not. First a daemon started
+/// directly, then one a bridge started, which proves the bridge passes the
+/// variable on. The seam exists only in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+fn a_daemon_stops_once_its_test_parent_is_gone() {
+    // Direct: the daemon is this test's own child, so its exit is read with
+    // `try_wait`.
+    {
+        let env = Env::new("parent-gone");
+        env.setup_domain("eng");
+        let mut parent = StandInParent::start();
+        let stderr_path = env.dir.join("serve.stderr");
+        let mut cmd = Command::new(bin());
+        env.apply(&mut cmd);
+        cmd.env(crate::common::TEST_PARENT_PID_VAR, parent.pid());
+        let mut daemon = cmd
+            .args(["serve", "--daemon"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap();
+        env.wait_ready();
+        // Two checks pass while the parent is there, and the daemon stays.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "the daemon stopped while its parent was still running:\n{}",
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+
+        parent.end();
+        let ended = Instant::now();
+        let status = loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                break Some(status);
+            }
+            if ended.elapsed() > SIGNAL_EXIT_BOUND {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let Some(status) = status else {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!(
+                "the daemon was still running {:?} after its parent ended; its stderr:\n{stderr}",
+                ended.elapsed()
+            );
+        };
+        assert!(status.success(), "a clean exit: {status:?}\n{stderr}");
+        assert!(stderr.contains(PARENT_GONE_LINE), "{stderr}");
+        assert!(!stderr.contains("did not finish in"), "{stderr}");
+        assert!(!env.info_path().exists(), "record removed");
+        assert!(!env.lock_path().exists(), "lock file removed");
+        let left = crate::common::processes_under(&env.dir).expect("the process scan runs");
+        assert!(left.is_empty(), "still running: {left:?}");
+    }
+
+    // Through a bridge: the daemon it autostarts is nobody's child here, so
+    // its exit is read from `kill(pid, 0)`.
+    {
+        let env = Env::new("parent-gone-auto");
+        env.setup_domain("eng");
+        let mut parent = StandInParent::start();
+        let mut client =
+            Mcp::spawn_with_env(&env, crate::common::TEST_PARENT_PID_VAR, &parent.pid());
+        client.initialize();
+        env.wait_ready();
+        let pid = env.lock_pid().expect("the daemon published its pid");
+        // The bridge goes first, or it would reconnect and start a successor.
+        drop(client);
+        let pid = libc::pid_t::try_from(pid).unwrap();
+
+        parent.end();
+        let ended = Instant::now();
+        // SAFETY: signal 0 sends nothing; `kill` only checks that `pid`
+        // still exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                ended.elapsed() < SIGNAL_EXIT_BOUND,
+                "the autostarted daemon (pid {pid}) was still running {:?} after its parent ended:\n{}",
+                ended.elapsed(),
+                env.daemon_lifecycle_lines()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let log = env.daemon_lifecycle_lines();
+        assert!(log.contains(PARENT_GONE_LINE), "{log}");
+        assert!(!log.contains("did not finish in"), "{log}");
+        assert!(!env.info_path().exists(), "record removed");
+        let left = crate::common::processes_under(&env.dir).expect("the process scan runs");
+        assert!(left.is_empty(), "still running: {left:?}");
+    }
+}
+
+/// How long a signalled daemon may take to be gone: the shutdown deadline
+/// (10 s, `crystalline_service::daemon::SHUTDOWN_DEADLINE`) plus room for a
+/// loaded machine. A clean stop takes well under a second.
+const SIGNAL_EXIT_BOUND: Duration = Duration::from_secs(15);
 
 /// A minimal OpenAI-compatible embeddings endpoint on a loopback port: every
 /// input gets the same unit vector, so every pair of engrams is related. One
@@ -4321,6 +4694,9 @@ fn prompt_system_marks_a_read_only_virtual_domain_with_a_daemon() {
         assert_eq!(answer["data"]["$read_only"], json!(["notes"]), "{answer}");
         assert!(answer["data"]["notes"].is_array(), "{answer}");
     }
+    // The bridge goes first: one still attached when the daemon stops
+    // reconnects and spawns a successor, which this test would leave behind.
+    drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
@@ -5270,7 +5646,8 @@ fn status_notes_an_unreachable_daemon_on_stderr() {
     std::fs::create_dir_all(env.state_dir()).unwrap();
     // A disposable child stands in for the daemon: alive, but its socket
     // path holds nothing. A same-or-newer version sidesteps the takeover
-    // path, and Env::drop's kill -9 of the lock pid only hits the stand-in.
+    // path. The stand-in does not run under this folder, so Env::drop never
+    // sees it; the test stops it itself below.
     let mut stand_in = Command::new("sleep")
         .arg("30")
         .stdin(Stdio::null())

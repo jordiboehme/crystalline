@@ -393,6 +393,17 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("the engram editor's tab title", () => {
+  it("names the page by the engram it edits, and not-found by Fluid", async () => {
+    serveEditor();
+    const { unmount } = renderApp("/d/eng/edit/alpha");
+    await openBuffer();
+    expect(document.title).toBe("Alpha - Fluid");
+    unmount();
+    expect(document.title).toBe("Fluid");
+  });
+});
+
 describe("the engram editor on a domain GitHub governs", () => {
   /** A viewer's session, with `row` folded into the listing's one domain. */
   function serveViewer(row: Record<string, unknown>) {

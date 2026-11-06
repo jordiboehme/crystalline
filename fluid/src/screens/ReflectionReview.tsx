@@ -18,6 +18,7 @@
  * to judge an anchor against.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { useState } from "react";
@@ -102,6 +103,7 @@ const MUTED = "text-sm text-muted";
 export default function ReflectionReview(): ReactElement {
   const { domain = "" } = useParams();
   const status = useReflectionStatus(domain);
+  usePageTitle(`${domain} review`);
   const review = useQuery({
     queryKey: reflectionReviewKey(domain),
     queryFn: () => fetchReview(domain),

@@ -25,6 +25,7 @@
  * client waiting somewhere else entirely.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
 
@@ -66,6 +67,11 @@ export default function OauthConsent() {
     },
   });
 
+  const expired =
+    requestId === null ||
+    (authorization.isError && isGone(authorization.error)) ||
+    (decide.isError && isGone(decide.error));
+  usePageTitle(expired ? "This request has expired" : "Connect a client");
   if (requestId === null) {
     return <Expired />;
   }

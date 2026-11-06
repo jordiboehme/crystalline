@@ -136,6 +136,15 @@ beforeAll(async () => {
 }, 120_000);
 
 describe("the reflection page", () => {
+  it("names the tab by the page's title and falls back to Fluid", async () => {
+    serve("curate", true);
+    const { unmount } = renderApp("/d/eng/reflection/guides/deploying.md");
+    await screen.findByRole("heading", { name: "Deploying", level: 1 });
+    expect(document.title).toBe("Deploying - Fluid");
+    unmount();
+    expect(document.title).toBe("Fluid");
+  });
+
   it("renders the page without its frontmatter or its section ids", async () => {
     serve("curate", true);
     renderApp("/d/eng/reflection/guides/deploying.md");

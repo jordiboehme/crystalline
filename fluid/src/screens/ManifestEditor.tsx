@@ -18,6 +18,7 @@
  * buffer.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import type { Extension } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -172,6 +173,9 @@ export default function ManifestEditor() {
     enabled: capabilities.canAdminister,
   });
 
+  usePageTitle(
+    capabilities.canAdminister && !detail.error ? `${domain} MANIFEST` : null,
+  );
   if (!capabilities.canAdminister) {
     return <NotFound />;
   }

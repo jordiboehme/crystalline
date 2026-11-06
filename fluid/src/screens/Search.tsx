@@ -20,6 +20,7 @@
  * hybrid.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
@@ -46,6 +47,7 @@ import { searchTerms } from "../snippet";
 
 export default function Search() {
   const [params, setParams] = useSearchParams();
+  usePageTitle("Search");
 
   const request = useMemo<SearchRequest>(
     () => ({

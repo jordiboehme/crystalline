@@ -6,6 +6,9 @@
 //! command sends its writes to the daemon or refuses (issue 153). No seam
 //! can simulate the redirection itself; these tests pin that the client
 //! process writes nothing.
+//!
+//! Debug builds only (see `main.rs`): a release binary reads neither seam, so
+//! these tests would ask the real package check and the real Task Scheduler.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -41,16 +44,18 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, (u64, Option<SystemTime>)> {
 
 /// A home with a short path: a daemon the `serve` seam starts binds a unix
 /// socket under it, and macOS allows 103 bytes for that path.
-fn short_home() -> tempfile::TempDir {
+fn short_home() -> crate::common::GuardedHome {
     let base = if cfg!(unix) {
         PathBuf::from("/tmp")
     } else {
         std::env::temp_dir()
     };
-    tempfile::Builder::new()
-        .prefix("cp-")
-        .tempdir_in(base)
-        .unwrap()
+    crate::common::GuardedHome::new(
+        tempfile::Builder::new()
+            .prefix("cp-")
+            .tempdir_in(base)
+            .unwrap(),
+    )
 }
 
 /// The config file a child isolated by `isolation_env` reads.
