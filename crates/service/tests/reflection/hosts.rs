@@ -47,6 +47,14 @@ fn refusal(label: &str) -> String {
     )
 }
 
+/// The same refusal as REST words it: it answers before it knows who asked, so
+/// the command stays in the server log.
+fn rest_refusal(label: &str) -> String {
+    format!(
+        "this domain's Reflection is served by {label}. An admin can move it, and the server log says how."
+    )
+}
+
 /// Two instances on one Postgres schema: the first claims `eng`'s host lock
 /// and serves its Reflection; the second refuses every write with 409, says
 /// `hosted_elsewhere` with the host's label in its status and its listing,
@@ -132,11 +140,11 @@ async fn a_reflection_on_a_shared_database_is_served_by_its_host_only_on_postgre
         .send(reqwest::Method::PUT, PAGE, Some(page.clone()))
         .await;
     assert_eq!(status, 409, "{err}");
-    assert_eq!(err["detail"], refusal("alpha"), "{err}");
+    assert_eq!(err["detail"], rest_refusal("alpha"), "{err}");
     const FILE: &str = "/api/v1/domains/eng/reflection/assets/diagrams/flow.png";
     let (status, err) = ed.put_bytes(FILE, crate::assets::PNG).await;
     assert_eq!(status, 409, "{err}");
-    assert_eq!(err["detail"], refusal("alpha"), "{err}");
+    assert_eq!(err["detail"], rest_refusal("alpha"), "{err}");
     assert!(
         !s.fx.root.join("reflections/guides/new.md").exists()
             && !s
