@@ -779,7 +779,7 @@ impl Engine {
                 )));
             }
             let warning = view
-                .write(desc.domain_id, &desc.path, &edited)
+                .write_from(desc.domain_id, &desc.path, &edited, Some(&current))
                 .await
                 .map_err(SourceEditFailure::before)?;
             // Neither tail below runs. A draft of the MANIFEST is one actor's

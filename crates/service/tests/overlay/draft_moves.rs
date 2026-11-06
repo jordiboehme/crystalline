@@ -148,8 +148,17 @@ impl Fixture {
         self.origins.join("team")
     }
 
-    /// The base snapshot now holds `bytes` at `path`, as after a pull.
+    /// The team's file at `path` now holds `bytes`, in the folder and in the base
+    /// snapshot, as after a pull. The index is not told, as a sync would.
     fn team_has(&self, path: &str, bytes: &[u8]) {
+        std::fs::write(self.root.join("team").join(path), bytes).unwrap();
+        self.snapshot_ahead(path, bytes);
+    }
+
+    /// The base snapshot holds `bytes` at `path` and the folder does not follow:
+    /// the moment in a direct commit before the folder is written, and the state a
+    /// failed folder write leaves for good.
+    fn snapshot_ahead(&self, path: &str, bytes: &[u8]) {
         let dir = self.snapshot_dir();
         let mut state = OriginState::load(&dir).unwrap().unwrap();
         state.files.insert(
@@ -373,13 +382,339 @@ async fn a_new_draft_records_the_teams_text_and_a_second_write_does_not_move_it(
     assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
 }
 
-/// The team's text is read from the snapshot and not the folder, as LF.
+/// The start is what the verb read, as LF, whatever line ending the team's file
+/// has.
 #[tokio::test]
-async fn a_new_draft_records_the_snapshot_as_lf_and_not_the_folder() {
+async fn a_new_draft_records_what_she_read_as_lf() {
     let f = fixture(&[("plan.md", PLAN)]).await;
     f.team_has("plan.md", PLAN_LATER.replace('\n', "\r\n").as_bytes());
     f.draft_plan().await;
     assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN_LATER)));
+
+    // A writer with no read of its own takes the snapshot's text, also as LF.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.team_has("plan.md", PLAN_LATER.replace('\n', "\r\n").as_bytes());
+    f.engine
+        .restore_engram(
+            "team",
+            "plan.md",
+            &PLAN.replace("as the team", "restored"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN_LATER)));
+}
+
+/// A pull lands while a first edit stands between its read and its write. Her row
+/// does not hold bob's line, so a start of bob's text would read as in step and
+/// her share would overwrite him. If the pull deleted the file, a start of nothing
+/// would read as a new file and undo his delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_during_a_first_edit_leaves_the_start_on_what_she_read() {
+    for deletes in [false, true] {
+        let f = fixture(&[("plan.md", PLAN)]).await;
+        f.engine.hold_next_draft_edit(800);
+        let edit = {
+            let engine = f.engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .edit_engram_as(&edit_append("plan", "- [fact] hers #team"), None, &alice())
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut files = BTreeMap::from([("MANIFEST.md".to_string(), MANIFEST.as_bytes().to_vec())]);
+        if !deletes {
+            files.insert("plan.md".to_string(), PLAN_LATER.as_bytes().to_vec());
+        }
+        let mock = f.mock.as_ref().unwrap();
+        let commit = mock.add_commit(files);
+        mock.set_branch("main", &commit);
+        f.engine
+            .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+        let held = OriginState::load(&f.snapshot_dir()).unwrap().unwrap();
+        assert_eq!(
+            held.files.contains_key("plan.md"),
+            !deletes,
+            "the pull landed"
+        );
+
+        edit.await.unwrap().unwrap();
+
+        assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+        assert_eq!(
+            f.start("plan.md"),
+            Some(in_step("plan.md", PLAN)),
+            "deletes: {deletes}"
+        );
+    }
+}
+
+/// The snapshot stands ahead of the folder, so what she sees is older than what
+/// the snapshot says. Each verb records what it read, and never bob's text, which
+/// her row does not hold.
+#[tokio::test]
+async fn a_snapshot_ahead_of_the_folder_does_not_become_her_start() {
+    let ahead = async || {
+        let f = fixture(&[("plan.md", PLAN)]).await;
+        f.snapshot_ahead("plan.md", PLAN_LATER.as_bytes());
+        f
+    };
+
+    let f = ahead().await;
+    f.engine
+        .edit_engram_as(&edit_append("plan", "- [fact] hers #team"), None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "edit");
+
+    let f = ahead().await;
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "write");
+
+    let f = ahead().await;
+    let mut guarded = write_params("Plan", "her body");
+    guarded.overwrite = true;
+    guarded.expected_checksum = Some(crate::support::sha256_hex(PLAN.as_bytes()));
+    f.engine
+        .write_engram_as(&guarded, None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.start("plan.md"),
+        Some(in_step("plan.md", PLAN)),
+        "write with a checksum"
+    );
+
+    let f = ahead().await;
+    f.engine
+        .save_engram(
+            &SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("as the team", "saved by alice"),
+                expected_checksum: crate::support::sha256_hex(PLAN.as_bytes()),
+            },
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "save");
+
+    let f = ahead().await;
+    f.delete("plan").await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "delete");
+
+    let f = ahead().await;
+    f.moved("plan", "renamed.md").await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "move");
+    let moved = f.start("renamed.md").unwrap();
+    assert_eq!(moved.from.as_deref(), Some("plan.md"));
+    assert_eq!(moved.start.as_deref(), Some(PLAN), "move");
+
+    let f = ahead().await;
+    let mut asked = draft_move("plan", "plan.md");
+    asked.permalink = Some("a-new-address".to_string());
+    f.engine.move_engram(&asked, &alice()).await.unwrap();
+    assert_eq!(
+        f.start("plan.md"),
+        Some(in_step("plan.md", PLAN)),
+        "permalink-only move"
+    );
+}
+
+/// The snapshot holds a file the folder does not have yet, and she creates one at
+/// that path. She read nothing there, so she did not edit his file.
+#[tokio::test]
+async fn a_new_file_at_a_path_only_the_snapshot_holds_has_no_start() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.snapshot_ahead("fresh.md", PLAN_LATER.as_bytes());
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    let record = f.start("fresh.md").unwrap();
+    assert_eq!((record.from, record.start), (None, None));
+}
+
+/// A team file that cannot be read can still be replaced: she read nothing there,
+/// and the write is not refused for it.
+#[tokio::test]
+async fn an_overwrite_of_an_unreadable_team_file_still_lands() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    std::fs::write(f.root.join("team/plan.md"), b"\xff\xfe not text").unwrap();
+    f.draft_plan().await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    let record = f.start("plan.md").unwrap();
+    assert_eq!((record.from, record.start), (None, None));
+}
+
+/// Her draft moved to `b.md`, then the team added its own `b.md`, and she moves on.
+/// The deletion of the team's `b.md` is of a file she never saw. A record that
+/// still said `from: plan.md` would read as in step, and her share would delete it
+/// with no conflict.
+#[tokio::test]
+async fn a_tombstone_over_a_draft_from_elsewhere_does_not_read_as_in_step() {
+    let team_b = own_text("team-b", "the team's own b");
+    let moved_onto_by_the_team = async || {
+        let f = fixture(&[("plan.md", PLAN)]).await;
+        f.draft_plan().await;
+        f.moved("plan", "b.md").await;
+        f.team_has("b.md", team_b.as_bytes());
+        f.engine.sync(None).await.unwrap();
+        f
+    };
+    let no_known_start = DraftStart {
+        path: "b.md".to_string(),
+        from: Some("b.md".to_string()),
+        start: None,
+        shared: None,
+        merged_at: None,
+    };
+
+    let f = moved_onto_by_the_team().await;
+    f.moved("plan", "c.md").await;
+    assert_eq!(f.start("b.md"), Some(no_known_start.clone()), "move");
+    let draft = f.start("c.md").unwrap();
+    assert_eq!(
+        draft.from.as_deref(),
+        Some("plan.md"),
+        "the draft keeps its own"
+    );
+    assert_eq!(draft.start.as_deref(), Some(PLAN));
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+
+    let f = moved_onto_by_the_team().await;
+    f.delete("plan").await;
+    assert_eq!(f.start("b.md"), Some(no_known_start.clone()), "delete");
+
+    // The same for a new file of hers, whose `from` is nothing.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("B", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    f.team_has("b.md", team_b.as_bytes());
+    f.engine.sync(None).await.unwrap();
+    f.delete("b").await;
+    assert_eq!(
+        f.start("b.md"),
+        Some(no_known_start.clone()),
+        "her new file"
+    );
+
+    // A move that fails puts the record back as it was.
+    let f = moved_onto_by_the_team().await;
+    let before = f.start("b.md").unwrap();
+    assert_eq!(before.from.as_deref(), Some("plan.md"));
+    f.block_the_record("c.md");
+    f.engine
+        .move_engram(&draft_move("plan", "c.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.start("b.md"), Some(before), "rolled back");
+
+    // A deletion whose row the store refuses leaves the record as it was: her
+    // other draft holds the column the tombstone's row needs.
+    let f = moved_onto_by_the_team().await;
+    let before = f.start("b.md").unwrap();
+    f.engine
+        .restore_engram(
+            "team",
+            "other.md",
+            &own_text("b.md", "an address that is this path"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.start("b.md"), Some(before), "the row did not land");
+}
+
+/// C1: asking a held row's record whether it names this path can meet a broken
+/// one, and the deletion refuses with nothing changed. A discard is the way out.
+#[tokio::test]
+async fn a_delete_of_a_draft_with_a_broken_record_refuses_and_changes_nothing() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
+    std::fs::write(&file, b"{ not json").unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
+
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// A restore writes the row like every other writer of this draft, under its lock,
+/// or a first edit and a restore could both find no row and the last record win.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_waits_for_the_draft_lock() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    let mirror = f
+        .state
+        .join("overlays")
+        .join("team")
+        .join("alice")
+        .join("fresh.md");
+    let lock = f.engine.file_write_lock(&mirror);
+    let held = lock.lock().await;
+    let mut restoring = {
+        let engine = f.engine.clone();
+        tokio::spawn(async move {
+            engine
+                .restore_engram("team", "fresh.md", &own_text("fresh", "put back"), &alice())
+                .await
+                .map(|_| ())
+        })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut restoring)
+            .await
+            .is_err(),
+        "the restore waits for the lock"
+    );
+    assert_eq!(f.rows().await, vec![]);
+    drop(held);
+    restoring.await.unwrap().unwrap();
+    assert_eq!(f.rows().await, vec![("fresh.md".to_string(), false)]);
 }
 
 #[tokio::test]
@@ -971,20 +1306,33 @@ async fn a_state_file_that_does_not_parse_refuses_a_new_draft_and_leaves_nothing
 /// while nothing has changed, so no destination can read as an old draft.
 #[tokio::test]
 async fn a_move_of_a_draft_with_a_broken_record_refuses_and_changes_nothing() {
-    let f = fixture(&[("plan.md", PLAN)]).await;
-    f.draft_plan().await;
-    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
-    std::fs::write(&file, b"{ not json").unwrap();
+    // Her draft of a team file, and her own new file, where no tombstone is
+    // written that would ask the record again.
+    for own_new_file in [false, true] {
+        let f = fixture(&[("plan.md", PLAN)]).await;
+        let (path, address, words) = if own_new_file {
+            f.engine
+                .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+                .await
+                .unwrap();
+            ("fresh.md", "fresh", "only hers")
+        } else {
+            f.draft_plan().await;
+            ("plan.md", "plan", "her body")
+        };
+        let file = draft_start::record_file(&f.state, "team", "alice", path).unwrap();
+        std::fs::write(&file, b"{ not json").unwrap();
 
-    f.engine
-        .move_engram(&draft_move("plan", "renamed.md"), &alice())
-        .await
-        .unwrap_err();
+        f.engine
+            .move_engram(&draft_move(address, "renamed.md"), &alice())
+            .await
+            .unwrap_err();
 
-    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
-    assert!(f.reads("plan").await.contains("her body"));
-    assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
-    assert_eq!(f.start("renamed.md"), None);
+        assert_eq!(f.rows().await, vec![(path.to_string(), false)]);
+        assert!(f.reads(address).await.contains(words));
+        assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
+        assert_eq!(f.start("renamed.md"), None);
+    }
 }
 
 /// The row after the record failed: the row's address is taken by the column a
@@ -1108,6 +1456,87 @@ async fn a_failed_move_destination_restores_the_source_record() {
         .unwrap_err();
     assert_eq!(f.rows().await, vec![]);
     assert_eq!(f.start("plan.md"), None, "the base shows through again");
+}
+
+/// The record cannot be put back on the way out of a failed move: her row and her
+/// text come back all the same, and the record goes, which reads as "we cannot
+/// tell". A wrong record would read as a known start.
+#[tokio::test]
+async fn a_record_that_cannot_be_put_back_costs_the_start_and_never_the_text() {
+    // Her draft of a team file.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.block_the_record("renamed.md");
+    f.engine.fail_next_start_restore();
+    f.engine
+        .move_engram(&draft_move("plan", "renamed.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert!(f.reads("plan").await.contains("her body"));
+    assert_eq!(f.start("plan.md"), None);
+
+    // Her own new file.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    f.block_the_record("later.md");
+    f.engine.fail_next_start_restore();
+    f.engine
+        .move_engram(&draft_move("fresh", "later.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("fresh.md".to_string(), false)]);
+    assert!(f.reads("fresh").await.contains("only hers"));
+    assert_eq!(f.start("fresh.md"), None);
+}
+
+/// A folder of records that refuses writes fails the save and the clear both, in
+/// the rollback too. Her row and text still come back, and the record stands. Unix
+/// only for the mode bit, and passed over where the mode does not bind, as for root.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_folder_of_records_that_refuses_writes_never_costs_the_text() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |dir: &Path, bits: u32| {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    for own_new_file in [false, true] {
+        let f = fixture(&[("plan.md", PLAN)]).await;
+        let (path, address, words) = if own_new_file {
+            f.engine
+                .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+                .await
+                .unwrap();
+            ("fresh.md", "fresh", "only hers")
+        } else {
+            f.draft_plan().await;
+            ("plan.md", "plan", "her body")
+        };
+        let before = f.start(path);
+        assert!(before.is_some());
+        let file = draft_start::record_file(&f.state, "team", "alice", path).unwrap();
+        let starts = file.parent().unwrap().to_path_buf();
+        mode(&starts, 0o555);
+        if std::fs::write(starts.join("probe"), b"").is_ok() {
+            std::fs::remove_file(starts.join("probe")).unwrap();
+            mode(&starts, 0o755);
+            eprintln!("skipped: this user writes through the mode");
+            return;
+        }
+        let moved = f
+            .engine
+            .move_engram(&draft_move(address, "later.md"), &alice())
+            .await;
+        let (rows, reads, record) = (f.rows().await, f.reads(address).await, f.start(path));
+        mode(&starts, 0o755);
+        moved.unwrap_err();
+        assert_eq!(rows, vec![(path.to_string(), false)]);
+        assert!(reads.contains(words));
+        assert_eq!(record, before);
+    }
 }
 
 #[tokio::test]

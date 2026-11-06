@@ -1050,6 +1050,10 @@ pub struct Engine {
     detection_walks: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
+    // When armed, the next put-back of a draft start record fails once. See
+    // `Engine::fail_next_start_restore`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_start_restore: std::sync::atomic::AtomicBool,
     // When armed, the next rename-question scan fails once. See
     // `Engine::fail_next_rename_scan`.
     #[cfg(any(test, feature = "testing"))]
@@ -2502,6 +2506,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            fail_next_start_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             lose_next_relink_swap: std::sync::atomic::AtomicBool::new(false),
@@ -2641,6 +2647,30 @@ impl Engine {
     pub fn fail_next_source_edit(&self) {
         self.fail_next_source_edit
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make the next put-back of a draft start record fail, once, as a full disk
+    /// would, leaving the clear that follows it to work. The other way to get
+    /// there, a folder that refuses writes, fails the clear as well. Nothing in
+    /// the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_start_restore(&self) {
+        self.fail_next_start_restore
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::fail_next_start_restore`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    pub(crate) fn take_failed_start_restore(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_start_restore
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
     }
 
     /// Make the next scan for a rename question's old spellings fail, once,
@@ -5941,14 +5971,22 @@ impl Engine {
     /// **A held row keeps its record, or keeps having none.** The deletion stands
     /// on what the draft it replaces started from, and an old draft's deletion
     /// stays unknown: today's team text would make a stale delete read as in step.
-    /// With no row held the record is new, and it goes down before the row, as in
-    /// [`DomainView::put`].
+    /// With no row held the record is new, with `read` as its start, and it goes
+    /// down before the row, as in [`DomainView::put`].
+    ///
+    /// **Except a held record of another path.** The draft came from elsewhere or
+    /// was new, and the team has since added a file here. She never saw that file,
+    /// and a record comparing against the other path would read its deletion as in
+    /// step. So the record names this path and no start, and the team's text
+    /// differs from it. The draft's own record is the mover's to carry, read before
+    /// this runs.
     pub(crate) async fn write_overlay_tombstone(
         &self,
         domain: &str,
         actor: &str,
         desc: &EngramDescriptor,
         base_text: &str,
+        read: &str,
     ) -> Result<Option<String>> {
         let state_dir = self.journal_state_dir()?;
         let record = EngramRecord {
@@ -5988,30 +6026,51 @@ impl Engine {
                 .await?
                 .is_some()
         };
-        if !held {
-            let start = self.fresh_tombstone_start(domain, &desc.path)?;
-            let saved = match &start {
+        // `Some` is a change to the record, with what to put back if the row fails.
+        let io = |source| EngineError::Io {
+            path: format!("the draft start record of '{}'", desc.path),
+            source,
+        };
+        let way_back = if held {
+            let before =
+                crate::draft_start::load(&state_dir, domain, actor, &desc.path).map_err(io)?;
+            match before {
+                Some(before) if before.from.as_deref() != Some(desc.path.as_str()) => {
+                    let elsewhere = crate::draft_start::DraftStart {
+                        from: Some(desc.path.clone()),
+                        start: None,
+                        ..before.clone()
+                    };
+                    crate::draft_start::save(&state_dir, domain, actor, &elsewhere).map_err(io)?;
+                    Some(Some(before))
+                }
+                _ => None,
+            }
+        } else {
+            let start = self.fresh_tombstone_start(domain, &desc.path, read)?;
+            match &start {
                 Some(start) => crate::draft_start::save(&state_dir, domain, actor, start),
                 None => crate::draft_start::clear(&state_dir, domain, actor, &desc.path),
-            };
-            saved.map_err(|source| EngineError::Io {
-                path: format!("the draft start record of '{}'", desc.path),
-                source,
-            })?;
-        }
+            }
+            .map_err(io)?;
+            Some(None)
+        };
         if let Err(e) = self
             .commit_overlay_row(desc.domain_id, actor, &record)
             .await
         {
-            // No row was held, so what stands is the record just written.
-            if !held
-                && let Err(left) = crate::draft_start::clear(&state_dir, domain, actor, &desc.path)
-            {
+            let put_back = match way_back {
+                Some(Some(before)) => crate::draft_start::save(&state_dir, domain, actor, &before),
+                Some(None) => crate::draft_start::clear(&state_dir, domain, actor, &desc.path),
+                None => Ok(()),
+            };
+            if let Err(left) = put_back {
                 tracing::warn!(
                     domain,
                     actor,
                     path = desc.path.as_str(),
-                    "a deletion failed and the record of where it started stays behind: {left}"
+                    "a deletion failed and the record of where it started could not be put \
+                     back: {left}"
                 );
             }
             return Err(e);
@@ -6110,14 +6169,51 @@ impl Engine {
             }))
     }
 
+    /// The record of a new row at `path` for a verb that read what it builds on.
+    /// `from` and `start` come from that read, and the snapshot says only whether
+    /// anything can be told and whether the team holds this path. The two can
+    /// disagree in the moment a pull or a direct commit moves them, and for good
+    /// after a folder write that failed, and the draft holds what she read.
+    ///
+    /// A read of a path the snapshot does not hold is one of two things, and the
+    /// folder tells them apart: still there, it is a file nobody shared, so a new
+    /// file. Gone, the team deleted what she read since she read it, and it stays a
+    /// known start. On a case rename in that moment the folder's answer can differ
+    /// by disk; one that keeps the address is refused by the address check anyway.
+    pub(crate) fn start_from_read(
+        &self,
+        domain: &str,
+        path: &str,
+        read: Option<&str>,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        let Some(team) = self.team_text_for_a_start(domain, path)? else {
+            return Ok(None);
+        };
+        let start = read.filter(|_| {
+            team.is_some()
+                || match self.content_source(domain) {
+                    Ok(ContentSource::File { root }) => !join_rel(&root, path).exists(),
+                    _ => false,
+                }
+        });
+        Ok(Some(crate::draft_start::DraftStart {
+            path: path.to_string(),
+            from: start.map(|_| path.to_string()),
+            start: start.map(|text| crystalline_core::to_lf(text).into_owned()),
+            shared: None,
+            merged_at: None,
+        }))
+    }
+
     /// The record of a new tombstone at `path`, whose `from` is always its path.
     fn fresh_tombstone_start(
         &self,
         domain: &str,
         path: &str,
+        read: &str,
     ) -> Result<Option<crate::draft_start::DraftStart>> {
         Ok(self
-            .fresh_start(domain, path)?
+            .start_from_read(domain, path, Some(read))?
             .map(|start| crate::draft_start::DraftStart {
                 from: Some(path.to_string()),
                 ..start

@@ -139,10 +139,15 @@ pub struct DomainView<'a> {
 /// can outlive its row, since a write that failed or a crash leaves one, so every
 /// write at a path with no row writes the record or clears it. That is what keeps
 /// a record left behind from ever being read as a later row's.
-pub(crate) enum StartRule {
-    /// An ordinary write. A row already held keeps the record it has, or keeps
-    /// having none. A new row gets a fresh one from the base snapshot.
+pub(crate) enum StartRule<'a> {
+    /// A write built on nothing it read. A row already held keeps the record it
+    /// has, or keeps having none. A new row gets a fresh one from the base snapshot.
     IfNew,
+    /// A write built on what the verb read under the draft lock (`None`: nothing
+    /// stood there). A held row is left as under [`StartRule::IfNew`]. A new row's
+    /// start is that text and not what the snapshot says by now, or a pull in
+    /// between would read as in step.
+    IfNewFrom(Option<&'a str>),
     /// One of the two movers: this is the record, under whatever path it names.
     /// `None` is a draft with no known start, and no record stands afterwards.
     Carried(Option<DraftStart>),
@@ -575,6 +580,21 @@ impl<'a> DomainView<'a> {
         self.put(domain_id, path, record, StartRule::IfNew).await
     }
 
+    /// [`DomainView::write`] for a verb that read the text it builds on.
+    pub(crate) async fn write_from(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        text: &str,
+        read: Option<&str>,
+    ) -> Result<Option<String>> {
+        let record = Engine::overlay_record(path, text)?;
+        self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
+            .await?;
+        self.put(domain_id, path, record, StartRule::IfNewFrom(read))
+            .await
+    }
+
     /// [`DomainView::write`] for the destination of a move: the same address
     /// check, and the record the source held instead of a fresh look at the base
     /// snapshot, so the draft goes on knowing what it started from.
@@ -626,7 +646,12 @@ impl<'a> DomainView<'a> {
     /// it goes, since no record reads as "we cannot tell" and a wrong one would
     /// read as a known start.
     fn put_start_back(&self, path: &str, start: Option<&DraftStart>) {
-        if let Err(e) = self.set_start(path, start) {
+        let restored = if self.engine.take_failed_start_restore() {
+            Err(std::io::Error::other("the armed failure of a test"))
+        } else {
+            self.set_start(path, start)
+        };
+        if let Err(e) = restored {
             tracing::error!(
                 domain = self.domain.as_str(),
                 path,
@@ -865,7 +890,7 @@ impl<'a> DomainView<'a> {
         domain_id: DomainId,
         path: &str,
         record: EngramRecord,
-        start: StartRule,
+        start: StartRule<'_>,
     ) -> Result<Option<String>> {
         let actor = self.writing_actor()?;
         let held = {
@@ -874,8 +899,14 @@ impl<'a> DomainView<'a> {
             store.overlay_entry(domain_id, actor, path).await?.is_some()
         };
         let wanted = match start {
-            StartRule::IfNew if held => return self.put_row(domain_id, path, record).await,
+            StartRule::IfNew | StartRule::IfNewFrom(_) if held => {
+                return self.put_row(domain_id, path, record).await;
+            }
             StartRule::IfNew => self.engine.fresh_start(self.domain.as_str(), path)?,
+            StartRule::IfNewFrom(read) => {
+                self.engine
+                    .start_from_read(self.domain.as_str(), path, read)?
+            }
             StartRule::Carried(start) => start.map(|start| DraftStart {
                 path: path.to_string(),
                 ..start
@@ -1101,6 +1132,9 @@ impl<'a> DomainView<'a> {
         match done {
             Ok(permalink) => {
                 store.commit().await?;
+                // Let go first: this waits for the journal's lock, which a large
+                // upload can hold, and every store user would wait with it.
+                drop(store);
                 // After the row, and it fails nothing: the row is what a draft
                 // is, a move's source half cannot be undone from an error here,
                 // and a record with no row is written over by the next row at
@@ -1548,6 +1582,9 @@ impl<'a> DomainView<'a> {
                 p.identifier, p.domain
             ))
         })?;
+        // What this verb read, before the steps below rewrite it for its new
+        // place: a first touch of the team's file starts from this.
+        let read = text.clone();
         // Where the engram would answer from once it has moved: the document
         // travels verbatim, so the address travels with it unless the
         // frontmatter never carried one and the path's own slug is it - and
@@ -1604,7 +1641,9 @@ impl<'a> DomainView<'a> {
         // already has, answering to its new name. Nothing is tombstoned and no
         // grant ends, since a grant was minted on the path and the path stays.
         if in_place {
-            let warning = self.write(src.domain_id, &src.path, &text).await?;
+            let warning = self
+                .write_from(src.domain_id, &src.path, &text, Some(&read))
+                .await?;
             let mut receipt = json!({
                 "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
                 "to": { "domain": p.domain, "permalink": dest_permalink, "path": src.path },
@@ -1667,7 +1706,7 @@ impl<'a> DomainView<'a> {
                 let base_text = self.engine.load_content(src_source, base).await?;
                 warnings.extend(
                     self.engine
-                        .write_overlay_tombstone(&p.domain, actor, base, &base_text)
+                        .write_overlay_tombstone(&p.domain, actor, base, &base_text, &read)
                         .await?,
                 );
             }

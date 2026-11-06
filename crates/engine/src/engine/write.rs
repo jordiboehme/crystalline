@@ -783,7 +783,11 @@ impl Engine {
         if let Some((_, domain_id)) = overlay_draft {
             // Checked against this caller's own view, under the draft lock:
             // their draft when they hold one, the base when they do not.
-            if let Some(expected) = p.expected_checksum.as_deref() {
+            //
+            // What is read here is also where a new draft starts from. A team
+            // file that is not text can be replaced, as `capture_landing` allows,
+            // and then she read nothing there.
+            let read = if let Some(expected) = p.expected_checksum.as_deref() {
                 let current = view.own_text_at_path(domain_id, &path).await?;
                 refuse_stale_replacement(
                     expected,
@@ -791,8 +795,21 @@ impl Engine {
                     &permalink,
                     &p.domain,
                 )?;
-            }
-            let warning = view.write(domain_id, &path, &markdown).await?;
+                current
+            } else {
+                match view.engram_text_at_path(&path).await {
+                    Ok(found) => found.map(|found| found.content),
+                    Err(EngineError::Io { source, .. })
+                        if source.kind() == std::io::ErrorKind::InvalidData =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let warning = view
+                .write_from(domain_id, &path, &markdown, read.as_deref())
+                .await?;
             receipt["draft"] = json!(true);
             // Whose draft it landed in, when that is not the caller's own, in
             // the words the joined save and the joined edit both use.
@@ -1507,7 +1524,9 @@ impl Engine {
         let (content, domain_names_normalized) = self
             .normalize_domain_spellings_for(&p.content, scope)
             .await?;
-        let warning = view.write(desc.domain_id, &desc.path, &content).await?;
+        let warning = view
+            .write_from(desc.domain_id, &desc.path, &content, Some(&current))
+            .await?;
         // Where the draft now answers, derived exactly as the row's own
         // permalink is: an author who edited the frontmatter's permalink
         // line has just moved the address, and the receipt has to say so.
@@ -1667,8 +1686,16 @@ impl Engine {
         // The third place a restore can land: in review mode the recovered
         // document is this actor's draft of the path, never a file written
         // back into what the team reviewed.
-        if overlay.is_some() {
-            let warning = view.write(domain_id, path, content).await?;
+        if let Some(who) = overlay {
+            // Under the draft's lock like every other writer of it, so a first
+            // edit and this cannot both find no row and the last record win. The
+            // room that asks for this holds its state here, as its save does,
+            // and nothing under the lock asks about a room.
+            let warning = {
+                let lock = self.draft_lock(domain, who, path)?;
+                let _guard = lock.lock().await;
+                view.write(domain_id, path, content).await?
+            };
             let permalink = parse_engram(content)
                 .map(|engram| {
                     EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink

@@ -124,9 +124,27 @@ fn read_record(file: &Path) -> io::Result<Option<DraftStart>> {
         .map_err(|e| broken(file, e))
 }
 
+/// Refuse a file standing at the actor's folder or at the records' own, which
+/// reads as "no record" to a plain open on every platform but has lost whatever
+/// records stood there, so it is a broken record and not a missing one. A file
+/// higher up is a broken journal, which holds nothing of this actor's at all and
+/// which a write only warns about.
+fn no_file_in_a_folders_place(state_dir: &Path, domain: &str, actor: &str) -> io::Result<()> {
+    for dir in [
+        actor_dir(state_dir, domain, actor)?,
+        starts_dir(state_dir, domain, actor)?,
+    ] {
+        if std::fs::metadata(&dir).is_ok_and(|found| !found.is_dir()) {
+            return Err(broken(&dir, "a file stands where the folder belongs"));
+        }
+    }
+    Ok(())
+}
+
 /// The record of one row. `Ok(None)` means no file, and only that: broken JSON,
-/// an empty file or a record that names another path is an error of kind
-/// [`io::ErrorKind::InvalidData`], and any other failed read is an error too.
+/// an empty file, a record that names another path or a file where the records'
+/// folder belongs is an error of kind [`io::ErrorKind::InvalidData`], and any other
+/// failed read is an error too.
 pub fn load(
     state_dir: &Path,
     domain: &str,
@@ -136,7 +154,8 @@ pub fn load(
     let file = record_file(state_dir, domain, actor, path)?;
     match read_record(&file)? {
         Some(record) if record.path != path => Err(broken(&file, "it names another path")),
-        record => Ok(record),
+        Some(record) => Ok(Some(record)),
+        None => no_file_in_a_folders_place(state_dir, domain, actor).map(|()| None),
     }
 }
 
@@ -198,8 +217,14 @@ pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftS
     let dir = starts_dir(state_dir, domain, actor)?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+        Err(e) => {
+            no_file_in_a_folders_place(state_dir, domain, actor)?;
+            return if no_such_file(&e) {
+                Ok(Vec::new())
+            } else {
+                Err(e)
+            };
+        }
     };
     let mut records = Vec::new();
     for entry in entries {
@@ -475,6 +500,46 @@ mod tests {
         assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
         clear(state, "team", "alice", "note.md").unwrap();
         save(state, "team", "alice", &record("note.md", "text\n")).unwrap_err();
+    }
+
+    /// A file at the records' own folder or at the actor's is a lost store of
+    /// records, not a missing record, and a caller refuses on it. Above the actor's
+    /// folder it is a broken journal, which holds nothing of this actor's.
+    #[test]
+    fn a_file_in_the_records_folders_place_is_an_error_to_load_and_all() {
+        let broken = |state: &Path| {
+            assert_eq!(
+                load(state, "team", "alice", "note.md").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                all(state, "team", "alice").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        };
+
+        let tmp = dir();
+        let starts = starts_dir(tmp.path(), "team", "alice").unwrap();
+        std::fs::create_dir_all(starts.parent().unwrap()).unwrap();
+        std::fs::write(&starts, b"not a folder").unwrap();
+        broken(tmp.path());
+
+        let tmp = dir();
+        let actor = actor_dir(tmp.path(), "team", "alice").unwrap();
+        std::fs::create_dir_all(actor.parent().unwrap()).unwrap();
+        std::fs::write(&actor, b"not a folder").unwrap();
+        broken(tmp.path());
+
+        let tmp = dir();
+        let domain = actor_dir(tmp.path(), "team", "alice")
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(domain.parent().unwrap()).unwrap();
+        std::fs::write(&domain, b"not a folder").unwrap();
+        assert_eq!(load(tmp.path(), "team", "alice", "note.md").unwrap(), None);
+        assert_eq!(all(tmp.path(), "team", "alice").unwrap(), Vec::new());
     }
 
     #[test]
