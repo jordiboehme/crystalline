@@ -696,7 +696,7 @@ impl From<EngineError> for ApiError {
         // a command line, a setting or a host goes to the log. An admin reads it on
         // the GitHub settings screen too.
         let full = e.to_string();
-        let detail = match crate::engine::plain_refusal_text(&full) {
+        let detail = match crate::engine::neutral_refusal_text(&full) {
             Some(plain) => {
                 tracing::warn!("a request was refused: {full}");
                 plain

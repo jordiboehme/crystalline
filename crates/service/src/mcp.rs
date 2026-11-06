@@ -6914,18 +6914,6 @@ fn present_names(present: &[String]) -> String {
     }
 }
 
-/// A call-time refusal: the tool ran and could not do its job because a
-/// server-side condition is off.
-///
-/// **Deliberately a tool-level error rather than a JSON-RPC one.** Every gate
-/// that stopped shaping the tool list under SEP-2567 refuses here instead, so
-/// the model that called the tool has to be able to read why: rmcp's own
-/// guidance is that "MCP clients typically render protocol errors opaquely
-/// [...] the caller will not see your message" and that `CallToolResult::error`
-/// is the right shape for a failure the caller should act on (rmcp 3.1.2
-/// `handler/server.rs:454-480`, `model.rs:3892-3913`). The message names the
-/// condition and how to change it, which is the same thing the tool's
-/// description says, exactly as SEP-2567 prescribes.
 /// A tool's answer in the words of who reads it, for every tool in one place: only
 /// an admin and the machine owner read a sentence with a command line, a setting or
 /// a host. The open tier may turn GitHub on, so it still reads how.
@@ -6974,6 +6962,18 @@ fn reader_response(
 /// The part of the rename guidance only the machine owner can use.
 const RENAME_OWNER_COMMAND: &str = " or with `crystalline doctor --fix`";
 
+/// A call-time refusal: the tool ran and could not do its job because a
+/// server-side condition is off.
+///
+/// **Deliberately a tool-level error rather than a JSON-RPC one.** Every gate
+/// that stopped shaping the tool list under SEP-2567 refuses here instead, so
+/// the model that called the tool has to be able to read why: rmcp's own
+/// guidance is that "MCP clients typically render protocol errors opaquely
+/// [...] the caller will not see your message" and that `CallToolResult::error`
+/// is the right shape for a failure the caller should act on (rmcp 3.1.2
+/// `handler/server.rs:454-480`, `model.rs:3892-3913`). The message names the
+/// condition and how to change it, which is the same thing the tool's
+/// description says, exactly as SEP-2567 prescribes.
 fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(
         message.into(),

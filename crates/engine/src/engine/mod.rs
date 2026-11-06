@@ -7579,7 +7579,7 @@ mod fence;
 mod github;
 pub use github::{
     GITHUB_OFF_PLAIN, LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK,
-    OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK, plain_refusal_text,
+    OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK, neutral_refusal_text, plain_refusal_text,
 };
 mod github_access;
 pub use github_access::{
@@ -12386,8 +12386,14 @@ mod share_actor_tests {
             ] {
                 assert!(!plain.contains(detail), "{plain}");
             }
+            // The neutral words are read by an admin too, so none says to ask one.
+            let neutral =
+                neutral_refusal_text(&text).unwrap_or_else(|| panic!("no neutral words: {text}"));
+            assert!(!neutral.contains("Ask an admin"), "{neutral}");
+            assert!(!neutral.contains("crystalline "), "{neutral}");
         }
         assert_eq!(plain_refusal_text("the domain is not there"), None);
+        assert_eq!(neutral_refusal_text("the domain is not there"), None);
     }
 
     /// With one configured, the agent writes as that account's connected

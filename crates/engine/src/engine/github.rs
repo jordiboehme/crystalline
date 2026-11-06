@@ -1753,6 +1753,33 @@ impl LinkSetupReason {
             }
         }
     }
+
+    /// The cause in plain words for a surface that words it before it knows who
+    /// asked (the JSON API): it reads true for an admin too, so it never says to ask
+    /// one. Names no command line and no setting, only where an admin can look.
+    pub fn neutral_sentence(self) -> &'static str {
+        match self {
+            LinkSetupReason::NoClientSecret => {
+                "The GitHub App on this instance has no client secret yet, so it cannot link \
+                 accounts. An admin can see what is missing in the GitHub settings or the server log."
+            }
+            LinkSetupReason::NoPublicUrl => {
+                "This instance does not know its public address yet, so GitHub cannot send you \
+                 back. An admin can see what is missing in the GitHub settings or the server log."
+            }
+            LinkSetupReason::AppUnusable => {
+                "The GitHub App on this instance is set up but cannot be used right now. An admin \
+                 can see why in the GitHub settings or the server log."
+            }
+            LinkSetupReason::Keychain => {
+                "This instance cannot read the GitHub App's stored keys right now. An admin can \
+                 see why in the GitHub settings or the server log."
+            }
+            LinkSetupReason::NoApp => {
+                "This instance has no GitHub App yet. An admin can set one up in the GitHub settings."
+            }
+        }
+    }
 }
 
 /// Why [`Engine::github_link_app_explained`] refused: the error every surface
@@ -1781,7 +1808,26 @@ pub const NO_CLIENT_SECRET_TO_LINK: &str = "the GitHub App has no client secret,
 /// machine owner. The JSON API words an error before it knows who asked, so it uses
 /// this for everybody, and logs the full text.
 pub fn plain_refusal_text(text: &str) -> Option<String> {
-    let plain = |reason: LinkSetupReason| Some(reason.plain_sentence().to_string());
+    refusal_words(text, false)
+}
+
+/// [`plain_refusal_text`] for a surface that words an error before it knows who
+/// asked (the JSON API): the sentences never say to ask an admin, so they read true
+/// for an admin too.
+pub fn neutral_refusal_text(text: &str) -> Option<String> {
+    refusal_words(text, true)
+}
+
+fn refusal_words(text: &str, neutral: bool) -> Option<String> {
+    let plain = |reason: LinkSetupReason| {
+        Some(
+            match neutral {
+                true => reason.neutral_sentence(),
+                false => reason.plain_sentence(),
+            }
+            .to_string(),
+        )
+    };
     if text.starts_with(super::github_app::KEYCHAIN_REFUSAL) {
         return plain(LinkSetupReason::Keychain);
     }
@@ -1796,12 +1842,23 @@ pub fn plain_refusal_text(text: &str) -> Option<String> {
     }
     if text.starts_with("This GitHub server does not offer") {
         return Some(
-            "This GitHub server does not offer what the GitHub App needs. Ask an admin to check it."
+            if neutral {
+                "This GitHub server does not offer what the GitHub App needs. An admin can see why in the server log."
+            } else {
+                "This GitHub server does not offer what the GitHub App needs. Ask an admin to check it."
+            }
                 .to_string(),
         );
     }
     if text == RemoteError::NotEnabled.to_string() {
-        return Some(GITHUB_OFF_PLAIN.to_string());
+        return Some(
+            if neutral {
+                GITHUB_OFF_NEUTRAL
+            } else {
+                GITHUB_OFF_PLAIN
+            }
+            .to_string(),
+        );
     }
     if text == PERSONAL_TOKEN_MISSING {
         return Some(PERSON_TOKEN_MISSING.to_string());
@@ -1810,7 +1867,11 @@ pub fn plain_refusal_text(text: &str) -> Option<String> {
         return Some(PERSON_LINK_MISSING.to_string());
     }
     if let Some(hosted) = text.strip_suffix("; move it with crystalline serve --take-over") {
-        return Some(format!("{hosted}. Ask an admin to move it."));
+        return Some(if neutral {
+            format!("{hosted}. An admin can move it, and the server log says how.")
+        } else {
+            format!("{hosted}. Ask an admin to move it.")
+        });
     }
     None
 }
@@ -1818,6 +1879,10 @@ pub fn plain_refusal_text(text: &str) -> Option<String> {
 /// What somebody who cannot turn it on reads while GitHub collaboration is off.
 pub const GITHUB_OFF_PLAIN: &str =
     "GitHub collaboration is not on for this instance. Ask an admin to turn it on.";
+
+/// [`GITHUB_OFF_PLAIN`] for a surface that does not know its caller.
+const GITHUB_OFF_NEUTRAL: &str =
+    "GitHub collaboration is not on for this instance. An admin can turn it on.";
 
 /// What a link is refused with when no GitHub App is configured.
 const NO_APP_TO_LINK: &str = "linking a GitHub account needs a GitHub App, and none is configured on this instance; an admin sets one up with: crystalline github app set";
