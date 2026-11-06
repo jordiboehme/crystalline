@@ -719,6 +719,10 @@ test("the flip back to text ends where the source and the caption put the page",
   const boxHeight = (await page.locator(".cm-diagram").boundingBox())?.height;
   if (boxHeight === undefined) throw new Error("no box");
   await sampleFrames(page, "Below marker");
+  // The caption late on purpose: mermaid's answer takes frames at this rate, so
+  // with no hold the page would move twice every time, not when it is unlucky.
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 40 });
   // A peer's edit that mermaid refuses: the last arrow has no end.
   await page.evaluate(() => {
     const content = document.querySelector(".cm-content") as unknown as {
@@ -735,6 +739,7 @@ test("the flip back to text ends where the source and the caption put the page",
   });
   await expect(page.locator(".cm-diagram")).toHaveCount(0);
   await expect(page.locator(".cm-mermaid-error")).toBeVisible();
+  await cdp.send("Emulation.setCPUThrottlingRate", { rate: 1 });
   await settle(page, 800);
   const source = await page.evaluate(() =>
     [...document.querySelectorAll(".cm-content > .cm-line")]

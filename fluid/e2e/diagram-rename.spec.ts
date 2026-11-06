@@ -360,10 +360,261 @@ test("the toolbar's flowchart opens the field on its first box, and typing goes 
   await expect(field(page)).toBeVisible();
   await expect(field(page)).toHaveValue("First step");
   await expect.poll(() => fieldIsFocused(page)).toBe(true);
-  // Twice over: the same insert when the verdict is known already.
   await page.keyboard.type("Go");
   await page.keyboard.press("Enter");
   await expect.poll(() => docText(page)).toContain("A[Go] --> B[Next step]");
   await expect(field(page)).toHaveCount(0);
   await expect(box(page).locator("g.node", { hasText: "Go" })).toBeVisible();
+});
+
+async function insertFlowchart(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Insert", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Diagram" }).click();
+  await page.getByRole("menuitem", { name: "Flowchart" }).click();
+}
+
+test("a starter by mouse on a page with a drawn fence opens the field, and every key lands", async ({
+  page,
+}) => {
+  await openEditor(page, `${DOC}\nTail\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-line", { hasText: "Tail" }).click();
+  await insertFlowchart(page);
+  await expect(field(page)).toHaveValue("First step");
+  await expect.poll(() => fieldIsFocused(page)).toBe(true);
+  await page.waitForTimeout(800);
+  await page.keyboard.type("Typed");
+  await expect(field(page)).toHaveValue("Typed");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => docText(page)).toContain("A[Typed] --> B[Next step]");
+
+  // A second one, with its verdict known by now.
+  await page.keyboard.press("Escape");
+  await page.locator(".cm-line", { hasText: "Tail" }).click();
+  await insertFlowchart(page);
+  await expect(field(page)).toHaveValue("First step");
+  await expect.poll(() => fieldIsFocused(page)).toBe(true);
+  await page.keyboard.type("Again");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => docText(page)).toContain("A[Again] --> B[Next step]");
+});
+
+async function savedContent(page: Page): Promise<string> {
+  const response = await page.request.get(
+    `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams/${made.at(-1) ?? ""}`,
+  );
+  return ((await response.json()) as { content: string }).content;
+}
+
+/** A press and a release with nothing between them, on what is at `locator`. */
+async function zeroClick(page: Page, name: string): Promise<void> {
+  const where = await page
+    .getByRole("link", { name, exact: true })
+    .boundingBox();
+  if (where === null) throw new Error(`no ${name}`);
+  await page.mouse.move(where.x + where.width / 2, where.y + where.height / 2);
+  await page.evaluate(() => undefined);
+  await Promise.all([page.mouse.down(), page.mouse.up()]);
+}
+
+test("Done at 0 ms writes a good draft before the page goes", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Quick");
+  await zeroClick(page, "Done");
+  await expect(page.locator(".cm-content")).toHaveCount(0);
+  await expect.poll(() => savedContent(page)).toContain("B[Quick]");
+});
+
+test("Back writes a good draft before the page goes", async ({ page }) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Backed");
+  await page.goBack();
+  await expect(page.locator(".cm-content")).toHaveCount(0);
+  await expect.poll(() => savedContent(page)).toContain("B[Backed]");
+});
+
+test("a refused draft stays on the page through Done and Back, and the page stays usable", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  const editing = page.url();
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  await zeroClick(page, "Done");
+  const status = box(page).locator(".cm-diagram-notice");
+  await expect(status).toContainText("Escape");
+  await expect(field(page)).toHaveValue("a %%{ b");
+  await expect(field(page)).toHaveAttribute("aria-invalid", "true");
+  expect(page.url()).toBe(editing);
+
+  await page.goBack();
+  await expect(field(page)).toHaveValue("a %%{ b");
+  await expect.poll(() => page.url()).toBe(editing);
+  await expect(field(page)).toHaveValue("a %%{ b");
+
+  // The sentence outlasts any timer.
+  await page.waitForTimeout(4_500);
+  await expect(status).toContainText("Escape");
+
+  // Nothing holds the keyboard: the text takes the click and the letters.
+  await page.locator(".cm-line", { hasText: "Below marker" }).click();
+  await page.keyboard.press("End");
+  await page.keyboard.type("!");
+  expect(await fieldIsFocused(page)).toBe(false);
+  await expect.poll(() => docText(page)).toContain("Below marker!");
+  await expect(field(page)).toHaveValue("a %%{ b");
+
+  // Back in the field, Escape drops it, and Done then goes.
+  await field(page).click();
+  await page.keyboard.press("Escape");
+  await expect(field(page)).toHaveCount(0);
+  await page.getByRole("link", { name: "Done", exact: true }).click();
+  await expect(page.locator(".cm-content")).toHaveCount(0);
+});
+
+test("Tab after a refused name goes on, and the field does not take it back", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  await page.keyboard.press("Tab");
+  await expect(box(page).locator(".cm-diagram-notice")).toContainText("Escape");
+  expect(await fieldIsFocused(page)).toBe(false);
+  await page.keyboard.press("Tab");
+  expect(await fieldIsFocused(page)).toBe(false);
+  await page.keyboard.press("Shift+Tab");
+  await page.keyboard.press("Shift+Tab");
+  await page.waitForTimeout(100);
+  await expect(field(page)).toHaveValue("a %%{ b");
+});
+
+test("leaving the page asks while a draft is unsaved", async ({ page }) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Unsaved");
+  const asked: string[] = [];
+  page.on("dialog", (dialog) => {
+    asked.push(dialog.type());
+    void dialog.dismiss();
+  });
+  await page.reload({ timeout: 2_000 }).catch(() => undefined);
+  expect(asked).toEqual(["beforeunload"]);
+  await expect(field(page)).toHaveValue("Unsaved");
+});
+
+test("Raw with a refused name: a line says so, and the field is back when Raw goes off", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  const raw = page.getByRole("button", { name: "Raw", exact: true });
+  await raw.click();
+  await expect(box(page)).toHaveCount(0);
+  const note = page.locator(".cm-diagram-raw-note");
+  await expect(note).toContainText("a %%{ b");
+  await raw.click();
+  await expect(field(page)).toHaveValue("a %%{ b");
+  await expect(note).toHaveCount(0);
+  await expect(box(page).locator(".cm-diagram-notice")).toContainText("Escape");
+  await page.keyboard.press("Escape");
+  await expect(field(page)).toHaveCount(0);
+  expect(await docText(page)).toContain("B[Second]");
+});
+
+test("Shift+Tab from a good draft leaves the focus on the stop, through the redraw", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Good");
+  await page.keyboard.press("Shift+Tab");
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.activeElement?.getAttribute("aria-label")),
+    )
+    .toBe("Box: Good");
+  await page.keyboard.press("ArrowLeft");
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.activeElement?.getAttribute("aria-label")),
+    )
+    .toBe("Box: First");
+});
+
+const FILLER = Array.from(
+  { length: 300 },
+  (_, i) => `Filler line ${String(i)}`,
+).join("\n\n");
+
+test("a letter typed with the box scrolled away brings it back and goes in", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n\n${FENCE}\n\n${FILLER}\n`);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Dra");
+  const content = await page.locator(".cm-content").boundingBox();
+  await page.mouse.move((content?.x ?? 0) + 100, 400);
+  await page.mouse.wheel(0, 100_000);
+  await expect(box(page)).toHaveCount(0);
+  // Chromium animates a wheel step: past that, so nothing scrolls the page away.
+  await page.waitForTimeout(600);
+  await page.keyboard.type("ft");
+  await expect(field(page)).toBeVisible();
+  await expect(field(page)).toHaveValue("Draft");
+  expect(await fieldIsFocused(page)).toBe(true);
+  await expect(field(page)).toBeInViewport();
+});
+
+test("a composition keeps the page where it is, and its letter is whole", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n\n${FENCE}\n\n${FILLER}\n`);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Dr");
+  await markField(page);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.imeSetComposition", {
+    text: "ㄱ",
+    selectionStart: 1,
+    selectionEnd: 1,
+  });
+  const content = await page.locator(".cm-content").boundingBox();
+  await page.mouse.move((content?.x ?? 0) + 100, 400);
+  await page.mouse.wheel(0, 100_000);
+  await page.waitForTimeout(400);
+  await expect(box(page)).toHaveCount(1);
+  expect(await fieldIsMarked(page)).toBe(true);
+  expect(await fieldIsFocused(page)).toBe(true);
+  await cdp.send("Input.imeSetComposition", {
+    text: "가",
+    selectionStart: 1,
+    selectionEnd: 1,
+  });
+  await cdp.send("Input.insertText", { text: "가" });
+  await expect(field(page)).toHaveValue("Dr가");
+});
+
+test("the field keeps its text in the middle of a tall box", async ({
+  page,
+}) => {
+  await openEditor(
+    page,
+    "Above\n\n```mermaid\nflowchart TD\n  A[First] --> B{Second}\n```\n\nBelow\n",
+  );
+  const node = box(page).locator("g.node", { hasText: "Second" });
+  await expect(node).toBeVisible();
+  const shape = await node.boundingBox();
+  await node.click();
+  const place = await field(page).boundingBox();
+  if (shape === null || place === null) throw new Error("no box");
+  expect(place.height).toBeLessThan(shape.height / 2);
+  expect(
+    Math.abs(place.y + place.height / 2 - (shape.y + shape.height / 2)),
+  ).toBeLessThanOrEqual(2);
 });

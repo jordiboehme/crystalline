@@ -120,6 +120,11 @@ function insertAt(peer: EditorView, at: number, insert: string) {
 const notice = (view: EditorView) =>
   view.dom.querySelector(".cm-diagram-notice")?.textContent;
 
+const peerRenamesAgain = (peer: EditorView, was: string, label: string) => {
+  const at = bytes(peer.state).indexOf(was);
+  peer.dispatch({ changes: { from: at, to: at + was.length, insert: label } });
+};
+
 const peerRenamesB = (peer: EditorView, label: string) => {
   const at = bytes(peer.state).indexOf("Next step");
   peer.dispatch({ changes: { from: at, to: at + 9, insert: label } });
@@ -262,6 +267,115 @@ describe("the field with a peer in the room", () => {
     expect(bytes(view.state)).not.toContain("Don");
   });
 
+  it("writes a typed old name back over a peer's rename (M1)", async () => {
+    const { local, peer, sync } = await room();
+    const field = openOn(local, "B", "Zed");
+    type(field, "Next step");
+    peerRenamesB(peer, "Peer name");
+    sync();
+    await flush();
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(noField(local)).toBe(true);
+    });
+    expect(bytes(local.state)).toContain("B[Next step]");
+    expect(bytes(local.state)).not.toContain("Peer name");
+  });
+
+  it("follows the fence through a line above it, then a broken line stays held", async () => {
+    const { local, peer, sync } = await room();
+    const field = openOn(local, "B", "Don");
+    insertAt(peer, 0, "New top\n\n");
+    sync();
+    await flush();
+    const at = bytes(peer.state).indexOf("    A[First");
+    insertAt(peer, at, "    C -->\n");
+    sync();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fieldOf(local)).toBe(field);
+    expect(local.dom.querySelector(".cm-diagram")).not.toBeNull();
+  });
+
+  it("keeps the selection on all of a peer's new name, and not on part of it", async () => {
+    const { local, peer, sync } = await room();
+    nodeOf(local, "B").dispatchEvent(
+      new MouseEvent("click", { bubbles: true }),
+    );
+    const field = fieldOf(local);
+    peerRenamesB(peer, "Peer name");
+    sync();
+    await vi.waitFor(() => {
+      expect(field.value).toBe("Peer name");
+    });
+    expect([field.selectionStart, field.selectionEnd]).toEqual([0, 9]);
+    field.setSelectionRange(1, 1);
+    peerRenamesAgain(peer, "Peer name", "Other");
+    sync();
+    await vi.waitFor(() => {
+      expect(field.value).toBe("Other");
+    });
+    expect(field.selectionStart).not.toBe(0);
+  });
+
+  it("puts the focus on the canvas when the box goes under it, not anywhere else", async () => {
+    const { local, peer, sync } = await room();
+    openOn(local, "B", "Don");
+    const other = document.createElement("input");
+    document.body.append(other);
+    const start = bytes(peer.state).indexOf(" --> B[Next step]");
+    peer.dispatch({
+      changes: { from: start, to: start + " --> B[Next step]".length },
+    });
+    sync();
+    await vi.waitFor(() => {
+      expect(noField(local)).toBe(true);
+    });
+    expect(document.activeElement).toBe(local.dom.querySelector(".cm-diagram"));
+  });
+
+  it("leaves the focus where it went when the box goes after a blur's refusal", async () => {
+    const { local, peer, sync } = await room();
+    const field = openOn(local, "B", "a %%{ b");
+    const other = document.createElement("input");
+    document.body.append(other);
+    other.focus();
+    await vi.waitFor(() => {
+      expect(notice(local)).toContain(NOTICES.invalid);
+    });
+    expect(fieldOf(local)).toBe(field);
+    const start = bytes(peer.state).indexOf(" --> B[Next step]");
+    peer.dispatch({
+      changes: { from: start, to: start + " --> B[Next step]".length },
+    });
+    sync();
+    await vi.waitFor(() => {
+      expect(noField(local)).toBe(true);
+    });
+    expect(document.activeElement).toBe(other);
+  });
+
+  it("draws the new body when one edit takes in the first mark and the body", async () => {
+    const { local, peer, sync } = await room();
+    const field = openOn(local, "B", "Don");
+    const box = local.dom.querySelector(".cm-diagram");
+    peer.dispatch({
+      changes: [
+        { from: FENCE_AT, insert: "peer line\n\n" },
+        { from: LINE_B, insert: "    D[Fourth]\n" },
+      ],
+    });
+    sync();
+    await vi.waitFor(() => {
+      expect(
+        local.dom.querySelector('g.node[id*="flowchart-D-"]'),
+      ).not.toBeNull();
+    });
+    expect(local.dom.querySelector(".cm-diagram")).toBe(box);
+    expect(fieldOf(local)).toBe(field);
+    expect(document.activeElement).toBe(field);
+  });
+
   it("waits with the close until a composition has ended", async () => {
     const { local, peer, sync } = await room();
     const field = openOn(local, "B", "");
@@ -353,7 +467,7 @@ describe("the field with a peer in the room", () => {
     expect(local.dom.querySelector(".cm-diagram")).not.toBeNull();
     press(field, "Enter");
     await vi.waitFor(() => {
-      expect(notice(local)).toBe(NOTICES.stale);
+      expect(notice(local)).toContain(NOTICES.stale);
     });
     expect(fieldOf(local)).toBe(field);
     expect(bytes(local.state)).not.toContain("Don");
@@ -384,5 +498,168 @@ describe("the field with a peer in the room", () => {
       expect(local.dom.querySelector(".cm-diagram")).toBeNull();
     });
     expect(noField(local)).toBe(true);
+  });
+});
+
+describe("an arrow held through a peer's duplicates (C1, R94)", () => {
+  const body = (...lines: string[]) =>
+    `Top\n\n\`\`\`mermaid\nflowchart TD\n${lines.map((l) => `    ${l}`).join("\n")}\n\`\`\`\n\nEnd\n`;
+
+  async function roomOf(...lines: string[]) {
+    const doc = body(...lines);
+    const peers = markPeers(doc, modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(
+        peers.local.dom.querySelectorAll('.cm-diagram svg path[data-et="edge"]')
+          .length,
+      ).toBeGreaterThan(0);
+    });
+    await flush();
+    return { ...peers, doc };
+  }
+
+  function openArrow(view: EditorView, at: number) {
+    view.dom
+      .querySelectorAll('path[data-et="edge"]')
+      [at]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    return fieldOf(view);
+  }
+
+  const atLine = (peer: EditorView, line: string) =>
+    bytes(peer.state).indexOf(line);
+  const delLine = (peer: EditorView, line: string) => {
+    const at = atLine(peer, line);
+    peer.dispatch({ changes: { from: at, to: at + line.length } });
+  };
+
+  async function enter(view: EditorView, field: HTMLTextAreaElement) {
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(noField(view)).toBe(true);
+    });
+  }
+
+  it("a duplicate added above: the label lands on the person's arrow", async () => {
+    const { local, peer, sync } = await roomOf("A -->|mine| B");
+    const field = openArrow(local, 0);
+    type(field, "renamed");
+    insertAt(peer, atLine(peer, "    A -->|mine|"), "    A -->|peers| B\n");
+    sync();
+    await flush();
+    await enter(local, field);
+    expect(bytes(local.state)).toBe(body("A -->|peers| B", "A -->|renamed| B"));
+  });
+
+  it("the same with the peer's line landing during the verify", async () => {
+    const { local, peer, sync } = await roomOf("A -->|mine| B");
+    const field = openArrow(local, 0);
+    type(field, "renamed");
+    press(field, "Enter");
+    insertAt(peer, atLine(peer, "    A -->|mine|"), "    A -->|peers| B\n");
+    sync();
+    await vi.waitFor(() => {
+      expect(noField(local)).toBe(true);
+    });
+    expect(bytes(local.state)).toBe(body("A -->|peers| B", "A -->|renamed| B"));
+  });
+
+  it("an earlier duplicate deleted: the third is not overwritten", async () => {
+    const { local, peer, sync } = await roomOf(
+      "A -->|one| B",
+      "A -->|two| B",
+      "A -->|three| B",
+    );
+    const field = openArrow(local, 1);
+    expect(field.value).toBe("two");
+    type(field, "renamed");
+    delLine(peer, "    A -->|one| B\n");
+    sync();
+    await flush();
+    await enter(local, field);
+    expect(bytes(local.state)).toBe(body("A -->|renamed| B", "A -->|three| B"));
+  });
+
+  it("an earlier duplicate deleted: no false gone, the draft stays", async () => {
+    const { local, peer, sync } = await roomOf("A -->|one| B", "A -->|two| B");
+    const field = openArrow(local, 1);
+    type(field, "renamed");
+    delLine(peer, "    A -->|one| B\n");
+    sync();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fieldOf(local)).toBe(field);
+    expect(field.value).toBe("renamed");
+    await enter(local, field);
+    expect(bytes(local.state)).toBe(body("A -->|renamed| B"));
+  });
+
+  it("a field nobody typed in keeps showing its own arrow's label", async () => {
+    const { local, peer, sync } = await roomOf("A -->|mine| B");
+    const field = openArrow(local, 0);
+    insertAt(peer, atLine(peer, "    A -->|mine|"), "    A -->|peers| B\n");
+    sync();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(field.value).toBe("mine");
+  });
+
+  it("a peer's new label on that very arrow shows in a field nobody typed in", async () => {
+    const { local, peer, sync } = await roomOf("A -->|mine| B");
+    const field = openArrow(local, 0);
+    const at = atLine(peer, "mine");
+    peer.dispatch({ changes: { from: at, to: at + 4, insert: "theirs" } });
+    sync();
+    await vi.waitFor(() => {
+      expect(field.value).toBe("theirs");
+    });
+  });
+
+  it("answers stale, with no bytes, when its arrow was rewritten among duplicates", async () => {
+    const { local, peer, sync } = await roomOf("A -->|one| B", "A -->|two| B");
+    const field = openArrow(local, 1);
+    type(field, "renamed");
+    const line = "    A -->|two| B";
+    const at = atLine(peer, line);
+    peer.dispatch({
+      changes: { from: at, to: at + line.length, insert: "    A -.->|re| B" },
+    });
+    sync();
+    await flush();
+    const before = bytes(local.state);
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(notice(local)).toContain(NOTICES.stale);
+    });
+    expect(bytes(local.state)).toBe(before);
+    expect(fieldOf(local)).toBe(field);
+  });
+
+  it("takes the one arrow left of that pair when its own was rewritten", async () => {
+    const { local, peer, sync } = await roomOf("A -->|one| B");
+    const field = openArrow(local, 0);
+    type(field, "renamed");
+    const line = "    A -->|one| B";
+    const at = atLine(peer, line);
+    peer.dispatch({
+      changes: { from: at, to: at + line.length, insert: "    A -.->|re| B" },
+    });
+    sync();
+    await flush();
+    await enter(local, field);
+    expect(bytes(local.state)).toContain("A -.->|renamed| B");
+  });
+
+  it("closes as gone when a peer deletes the arrow, with its boxes left", async () => {
+    const { local, peer, sync } = await roomOf("A --> B", "A --> C");
+    openArrow(local, 0);
+    type(fieldOf(local), "renamed");
+    delLine(peer, "    A --> B\n");
+    sync();
+    await vi.waitFor(() => {
+      expect(noField(local)).toBe(true);
+    });
+    expect(notice(local)).toBe(NOTICES.gone);
+    expect(bytes(local.state)).not.toContain("renamed");
   });
 });

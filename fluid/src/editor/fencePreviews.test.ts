@@ -911,6 +911,29 @@ describe("the flip back from a drawn diagram", () => {
     view.destroy();
   });
 
+  it("gives a held height back when the drawing lands", async () => {
+    let draw: (result: { svg: string }) => void = () => undefined;
+    vi.mocked(mermaid.render).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          draw = resolve as typeof draw;
+        }),
+    );
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  S --> T\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    });
+    holdPreviewHeight(box, 120);
+    draw({ svg: "<svg></svg>" });
+    await vi.waitFor(() => {
+      expect(box.querySelector("svg")).not.toBeNull();
+    });
+    expect(box.style.minHeight).toBe("");
+    view.destroy();
+  });
+
   it("holds nothing for a preview that has drawn", async () => {
     const view = editor(`\`\`\`mermaid\nflowchart TD\n  Q --> R\n\`\`\`\n`);
     const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");

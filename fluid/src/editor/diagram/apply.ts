@@ -18,7 +18,8 @@
  * called inside an update.
  */
 
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, language, syntaxTree } from "@codemirror/language";
+import type { Parser } from "@lezer/common";
 import type { EditorState, Line } from "@codemirror/state";
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -66,6 +67,21 @@ const PARSE_MS = 500;
 
 let lastTicket = 0;
 
+/** A ticket of `diagramAnchors` no op holds, for a place held across several ops. */
+export function nextAnchorTicket(): number {
+  lastTicket += 1;
+  return lastTicket;
+}
+
+/**
+ * An op worked out again on each read of the fence, for one that names a part by
+ * something the text can move, as an arrow's occurrence (R94).
+ */
+export type OpResolver<M, O> = (
+  model: M,
+  bodyFrom: number,
+) => O | { refused: RefusalCode };
+
 const refusal = (refused: RefusalCode) =>
   ({ applied: false, refused }) as const;
 const NOOP = { applied: false, noop: true } as const;
@@ -100,14 +116,26 @@ function readFence(view: EditorView, pos: number): MermaidFence | null {
 /** The compiler's answer for `body`; a compiler that throws has made no edit. */
 function compiled<M, O, Created>(
   kind: DiagramKindOps<M, O, Created>,
-  body: string,
-  op: O,
+  fence: MermaidFence,
+  op: O | OpResolver<M, O>,
 ): OpResult<Created> {
   try {
-    const model = kind.parse(body);
-    return model.understood
-      ? kind.compile(model, op)
-      : { refused: "unsupported" };
+    const model = kind.parse(fence.body);
+    if (!model.understood) {
+      return { refused: "unsupported" };
+    }
+    const resolved =
+      typeof op === "function"
+        ? (op as OpResolver<M, O>)(model, fence.bodyFrom)
+        : op;
+    if (
+      typeof resolved === "object" &&
+      resolved !== null &&
+      "refused" in resolved
+    ) {
+      return resolved;
+    }
+    return kind.compile(model, resolved);
   } catch {
     return { refused: "invalid" };
   }
@@ -177,8 +205,9 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
     // A plain line below takes the caret. Any other block below starts with a mark
     // a letter would break, so the fence's line stays, empty, and what is typed
     // next has a line of its own (R83).
+    const above = first.number > 1 ? doc.line(first.number - 1) : null;
     const to =
-      below === null || !plainLine(state, below) ? last.to : below.from;
+      below === null || !plainLine(state, below, above) ? last.to : below.from;
     dispatchIsolated(view, {
       changes: { from, to },
       selection: EditorSelection.cursor(from),
@@ -199,18 +228,41 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
 }
 
 /**
- * Whether a letter at the start of `line` is only a letter: blank, or a paragraph.
- * Not a paragraph of `===` or `--`: moved up under a line of text it would make
- * that line a heading, with no byte of it changed.
+ * Whether a letter at the start of `line` is only a letter: blank, or a paragraph
+ * that does not change the text above when it moves up under it. A paragraph's
+ * `===`, `--` or `---|---` under a line of text would make that line a heading or
+ * a table, with no byte of it changed, so the parser is asked rather than a list
+ * of such lines kept.
  */
-function plainLine(state: EditorState, line: Line): boolean {
+function plainLine(
+  state: EditorState,
+  line: Line,
+  above: Line | null,
+): boolean {
   if (line.text.trim() === "") {
     return true;
   }
+  if (
+    /^\s*\$\$/.test(line.text) ||
+    syntaxTree(state).topNode.childAfter(line.from)?.name !== "Paragraph"
+  ) {
+    return false;
+  }
+  if (above === null) {
+    return true;
+  }
+  const parser = state.facet(language)?.parser;
+  if (parser === undefined || !paragraphAt(parser, above.text)) {
+    return true;
+  }
+  return paragraphAt(parser, `${above.text}\n${line.text}`);
+}
+
+/** Whether `text`, read alone, is one paragraph. */
+function paragraphAt(parser: Parser, text: string): boolean {
+  const top = parser.parse(text).topNode;
   return (
-    !/^\s*\$\$/.test(line.text) &&
-    !/^ {0,3}(?:=+|-+)[ \t]*$/.test(line.text) &&
-    syntaxTree(state).topNode.childAfter(line.from)?.name === "Paragraph"
+    top.firstChild?.name === "Paragraph" && top.firstChild.nextSibling === null
   );
 }
 
@@ -226,7 +278,7 @@ export async function runDiagramOp<M, O, Created>(
   view: EditorView,
   anchor: number,
   kind: DiagramKindOps<M, O, Created>,
-  op: O,
+  op: O | OpResolver<M, O>,
 ): Promise<ApplyOutcome<Created>> {
   if (!writable(view)) {
     return NOOP;
@@ -252,7 +304,7 @@ export async function runDiagramOp<M, O, Created>(
       effects: trackAnchor.of({ ticket, pos: fence.bodyFrom }),
     });
     for (let pass = 0; pass < 2; pass++) {
-      const result = compiled(kind, fence.body, op);
+      const result = compiled(kind, fence, op);
       if ("refused" in result) {
         return refusal(result.refused);
       }

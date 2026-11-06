@@ -65,6 +65,10 @@ export interface DiagramHost {
   overlay: HTMLElement;
   /** Says a refusal in the status line, for `NOTICE_MS`. */
   notice(code: RefusalCode): void;
+  /** Keeps a sentence in the status line until the next one, or null to empty it. */
+  holdNotice(text: string | null): void;
+  /** The status line's id, for a field's `aria-describedby`. */
+  statusId: string;
   /** The body of the SVG on screen; empty before the first one landed. */
   renderedBody(): string;
   /** Whether the page takes writes: menus, rename, connect and delete ask this. */
@@ -116,6 +120,7 @@ const boxes = new WeakMap<HTMLElement, Box>();
 const boxesByKey = new WeakMap<EditorView, Map<number, Box>>();
 
 let renders = 0;
+let statuses = 0;
 let renderer: Promise<
   [typeof import("mermaid"), typeof import("../../theme/mermaidText")]
 > | null = null;
@@ -421,6 +426,8 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
   overlay.className = "cm-diagram-overlay";
   const status = document.createElement("div");
   status.className = "cm-diagram-notice";
+  statuses += 1;
+  status.id = `cm-notice-${String(statuses)}`;
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
   dom.append(drawing, overlay, status);
@@ -451,6 +458,14 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
       notice: (code) => {
         notice(box, code);
       },
+      holdNotice: (text) => {
+        if (box.noticeTimer !== null) {
+          clearTimeout(box.noticeTimer);
+          box.noticeTimer = null;
+        }
+        status.textContent = text ?? "";
+      },
+      statusId: status.id,
       renderedBody: () => box.shownBody,
       writable: () => writable(view.state),
     },
@@ -505,6 +520,9 @@ export class DiagramWidget extends WidgetType {
   }
 
   override toDOM(view: EditorView): HTMLElement {
+    // Rests on CodeMirror's sync moving no node that stays in order. An upgrade that
+    // re-inserts one cuts a field's focus and composition; `widget.test.ts`'s "keeps
+    // the box element" and the composition journey in `diagram-rename.spec.ts` go red.
     const standing = boxesByKey.get(view)?.get(this.key);
     if (standing !== undefined && !standing.dead) {
       standing.claims += 1;

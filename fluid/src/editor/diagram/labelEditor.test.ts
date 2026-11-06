@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EditorState } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 
 import { cellMarksMode } from "../../test/cellMarksMode";
 import type { MarkViewOptions } from "../../test/markKit";
@@ -28,6 +28,7 @@ import { NOTICES } from "./edits";
 import { flowKind, runDiagramOp } from "./apply";
 import { parseFlowchart } from "./flowchart/parse";
 import { focusTarget } from "./focus";
+import { diagramField, pointerDown, showFenceSource } from "./field";
 import { diagramIntent } from "./intent";
 import {
   addWithName,
@@ -37,7 +38,7 @@ import {
 } from "./labelEditor";
 import { prefetchDiagrams } from "./loader";
 import { requestVerdict } from "./verdict";
-import { forgetDrawings } from "./widget";
+import { forgetDrawings, NOTICE_MS } from "./widget";
 
 vi.mock("mermaid", async (original) => {
   const real = (await original<{ default: object }>()).default;
@@ -75,6 +76,9 @@ const withB = (label: string) =>
   `Above\n${fence(`flowchart TD\n    A[First step] --> B[${label}]`)}\nBelow\n`;
 
 const NODE_B = { kind: "node", id: "B" } as const;
+
+const noticeOf = (view: EditorView) =>
+  view.dom.querySelector(".cm-diagram-notice")?.textContent ?? "";
 
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -471,9 +475,7 @@ describe.each<[string, MarkViewOptions]>([
     type(field, "a %%{ b");
     press(field, "Enter");
     await vi.waitFor(() => {
-      expect(view.dom.querySelector(".cm-diagram-notice")?.textContent).toBe(
-        NOTICES.invalid,
-      );
+      expect(noticeOf(view)).toContain(NOTICES.invalid);
     });
     expect(fieldOf(view)).toBe(field);
     expect(field.value).toBe("a %%{ b");
@@ -484,19 +486,17 @@ describe.each<[string, MarkViewOptions]>([
     expect(text(view)).toBe(DOC);
   });
 
-  it("keeps a refused blur's draft and takes the focus back from the text", async () => {
+  it("keeps a refused blur's draft, and the person stays in the text", async () => {
     const view = await open();
     clickNode(view, "B");
     const field = fieldOf(view);
     type(field, "a %%{ b");
     view.contentDOM.focus();
     await vi.waitFor(() => {
-      expect(view.dom.querySelector(".cm-diagram-notice")?.textContent).toBe(
-        NOTICES.invalid,
-      );
+      expect(noticeOf(view)).toContain(NOTICES.invalid);
     });
     expect(fieldOf(view)).toBe(field);
-    expect(active()).toBe(field);
+    expect(active()).toBe(view.contentDOM);
     expect(text(view)).toBe(DOC);
   });
 
@@ -686,5 +686,461 @@ describe("the field in a CRLF document", () => {
     expect(text(view)).toBe(doc.replace("Next step", "a<br>b"));
     undoOnce(view);
     expect(text(view)).toBe(doc);
+  });
+});
+
+/** Runs CodeMirror's pending measure now, as a frame would. */
+function measured(view: EditorView): void {
+  (view as unknown as { measure(): void }).measure();
+}
+
+const panelOf = (view: EditorView) =>
+  view.dom.querySelector(".cm-diagram-refusal")?.textContent ?? "";
+
+describe("a starter on a page that has the chunk (C2)", () => {
+  const starter = () => {
+    const found = MERMAID_STARTER_GROUPS[0]?.starters[0];
+    if (found === undefined) throw new Error("no starter");
+    return mermaidFence(found);
+  };
+
+  it("opens the field under a running pointer hold, as after a menu's mouse up", async () => {
+    const view = await drawn(`${DOC}Tail\n`);
+    view.dispatch({ effects: pointerDown.of(true) });
+    setCaret(view, view.state.doc.length - 1);
+    const { lines, select } = starter();
+    insertBlock(view, lines, select);
+    await vi.waitFor(() => {
+      expect(noField(view)).toBe(false);
+    });
+    const field = fieldOf(view);
+    expect(field.value).toBe("First step");
+    expect(active()).toBe(field);
+  });
+
+  it("opens a second starter on the same page", async () => {
+    const view = markView("Intro\n", modeOptions());
+    await prefetchDiagrams();
+    view.contentDOM.focus();
+    setCaret(view, 5);
+    const { lines, select } = starter();
+    insertBlock(view, lines, select);
+    await vi.waitFor(() => {
+      expect(noField(view)).toBe(false);
+    });
+    press(fieldOf(view), "Escape");
+    await closed(view);
+    setCaret(view, view.state.doc.length);
+    view.contentDOM.focus();
+    view.dispatch({ effects: pointerDown.of(true) });
+    insertBlock(view, lines, select);
+    await vi.waitFor(() => {
+      expect(noField(view)).toBe(false);
+    });
+    expect(view.state.facet(drawnFenceLines)).toHaveLength(2);
+  });
+
+  it("does not open a field on a fence that is not drawn: no record, and it says so", async () => {
+    const doc = `Above\n${fence(BODY)}\nBelow\n`;
+    const view = await drawn(doc);
+    setCaret(view, doc.indexOf("Next"), "select");
+    view.dispatch({ effects: showFenceSource.of(FROM) });
+    view.contentDOM.focus();
+    await flush();
+    expect(view.state.facet(drawnFenceLines)).toHaveLength(0);
+    openLabelEditor(view, FROM, NODE_B, { selectAll: true });
+    expect(noField(view)).toBe(true);
+    expect(view.state.field(diagramIntent)).toBeNull();
+    expect(view.state.field(diagramField).kept).toBeNull();
+    await vi.waitFor(() => {
+      expect(panelOf(view)).toBe(NOTICES.stale);
+    });
+    typeText(view, "x");
+    expect(text(view)).not.toBe(doc);
+  });
+});
+
+describe("leaving with a field open (C3, R95)", () => {
+  function linkOnPage(onClick: () => void): HTMLElement {
+    const link = document.createElement("a");
+    link.href = "#elsewhere";
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      onClick();
+    });
+    document.body.append(link);
+    return link;
+  }
+
+  function click(el: Element, options: MouseEventInit = {}): void {
+    el.dispatchEvent(
+      new MouseEvent("click", { bubbles: true, cancelable: true, ...options }),
+    );
+  }
+
+  it("holds a link at 0 ms until the draft is written, then lets it go once", async () => {
+    const view = await drawn();
+    const went = vi.fn();
+    const link = linkOnPage(() => {
+      expect(text(view)).toBe(withB("Done"));
+      went();
+    });
+    clickNode(view, "B");
+    type(fieldOf(view), "Done");
+    click(link);
+    expect(went).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(went).toHaveBeenCalledTimes(1);
+    });
+    expect(noField(view)).toBe(true);
+  });
+
+  it("holds a marked Done button the same way", async () => {
+    const view = await drawn();
+    const went = vi.fn();
+    const done = document.createElement("button");
+    done.setAttribute("data-leaves-editor", "");
+    done.addEventListener("click", went);
+    document.body.append(done);
+    clickNode(view, "B");
+    type(fieldOf(view), "Done");
+    click(done);
+    expect(went).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(went).toHaveBeenCalledTimes(1);
+    });
+    expect(text(view)).toBe(withB("Done"));
+  });
+
+  it("keeps a refused draft on the page, with the sentence, and the link does not go", async () => {
+    const view = await drawn();
+    const went = vi.fn();
+    const link = linkOnPage(went);
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "a %%{ b");
+    click(link);
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toContain(NOTICES.invalid);
+    });
+    await flush();
+    expect(went).not.toHaveBeenCalled();
+    expect(fieldOf(view)).toBe(field);
+    expect(field.value).toBe("a %%{ b");
+    expect(field.getAttribute("aria-invalid")).toBe("true");
+  });
+
+  it("lets a link go at once with nothing typed, and a click that opens a new tab", async () => {
+    const view = await drawn();
+    const went = vi.fn();
+    const link = linkOnPage(went);
+    clickNode(view, "B");
+    click(link);
+    expect(went).toHaveBeenCalledTimes(1);
+    type(fieldOf(view), "Done");
+    click(link, { metaKey: true });
+    expect(went).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves other buttons alone while nothing is being checked", async () => {
+    const view = await drawn();
+    const pressed = vi.fn();
+    const other = document.createElement("button");
+    other.addEventListener("click", pressed);
+    document.body.append(other);
+    clickNode(view, "B");
+    type(fieldOf(view), "Dra");
+    click(other);
+    expect(pressed).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks before the page goes while a draft is unsaved, and not otherwise", async () => {
+    const view = await drawn();
+    const ask = () => {
+      const event = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    expect(ask()).toBe(false);
+    clickNode(view, "B");
+    expect(ask()).toBe(false);
+    type(fieldOf(view), "Done");
+    expect(ask()).toBe(true);
+    press(fieldOf(view), "Escape");
+    await closed(view);
+    expect(ask()).toBe(false);
+  });
+
+  it("holds Back until the draft is written, then the router hears it", async () => {
+    const router = vi.fn();
+    window.addEventListener("popstate", router);
+    try {
+      const view = await drawn();
+      clickNode(view, "B");
+      type(fieldOf(view), "Done");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      expect(router).not.toHaveBeenCalled();
+      await vi.waitFor(() => {
+        expect(router).toHaveBeenCalledTimes(1);
+      });
+      expect(text(view)).toBe(withB("Done"));
+    } finally {
+      window.removeEventListener("popstate", router);
+    }
+  });
+
+  it("undoes Back for a refused draft, and the router never hears it", async () => {
+    const router = vi.fn();
+    const forward = vi
+      .spyOn(window.history, "forward")
+      .mockImplementation(() => undefined);
+    window.addEventListener("popstate", router);
+    try {
+      const view = await drawn();
+      clickNode(view, "B");
+      type(fieldOf(view), "a %%{ b");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      await vi.waitFor(() => {
+        expect(noticeOf(view)).toContain(NOTICES.invalid);
+      });
+      expect(forward).toHaveBeenCalledTimes(1);
+      // The browser's own answer to that forward: not a person leaving.
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      await flush();
+      expect(router).not.toHaveBeenCalled();
+      expect(noField(view)).toBe(false);
+    } finally {
+      window.removeEventListener("popstate", router);
+      forward.mockRestore();
+    }
+  });
+});
+
+describe("a refused blur (I1, R96)", () => {
+  it("never takes the focus back, marks the field and keeps the sentence", async () => {
+    const view = await drawn();
+    const tags = document.createElement("input");
+    document.body.append(tags);
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "a %%{ b");
+    tags.focus();
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toContain(NOTICES.invalid);
+    });
+    await flush();
+    expect(active()).toBe(tags);
+    expect(field.getAttribute("aria-invalid")).toBe("true");
+    const status = view.dom.querySelector(".cm-diagram-notice");
+    expect(status?.id).not.toBe("");
+    expect(field.getAttribute("aria-describedby")).toBe(status?.id);
+    expect(noticeOf(view)).toContain("Escape");
+    await new Promise((resolve) => setTimeout(resolve, NOTICE_MS + 100));
+    expect(noticeOf(view)).toContain("Escape");
+    expect(fieldOf(view)).toBe(field);
+  }, 10_000);
+
+  it("takes the mark and the sentence away when the text changes", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "a %%{ b");
+    view.contentDOM.focus();
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toContain("Escape");
+    });
+    field.focus();
+    type(field, "fine");
+    expect(field.getAttribute("aria-invalid")).toBeNull();
+    expect(noticeOf(view)).toBe("");
+  });
+
+  it("does not park main's selection for a person gone on to the text", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "a %%{ b");
+    view.contentDOM.focus();
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toContain("Escape");
+    });
+    expect(active()).toBe(view.contentDOM);
+    expect(view.state.facet(mainSelectionParked)).toBe(false);
+  });
+
+  it("keeps the field on a window that lost the focus, with nothing written", async () => {
+    const view = await drawn();
+    const steps = undoSteps(view);
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "Dra");
+    const has = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    try {
+      field.blur();
+      await flush();
+      await flush();
+    } finally {
+      has.mockRestore();
+    }
+    expect(fieldOf(view)).toBe(field);
+    expect(undoSteps(view)).toBe(steps);
+  });
+
+  it("holds Enter's refusal in the field, marked too", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "a %%{ b");
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(field.getAttribute("aria-invalid")).toBe("true");
+    });
+    expect(active()).toBe(field);
+  });
+});
+
+describe("a refused Raw commit (I2, R97)", () => {
+  it("says so under Raw, with the draft, and brings the field back when Raw goes off", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "a %%{ b");
+    setRaw(view, true);
+    await vi.waitFor(() => {
+      expect(
+        view.dom.querySelector(".cm-diagram-raw-note")?.textContent,
+      ).toContain(NOTICES.invalid);
+    });
+    expect(
+      view.dom.querySelector(".cm-diagram-raw-note")?.textContent,
+    ).toContain("a %%{ b");
+    expect(text(view)).toBe(DOC);
+    setRaw(view, false);
+    await vi.waitFor(() => {
+      expect(fieldOf(view).value).toBe("a %%{ b");
+    });
+    expect(view.dom.querySelector(".cm-diagram-raw-note")).toBeNull();
+    expect(active()).toBe(fieldOf(view));
+    press(fieldOf(view), "Escape");
+    await closed(view);
+    expect(text(view)).toBe(DOC);
+  });
+});
+
+describe("a box the person scrolled away (I3, R98)", () => {
+  const LONG = `${DOC}${"Line of text\n\n".repeat(8000)}`;
+
+  async function scrolledAway() {
+    const view = await drawn(LONG);
+    clickNode(view, "B");
+    const field = fieldOf(view);
+    type(field, "Dra");
+    field.setSelectionRange(3, 3);
+    view.dispatch({
+      effects: EditorView.scrollIntoView(view.state.doc.length),
+    });
+    measured(view);
+    expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+    expect(field.isConnected).toBe(false);
+    (document.activeElement as HTMLElement | null)?.blur();
+    return { view, field };
+  }
+
+  function keyOnBody(key: string): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    return event;
+  }
+
+  it("takes a letter back to the field, which comes back with it", async () => {
+    const { view, field } = await scrolledAway();
+    const event = keyOnBody("f");
+    expect(event.defaultPrevented).toBe(true);
+    keyOnBody("t");
+    measured(view);
+    await vi.waitFor(() => {
+      expect(field.isConnected).toBe(true);
+    });
+    expect(field.value).toBe("Draft");
+    expect(active()).toBe(field);
+    expect(view.state.field(diagramIntent)?.draft).toBe("Draft");
+  });
+
+  it("leaves a shortcut and a scrolling key alone", async () => {
+    const { field } = await scrolledAway();
+    expect(keyOnBody("PageDown").defaultPrevented).toBe(false);
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "s",
+        metaKey: true,
+        bubbles: true,
+      }),
+    );
+    expect(field.value).toBe("Dra");
+  });
+
+  it("leaves a key in another field alone", async () => {
+    const { field } = await scrolledAway();
+    const other = document.createElement("input");
+    document.body.append(other);
+    other.focus();
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      bubbles: true,
+      cancelable: true,
+    });
+    other.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(field.value).toBe("Dra");
+  });
+
+  it("says a refusal in the panel while the box is away, and keeps the draft", async () => {
+    const { view, field } = await scrolledAway();
+    type(field, "a %%{ b");
+    await commitLabelEditor(view);
+    await vi.waitFor(() => {
+      expect(panelOf(view)).toContain(NOTICES.invalid);
+    });
+    expect(field.value).toBe("a %%{ b");
+  });
+});
+
+describe("Shift+Tab onto the box (I4)", () => {
+  it("keeps the focus on the stop through the commit and the redraw", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "Good");
+    await flush();
+    const stop = nodeOf(view, "B") as SVGElement;
+    stop.focus();
+    await vi.waitFor(() => {
+      expect(text(view)).toBe(withB("Good"));
+    });
+    await vi.waitFor(() => {
+      expect(active()?.getAttribute("aria-label")).toBe("Box: Good");
+    });
+    expect(view.state.field(diagramIntent)).toMatchObject({
+      target: NODE_B,
+      mode: "focus",
+    });
+  });
+});
+
+describe("what the field holds to", () => {
+  it("does not take an unchanged name's Enter for a repeat of a held key", async () => {
+    const view = await drawn();
+    focusTarget(view, FROM, NODE_B);
+    press(active(), "Enter");
+    const field = fieldOf(view);
+    press(field, "Enter", { repeat: true });
+    await flush();
+    expect(fieldOf(view)).toBe(field);
+    press(field, "Escape", { repeat: true });
+    await flush();
+    expect(fieldOf(view)).toBe(field);
+    press(field, "Escape");
+    await closed(view);
   });
 });

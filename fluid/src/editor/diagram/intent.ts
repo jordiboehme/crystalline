@@ -53,6 +53,11 @@ export interface DiagramIntent {
   target: TargetKey;
   mode: IntentMode;
   draft?: string;
+  /**
+   * A rename field that stays open with a refused draft while the person has gone
+   * on: main's selection is theirs again, so it is not parked (R96).
+   */
+  released?: true;
 }
 
 /** How long a close may wait for the parse to reach the fence. */

@@ -1416,6 +1416,18 @@ describe("after a canvas delete, the next letter is on a line of its own (R83)",
     },
   );
 
+  it("a table's delimiter line below, which would make the line above a table (M2)", async () => {
+    const doc = `a | b\n${fence(BODY)}\n---|---\n`;
+    const view = await drawn(doc);
+    await deleteAndType(view, box(view), "a | b\nQ\n---|---\n", doc);
+  });
+
+  it("an ordinary paragraph below joins as before, with `===` harmless under a heading", async () => {
+    const doc = `# Head\n${fence(BODY)}\n===\n`;
+    const view = await drawn(doc);
+    await deleteAndType(view, box(view), "# Head\nQ===\n", doc);
+  });
+
   it("a plain line above, no final line break", async () => {
     const doc = `Above\n${fence(BODY)}`;
     const view = await drawn(doc);

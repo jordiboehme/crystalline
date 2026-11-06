@@ -1205,6 +1205,7 @@ function Surface({
                   <button
                     type="button"
                     onClick={closing.close}
+                    data-leaves-editor=""
                     className={BUTTON.primary}
                   >
                     Done

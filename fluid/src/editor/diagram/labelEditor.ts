@@ -21,8 +21,18 @@
  * - A blur commits, and the focus stays where it went. A window losing the focus
  *   is no blur: the browser hands the focus back along with the field.
  * - A close from elsewhere (a press in the text, Raw on) commits what is typed.
- * - `setState` and the view going away drop it: another document, no box.
- * - A refusal keeps it open with its draft and says why. The way out is Escape.
+ * - `setState` drops it: another document.
+ * - A refusal keeps it open with its draft, marked, and says why. It never takes
+ *   the focus back after a blur, so a person can always go on (R96); only leaving
+ *   the page is held, as that would lose the draft.
+ *
+ * Leaving (R95). While a field is open a link, Done and Back wait for its commit,
+ * and a refused one stays on the page. Closing the tab cannot wait, so
+ * `beforeunload` asks. The view going away with nothing having held it is the one
+ * route that still drops a draft.
+ *
+ * An arrow is held by its place in the text, not by its occurrence, which a peer's
+ * duplicate moves (R94): `flowEdgeAt`, read again on each pass of the op.
  *
  * With a peer: a body edit keeps the field, and the fence stays drawn while it is
  * open whatever mermaid says of a half-typed line (`keepFenceDrawn`). Two people
@@ -31,12 +41,15 @@
  */
 
 import { forceParsing, syntaxTree } from "@codemirror/language";
-import { Transaction } from "@codemirror/state";
+import { StateEffect, StateField, Transaction } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
-import { EditorView, ViewPlugin } from "@codemirror/view";
+import { EditorView, ViewPlugin, showPanel } from "@codemirror/view";
 
+import { backGates } from "../../backGates";
+import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { writable } from "../elementEdit";
-import { flowKind, runDiagramOp } from "./apply";
+import { flowKind, nextAnchorTicket, runDiagramOp } from "./apply";
+import type { OpResolver } from "./apply";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
 import type { MermaidFence } from "./fence";
@@ -48,7 +61,7 @@ import {
   verdictArrived,
   showFenceSource,
 } from "./field";
-import { flowLabelOf } from "./flowchart/hit";
+import { flowEdgeAt, flowEdgeSpanOf, flowLabelOf } from "./flowchart/hit";
 import { tidyLabel } from "./flowchart/labels";
 import type { FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
@@ -102,12 +115,55 @@ interface OpenField {
   goneWaits: boolean;
   /** The commit running now. */
   checking: Promise<void> | null;
+  /** The ticket holding an arrow's place in the text (R94); null for a box. */
+  arrow: number | null;
+  /** What a refusal said, while the text it refused still stands. */
+  refused: RefusalCode | null;
+  /** Letters typed while the box was away: they go in when it is back (R98). */
+  queued: string;
+  /** Where the field stood when a composition began, to hold the page there. */
+  lockTop: number | null;
 }
 
 const fields = new WeakMap<EditorView, OpenField>();
 
 const sameTarget = (a: TargetKey, b: TargetKey) =>
   JSON.stringify(a) === JSON.stringify(b);
+
+/** Says a refusal where it can be seen: the box, or the panel with no box. */
+function say(main: EditorView, code: RefusalCode, host: DiagramHost | null) {
+  if (host === null) {
+    main.dispatch({ effects: sayRefusal.of(code) });
+  } else {
+    host.notice(code);
+  }
+}
+
+/**
+ * The arrow's key in `model`, by the place the field holds. A box's target stands
+ * as it is, and `flowLabelOf` says whether it is there.
+ */
+function heldTarget(
+  main: EditorView,
+  target: TargetKey,
+  arrow: number | null,
+  model: FlowModel,
+  bodyFrom: number,
+): TargetKey | "stale" | "gone" {
+  if (target.kind !== "edge") {
+    return target;
+  }
+  const pos =
+    arrow === null
+      ? undefined
+      : main.state.field(diagramAnchors, false)?.get(arrow);
+  const edge = flowEdgeAt(
+    model,
+    target.key,
+    pos === undefined ? null : pos - bodyFrom,
+  );
+  return typeof edge === "string" ? edge : { kind: "edge", key: edge };
+}
 
 /** The fence at `anchor` on a tree that reaches it, or null. */
 function fenceNow(main: EditorView, anchor: number): MermaidFence | null {
@@ -182,10 +238,8 @@ function placeField(open: OpenField, host: DiagramHost): void {
   );
   el.style.width = `${String(width)}px`;
   el.style.height = "auto";
-  const height = Math.min(
-    Math.max(el.scrollHeight, place.height, MIN_HEIGHT),
-    MAX_HEIGHT,
-  );
+  // Its text's own height, in the middle of a tall box: where the label was.
+  const height = Math.min(Math.max(el.scrollHeight, MIN_HEIGHT), MAX_HEIGHT);
   el.style.height = `${String(height)}px`;
   el.style.overflow = el.scrollHeight > height ? "auto" : "hidden";
   const left = place.left + place.width / 2 - width / 2;
@@ -200,7 +254,6 @@ function focusIsFree(open: OpenField, host: DiagramHost | null): boolean {
   return (
     active === null ||
     active === main.dom.ownerDocument.body ||
-    active === main.contentDOM ||
     (host !== null && host.container.contains(active))
   );
 }
@@ -216,10 +269,22 @@ function mount(
   }
   clearStopLook(host);
   placeField(open, host);
+  if (open.refused !== null) {
+    showRefusal(open, host);
+  }
   if (how === "back") {
     // A box coming back: the focus went with the old one, or went somewhere.
-    if (focusIsFree(open, host)) {
+    if (
+      focusIsFree(open, host) &&
+      (open.refused === null || open.queued !== "")
+    ) {
       el.focus({ preventScroll: true });
+    }
+    if (open.queued !== "") {
+      const { queued } = open;
+      open.queued = "";
+      el.setRangeText(queued, el.selectionStart, el.selectionEnd, "end");
+      el.dispatchEvent(new Event("input", { bubbles: true }));
     }
     return;
   }
@@ -233,20 +298,49 @@ function mount(
 
 /** The field out of the record and the page. The caller says where the focus goes. */
 function detach(open: OpenField): void {
-  fields.delete(open.main);
+  const { main, arrow } = open;
+  fields.delete(main);
   open.el.remove();
-  if (open.main.state.field(diagramField, false)?.kept !== null) {
-    open.main.dispatch({ effects: keepFenceDrawn.of(null) });
+  syncGuards(main);
+  const effects: StateEffect<unknown>[] = [];
+  if (main.state.field(diagramField, false)?.kept !== null) {
+    effects.push(keepFenceDrawn.of(null));
+  }
+  if (arrow !== null && main.state.field(diagramAnchors, false)?.has(arrow)) {
+    effects.push(untrackAnchor.of(arrow));
+  }
+  if (effects.length > 0) {
+    main.dispatch({ effects });
   }
 }
 
 /** The stop the person was on, or the canvas when it went. */
 function backToStop(open: OpenField): void {
-  const { main, anchor, target } = open;
+  const { main, anchor, target, arrow } = open;
   const fence = fenceNow(main, anchor);
   const model = fence && modelOf(fence.body);
-  const stands = model?.understood && flowLabelOf(model, target) !== null;
-  focusTarget(main, anchor, stands ? target : CANVAS);
+  const held =
+    fence && model?.understood
+      ? heldTarget(main, target, arrow, model, fence.bodyFrom)
+      : "gone";
+  const stands =
+    typeof held !== "string" &&
+    model !== null &&
+    flowLabelOf(model, held) !== null;
+  focusTarget(main, anchor, stands ? held : CANVAS);
+}
+
+/** Whether the focus went to a stop of this box, as Shift+Tab takes it. */
+function onItsOwnBox(open: OpenField): boolean {
+  const { main, el, anchor } = open;
+  const active = main.root.activeElement;
+  const host = hostOf(main, anchor);
+  return (
+    active !== null &&
+    active !== el &&
+    host !== null &&
+    host.container.contains(active)
+  );
 }
 
 function finish(open: OpenField, way: Way): void {
@@ -270,6 +364,21 @@ function finish(open: OpenField, way: Way): void {
       detach(open);
       break;
     case "blur": {
+      if (onItsOwnBox(open)) {
+        // As Enter does: the stop comes back after the redraw (I4).
+        const intent = main.state.field(diagramIntent);
+        if (intent?.mode === "rename") {
+          main.dispatch({
+            effects: setDiagramIntent.of({
+              anchor,
+              target: open.target,
+              mode: "focus",
+            }),
+          });
+        }
+        detach(open);
+        break;
+      }
       detach(open);
       closeDiagramIntent(main, "user", "none");
       // Main took the focus with its selection in this fence (R80): the box was
@@ -291,33 +400,62 @@ function finish(open: OpenField, way: Way): void {
   }
 }
 
-/** The field stays with its draft and says why. */
-function refuse(open: OpenField, code: RefusalCode): void {
+/** What a refused field says as long as it stands, with the way out. */
+function refusalSentence(code: RefusalCode): string {
+  return `${NOTICES[code]} Fix it, or press Escape in the field to drop it.`;
+}
+
+function showRefusal(open: OpenField, host: DiagramHost): void {
+  if (open.refused !== null) {
+    open.el.setAttribute("aria-describedby", host.statusId);
+    host.holdNotice(refusalSentence(open.refused));
+  }
+}
+
+function clearRefusal(open: OpenField): void {
+  if (open.refused === null) {
+    return;
+  }
+  open.refused = null;
+  open.el.removeAttribute("aria-invalid");
+  open.el.removeAttribute("aria-describedby");
+  hostOf(open.main, open.anchor)?.holdNotice(null);
+}
+
+/**
+ * The field stays with its draft, marked, and says why until the text changes. It
+ * takes the focus back only from Enter, where the person is still in it: after a
+ * blur the person has gone on, and may (R96).
+ */
+function refuse(open: OpenField, code: RefusalCode, way: Way): void {
   const { main, el, anchor, target } = open;
   el.readOnly = false;
+  open.refused = code;
+  el.setAttribute("aria-invalid", "true");
+  const held = way === "enter" || main.root.activeElement === el;
   const intent = main.state.field(diagramIntent, false);
+  const wanted = {
+    anchor,
+    target,
+    mode: "rename" as const,
+    draft: el.value,
+    ...(held ? {} : { released: true as const }),
+  };
   if (
-    intent === undefined ||
-    intent === null ||
+    !intent ||
     intent.mode !== "rename" ||
-    !sameTarget(intent.target, target)
+    !sameTarget(intent.target, target) ||
+    (intent.released === true) !== (wanted.released === true)
   ) {
-    main.dispatch({
-      effects: setDiagramIntent.of({
-        anchor,
-        target,
-        mode: "rename",
-        draft: el.value,
-      }),
-    });
+    main.dispatch({ effects: setDiagramIntent.of(wanted) });
   }
   const host = hostOf(main, anchor);
   if (host === null) {
     main.dispatch({ effects: sayRefusal.of(code) });
     return;
   }
-  host.notice(code);
-  if (focusIsFree(open, host)) {
+  showRefusal(open, host);
+  if (way === "enter") {
     if (el.parentElement !== host.overlay) {
       host.overlay.append(el);
     }
@@ -325,24 +463,34 @@ function refuse(open: OpenField, code: RefusalCode): void {
   }
 }
 
-function opFor(target: TargetKey, text: string): FlowOp | null {
-  if (target.kind === "node") {
-    return { op: "rename", id: target.id, text };
+/** The op for what is typed, worked out on each read of the fence (R94). */
+function opFor(
+  main: EditorView,
+  target: TargetKey,
+  arrow: number | null,
+  text: string,
+): OpResolver<FlowModel, FlowOp> | null {
+  if (target.kind === "canvas") {
+    return null;
   }
-  return target.kind === "edge"
-    ? { op: "edgeLabel", edge: target.key, text }
-    : null;
+  return (model, bodyFrom) => {
+    const held = heldTarget(main, target, arrow, model, bodyFrom);
+    if (typeof held === "string") {
+      return { refused: held };
+    }
+    return held.kind === "edge"
+      ? { op: "edgeLabel", edge: held.key, text }
+      : { op: "rename", id: target.kind === "node" ? target.id : "", text };
+  };
 }
 
 async function commitNow(open: OpenField, way: Way): Promise<void> {
   const { main, el, target } = open;
   const typed = tidyLabel(el.value);
-  const op = opFor(target, typed);
-  if (
-    op === null ||
-    typed === tidyLabel(open.baseline) ||
-    (target.kind === "node" && typed === "")
-  ) {
+  const op = opFor(main, target, open.arrow, typed);
+  // What was typed counts against the label as it stands now, so the old name
+  // typed back over a peer's rename is written. The op answers no-op on the same.
+  if (op === null || !open.typed || (target.kind === "node" && typed === "")) {
     finish(open, way);
     return;
   }
@@ -353,7 +501,7 @@ async function commitNow(open: OpenField, way: Way): Promise<void> {
     intentStale(main.state) ||
     (fence !== null && verdictFor(fence.body)?.ok === false)
   ) {
-    refuse(open, "stale");
+    refuse(open, "stale", way);
     return;
   }
   el.readOnly = true;
@@ -367,7 +515,7 @@ async function commitNow(open: OpenField, way: Way): Promise<void> {
   } else if (outcome.refused === "gone") {
     goneNow(open);
   } else {
-    refuse(open, outcome.refused);
+    refuse(open, outcome.refused, way);
   }
 }
 
@@ -391,11 +539,7 @@ function goneNow(open: OpenField): void {
     });
   }
   detach(open);
-  if (host === null) {
-    main.dispatch({ effects: sayRefusal.of("gone") });
-  } else {
-    host.notice("gone");
-  }
+  say(main, "gone", host);
 }
 
 /** A peer's edit, a new drawing or the end of a composition: is this still right? */
@@ -437,7 +581,22 @@ function reconcile(main: EditorView): void {
     // No reading of it now: the verdict decides, and the field waits.
     return;
   }
-  const label = flowLabelOf(model, target);
+  const held =
+    fence === null
+      ? target
+      : heldTarget(main, target, open.arrow, model, fence.bodyFrom);
+  if (held === "stale") {
+    // Not said until it matters: at the commit, with a sentence.
+    return;
+  }
+  const now = held === "gone" ? null : held;
+  if (now !== null && !sameTarget(now, target)) {
+    open.target = now;
+    main.dispatch({
+      effects: setDiagramIntent.of({ ...intent, target: now }),
+    });
+  }
+  const label = now === null ? null : flowLabelOf(model, now);
   if (label === null) {
     if (open.composing) {
       open.goneWaits = true;
@@ -457,7 +616,11 @@ function reconcile(main: EditorView): void {
       placeField(open, host);
     }
     main.dispatch({
-      effects: setDiagramIntent.of({ ...intent, draft: label }),
+      effects: setDiagramIntent.of({
+        ...intent,
+        target: open.target,
+        draft: label,
+      }),
     });
   }
 }
@@ -488,9 +651,14 @@ function makeField(
     composing: false,
     goneWaits: false,
     checking: null,
+    arrow: null,
+    refused: null,
+    queued: "",
+    lockTop: null,
   };
   el.addEventListener("input", () => {
     open.typed = true;
+    clearRefusal(open);
     const intent = main.state.field(diagramIntent, false);
     if (intent) {
       main.dispatch({
@@ -502,11 +670,26 @@ function makeField(
       placeField(open, host);
     }
   });
+  el.addEventListener("focus", () => {
+    const intent = main.state.field(diagramIntent, false);
+    if (intent?.released === true) {
+      main.dispatch({
+        effects: setDiagramIntent.of({
+          anchor: intent.anchor,
+          target: intent.target,
+          mode: intent.mode,
+          draft: el.value,
+        }),
+      });
+    }
+  });
   el.addEventListener("compositionstart", () => {
     open.composing = true;
+    open.lockTop = el.getBoundingClientRect().top;
   });
   el.addEventListener("compositionend", () => {
     open.composing = false;
+    open.lockTop = null;
     if (open.goneWaits) {
       open.goneWaits = false;
       reconcile(main);
@@ -528,6 +711,7 @@ function makeField(
 function onFieldBlur(open: OpenField): void {
   const { main, el } = open;
   open.composing = false;
+  open.lockTop = null;
   if (
     fields.get(main) !== open ||
     open.checking !== null ||
@@ -606,14 +790,20 @@ export function openLabelEditor(
   }
   const fence = fenceNow(main, anchor);
   const host = hostOf(main, anchor);
-  if (fence === null || intentStaleAt(main, fence)) {
-    host?.notice("stale");
+  // A fence not drawn has no box to come and no intent to hold: `settled` drops
+  // one at once, and a record with no intent would go at the next key, silently.
+  if (
+    fence === null ||
+    intentStaleAt(main, fence) ||
+    !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
+  ) {
+    say(main, "stale", host);
     return;
   }
   const model = modelNow(fence);
   const label = model && flowLabelOf(model, target);
   if (model === null || label === null || label === undefined) {
-    host?.notice("gone");
+    say(main, "gone", host);
     return;
   }
   // No use typing a label the arrow cannot take on its own.
@@ -624,15 +814,30 @@ export function openLabelEditor(
       text: label === "x" ? "y" : "x",
     });
     if ("refused" in tried && tried.refused === "group") {
-      host?.notice("group");
+      say(main, "group", host);
       return;
     }
   }
   const text = options.initial ?? label;
   const created = makeField(main, fence.from, target, label, text);
+  const span =
+    target.kind === "edge" ? flowEdgeSpanOf(model, target.key) : null;
+  // Inside the token, so a change right at its edge stays clear of the ticket.
+  const arrowEffect: StateEffect<unknown>[] = [];
+  if (span !== null) {
+    created.arrow = nextAnchorTicket();
+    arrowEffect.push(
+      trackAnchor.of({
+        ticket: created.arrow,
+        pos: fence.bodyFrom + span + 1,
+      }),
+    );
+  }
   fields.set(main, created);
+  syncGuards(main);
   main.dispatch({
     effects: [
+      ...arrowEffect,
       setDiagramIntent.of({
         anchor: fence.from,
         target,
@@ -690,12 +895,7 @@ export async function addWithName(
   const outcome = await runDiagramOp(main, anchor, flowKind, op);
   const place = main.state.field(diagramIntent, false)?.anchor ?? anchor;
   if ("refused" in outcome) {
-    const host = hostOf(main, place);
-    if (host === null) {
-      main.dispatch({ effects: sayRefusal.of(outcome.refused) });
-    } else {
-      host.notice(outcome.refused);
-    }
+    say(main, outcome.refused, hostOf(main, place));
   } else if (outcome.applied && outcome.created !== undefined) {
     openLabelEditor(main, place, outcome.created, { selectAll: true });
   }
@@ -715,6 +915,7 @@ function onClosing(
   if (reason === "swap" || reason === "destroy") {
     fields.delete(main);
     open.el.remove();
+    syncGuards(main);
     return;
   }
   if (open.checking !== null) {
@@ -732,29 +933,359 @@ function onClosing(
   void commit(open, "leave");
 }
 
+/** A refused draft waiting for Raw to go off (R97). */
+interface RawDraft {
+  target: TargetKey;
+  arrow: number | null;
+  /** The ticket holding the fence's place. */
+  place: number;
+  baseline: string;
+  draft: string;
+  code: RefusalCode;
+}
+
+const rawDrafts = new WeakMap<EditorView, RawDraft>();
+
+const rawNoteShown = StateEffect.define<string | null>();
+
+/** Outside the layer, as Raw takes the layer and its panels with it. */
+const rawNote = StateField.define<string | null>({
+  create: () => null,
+  update: (value, tr) => {
+    let next = value;
+    for (const effect of tr.effects) {
+      if (effect.is(rawNoteShown)) {
+        next = effect.value;
+      }
+    }
+    return next;
+  },
+  provide: (field) =>
+    showPanel.from(field, (sentence) =>
+      sentence === null
+        ? null
+        : () => {
+            const dom = document.createElement("div");
+            dom.className = "cm-diagram-raw-note";
+            dom.setAttribute("role", "status");
+            dom.textContent = sentence;
+            return { dom };
+          },
+    ),
+});
+
+const rawNoteTheme = EditorView.baseTheme({
+  ".cm-diagram-raw-note": {
+    padding: "0.25rem 0.75rem",
+    color: "var(--color-slate-700)",
+    backgroundColor: "var(--color-slate-100)",
+    fontSize: "var(--text-caption, 0.75rem)",
+    lineHeight: "var(--text-caption--line-height, 1rem)",
+  },
+  "&dark .cm-diagram-raw-note": {
+    color: "var(--color-slate-200)",
+    backgroundColor: "var(--color-slate-800)",
+  },
+});
+
 /**
  * Raw took the box and the field with it, so all that is left is the text. A text
- * refused here has no place to stay, so the page says why.
+ * refused here comes back in its field when Raw goes off, and until then a line
+ * outside the layer says so (R97).
  */
 async function commitForRaw(open: OpenField): Promise<void> {
-  const { main, el, target, anchor } = open;
+  const { main, el, target, anchor, arrow } = open;
   fields.delete(main);
   const typed = tidyLabel(el.value);
   el.remove();
-  const op = opFor(target, typed);
+  syncGuards(main);
+  const op = opFor(main, target, arrow, typed);
+  const refused =
+    op === null || !open.typed || (target.kind === "node" && typed === "")
+      ? null
+      : await runDiagramOp(main, anchor, flowKind, op);
+  if (refused === null || !("refused" in refused) || !main.dom.isConnected) {
+    if (arrow !== null && main.state.field(diagramAnchors, false)?.has(arrow)) {
+      main.dispatch({ effects: untrackAnchor.of(arrow) });
+    }
+    return;
+  }
+  const place = nextAnchorTicket();
+  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off.`;
+  rawDrafts.set(main, {
+    target,
+    arrow,
+    place,
+    baseline: open.baseline,
+    draft: el.value,
+    code: refused.refused,
+  });
+  syncGuards(main);
+  main.dispatch({
+    effects: [
+      ...(main.state.field(rawNote, false) === undefined
+        ? [StateEffect.appendConfig.of([rawNote, rawNoteTheme])]
+        : []),
+      trackAnchor.of({ ticket: place, pos: anchor + 1 }),
+    ],
+  });
+  main.dispatch({
+    effects: [rawNoteShown.of(sentence), EditorView.announce.of(sentence)],
+  });
+}
+
+/** Raw is off: the refused draft is back in its field, once its fence is drawn. */
+function restoreRawDraft(main: EditorView): void {
+  const raw = rawDrafts.get(main);
+  if (raw === undefined || fields.has(main)) {
+    return;
+  }
+  const at = main.state.field(diagramAnchors, false)?.get(raw.place);
+  const fence = at === undefined ? null : fenceNow(main, at);
+  const model = fence && modelNow(fence);
+  const end = () => {
+    rawDrafts.delete(main);
+    syncGuards(main);
+    main.dispatch({
+      effects: [
+        untrackAnchor.of(raw.place),
+        ...(raw.arrow === null ? [] : [untrackAnchor.of(raw.arrow)]),
+        ...(main.state.field(rawNote, false) === undefined
+          ? []
+          : [rawNoteShown.of(null)]),
+      ],
+    });
+  };
+  const held =
+    fence === null || model === null
+      ? "gone"
+      : heldTarget(main, raw.target, raw.arrow, model, fence.bodyFrom);
+  if (fence === null || model === null || typeof held === "string") {
+    end();
+    say(main, "gone", null);
+    return;
+  }
   if (
-    op === null ||
-    typed === tidyLabel(open.baseline) ||
-    (target.kind === "node" && typed === "")
+    !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
   ) {
     return;
   }
-  const outcome = await runDiagramOp(main, anchor, flowKind, op);
-  if ("refused" in outcome && main.dom.isConnected) {
-    main.dispatch({
-      effects: EditorView.announce.of(NOTICES[outcome.refused]),
-    });
+  end();
+  openLabelEditor(main, fence.from, held, {
+    selectAll: false,
+    initial: raw.draft,
+  });
+  const open = fields.get(main);
+  const host = hostOf(main, fence.from);
+  if (open !== undefined) {
+    open.refused = raw.code;
+    open.el.setAttribute("aria-invalid", "true");
+    if (host !== null) {
+      showRefusal(open, host);
+    }
   }
+}
+
+/** Whether leaving now would lose what the field holds. */
+function hasDraft(open: OpenField): boolean {
+  const typed = tidyLabel(open.el.value);
+  return (
+    open.typed &&
+    typed !== tidyLabel(open.baseline) &&
+    !(open.target.kind === "node" && typed === "")
+  );
+}
+
+const guards = new WeakMap<EditorView, () => void>();
+
+/** The listeners that hold a page while a field is open, and only then (R95, R98). */
+function syncGuards(main: EditorView): void {
+  const wanted = fields.has(main) || rawDrafts.has(main);
+  const stop = guards.get(main);
+  if (wanted && stop === undefined) {
+    guards.set(main, armGuards(main));
+  } else if (!wanted && stop !== undefined) {
+    stop();
+    guards.delete(main);
+  }
+}
+
+function armGuards(main: EditorView): () => void {
+  let replaying = false;
+  let restoring = false;
+  const historyAt = historyIndex();
+
+  const onClick = (event: MouseEvent) => {
+    const target = event.target;
+    if (replaying || !main.dom.isConnected || !(target instanceof Element)) {
+      return;
+    }
+    if (target.closest(".cm-diagram") !== null && main.dom.contains(target)) {
+      return;
+    }
+    const link = target.closest<HTMLAnchorElement>("a[href]");
+    const leaving =
+      (link !== null || target.closest("[data-leaves-editor]") !== null) &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.shiftKey &&
+      event.button === 0 &&
+      link?.target !== "_blank";
+    const open = fields.get(main);
+    if (open === undefined) {
+      // A refused draft under Raw: its line stands, and the page stays.
+      if (leaving && rawDrafts.has(main)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
+    const running = open.checking !== null;
+    if (!running && !(leaving && hasDraft(open))) {
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const replay = new MouseEvent("click", event);
+    void commit(open, "blur").then(() => {
+      if (!leaving || fields.get(main) !== open) {
+        replaying = true;
+        target.dispatchEvent(replay);
+        replaying = false;
+      }
+    });
+  };
+
+  const onPopstate = (event: PopStateEvent) => {
+    if (restoring) {
+      restoring = false;
+      event.stopImmediatePropagation();
+      return;
+    }
+    if (!main.dom.isConnected) {
+      return;
+    }
+    const undo = () => {
+      restoring = true;
+      const now = historyIndex();
+      if (historyAt !== null && now !== null && now !== historyAt) {
+        window.history.go(historyAt - now);
+      } else {
+        window.history.forward();
+      }
+    };
+    const open = fields.get(main);
+    if (open === undefined) {
+      if (rawDrafts.has(main)) {
+        event.stopImmediatePropagation();
+        undo();
+      }
+      return;
+    }
+    if (open.checking === null && !hasDraft(open)) {
+      return;
+    }
+    event.stopImmediatePropagation();
+    const state: unknown = event.state;
+    void commit(open, "blur").then(() => {
+      if (fields.get(main) === open) {
+        undo();
+      } else {
+        window.dispatchEvent(new PopStateEvent("popstate", { state }));
+      }
+    });
+  };
+
+  const onUnload = (event: BeforeUnloadEvent) => {
+    const open = fields.get(main);
+    if (
+      main.dom.isConnected &&
+      (rawDrafts.has(main) || (open !== undefined && hasDraft(open)))
+    ) {
+      event.preventDefault();
+    }
+  };
+
+  const onKey = (event: KeyboardEvent) => {
+    const open = fields.get(main);
+    if (
+      open === undefined ||
+      open.el.isConnected ||
+      !main.dom.isConnected ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    const active = main.root.activeElement;
+    if (active !== null && active !== main.dom.ownerDocument.body) {
+      return;
+    }
+    const printable = event.key.length === 1;
+    const { key } = event;
+    if (
+      !printable &&
+      !["Backspace", "Delete", "Enter", "Escape", "Process"].includes(key)
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (key === "Escape") {
+      cancelLabelEditor(main);
+      return;
+    }
+    if (key === "Enter") {
+      void commit(open, "enter");
+      return;
+    }
+    if (printable) {
+      open.queued += key;
+    }
+    main.dispatch({
+      effects: EditorView.scrollIntoView(open.anchor, { y: "center" }),
+    });
+  };
+
+  // A composition goes on where it began: an element taken out of the page ends
+  // it and loses its last letter, so the page waits for its end (R98).
+  const onScroll = (event: Event) => {
+    const open = fields.get(main);
+    if (open?.lockTop === null || open === undefined || !open.el.isConnected) {
+      return;
+    }
+    const moved = open.el.getBoundingClientRect().top - open.lockTop;
+    if (Math.abs(moved) < 0.5) {
+      return;
+    }
+    const scroller =
+      event.target instanceof Element
+        ? event.target
+        : main.dom.ownerDocument.scrollingElement;
+    if (scroller !== null) {
+      scroller.scrollTop += moved;
+    }
+  };
+
+  window.addEventListener("click", onClick, true);
+  backGates.add(onPopstate);
+  window.addEventListener("beforeunload", onUnload);
+  window.addEventListener("keydown", onKey, true);
+  window.addEventListener("scroll", onScroll, true);
+  return () => {
+    window.removeEventListener("click", onClick, true);
+    backGates.delete(onPopstate);
+    window.removeEventListener("beforeunload", onUnload);
+    window.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("scroll", onScroll, true);
+  };
+}
+
+/** The router's place in the history, which it keeps in the entry's state. */
+function historyIndex(): number | null {
+  const state = window.history.state as { idx?: unknown } | null;
+  return typeof state?.idx === "number" ? state.idx : null;
 }
 
 registerStopAction("rename", (main, anchor, target) => {
@@ -895,6 +1426,11 @@ export const labelEditorPlugin = ViewPlugin.fromClass(
           this.tryStarter();
         });
       }
+      if (rawDrafts.has(view)) {
+        queueMicrotask(() => {
+          restoreRawDraft(view);
+        });
+      }
       if (!hooked.has(view)) {
         hooked.add(view);
         beforeClose(view, (reason, intent) => {
@@ -906,6 +1442,11 @@ export const labelEditorPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate): void {
       const { view } = this;
       const open = fields.get(view);
+      if (rawDrafts.has(view) && update.docChanged) {
+        queueMicrotask(() => {
+          restoreRawDraft(view);
+        });
+      }
       if (
         open !== undefined &&
         (update.docChanged ||

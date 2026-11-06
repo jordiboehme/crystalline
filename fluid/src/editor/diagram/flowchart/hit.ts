@@ -127,6 +127,42 @@ function arrowLabel(model: FlowModel, edge: FlowEdge): string {
 }
 
 /**
+ * The arrow of (`start`, `end`) that stands at `offset`, a position in the body;
+ * an arrow's occurrence moves with every duplicate added or removed before it, and
+ * its token does not. With no such token: the only arrow of that pair if there is
+ * one, "stale" among several (no guess about which is meant), "gone" with none.
+ */
+export function flowEdgeAt(
+  model: FlowModel,
+  key: EdgeKey,
+  offset: number | null,
+): EdgeKey | "stale" | "gone" {
+  const pair = model.edges.filter(
+    (edge) => edge.start === key.start && edge.end === key.end,
+  );
+  const held =
+    offset === null
+      ? undefined
+      : pair.find((edge) => {
+          const span = model.chains[edge.chain]?.links[edge.link]?.arrow.span;
+          return span !== undefined && span.from <= offset && offset < span.to;
+        });
+  const edge = held ?? (pair.length === 1 ? pair[0] : undefined);
+  if (edge !== undefined) {
+    return edgeKey(edge);
+  }
+  return pair.length === 0 ? "gone" : "stale";
+}
+
+/** Where an arrow's token starts in the body, or null with no such arrow. */
+export function flowEdgeSpanOf(model: FlowModel, key: EdgeKey): number | null {
+  const edge = model.edges.find((e) => sameEdge(e, key));
+  return edge
+    ? (model.chains[edge.chain]?.links[edge.link]?.arrow.span.from ?? null)
+    : null;
+}
+
+/**
  * What the rename field shows for `target`, which is what is drawn: a box with no
  * label of its own shows its id, an arrow with none is empty. Null when the source
  * has no such box or arrow, so a target a peer took away can be told.

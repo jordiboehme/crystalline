@@ -43,10 +43,10 @@ export function diagramExtension(): Extension {
     ),
     enterDrawnFence.of(enterCanvas),
     // No bar writes into a hidden fence while the keyboard is on the drawing.
-    mainSelectionParked.compute(
-      [diagramIntent],
-      (state) => state.field(diagramIntent) !== null,
-    ),
+    mainSelectionParked.compute([diagramIntent], (state) => {
+      const intent = state.field(diagramIntent);
+      return intent !== null && intent.released !== true;
+    }),
     fenceMarksGuard,
     diagramEntryKeys,
     diagramFocus,

@@ -201,9 +201,11 @@ function build(
     // R52: typing into a fence must not take the source away under the caret.
     // It is drawn when the caret leaves (the field rebuilds on a selection
     // move while one is held), unless `drawUnderCaret` exempted it.
+    // A starter's own exemption wins over a pointer hold too: a menu's mouse up
+    // starts one, and with the field to come no flip can move a word under it.
     if (
-      pointer ||
-      (head <= fence.to && tail >= fence.from && !exempt.includes(fence.from))
+      !exempt.includes(fence.from) &&
+      (pointer || (head <= fence.to && tail >= fence.from))
     ) {
       held = true;
       return false;

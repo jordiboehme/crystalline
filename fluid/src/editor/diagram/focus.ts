@@ -636,7 +636,8 @@ const focusPlugin = ViewPlugin.fromClass(
       if (
         el instanceof Element &&
         el.closest(".cm-diagram") === null &&
-        this.view.state.field(diagramIntent) !== null
+        this.view.state.field(diagramIntent) !== null &&
+        this.view.state.field(diagramIntent)?.released !== true
       ) {
         closeDiagramIntent(this.view, "user", "none");
       }
