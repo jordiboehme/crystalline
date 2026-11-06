@@ -1444,6 +1444,11 @@ export interface SharePlan {
    */
   note: string | null;
   /**
+   * The server's sentence when a change of letter case in this share will not
+   * reach the team; null otherwise, and from an older server.
+   */
+  spellingNote: string | null;
+  /**
    * The team marker this share adds to the MANIFEST, with the server's
    * reason, when it adds one; null otherwise, and from an older server. It
    * is not in `changes`: the folder does not hold it yet, and `changes` is
@@ -1541,6 +1546,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     title: asString(record?.title),
     own: record?.own !== false,
     note: asString(record?.note),
+    spellingNote: asString(record?.spelling_note),
     teamMarker: readTeamMarker(record?.team_marker),
   };
 }

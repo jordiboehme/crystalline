@@ -355,6 +355,20 @@ pub fn journal_tombstone(
     save(&tombstone_of(&file), b"")
 }
 
+/// [`journal_tombstone`] for a deletion whose path is also where another of the
+/// actor's drafts may be mirrored: the sidecar goes down and that file stays. If
+/// the two end up at one spelling the draft is taken, so her text is what a
+/// rebuild brings back.
+pub fn journal_tombstone_beside_a_draft(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<()> {
+    let file = entry_path(state_dir, domain, actor, path)?;
+    save(&tombstone_of(&file), b"")
+}
+
 /// Drop whatever one actor holds at `path`, draft or tombstone.
 ///
 /// The folders the entry stood in are pruned while they are empty, up to and
@@ -365,6 +379,23 @@ pub fn journal_clear(state_dir: &Path, domain: &str, actor: &str, path: &str) ->
     let file = entry_path(state_dir, domain, actor, path)?;
     remove_entry_if_present(&tombstone_of(&file))?;
     remove_entry_if_present(&file)?;
+    let stop = actor_dir(state_dir, domain, actor)?;
+    prune_empty(file.parent(), &stop);
+    Ok(())
+}
+
+/// Drop only the sidecar of one actor's deletion at `path`, and any folder it
+/// leaves empty. For a deletion whose path is also where another of the actor's
+/// drafts is mirrored: on a disk that folds case `notes/x.md` and `Notes/x.md`
+/// are one file, and [`journal_clear`] would take that draft's only copy.
+pub fn journal_clear_tombstone(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<()> {
+    let file = entry_path(state_dir, domain, actor, path)?;
+    remove_entry_if_present(&tombstone_of(&file))?;
     let stop = actor_dir(state_dir, domain, actor)?;
     prune_empty(file.parent(), &stop);
     Ok(())

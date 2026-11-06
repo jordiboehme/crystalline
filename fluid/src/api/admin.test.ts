@@ -1134,6 +1134,7 @@ describe("the admin client layer", () => {
       own: true,
       // No note: the plain share needs no sentence about how it will go.
       note: null,
+      spellingNote: null,
       // No marker: the share adds nothing of its own.
       teamMarker: null,
     });

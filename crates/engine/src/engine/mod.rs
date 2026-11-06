@@ -5988,9 +5988,17 @@ impl Engine {
             draft_of: Some(actor.to_string()),
             audience: None,
         }));
-        let warning = match crate::overlay_journal::journal_tombstone(
-            &state_dir, domain, actor, &desc.path,
-        ) {
+        let mirrored = if self
+            .deletion_shares_a_mirror(desc.domain_id, actor, &desc.path)
+            .await?
+        {
+            crate::overlay_journal::journal_tombstone_beside_a_draft(
+                &state_dir, domain, actor, &desc.path,
+            )
+        } else {
+            crate::overlay_journal::journal_tombstone(&state_dir, domain, actor, &desc.path)
+        };
+        let warning = match mirrored {
             Ok(()) => None,
             Err(e) => Some(unmirrored(domain, actor, &desc.path, &e, true)),
         };
@@ -5998,6 +6006,37 @@ impl Engine {
             tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
         }
         Ok(warning)
+    }
+
+    /// Whether this actor's deletion at `path` stands beside a draft of theirs at
+    /// another spelling of it. That draft may be mirrored in the very file `path`
+    /// names, where a folder-only case move leaves it on a disk that folds case,
+    /// and the mirror is the one copy a rebuild can bring it back from. So writing
+    /// or ending such a deletion touches its sidecar and nothing else.
+    pub(crate) async fn deletion_shares_a_mirror(
+        &self,
+        domain_id: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<bool> {
+        let store = self.store.lock().await;
+        let is_deletion = store
+            .overlay_entry(domain_id, actor, path)
+            .await?
+            .is_some_and(|entry| entry.tombstone);
+        if !is_deletion {
+            return Ok(false);
+        }
+        let folded = crystalline_core::fold_path_case(path);
+        Ok(store
+            .overlay_entries(domain_id, actor)
+            .await?
+            .iter()
+            .any(|entry| {
+                !entry.tombstone
+                    && entry.path != path
+                    && crystalline_core::fold_path_case(&entry.path) == folded
+            }))
     }
 
     /// The row half of both overlay writers, in one transaction: the row, its
@@ -7625,6 +7664,7 @@ pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
 mod review_mode;
+pub(crate) use review_mode::folder_may_fold_case;
 mod schemas;
 mod search;
 mod sources;

@@ -2270,6 +2270,54 @@ describe("seeing and discarding changes from the dialog", () => {
     ).toBeVisible();
   });
 
+  it("says a change of letter case did not travel, before and after the share", async () => {
+    const note = "A share does not carry a change of letter case.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "nothing_to_share",
+        effective_title: "",
+        changes: [],
+        spelling_note: note,
+      }),
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      await within(dialog).findByText("Nothing to share."),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText(note)).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText(/the team already has all of this/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("names the spelling that did not travel in a share's outcome", async () => {
+    const note = "A share does not carry a change of letter case.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "Plan.md", kind: "modified" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              url: "https://github.com/acme/knowledge/pull/4",
+              number: 4,
+              spelling_note: note,
+            }
+          : null,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByText("Plan.md");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    expect(await within(dialog).findByText(note)).toBeInTheDocument();
+  });
+
   it("has no discard controls on a read-only instance", async () => {
     serve({
       "/auth/me": () =>
