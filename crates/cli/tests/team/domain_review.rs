@@ -277,10 +277,15 @@ fn users_add_refuses_a_name_with_drafts_and_discard_drafts_is_the_way_out() {
     // The domain has to be in the index for a draft to be held in it.
     fx.ok(&["sync", "--config", fx.config.to_str().unwrap()]);
     // `users` reads the default configuration, so that is this one too.
-    let default_config = fx.home.path().join("config/crystalline/config.yaml");
+    let config_home = if cfg!(windows) { "roaming" } else { "config" };
+    let default_config = fx
+        .home
+        .path()
+        .join(config_home)
+        .join("crystalline/config.yaml");
     std::fs::create_dir_all(default_config.parent().unwrap()).unwrap();
     std::fs::copy(&fx.config, &default_config).unwrap();
-    let db = fx.home.path().join("state/crystalline/index.db");
+    let db = crate::common::isolated_state_dir(fx.home.path()).join("index.db");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         use crystalline_index::Store as _;
