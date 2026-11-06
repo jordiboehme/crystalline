@@ -462,8 +462,10 @@ test("past the canvas limit the file comes smaller and says so", async ({
     NOT_SHARP,
   );
   expect(size.width * size.height).toBeLessThanOrEqual(limit);
-  // The largest that fits: one more pixel of width would not.
-  expect(size.width * size.height).toBeGreaterThan(limit * 0.99);
+  // The largest that fits: one more row and column of pixels would not. A
+  // percentage is no test here, since one row of a very wide picture is more
+  // than one percent of it.
+  expect((size.width + 1) * (size.height + 1)).toBeGreaterThan(limit);
   expect(drawing.font * scale).toBeLessThan(28);
   expect(drawing.font * scale).toBeGreaterThanOrEqual(10);
   console.log(
