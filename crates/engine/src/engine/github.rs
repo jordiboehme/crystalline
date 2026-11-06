@@ -1,6 +1,7 @@
 use crystalline_remote::UserTokenGrant;
 
 use super::*;
+use crystalline_core::account::NewAccountRefusal;
 
 impl Engine {
     // --- configure: GitHub connect ------------------------------------------
@@ -104,8 +105,8 @@ impl Engine {
     /// Drops a pending flow belonging to `identity`, leaving another
     /// identity's alone. What a connect that settles the same credential by
     /// another route (a pasted token) and a disconnect both do: the flow in
-    /// flight is about to be answered by a stale background task, and only for
-    /// this one credential.
+    /// flight would otherwise land later, so dropping the record stops its task
+    /// ([`PendingConnect`]'s `Drop`), and only for this one credential.
     fn clear_pending_for(&self, identity: &TokenIdentity) {
         let mut guard = self.pending_connect.lock().unwrap();
         if guard.as_ref().is_some_and(|p| p.identity == *identity) {
@@ -568,7 +569,9 @@ impl Engine {
         // with no task in it. Resolved here, a failure costs nothing at all:
         // no code has been asked for and no record exists.
         let token_host = origin::token_host(api_url.as_deref());
-        let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
+        let plan = self
+            .github_save_plan_for(identity, token_host.as_deref())
+            .await?;
         let started = match &link {
             Some(_) => {
                 self.connect_auth
@@ -612,22 +615,6 @@ impl Engine {
         let verification_url = start.verification_url.clone();
         let expires_in_secs = start.expires_in_secs;
         let record_slot = outcome_slot.clone();
-        // A flow with no App link saves the token with no row to refuse it, so
-        // the account is asked right before the save. The owner and an agent
-        // identity have no account to ask about, and neither has an engine with
-        // no accounts store.
-        let must_exist = match (identity, self.domain_access.get()) {
-            (TokenIdentity::Personal(name), Some(access)) if name != OWNER_IDENTITY_NAME => {
-                let agent = self
-                    .config
-                    .read()
-                    .unwrap()
-                    .github_agent_identity()
-                    .map(str::to_string);
-                (agent.as_deref() != Some(name.as_str())).then(|| (access.clone(), name.clone()))
-            }
-            _ => None,
-        };
         let task = tokio::spawn(async move {
             let result: std::result::Result<String, (&'static str, RemoteError)> = async {
                 if let Some(flow) = link {
@@ -672,16 +659,6 @@ impl Engine {
                     expires_at: None,
                     refresh_expires_at: None,
                 };
-                if let Some((access, name)) = &must_exist
-                    && matches!(access.account_contact(name).await, Ok(None))
-                {
-                    return Err((
-                        "save",
-                        RemoteError::Refused(format!(
-                            "the account '{name}' no longer exists, so this sign-in saved nothing"
-                        )),
-                    ));
-                }
                 // The save touches the OS keychain, which is a blocking call
                 // with a bound but no cancellation: off the runtime's worker
                 // it goes, so a slow keychain cannot stall unrelated work.
@@ -801,12 +778,15 @@ impl Engine {
         }
         self.refuse_oauth_identity_under_app()?;
         let api_url = self.connect_api_url(None);
+        let token_host = origin::token_host(api_url.as_deref());
+        // Bound before GitHub is asked: the name may change hands while it answers.
+        let plan = self
+            .github_save_plan_for(&identity, token_host.as_deref())
+            .await?;
         let user = self
             .connect_auth
             .validate_token(api_url.as_deref(), token)
             .await?;
-        let token_host = origin::token_host(api_url.as_deref());
-        let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
         save_off_runtime(
             plan,
             StoredToken {
@@ -921,9 +901,10 @@ impl Engine {
     /// mutation this instance serves, and refusing it would leave the token in
     /// memory precisely where the instance can still write with it.
     ///
-    /// The pending device-flow record for the same identity is dropped too,
-    /// and for a person the spawned exchange is stopped with it, so it cannot
-    /// save a token later under a name that has changed hands.
+    /// The pending device-flow record for the same identity is dropped too, and
+    /// the spawned exchange is stopped with it. One that was already past that
+    /// point, or one started some other way, is refused at its save, because the
+    /// save asks whether the name still holds the same account.
     pub fn forget_cached_credential(&self, account: Option<&str>) -> Result<()> {
         let identity = match account {
             None => TokenIdentity::Instance,
@@ -935,15 +916,6 @@ impl Engine {
             .unwrap()
             .retain(|key, _| !key.starts_with(&prefix));
         self.forget_token_missing(&prefix);
-        // One person's flow is stopped, not only forgotten: it would save its
-        // token under a name that may belong to somebody else by then.
-        if account.is_some()
-            && let Some(flow) = self.pending_connect.lock().unwrap().as_ref()
-            && flow.identity == identity
-            && let Some(abort) = &flow.abort
-        {
-            abort.abort();
-        }
         self.clear_pending_for(&identity);
         // The CLI sends this when it removes an account, so a single-use
         // link that account still holds goes with it.
@@ -951,6 +923,14 @@ impl Engine {
             self.forget_github_link_invites(name);
         }
         Ok(())
+    }
+
+    /// [`Engine::forget_cached_credential`] for the CLI's message: it waits for a
+    /// token save in flight, so when this answers, what the CLI reads from the
+    /// store next is all there is.
+    pub async fn forget_cached_credential_settled(&self, account: Option<&str>) -> Result<()> {
+        let _settled = self.token_writes.lock().await;
+        self.forget_cached_credential(account)
     }
 
     // --- one account's GitHub link (GitHub App) -----------------------------
@@ -1194,6 +1174,31 @@ impl Engine {
         account: &str,
         grant: UserTokenGrant,
     ) -> Result<GithubLinkView> {
+        let born = self.account_born(account).await?;
+        self.link_github_begun(account, born, grant).await
+    }
+
+    /// When the account under `account` was made, `None` when the name holds
+    /// none or this process keeps no accounts. Something that takes a while asks
+    /// this when it begins and hands it to [`Engine::link_github_begun`].
+    pub async fn account_born(&self, account: &str) -> Result<Option<String>> {
+        match self.domain_access.get() {
+            Some(access) => access
+                .account_born(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Engine::link_github`] for a link that began earlier, when the name held
+    /// the account `born` says. Refused when it holds another by now.
+    pub async fn link_github_begun(
+        &self,
+        account: &str,
+        born: Option<String>,
+        grant: UserTokenGrant,
+    ) -> Result<GithubLinkView> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -1202,9 +1207,15 @@ impl Engine {
             app: self.link_app()?,
             access: self.link_access()?,
             account: account.to_string(),
+            born: born.clone(),
         };
         let token_host = self.github_token_host();
-        let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
+        let mut plan = self
+            .github_save_plan_for(&identity, token_host.as_deref())
+            .await?;
+        if let Some(owner) = &mut plan.owner {
+            owner.born = born;
+        }
         complete_link(&flow, token_host, plan, grant).await?;
         // A link settles this identity now: a device flow of this person's
         // still in flight must not land on top of it later.
@@ -1227,6 +1238,7 @@ impl Engine {
             app: self.link_app()?,
             access: self.link_access()?,
             account: account.to_string(),
+            born: self.account_born(account).await?,
         };
         self.begin_device_flow(&identity, None, false, Some(flow))
             .await?;
@@ -1331,6 +1343,7 @@ impl Engine {
     /// account made later under the same name cannot write on it. The token is
     /// revoked at GitHub when an App can do that, deleted where it lives, and
     /// every cached slot, device flow and single-use link of the name dropped.
+    /// Rooms open over its drafts save and close.
     ///
     /// Best effort in every direction, because the account is already gone: a
     /// failure is logged, never a refusal of the removal. A name no credential
@@ -1338,6 +1351,11 @@ impl Engine {
     /// same in the CLI process and tells a running daemon over the control
     /// socket (`sweep_personal_credential`), without the revoke.
     pub async fn forget_removed_account(&self, account: &str) {
+        // A socket can outlive its session. Its room saves into the draft now,
+        // which stays until an admin ends it, and nothing lands there later.
+        if let Some(rooms) = self.collab_rooms() {
+            rooms.close_drafts_of(account).await;
+        }
         if let Err(e) = self.sweep_account_credential(account).await {
             tracing::warn!(
                 "the GitHub token of the removed account {account} could not be deleted: {e}; it is tried again when an account is made under that name"
@@ -1345,30 +1363,45 @@ impl Engine {
         }
     }
 
-    /// The sentence an admin is refused a new account with while its name still
-    /// holds drafts, or `None` when it holds none: how many, where, and what to
-    /// do. For an admin only: it names domains and a command.
-    pub async fn new_account_draft_refusal(&self, account: &str) -> Result<Option<String>> {
-        let drafts = self.account_drafts(account).await?;
-        if drafts.is_empty() {
-            return Ok(None);
+    /// The one step every way of making an account takes first, while the name
+    /// holds no account: nothing another account left under the name may reach
+    /// the new one. A name with drafts is refused, a place that cannot be read
+    /// refuses too, links the old person gave on a draft end, and a GitHub token
+    /// left under the name goes. `Ok` means the name is clear.
+    ///
+    /// Before the account exists, so no second request can act as it in between,
+    /// and so a refusal leaves nothing to take back. A token write that began for
+    /// the old account is refused from here on, whatever it finds: no account, or
+    /// another one. Call this only for a name that holds no account: it deletes
+    /// what is saved under the name.
+    pub async fn clear_name_for_new_account(
+        &self,
+        account: &str,
+    ) -> std::result::Result<(), NewAccountRefusal> {
+        match self.account_drafts(account).await {
+            Ok(drafts) if drafts.is_empty() => {}
+            Ok(drafts) => {
+                let held = drafts
+                    .iter()
+                    .map(|(domain, entries)| format!("{entries} in {domain}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(NewAccountRefusal::Drafts(format!(
+                    "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them from the users screen, or with: crystalline users discard-drafts {account} (DELETE /api/v1/users/{account}/drafts), and add the account again"
+                )));
+            }
+            Err(e) => return Err(NewAccountRefusal::Unread(e.to_string())),
         }
-        let held = drafts
-            .iter()
-            .map(|(domain, entries)| format!("{entries} in {domain}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(Some(format!(
-            "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account} (DELETE /api/v1/users/{account}/drafts), and add the account again"
-        )))
-    }
-
-    /// An account was just made: nothing another account left under its name
-    /// may reach it, whether an earlier removal could not delete it or the
-    /// token landed afterwards. An error means a token is still there, and the
-    /// caller must not let the account act.
-    pub async fn forget_new_account_credential(&self, account: &str) -> Result<()> {
-        self.sweep_account_credential(account).await
+        if let Some(access) = self.domain_access.get()
+            && let Err(e) = access.end_overlay_grants_of_owner(account).await
+        {
+            return Err(NewAccountRefusal::Unread(format!(
+                "the draft links under this name could not be ended ({e:#})"
+            )));
+        }
+        self.sweep_account_credential(account)
+            .await
+            .map_err(|e| NewAccountRefusal::Token(e.to_string()))
     }
 
     /// What both ends of an account's life do: revoke the token when an App
@@ -1382,16 +1415,24 @@ impl Engine {
         };
         let host = self.github_token_host();
         let dropped = self.forget_cached_credential(Some(account));
+        // Every look and delete waits for a save in flight, and the revoke, which
+        // is a call to GitHub, holds nothing up.
+        let gate = self.token_writes.clone();
         for _ in 0..2 {
-            let (_, token) = self.github_credential_for(&identity, host.as_deref())?;
+            let token = {
+                let _settled = gate.lock().await;
+                self.github_credential_for(&identity, host.as_deref())?.1
+            };
             let Some(token) = token else {
                 return dropped;
             };
             if matches!(self.github_app_slot(), super::github_app::AppSlot::Ready(_)) {
                 self.revoke_user_token(account, &token).await;
             }
+            let _settled = gate.lock().await;
             self.forget_personal_token(&identity, host.as_deref())?;
         }
+        let _settled = gate.lock().await;
         let (_, token) = self.github_credential_for(&identity, host.as_deref())?;
         if token.is_some() {
             return Err(EngineError::Internal(format!(
@@ -1499,7 +1540,9 @@ impl Engine {
                     .await);
             }
         };
-        let plan = self.github_save_plan_for(&identity, host.as_deref())?;
+        let plan = self
+            .github_save_plan_for(&identity, host.as_deref())
+            .await?;
         let owner = account.to_string();
         let renewal = tokio::spawn(async move {
             // Held until the new pair is saved, so a share waiting for this
@@ -1524,6 +1567,9 @@ impl Engine {
             };
             match save_off_runtime(plan, renewed.clone()).await {
                 Ok(()) => tracing::info!("the GitHub token of {owner} was renewed"),
+                // The account this renewal began for is gone: nothing goes out
+                // on its token.
+                Err(refused @ RemoteError::Refused(_)) => return Err(refused),
                 Err(e) => tracing::error!(
                     "the GitHub token of {owner} was renewed but could not be saved ({e}); this share uses it, and {owner} may have to link GitHub again"
                 ),
@@ -1652,6 +1698,34 @@ impl LinkSetupReason {
             LinkSetupReason::NoPublicUrl => "no_public_url",
         }
     }
+
+    /// The cause in plain words, for a person who is not an admin: no command
+    /// line and no setting. Keep in step with `START_REASONS` in
+    /// `fluid/src/screens/Profile.tsx`, which says the same on the profile's
+    /// "Connect GitHub".
+    pub fn plain_sentence(self) -> &'static str {
+        match self {
+            LinkSetupReason::NoClientSecret => {
+                "The GitHub App on this instance has no client secret yet, so it cannot link \
+                 accounts. Ask an admin to add it."
+            }
+            LinkSetupReason::NoPublicUrl => {
+                "This instance does not know its public address yet, so GitHub cannot send you \
+                 back. Ask an admin to set it."
+            }
+            LinkSetupReason::AppUnusable => {
+                "The GitHub App on this instance is set up but cannot be used right now. Ask an \
+                 admin to check its settings."
+            }
+            LinkSetupReason::Keychain => {
+                "This instance cannot read the GitHub App's stored keys right now. Ask an admin to \
+                 check the server."
+            }
+            LinkSetupReason::NoApp => {
+                "This instance has no GitHub App yet. Ask an admin to set one up."
+            }
+        }
+    }
 }
 
 /// Why [`Engine::github_link_app_explained`] refused: the error every surface
@@ -1697,6 +1771,9 @@ pub(super) struct LinkFlow {
     app: Arc<crystalline_remote::GithubApp>,
     access: Arc<crate::scope::DomainAccess>,
     account: String,
+    /// When the account was made, read as the link began. See
+    /// [`crate::auth_store::AuthStore::link_github_if_born`].
+    born: Option<String>,
 }
 
 /// The link itself, shared by [`Engine::link_github`] and the device-flow
@@ -1714,10 +1791,17 @@ async fn complete_link(
     let user =
         crystalline_remote::github::auth::github_user(flow.app.api_url(), &grant.access_token)
             .await?;
+    let Some(born) = flow.born.as_deref() else {
+        return Err(EngineError::NotFound(format!(
+            "no such user: '{}'",
+            flow.account
+        )));
+    };
     let link = flow
         .access
-        .link_github(
+        .link_github_if_born(
             &flow.account,
+            born,
             &flow.app.credentials().host,
             user.id,
             &user.login,

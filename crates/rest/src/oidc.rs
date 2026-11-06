@@ -1605,6 +1605,14 @@ pub async fn callback(
     let user = resolve_oidc_identity(&state, claims, &identity).await;
     let user = match user {
         Ok(user) => user,
+        // A person's browser lands here, and only an admin can act on this.
+        Err(err)
+            if err.status == StatusCode::CONFLICT
+                && err.detail == crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN =>
+        {
+            let page = super::github_link::plain_page(err.status, "Sign in", &err.detail);
+            return Ok((jar, super::auth::no_store(), page).into_response());
+        }
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
@@ -2072,9 +2080,10 @@ async fn resolve_oidc_identity(
             .await?);
     }
     let derived = derive_account_name(&claims);
-    match state
-        .auth
-        .provision_linked_user(
+    match super::users_api::provision_clear(
+        state,
+        &derived,
+        state.auth.provision_linked_user(
             &claims.issuer,
             &claims.subject,
             &derived,
@@ -2082,13 +2091,11 @@ async fn resolve_oidc_identity(
             claims.email.as_deref(),
             settings.default_role(),
             state.auth_cfg.max_users,
-        )
-        .await
+        ),
+    )
+    .await?
     {
-        Ok(user) => {
-            super::users_api::sweep_new_account(state, &user.name, false).await?;
-            Ok(user)
-        }
+        Ok(user) => Ok(user),
         Err(err) => {
             // Two first sign-ins for one subject can race: both miss the
             // lookup, one provisions and the other's link is refused. The

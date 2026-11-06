@@ -15,6 +15,7 @@
 /// time so callers do not need to depend on `env!` directly.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod account;
 pub mod address;
 pub mod attachment;
 pub mod automation;

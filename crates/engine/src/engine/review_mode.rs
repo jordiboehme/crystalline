@@ -1,105 +1,268 @@
 use super::*;
 
 impl Engine {
-    /// What `account` holds in drafts, per domain: rows and files beside them,
-    /// counted by name and never read. Fails rather than answers "nothing" when
-    /// a domain cannot be asked.
+    /// What `account` holds in drafts, per domain, counted by name and never
+    /// read: rows, what only the journal holds so far (a sync would bring it
+    /// back), the files beside them, and the texts kept from its drafts. A
+    /// domain that does not review changes right now is asked too: its leftovers
+    /// come back if it reviews again.
+    ///
+    /// Fails rather than answers "nothing" when a place this name's drafts can
+    /// live in cannot be read, and names the domain. A folder only another
+    /// account's drafts live in is not such a place.
     pub async fn account_drafts(&self, account: &str) -> Result<Vec<(String, u64)>> {
-        let names: Vec<String> = self
-            .config
-            .read()
-            .unwrap()
-            .domains
-            .keys()
-            .cloned()
-            .collect();
-        let mut out = Vec::new();
-        for name in names {
-            let counts = self.overlay_counts_by_actor(&name).await.ok_or_else(|| {
-                EngineError::Internal(format!("the drafts of domain '{name}' could not be read"))
-            })?;
-            if let Some((_, entries)) = counts.iter().find(|(actor, n)| actor == account && *n > 0)
-            {
-                out.push((name, *entries));
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        for domain in self.registered_domain_names() {
+            let entries = self
+                .drafts_in_domain(&domain, account)
+                .await
+                .map_err(|why| {
+                    tracing::warn!(domain = %domain, "the drafts of '{account}' could not be read: {why}");
+                    EngineError::Internal(format!(
+                        "the drafts of domain '{domain}' could not be read"
+                    ))
+                })?;
+            if entries > 0 {
+                held.insert(domain, entries);
             }
         }
-        out.sort();
-        Ok(out)
+        for kept in self.kept_held_by(account)? {
+            *held.entry(kept.domain).or_default() += 1;
+        }
+        // A room still open over a draft saves into it when it closes, so it
+        // counts even before it has saved anything.
+        if let Some(rooms) = self.collab_rooms() {
+            for domain in rooms.draft_rooms_of(account).await {
+                held.entry(domain).or_insert(1);
+            }
+        }
+        Ok(held.into_iter().collect())
     }
 
-    /// An admin's explicit end of every draft a name still holds, for a removed
-    /// account whose name is wanted again. Nothing calls this but that admin
-    /// action, and it is logged with who asked. A draft open in a live editor is
-    /// left and named: the room's own save would write it straight back. Each
+    /// What `account` holds in one domain's rows, journal and files.
+    async fn drafts_in_domain(
+        &self,
+        domain: &str,
+        account: &str,
+    ) -> std::result::Result<u64, String> {
+        let rows = {
+            let store = self.store.lock().await;
+            match store.domain_id(domain).await.map_err(|e| e.to_string())? {
+                Some(id) => store
+                    .overlay_paths(id, account)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len() as u64,
+                None => 0,
+            }
+        };
+        let state_dir = match self.journal_state_dir() {
+            Ok(state_dir) => state_dir,
+            // A process with no state directory never wrote an overlay. Only a
+            // domain that reviews changes makes that an unknown.
+            Err(_) if !self.reviews_changes(domain) => return Ok(rows),
+            Err(e) => return Err(e.to_string()),
+        };
+        let (journal, journal_unreadable) =
+            crate::overlay_journal::journal_actor_count(&state_dir, domain, account);
+        let files = crate::overlay_files::actor_entries(&state_dir, domain, account);
+        if journal_unreadable || files.unreadable {
+            return Err("its overlay folder could not be read".to_string());
+        }
+        // The journal mirrors the rows, so one draft is not two.
+        Ok(rows.max(journal) + files.entries.len() as u64)
+    }
+
+    /// An admin's explicit end of everything a removed account's name still
+    /// holds in drafts, so the name can be used again. Nothing calls this but
+    /// that admin action.
+    ///
+    /// Refuses the machine owner, whose drafts are live work, and a name with an
+    /// account, whose drafts are that person's own. The check is here so every
+    /// caller meets it.
+    ///
+    /// The line that says who asked is logged before anything goes, and one line
+    /// per domain says what finished. A domain never stops the others: one this
+    /// instance does not host is reported with `not_hosted`, and one that fails
+    /// half way is reported with `error` and what went before the failure.
+    ///
+    /// A draft open in a live editor is left and named, and then the files beside
+    /// it stay too: the room's own save would write the draft straight back. Each
     /// row goes the way a discard takes it, so its journal entry and the links
-    /// its owner gave to others go with it.
+    /// its owner gave to others go with it. Kept texts are deleted, not set
+    /// aside, since a text set aside could still be read on this machine by name.
     pub async fn discard_account_drafts(&self, account: &str, by: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        let account = crate::auth_store::normalize_account_name(account)
+            .map_err(|e| EngineError::Invalid(format!("{e:#}")))?;
+        let account = account.as_str();
+        if account == OWNER_IDENTITY_NAME {
+            return Err(EngineError::Conflict(format!(
+                "'{account}' is the name this machine's own work is filed under, and its drafts are live work; this is for a name whose account was removed"
+            )));
+        }
+        if let Some(access) = self.domain_access.get()
+            && access
+                .account_born(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?
+                .is_some()
+        {
+            return Err(EngineError::Conflict(format!(
+                "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
+            )));
+        }
+        let kept_read = self.kept_held_by(account);
+        let kept_error = kept_read.as_ref().err().map(ToString::to_string);
+        let kept = kept_read.unwrap_or_default();
+        let mut names: BTreeSet<String> = self.registered_domain_names().into_iter().collect();
+        names.extend(kept.iter().map(|k| k.domain.clone()));
+        tracing::warn!(
+            account,
+            by,
+            domains = names.len(),
+            "an admin is ending the drafts of a removed account"
+        );
         let mut domains = Vec::new();
-        for (domain, entries) in self.account_drafts(account).await? {
-            let lock = self.origin_lock_registered(&domain)?;
-            let _guard = lock.lock().await;
-            self.require_file_host(&domain, &crate::scope::Scope::Unrestricted)
-                .await?;
-            let domain_id = {
-                let store = self.store.lock().await;
-                store.domain_id(&domain).await?
+        for domain in names {
+            let own_kept: Vec<&crystalline_core::kept::KeptText> =
+                kept.iter().filter(|k| k.domain == domain).collect();
+            let registered = self.registered_domain_names().contains(domain.as_str());
+            // A read that fails is no reason to skip the domain: it may be only
+            // one folder, and the discard reports what it could not do.
+            let held = match registered {
+                true => self.drafts_in_domain(&domain, account).await,
+                false => Ok(0),
             };
+            if matches!(held, Ok(0)) && own_kept.is_empty() {
+                continue;
+            }
             let mut discarded = 0u64;
             let mut left: Vec<String> = Vec::new();
-            if let Some(domain_id) = domain_id {
-                let paths = {
-                    let store = self.store.lock().await;
-                    store.overlay_paths(domain_id, account).await?
-                };
-                let view = crate::domain_view::DomainView::for_actor(
-                    self,
-                    &domain,
-                    &HashSet::new(),
-                    account,
-                )?;
-                for (path, _tombstone) in paths {
-                    let held = {
-                        let store = self.store.lock().await;
-                        store.overlay_entry(domain_id, account, &path).await?
-                    };
-                    let open = match (self.collab_rooms(), &held) {
-                        (Some(rooms), Some(held)) => {
-                            rooms
-                                .has_live_room(&domain, &held.permalink, Some(account))
-                                .await
-                        }
-                        _ => false,
-                    };
-                    if open {
-                        left.push(path);
-                        continue;
-                    }
-                    view.drop(domain_id, &path).await?;
-                    discarded += 1;
+            let mut failed = self.drop_kept(&own_kept, &mut discarded).err();
+            let mut not_hosted = false;
+            if registered && !matches!(held, Ok(0)) {
+                match self
+                    .discard_in_domain(&domain, account, &mut discarded, &mut left)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) if super::fence::is_file_host_refusal(&e) => not_hosted = true,
+                    Err(e) => failed = failed.or(Some(e)),
                 }
             }
-            let state_dir = self.journal_state_dir()?;
-            discarded += crate::overlay_files::remove_actor(&state_dir, &domain, account).map_err(
-                |source| EngineError::Io {
-                    path: domain.clone(),
-                    source,
-                },
-            )?;
             tracing::warn!(
                 account,
                 by,
                 domain = %domain,
-                held = entries,
                 discarded,
                 left = left.len(),
-                "an admin discarded the drafts of a removed account"
+                not_hosted,
+                failed = failed.as_ref().map(ToString::to_string),
+                "the end of a removed account's drafts in this domain"
             );
-            domains.push(json!({ "domain": domain, "discarded": discarded, "left": left }));
+            let mut row = json!({ "domain": domain, "discarded": discarded, "left": left });
+            if not_hosted {
+                row["not_hosted"] = json!(true);
+                row["where"] = json!(
+                    "Another instance hosts this domain. Run this there, or the name stays refused."
+                );
+            }
+            if let Some(e) = failed {
+                row["error"] = json!(e.to_string());
+            }
+            domains.push(row);
         }
-        Ok(json!({ "account": account, "domains": domains }))
+        let mut report = json!({ "account": account, "domains": domains });
+        if let Some(error) = kept_error {
+            report["error"] = json!(error);
+        }
+        Ok(report)
+    }
+
+    /// Delete `kept`, counting each one as it goes.
+    fn drop_kept(
+        &self,
+        kept: &[&crystalline_core::kept::KeptText],
+        discarded: &mut u64,
+    ) -> Result<()> {
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let root = self.kept_dir().ok_or_else(|| {
+            EngineError::Internal("this process knows no state folder".to_string())
+        })?;
+        for text in kept {
+            crystalline_core::kept::remove(&root, text).map_err(|source| EngineError::Io {
+                path: text.file.display().to_string(),
+                source,
+            })?;
+            *discarded += 1;
+        }
+        Ok(())
+    }
+
+    /// One domain's half of [`Engine::discard_account_drafts`]. `discarded` and
+    /// `left` hold what happened even when this fails half way.
+    async fn discard_in_domain(
+        &self,
+        domain: &str,
+        account: &str,
+        discarded: &mut u64,
+        left: &mut Vec<String>,
+    ) -> Result<()> {
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        self.require_file_host(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        if let Some(domain_id) = domain_id {
+            let paths = {
+                let store = self.store.lock().await;
+                store.overlay_paths(domain_id, account).await?
+            };
+            let view =
+                crate::domain_view::DomainView::for_actor(self, domain, &HashSet::new(), account)?;
+            for (path, _tombstone) in paths {
+                let held = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, account, &path).await?
+                };
+                let open = match (self.collab_rooms(), &held) {
+                    (Some(rooms), Some(held)) => {
+                        rooms
+                            .has_live_room(domain, &held.permalink, Some(account))
+                            .await
+                    }
+                    _ => false,
+                };
+                if open {
+                    left.push(path);
+                    continue;
+                }
+                view.drop(domain_id, &path).await?;
+                *discarded += 1;
+            }
+        }
+        // While a draft stays because it is open, its files stay beside it.
+        if !left.is_empty() {
+            return Ok(());
+        }
+        let state_dir = self.journal_state_dir()?;
+        let io = |source| EngineError::Io {
+            path: domain.to_string(),
+            source,
+        };
+        *discarded +=
+            crate::overlay_files::remove_actor(&state_dir, domain, account).map_err(io)?;
+        *discarded += crate::overlay_journal::journal_remove_actor(&state_dir, domain, account)
+            .map_err(io)?;
+        Ok(())
     }
 
     // --- review mode -------------------------------------------------------

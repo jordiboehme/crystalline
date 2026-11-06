@@ -189,6 +189,15 @@ pub(super) async fn run_one(
         domain,
         token: &token,
     };
+    // A run that could not share its work does not start, unless it was not going
+    // to share anyway.
+    if !args.no_share
+        && let Some(refused) = take["share_refused"].as_str()
+    {
+        return lease
+            .fail_and_err(&started, anyhow::anyhow!("{refused}"), stop.clone())
+            .await;
+    }
 
     let (log_path, log) = match open_log(args.log_dir.as_deref(), lp, domain, &started) {
         Ok(opened) => opened,
@@ -326,7 +335,8 @@ async fn share_changes(
             Ok(answer) => (Some(answer), None),
             Err(e) => {
                 eprintln!("Sharing the run's changes failed: {e:#}");
-                (None, Some(share_failure(lease.domain, &format!("{e:#}"))))
+                let remote = matches!(lease.client, AutomationClient::Remote(_));
+                (None, Some(share_failure(lease.domain, &format!("{e:#}"), remote)))
             }
         },
         _ = stop.wait_for(|stopped| *stopped) => {
@@ -344,7 +354,15 @@ const RUN_NOT_SHARED: &str =
 /// What the operator of a run reads about a share that failed: that the changes
 /// stayed here, why, and the fix. Later runs do not pick these files up,
 /// so the last sentence is the way they still reach the team.
-fn share_failure(domain: &str, error: &str) -> String {
+///
+/// A remote runner's token need not be an admin's, so it reads only the reason,
+/// which the server already put in plain words.
+fn share_failure(domain: &str, error: &str, remote: bool) -> String {
+    if remote {
+        return format!(
+            "The run's changes were not shared and stay on the server: {error} An admin can share them once that is fixed."
+        );
+    }
     let mut text = format!("The run's changes were not shared and stay on this machine: {error}");
     if error.contains("personal GitHub identities") {
         text.push_str(
@@ -859,13 +877,21 @@ mod tests {
         let text = share_failure(
             "kb",
             "This instance shares with personal GitHub identities through its GitHub App.",
+            false,
         );
         assert!(text.contains("not shared"), "{text}");
         assert!(text.contains("through its GitHub App"), "{text}");
         assert!(text.contains("github.share_identity to instance"), "{text}");
         assert!(text.ends_with("crystalline origin share kb"), "{text}");
-        let other = share_failure("kb", "GitHub could not be reached");
+        let other = share_failure("kb", "GitHub could not be reached", false);
         assert!(!other.contains("github.share_identity"), "{other}");
+        let remote = share_failure(
+            "kb",
+            "This instance shares with personal GitHub identities through its GitHub App.",
+            true,
+        );
+        assert!(!remote.contains("github.share_identity"), "{remote}");
+        assert!(!remote.contains("crystalline "), "{remote}");
     }
 
     fn summary(done: u64) -> RunSummary {

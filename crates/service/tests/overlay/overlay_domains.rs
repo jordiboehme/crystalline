@@ -7118,7 +7118,7 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "start_device_connect"),
         ("engine.rs", "start_github_identity_device_flow"),
         // A person's GitHub link: a credential and an accounts row.
-        ("engine.rs", "link_github"),
+        ("engine.rs", "link_github_begun"),
         ("engine.rs", "mint_github_link"),
         ("engine.rs", "start_github_link_device_flow"),
         ("engine.rs", "unlink_github"),
@@ -7173,7 +7173,7 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         // An admin's explicit end of the drafts a removed account left: the
         // name comes from an admin-only route with no account under it, and it
         // answers no reader.
-        ("engine.rs", "discard_account_drafts"),
+        ("engine.rs", "discard_in_domain"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
         // A `#[cfg(test)]` unit test standing in for an open co-editing room,
@@ -9586,4 +9586,358 @@ async fn a_removed_accounts_drafts_stay_and_only_an_admin_ends_them() {
     )
     .await;
     assert_eq!(status, 201, "{answer}");
+}
+
+async fn new_account(
+    addr: std::net::SocketAddr,
+    admin: &(String, String),
+    name: &str,
+) -> (u16, serde_json::Value) {
+    let (status, answer) = users_call(
+        addr,
+        admin,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(serde_json::json!({ "name": name, "password": "pw12345678", "role": "editor" })),
+    )
+    .await;
+    (status, answer)
+}
+
+async fn remove_account(addr: std::net::SocketAddr, admin: &(String, String), name: &str) {
+    let (status, answer) = users_call(
+        addr,
+        admin,
+        reqwest::Method::DELETE,
+        &format!("/api/v1/users/{name}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "{answer}");
+}
+
+/// A text kept from a review draft goes to the draft's owner only, matched by
+/// name, so it counts as a draft: a new account is refused, the sentence shows
+/// no word of it, and only an admin's discard ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_text_of_a_removed_account_never_reaches_a_new_one() {
+    let (f, addr, auth) = served_review_instance().await;
+    for (who, role) in [("root", Role::Admin), ("ada", Role::Editor)] {
+        auth.add_user(who, who, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    let kept_root = f.state.join("kept");
+    crystalline_core::kept::write(
+        &kept_root,
+        "team",
+        Some("ada"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        chrono::Utc::now(),
+        "OLD ADA PRIVATE TEXT",
+    )
+    .unwrap();
+    // A comment she sent, which her reading right alone reaches.
+    let comment = crystalline_core::kept::write(
+        &kept_root,
+        "team",
+        None,
+        crystalline_core::kept::KeptKind::Comment,
+        "page.md",
+        chrono::Utc::now(),
+        "OLD ADA COMMENT",
+    )
+    .unwrap();
+    crystalline_core::kept::record_sender(
+        &comment,
+        &crystalline_core::kept::Sender {
+            account: "ada".to_string(),
+            name: "Ada".to_string(),
+        },
+    )
+    .unwrap();
+
+    let root = sign_in(addr, "root").await;
+    remove_account(addr, &root, "ada").await;
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 2)]
+    );
+
+    // A new account is refused, and the sentence shows no word of the text.
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    if status == 201 {
+        // What the review ran: the new account reads the old person's words.
+        let ada = sign_in(addr, "ada").await;
+        let (_, kept) = users_call(
+            addr,
+            &ada,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/kept",
+            None,
+        )
+        .await;
+        let draft = kept["kept"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|k| k["draft"] == true);
+        let id = draft.map_or("", |k| k["id"].as_str().unwrap_or_default());
+        let (_, read) = users_call(
+            addr,
+            &ada,
+            reqwest::Method::GET,
+            &format!("/api/v1/domains/team/kept/{id}"),
+            None,
+        )
+        .await;
+        panic!("the new account was made and reads: {read}");
+    }
+    assert_eq!(status, 409, "{answer}");
+    assert!(!answer.to_string().contains("PRIVATE"), "{answer}");
+
+    // The way out ends them.
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["domains"][0]["discarded"], 2, "{report}");
+    assert!(
+        crystalline_core::kept::held_by(&kept_root, "ada")
+            .unwrap()
+            .is_empty()
+    );
+
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 201, "{answer}");
+    let ada = sign_in(addr, "ada").await;
+    let (status, kept) = users_call(
+        addr,
+        &ada,
+        reqwest::Method::GET,
+        "/api/v1/domains/team/kept",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{kept}");
+    assert!(!kept.to_string().contains("plan.md"), "{kept}");
+}
+
+/// The machine owner never has a row in `users`, so a check that only asks about
+/// accounts lets it through. Its drafts are live work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_machine_owners_drafts_are_not_a_removed_accounts() {
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let root = sign_in(addr, "root").await;
+    for name in ["owner", "OWNER"] {
+        let (status, answer) = users_call(
+            addr,
+            &root,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/users/{name}/drafts"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 409, "{answer}");
+    }
+    // The engine itself refuses, so the control socket gets the same answer.
+    let refused = f.engine.discard_account_drafts("owner", "owner").await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        f.engine.account_drafts("owner").await.unwrap(),
+        vec![("team".to_string(), 1)]
+    );
+}
+
+/// The engine's own check refuses a live account for every caller, whichever
+/// route brought it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_refuses_to_discard_a_live_accounts_drafts() {
+    let (f, _addr, auth) = served_review_instance().await;
+    auth.add_user("ada", "ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    let refused = f.engine.discard_account_drafts("ada", "owner").await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(f.engine.account_drafts("ada").await.unwrap().len(), 1);
+}
+
+/// One unreadable folder used to refuse every new name on the instance. A folder
+/// only somebody else's drafts live in now refuses only that somebody. A folder
+/// every name's drafts live under still refuses, and the admin reads which domain
+/// and where to look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_folder_refuses_only_the_names_it_can_hold() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.file("team", "bob", "assets/deck.png", DECK_PNG).await;
+    let root = sign_in(addr, "root").await;
+    let domain_folder = f.state.join("overlays/team");
+    let bobs = domain_folder.join("bob");
+    let set = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    set(&bobs, 0o000);
+    let (cleo, cleo_answer) = new_account(addr, &root, "cleo").await;
+    let (bob, bob_answer) = new_account(addr, &root, "bob").await;
+    set(&bobs, 0o755);
+    assert_eq!(cleo, 201, "{cleo_answer}");
+    assert_eq!(bob, 500, "{bob_answer}");
+
+    set(&domain_folder, 0o000);
+    let (dana, dana_answer) = new_account(addr, &root, "dana").await;
+    set(&domain_folder, 0o755);
+    assert_eq!(dana, 500, "{dana_answer}");
+    let detail = dana_answer["detail"].as_str().unwrap();
+    assert!(detail.contains("'team'"), "{detail}");
+    assert!(detail.contains("log"), "{detail}");
+    assert!(!detail.contains("try again"), "{detail}");
+}
+
+/// Every place a draft can live counts: what only the journal holds so far, which
+/// a sync brings back, and what a domain that stopped reviewing still holds, which
+/// comes back if it reviews again. The discard ends both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_count_sees_the_journal_and_a_domain_that_stopped_reviewing() {
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let root = sign_in(addr, "root").await;
+
+    // A draft only in the journal: no row, and a sync would make one.
+    overlay_journal::journal_write(&f.state, "team", "ada", "only-here.md", ALICE_DRAFT).unwrap();
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 1)]
+    );
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 409, "{answer}");
+
+    // A file left while the domain no longer reviews.
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("ada", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let leftover = f.state.join("overlays/team/ada/files/assets");
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join("deck.png"), DECK_PNG).unwrap();
+    assert!(
+        !f.engine.account_drafts("ada").await.unwrap().is_empty(),
+        "the leftover counts"
+    );
+
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert!(f.engine.account_drafts("ada").await.unwrap().is_empty());
+    assert!(!f.state.join("overlays/team/ada").exists());
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 201, "{answer}");
+}
+
+/// A discard that fails half way says what went, and a domain with a failure does
+/// not stop the next. The drafts stay counted, so the name stays refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discard_that_fails_half_way_says_what_went() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    let root = sign_in(addr, "root").await;
+    let files = f.state.join("overlays/team/ada/files/assets");
+    assert!(files.is_dir(), "the fixture's layout");
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, 200, "{report}");
+    let row = &report["domains"][0];
+    assert_eq!(
+        row["discarded"], 1,
+        "the draft went before the failure: {report}"
+    );
+    assert!(row["error"].is_string(), "{report}");
+    assert!(!f.engine.account_drafts("ada").await.unwrap().is_empty());
+}
+
+/// A socket can outlive its session. A room over a removed account's draft saves
+/// and closes at the removal, and one still open counts, so what is typed there
+/// never lands on a new account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_room_over_a_removed_accounts_draft_keeps_the_name_refused() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    let _joined = sessions.join("team", "plan", Some("ada")).await.unwrap();
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 1)],
+        "the open room counts"
+    );
+    assert!(f.engine.clear_name_for_new_account("ada").await.is_err());
+    f.engine.forget_removed_account("ada").await;
+    assert_eq!(sessions.session_count().await, 0, "the removal closed it");
+}
+
+/// A draft left because it is open keeps the files beside it: the live editor
+/// still needs them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_left_open_keeps_its_files() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    let _joined = sessions.join("team", "plan", Some("ada")).await.unwrap();
+
+    let report = f
+        .engine
+        .discard_account_drafts("ada", "root")
+        .await
+        .unwrap();
+    assert_eq!(report["domains"][0]["left"][0], "plan.md", "{report}");
+    assert!(
+        f.state
+            .join("overlays/team/ada/files/assets/deck.png")
+            .exists(),
+        "{report}"
+    );
+    assert!(!f.engine.account_drafts("ada").await.unwrap().is_empty());
 }

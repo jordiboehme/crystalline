@@ -313,7 +313,9 @@ fn a_refused_share_is_in_the_recorded_run_and_the_json() {
     let error = answer["share_error"].as_str().unwrap_or_default();
     assert!(error.contains(refusal), "{answer}");
     assert!(error.contains("not shared"), "{answer}");
-    assert!(error.contains("origin share brand"), "{answer}");
+    // A remote runner's token need not be an admin's: no command line for it.
+    assert!(!error.contains("crystalline "), "{answer}");
+    assert!(!error.contains("github."), "{answer}");
     // The recorded run is read by anybody who may run the loop: plain words,
     // no command line and no setting.
     let summary = answer["run"]["summary"].as_str().unwrap_or_default();

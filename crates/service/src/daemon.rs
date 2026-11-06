@@ -648,19 +648,8 @@ pub async fn run_serve(
     // it opens is dropped inside, so `setup_token_for`'s own open is the only
     // handle left. A refused configuration fails the start here, with a
     // sentence that never carries the password.
-    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
-    // A new account never stands on a GitHub token left under its name.
-    if let Some(created) = &created_admin {
-        engine
-            .forget_new_account_credential(&created.name)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "a GitHub token left under '{}' could not be deleted: {e}",
-                    created.name
-                )
-            })?;
-    }
+    let created_admin =
+        crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
     let setup_token = match http_addr.as_deref() {
         Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,

@@ -412,6 +412,36 @@ pub fn journal_counts(state_dir: &Path, domain: &str) -> JournalCounts {
     }
 }
 
+/// How many drafts one actor's folder holds in the journal, and whether anything
+/// in it could not be read. Only that actor's folder is walked, so another
+/// actor's folder that cannot be read says nothing about this one. A name that
+/// cannot address a folder holds nothing here.
+pub fn journal_actor_count(state_dir: &Path, domain: &str, actor: &str) -> (u64, bool) {
+    let Ok(dir) = actor_dir(state_dir, domain, actor) else {
+        return (0, false);
+    };
+    if matches!(std::fs::read_dir(&dir), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return (0, false);
+    }
+    let mut found = Vec::new();
+    let unreadable = collect(&dir, "", actor, false, &mut found);
+    (found.len() as u64, unreadable)
+}
+
+/// Remove one actor's whole folder in a domain: what is mirrored and the files
+/// beside it. Answers how many mirrored drafts went.
+pub fn journal_remove_actor(state_dir: &Path, domain: &str, actor: &str) -> io::Result<u64> {
+    let Ok(dir) = actor_dir(state_dir, domain, actor) else {
+        return Ok(0);
+    };
+    let (held, _) = journal_actor_count(state_dir, domain, actor);
+    match crystalline_core::tree::remove_tree(&dir) {
+        Ok(true) => Ok(held),
+        Ok(false) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The one walk both readers run. `read_content` is the only difference: with
 /// it off, every entry comes back with `content: None` and no file is opened,
 /// so a tombstone and a draft are indistinguishable in the result - which is

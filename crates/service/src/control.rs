@@ -635,13 +635,6 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
-        // A credential the CLI just deleted from this machine's store, so this
-        // daemon stops serving the deleted token out of its process cache.
-        // `account` absent or null is this machine's own credential; a string
-        // is one person's. Nothing is deleted here - the delete already
-        // happened in the process that sent this - and nothing is refused on a
-        // read-only instance, since dropping a cached secret is not a mutation
-        // this instance serves.
         // The drafts a name holds, and an admin's explicit end of them: the
         // machine owner's, so not on the remote allow list.
         "account_drafts" => {
@@ -672,12 +665,23 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // A credential the CLI just deleted from this machine's store, so this
+        // daemon stops serving the deleted token out of its process cache.
+        // `account` absent or null is this machine's own credential; a string
+        // is one person's. Nothing is deleted here - the delete already
+        // happened in the process that sent this - and nothing is refused on a
+        // read-only instance, since dropping a cached secret is not a mutation
+        // this instance serves.
         "forget_credential" => {
             let account = match optional_account(req, "account") {
                 Ok(account) => account,
                 Err(message) => return (envelope_err(message), false),
             };
-            match shared.engine.forget_cached_credential(account.as_deref()) {
+            match shared
+                .engine
+                .forget_cached_credential_settled(account.as_deref())
+                .await
+            {
                 Ok(()) => (
                     envelope_ok(json!({
                         "forgotten": account.as_deref().unwrap_or("instance"),

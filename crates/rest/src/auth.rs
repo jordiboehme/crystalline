@@ -607,9 +607,16 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
         // The store folds the name, so a proxy that sends `Ada` today and `ada`
         // tomorrow keeps one account, and it hands disabled accounts back like
         // any other: refusing them is this layer's job.
-        let (user, created) = state
+        // Before the account exists, so a second request for the same newcomer
+        // takes the same step and never acts ahead of it.
+        // Past the account cap the store refuses a new name anyway, so a proxy
+        // that sends a new value on every request costs no walk of the drafts.
+        if state.auth.user_count().await? < state.auth_cfg.max_users {
+            super::users_api::clear_name_for_new_account(state, value, false).await?;
+        }
+        let user = state
             .auth
-            .ensure_user_created(value, Role::Viewer, state.auth_cfg.max_users)
+            .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
             .await
             .map_err(|e| {
                 // The header named an identity this instance will not
@@ -623,9 +630,6 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
                     _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
-        if created {
-            super::users_api::sweep_new_account(state, &user.name, false).await?;
-        }
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
@@ -984,9 +988,10 @@ async fn provision_forwarded_user(
     display: Option<&str>,
     email: Option<&str>,
 ) -> Result<User, ApiError> {
-    let provisioned = state
-        .auth
-        .provision_linked_user(
+    let provisioned = super::users_api::provision_clear(
+        state,
+        &desired_account_name(subject),
+        state.auth.provision_linked_user(
             PROXY_ISSUER,
             subject,
             &desired_account_name(subject),
@@ -994,13 +999,11 @@ async fn provision_forwarded_user(
             email,
             state.auth_cfg.proxy_role,
             state.auth_cfg.max_users,
-        )
-        .await;
+        ),
+    )
+    .await?;
     match provisioned {
-        Ok(user) => {
-            super::users_api::sweep_new_account(state, &user.name, false).await?;
-            Ok(user)
-        }
+        Ok(user) => Ok(user),
         Err(err) => {
             if let Some(user) = state.auth.linked_user(PROXY_ISSUER, subject).await? {
                 return Ok(user);
@@ -1803,6 +1806,7 @@ pub async fn setup(
     }
     super::check_password(&body.password)?;
     authorize_setup(&state, peer, &headers, body.token.as_deref())?;
+    super::users_api::clear_name_for_new_account(&state, &body.name, true).await?;
     // The login name as typed makes the better display name, matching
     // `users_api::create`: the store folds the login name and keeps this one.
     let display = body.name.trim().to_string();
@@ -1821,7 +1825,6 @@ pub async fn setup(
         // it, and the answer is the one every later caller gets.
         return Err(gone());
     }
-    super::users_api::sweep_new_account(&state, &body.name, true).await?;
     let user = super::users_api::read_back(&state, &body.name).await?;
     sign_in(&state, jar, &headers, user).await
 }

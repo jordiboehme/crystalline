@@ -1261,6 +1261,9 @@ pub struct Engine {
     // token on use, and a second exchange of the same one would be refused
     // and cost the person their token. See `Engine::personal_user_token`.
     personal_refresh: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held across a personal token's check and save, and across a sweep's
+    /// delete, so a save that passed its check ends before a sweep looks.
+    token_writes: Arc<tokio::sync::Mutex<()>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -1862,7 +1865,7 @@ const PERSON_LINK_MISSING: &str = "This instance shares with personal GitHub ide
 /// nobody to resolve a credential for until an admin names the account those
 /// shares run as - which is what this message teaches, rather than reporting a
 /// missing token for an identity the caller never chose.
-const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured. Ask an admin to name the account agents share as, or share from Fluid or the CLI.";
 
 /// The [`TokenIdentity`] one account's personal credential lives under, or the
 /// teaching refusal for a name that cannot address a credential at all.
@@ -2551,6 +2554,7 @@ impl Engine {
             github_tokens: Arc::default(),
             github_tokens_missing: std::sync::Mutex::default(),
             personal_refresh: std::sync::Mutex::default(),
+            token_writes: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
@@ -7594,7 +7598,7 @@ mod move_;
 mod name_report;
 mod names;
 mod origins;
-pub use origins::READERS_REQUIRED;
+pub use origins::{READERS_REQUIRED, leave_out_for_non_admin};
 mod read;
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};
@@ -7915,6 +7919,17 @@ struct PendingConnect {
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
 }
 
+/// A flow whose record goes is stopped with it, on every path: a task left
+/// running would save its token later, under a name that may have changed hands
+/// by then.
+impl Drop for PendingConnect {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
 impl PendingConnect {
     /// How many seconds of this code's life are left, saturating at 0. The
     /// one place the countdown is computed, so the MCP view and the REST one
@@ -7961,6 +7976,44 @@ struct TokenSavePlan {
     /// The engine's token cache, refreshed after a successful write so the
     /// next `github_credential` serves the new identity with no keychain read.
     cache: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    /// The account this write belongs to, for a person's credential on an
+    /// engine that keeps accounts. [`save_off_runtime`] asks it before the save.
+    owner: Option<TokenOwner>,
+    /// Held across the check and the save. See [`Engine::token_writes`].
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Which account a personal token write began for. The name alone says nothing:
+/// a name can be freed and made again while a sign-in or a renewal is running.
+#[derive(Clone)]
+struct TokenOwner {
+    access: Arc<crate::scope::DomainAccess>,
+    name: String,
+    /// [`crate::auth_store::AuthStore::account_born`] when the write began.
+    born: Option<String>,
+    /// The machine owner and an agent identity with no account: a name with no
+    /// account is right for them, as long as it stays that way.
+    no_account_is_right: bool,
+}
+
+impl TokenOwner {
+    /// Refuses unless the name still holds the account the write began for. A
+    /// read that fails refuses too: a token never lands on a guess.
+    async fn refuse_if_changed(&self) -> std::result::Result<(), RemoteError> {
+        let name = &self.name;
+        let now = self.access.account_born(name).await.map_err(|e| {
+            tracing::warn!("the account '{name}' could not be read before a token save: {e:#}");
+            RemoteError::Refused(format!(
+                "the account '{name}' could not be read, so this sign-in saved nothing"
+            ))
+        })?;
+        if now == self.born && (now.is_some() || self.no_account_is_right) {
+            return Ok(());
+        }
+        Err(RemoteError::Refused(format!(
+            "the account '{name}' no longer exists, so this sign-in saved nothing"
+        )))
+    }
 }
 
 /// Where a [`TokenSavePlan`] writes: a fixed file under a test override, or a
@@ -7997,24 +8050,81 @@ fn identity_label(identity: &TokenIdentity) -> String {
 /// unwrapped: the caller is a background flow whose whole job is to land an
 /// outcome, and a task that disappeared without one is exactly the silence
 /// this change exists to remove.
+///
+/// **The one place a token write is checked**, so every late writer meets it: a
+/// device flow, a link, a pasted token, a renewal. The gate is held across the
+/// check and the save and travels into the blocking closure, so a caller that is
+/// aborted in the middle does not let a sweep run beside a save that has started.
+///
+/// The check runs a second time after the save, for what the gate cannot see:
+/// `crystalline users remove` in another process. A token that lost that race is
+/// taken back out.
 async fn save_off_runtime(
     plan: TokenSavePlan,
     token: StoredToken,
 ) -> std::result::Result<(), RemoteError> {
+    let held = Arc::new(plan.gate.clone().lock_owned().await);
+    let owner = plan.owner.clone();
+    if let Some(owner) = &owner {
+        owner.refuse_if_changed().await?;
+    }
     // Where the token landed is only known after the write - `save_resolving`
     // falls through to the file store on its own - so the line is emitted
     // here, back on the runtime, rather than inside the blocking closure.
     // Both connect paths save through this function, so both get the line.
     let identity = identity_label(&plan.identity);
-    match tokio::task::spawn_blocking(move || plan.save(&token)).await {
+    let cache = plan.cache.clone();
+    let key = credential_cache_key(&plan.identity, plan.host.as_deref());
+    let written = token.access_token.clone();
+    let in_save = held.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let _held = in_save;
+        plan.save(&token)
+    })
+    .await;
+    match saved {
         Ok(Ok(store)) => {
             tracing::info!(identity = %identity, store, "github token saved");
-            Ok(())
         }
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(RemoteError::Credential {
-            detail: format!("could not save the GitHub token: {e}"),
-        }),
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Err(RemoteError::Credential {
+                detail: format!("could not save the GitHub token: {e}"),
+            });
+        }
+    }
+    if let Some(owner) = &owner
+        && let Err(refused) = owner.refuse_if_changed().await
+    {
+        take_back_saved_token(cache, key, written).await;
+        return Err(refused);
+    }
+    drop(held);
+    Ok(())
+}
+
+/// Deletes a token [`save_off_runtime`] just saved for an account that went while
+/// it did, if the store still holds that token and not a later one.
+async fn take_back_saved_token(
+    cache: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    key: String,
+    written: String,
+) {
+    let Some(entry) = cache.lock().unwrap().remove(&key) else {
+        return;
+    };
+    let undone = tokio::task::spawn_blocking(move || {
+        let held = entry.store.load()?;
+        if held.is_some_and(|token| token.access_token == written) {
+            entry.store.delete()?;
+        }
+        Ok::<(), RemoteError>(())
+    })
+    .await;
+    if !matches!(undone, Ok(Ok(()))) {
+        tracing::warn!(
+            "a GitHub token saved for an account that went at the same moment could not be taken back; it is deleted when an account is next made under that name"
+        );
     }
 }
 
@@ -12238,11 +12348,8 @@ mod share_actor_tests {
         let err = engine
             .resolve_share_credential(&ShareActor::HttpAgent)
             .expect_err("no agent identity is configured");
-        assert_eq!(
-            err.to_string(),
-            "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI."
-        );
-        assert!(err.to_string().contains("github.agent_identity"), "{err}");
+        assert_eq!(err.to_string(), AGENT_IDENTITY_UNSET);
+        assert!(!err.to_string().contains("github."), "{err}");
     }
 
     /// With one configured, the agent writes as that account's connected

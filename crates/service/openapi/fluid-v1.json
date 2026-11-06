@@ -12030,7 +12030,7 @@
             }
           },
           "409": {
-            "description": "The name has an account.",
+            "description": "The name has an account, or is the machine owner's.",
             "content": {
               "application/problem+json": {
                 "schema": {

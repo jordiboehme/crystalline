@@ -230,6 +230,7 @@ pub async fn create(
     identity.require_admin()?;
     refuse_read_only(&state)?;
     check_password(&body.password)?;
+    clear_name_for_new_account(&state, &body.name, true).await?;
     // The login name as typed makes the better default display name: the store
     // folds the login name but keeps this one as given.
     let display = body.display.unwrap_or_else(|| body.name.trim().to_string());
@@ -248,63 +249,75 @@ pub async fn create(
         ))
         .await?
         .map_err(|e| store_error(e, &body.name))?;
-    sweep_new_account(&state, &body.name, true).await?;
     let user = read_back(&state, &body.name).await?;
     crate::readers_changed(&state);
     Ok((StatusCode::CREATED, Json(UserResponse { user })))
 }
 
-/// An account was just made, before it can act. A name that still holds the
-/// drafts of a removed account is refused: the new person would inherit them,
-/// and nothing deletes a draft without an admin asking for it. Then a GitHub
-/// token left under the name goes, whoever left it. When either fails the
-/// account is taken back out, so the next try asks again.
+/// The step before an account is made, while the name holds none: see
+/// [`crate::engine::Engine::clear_name_for_new_account`]. A name that holds an
+/// account, or that no account can have, is left alone, so the insert answers it
+/// and nothing saved under the name is touched.
 ///
-/// `admin_reads` says whether an admin is at the other end: the sentence with
-/// the domains and the command is theirs, and anybody else (a first sign-in
-/// through a proxy or a provider) is told to ask one.
-pub(crate) async fn sweep_new_account(
+/// `admin_reads` says whether an admin is at the other end: the sentence with the
+/// domains and the command is theirs, and anybody else (a first sign-in through a
+/// proxy or a provider) is told to ask one.
+pub(crate) async fn clear_name_for_new_account(
     state: &RestState,
     name: &str,
     admin_reads: bool,
 ) -> Result<(), ApiError> {
-    let Ok(account) = crate::auth_store::normalize_account_name(name) else {
+    let Ok(account) = crate::auth_store::normalize_new_account_name(name) else {
         return Ok(());
     };
-    let take_back = async {
-        if let Err(undo) = state.auth.remove_user_force(&account).await {
-            tracing::warn!("the account '{account}' could not be taken back out: {undo:#}");
-        }
-    };
-    match state.engine.new_account_draft_refusal(&account).await {
-        Ok(None) => {}
-        Ok(Some(sentence)) => {
-            take_back.await;
-            tracing::warn!("{sentence}");
-            return Err(ApiError::conflict(if admin_reads {
-                sentence
-            } else {
-                "An account cannot be made under this name yet. Ask an admin of this instance."
-                    .to_string()
-            }));
-        }
-        Err(e) => {
-            take_back.await;
-            tracing::warn!("the drafts under '{account}' could not be read: {e}");
-            return Err(ApiError::internal(
-                "the drafts under this name could not be read, so the account was not made; try again",
-            ));
-        }
+    if state.auth.user(&account).await?.is_some() {
+        return Ok(());
     }
-    match state.engine.forget_new_account_credential(&account).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            take_back.await;
-            tracing::warn!("a GitHub token left under '{account}' could not be deleted: {e}");
-            Err(ApiError::internal(
-                "an old GitHub token is still saved under this name and could not be deleted, so the account was not made; look at this instance's log and try again",
+    let Err(refusal) = state.engine.clear_name_for_new_account(&account).await else {
+        return Ok(());
+    };
+    tracing::warn!("no account under '{account}': {}", refusal.logged());
+    use crystalline_core::account::NewAccountRefusal as Refusal;
+    Err(match (&refusal, admin_reads) {
+        (Refusal::Drafts(_), true) => ApiError::conflict(refusal.admin_sentence()),
+        (_, true) => ApiError::internal(refusal.admin_sentence()),
+        (_, false) => ApiError::conflict(crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN),
+    })
+}
+
+/// A first sign-in's provisioning with the same step before it. The store picks
+/// the first free name from `desired`, so the step asks about that name. When
+/// another account took it in between, the store picks a later one, which was not
+/// asked about: that account is taken back out and the person signs in again.
+pub(crate) async fn provision_clear(
+    state: &RestState,
+    desired: &str,
+    provision: impl std::future::Future<Output = anyhow::Result<User>>,
+) -> Result<anyhow::Result<User>, ApiError> {
+    let cleared = match state.auth.free_name_from(desired).await {
+        Ok(name) => {
+            clear_name_for_new_account(state, &name, false).await?;
+            Some(name)
+        }
+        Err(_) => None,
+    };
+    match provision.await {
+        // Also when the name could not be asked about: an account stands only on a
+        // name that was cleared.
+        Ok(user) if cleared.as_deref() != Some(user.name.as_str()) => {
+            // A sign-in that found an account of its own never reaches here: the
+            // caller asks for the linked account first.
+            if let Err(e) = state.auth.remove_user_force(&user.name).await {
+                tracing::warn!(
+                    "the account '{}' could not be taken back out: {e:#}",
+                    user.name
+                );
+            }
+            Err(ApiError::conflict(
+                "Another account took this name just now. Sign in again.",
             ))
         }
+        other => Ok(other),
     }
 }
 
@@ -715,7 +728,7 @@ pub async fn remove(
         ),
         (
             status = 409,
-            description = "The name has an account.",
+            description = "The name has an account, or is the machine owner's.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -735,12 +748,15 @@ pub async fn discard_drafts(
             "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
         )));
     }
-    Ok(Json(
-        state
-            .engine
-            .discard_account_drafts(&account, caller.name())
-            .await?,
-    ))
+    match state
+        .engine
+        .discard_account_drafts(&account, caller.name())
+        .await
+    {
+        Ok(report) => Ok(Json(report)),
+        Err(crate::engine::EngineError::Conflict(sentence)) => Err(ApiError::conflict(sentence)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `DELETE /users/{name}/github-link` - unlink another account from GitHub.

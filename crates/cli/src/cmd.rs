@@ -3093,6 +3093,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         data["fts_mode"].as_str().unwrap_or("unknown")
     );
     println!("{}", embeddings_line(&data["embeddings"]));
+
     // What a host move left only on another instance of a shared
     // database: one line per domain, until a walk finds the files or a
     // sync with --accept-disk drops their rows.
@@ -3621,6 +3622,8 @@ pub async fn connect_github(
         .and_then(|g| g.oauth_client_id.clone())
         .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string());
 
+    // Read before the sign-in, which can take minutes.
+    let account_then = AccountThen::read(identity).await?;
     let (access_token, login) = match token {
         Some(pat) => {
             let login = crystalline_remote::github::auth::validate_token(api_url.as_deref(), pat)
@@ -3642,6 +3645,7 @@ pub async fn connect_github(
         expires_at: None,
         refresh_expires_at: None,
     };
+    account_then.refuse_if_changed().await?;
     let store = save_credential(
         identity,
         token_host.as_deref(),
@@ -3649,6 +3653,7 @@ pub async fn connect_github(
         token_store_dir,
         &stored,
     )?;
+    account_then.take_back_if_changed(&store, &stored).await?;
 
     // A personal connect that lands on an instance-mode installation is a
     // credential nothing will use yet, so the mode is named where it is
@@ -3698,6 +3703,69 @@ pub async fn connect_github(
         }
     }
     Ok(())
+}
+
+/// Which account a person's name held when this connect began. This process
+/// polls for minutes while the account can be removed and made again, and removal
+/// tells only the daemon, so it asks again right before it saves and once after.
+struct AccountThen {
+    /// The accounts database and the name, for a person on a machine that has one.
+    asks: Option<(crystalline_service::rest::AuthStore, String)>,
+    born: Option<String>,
+}
+
+impl AccountThen {
+    async fn read(identity: &crystalline_remote::TokenIdentity) -> Result<AccountThen> {
+        let nobody = AccountThen {
+            asks: None,
+            born: None,
+        };
+        let crystalline_remote::TokenIdentity::Personal(name) = identity else {
+            return Ok(nobody);
+        };
+        if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            return Ok(nobody);
+        }
+        let path = config::web_auth_db_path()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+        if !path.exists() {
+            return Ok(nobody);
+        }
+        let store = crystalline_service::rest::AuthStore::open(&path).await?;
+        let born = store.account_born(name).await?;
+        Ok(AccountThen {
+            asks: Some((store, name.clone())),
+            born,
+        })
+    }
+
+    /// Refuses unless the name still holds what it held. A read that fails refuses.
+    async fn refuse_if_changed(&self) -> Result<()> {
+        let Some((store, name)) = &self.asks else {
+            return Ok(());
+        };
+        if store.account_born(name).await? != self.born {
+            bail!("the account '{name}' changed during this sign-in, so nothing was saved");
+        }
+        Ok(())
+    }
+
+    /// The same after a save, taking back the token that lost the race.
+    async fn take_back_if_changed(
+        &self,
+        saved: &crystalline_remote::TokenStore,
+        stored: &crystalline_remote::StoredToken,
+    ) -> Result<()> {
+        let Err(refused) = self.refuse_if_changed().await else {
+            return Ok(());
+        };
+        if let Ok(Some(held)) = saved.load()
+            && held.access_token == stored.access_token
+        {
+            saved.delete().map_err(|e| anyhow!("{e}"))?;
+        }
+        Err(refused)
+    }
 }
 
 /// Saves `stored` as `identity`'s credential: under `token_store_dir` when
@@ -3801,6 +3869,8 @@ impl PersonalApp<'_> {
     async fn connect(&self, json: bool) -> Result<()> {
         let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
         let accounts = self.link_target().await?;
+        // Read before the sign-in, which can take minutes.
+        let account_then = AccountThen::read(self.identity).await?;
         let credentials = app.credentials();
         let auth_base = app.auth_base();
         let grant = device_flow_grant(auth_base, &credentials.client_id, None)
@@ -3817,9 +3887,11 @@ impl PersonalApp<'_> {
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
         let name = self.name();
+        account_then.refuse_if_changed().await?;
         if let Some(store) = &accounts {
+            let born = account_then.born.as_deref().unwrap_or_default();
             store
-                .link_github(name, &credentials.host, user.id, &user.login)
+                .link_github_if_born(name, born, &credentials.host, user.id, &user.login)
                 .await?;
         }
         let stored = crystalline_remote::StoredToken {
@@ -3854,6 +3926,7 @@ impl PersonalApp<'_> {
                 return Err(e);
             }
         };
+        account_then.take_back_if_changed(&store, &stored).await?;
         // A running daemon may hold an older token of this identity in its
         // cache; a relink replaces it.
         let told = notify_daemon_forgot(self.identity).await;

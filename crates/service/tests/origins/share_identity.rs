@@ -83,6 +83,15 @@ async fn case_with_clock(
     key: Option<&str>,
     now: Arc<std::sync::Mutex<std::time::Instant>>,
 ) -> Case {
+    case_with_auth(app, key, now, None).await
+}
+
+async fn case_with_auth(
+    app: App,
+    key: Option<&str>,
+    now: Arc<std::sync::Mutex<std::time::Instant>>,
+    connect_auth: Option<Arc<crate::support::StubConnectAuth>>,
+) -> Case {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (forge, url) = spawn_forge(
@@ -144,6 +153,9 @@ async fn case_with_clock(
                 marker: None,
             })
         }));
+    }
+    if let Some(stub) = connect_auth {
+        eng = eng.with_connect_auth(stub);
     }
     let eng = Arc::new(eng);
     let domain_root = root.join("kb");
@@ -308,7 +320,7 @@ async fn a_real_share_goes_where_the_mode_says_in_every_cell() {
                 // asked for personal sharing by name.
                 (App::Refused, _, key) if key != Some("personal") => {
                     assert!(
-                        matches!(&answer, Err(EngineError::Remote(RemoteError::AppCredential(d))) if d.contains("github.com")),
+                        matches!(&answer, Err(EngineError::Remote(RemoteError::Refused(d))) if d.contains("cannot be used right now")),
                         "{label}"
                     );
                 }
@@ -373,7 +385,7 @@ async fn with_an_app_and_no_key_a_linked_person_opens_the_proposal() {
 async fn with_an_app_and_no_key_the_owner_and_an_open_agent_are_refused_with_the_fix() {
     for (actor, words) in [
         (ShareActor::Owner, "through its GitHub App"),
-        (ShareActor::HttpAgent, "set github.agent_identity"),
+        (ShareActor::HttpAgent, "Ask an admin to name the account"),
     ] {
         let fx = case(App::Ready, None).await;
         let text = fx
@@ -1312,5 +1324,502 @@ async fn the_owner_at_the_machine_never_takes_the_runs_way_out() {
         include_str!("../../src/mcp.rs"),
     ] {
         assert!(!source.contains("ShareActor::Machine"));
+    }
+}
+
+/// An admin removes `name` and makes it again, over the JSON API.
+async fn admin_replaces(fx: &Case, name: &str) {
+    let root = login(fx.addr, "root").await.unwrap();
+    let gone = with_session(
+        client().delete(format!("http://{}/api/v1/users/{name}", fx.addr)),
+        Some(&root),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(gone.status(), 204);
+    let made = with_session(
+        client().post(format!("http://{}/api/v1/users", fx.addr)),
+        Some(&root),
+    )
+    .json(&json!({ "name": name, "password": PASSWORD, "role": "editor" }))
+    .send()
+    .await
+    .unwrap();
+    let status = made.status();
+    assert_eq!(status, 201, "{}", made.text().await.unwrap());
+}
+
+/// Waits until the flow's task is stopped or its token is on file.
+async fn until_stopped_or_saved(stub: &crate::support::StubConnectAuth, fx: &Case) {
+    for _ in 0..200 {
+        if stub.run_was_abandoned() || token_file(fx.tmp.path(), "ada").exists() {
+            // A moment more, so a row written just before the token shows too.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The old person starts a link and disconnects, which drops the record but
+/// used to leave the task running. The admin replaces the name, and the old
+/// person then confirms the code. Nothing of that may reach the new account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_flow_cleared_by_a_disconnect_never_reaches_a_new_account() {
+    use crate::support::{device_flow_start, fake_auth};
+    let stub = fake_auth(
+        Ok(device_flow_start()),
+        Ok("gho_old_person".to_string()),
+        Err(RemoteError::NotConnected),
+    );
+    let fx = case_with_auth(
+        App::Ready,
+        None,
+        Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        Some(stub.clone()),
+    )
+    .await;
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("gho_old_person".to_string(), (4242, "old-gh".to_string()));
+    fx.forge.collaborators.lock().unwrap().insert(
+        "acme/kb".to_string(),
+        vec![json!({"id": 4242, "login": "old-gh", "role_name": "write"})],
+    );
+
+    fx.eng.start_github_link_device_flow("ada").await.unwrap();
+    for _ in 0..400 {
+        if stub.run_was_entered() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    fx.eng.disconnect_github_identity("ada").await.unwrap();
+    admin_replaces(&fx, "ada").await;
+    stub.run_gate.notify_one();
+    until_stopped_or_saved(&stub, &fx).await;
+    fx.eng.invalidate_github_access(Invalidate::All);
+
+    // The new person shares, and nothing goes out on the old token.
+    let session = login(fx.addr, "ada").await.unwrap();
+    let answer = with_session(
+        client().post(format!("http://{}/api/v1/domains/kb/sync/share", fx.addr)),
+        Some(&session),
+    )
+    .json(&json!({}))
+    .send()
+    .await
+    .unwrap();
+    let status = answer.status();
+    let body = answer.text().await.unwrap();
+    assert!(
+        !writes(&fx.forge)
+            .iter()
+            .any(|auth| auth.as_deref() == Some("Bearer gho_old_person")),
+        "{:?}",
+        writes(&fx.forge)
+    );
+    assert_ne!(status, 200, "{body}");
+    let status = fx.eng.github_link_status("ada").await.unwrap();
+    assert!(!status.linked, "{:?}", status.login);
+    assert!(!token_file(fx.tmp.path(), "ada").exists());
+}
+
+/// The same with no App, on the plain device flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_flow_cleared_by_a_disconnect_never_reaches_a_new_account() {
+    use crate::support::{device_flow_start, fake_auth};
+    let stub = fake_auth(
+        Ok(device_flow_start()),
+        Ok("gho_old_person".to_string()),
+        Ok("old-person-gh".to_string()),
+    );
+    let fx = case_with_auth(
+        App::None,
+        Some("personal"),
+        Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        Some(stub.clone()),
+    )
+    .await;
+    fx.eng
+        .start_github_identity_device_flow("ada", false)
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if stub.run_was_entered() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    fx.eng.disconnect_github_identity("ada").await.unwrap();
+    admin_replaces(&fx, "ada").await;
+    stub.run_gate.notify_one();
+    until_stopped_or_saved(&stub, &fx).await;
+
+    let status = fx.eng.github_identity_status("ada").await.unwrap();
+    assert!(!status.connected, "{:?}", status.login);
+    assert!(!token_file(fx.tmp.path(), "ada").exists());
+}
+
+/// A browser link that began for the old account finishes after the name was
+/// made again: no row and no token, though the session check is not what stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_began_for_the_old_account_is_refused() {
+    let fx = case(App::Ready, None).await;
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("gho_old_person".to_string(), (4242, "old-gh".to_string()));
+    let born = fx.eng.account_born("ada").await.unwrap();
+    admin_replaces(&fx, "ada").await;
+    let refused = fx
+        .eng
+        .link_github_begun("ada", born, grant("gho_old_person"))
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    let status = fx.eng.github_link_status("ada").await.unwrap();
+    assert!(!status.linked);
+    assert!(!token_file(fx.tmp.path(), "ada").exists());
+}
+
+/// A renewal holds no check while GitHub answers. The name is made again in that
+/// time: the renewed pair is not saved for the new account, and the share that
+/// asked for it does not go out on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_in_flight_saves_nothing_for_a_new_account() {
+    let fx = case(App::Ready, None).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *fx.forge.refresh_gate.lock().unwrap() = Some(gate.clone());
+    fx.forge.refreshable.lock().unwrap().insert(
+        "ghr_old".to_string(),
+        (
+            "ghu_renewed".to_string(),
+            "ghr_renewed".to_string(),
+            (ADA_GH, "ada-gh".to_string()),
+        ),
+    );
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("ghu_old".to_string(), (ADA_GH, "ada-gh".to_string()));
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("ghu_renewed".to_string(), (ADA_GH, "ada-gh".to_string()));
+    fx.forge.collaborators.lock().unwrap().insert(
+        "acme/kb".to_string(),
+        vec![json!({"id": ADA_GH, "login": "ada-gh", "role_name": "write"})],
+    );
+    let mut expiring = grant("ghu_old");
+    expiring.refresh_token = Some("ghr_old".to_string());
+    expiring.expires_at = Some(Utc::now() + chrono::Duration::minutes(1));
+    fx.eng.link_github("ada", expiring).await.unwrap();
+
+    let eng = fx.eng.clone();
+    let share = tokio::spawn(async move { share_as_ada(&eng).await });
+    for _ in 0..1000 {
+        if !fx.forge.refreshes.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    admin_replaces(&fx, "ada").await;
+    gate.add_permits(4);
+    let shared = share.await.unwrap();
+    assert!(shared.is_err(), "{shared:?}");
+    assert!(!token_file(fx.tmp.path(), "ada").exists());
+    assert!(
+        !writes(&fx.forge)
+            .iter()
+            .any(|auth| auth.as_deref() == Some("Bearer ghu_renewed")),
+        "{:?}",
+        writes(&fx.forge)
+    );
+}
+
+/// The name is cleared before the account exists, so while a token left under it
+/// is still being dealt with there is no account for a second request to act as.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_account_stands_while_its_name_is_being_cleared() {
+    let fx = case(App::Ready, None).await;
+    leave_token(fx.tmp.path(), "newbie");
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *fx.forge.revoke_gate.lock().unwrap() = Some(gate.clone());
+
+    let root = login(fx.addr, "root").await.unwrap();
+    let url = format!("http://{}/api/v1/users", fx.addr);
+    let making = tokio::spawn(async move {
+        with_session(client().post(url), Some(&root))
+            .json(&json!({ "name": "newbie", "password": PASSWORD, "role": "editor" }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    for _ in 0..1000 {
+        if !fx.forge.revokes.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!fx.forge.revokes.lock().unwrap().is_empty());
+    assert!(
+        fx.auth.user("newbie").await.unwrap().is_none(),
+        "the account stands while the old token is still there"
+    );
+    gate.add_permits(4);
+    assert_eq!(making.await.unwrap(), 201);
+    assert!(fx.auth.user("newbie").await.unwrap().is_some());
+    assert!(!token_file(fx.tmp.path(), "newbie").exists());
+}
+
+/// The step before an account is made deletes what is saved under the name, so it
+/// never runs for a name that holds an account, or for the machine owner's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clearing_a_name_never_touches_a_live_account_or_the_machine_owner() {
+    let fx = case(App::None, Some("personal")).await;
+    leave_token(fx.tmp.path(), "ada");
+    leave_token(fx.tmp.path(), "owner");
+    let root = login(fx.addr, "root").await.unwrap();
+    for name in ["ada", "owner"] {
+        let answer = with_session(
+            client().post(format!("http://{}/api/v1/users", fx.addr)),
+            Some(&root),
+        )
+        .json(&json!({ "name": name, "password": PASSWORD, "role": "editor" }))
+        .send()
+        .await
+        .unwrap();
+        assert!(!answer.status().is_success(), "{name}");
+        assert!(token_file(fx.tmp.path(), name).exists(), "{name}'s token");
+    }
+}
+
+/// The proposal records on `kb`.
+async fn proposals(fx: &Case) -> Vec<Value> {
+    let state = crystalline_remote::state::OriginState::load(&fx.tmp.path().join("origins/kb"))
+        .unwrap()
+        .unwrap();
+    state
+        .proposals
+        .iter()
+        .map(|p| json!({ "number": p.number, "author_login": p.author_login }))
+        .collect()
+}
+
+/// Links `ada` so her shares go out on `ghu_ada`, and a run's on the App.
+async fn run_and_person(fx: &Case) {
+    give_ada_a_token(fx, App::Ready).await;
+}
+
+/// Where a forge serves no stacks, a run and a person reach one proposal. Neither
+/// order changes whose it is, and each commit goes out on who made it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_stacks_the_author_never_flips_and_each_commit_is_its_makers() {
+    // The person first, then a run.
+    let fx = case(App::Ready, None).await;
+    run_and_person(&fx).await;
+    let first = share_as_ada(&fx.eng).await.unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    run_shares(&fx).await.unwrap();
+    let records = proposals(&fx).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["author_login"], "ada-gh", "{records:?}");
+    let commits: Vec<Option<String>> = fx
+        .forge
+        .hits()
+        .into_iter()
+        .filter(|h| h.method == "POST" && h.path.ends_with("/git/commits"))
+        .map(|h| h.auth)
+        .collect();
+    assert_eq!(commits, vec![bearer("ghu_ada"), bearer("ghs_test")]);
+
+    // A run first, then the person.
+    let fx = case(App::Ready, None).await;
+    run_and_person(&fx).await;
+    run_shares(&fx).await.unwrap();
+    change(&fx, "person");
+    share_as_ada(&fx.eng).await.unwrap();
+    let records = proposals(&fx).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]["author_login"], "crystalline-acme[bot]",
+        "{records:?}"
+    );
+    let commits: Vec<Option<String>> = fx
+        .forge
+        .hits()
+        .into_iter()
+        .filter(|h| h.method == "POST" && h.path.ends_with("/git/commits"))
+        .map(|h| h.auth)
+        .collect();
+    assert_eq!(commits, vec![bearer("ghs_test"), bearer("ghu_ada")]);
+}
+
+/// The default on github.com: the forge serves stacks, so a run and a person each
+/// have a proposal of their own, as layers of one chain, in either order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_stacks_a_run_and_a_person_each_keep_a_proposal_of_their_own() {
+    for person_first in [true, false] {
+        let fx = case(App::Ready, None).await;
+        fx.forge.repos["acme/kb"].enable_stacks();
+        run_and_person(&fx).await;
+        if person_first {
+            share_as_ada(&fx.eng).await.unwrap();
+            run_shares(&fx).await.unwrap();
+        } else {
+            run_shares(&fx).await.unwrap();
+            change(&fx, "person");
+            share_as_ada(&fx.eng).await.unwrap();
+        }
+        let records = proposals(&fx).await;
+        assert_eq!(records.len(), 2, "person first {person_first}: {records:?}");
+        let authors: Vec<&str> = records
+            .iter()
+            .map(|r| r["author_login"].as_str().unwrap_or_default())
+            .collect();
+        let wanted = if person_first {
+            ["ada-gh", "crystalline-acme[bot]"]
+        } else {
+            ["crystalline-acme[bot]", "ada-gh"]
+        };
+        assert_eq!(authors, wanted, "person first {person_first}: {records:?}");
+    }
+}
+
+/// Says that `text`, read by somebody who is not an admin, holds no command line,
+/// no setting and no internal host.
+fn plain(text: &str, addr_hint: &str) {
+    assert!(!text.contains("crystalline "), "{text}");
+    assert!(!text.contains("github."), "{text}");
+    assert!(!text.contains("CRYSTALLINE_"), "{text}");
+    assert!(!text.contains("service.public_url"), "{text}");
+    assert!(!text.contains(addr_hint), "{text}");
+}
+
+/// An editor on an instance whose App cannot be used: the status, the link and the
+/// share all answer in plain words. An admin still reads the App's own sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_admin_reads_no_command_line_or_setting_on_any_path() {
+    let fx = case(App::Refused, None).await;
+    let host = "127.0.0.1";
+    let ada = login(fx.addr, "ada").await.unwrap();
+    for path in ["/api/v1/sync", "/api/v1/domains/kb/sync"] {
+        let answer: Value = with_session(
+            client().get(format!("http://{}{path}", fx.addr)),
+            Some(&ada),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(answer["connection"]["app"].is_null(), "{path}: {answer}");
+    }
+    // The same status reached another way, by MCP or a remote runner.
+    let status = fx
+        .eng
+        .origin_status(
+            None,
+            false,
+            false,
+            &Scope::User {
+                account: "ada".to_string(),
+                admin: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(status["connection"]["app"].is_null(), "{status}");
+
+    let start = with_session(
+        client().post(format!("http://{}/api/v1/me/github-link/start", fx.addr)),
+        Some(&ada),
+    )
+    .send()
+    .await
+    .unwrap();
+    let start: Value = start.json().await.unwrap();
+    assert_eq!(start["reason"], "app_unusable", "{start}");
+    plain(start["detail"].as_str().unwrap(), host);
+
+    // An unlinked editor is told about the App, not told to link.
+    let share = with_session(
+        client().post(format!("http://{}{SHARE}", fx.addr)),
+        Some(&ada),
+    )
+    .json(&json!({}))
+    .send()
+    .await
+    .unwrap();
+    let share: Value = share.json().await.unwrap();
+    let detail = share["detail"].as_str().unwrap();
+    assert!(!detail.contains("not linked"), "{detail}");
+    assert!(detail.contains("Ask an admin"), "{detail}");
+    plain(detail, host);
+
+    // The share path itself, for an account past the gate.
+    let engine_refusal = share_as_ada(&fx.eng).await.unwrap_err().to_string();
+    plain(&engine_refusal, host);
+
+    // An admin reads what to do.
+    let root = login(fx.addr, "root").await.unwrap();
+    let answer: Value = with_session(
+        client().get(format!("http://{}/api/v1/domains/kb/sync", fx.addr)),
+        Some(&root),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(answer["connection"]["app"]["error"].is_string(), "{answer}");
+}
+
+/// A run by an agent account stays that account (S7 speaks of runs with no
+/// account). One with no GitHub identity hears it when it takes the lease, before
+/// the run does its work. One with an identity hears nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlinked_agent_account_hears_it_cannot_share_at_the_take() {
+    use crystalline_core::automation::Loop;
+    let fx = case(App::Ready, None).await;
+    let unlinked = Scope::User {
+        account: "root".to_string(),
+        admin: true,
+    };
+    let take = fx
+        .eng
+        .automation_lease_take(Loop::Evolve, "kb", "cron", &unlinked)
+        .await
+        .unwrap();
+    let sentence = take["share_refused"].as_str().unwrap();
+    plain(sentence, "127.0.0.1");
+    fx.eng
+        .automation_lease_release(
+            Loop::Evolve,
+            "kb",
+            take["token"].as_str().unwrap(),
+            &unlinked,
+        )
+        .await
+        .ok();
+
+    fx.eng.link_github("root", grant("ghu_root")).await.ok();
+    leave_token(fx.tmp.path(), "root");
+    fx.eng.forget_cached_credential(Some("root")).unwrap();
+    let take = fx
+        .eng
+        .automation_lease_take(Loop::Reflect, "kb", "cron", &unlinked)
+        .await;
+    if let Ok(take) = take {
+        assert!(take["share_refused"].is_null(), "{take}");
     }
 }

@@ -809,13 +809,9 @@ async fn start_without_public_url_is_409() {
     let response = ctx.start_link(&ann).await;
     assert_eq!(response.status(), 409);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("service.public_url"),
-        "{body}"
-    );
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("Ask an admin"), "{body}");
+    assert!(!detail.contains("service.public_url"), "{body}");
     assert_eq!(body["reason"], "no_public_url", "{body}");
 }
 
@@ -835,6 +831,15 @@ async fn start_without_a_client_secret_is_409() {
     let ann = ctx.login("ann").await;
     let response = ctx.start_link(&ann).await;
     assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("Ask an admin"), "{body}");
+    assert!(!detail.contains("crystalline "), "{body}");
+    assert_eq!(body["reason"], "no_client_secret", "{body}");
+
+    // The command is the admin's.
+    let admin = ctx.login("root").await;
+    let response = ctx.start_link(&admin).await;
     let body: serde_json::Value = response.json().await.unwrap();
     assert!(
         body["detail"]
@@ -868,11 +873,8 @@ async fn start_without_an_app_says_no_app() {
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["reason"], "no_app", "{body}");
     assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("crystalline github app set"),
-        "the detail keeps the admin's fix: {body}"
+        !body["detail"].as_str().unwrap().contains("crystalline "),
+        "a viewer reads plain words: {body}"
     );
 }
 
@@ -899,7 +901,7 @@ async fn start_with_an_unreadable_keychain_says_keychain() {
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["reason"], "keychain", "{body}");
     assert!(
-        body["detail"].as_str().unwrap().contains("keychain"),
+        body["detail"].as_str().unwrap().contains("stored keys"),
         "{body}"
     );
 }

@@ -6812,6 +6812,69 @@ fn serve_creates_the_first_admin_from_the_environment_once() {
     let _ = child.wait();
 }
 
+/// The first admin from the environment takes the same check as every other new
+/// account. A refusal does not stop the start, because the way out needs this
+/// daemon: no account is made, the log says why, and the next start tries again.
+#[test]
+fn serve_refuses_the_first_admin_on_a_name_with_drafts_and_keeps_serving() {
+    let env = Env::new("admindrafts");
+    env.setup_domain("eng");
+    crystalline_core::kept::write(
+        &env.state_dir().join(crystalline_core::kept::KEPT_DIR),
+        "eng",
+        Some("ada"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        chrono::Utc::now(),
+        "OLD ADA PRIVATE TEXT",
+    )
+    .unwrap();
+    let secret = env.dir.join("admin-password");
+    std::fs::write(&secret, "first-password\n").unwrap();
+    let addr = format!("0.0.0.0:{}", free_port());
+    let probe = addr.replace("0.0.0.0", "127.0.0.1");
+
+    let log = env.dir.join("serve1.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("created the first admin"), "{text}");
+    assert!(text.contains("was not created"), "{text}");
+    assert!(!text.contains("PRIVATE"), "{text}");
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 401);
+
+    // The way out reaches this daemon, and the next start makes the admin.
+    let (ok, out) = env.run(&["users", "discard-drafts", "ada"]);
+    assert!(ok, "{out}");
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+    wait_lock_released(&env);
+
+    let log = env.dir.join("serve2.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("created the first admin 'ada' from the environment"),
+        "{text}"
+    );
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 200);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
 /// A half done configuration stops the first start with a sentence naming the
 /// variable, and never echoes the password.
 #[test]

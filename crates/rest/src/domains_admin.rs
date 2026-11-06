@@ -89,17 +89,11 @@ pub(crate) async fn require_share_role_on(
     }
 }
 
-/// What a status route leaves out of the `connection` block for a non-admin: the
-/// reason names a setting, and the owner's and the agent's slots are about who
-/// else this instance shares as. The mode stays, because the share surfaces
-/// branch on it.
+/// What a status route leaves out of the `connection` block for a non-admin: see
+/// [`crate::engine::leave_out_for_non_admin`].
 fn connection_for(identity: &Identity, mut connection: Value) -> Value {
-    if identity.require_admin().is_err()
-        && let Value::Object(map) = &mut connection
-    {
-        map.remove("share_identity_reason");
-        map.remove("owner_identity");
-        map.remove("agent_identity");
+    if identity.require_admin().is_err() {
+        crate::engine::leave_out_for_non_admin(&mut connection);
     }
     connection
 }

@@ -65,20 +65,41 @@ fn team_marker_json() -> Value {
     json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
 }
 
-/// The refusal for a missing personal identity, in the words of who reads it: a
-/// person with a session may not be an admin, so plain words and the fix, while
-/// the machine owner and an agent identity are at a command line or have an
-/// admin behind them.
+/// What the `connection` block of a status leaves out for a non-admin: the reason
+/// names a setting, the owner's and the agent's slots are about who else this
+/// instance shares as, and the App's sentences hold a command line and an
+/// internal host. The mode stays, because the share surfaces branch on it.
+pub fn leave_out_for_non_admin(connection: &mut Value) {
+    if let Value::Object(map) = connection {
+        map.remove("share_identity_reason");
+        map.remove("owner_identity");
+        map.remove("agent_identity");
+        map.remove("app");
+    }
+}
+
+/// A share refusal in the words of who reads it. A person with a session or an
+/// agent over HTTP may not be an admin, so plain words and the fix. The machine
+/// owner is at a command line. The App's own sentences hold a command line and a
+/// host, so they go to the log here.
 fn refusal_for(actor: &ShareActor, e: EngineError) -> EngineError {
-    let ShareActor::Account(_) = actor else {
+    if !matches!(actor, ShareActor::Account(_) | ShareActor::HttpAgent) {
         return e;
-    };
+    }
     match &e {
         EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_LINK_MISSING => {
             RemoteError::Refused(PERSON_LINK_MISSING.to_string()).into()
         }
         EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING => {
             RemoteError::Refused(PERSON_TOKEN_MISSING.to_string()).into()
+        }
+        EngineError::Remote(RemoteError::AppCredential(_)) => {
+            tracing::warn!("a share was refused: {e}");
+            RemoteError::Refused(LinkSetupReason::AppUnusable.plain_sentence().to_string()).into()
+        }
+        EngineError::Conflict(text) if text == github_app::KEYCHAIN_REFUSAL => {
+            tracing::warn!("a share was refused: {e}");
+            RemoteError::Refused(LinkSetupReason::Keychain.plain_sentence().to_string()).into()
         }
         _ => e,
     }
@@ -1451,7 +1472,13 @@ impl Engine {
         let detail = detail || diff;
         let hidden = self.hidden_for(scope).await?;
         let targets = self.origin_targets(domain, &hidden)?;
-        let connection = self.origin_status_connection().await?;
+        let mut connection = self.origin_status_connection().await?;
+        if !matches!(
+            scope,
+            crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+        ) {
+            leave_out_for_non_admin(&mut connection);
+        }
 
         let actor = crate::scope::overlay_actor(scope);
         // Who is asking, as a share would act: whose changes a `diff`
@@ -4020,12 +4047,18 @@ impl Engine {
         // Once, here: the steps below must agree, or a personal share could
         // fall back to the instance credential when the mode moves between them.
         let effective = self.share_identity_loaded();
-        if let Some(app) = self.instance_share_app(effective, actor)? {
+        if let Some(app) = self
+            .instance_share_app(effective, actor)
+            .map_err(|e| refusal_for(actor, e))?
+        {
             let app = self.app_share_router(app, actor, repo).await;
             let login = app.bot_login();
             return Ok((app, login));
         }
-        let (api_url, token) = match self.personal_app_identity(actor, effective)? {
+        let (api_url, token) = match self
+            .personal_app_identity(actor, effective)
+            .map_err(|e| refusal_for(actor, e))?
+        {
             Some(name) => (
                 self.share_api_url(),
                 self.personal_user_token(&name)
@@ -4537,7 +4570,43 @@ impl Engine {
 
     /// The plan a connect flow saves the INSTANCE credential through.
     pub(super) fn github_save_plan(&self, host: Option<&str>) -> Result<TokenSavePlan> {
-        self.github_save_plan_for(&TokenIdentity::Instance, host)
+        self.token_save_plan(&TokenIdentity::Instance, host)
+    }
+
+    /// The plan a person's credential is saved through: the same, and bound to
+    /// the account the name holds right now, so the write is refused if the name
+    /// holds another by the time it lands. Asked when the work begins, not when
+    /// it ends. A read that fails refuses here rather than guessing.
+    pub(super) async fn github_save_plan_for(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<TokenSavePlan> {
+        let mut plan = self.token_save_plan(identity, host)?;
+        let TokenIdentity::Personal(name) = identity else {
+            return Ok(plan);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(plan);
+        };
+        let agent = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        let born = access
+            .account_born(name)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        plan.owner = Some(TokenOwner {
+            access: access.clone(),
+            name: name.clone(),
+            born,
+            no_account_is_right: name == OWNER_IDENTITY_NAME
+                || agent.as_deref() == Some(name.as_str()),
+        });
+        Ok(plan)
     }
 
     /// The plan a connect flow saves its token through: the test file override
@@ -4550,7 +4619,7 @@ impl Engine {
     /// refreshes - so a person's connect can never overwrite the machine's
     /// credential, nor leave the machine's client cached under a name it no
     /// longer belongs to.
-    pub(super) fn github_save_plan_for(
+    fn token_save_plan(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
@@ -4570,6 +4639,8 @@ impl Engine {
             host: host.map(str::to_string),
             target,
             cache: Arc::clone(&self.github_tokens),
+            owner: None,
+            gate: self.token_writes.clone(),
         })
     }
 

@@ -1505,6 +1505,13 @@ pub(crate) async fn require_domain_write(
             && state.access.governs(domain)
             && matches!(state.access.github_link_of(&user.name).await, Ok(None))
         {
+            // A link cannot help while the App itself cannot be used, so the
+            // person is told that, in words that fit who reads them.
+            if let Err(refusal) = state.engine.github_link_app_explained()
+                && let Some(reason) = refusal.reason
+            {
+                return Err(ApiError::forbidden(reason.plain_sentence()));
+            }
             return Err(ApiError::forbidden(LINK_GITHUB_TO_WRITE));
         }
         return Err(ApiError::forbidden(format!(

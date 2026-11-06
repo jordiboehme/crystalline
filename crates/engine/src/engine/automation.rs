@@ -278,6 +278,31 @@ impl Engine {
     /// `service.public_url` (see `claim_evolve_home`): the answer then
     /// carries `evolve_home` and a `note`, and without an address only the
     /// `note` that every clone may still run evolve.
+    /// Why a run by this account could not share at the end, when that can be
+    /// told now: the instance shares on personal identities, the domain has a
+    /// team origin, and the account has no token on file. Plain words: a runner's
+    /// token need not be an admin's. A store that cannot be read says nothing
+    /// here, and the share itself answers it.
+    fn run_cannot_share(&self, domain: &str, scope: &Scope) -> Option<&'static str> {
+        let Scope::User { account, .. } = scope else {
+            return None;
+        };
+        if !self.config.read().unwrap().github_enabled()
+            || !self.domain_has_origin(domain).unwrap_or(false)
+            || self.share_identity_loaded().mode != ShareIdentityMode::Personal
+        {
+            return None;
+        }
+        let identity = personal_identity(account).ok()?;
+        let host = self.github_token_host();
+        let (_, token) = self
+            .github_credential_for(&identity, host.as_deref())
+            .ok()?;
+        token.is_none().then_some(
+            "This account has no GitHub identity, so this run could not share its changes. Ask an admin to link GitHub for this account.",
+        )
+    }
+
     pub async fn automation_lease_take(
         &self,
         lp: Loop,
@@ -328,6 +353,13 @@ impl Engine {
         let mut taken = self
             .take_lease(lp, id, &holder, &now, &stale_before)
             .await?;
+        // An agent account shares on its own GitHub identity. Without one the
+        // whole run would end in a refusal, so the runner hears it now.
+        if let Some(sentence) = self.run_cannot_share(domain, scope)
+            && let Value::Object(answer) = &mut taken
+        {
+            answer.insert("share_refused".to_string(), json!(sentence));
+        }
         // After the lease is held, so of two takes racing only the one that
         // won writes the home.
         if withdrawn.is_some() {

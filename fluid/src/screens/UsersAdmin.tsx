@@ -1,7 +1,8 @@
 /**
  * Account administration, the admin-only screen: who may sign in, what each
  * account may do, and the levers an admin has - create, role, display name,
- * deactivate/reactivate, password reset, delete. Every refusal is the
+ * deactivate/reactivate, password reset, delete, and ending a removed account's
+ * drafts. Every refusal is the
  * server's own sentence (NOT_LAST_ADMIN above all), shown where the action
  * happened; the force escape hatches exist only in the CLI, on purpose.
  *
@@ -17,10 +18,12 @@ import { useId, useRef, useState } from "react";
 
 import { problemDetail } from "../api/client";
 import type { PatchUserBody, ReflectionLevel, Role, User } from "../api/model";
+import type { DiscardedDrafts } from "../api/users";
 import {
   USERS_QUERY_KEY,
   createUser,
   deleteUser,
+  discardUserDrafts,
   fetchUsers,
   patchUser,
   resetPassword,
@@ -134,6 +137,23 @@ function UsersPanel() {
     },
   });
 
+  const endDrafts = useMutation({
+    mutationFn: discardUserDrafts,
+    onSuccess: (domains, name) => {
+      setNotice({
+        kind:
+          domains.some((row) => row.error ?? row.not_hosted) ||
+          domains.some((row) => row.left.length > 0)
+            ? "problem"
+            : "done",
+        text: endedDraftsText(name, domains),
+      });
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
   const accounts = users.data ?? [];
 
   return (
@@ -240,7 +260,120 @@ function UsersPanel() {
         pending={add.isPending}
         onCreate={(body) => add.mutateAsync(body)}
       />
+
+      <EndDraftsForm
+        pending={endDrafts.isPending}
+        onEnd={(name) => endDrafts.mutateAsync(name)}
+      />
     </div>
+  );
+}
+
+/** What ending a name's drafts did, in one sentence per domain. */
+function endedDraftsText(name: string, domains: DiscardedDrafts[]): string {
+  if (domains.length === 0) {
+    return `${name} holds no drafts.`;
+  }
+  const lines = domains.map((row) => {
+    const parts = [`${row.domain}: ${row.discarded} ended`];
+    if (row.left.length > 0) {
+      parts.push(`${row.left.length} left, open in an editor`);
+    }
+    if (row.where) {
+      parts.push(row.where);
+    }
+    if (row.error) {
+      parts.push(`stopped: ${row.error}`);
+    }
+    return parts.join(", ");
+  });
+  return `Drafts under ${name}. ${lines.join(". ")}.`;
+}
+
+/**
+ * The way out when a new account is refused because its name still holds a
+ * removed account's drafts. Nothing ends a draft without an admin asking, so the
+ * name is typed twice: what goes cannot be brought back.
+ */
+function EndDraftsForm({
+  pending,
+  onEnd,
+}: {
+  pending: boolean;
+  onEnd: (name: string) => Promise<unknown>;
+}) {
+  const nameField = useId();
+  const confirmField = useId();
+  const [name, setName] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const ready = name.trim() !== "" && confirmation === name;
+
+  return (
+    <section
+      aria-labelledby="users-end-drafts"
+      className="rounded border border-slate-200 p-4 dark:border-slate-800"
+    >
+      <h2 id="users-end-drafts" className="text-lg font-semibold">
+        End a removed account&apos;s drafts
+      </h2>
+      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+        A new account is refused while its name still holds the drafts of a
+        removed account. This ends them, and the texts kept from them, for good.
+        It does not work for a name with an account.
+      </p>
+      <form
+        className="mt-4 flex flex-wrap items-end gap-3"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!ready) {
+            return;
+          }
+          void onEnd(name).then(
+            () => {
+              setName("");
+              setConfirmation("");
+            },
+            () => undefined,
+          );
+        }}
+      >
+        <div className="flex flex-col gap-1">
+          <label htmlFor={nameField} className="text-sm font-medium">
+            Removed account&apos;s name
+          </label>
+          <input
+            id={nameField}
+            className={FIELD}
+            value={name}
+            autoComplete="off"
+            onChange={(event) => {
+              setName(event.target.value);
+            }}
+          />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label htmlFor={confirmField} className="text-sm font-medium">
+            Type the name again
+          </label>
+          <input
+            id={confirmField}
+            className={FIELD}
+            value={confirmation}
+            autoComplete="off"
+            onChange={(event) => {
+              setConfirmation(event.target.value);
+            }}
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={pending || !ready}
+          className={DANGER_BUTTON}
+        >
+          End these drafts
+        </button>
+      </form>
+    </section>
   );
 }
 

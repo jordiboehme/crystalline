@@ -8667,7 +8667,7 @@ export type DiscardUserDraftsErrors = {
      */
     403: ProblemDetail;
     /**
-     * The name has an account.
+     * The name has an account, or is the machine owner's.
      */
     409: ProblemDetail;
 };

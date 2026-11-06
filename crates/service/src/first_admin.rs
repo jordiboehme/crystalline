@@ -150,11 +150,9 @@ pub(crate) async fn seed(
     }
 }
 
-/// The admin made from the environment: the line to say, and the name, whose
-/// GitHub token left behind (if any) the caller sweeps.
+/// The admin made from the environment: the line to say.
 pub(crate) struct CreatedAdmin {
     pub(crate) line: String,
-    pub(crate) name: String,
 }
 
 /// The line said when the admin was created.
@@ -172,8 +170,15 @@ fn ignored_line(var: &str) -> String {
 /// database at `accounts` and seed it. Returns the line to say when the admin
 /// was created, `None` otherwise. The store is dropped before this returns, so
 /// the setup token's own open stays the only handle.
+///
+/// The name takes the step every new account takes
+/// ([`crate::engine::Engine::clear_name_for_new_account`]), before the account is
+/// made. A refusal does not stop the start: the way out, `crystalline users
+/// discard-drafts`, needs this daemon running. No admin is made, the reason is
+/// logged, and the next start tries again.
 pub(crate) async fn seed_from_environment(
     accounts: Option<&Path>,
+    engine: &crate::engine::Engine,
 ) -> anyhow::Result<Option<CreatedAdmin>> {
     let var = |k: &str| std::env::var(k).ok();
     if !any_set(&var) {
@@ -199,12 +204,23 @@ pub(crate) async fn seed_from_environment(
         .unwrap_or_default();
     // Something is set, so `from_env` answered a seed or a refusal, never `None`.
     let outcome = outcome.and_then(|s| s.ok_or_else(|| "no admin is configured".to_string()));
+    let accounts_exist = store.user_count().await.map(|n| n > 0).unwrap_or(false);
+    if !accounts_exist
+        && outcome.is_ok()
+        && let Ok(account) = crystalline_identity::auth_store::normalize_new_account_name(&name)
+        && let Err(refusal) = engine.clear_name_for_new_account(&account).await
+    {
+        tracing::error!(
+            "the admin '{account}' from the environment was not created: {}",
+            refusal.admin_sentence()
+        );
+        return Ok(None);
+    }
     let seeded = seed(&store, outcome).await;
     drop(store);
     match seeded.map_err(anyhow::Error::msg)? {
         Seeded::Created => Ok(Some(CreatedAdmin {
             line: created_line(&name),
-            name,
         })),
         Seeded::Ignored => {
             if let Some(v) = password_variable(&var) {
