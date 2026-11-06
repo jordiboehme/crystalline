@@ -161,6 +161,15 @@ describe.each([
         userEvent: "select.pointer",
       });
     };
+    const cut = (view: EditorView, from: number, to: number) => {
+      select(view, from, to);
+      const event = new Event("cut", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: { setData: () => {}, getData: () => "", clearData: () => {} },
+      });
+      view.focus();
+      view.contentDOM.dispatchEvent(event);
+    };
     const type = (view: EditorView, from: number, to: number) => {
       select(view, from, to);
       typeText(view, "X");
@@ -194,6 +203,13 @@ describe.each([
         }
       },
     );
+
+    it("cut with a real event reads as on a whole tree, or not at all", () => {
+      const row = "| label | **a** b |";
+      const whole = pressed(row, "a** b", 5, false, cut);
+      expect(whole).not.toBe(row);
+      expect([whole, row]).toContain(pressed(row, "a** b", 5, true, cut));
+    });
 
     it("never leaves the lone mark the old pin named, where marks are hidden", () => {
       const wanted =

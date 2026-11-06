@@ -97,8 +97,49 @@ const newLink = (state: EditorState, edit: ElementEdit) =>
     ? newLinkChanges(state, edit.range, { text: "", address: "https://x" })
     : null;
 
+/** A cut as the browser sends it: a real event on the view's content. */
+function cutEvent(view: EditorView): void {
+  const event = new Event("cut", { bubbles: true, cancelable: true });
+  Object.defineProperty(event, "clipboardData", {
+    value: { setData: () => {}, getData: () => "", clearData: () => {} },
+  });
+  view.focus();
+  view.contentDOM.dispatchEvent(event);
+}
+
 describe.each(MODES)("a selection replaced, $mode, room $room", (options) => {
   const text = page("a **bold** b `code` e");
+
+  it("cut with a real event reads as on a whole tree", () => {
+    const cut = (view: EditorView) => {
+      cutEvent(view);
+    };
+    const whole = replaced(false, cut);
+    expect(whole).not.toBe(text);
+    expect(replaced(true, cut)).toBe(whole);
+  });
+
+  it.each(["delete.selection", "delete.cut", "delete.picture", "move.drop"])(
+    "%s reads as on a whole tree",
+    (userEvent) => {
+      const remove = (view: EditorView) => {
+        const { from, to } = view.state.selection.main;
+        view.dispatch({ changes: { from, to }, userEvent });
+      };
+      expect(replaced(true, remove)).toBe(replaced(false, remove));
+    },
+  );
+
+  it.each(["input.drop", "input.complete"])(
+    "%s reads as on a whole tree",
+    (userEvent) => {
+      const put = (view: EditorView) => {
+        const { from, to } = view.state.selection.main;
+        view.dispatch({ changes: { from, to, insert: "Y" }, userEvent });
+      };
+      expect(replaced(true, put)).toBe(replaced(false, put));
+    },
+  );
 
   function replaced(short: boolean, write: (view: EditorView) => void) {
     const view = parsedView(markView(text, options));
@@ -245,6 +286,39 @@ describe("a rich paste", () => {
   });
 });
 
+describe("a rich paste past its budget", () => {
+  it("into an unread fence goes in as plain text", () => {
+    const above = Array.from(
+      { length: 4000 },
+      (_, i) => `Paragraph ${String(i)} with **bold** text.`,
+    ).join("\n\n");
+    const text = `${above}\n\n\`\`\`sh\necho one\n\`\`\`\n`;
+    const view = markView(text, { mode: "hidden", parsed: false });
+    const at = text.indexOf("echo one") + 8;
+    setCaret(view, at);
+    clock.starved = true;
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        getData: (type: string) =>
+          type === "text/html"
+            ? "<p><b>bold</b> word</p>"
+            : type === "text/plain"
+              ? "bold word"
+              : "",
+        types: ["text/html", "text/plain"],
+        files: [],
+        items: [],
+      },
+    });
+    view.contentDOM.dispatchEvent(event);
+    clock.starved = false;
+    expect(bytes(view.state)).toBe(
+      text.replace("echo one", "echo onebold word"),
+    );
+  });
+});
+
 describe("the / menu", () => {
   it.each([
     ["a fence", "```sh\n/\n```"],
@@ -335,6 +409,24 @@ describe("a fence whose language is still loading", () => {
   });
 });
 
+describe("typing below a fence whose language is loading", () => {
+  it("asks no further parse of a line the edit's own parse read", () => {
+    const text = page("```python\nprint(1)\n```");
+    const view = parsedView(markView(text, { mode: "hidden" }));
+    const at = text.indexOf("The end.");
+    view.dispatch({ changes: { from: at, insert: "Z" } });
+    const { state } = view;
+    clock.seen = 0;
+    const parsed = parsedTo(
+      state,
+      state.doc.lineAt(at).to,
+      deadlineIn(PARSE_BUDGET.typing),
+    );
+    expect(parsed).toBe(state);
+    expect(clock.seen).toBe(0);
+  });
+});
+
 describe("a trial whose reparse is cut short", () => {
   // A tree cut inside a quote is as long as the blocks it closed, with the
   // next line unread. One pause of the page at each look at the clock in turn:
@@ -362,12 +454,23 @@ describe("a key whose own parse ran out acts on the page as drawn (ruling on F5)
   // On a short tree the line is drawn as text, so the person sees the fence
   // or the marker as letters, and the key does what they see. Refusing would
   // make a long page unusable during its first parse.
-  it("Enter is a plain line break", () => {
-    const text = "# Title\n\nA first paragraph.\n\n- one\n- [ ] two\n";
-    const view = parsedView(markView(text, { mode: "hidden" }));
-    const at = text.indexOf("two") + 3;
+  const above = Array.from(
+    { length: 4000 },
+    (_, i) => `Paragraph ${String(i)} with **bold** text.`,
+  ).join("\n\n");
+
+  /** A long page in its first parse, the caret far below what it has read. */
+  function far(target: string, word: string, off: number) {
+    const text = `${above}\n\n${target}\n`;
+    const view = markView(text, { mode: "hidden", parsed: false });
+    const at = text.indexOf(word) + off;
     setCaret(view, at);
-    cut(view, at);
+    expect(syntaxTree(view.state).length).toBeLessThan(at);
+    return { text, view };
+  }
+
+  it("Enter is a plain line break", () => {
+    const { text, view } = far("- one\n- [ ] two", "two", 3);
     clock.starved = true;
     keys(view, "Enter");
     clock.starved = false;
@@ -375,11 +478,7 @@ describe("a key whose own parse ran out acts on the page as drawn (ruling on F5)
   });
 
   it("Mod-Enter falls through to the default line break", () => {
-    const text = "# Title\n\nA first paragraph.\n\n- one\n- [ ] two\n";
-    const view = parsedView(markView(text, { mode: "hidden" }));
-    const at = text.indexOf("two") + 3;
-    setCaret(view, at);
-    cut(view, at);
+    const { text, view } = far("- one\n- [ ] two", "two", 3);
     clock.starved = true;
     keys(view, "Mod-Enter");
     clock.starved = false;
@@ -387,21 +486,9 @@ describe("a key whose own parse ran out acts on the page as drawn (ruling on F5)
   });
 
   it("Backspace joins a code line to the fence the page draws as text", () => {
-    const above = Array.from(
-      { length: 4000 },
-      (_, i) => `Paragraph ${String(i)} with **bold** text.`,
-    ).join("\n\n");
-    const text = `# Title\n\nA first paragraph.\n\n${above}\n\n\`\`\`js\nlet x = 1;\n\`\`\`\n`;
-    const view = parsedView(markView(text, { mode: "hidden" }));
-    const at = text.indexOf("let x");
-    setCaret(view, at);
-    clock.starved = true;
-    view.dispatch({ changes: { from: 9, insert: "Z" } });
-    view.dispatch({ changes: { from: 9, to: 10 } });
-    clock.starved = false;
-    expect(syntaxTree(view.state).length).toBeLessThan(at);
+    const { text, view } = far("```js\nlet x = 1;\n```", "let x", 0);
     // The key's own parse runs out; the deletion check's reaches.
-    clock.stall = 8;
+    clock.stall = 50;
     keys(view, "Backspace");
     clock.stall = 0;
     expect(bytes(view.state)).toBe(text.replace("```js\nlet", "```jslet"));

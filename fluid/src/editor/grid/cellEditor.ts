@@ -65,7 +65,7 @@ import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage, editorHighlight } from "../setup";
 import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
-import { budgetOf, isReadTo } from "../marks/parse";
+import { budgetOf, isReadTo, parsedTo, pressDeadline } from "../marks/parse";
 import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
@@ -995,7 +995,7 @@ function rowUnreadAfter(state: EditorState, budget: number): boolean {
   if (!rowUnread(state)) return false;
   const cell = state.field(rangeField);
   const line = state.doc.lineAt(cell.to);
-  return ensureSyntaxTree(state, line.to, budget) === null;
+  return parsedTo(state, line.to, pressDeadline(state, budget)) === null;
 }
 
 /**

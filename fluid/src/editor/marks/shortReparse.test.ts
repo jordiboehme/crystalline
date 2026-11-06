@@ -199,13 +199,13 @@ describe("a press whose own parse runs out", () => {
       (_, i) => `Paragraph ${String(i)} with **bold** text.`,
     ).join("\n\n");
     const text = `${above}\n\nThe last line.\n`;
-    const view = parsedView(markView(text, { mode: "hidden" }));
+    // In its first parse: a cut reparse is too near the line it edited for a
+    // starved press to fall short, and the free steps would reach it.
+    const view = markView(text, { mode: "hidden", parsed: false });
     const said = heard(view);
     const at = text.indexOf("The last line.");
-    clock.starved = true;
-    view.dispatch({ changes: { from: 0, insert: "Z" } });
-    view.dispatch({ changes: { from: 0, to: 1 } });
     setCaret(view, at + 2);
+    clock.starved = true;
     keys(view, "Delete");
     clock.starved = false;
     expect(syntaxTree(view.state).length).toBeLessThan(at);

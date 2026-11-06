@@ -63,6 +63,7 @@ import {
   budgetOf,
   deadlineIn,
   parsedTo,
+  pressDeadline,
   viewParsedTo,
 } from "./parse";
 
@@ -893,19 +894,18 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
     return tr;
   }
   // Judged on a tree that reaches what it takes: a filter cannot publish, and
-  // a short one shows no marks to keep, so a typed or pasted letter would leave
-  // a lone `**` (D35). Short of time it goes as the page draws it; caret typing
-  // has returned above and never pays this. A delete does not parse here: the
-  // deletion check after this filter does, and refuses past the press's one
-  // bound (`parse.test.ts`).
+  // a short one shows no marks to keep, so a typed, pasted or cut stretch would
+  // leave a lone `**` (D35). Every event alike, as nothing before a filter need
+  // have parsed. Short of time it goes as the page draws it, and the deletion
+  // check, on the same deadline, refuses a delete. Caret typing has returned
+  // above and never pays this.
   const reach = Math.max(...deleted.map((d) => d.to));
-  const judged = tr.isUserEvent("delete")
-    ? start
-    : (parsedTo(
-        start,
-        start.doc.lineAt(reach).to,
-        deadlineIn(budgetOf(event)),
-      ) ?? start);
+  const judged =
+    parsedTo(
+      start,
+      start.doc.lineAt(reach).to,
+      pressDeadline(start, budgetOf(event)),
+    ) ?? start;
   const { kept, dropped } = markFate(judged, deleted, inserts);
   if (kept.length === 0 && dropped.length === 0) {
     return tr;

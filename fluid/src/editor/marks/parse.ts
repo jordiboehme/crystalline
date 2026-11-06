@@ -16,13 +16,13 @@
  * Past its bound a command or a deletion is refused with `PAGE_LOADING`,
  * never written unchecked: a delete that touches no pair can still make one.
  *
- * A key that deletes holds more than one deadline: the key's own parse and
- * the deletion check each have one, and in a cell so does the guard of an
- * unread row. Only a press that is refused for want of a parse spends them all.
+ * The filters that judge one edit share one deadline (`pressDeadline`). A key
+ * that deletes holds two: its own parse before it reads the page, and that
+ * one. Only a press that is refused for want of a parse spends them both.
  */
 
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
+import { Language, ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import type { EditorState, StateField } from "@codemirror/state";
 import type { Tree } from "@lezer/common";
 import type { EditorView } from "@codemirror/view";
 
@@ -102,6 +102,22 @@ export function deadlineIn(budget: number): Deadline {
   };
 }
 
+const pressDeadlines = new WeakMap<EditorState, Deadline>();
+
+/**
+ * The one deadline of the filters that judge one edit, which all start from
+ * the same state: the guard of a cell's row, `keepPartnerMarks` and the deletion
+ * check. A refused edit still makes a new state, so the next press gets its own.
+ */
+export function pressDeadline(state: EditorState, budget: number): Deadline {
+  let deadline = pressDeadlines.get(state);
+  if (!deadline) {
+    deadline = deadlineIn(budget);
+    pressDeadlines.set(state, deadline);
+  }
+  return deadline;
+}
+
 /** The bound of one press that writes an edit of `event` (D35). */
 export function budgetOf(event: string): number {
   return event === "input.type" ||
@@ -112,36 +128,39 @@ export function budgetOf(event: string): number {
 }
 
 /**
- * How far each finished tree is known to reach. The parse context cannot say
- * for a page with a fence whose language is still loading: the parse covers
- * every character but leaves no fragment over the fence, so the context never
- * calls itself done and each ask would parse again.
+ * The parse a state holds. `treeLen` is how far it finished, which is the one
+ * thing that says what is read: a cut tree's `length` overstates it (`advance`),
+ * and `ensureSyntaxTree` calls a page with a fence whose language is still
+ * loading never done (no fragment spans the fence), so it would parse again
+ * on each key. Not public API in @codemirror/language 6.13.1; a test pins it
+ * (`pressParse.test.ts`), as other tests pin the same version's clock (D26).
  */
-const knownReach = new WeakMap<Tree, number>();
-
-function noteReach(tree: Tree, upto: number): void {
-  knownReach.set(tree, Math.max(knownReach.get(tree) ?? -1, upto));
+interface HeldParse {
+  context: { treeLen: number; tree: Tree };
 }
+const languageState = (Language as unknown as { state: StateField<HeldParse> })
+  .state;
 
-/**
- * The tree that is parsed to `upto` with no parse time spent, or null. A look
- * at no clock when it is done. The one way to ask how far a state is read: a
- * cut tree's `length` overstates it (`advance`).
- */
+/** The tree `state`'s parse finished to `upto`, with no parse time spent, or null. */
 function readTo(state: EditorState, upto: number): Tree | null {
-  const held = syntaxTree(state);
-  if ((knownReach.get(held) ?? -1) >= upto) return held;
-  const done = ensureSyntaxTree(state, upto, 0);
-  if (done) noteReach(done, upto);
-  return done;
+  const held = state.field(languageState, false)?.context;
+  return held && held.treeLen >= upto ? held.tree : null;
 }
 
-/** Whether `state` is read to `upto`. */
+/** Whether `state` is read to `upto`. Spends nothing, so a filter can ask. */
 export function isReadTo(state: EditorState, upto: number): boolean {
   return readTo(state, upto) !== null;
 }
 
-/** `ensureSyntaxTree` on the press's clock, after asking with no time. */
+/**
+ * The parse steps a press takes before its clock counts. A step is one block,
+ * so a line a few blocks away is read at any load: a pause of the page must not
+ * cost a press on a small page its format (D52), and a long way off is still a
+ * long way off.
+ */
+const FREE_STEPS = 16;
+
+/** `ensureSyntaxTree` on the press's clock, when the parse is not there yet. */
 function timed(
   state: EditorState,
   upto: number,
@@ -155,8 +174,16 @@ function timed(
   const spent = Math.max(0, Date.now() - began);
   deadline.left -= spent;
   deadline.rest -= spent;
-  if (tree) noteReach(tree, upto);
   return tree;
+}
+
+/** The first `FREE_STEPS` steps towards `upto`, or null when they fall short. */
+function freeSteps(state: EditorState, upto: number): Tree | null {
+  for (let step = 0; step < FREE_STEPS; step += 1) {
+    const tree = ensureSyntaxTree(state, upto, 0);
+    if (tree) return tree;
+  }
+  return null;
 }
 
 /**
@@ -176,7 +203,10 @@ function advance(
   upto: number,
   deadline: Deadline,
 ): Tree | null {
-  const reached = timed(state, upto, deadline, deadline.left);
+  const reached =
+    readTo(state, upto) ??
+    freeSteps(state, upto) ??
+    timed(state, upto, deadline, deadline.left);
   if (!reached) return null;
   if (deadline.rest <= 0 || !readsBelow(state, upto)) return reached;
   const whole = timed(
@@ -203,11 +233,7 @@ export function parsedTo(
 ): EditorState | null {
   const tree = advance(state, upto, deadline);
   if (!tree) return null;
-  if (tree === syntaxTree(state)) return state;
-  const settled = state.update({}).state;
-  // Its update can run the parse again, on a page the context never calls done.
-  noteReach(syntaxTree(settled), upto);
-  return settled;
+  return tree === syntaxTree(state) ? state : state.update({}).state;
 }
 
 /**
@@ -227,9 +253,6 @@ export function viewParsedTo(
 ): boolean {
   const tree = advance(view.state, upto, deadline);
   if (!tree) return false;
-  if (tree !== syntaxTree(view.state)) {
-    view.dispatch({});
-    noteReach(syntaxTree(view.state), upto);
-  }
+  if (tree !== syntaxTree(view.state)) view.dispatch({});
   return true;
 }

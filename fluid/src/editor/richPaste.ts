@@ -74,10 +74,14 @@ function isPlainPasteKey(event: KeyboardEvent): boolean {
   );
 }
 
-function parsedForPaste(view: EditorView): void {
+function parsedForPaste(view: EditorView): boolean {
   const { doc, selection } = view.state;
   const last = selection.ranges.at(-1) ?? selection.main;
-  viewParsedTo(view, doc.lineAt(last.to).to, deadlineIn(PARSE_BUDGET.gesture));
+  return viewParsedTo(
+    view,
+    doc.lineAt(last.to).to,
+    deadlineIn(PARSE_BUDGET.gesture),
+  );
 }
 
 /** Whether a caret or selection sits in a code block, which takes code as it is. */
@@ -162,8 +166,9 @@ export function richPaste(): Extension {
         }
         const plain = data.getData("text/plain");
         // Parsed first (D35): a short tree holds no fence, and the paste would
-        // write converted Markdown into one.
-        if (plainKey || (parsedForPaste(view), inCode(view.state))) {
+        // write converted Markdown into one. Past the budget plain text goes
+        // in, which is never wrong there.
+        if (plainKey || !parsedForPaste(view) || inCode(view.state)) {
           if (files.length === 0) {
             return false;
           }
