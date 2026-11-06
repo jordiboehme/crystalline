@@ -958,6 +958,7 @@ fn leave_token(root: &Path, account: &str) {
     .unwrap();
 }
 
+#[cfg(unix)]
 fn set_writable(dir: &Path, writable: bool) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(
@@ -997,6 +998,7 @@ async fn creating_an_account_sweeps_a_token_left_under_its_name() {
 
 /// A delete that failed at the removal is made good when the name is taken
 /// again, and a delete that fails then refuses the new account, leaving none.
+#[cfg(unix)]
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_delete_never_reaches_a_new_account() {

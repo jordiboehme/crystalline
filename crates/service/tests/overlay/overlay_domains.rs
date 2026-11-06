@@ -9777,6 +9777,7 @@ async fn the_engine_refuses_to_discard_a_live_accounts_drafts() {
 /// only somebody else's drafts live in now refuses only that somebody. A folder
 /// every name's drafts live under still refuses, and the admin reads which domain
 /// and where to look.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreadable_folder_refuses_only_the_names_it_can_hold() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -9865,6 +9866,7 @@ async fn the_count_sees_the_journal_and_a_domain_that_stopped_reviewing() {
 
 /// A discard that fails half way says what went, and a domain with a failure does
 /// not stop the next. The drafts stay counted, so the name stays refused.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_discard_that_fails_half_way_says_what_went() {
     use std::os::unix::fs::PermissionsExt as _;
