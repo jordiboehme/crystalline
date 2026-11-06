@@ -266,6 +266,36 @@ describe("closing by hand", () => {
     expect(reasons).toEqual(["user"]);
   });
 
+  it("scrolls to the caret it placed, which a tall diagram can leave out of the window (i5)", async () => {
+    const view = await drawn();
+    open(view);
+    const dispatch = vi.spyOn(view, "dispatch");
+    closeDiagramIntent(view, "user");
+    const placed = dispatch.mock.calls
+      .flat()
+      .find((spec) => "selection" in (spec as object)) as
+      { scrollIntoView?: boolean } | undefined;
+    expect(placed?.scrollIntoView).toBe(true);
+  });
+
+  it("gives beforeClose the newest draft, not an older note (i23)", async () => {
+    const view = await drawn();
+    open(view, "rename");
+    noteIntentDraft(view, "old");
+    view.dispatch({
+      effects: setDiagramIntent.of({
+        anchor: FROM,
+        target: CANVAS,
+        mode: "rename",
+        draft: "new",
+      }),
+    });
+    const seen: (string | undefined)[] = [];
+    beforeClose(view, (_, intent) => seen.push(intent.draft));
+    closeDiagramIntent(view, "user");
+    expect(seen).toEqual(["new"]);
+  });
+
   it("moves neither the caret nor the focus with focusTo none", async () => {
     const view = await drawn();
     open(view);
@@ -521,6 +551,35 @@ describe("a fence coming back", () => {
     expect(host.container).toBe(again);
   });
 
+  it("hands the mode to its reopener once per remount, after Raw flips too (i24)", async () => {
+    const view = await drawn(LONG);
+    setRaw(view, true);
+    setRaw(view, false);
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
+    });
+    open(view, "connect");
+    const reopen = vi.fn();
+    registerIntentReopen("connect", reopen);
+    away(view);
+    back(view);
+    await flush();
+    expect(reopen).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives the focus back without scrolling to the box (i19)", async () => {
+    const view = await drawn(LONG);
+    open(view, "menu");
+    view.dom.querySelector<HTMLElement>(".cm-diagram")?.focus();
+    away(view);
+    await flush();
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
+    back(view);
+    await flush();
+    expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+    focus.mockRestore();
+  });
+
   it("focuses the canvas when no later task claimed the mode and the focus went with the box", async () => {
     const view = await drawn(LONG);
     open(view, "focus");
@@ -638,6 +697,41 @@ describe("leaving a diagram with no line to stand on (R74)", () => {
     expect(view.dom.querySelectorAll(".cm-diagram")).toHaveLength(2);
   });
 
+  it("treats a table right below the same way: no key goes into it (R79 N4)", async () => {
+    const doc = `Top\n\n${fence(BODY)}\n| a |\n|---|\n| b |\n\nEnd`;
+    const view = await drawn(doc);
+    setCaret(view, doc.indexOf("| a |"));
+    open(view);
+    box(view).focus();
+    closeDiagramIntent(view, "user");
+    expect(document.activeElement).toBe(box(view));
+    expect(view.state.selection.main.head).toBe(4);
+    pressOn(box(view), "x");
+    expect(view.state.doc.toString()).toBe(doc);
+  });
+
+  it("does not take a caret to a table on a tree the parse has not brought there", async () => {
+    const doc = `Top\n\n${fence(BODY)}\n| a |\n|---|\n| b |\n\nEnd`;
+    const view = await drawn(doc);
+    open(view);
+    box(view).focus();
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1_000;
+      return now;
+    });
+    try {
+      view.dispatch({ changes: { from: 0, insert: "x" }, userEvent: "input" });
+    } finally {
+      clock.mockRestore();
+    }
+    closeDiagramIntent(view, "user");
+    expect(document.activeElement).toBe(box(view));
+    expect(view.state.selection.main.head).not.toBe(
+      view.state.doc.toString().indexOf("| a |"),
+    );
+  });
+
   it("treats any fence right below the same way, a code fence too", async () => {
     const code = "```ts\nconst a = 1;\n```";
     const doc = `Top\n\n${fence(BODY)}\n${code}\n\nEnd`;
@@ -734,6 +828,21 @@ describe("a body edit with the parse behind (R75)", () => {
     expect(intentStale(view.state)).toBe(false);
     expect(intentOf(view)?.mode).toBe("rename");
     expect(view.dom.querySelector(".cm-diagram")).toBe(dom);
+    await flush();
+    expect(reasons).toEqual([]);
+  });
+
+  it("stays stale, not gone, for a line a peer inserts at the fence's first mark", async () => {
+    const view = await drawn(DOC, { room: true });
+    open(view, "rename");
+    const reasons = closes(view);
+    withNoBudget(() => {
+      remoteInsert(view, FROM, "New line\n");
+    });
+    expect(syntaxTree(view.state).length).toBeLessThan(view.state.doc.length);
+    expect(intentOf(view)?.mode).toBe("rename");
+    expect(intentStale(view.state)).toBe(true);
+    expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
     await flush();
     expect(reasons).toEqual([]);
   });

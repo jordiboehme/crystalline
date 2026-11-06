@@ -1,0 +1,202 @@
+/**
+ * The keys and the pointer on a drawn diagram in a real browser: what jsdom
+ * cannot answer. Real focus and the tab order, a click landing on a part of a
+ * real drawing, and a key on the box not reaching the text.
+ *
+ * Shares the daemon, the fixture domain and the accounts `run-smoke.sh` sets
+ * up; run it the same way (`bash fluid/e2e/run-smoke.sh e2e/diagram-keys.spec.ts`).
+ */
+
+import type { Locator, Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+
+const USER = process.env.FLUID_E2E_USER ?? "smoke";
+const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
+const DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
+const BASE_PATH = process.env.FLUID_E2E_BASE_PATH ?? "";
+
+let unique = 0;
+const made: string[] = [];
+
+async function signIn(page: Page): Promise<void> {
+  await page.goto("./");
+  await expect(page).toHaveURL((url) => url.pathname === `${BASE_PATH}/login`);
+  await page.getByLabel("Name", { exact: true }).fill(USER);
+  await page.getByLabel("Password", { exact: true }).fill(PASSWORD);
+  await page.getByRole("button", { name: "Log in" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Home", level: 1 }),
+  ).toBeVisible();
+}
+
+async function openEditor(page: Page, content: string): Promise<void> {
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  const csrf = ((await me.json()) as { csrf: string }).csrf;
+  unique += 1;
+  const response = await page.request.post(
+    `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams`,
+    {
+      headers: { "X-CSRF-Token": csrf },
+      data: {
+        title: `Diagram widget ${String(Date.now())}${String(unique)}`,
+        content,
+      },
+    },
+  );
+  expect(response.ok(), await response.text()).toBeTruthy();
+  const { permalink } = (await response.json()) as { permalink: string };
+  made.push(permalink);
+  await page.goto(`d/${DOMAIN}/e/${permalink}`);
+  await page.getByRole("link", { name: "Edit" }).click();
+}
+
+function line(page: Page, text: string): Locator {
+  return page.locator(".cm-content > .cm-line", {
+    hasText: new RegExp(`^${text}$`),
+  });
+}
+
+test.beforeEach(async ({ page }) => {
+  await signIn(page);
+});
+
+test.afterEach(async ({ page }) => {
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  const token = ((await me.json()) as { csrf: string }).csrf;
+  for (const permalink of made.splice(0)) {
+    const at = `${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams/${permalink}`;
+    // Named by version (If-Match); a room may still be saving its last change.
+    await expect
+      .poll(
+        async () => {
+          const detail = await page.request.get(at);
+          const removed = await page.request.delete(at, {
+            headers: {
+              "X-CSRF-Token": token,
+              "If-Match": detail.headers()["etag"] ?? "",
+            },
+          });
+          return removed.status();
+        },
+        { timeout: 15_000 },
+      )
+      .toBeLessThan(300);
+  }
+});
+
+const box = (page: Page) => page.locator(".cm-diagram");
+const focusedLabel = (page: Page) =>
+  page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? "");
+const focusedIsBox = (page: Page) =>
+  page.evaluate(
+    () => document.activeElement?.classList.contains("cm-diagram") ?? false,
+  );
+const FENCE = "```mermaid\nflowchart TD\n  A[First] --> B[Second]\n```";
+
+test("the keys walk the stops, with one Tab stop, and Escape leaves", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ArrowDown");
+  expect(await focusedIsBox(page)).toBe(true);
+  await page.keyboard.press("ArrowRight");
+  expect(await focusedLabel(page)).toBe("Box: First");
+  await expect(box(page).locator(".cm-diagram-focus-ring")).toBeVisible();
+  await page.keyboard.press("End");
+  expect(await focusedLabel(page)).toBe("Arrow from First to Second");
+  await expect(box(page).locator('[tabindex="0"]')).toHaveCount(1);
+  await page.keyboard.press("x");
+  expect(await focusedLabel(page)).toBe("Arrow from First to Second");
+  await page.keyboard.press("Escape");
+  await expect(line(page, "Below marker")).toBeVisible();
+  await page.keyboard.type("Q");
+  await expect(line(page, "QBelow marker")).toBeVisible();
+});
+
+test("Tab goes in and out in one stop", async ({ page }) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await box(page).focus();
+  expect(await focusedIsBox(page)).toBe(true);
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Tab");
+  const inside = await page.evaluate(
+    () => document.activeElement?.closest(".cm-diagram") != null,
+  );
+  expect(inside).toBe(false);
+  await page.keyboard.press("Shift+Tab");
+  expect(await focusedLabel(page)).toBe("Box: First");
+});
+
+test("a click maps to its box and its arrow, also for duplicates and odd ids", async ({
+  page,
+}) => {
+  await openEditor(
+    page,
+    "Top\n\n```mermaid\nflowchart LR\n  step-1[One] --> a_b[Two]\n  step-1 --> a_b\n```\n\nEnd\n",
+  );
+  await expect(box(page).locator("svg")).toBeVisible();
+  await box(page).locator("g.node", { hasText: "Two" }).click();
+  expect(await focusedLabel(page)).toBe("Box: Two");
+  const paths = box(page).locator('path[data-et="edge"]');
+  await expect(paths).toHaveCount(2);
+  expect(await paths.first().getAttribute("aria-label")).toBe(
+    "Arrow from One to Two",
+  );
+  await expect(box(page).locator("[data-hit-for]")).toHaveCount(2);
+  const ids = await box(page)
+    .locator("[data-hit-for]")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-hit-for")));
+  // Mermaid's own numbering, which skips: a hit path exists only for an id that
+  // matched a model edge exactly, so both arrows here mapped.
+  expect([...ids].sort()).toEqual(["L_step-1_a_b_0", "L_step-1_a_b_2"]);
+});
+
+test("Backspace from the line below goes to the canvas, and the second press deletes", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await line(page, "Below marker").click();
+  await page.keyboard.press("Home");
+  await page.keyboard.press("Backspace");
+  expect(await focusedIsBox(page)).toBe(true);
+  await expect(box(page)).toHaveCount(1);
+  await page.keyboard.press("Backspace");
+  await expect(box(page)).toHaveCount(0);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(box(page)).toHaveCount(1);
+});
+
+test("Delete on a box takes it out, and the focus stays on the drawing", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.press("Delete");
+  await expect(box(page).locator("g.node")).toHaveCount(1);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () => document.activeElement?.closest(".cm-diagram") != null,
+      ),
+    )
+    .toBe(true);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect(box(page).locator("g.node")).toHaveCount(2);
+});
+
+test("a self-loop's arrow is a stop like any other", async ({ page }) => {
+  await openEditor(
+    page,
+    "Top\n\n```mermaid\nflowchart TD\n  A[One] --> A\n```\n\nEnd\n",
+  );
+  await expect(box(page).locator("svg")).toBeVisible();
+  await expect(box(page).locator("[data-hit-for]")).toHaveCount(1);
+  await box(page).focus();
+  await page.keyboard.press("End");
+  expect(await focusedLabel(page)).toBe("Arrow from One to One");
+});

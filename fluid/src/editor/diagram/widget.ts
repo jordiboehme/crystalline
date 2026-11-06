@@ -27,14 +27,14 @@
  *
  * Reading-only pages keep the drawing and its stops; `host.writable()` is what
  * the menus, the rename field, connect and delete ask before they offer
- * themselves. The stops come with Task 10, and the box itself is the canvas
- * stop from the start: the one place in the page's tab order.
+ * themselves. `focus.ts` makes the drawing's parts stops, and the box itself is
+ * the canvas stop: with those, one place in the page's tab order.
  */
 
 import type { EditorView } from "@codemirror/view";
 import { EditorView as View, WidgetType } from "@codemirror/view";
 
-import { mermaidConfig } from "../../theme/mermaid";
+import { initializeMermaid, mermaidThemeChanges } from "../../theme/mermaid";
 import { writable } from "../elementEdit";
 import { takePreviewDrawing } from "../fencePreviews";
 import type { RefusalCode } from "./edits";
@@ -97,9 +97,6 @@ interface Box {
 const boxes = new WeakMap<HTMLElement, Box>();
 
 let renders = 0;
-/** The theme mermaid was last given, and how often that changed. */
-let lastDark: boolean | null = null;
-let themeChanges = 0;
 let renderer: Promise<
   [typeof import("mermaid"), typeof import("../../theme/mermaidText")]
 > | null = null;
@@ -299,16 +296,11 @@ function render(box: Box): void {
   const id = nextRenderId();
   void loadRenderer()
     .then(async ([{ default: mermaid }, { drawnLabels }]) => {
-      mermaid.initialize(mermaidConfig(dark));
-      if (lastDark !== null && lastDark !== dark) {
-        themeChanges += 1;
-      }
-      lastDark = dark;
-      const theme = themeChanges;
+      const theme = initializeMermaid(mermaid, dark);
       const rendered = await mermaid.render(id, body);
       return {
         svg: drawnLabels(rendered.svg),
-        sameTheme: theme === themeChanges,
+        sameTheme: theme === mermaidThemeChanges(),
       };
     })
     .then(
@@ -578,6 +570,18 @@ export const diagramTheme = View.baseTheme({
     pointerEvents: "none",
   },
   ".cm-diagram-overlay > *": { pointerEvents: "auto" },
+  // The ring is the look of the focus; the browser's own outline would double it.
+  ".cm-diagram:focus, .cm-diagram svg [tabindex]:focus": { outline: "none" },
+  ".cm-diagram-overlay > .cm-diagram-focus-ring": {
+    position: "absolute",
+    pointerEvents: "none",
+    boxSizing: "border-box",
+    border: "2px solid var(--color-accent-600)",
+    borderRadius: "0.25rem",
+  },
+  "&dark .cm-diagram-overlay > .cm-diagram-focus-ring": {
+    borderColor: "var(--color-accent-300)",
+  },
   // Over the drawing, so a notice never moves the text below the box.
   ".cm-diagram-notice": {
     position: "absolute",

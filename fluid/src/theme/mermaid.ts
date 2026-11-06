@@ -204,3 +204,30 @@ export function mermaidConfig(dark: boolean): MermaidConfig {
       : { ...VARIABLES.light, ...seriesVariables(RAMP.light) },
   };
 }
+
+/** The theme mermaid was last given, and how often that changed. */
+let lastDark: boolean | null = null;
+let themeChanges = 0;
+
+/**
+ * The one way the app initializes mermaid, so every change of theme counts.
+ * Mermaid queues its renders and reads the configuration when a render's turn
+ * comes, so a render that saw this number change may have drawn in the other
+ * theme. Returns the number as it stands after this call.
+ */
+export function initializeMermaid(
+  mermaid: { initialize(config: MermaidConfig): void },
+  dark: boolean,
+): number {
+  mermaid.initialize(mermaidConfig(dark));
+  if (lastDark !== null && lastDark !== dark) {
+    themeChanges += 1;
+  }
+  lastDark = dark;
+  return themeChanges;
+}
+
+/** How often the theme mermaid was given has changed. */
+export function mermaidThemeChanges(): number {
+  return themeChanges;
+}

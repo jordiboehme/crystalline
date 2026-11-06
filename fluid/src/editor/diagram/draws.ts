@@ -5,7 +5,9 @@
  * Eager, so it imports nothing of the chunk.
  */
 
+import type { EditorState } from "@codemirror/state";
 import { Facet } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 
 /**
  * The diagram kinds the layer draws and edits. 4b adds `sequenceDiagram`.
@@ -78,3 +80,68 @@ export const drawnDiagrams = Facet.define<readonly number[], readonly number[]>(
     compare: sameNumbers,
   },
 );
+
+/** The lines a drawn fence takes: its first line's start, its last line's end. */
+export interface DrawnLines {
+  from: number;
+  to: number;
+}
+
+/** The drawn fences by their lines, in document order. The chunk computes it. */
+export const drawnFenceLines = Facet.define<
+  readonly DrawnLines[],
+  readonly DrawnLines[]
+>({
+  combine: (values) => values.flat(),
+  compare: (a, b) =>
+    a.length === b.length &&
+    a.every((v, at) => v.from === b[at]?.from && v.to === b[at]?.to),
+});
+
+/** Provided by the chunk: takes the keyboard to the canvas of the fence at `pos`. */
+export const enterDrawnFence = Facet.define<
+  (view: EditorView, pos: number) => void,
+  ((view: EditorView, pos: number) => void) | null
+>({ combine: (values) => values[0] ?? null });
+
+/**
+ * The drawn fence right across the line edge `pos`: on the next line going
+ * `forward` from a line's end, on the line before going back from its start.
+ */
+export function drawnFenceBeside(
+  state: EditorState,
+  pos: number,
+  forward: boolean,
+): DrawnLines | null {
+  const line = state.doc.lineAt(pos);
+  if (pos !== (forward ? line.to : line.from)) {
+    return null;
+  }
+  return (
+    state
+      .facet(drawnFenceLines)
+      .find((f) =>
+        forward ? f.from === line.to + 1 : f.to === line.from - 1,
+      ) ?? null
+  );
+}
+
+/**
+ * The hand-off from the hidden-mark keys (R13): a key at the line edge `pos`
+ * that would cross into a drawn fence takes the keyboard to its canvas and
+ * changes nothing. False when no drawn fence is there.
+ */
+export function stepIntoDrawnFence(
+  view: EditorView,
+  pos: number,
+  forward: boolean,
+): boolean {
+  const { state } = view;
+  const enter = state.facet(enterDrawnFence);
+  const fence = enter === null ? null : drawnFenceBeside(state, pos, forward);
+  if (enter === null || fence === null) {
+    return false;
+  }
+  enter(view, fence.from);
+  return true;
+}

@@ -268,6 +268,20 @@ describe("carryFences and a touched body (R75)", () => {
     const first = state.update({ changes: { from: 3, insert: "z" } });
     expect(carryFences([drawn], first, 5, [])).toEqual([]);
   });
+
+  it("keeps a fence when a whole line goes in right before its first mark", () => {
+    const state = EditorState.create({ doc: `${LINES}${"x".repeat(300)}` });
+    const drawn = { from: 0, to: LINES.length - 1, body, kind: "flowchart" };
+    const line = state.update({ changes: { from: 0, insert: "New line\n" } });
+    expect(carryFences([drawn], line, 5, []).map((f) => f.from)).toEqual([9]);
+  });
+
+  it("drops a fence when text at its first mark leaves that line changed", () => {
+    const state = EditorState.create({ doc: `${LINES}${"x".repeat(300)}` });
+    const drawn = { from: 0, to: LINES.length - 1, body, kind: "flowchart" };
+    const glued = state.update({ changes: { from: 0, insert: "x" } });
+    expect(carryFences([drawn], glued, 5, [])).toEqual([]);
+  });
 });
 
 describe("asking for verdicts ends", () => {

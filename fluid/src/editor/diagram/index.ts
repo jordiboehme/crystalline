@@ -8,8 +8,20 @@
 
 import type { Extension } from "@codemirror/state";
 
-import { diagramLoaded, drawnDiagrams } from "./draws";
+import { mainSelectionParked } from "../parkedSelection";
+import {
+  diagramLoaded,
+  drawnDiagrams,
+  drawnFenceLines,
+  enterDrawnFence,
+} from "./draws";
 import { diagramField, pointerWatcher, verdictWatcher } from "./field";
+import {
+  diagramEntryKeys,
+  diagramFocus,
+  enterCanvas,
+  fenceMarksGuard,
+} from "./focus";
 import { diagramIntent, intentWatcher } from "./intent";
 import { diagramTheme } from "./widget";
 
@@ -22,6 +34,21 @@ export function diagramExtension(): Extension {
     drawnDiagrams.compute([diagramField], (state) =>
       state.field(diagramField).fences.map((fence) => fence.from),
     ),
+    drawnFenceLines.compute([diagramField], (state) =>
+      state.field(diagramField).fences.map((fence) => ({
+        from: state.doc.lineAt(fence.from).from,
+        to: state.doc.lineAt(fence.to).to,
+      })),
+    ),
+    enterDrawnFence.of(enterCanvas),
+    // No bar writes into a hidden fence while the keyboard is on the drawing.
+    mainSelectionParked.compute(
+      [diagramIntent],
+      (state) => state.field(diagramIntent) !== null,
+    ),
+    fenceMarksGuard,
+    diagramEntryKeys,
+    diagramFocus,
     verdictWatcher,
     pointerWatcher,
     intentWatcher,

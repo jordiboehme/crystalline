@@ -4,6 +4,7 @@
  * alone. Built the way the Reflection editor builds its buffer.
  */
 
+import type { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { cellMarksMode } from "../../test/cellMarksMode";
@@ -92,46 +93,73 @@ describe("a Reflection", () => {
   });
 });
 
-// R73: today's bytes, wrong on purpose. Task 10 binds these keys, on this branch
-// and before the PR, and flips each of these.
-describe("Backspace on the line right after a drawn fence, until Task 10", () => {
+// R73: Backspace on the line right below a drawn fence never joins it to the
+// closing mark. It takes the keyboard to the canvas and changes nothing.
+describe("Backspace on the line right after a drawn fence", () => {
   const ID_NEXT = "## Next\n<!-- r:0b1c2d3e -->\n\nMore.\n";
   const mode = () => (cellMarksMode() === "show" ? "show" : "hidden");
+  const box = (view: EditorView) => view.dom.querySelector(".cm-diagram");
 
-  async function press(doc: string, at: string) {
+  async function press(doc: string, at: string, key = "Backspace") {
     const view = await drawn(doc);
     setCaret(view, doc.indexOf(at));
-    keys(view, "Backspace");
+    keys(view, key);
     return view;
   }
 
-  it("a blank line goes, and one undo gives it back", async () => {
+  it("a blank line stays, and the keyboard goes to the canvas", async () => {
     const view = await press(DOC, "\nDeploys");
-    expect(view.state.doc.toString()).toBe(
-      DOC.replace("\n\nDeploys", "\nDeploys"),
-    );
-    expect(hidesIdLines(view.state)).toBe(true);
-    undoOnce(view);
     expect(view.state.doc.toString()).toBe(DOC);
+    expect(hidesIdLines(view.state)).toBe(true);
+    expect(document.activeElement).toBe(box(view));
   });
 
-  it("a section heading: joins in show mode, nothing in hidden mode", async () => {
+  it("a section heading: unchanged in both modes, and show mode goes to the canvas", async () => {
     const doc = `${HEAD}${fence(BODY)}\n${ID_NEXT}`;
     const view = await press(doc, "## Next");
-    expect(view.state.doc.toString()).toBe(
-      mode() === "show" ? `${HEAD}${fence(BODY)}${ID_NEXT}` : doc,
-    );
-    expect(hidesIdLines(view.state)).toBe(true);
-    if (mode() === "show") {
-      undoOnce(view);
-    }
     expect(view.state.doc.toString()).toBe(doc);
+    expect(hidesIdLines(view.state)).toBe(true);
+    // Hidden mode keeps its own answer: the caret stands past the heading's
+    // marks, and the key that would change a section heading is refused there.
+    if (mode() === "show") {
+      expect(document.activeElement).toBe(box(view));
+    }
   });
 
-  it("text: joins the closing mark, and one undo gives the bytes back", async () => {
+  it("text: stays on its own line, and the keyboard goes to the canvas", async () => {
     const doc = `${HEAD}${fence(BODY)}\nBelow\n`;
     const view = await press(doc, "Below");
-    expect(view.state.doc.toString()).toBe(`${HEAD}${fence(BODY)}Below\n`);
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(document.activeElement).toBe(box(view));
+  });
+
+  it("Mod-Backspace: the same", async () => {
+    const doc = `${HEAD}${fence(BODY)}\nBelow\n`;
+    const view = await press(doc, "Below", "Mod-Backspace");
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(document.activeElement).toBe(box(view));
+  });
+
+  it.each(["Alt-ArrowUp"])(
+    "%s with an id line in reach does not move a line into the fence",
+    async (key) => {
+      const doc = `${HEAD}${fence(BODY)}\n${ID_NEXT}`;
+      const view = await press(doc, "## Next", key);
+      expect(view.state.doc.toString()).toBe(doc);
+    },
+  );
+
+  it("a second press on the canvas deletes the fence, and one undo gives every byte back", async () => {
+    const doc = `${HEAD}${fence(BODY)}\nBelow\n`;
+    const view = await press(doc, "Below");
+    document.activeElement?.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Backspace",
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(view.state.doc.toString()).toBe(`${HEAD}Below\n`);
     undoOnce(view);
     expect(view.state.doc.toString()).toBe(doc);
   });

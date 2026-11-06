@@ -31,7 +31,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
-import { mermaidConfig } from "../theme/mermaid";
+import { initializeMermaid } from "../theme/mermaid";
 import { drawnDiagrams } from "./diagram/draws";
 import { mermaidFence } from "./elementVerbs";
 import { gridDraws, gridLoaded, gridUnavailable } from "./grid/draws";
@@ -345,7 +345,7 @@ class MermaidPreviewWidget extends WidgetType {
         // teardown - where they accumulate for the whole session. A broken
         // diagram draws no diagram; what it draws instead is the caption
         // below, and the source is right above it.
-        mermaid.initialize(mermaidConfig(dark));
+        initializeMermaid(mermaid, dark);
         const rendered = await mermaid.render(id, source);
         if (box.isConnected || box.childElementCount === 0) {
           box.innerHTML = drawnLabels(rendered.svg);

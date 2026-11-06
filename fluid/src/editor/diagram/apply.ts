@@ -19,7 +19,10 @@
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
+import type { EditorState } from "@codemirror/state";
+import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
+import type { SyntaxNode } from "@lezer/common";
 
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { judgeBeforeCommand } from "../marks/commandJudge";
@@ -140,6 +143,75 @@ function trackedFence(view: EditorView, ticket: number): MermaidFence | null {
   }
   const pos = view.state.field(diagramAnchors, false)?.get(ticket);
   return pos === undefined ? null : readFence(view, pos);
+}
+
+/**
+ * Removes the whole fence at `anchor`: its lines and one line break, the one
+ * after it when a line follows, as one undo step. The caret goes where no next
+ * key lands on a mark: the line above when another block opens right below.
+ * Same refusals as an op, and synchronous, since nothing is left to verify.
+ */
+export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
+  if (!writable(view)) {
+    return NOOP;
+  }
+  if (composingNow(view)) {
+    return refusal("stale");
+  }
+  const ticket = ++lastTicket;
+  view.dispatch({ effects: trackAnchor.of({ ticket, pos: anchor }) });
+  try {
+    judgeBeforeCommand(view);
+    const fence = trackedFence(view, ticket);
+    if (fence === null) {
+      return refusal("gone");
+    }
+    if (!fence.topLevel) {
+      return refusal("unsupported");
+    }
+    const { state } = view;
+    const { doc } = state;
+    const first = doc.lineAt(fence.from);
+    const last = doc.lineAt(fence.to);
+    const below = last.number < doc.lines ? doc.line(last.number + 1) : null;
+    const above = first.number > 1 ? doc.line(first.number - 1) : null;
+    const from = below === null && above !== null ? above.to : first.from;
+    const to = below === null ? last.to : below.from;
+    const caret =
+      below !== null &&
+      above !== null &&
+      startsBlock(state, below.from) &&
+      !startsBlock(state, above.to)
+        ? above.to
+        : from;
+    dispatchIsolated(view, {
+      changes: { from, to },
+      selection: EditorSelection.cursor(caret),
+      userEvent: "delete.diagram",
+    });
+    return { applied: true };
+  } finally {
+    if (
+      view.dom.isConnected &&
+      view.state.field(diagramAnchors, false)?.has(ticket)
+    ) {
+      view.dispatch({ effects: untrackAnchor.of(ticket) });
+    }
+  }
+}
+
+/** Whether `pos` lies in a fenced block or a table: no place for a caret. */
+function startsBlock(state: EditorState, pos: number): boolean {
+  for (
+    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1);
+    node !== null;
+    node = node.parent
+  ) {
+    if (node.name === "FencedCode" || node.name === "Table") {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

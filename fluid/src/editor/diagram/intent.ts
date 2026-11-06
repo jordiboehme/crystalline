@@ -18,7 +18,7 @@
  * keeps the draft current with `noteIntentDraft`.
  */
 
-import { syntaxTree } from "@codemirror/language";
+import { forceParsing, syntaxTree } from "@codemirror/language";
 import type { EditorState, Line } from "@codemirror/state";
 import {
   EditorSelection,
@@ -54,6 +54,9 @@ export interface DiagramIntent {
   mode: IntentMode;
   draft?: string;
 }
+
+/** How long a close may wait for the parse to reach the fence. */
+const PARSE_MS = 50;
 
 export type IntentCloseReason = "user" | "gone" | "raw" | "swap" | "destroy";
 
@@ -203,15 +206,18 @@ function focusIsElsewhere(main: EditorView): boolean {
   );
 }
 
-/** Whether a fenced block, of any language, opens on `line`. */
-function opensFence(state: EditorState, line: Line): boolean {
+/**
+ * Whether a block no caret can stand on opens on `line`: a fenced block of any
+ * language, or a table, where the next key would go into its first row (R79 N4).
+ */
+function opensBlock(state: EditorState, line: Line): boolean {
   let found = false;
   syntaxTree(state).iterate({
     from: line.from,
     to: line.to,
     enter: (node) => {
       found ||=
-        node.name === "FencedCode" &&
+        (node.name === "FencedCode" || node.name === "Table") &&
         state.doc.lineAt(node.from).number === line.number;
       return !found;
     },
@@ -235,8 +241,8 @@ function inFence(state: EditorState, pos: number): boolean {
 
 /**
  * The start of the line after the fence, or null when there is no line to stand
- * on: the fence is last, or another one opens right below. A caret on a fence
- * mark turns the next key into a broken fence (R74).
+ * on: the fence is last, or another fence or a table opens right below. A caret
+ * on a fence mark turns the next key into a broken fence (R74).
  */
 function placeAfterFence(
   state: EditorState,
@@ -247,7 +253,7 @@ function placeAfterFence(
     return null;
   }
   const next = state.doc.line(line.number + 1);
-  return opensFence(state, next) ? null : next.from;
+  return opensBlock(state, next) ? null : next.from;
 }
 
 /**
@@ -284,6 +290,16 @@ function placeFocus(
   // A fence a peer removed does not pull the focus out of another field.
   if (reason === "gone" && focusIsElsewhere(main)) {
     return;
+  }
+  // On a short tree the fence and what follows it would not be found.
+  if (reason === "user" || reason === "raw") {
+    const reach = Math.min(anchor, main.state.doc.length);
+    forceParsing(main, main.state.doc.lineAt(reach).to, PARSE_MS);
+    const end = fenceAt(main.state, reach)?.to ?? reach;
+    const line = main.state.doc.lineAt(end).number;
+    if (line < main.state.doc.lines) {
+      forceParsing(main, main.state.doc.line(line + 1).to, PARSE_MS);
+    }
   }
   // After a swap the anchor names a place in another document, and after "gone"
   // no fence is left to stand after.
@@ -379,7 +395,7 @@ function restore(main: EditorView, host: DiagramHost): void {
     reopen(main, intent, host);
     return;
   }
-  // Until a later task knows the target's element: the canvas. The focus went
+  // A mode no one claimed yet: the canvas. The focus went
   // when the old box left, so only an unclaimed focus comes back here.
   const active = main.root.activeElement;
   if (active === null || active === main.dom.ownerDocument.body) {

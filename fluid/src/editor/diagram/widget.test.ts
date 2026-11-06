@@ -287,18 +287,44 @@ describe("the host", () => {
 });
 
 describe("events on the box", () => {
-  it("leaves the document alone for a key pressed on it (Task 10's keys rest on this)", async () => {
+  const pressOn = (view: EditorView, key: string) => {
+    box(view).dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+    );
+  };
+
+  it("leaves the document alone for a key the canvas does not act on (Task 10's keys rest on this)", async () => {
     const doc = `Top line\n\n${fence(BODY)}\n\nEnd`;
     const view = await drawn(doc);
     setCaret(view, 8);
     box(view).focus();
-    for (const key of ["Backspace", "Delete", "Enter", "x"]) {
-      box(view).dispatchEvent(
-        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
-      );
+    for (const key of ["ArrowLeft", "Enter", "x"]) {
+      pressOn(view, key);
     }
+    // No key of the diagram, and one main's keymap writes with: `ignoreEvent` is
+    // all that keeps it from adding a line to the text.
+    const mac = /Mac/.test(navigator.platform);
+    box(view).dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        keyCode: 13,
+        metaKey: mac,
+        ctrlKey: !mac,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
     expect(view.state.doc.toString()).toBe(doc);
     expect(view.state.selection.main.head).toBe(8);
+  });
+
+  it("takes exactly the fence for a Delete on the canvas, nothing of the caret's line", async () => {
+    const doc = `Top line\n\n${fence(BODY)}\n\nEnd`;
+    const view = await drawn(doc);
+    setCaret(view, 8);
+    box(view).focus();
+    pressOn(view, "Delete");
+    expect(view.state.doc.toString()).toBe("Top line\n\n\nEnd");
   });
 });
 
@@ -1112,14 +1138,14 @@ describe("the caret and deleting", () => {
     expect(covers).toBe(true);
   });
 
-  // The interim: Task 10 binds this key and flips this test. Until then the line
-  // right below joins the closing mark, so the fence is unclosed and shows as text.
-  it("joins the line right below onto the closing mark on Backspace, losing no text", async () => {
+  // R73: the line right below never joins the closing mark.
+  it("leaves the line right below on its own line on Backspace, and goes to the canvas", async () => {
     const doc = `Top\n\n${fence(BODY)}\nBelow\n`;
     const view = await drawn(doc);
     setCaret(view, doc.indexOf("Below"));
     keys(view, "Backspace");
-    expect(view.state.doc.toString()).toBe(`Top\n\n${fence(BODY)}Below\n`);
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(document.activeElement).toBe(box(view));
   });
 
   it("restores a fence a selection deleted with one undo", async () => {
@@ -1132,6 +1158,58 @@ describe("the caret and deleting", () => {
     expect(view.state.doc.toString()).not.toContain("flowchart");
     undoOnce(view);
     expect(view.state.doc.toString()).toBe(DOC);
+  });
+});
+
+describe("trying a render again (R79 N5)", () => {
+  const edited = (n: number) => BODY.replace("Next", `Next${String(n)}`);
+
+  function edit(view: EditorView, from: string, to: string) {
+    const at = view.state.doc.toString().indexOf(from);
+    view.dispatch({ changes: { from: at, to: at + from.length, insert: to } });
+  }
+
+  it("drops the retry of a failed render when the next edit draws, so the drawing stays (w18)", async () => {
+    const view = await drawn();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    kit.hold.value = true;
+    edit(view, "Next", "Next1");
+    await vi.advanceTimersByTimeAsync(0);
+    renders().at(-1)?.reject(new Error("no"));
+    await vi.advanceTimersByTimeAsync(0);
+    edit(view, "Next1", "Next2");
+    await vi.advanceTimersByTimeAsync(0);
+    const last = renders().at(-1);
+    last?.resolve(recordedAs(last.id));
+    await vi.advanceTimersByTimeAsync(0);
+    const svg = box(view).querySelector("svg");
+    expect(svg?.id).toBe(last?.id);
+    const count = renders().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renders()).toHaveLength(count);
+    expect(box(view).querySelector("svg")).toBe(svg);
+  });
+
+  it("starts its tries again for an edit after they ran out (w4)", async () => {
+    const view = await drawn();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    kit.hold.value = true;
+    edit(view, "Next", "Next1");
+    for (const wait of [5_000, 30_000, 0]) {
+      await vi.advanceTimersByTimeAsync(0);
+      renders().at(-1)?.reject(new Error("no"));
+      await vi.advanceTimersByTimeAsync(wait);
+    }
+    const spent = renders().length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renders()).toHaveLength(spent);
+    expect(view.state.doc.toString()).toContain(edited(1));
+    edit(view, "Next1", "Next2");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(renders()).toHaveLength(spent + 1);
+    renders().at(-1)?.reject(new Error("no"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(renders()).toHaveLength(spent + 2);
   });
 });
 

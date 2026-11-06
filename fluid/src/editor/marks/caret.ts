@@ -30,6 +30,7 @@ import {
 import type { Command } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
+import { stepIntoDrawnFence } from "../diagram/draws";
 import { mainSelectionParked } from "../parkedSelection";
 import type { MarkKind, MarkRun } from "./hiddenMarks";
 import { atomsOnLine, runAt, runsOnLine } from "./hiddenMarks";
@@ -234,7 +235,12 @@ function arrow(forward: boolean, extend: boolean): Command {
     }
     const head = stepVisible(state, range.head, forward, viewAtoms(view));
     if (head === null) {
-      return false;
+      // At the visible edge, with hidden marks up to the raw one (R13).
+      const line = state.doc.lineAt(range.head);
+      return (
+        !extend &&
+        stepIntoDrawnFence(view, forward ? line.to : line.from, forward)
+      );
     }
     view.dispatch({
       selection: extend

@@ -118,12 +118,16 @@ export function carryFences(
   for (const fence of previous) {
     const from = tr.changes.mapPos(fence.from, 1);
     const to = tr.changes.mapPos(fence.to, -1);
+    const first = tr.startState.doc.lineAt(fence.from);
+    const firstNow = tr.newDoc.lineAt(from);
     if (
       to <= treeLength ||
-      tr.changes.touchesRange(
-        fence.from,
-        tr.startState.doc.lineAt(fence.from).to,
-      ) !== false ||
+      tr.changes.touchesRange(fence.from + 1, first.to) !== false ||
+      // A change at the first mark: an insert ending in a line break leaves
+      // the line whole and at its start, so this is still a fence (R79 N3).
+      (tr.changes.touchesRange(fence.from, fence.from) !== false &&
+        (firstNow.text !== first.text ||
+          firstNow.from + (fence.from - first.from) !== from)) ||
       candidates.some((c) => c.from <= to && from <= c.to)
     ) {
       continue;
