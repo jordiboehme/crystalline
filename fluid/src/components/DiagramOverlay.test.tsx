@@ -22,6 +22,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import DiagramOverlay from "./DiagramOverlay";
 import type { OverlayContent } from "./DiagramOverlay";
+import { exportDiagramPng } from "./diagramPng";
+import type { PngResult } from "./diagramPng";
 
 const instance = {
   zoomIn: vi.fn(),
@@ -36,6 +38,8 @@ const instance = {
 vi.mock("@panzoom/panzoom", () => ({
   default: vi.fn(() => instance),
 }));
+
+vi.mock("./diagramPng", () => ({ exportDiagramPng: vi.fn() }));
 
 const panzoom = vi.mocked(Panzoom);
 
@@ -453,6 +457,112 @@ describe("DiagramOverlay", () => {
       expect(text).toContain('width="600px"');
     });
 
+    /**
+     * What the control does with an answer. Whether the answer is any good
+     * cannot be seen here, since jsdom has no canvas: `e2e/diagram-png.spec.ts`
+     * opens real files.
+     */
+    describe("the PNG", () => {
+      const PNG = new Blob(["png"], { type: "image/png" });
+
+      async function clickPng() {
+        await open({
+          kind: "diagram",
+          svg: DIAGRAM,
+          source: "graph TD; A-->B;",
+          name: "alpha",
+        });
+        await userEvent.click(
+          screen.getByRole("button", { name: "Download PNG" }),
+        );
+      }
+
+      afterEach(() => {
+        vi.mocked(exportDiagramPng).mockReset();
+      });
+
+      it("saves the drawing under the document's name and says nothing", async () => {
+        vi.mocked(exportDiagramPng).mockResolvedValue({
+          blob: PNG,
+          note: null,
+        });
+        await clickPng();
+        await waitFor(() => {
+          expect(saved).toHaveLength(1);
+        });
+        expect(saved[0]?.name).toMatch(/^alpha-diagram-[0-9a-f]{4}\.png$/);
+        expect(saved[0]?.blob).toBe(PNG);
+        await waitFor(() => {
+          expect(screen.getByRole("status")).toHaveTextContent("");
+        });
+        const asked = vi.mocked(exportDiagramPng).mock.calls[0]?.[0];
+        expect(asked?.natural).toEqual({ width: 600, height: 400 });
+        expect(asked?.drawing).toBe(
+          screen.getByRole("dialog").querySelector("svg g#drawing")
+            ?.parentElement,
+        );
+      });
+
+      it("saves and keeps saying why the file is not sharp", async () => {
+        vi.mocked(exportDiagramPng).mockResolvedValue({
+          blob: PNG,
+          note: "Not sharp.",
+        });
+        await clickPng();
+        expect(await screen.findByRole("status")).toHaveTextContent(
+          "Not sharp.",
+        );
+        expect(saved).toHaveLength(1);
+      });
+
+      it("saves nothing when there is no file, and says why", async () => {
+        vi.mocked(exportDiagramPng).mockResolvedValue({
+          blob: null,
+          note: "No file.",
+        });
+        await clickPng();
+        await waitFor(() => {
+          expect(screen.getByRole("status")).toHaveTextContent("No file.");
+        });
+        expect(saved).toHaveLength(0);
+      });
+
+      it("leaves a long sentence up for longer than a short one", async () => {
+        const timer = vi.spyOn(globalThis, "setTimeout");
+        vi.mocked(exportDiagramPng).mockResolvedValue({
+          blob: null,
+          note: "No file.",
+        });
+        await clickPng();
+        await waitFor(() => {
+          expect(screen.getByRole("status")).toHaveTextContent("No file.");
+        });
+        expect(
+          timer.mock.calls.some(([, delay]) => (delay ?? 0) >= 10_000),
+        ).toBe(true);
+      });
+
+      it("starts one export at a time", async () => {
+        let finish: (result: PngResult) => void = () => undefined;
+        vi.mocked(exportDiagramPng).mockReturnValue(
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+        );
+        await clickPng();
+        await userEvent.click(
+          screen.getByRole("button", { name: "Download PNG" }),
+        );
+        await waitFor(() => {
+          expect(vi.mocked(exportDiagramPng)).toHaveBeenCalledTimes(1);
+        });
+        finish({ blob: PNG, note: null });
+        await waitFor(() => {
+          expect(saved).toHaveLength(1);
+        });
+      });
+    });
+
     it("puts a diagram's source on the clipboard and says so", async () => {
       const writeText = vi.fn(() => Promise.resolve());
       Object.defineProperty(navigator, "clipboard", {
@@ -514,7 +624,9 @@ describe("DiagramOverlay", () => {
         filename: "map.png",
       });
       expect(
-        screen.queryByRole("button", { name: /Download source|Download SVG/ }),
+        screen.queryByRole("button", {
+          name: /Download source|Download SVG|Download PNG/,
+        }),
       ).toBeNull();
       const link = screen.getByRole("link", { name: "Download image" });
       expect(link.getAttribute("download")).toBe("map.png");

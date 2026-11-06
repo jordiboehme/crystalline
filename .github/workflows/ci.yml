@@ -655,7 +655,7 @@ jobs:
   # own because it needs the Rust toolchain as well as Node.
   fluid-smoke:
     name: fluid-smoke
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
