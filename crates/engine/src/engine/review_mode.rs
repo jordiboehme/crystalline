@@ -671,7 +671,14 @@ impl Engine {
                 Some(FoldChoice::Fold) => {
                     let (mut written, mut deleted) = (0u64, 0u64);
                     if let Some(root) = &root {
-                        for draft in &held.entries {
+                        // The deletions first. A case-only move is a tombstone
+                        // at one spelling and a draft at the other, and on a
+                        // disk that folds case those are one file: written
+                        // first, the draft would then be what the deletion
+                        // removes, and neither text would be left.
+                        let (gone, landing): (Vec<_>, Vec<_>) =
+                            held.entries.iter().partition(|draft| draft.tombstone);
+                        for draft in gone.into_iter().chain(landing) {
                             let abs = join_rel(root, &draft.path);
                             if draft.tombstone {
                                 match std::fs::remove_file(&abs) {

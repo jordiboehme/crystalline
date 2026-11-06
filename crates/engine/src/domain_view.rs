@@ -2613,7 +2613,12 @@ impl<'a> DomainView<'a> {
             };
             write_staged_file(staging.root(), rel, &content)?;
         }
-        for entry in entries {
+        // The deletions first, as a fold takes them: a case-only move is a
+        // tombstone at one spelling and a draft at the other, and on a disk that
+        // folds case a deletion taken second would remove the draft just staged.
+        // The proposal would then read as the team's file deleted.
+        let (gone, landing): (Vec<_>, Vec<_>) = entries.iter().partition(|entry| entry.tombstone);
+        for entry in gone.into_iter().chain(landing) {
             // The write verbs normalize a draft's path before it becomes a row, so
             // this is the second assertion rather than the first - and it is here
             // because a path that escaped would write outside the staged tree, which

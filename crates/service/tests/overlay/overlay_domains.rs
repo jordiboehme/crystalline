@@ -6307,6 +6307,350 @@ async fn a_rename_inside_one_overlay_previews_clean_and_folds_clean() {
     );
 }
 
+/// A draft move at `destination` for one account, as the tests below ask it.
+fn draft_move(identifier: &str, destination: &str) -> crystalline_service::params::MoveParams {
+    crystalline_service::params::MoveParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        destination: destination.to_string(),
+        destination_domain: None,
+        permalink: None,
+        update_links: None,
+    }
+}
+
+/// Whether the disk under this fixture treats two spellings as one name.
+fn folds_case(f: &Fixture) -> bool {
+    let folds = f.root.join("TEAM").exists();
+    if !folds {
+        eprintln!("skipped: {} is case-sensitive", f.root.display());
+    }
+    folds
+}
+
+/// The names one actor's journal folder holds at `sub`, as the disk spells them.
+fn mirror_names(f: &Fixture, sub: &str) -> Vec<String> {
+    let dir = f.root.join("state/overlays/team/alice").join(sub);
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// **A draft moved to another spelling of its own name finishes.** Where the
+/// disk folds case, the two mirror paths are two strings but one lock, and
+/// asking for that lock twice would wait for ever, holding the process's one
+/// move at a time while it waited. Each case stands behind a timeout so a hang
+/// is a failure rather than a stuck run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_draft_finishes_where_the_disk_folds_case() {
+    let alice = account("alice");
+    let in_time = std::time::Duration::from_secs(5);
+
+    // Her own draft, lower case to upper.
+    let f = review_fixture().await;
+    if !folds_case(&f) {
+        return;
+    }
+    f.engine
+        .write_engram_as(&write_params("team", "Note", "her body"), None, &alice)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine.move_engram(&draft_move("note", "Note.md"), &alice),
+    )
+    .await
+    .expect("note.md -> Note.md hung")
+    .unwrap();
+    assert!(mirror_names(&f, "").contains(&"Note.md".to_string()));
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+
+    // Her draft of the team's file, upper case to lower.
+    let f = review_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join("Note.md"),
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut over = write_params("team", "Note", "her body");
+    over.overwrite = true;
+    f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine.move_engram(&draft_move("note", "note.md"), &alice),
+    )
+    .await
+    .expect("Note.md -> note.md hung")
+    .unwrap();
+    assert!(mirror_names(&f, "").contains(&"note.md".to_string()));
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+
+    // Only the folder's case differs.
+    let f = review_fixture().await;
+    let mut filed = write_params("team", "Note", "her body");
+    filed.folder = Some("notes".to_string());
+    f.engine
+        .write_engram_as(&filed, None, &alice)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine
+            .move_engram(&draft_move("notes/note", "Notes/note.md"), &alice),
+    )
+    .await
+    .expect("notes/note.md -> Notes/note.md hung")
+    .unwrap();
+    let moved = f.reads("notes/note", &alice).await.unwrap();
+    assert!(moved.contains("her body"), "{moved}");
+}
+
+/// **A draft move holds both draft locks, the lower key first.** Every other
+/// writer of a draft takes the same two locks one at a time, so a move has to
+/// wait for either and must not hold the second while it waits for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_move_takes_both_draft_locks_lower_key_first() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    f.engine
+        .write_engram_as(&write_params("team", "Alpha", "body"), None, &alice)
+        .await
+        .unwrap();
+    let mirror = |name: &str| f.root.join("state/overlays/team/alice").join(name);
+    let low = f.engine.file_write_lock(&mirror("alpha.md"));
+    let high = f.engine.file_write_lock(&mirror("zeta.md"));
+    let settle = std::time::Duration::from_millis(300);
+    let start = |destination: &'static str| {
+        let (engine, alice) = (f.engine.clone(), alice.clone());
+        tokio::spawn(async move {
+            engine
+                .move_engram(&draft_move("alpha", destination), &alice)
+                .await
+                .map(|_| ())
+        })
+    };
+
+    // The lower key held elsewhere: the move waits, holding neither.
+    let held = low.lock().await;
+    let mut moving = start("zeta.md");
+    assert!(
+        tokio::time::timeout(settle, &mut moving).await.is_err(),
+        "the move waits for the source's lock"
+    );
+    assert!(
+        high.try_lock().is_ok(),
+        "and does not hold the higher key while it waits for the lower"
+    );
+    drop(held);
+    moving.await.unwrap().unwrap();
+    assert!(mirror("zeta.md").is_file());
+
+    // Back again, with the higher key held elsewhere: the move has taken the
+    // lower one and waits for the higher, whichever end the source is.
+    let held = high.lock().await;
+    let mut moving = start("alpha.md");
+    assert!(
+        tokio::time::timeout(settle, &mut moving).await.is_err(),
+        "the move waits for the source's lock"
+    );
+    assert!(
+        low.try_lock().is_err(),
+        "and holds the lower key, the destination this time, while it waits"
+    );
+    drop(held);
+    moving.await.unwrap().unwrap();
+    assert!(mirror("alpha.md").is_file());
+}
+
+/// A team file at `from` that alice has moved to another spelling of its name,
+/// with a draft of her own over it first when `draft` is set.
+async fn team_file_moved_by_case(from: &str, to: &str, draft: bool) -> Fixture {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join(from),
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    if draft {
+        let mut over = write_params("team", "Note", "her body");
+        over.overwrite = true;
+        f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    }
+    f.engine
+        .move_engram(&draft_move("note", to), &alice)
+        .await
+        .unwrap();
+    f
+}
+
+/// Every spelling of `note.md` the folder holds, with its last line.
+fn notes_on_disk(f: &Fixture) -> Vec<(String, String)> {
+    std::fs::read_dir(f.domain_root("team"))
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_name().to_string_lossy().to_lowercase() == "note.md")
+        .map(|e| {
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                text.lines().last().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The four shapes of a case-only move of a team file: up and down, with and
+/// without a draft over it, and the text each should end up with.
+const CASE_MOVES: [(&str, &str, bool, &str); 4] = [
+    ("Note.md", "note.md", false, "team body"),
+    ("Note.md", "note.md", true, "her body"),
+    ("note.md", "Note.md", false, "team body"),
+    ("note.md", "Note.md", true, "her body"),
+];
+
+/// **A case-only move of a team file folds to one file, in the new spelling,
+/// with its text.** The tombstone and the draft are one file on a disk that
+/// folds case, so a deletion taken after the write would remove the draft, and
+/// the team's file with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_team_file_folds_to_the_new_spelling() {
+    for (from, to, draft, body) in CASE_MOVES {
+        let f = team_file_moved_by_case(from, to, draft).await;
+        if !folds_case(&f) {
+            return;
+        }
+        f.engine
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_on_disk(&f),
+            vec![(to.to_string(), body.to_string())],
+            "{from} -> {to}, draft {draft}"
+        );
+    }
+}
+
+/// **A case-only move of a team file survives a rebuild of the index.** The
+/// journal is the only copy of the move, and it holds the tombstone beside the
+/// draft, so the rows come back as they were: the new spelling answers, with
+/// the draft's text, and the fold is not refused as a second engram at one
+/// address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_team_file_survives_a_rebuild() {
+    let alice = account("alice");
+    for (from, to, draft, body) in CASE_MOVES {
+        let f = team_file_moved_by_case(from, to, draft).await;
+        if !folds_case(&f) {
+            return;
+        }
+        let mut journal: Vec<(String, bool)> =
+            crystalline_service::overlay_journal::journal_entries(&f.state, "team")
+                .entries
+                .into_iter()
+                .map(|entry| (entry.path, entry.content.is_none()))
+                .collect();
+        journal.sort();
+        let mut wanted = vec![(from.to_string(), true), (to.to_string(), false)];
+        wanted.sort();
+        assert_eq!(journal, wanted, "{from} -> {to}, draft {draft}");
+
+        let config_path = f.root.join("config.yaml");
+        let config: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+        let store: Arc<Mutex<dyn Store>> =
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+        let rebuilt = Arc::new(
+            Engine::new(store, config, None, Some(config_path))
+                .with_state_dir(f.state.clone())
+                .with_origins_dir(f.origins.clone()),
+        );
+        rebuilt.sync(None).await.unwrap();
+
+        let read_back = rebuilt.read_engram(&read("note"), &alice).await.unwrap();
+        assert_eq!(read_back["path"], to, "{from} -> {to}, draft {draft}");
+        assert!(
+            read_back["content"].as_str().unwrap().contains(body),
+            "{read_back}"
+        );
+        rebuilt
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_on_disk(&f),
+            vec![(to.to_string(), body.to_string())],
+            "{from} -> {to}, draft {draft}"
+        );
+    }
+}
+
+/// **Sharing a case-only move does not delete the team's file.** The staged tree
+/// takes its deletions first, so the file is still there to detect: a share
+/// with a new text changes the team's file at the spelling the team has, and a
+/// share with no new text has nothing to carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharing_a_case_only_move_keeps_the_teams_file() {
+    let alice = account("alice");
+    let share = |f: &Fixture| {
+        let engine = f.engine.clone();
+        async move {
+            engine
+                .origin_share(
+                    "team",
+                    None,
+                    None,
+                    None,
+                    None,
+                    ShareActor::Account("alice".to_string()),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let f = reviewed_direct_origin_fixture().await;
+    if !folds_case(&f) {
+        return;
+    }
+    f.engine
+        .move_engram(&draft_move("plan", "Plan.md"), &alice)
+        .await
+        .unwrap();
+    let receipt = share(&f).await;
+    assert_eq!(receipt["outcome"], "nothing_to_share", "{receipt}");
+    assert!(f.domain_root("team").join("plan.md").is_file());
+
+    let f = reviewed_direct_origin_fixture().await;
+    let mut over = write_params("team", "Plan", "her body");
+    over.overwrite = true;
+    f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("plan", "Plan.md"), &alice)
+        .await
+        .unwrap();
+    let receipt = share(&f).await;
+    assert_eq!(receipt["outcome"], "committed", "{receipt}");
+    assert_eq!(receipt["deleted"], serde_json::json!([]), "{receipt}");
+    let text = std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap();
+    assert!(text.contains("her body"), "{text}");
+}
+
 /// One address claimed at two paths by two people is a collision the plan has
 /// to name, because neither draft is in the folder for the other one's
 /// `conflict` to find and neither path is contested.

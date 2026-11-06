@@ -280,6 +280,42 @@ pub(crate) fn remove_if_present(file: &Path) -> io::Result<()> {
     }
 }
 
+/// [`remove_if_present`] for a journal entry, which leaves another spelling of
+/// the same name alone.
+///
+/// On a disk that folds case `note.md` and `Note.md` are one file, but to the
+/// index they are two paths, and a case-only move of a team's file holds both:
+/// a tombstone at one and a draft at the other. The two stand side by side here
+/// as `Note.md.tombstone` and `note.md`, and writing the draft must not take the
+/// tombstone away for answering to the draft's own sidecar, or a rebuild would
+/// bring the old spelling back. So a name the folder holds only in another case
+/// is somebody else's entry. A name the folder holds in no spelling comparable
+/// this way is removed as asked.
+fn remove_entry_if_present(file: &Path) -> io::Result<()> {
+    if file.symlink_metadata().is_err() {
+        return remove_if_present(file);
+    }
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name().and_then(|n| n.to_str())) else {
+        return remove_if_present(file);
+    };
+    let folded = crystalline_core::path::fold_path_case(name);
+    let mut another_spelling = false;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?.file_name();
+        let Some(entry) = entry.to_str() else {
+            continue;
+        };
+        if entry == name {
+            return remove_if_present(file);
+        }
+        another_spelling |= crystalline_core::path::fold_path_case(entry) == folded;
+    }
+    if another_spelling {
+        return Ok(());
+    }
+    remove_if_present(file)
+}
+
 /// Mirror one actor's draft of `path`.
 ///
 /// The draft is written first and the tombstone beside it removed second, so a
@@ -295,7 +331,7 @@ pub fn journal_write(
 ) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
     save(&file, content.as_bytes())?;
-    remove_if_present(&tombstone_of(&file))
+    remove_entry_if_present(&tombstone_of(&file))
 }
 
 /// Mirror one actor's deletion of the base row at `path`.
@@ -310,7 +346,7 @@ pub fn journal_tombstone(
     path: &str,
 ) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
-    remove_if_present(&file)?;
+    remove_entry_if_present(&file)?;
     save(&tombstone_of(&file), b"")
 }
 
@@ -322,8 +358,8 @@ pub fn journal_tombstone(
 /// [`journal_remove_domain`] answers about.
 pub fn journal_clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
-    remove_if_present(&tombstone_of(&file))?;
-    remove_if_present(&file)?;
+    remove_entry_if_present(&tombstone_of(&file))?;
+    remove_entry_if_present(&file)?;
     let stop = actor_dir(state_dir, domain, actor)?;
     prune_empty(file.parent(), &stop);
     Ok(())
