@@ -6307,6 +6307,871 @@ async fn a_rename_inside_one_overlay_previews_clean_and_folds_clean() {
     );
 }
 
+/// A draft move at `destination` for one account, as the tests below ask it.
+fn draft_move(identifier: &str, destination: &str) -> crystalline_service::params::MoveParams {
+    crystalline_service::params::MoveParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        destination: destination.to_string(),
+        destination_domain: None,
+        permalink: None,
+        update_links: None,
+    }
+}
+
+/// The names one actor's journal folder holds at `sub`, as the disk spells them.
+fn mirror_names(f: &Fixture, sub: &str) -> Vec<String> {
+    let dir = f.root.join("state/overlays/team/alice").join(sub);
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// **A draft moved to another spelling of its own name finishes.** Where the
+/// disk folds case, the two mirror paths are two strings but one lock, and
+/// asking for that lock twice would wait for ever, holding the process's one
+/// move at a time while it waited. Each case stands behind a timeout so a hang
+/// is a failure rather than a stuck run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_draft_finishes() {
+    let alice = account("alice");
+    let in_time = std::time::Duration::from_secs(5);
+
+    // Her own draft, lower case to upper.
+    let f = review_fixture().await;
+    f.engine
+        .write_engram_as(&write_params("team", "Note", "her body"), None, &alice)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine.move_engram(&draft_move("note", "Note.md"), &alice),
+    )
+    .await
+    .expect("note.md -> Note.md hung")
+    .unwrap();
+    assert!(mirror_names(&f, "").contains(&"Note.md".to_string()));
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+
+    // Her draft of the team's file, upper case to lower.
+    let f = review_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join("Note.md"),
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut over = write_params("team", "Note", "her body");
+    over.overwrite = true;
+    f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine.move_engram(&draft_move("note", "note.md"), &alice),
+    )
+    .await
+    .expect("Note.md -> note.md hung")
+    .unwrap();
+    assert!(mirror_names(&f, "").contains(&"note.md".to_string()));
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+
+    // Only the folder's case differs.
+    let f = review_fixture().await;
+    let mut filed = write_params("team", "Note", "her body");
+    filed.folder = Some("notes".to_string());
+    f.engine
+        .write_engram_as(&filed, None, &alice)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        in_time,
+        f.engine
+            .move_engram(&draft_move("notes/note", "Notes/note.md"), &alice),
+    )
+    .await
+    .expect("notes/note.md -> Notes/note.md hung")
+    .unwrap();
+    let moved = f.reads("notes/note", &alice).await.unwrap();
+    assert!(moved.contains("her body"), "{moved}");
+}
+
+/// **A draft move holds both draft locks, the lower key first.** Every other
+/// writer of a draft takes the same two locks one at a time, so a move has to
+/// wait for either and must not hold the second while it waits for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_move_takes_both_draft_locks_lower_key_first() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    f.engine
+        .write_engram_as(&write_params("team", "Alpha", "body"), None, &alice)
+        .await
+        .unwrap();
+    let mirror = |name: &str| f.root.join("state/overlays/team/alice").join(name);
+    let low = f.engine.file_write_lock(&mirror("alpha.md"));
+    let high = f.engine.file_write_lock(&mirror("zeta.md"));
+    let settle = std::time::Duration::from_millis(300);
+    let start = |destination: &'static str| {
+        let (engine, alice) = (f.engine.clone(), alice.clone());
+        tokio::spawn(async move {
+            engine
+                .move_engram(&draft_move("alpha", destination), &alice)
+                .await
+                .map(|_| ())
+        })
+    };
+
+    // The lower key held elsewhere: the move waits, holding neither.
+    let held = low.lock().await;
+    let mut moving = start("zeta.md");
+    assert!(
+        tokio::time::timeout(settle, &mut moving).await.is_err(),
+        "the move waits for the source's lock"
+    );
+    assert!(
+        high.try_lock().is_ok(),
+        "and does not hold the higher key while it waits for the lower"
+    );
+    drop(held);
+    moving.await.unwrap().unwrap();
+    assert!(mirror("zeta.md").is_file());
+
+    // Back again, with the higher key held elsewhere: the move has taken the
+    // lower one and waits for the higher, whichever end the source is.
+    let held = high.lock().await;
+    let mut moving = start("alpha.md");
+    assert!(
+        tokio::time::timeout(settle, &mut moving).await.is_err(),
+        "the move waits for the source's lock"
+    );
+    // A slow machine takes longer to get there, so this asks until it has.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while low.try_lock().is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move holds the lower key, the destination this time, while it waits"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(held);
+    moving.await.unwrap().unwrap();
+    assert!(mirror("alpha.md").is_file());
+}
+
+/// A team file at `from` that alice has moved to another spelling of its name,
+/// with a draft of her own over it first when `draft` is set.
+async fn team_file_moved_by_case(from: &str, to: &str, draft: bool) -> Fixture {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    std::fs::write(
+        f.domain_root("team").join(from),
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    if draft {
+        let mut over = write_params("team", "Note", "her body");
+        over.overwrite = true;
+        f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.engine.move_engram(&draft_move("note", to), &alice),
+    )
+    .await
+    .expect("the move hung")
+    .unwrap();
+    f
+}
+
+/// Every spelling of `note.md` the folder holds, with its last line.
+fn notes_on_disk(f: &Fixture) -> Vec<(String, String)> {
+    std::fs::read_dir(f.domain_root("team"))
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_name().to_string_lossy().to_lowercase() == "note.md")
+        .map(|e| {
+            let text = std::fs::read_to_string(e.path()).unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                text.lines().last().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The four shapes of a case-only move of a team file: up and down, with and
+/// without a draft over it, and the text each should end up with.
+const CASE_MOVES: [(&str, &str, bool, &str); 4] = [
+    ("Note.md", "note.md", false, "team body"),
+    ("Note.md", "note.md", true, "her body"),
+    ("note.md", "Note.md", false, "team body"),
+    ("note.md", "Note.md", true, "her body"),
+];
+
+/// **A case-only move of a team file folds to one file, in the new spelling,
+/// with its text.** The tombstone and the draft are one file on a disk that
+/// folds case, so a deletion taken after the write would remove the draft, and
+/// the team's file with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_team_file_folds_to_the_new_spelling() {
+    for (from, to, draft, body) in CASE_MOVES {
+        let f = team_file_moved_by_case(from, to, draft).await;
+        f.engine
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_on_disk(&f),
+            vec![(to.to_string(), body.to_string())],
+            "{from} -> {to}, draft {draft}"
+        );
+    }
+}
+
+/// This fixture's engine again over an empty index, as after a `reindex --wipe`:
+/// only the journal can bring the drafts back.
+async fn rebuilt_index(f: &Fixture) -> Arc<Engine> {
+    let config_path = f.root.join("config.yaml");
+    let config: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let rebuilt = Arc::new(
+        Engine::new(store, config, None, Some(config_path))
+            .with_state_dir(f.state.clone())
+            .with_origins_dir(f.origins.clone()),
+    );
+    rebuilt.sync(None).await.unwrap();
+    rebuilt
+}
+
+/// **A case-only move of a team file survives a rebuild of the index.** The
+/// journal is the only copy of the move, and it holds the tombstone beside the
+/// draft, so the rows come back as they were: the new spelling answers, with
+/// the draft's text, and the fold is not refused as a second engram at one
+/// address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_only_move_of_a_team_file_survives_a_rebuild() {
+    let alice = account("alice");
+    for (from, to, draft, body) in CASE_MOVES {
+        let f = team_file_moved_by_case(from, to, draft).await;
+        let mut journal: Vec<(String, bool)> =
+            crystalline_service::overlay_journal::journal_entries(&f.state, "team")
+                .entries
+                .into_iter()
+                .map(|entry| (entry.path, entry.content.is_none()))
+                .collect();
+        journal.sort();
+        let mut wanted = vec![(from.to_string(), true), (to.to_string(), false)];
+        wanted.sort();
+        assert_eq!(journal, wanted, "{from} -> {to}, draft {draft}");
+
+        let rebuilt = rebuilt_index(&f).await;
+
+        let read_back = rebuilt.read_engram(&read("note"), &alice).await.unwrap();
+        assert_eq!(read_back["path"], to, "{from} -> {to}, draft {draft}");
+        assert!(
+            read_back["content"].as_str().unwrap().contains(body),
+            "{read_back}"
+        );
+        rebuilt
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notes_on_disk(&f),
+            vec![(to.to_string(), body.to_string())],
+            "{from} -> {to}, draft {draft}"
+        );
+    }
+}
+
+/// **Sharing a case-only move does not delete the team's file, then or later.**
+///
+/// Detection folds case on every platform, so the spelling does not travel: a
+/// share with a new text changes the team's file at the spelling the team has,
+/// a share with no new text has nothing to carry, and the receipt says so.
+///
+/// What must not happen is a deletion. On a disk that folds case the first
+/// share's convergence finds the draft equal to the base, and the tombstone
+/// that was half of the same move has to end with it. Left behind it would hide
+/// the file from its author and be shared as a deletion by their next share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharing_a_case_only_move_keeps_the_teams_file() {
+    let alice = account("alice");
+    let share = |f: &Fixture| {
+        let engine = f.engine.clone();
+        async move {
+            engine
+                .origin_share(
+                    "team",
+                    None,
+                    None,
+                    None,
+                    None,
+                    ShareActor::Account("alice".to_string()),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let names_the_move = |receipt: &serde_json::Value| {
+        assert_eq!(
+            receipt["spelling_not_shared"],
+            serde_json::json!([{ "from": "plan.md", "to": "Plan.md" }]),
+            "{receipt}"
+        );
+    };
+
+    let f = reviewed_direct_origin_fixture().await;
+    f.engine
+        .move_engram(&draft_move("plan", "Plan.md"), &alice)
+        .await
+        .unwrap();
+    let plan = f
+        .engine
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+            crystalline_service::engine::PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert!(plan["spelling_note"].is_string(), "{plan}");
+    let receipt = share(&f).await;
+    assert_eq!(receipt["outcome"], "nothing_to_share", "{receipt}");
+    names_the_move(&receipt);
+    assert_eq!(
+        receipt["spelling_note"],
+        "A share does not carry a change of letter case. The team's file keeps its name, and \
+         any new text lands there."
+    );
+    assert!(f.domain_root("team").join("plan.md").is_file());
+
+    let f = reviewed_direct_origin_fixture().await;
+    let mut over = write_params("team", "Plan", "her body");
+    over.overwrite = true;
+    f.engine.write_engram_as(&over, None, &alice).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("plan", "Plan.md"), &alice)
+        .await
+        .unwrap();
+    let receipt = share(&f).await;
+    assert_eq!(receipt["outcome"], "committed", "{receipt}");
+    assert_eq!(receipt["deleted"], serde_json::json!([]), "{receipt}");
+    names_the_move(&receipt);
+    let on_disk = || std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap();
+    assert!(on_disk().contains("her body"), "{}", on_disk());
+
+    // She can still read it, and sharing again finds nothing to do.
+    let read_back = f.reads("plan", &alice).await.unwrap();
+    assert!(read_back.contains("her body"), "{read_back}");
+    let again = share(&f).await;
+    assert_eq!(again["outcome"], "nothing_to_share", "{again}");
+    assert!(on_disk().contains("her body"), "{}", on_disk());
+}
+
+/// **A move racing the first draft of its own source does not wait on itself.**
+///
+/// A writer holds the lock of a mirror that does not exist yet while the move
+/// works out its two locks, then makes the mirror and lets go. Where the disk
+/// folds case the destination's spelling now resolves to the source's mirror,
+/// so a move that looks its locks up again would ask for one it already holds.
+/// A move that has not reached its locks when the mirror appears sees one lock
+/// from the start and passes too, so being late never fails this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_racing_the_first_draft_of_its_source_finishes() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    let team_file =
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n";
+    std::fs::write(f.domain_root("team").join("Note.md"), team_file).unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let mirror = f.root.join("state/overlays/team/alice/Note.md");
+    let lock = f.engine.file_write_lock(&mirror);
+    let held = lock.lock().await;
+    let (engine, who) = (f.engine.clone(), alice.clone());
+    let moving = tokio::spawn(async move {
+        engine
+            .move_engram(&draft_move("note", "note.md"), &who)
+            .await
+            .map(|_| ())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::write(&mirror, team_file).unwrap();
+    drop(held);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), moving)
+        .await
+        .expect("the move waited on a lock it already held")
+        .unwrap()
+        .unwrap();
+    let read_back = f.reads("note", &alice).await.unwrap();
+    assert!(read_back.contains("team body"), "{read_back}");
+}
+
+/// **A fold keeps path order, so a failed write costs an ordinary rename no
+/// file.** Only a tombstone that folds onto a draft of the same actor has to go
+/// first. Here the new path sorts first, the write fails, and the old file is
+/// still there for everybody until the same call is made again.
+#[tokio::test]
+async fn a_fold_that_cannot_write_a_rename_leaves_the_old_file_for_the_retry() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::write(
+        root.join("zz.md"),
+        "---\ntitle: Zz\ntype: note\nstatus: draft\npermalink: zz\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("zz", "sub/zz.md"), &alice)
+        .await
+        .unwrap();
+
+    // A file where the destination's folder has to go.
+    std::fs::write(root.join("sub"), "in the way").unwrap();
+    let fold = || {
+        f.engine.set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+    };
+    fold().await.expect_err("the destination cannot be written");
+    assert!(root.join("zz.md").is_file(), "the old file is still there");
+
+    std::fs::remove_file(root.join("sub")).unwrap();
+    fold().await.unwrap();
+    assert!(root.join("sub/zz.md").is_file());
+    assert!(!root.join("zz.md").exists());
+}
+
+/// **A draft may not move onto another spelling of somebody else's file.** No
+/// macOS or Windows checkout can hold the two (`E009`), and on such a disk the
+/// fold would write over the team's file with no warning. Its own other spelling
+/// is the one exception, since that is a rename of itself.
+#[tokio::test]
+async fn a_draft_move_onto_another_spelling_of_a_team_file_is_refused() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    for (name, body) in [("a", "a body"), ("b", "b body")] {
+        std::fs::write(
+            f.domain_root("team").join(format!("{name}.md")),
+            format!(
+                "---\ntitle: {name}\ntype: note\nstatus: draft\npermalink: {name}\n---\n\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+    let refused = f
+        .engine
+        .move_engram(&draft_move("a", "B.md"), &alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, crystalline_service::EngineError::Conflict(_)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("b.md"), "{refused}");
+
+    // The same against a draft of her own that only she holds.
+    f.engine
+        .write_engram_as(&write_params("team", "Fresh", "body"), None, &alice)
+        .await
+        .unwrap();
+    let refused = f
+        .engine
+        .move_engram(&draft_move("a", "FRESH.md"), &alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, crystalline_service::EngineError::Conflict(_)),
+        "{refused}"
+    );
+
+    // Its own other spelling is a rename, not a collision.
+    f.engine
+        .move_engram(&draft_move("a", "A.md"), &alice)
+        .await
+        .unwrap();
+}
+
+/// **Discarding the deletion half of a folder-only case move keeps her text.**
+///
+/// On a disk that folds case `notes/x.md` and `Notes/x.md` are one mirror file,
+/// which holds her draft while the deletion has a row and no sidecar. Ending the
+/// deletion's row must not take that file away: it is the only copy a rebuild
+/// can bring her text back from. Runs on either kind of disk, since a
+/// case-sensitive one keeps two mirrors and must keep the draft too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discarding_the_deletion_of_a_folder_case_move_keeps_her_text() {
+    let alice = account("alice");
+    let f = reviewed_origin_fixture().await;
+    let dir = f.domain_root("team").join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("x.md"),
+        "---\ntitle: X\ntype: note\nstatus: draft\npermalink: notes/x\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut edit = write_params("team", "X", "her body");
+    edit.folder = Some("notes".to_string());
+    edit.overwrite = true;
+    f.engine.write_engram_as(&edit, None, &alice).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("notes/x", "Notes/x.md"), &alice)
+        .await
+        .unwrap();
+
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "notes/x.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    let mirrored = crystalline_service::overlay_journal::journal_entries(&f.state, "team").entries;
+    assert!(
+        mirrored.iter().any(|entry| entry
+            .content
+            .as_deref()
+            .is_some_and(|t| t.contains("her body"))),
+        "the journal still holds her text: {mirrored:?}"
+    );
+    let rebuilt = rebuilt_index(&f).await;
+    let plan = rebuilt
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan_entries(&plan, "alice").len(), 1, "{plan}");
+    // Where the disk folds case the mirror answers at the team's spelling, so
+    // the address reads her draft. On a disk that keeps them apart the draft
+    // stays at `Notes/x.md` and the address is still the team's file.
+    if f.root.join("TEAM").exists() {
+        let held = rebuilt.read_engram(&read("notes/x"), &alice).await.unwrap();
+        assert!(
+            held["content"].as_str().unwrap().contains("her body"),
+            "{held}"
+        );
+    }
+}
+
+/// **A delete by address after that discard keeps her text too.** The address
+/// answers with the team's file, whose path is the file her draft is mirrored in
+/// on a disk that folds case, so the deletion must not take that file away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_by_address_after_that_discard_keeps_her_text() {
+    let alice = account("alice");
+    let f = reviewed_origin_fixture().await;
+    let dir = f.domain_root("team").join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("x.md"),
+        "---\ntitle: X\ntype: note\nstatus: draft\npermalink: notes/x\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut edit = write_params("team", "X", "her body");
+    edit.folder = Some("notes".to_string());
+    edit.overwrite = true;
+    f.engine.write_engram_as(&edit, None, &alice).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("notes/x", "Notes/x.md"), &alice)
+        .await
+        .unwrap();
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "notes/x.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "notes/x".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+
+    let mirrored = crystalline_service::overlay_journal::journal_entries(&f.state, "team").entries;
+    assert!(
+        mirrored.iter().any(|entry| entry
+            .content
+            .as_deref()
+            .is_some_and(|t| t.contains("her body"))),
+        "the journal still holds her text: {mirrored:?}"
+    );
+}
+
+/// **A symlinked MANIFEST does not hide what the disk does.** The question is
+/// asked of the folder the two files would land in, and it is not fooled by what
+/// kind of entry stands there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_spellings_are_judged_by_their_folder_with_a_symlinked_manifest() {
+    let (alice, bob) = (account("alice"), account("bob"));
+    let f = review_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::rename(root.join("MANIFEST.md"), f.root.join("real-manifest.md")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("real-manifest.md"), root.join("MANIFEST.md")).unwrap();
+    std::fs::write(
+        root.join("a.md"),
+        "---\ntitle: A\ntype: note\nstatus: draft\npermalink: a\n---\n\na body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("a", "Zed.md"), &alice)
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(&write_params("team", "Zed", "bob body"), None, &bob)
+        .await
+        .unwrap();
+    let folded = f
+        .engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await;
+    if f.root.join("TEAM").exists() {
+        folded.expect_err("one file cannot hold both");
+        assert!(root.join("a.md").is_file(), "nothing was folded");
+    } else {
+        folded.unwrap();
+        assert!(root.join("Zed.md").is_file() && root.join("zed.md").is_file());
+    }
+}
+
+/// **Two people folding two spellings of one new path do not silently lose one
+/// text.** On a disk that folds case those are one file, so the fold refuses as
+/// it does for two people on one exact path, and nothing is written. On a disk
+/// that keeps them apart they are two files, and both land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_people_folding_two_spellings_of_one_path() {
+    let (alice, bob) = (account("alice"), account("bob"));
+    let f = review_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::write(
+        root.join("a.md"),
+        "---\ntitle: A\ntype: note\nstatus: draft\npermalink: a\n---\n\na body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("a", "Zed.md"), &alice)
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(&write_params("team", "Zed", "bob body"), None, &bob)
+        .await
+        .unwrap();
+
+    let both = folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)]);
+    let folded = f
+        .engine
+        .set_review_mode("team", None, both, &Scope::Unrestricted)
+        .await;
+    if f.root.join("TEAM").exists() {
+        let refusal = folded.expect_err("one file cannot hold both").to_string();
+        assert!(
+            refusal.contains("Zed.md") && refusal.contains("zed.md"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("alice") && refusal.contains("bob"),
+            "{refusal}"
+        );
+        assert!(root.join("a.md").is_file(), "nothing was folded");
+        assert!(!root.join("zed.md").exists(), "nothing was folded");
+
+        // One of them folding on their own is no conflict.
+        f.engine
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Discard)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(root.join("Zed.md")).unwrap();
+        assert!(text.contains("a body"), "{text}");
+    } else {
+        folded.unwrap();
+        let (upper, lower) = (
+            std::fs::read_to_string(root.join("Zed.md")).unwrap(),
+            std::fs::read_to_string(root.join("zed.md")).unwrap(),
+        );
+        assert!(upper.contains("a body"), "{upper}");
+        assert!(lower.contains("bob body"), "{lower}");
+    }
+}
+
+/// **A case move can be changed again, or undone, and her edit stays.** The other
+/// spelling is the team's file she moved herself, so there is nothing in the way:
+/// the draft moves to a third spelling or back, with no discard that would cost
+/// her text, and it survives a rebuild and lands in the fold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_case_move_of_her_own_file_can_move_again_and_back() {
+    let alice = account("alice");
+    let f = team_file_moved_by_case("note.md", "Note.md", true).await;
+    let holds_her_text = |f: &Fixture| {
+        crystalline_service::overlay_journal::journal_entries(&f.state, "team")
+            .entries
+            .iter()
+            .any(|entry| {
+                entry
+                    .content
+                    .as_deref()
+                    .is_some_and(|t| t.contains("her body"))
+            })
+    };
+
+    f.engine
+        .move_engram(&draft_move("note", "NOTE.md"), &alice)
+        .await
+        .unwrap();
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+    assert!(holds_her_text(&f));
+
+    f.engine
+        .move_engram(&draft_move("note", "note.md"), &alice)
+        .await
+        .unwrap();
+    assert!(f.reads("note", &alice).await.unwrap().contains("her body"));
+    assert!(holds_her_text(&f));
+
+    let rebuilt = rebuilt_index(&f).await;
+    let read_back = rebuilt.read_engram(&read("note"), &alice).await.unwrap();
+    assert_eq!(read_back["path"], "note.md", "{read_back}");
+    assert!(
+        read_back["content"].as_str().unwrap().contains("her body"),
+        "{read_back}"
+    );
+    rebuilt
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        notes_on_disk(&f),
+        vec![("note.md".to_string(), "her body".to_string())]
+    );
+}
+
+/// **Two real files are not a move of one.** Where the disk keeps them apart,
+/// deleting `note.md` and moving `Note.md` onto it would write over a file she
+/// did not move, so that is still refused. Says so and returns where case folds.
+#[tokio::test]
+async fn a_move_onto_a_deleted_real_file_is_still_refused() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    if f.root.join("TEAM").exists() {
+        eprintln!("skipped: {} folds case", f.root.display());
+        return;
+    }
+    for (name, address) in [("Note.md", "upper"), ("note.md", "lower")] {
+        std::fs::write(
+            f.domain_root("team").join(name),
+            format!("---\ntitle: {address}\ntype: note\nstatus: draft\npermalink: {address}\n---\n\nbody\n"),
+        )
+        .unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "lower".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice,
+        )
+        .await
+        .unwrap();
+    f.engine
+        .move_engram(&draft_move("upper", "note.md"), &alice)
+        .await
+        .unwrap_err();
+}
+
+/// **A different file with another spelling gets the plain refusal.**
+#[tokio::test]
+async fn a_refused_case_move_names_the_other_file() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    for name in ["a", "b"] {
+        std::fs::write(
+            f.domain_root("team").join(format!("{name}.md")),
+            format!(
+                "---\ntitle: {name}\ntype: note\nstatus: draft\npermalink: {name}\n---\n\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+    let other = f
+        .engine
+        .move_engram(&draft_move("a", "B.md"), &alice)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        other,
+        "'B.md' differs only in letter case from 'b.md', which is already an engram \
+         in domain 'team'. macOS and Windows cannot hold the two, so pick another name."
+    );
+}
+
 /// One address claimed at two paths by two people is a collision the plan has
 /// to name, because neither draft is in the folder for the other one's
 /// `conflict` to find and neither path is contested.
@@ -7103,6 +7968,8 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         // Putting paths back the way the team has them: the direction a pull
         // goes, so it stays allowed (decision D5).
         ("engine.rs", "discard_local_changes"),
+        // An admin ending what a removed account left: the same direction.
+        ("engine.rs", "discard_account_drafts"),
         // The GitHub connection and identities.
         ("engine.rs", "connect_github_identity_token"),
         ("engine.rs", "connect_with_token"),
@@ -7116,7 +7983,7 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "start_device_connect"),
         ("engine.rs", "start_github_identity_device_flow"),
         // A person's GitHub link: a credential and an accounts row.
-        ("engine.rs", "link_github"),
+        ("engine.rs", "link_github_begun"),
         ("engine.rs", "mint_github_link"),
         ("engine.rs", "start_github_link_device_flow"),
         ("engine.rs", "unlink_github"),
@@ -7168,6 +8035,10 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         // `ShareActor` resolved through `overlay_share_identity` - the caller's
         // own identity, never a name a request carried.
         ("engine.rs", "discard_into_overlay"),
+        // An admin's explicit end of the drafts a removed account left: the
+        // name comes from an admin-only route with no account under it, and it
+        // answers no reader.
+        ("engine.rs", "discard_in_domain"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
         // A `#[cfg(test)]` unit test standing in for an open co-editing room,
@@ -8928,16 +9799,26 @@ async fn the_close_folder_budget_starts_once_the_store_lock_is_held() {
 /// per-file lock. Two tabs of one account race on 50 fresh paths; each path
 /// answers one Ok and one create-only refusal, and the stored bytes are the
 /// winner's.
+///
+/// Each path stands in a folder of its own, because the first upload makes the
+/// folder while it holds the lock, and a second one asking for the lock in that
+/// moment has to get the same lock. The second upload starts a little later
+/// each round, spun rather than slept since a timer is too coarse on Windows,
+/// so the rounds sweep across that moment on a fast disk and a slow one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_create_only_overlay_uploads_of_one_path_land_once() {
     use crystalline_service::EngineError;
     use crystalline_service::engine::ASSET_EXISTS;
     let f = review_fixture().await;
-    for i in 0..50 {
-        let path = format!("assets/race-{i}.png");
-        let write = |bytes: &'static [u8]| {
+    for i in 0..50u64 {
+        let path = format!("assets/race-{i}/x.png");
+        let write = |bytes: &'static [u8], head_start: std::time::Duration| {
             let (engine, path) = (f.engine.clone(), path.clone());
             tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                while start.elapsed() < head_start {
+                    std::hint::spin_loop();
+                }
                 engine
                     .attachment_write_joined(
                         "team",
@@ -8950,7 +9831,11 @@ async fn two_create_only_overlay_uploads_of_one_path_land_once() {
                     .await
             })
         };
-        let (a, b) = tokio::join!(write(b"first"), write(b"second"));
+        let later = std::time::Duration::from_micros(i * 40);
+        let (a, b) = tokio::join!(
+            write(b"first", std::time::Duration::ZERO),
+            write(b"second", later)
+        );
         let (a, b) = (a.unwrap(), b.unwrap());
         let winner: &[u8] = match (&a, &b) {
             (Ok(_), Err(EngineError::Conflict(text))) if text.ends_with(ASSET_EXISTS) => b"first",
@@ -9383,4 +10268,557 @@ async fn a_folder_count_follows_the_readers_drafts_at_any_depth() {
         .await
         .unwrap();
     assert_eq!(listed["total"], counts(&level), "{listed}");
+}
+
+// --- a removed account's drafts ---------------------------------------------------
+
+async fn users_call(
+    addr: std::net::SocketAddr,
+    session: &(String, String),
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut request = client
+        .request(method, format!("http://{addr}{path}"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let answer = request.send().await.unwrap();
+    let status = answer.status().as_u16();
+    let text = answer.text().await.unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn sign_in(addr: std::net::SocketAddr, name: &str) -> (String, String) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let answer = client
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({ "name": name, "password": "pw12345678" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200, "{name} signs in");
+    let cookie = answer
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| v.strip_prefix("fluid_session="))
+        .and_then(|v| v.split(';').next())
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = answer.json().await.unwrap();
+    (cookie, body["csrf"].as_str().unwrap().to_string())
+}
+
+/// Removing an account ends the links it holds and keeps its drafts. A new
+/// account under the name is refused with what to do, the way out ends the
+/// drafts and is an admin's, and a name with no drafts is made as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_accounts_drafts_stay_and_only_an_admin_ends_them() {
+    let (f, addr, auth) = served_review_instance().await;
+    for (who, role) in [
+        ("root", Role::Admin),
+        ("ada", Role::Editor),
+        ("bob", Role::Editor),
+    ] {
+        auth.add_user(who, who, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+
+    // A link bob gave and ada redeemed, and one ada gave and bob redeemed.
+    f.draft("team", "bob", "bobs.md", ALICE_NEW).await;
+    let given_to_ada = auth
+        .mint_overlay_grant("team", "bobs.md", "bob", None)
+        .await
+        .unwrap();
+    auth.redeem_overlay_grant(&given_to_ada.token, "ada")
+        .await
+        .unwrap();
+    let given_by_ada = auth
+        .mint_overlay_grant("team", "plan.md", "ada", None)
+        .await
+        .unwrap();
+    auth.redeem_overlay_grant(&given_by_ada.token, "bob")
+        .await
+        .unwrap();
+
+    let root = sign_in(addr, "root").await;
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada",
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "{answer}");
+    assert!(
+        auth.overlay_grants_of("bob", "team", "bobs.md")
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.grantee.as_deref() != Some("ada")),
+        "what ada held went"
+    );
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 2)],
+        "her drafts stay, and nobody asked to end them"
+    );
+
+    // Refused, and no account stands.
+    let new = serde_json::json!({ "name": "ada", "password": "pw12345678", "role": "editor" });
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(new.clone()),
+    )
+    .await;
+    assert_eq!(status, 409, "{answer}");
+    let detail = answer["detail"].as_str().unwrap();
+    assert!(detail.contains("2 in team"), "{detail}");
+    assert!(detail.contains("users discard-drafts ada"), "{detail}");
+    assert!(auth.user("ada").await.unwrap().is_none());
+    assert_eq!(f.engine.account_drafts("ada").await.unwrap().len(), 1);
+
+    // Another name is made as before.
+    let other = serde_json::json!({ "name": "cleo", "password": "pw12345678", "role": "editor" });
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(other),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+
+    // The way out is an admin's, and not for a name with an account.
+    let bob = sign_in(addr, "bob").await;
+    let (status, _) = users_call(
+        addr,
+        &bob,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/bob/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(f.engine.account_drafts("bob").await.unwrap().len(), 1);
+
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["domains"][0]["discarded"], 2, "{report}");
+    assert!(f.engine.account_drafts("ada").await.unwrap().is_empty());
+    assert!(
+        auth.overlay_grants_of("ada", "team", "plan.md")
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.revoked_at.is_some()),
+        "the links she gave ended with her drafts"
+    );
+    assert!(
+        overlay_journal::journal_entries(&f.state, "team")
+            .entries
+            .iter()
+            .all(|entry| entry.actor != "ada"),
+        "an index wipe does not bring them back"
+    );
+
+    // Now the name is free.
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(new),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+}
+
+async fn new_account(
+    addr: std::net::SocketAddr,
+    admin: &(String, String),
+    name: &str,
+) -> (u16, serde_json::Value) {
+    let (status, answer) = users_call(
+        addr,
+        admin,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(serde_json::json!({ "name": name, "password": "pw12345678", "role": "editor" })),
+    )
+    .await;
+    (status, answer)
+}
+
+async fn remove_account(addr: std::net::SocketAddr, admin: &(String, String), name: &str) {
+    let (status, answer) = users_call(
+        addr,
+        admin,
+        reqwest::Method::DELETE,
+        &format!("/api/v1/users/{name}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "{answer}");
+}
+
+/// A text kept from a review draft goes to the draft's owner only, matched by
+/// name, so it counts as a draft: a new account is refused, the sentence shows
+/// no word of it, and only an admin's discard ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_text_of_a_removed_account_never_reaches_a_new_one() {
+    let (f, addr, auth) = served_review_instance().await;
+    for (who, role) in [("root", Role::Admin), ("ada", Role::Editor)] {
+        auth.add_user(who, who, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    let kept_root = f.state.join("kept");
+    crystalline_core::kept::write(
+        &kept_root,
+        "team",
+        Some("ada"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        chrono::Utc::now(),
+        "OLD ADA PRIVATE TEXT",
+    )
+    .unwrap();
+    // A comment she sent, which her reading right alone reaches.
+    let comment = crystalline_core::kept::write(
+        &kept_root,
+        "team",
+        None,
+        crystalline_core::kept::KeptKind::Comment,
+        "page.md",
+        chrono::Utc::now(),
+        "OLD ADA COMMENT",
+    )
+    .unwrap();
+    crystalline_core::kept::record_sender(
+        &comment,
+        &crystalline_core::kept::Sender {
+            account: "ada".to_string(),
+            name: "Ada".to_string(),
+        },
+    )
+    .unwrap();
+
+    let root = sign_in(addr, "root").await;
+    remove_account(addr, &root, "ada").await;
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 2)]
+    );
+
+    // A new account is refused, and the sentence shows no word of the text.
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    if status == 201 {
+        // What the review ran: the new account reads the old person's words.
+        let ada = sign_in(addr, "ada").await;
+        let (_, kept) = users_call(
+            addr,
+            &ada,
+            reqwest::Method::GET,
+            "/api/v1/domains/team/kept",
+            None,
+        )
+        .await;
+        let draft = kept["kept"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|k| k["draft"] == true);
+        let id = draft.map_or("", |k| k["id"].as_str().unwrap_or_default());
+        let (_, read) = users_call(
+            addr,
+            &ada,
+            reqwest::Method::GET,
+            &format!("/api/v1/domains/team/kept/{id}"),
+            None,
+        )
+        .await;
+        panic!("the new account was made and reads: {read}");
+    }
+    assert_eq!(status, 409, "{answer}");
+    assert!(!answer.to_string().contains("PRIVATE"), "{answer}");
+
+    // The way out ends them.
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["domains"][0]["discarded"], 2, "{report}");
+    assert!(
+        crystalline_core::kept::held_by(&kept_root, "ada")
+            .unwrap()
+            .is_empty()
+    );
+
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 201, "{answer}");
+    let ada = sign_in(addr, "ada").await;
+    let (status, kept) = users_call(
+        addr,
+        &ada,
+        reqwest::Method::GET,
+        "/api/v1/domains/team/kept",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{kept}");
+    assert!(!kept.to_string().contains("plan.md"), "{kept}");
+}
+
+/// The machine owner never has a row in `users`, so a check that only asks about
+/// accounts lets it through. Its drafts are live work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_machine_owners_drafts_are_not_a_removed_accounts() {
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "owner", "plan.md", ALICE_DRAFT).await;
+    let root = sign_in(addr, "root").await;
+    for name in ["owner", "OWNER"] {
+        let (status, answer) = users_call(
+            addr,
+            &root,
+            reqwest::Method::DELETE,
+            &format!("/api/v1/users/{name}/drafts"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 409, "{answer}");
+    }
+    // The engine itself refuses, so the control socket gets the same answer.
+    let refused = f.engine.discard_account_drafts("owner", "owner").await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        f.engine.account_drafts("owner").await.unwrap(),
+        vec![("team".to_string(), 1)]
+    );
+}
+
+/// The engine's own check refuses a live account for every caller, whichever
+/// route brought it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_refuses_to_discard_a_live_accounts_drafts() {
+    let (f, _addr, auth) = served_review_instance().await;
+    auth.add_user("ada", "ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    let refused = f.engine.discard_account_drafts("ada", "owner").await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(f.engine.account_drafts("ada").await.unwrap().len(), 1);
+}
+
+/// One unreadable folder used to refuse every new name on the instance. A folder
+/// only somebody else's drafts live in now refuses only that somebody. A folder
+/// every name's drafts live under still refuses, and the admin reads which domain
+/// and where to look.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_folder_refuses_only_the_names_it_can_hold() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.file("team", "bob", "assets/deck.png", DECK_PNG).await;
+    let root = sign_in(addr, "root").await;
+    let domain_folder = f.state.join("overlays/team");
+    let bobs = domain_folder.join("bob");
+    let set = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    set(&bobs, 0o000);
+    let (cleo, cleo_answer) = new_account(addr, &root, "cleo").await;
+    let (bob, bob_answer) = new_account(addr, &root, "bob").await;
+    set(&bobs, 0o755);
+    assert_eq!(cleo, 201, "{cleo_answer}");
+    assert_eq!(bob, 500, "{bob_answer}");
+
+    set(&domain_folder, 0o000);
+    let (dana, dana_answer) = new_account(addr, &root, "dana").await;
+    set(&domain_folder, 0o755);
+    assert_eq!(dana, 500, "{dana_answer}");
+    let detail = dana_answer["detail"].as_str().unwrap();
+    assert!(detail.contains("'team'"), "{detail}");
+    assert!(detail.contains("log"), "{detail}");
+    assert!(!detail.contains("try again"), "{detail}");
+}
+
+/// Every place a draft can live counts: what only the journal holds so far, which
+/// a sync brings back, and what a domain that stopped reviewing still holds, which
+/// comes back if it reviews again. The discard ends both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_count_sees_the_journal_and_a_domain_that_stopped_reviewing() {
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let root = sign_in(addr, "root").await;
+
+    // A draft only in the journal: no row, and a sync would make one.
+    overlay_journal::journal_write(&f.state, "team", "ada", "only-here.md", ALICE_DRAFT).unwrap();
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 1)]
+    );
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 409, "{answer}");
+
+    // A file left while the domain no longer reviews.
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            folds(&[("ada", FoldChoice::Discard)]),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let leftover = f.state.join("overlays/team/ada/files/assets");
+    std::fs::create_dir_all(&leftover).unwrap();
+    std::fs::write(leftover.join("deck.png"), DECK_PNG).unwrap();
+    assert!(
+        !f.engine.account_drafts("ada").await.unwrap().is_empty(),
+        "the leftover counts"
+    );
+
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert!(f.engine.account_drafts("ada").await.unwrap().is_empty());
+    assert!(!f.state.join("overlays/team/ada").exists());
+    let (status, answer) = new_account(addr, &root, "ada").await;
+    assert_eq!(status, 201, "{answer}");
+}
+
+/// A discard that fails half way says what went, and a domain with a failure does
+/// not stop the next. The drafts stay counted, so the name stays refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discard_that_fails_half_way_says_what_went() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (f, addr, auth) = served_review_instance().await;
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    let root = sign_in(addr, "root").await;
+    let files = f.state.join("overlays/team/ada/files/assets");
+    assert!(files.is_dir(), "the fixture's layout");
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(status, 200, "{report}");
+    let row = &report["domains"][0];
+    assert_eq!(
+        row["discarded"], 1,
+        "the draft went before the failure: {report}"
+    );
+    assert!(row["error"].is_string(), "{report}");
+    assert!(!f.engine.account_drafts("ada").await.unwrap().is_empty());
+}
+
+/// A socket can outlive its session. A room over a removed account's draft saves
+/// and closes at the removal, and one still open counts, so what is typed there
+/// never lands on a new account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_room_over_a_removed_accounts_draft_keeps_the_name_refused() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    let _joined = sessions.join("team", "plan", Some("ada")).await.unwrap();
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 1)],
+        "the open room counts"
+    );
+    assert!(f.engine.clear_name_for_new_account("ada").await.is_err());
+    f.engine.forget_removed_account("ada").await;
+    assert_eq!(sessions.session_count().await, 0, "the removal closed it");
+}
+
+/// A draft left because it is open keeps the files beside it: the live editor
+/// still needs them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_left_open_keeps_its_files() {
+    let f = review_fixture().await;
+    let sessions = crystalline_service::collab::session::CollabSessions::new(f.engine.clone());
+    f.engine.set_collab_sessions(&sessions);
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+    let _joined = sessions.join("team", "plan", Some("ada")).await.unwrap();
+
+    let report = f
+        .engine
+        .discard_account_drafts("ada", "root")
+        .await
+        .unwrap();
+    assert_eq!(report["domains"][0]["left"][0], "plan.md", "{report}");
+    assert!(
+        f.state
+            .join("overlays/team/ada/files/assets/deck.png")
+            .exists(),
+        "{report}"
+    );
+    assert!(!f.engine.account_drafts("ada").await.unwrap().is_empty());
 }

@@ -57,7 +57,7 @@ import { scanMarks, walkTree } from "./hiddenMarks";
 import { composing } from "./caret";
 import { droppable, judgedElsewhere } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
-import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import { PAGE_LOADING, budgetOf, parsedTo, pressDeadline } from "./parse";
 import type { Deadline } from "./parse";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
@@ -718,15 +718,6 @@ export function judgeDeletion(
   return timedOut ? LOADING : { outcome: "refused", said: CANNOT_JOIN };
 }
 
-/** The bound of one press of `event` (D35). */
-function budgetOf(event: string): number {
-  return event === "delete.selection" ||
-    event === "delete.cut" ||
-    event === "delete.picture"
-    ? PARSE_BUDGET.gesture
-    : PARSE_BUDGET.key;
-}
-
 /**
  * The check (D5). Listed before `keepPartnerMarks` in the layer, so it runs
  * after that filter (filters run last listed first) and judges the deletion
@@ -754,7 +745,11 @@ export const checkedDeletion: Extension = State.transactionFilter.of((tr) => {
   });
   // A replacement is not a deletion to judge.
   if (inserts) return tr;
-  const judged = judgeDeletion(start, tr.changes, deadlineIn(budgetOf(event)));
+  const judged = judgeDeletion(
+    start,
+    tr.changes,
+    pressDeadline(start, budgetOf(event)),
+  );
   switch (judged.outcome) {
     case "unchecked":
       return tr;

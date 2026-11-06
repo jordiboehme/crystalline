@@ -233,13 +233,23 @@ pub(crate) fn held(state_dir: &Path, domain: &str, actor: &str, path: &str) -> i
 /// No bytes are read: what a listing needs is which paths this actor has
 /// touched and which way.
 pub(crate) fn entries(state_dir: &Path, domain: &str, actor: &str) -> FileRead {
+    entries_or(state_dir, domain, actor, true)
+}
+
+/// [`entries`] for a name that may hold nothing at all: a name that cannot
+/// address a folder holds nothing here, rather than something unknown.
+pub(crate) fn actor_entries(state_dir: &Path, domain: &str, actor: &str) -> FileRead {
+    entries_or(state_dir, domain, actor, false)
+}
+
+fn entries_or(state_dir: &Path, domain: &str, actor: &str, bad_name_unreadable: bool) -> FileRead {
     let Ok(dir) = files_dir(state_dir, domain, actor) else {
         // A name that cannot address a folder is not a folder that is empty:
         // nothing was read, and a caller about to delete may not be told
         // otherwise.
         return FileRead {
             entries: Vec::new(),
-            unreadable: true,
+            unreadable: bad_name_unreadable,
         };
     };
     let mut entries = Vec::new();

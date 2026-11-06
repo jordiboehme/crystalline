@@ -809,13 +809,9 @@ async fn start_without_public_url_is_409() {
     let response = ctx.start_link(&ann).await;
     assert_eq!(response.status(), 409);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("service.public_url"),
-        "{body}"
-    );
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("Ask an admin"), "{body}");
+    assert!(!detail.contains("service.public_url"), "{body}");
     assert_eq!(body["reason"], "no_public_url", "{body}");
 }
 
@@ -835,6 +831,15 @@ async fn start_without_a_client_secret_is_409() {
     let ann = ctx.login("ann").await;
     let response = ctx.start_link(&ann).await;
     assert_eq!(response.status(), 409);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("Ask an admin"), "{body}");
+    assert!(!detail.contains("crystalline "), "{body}");
+    assert_eq!(body["reason"], "no_client_secret", "{body}");
+
+    // The command is the admin's.
+    let admin = ctx.login("root").await;
+    let response = ctx.start_link(&admin).await;
     let body: serde_json::Value = response.json().await.unwrap();
     assert!(
         body["detail"]
@@ -868,11 +873,8 @@ async fn start_without_an_app_says_no_app() {
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["reason"], "no_app", "{body}");
     assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("crystalline github app set"),
-        "the detail keeps the admin's fix: {body}"
+        !body["detail"].as_str().unwrap().contains("crystalline "),
+        "a viewer reads plain words: {body}"
     );
 }
 
@@ -899,7 +901,7 @@ async fn start_with_an_unreadable_keychain_says_keychain() {
     assert_eq!(status, 422, "{body}");
     assert_eq!(body["reason"], "keychain", "{body}");
     assert!(
-        body["detail"].as_str().unwrap().contains("keychain"),
+        body["detail"].as_str().unwrap().contains("stored keys"),
         "{body}"
     );
 }
@@ -1464,7 +1466,7 @@ async fn an_anonymous_agent_is_told_to_link_from_the_profile() {
 /// Without `service.public_url` there is no address to build a link with:
 /// nothing is minted, and the answer says what an admin sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_public_url_the_answer_names_the_setting() {
+async fn without_a_public_url_an_editor_reads_plain_words() {
     let github = FakeGithub::start().await;
     let ctx = Ctx::with(
         &github,
@@ -1485,14 +1487,9 @@ async fn without_a_public_url_the_answer_names_the_setting() {
     let answer = session
         .call_tool("configure", serde_json::json!({ "connect": "github" }))
         .await;
-    assert!(
-        answer.contains(
-            "Linking GitHub through the App needs service.public_url, which this instance does \
-             not have. An admin sets it (crystalline config set service.public_url <url>), then \
-             ask again."
-        ),
-        "{answer}"
-    );
+    assert!(answer.contains("Ask an admin to set it"), "{answer}");
+    assert!(!answer.contains("service.public_url"), "{answer}");
+    assert!(!answer.contains("crystalline config"), "{answer}");
     assert!(!answer.contains("profile"), "{answer}");
     assert!(!answer.contains(GO_PATH), "{answer}");
 }

@@ -280,6 +280,47 @@ pub(crate) fn remove_if_present(file: &Path) -> io::Result<()> {
     }
 }
 
+/// [`remove_if_present`] for a journal entry, which leaves another spelling of
+/// the same name alone.
+///
+/// On a disk that folds case `note.md` and `Note.md` are one file, but to the
+/// index they are two paths, and a case-only move of a team's file holds both:
+/// a tombstone at one and a draft at the other. The two stand side by side here
+/// as `Note.md.tombstone` and `note.md`, and writing the draft must not take the
+/// tombstone away for answering to the draft's own sidecar, or a rebuild would
+/// bring the old spelling back. So a name the folder holds only in another case
+/// is somebody else's entry. A name the folder holds in no spelling comparable
+/// this way is removed as asked.
+fn remove_entry_if_present(file: &Path) -> io::Result<()> {
+    if file.symlink_metadata().is_err() {
+        return remove_if_present(file);
+    }
+    let (Some(dir), Some(name)) = (file.parent(), file.file_name().and_then(|n| n.to_str())) else {
+        return remove_if_present(file);
+    };
+    let folded = crystalline_core::path::fold_path_case(name);
+    let mut another_spelling = false;
+    // A folder that cannot be listed cannot say who else stands here, so the
+    // removal goes ahead as asked rather than failing where it used not to.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return remove_if_present(file);
+    };
+    for entry in entries.flatten() {
+        let entry = entry.file_name();
+        let Some(entry) = entry.to_str() else {
+            continue;
+        };
+        if entry == name {
+            return remove_if_present(file);
+        }
+        another_spelling |= crystalline_core::path::fold_path_case(entry) == folded;
+    }
+    if another_spelling {
+        return Ok(());
+    }
+    remove_if_present(file)
+}
+
 /// Mirror one actor's draft of `path`.
 ///
 /// The draft is written first and the tombstone beside it removed second, so a
@@ -295,7 +336,7 @@ pub fn journal_write(
 ) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
     save(&file, content.as_bytes())?;
-    remove_if_present(&tombstone_of(&file))
+    remove_entry_if_present(&tombstone_of(&file))
 }
 
 /// Mirror one actor's deletion of the base row at `path`.
@@ -310,7 +351,21 @@ pub fn journal_tombstone(
     path: &str,
 ) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
-    remove_if_present(&file)?;
+    remove_entry_if_present(&file)?;
+    save(&tombstone_of(&file), b"")
+}
+
+/// [`journal_tombstone`] for a deletion whose path is also where another of the
+/// actor's drafts may be mirrored: the sidecar goes down and that file stays. If
+/// the two end up at one spelling the draft is taken, so her text is what a
+/// rebuild brings back.
+pub fn journal_tombstone_beside_a_draft(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<()> {
+    let file = entry_path(state_dir, domain, actor, path)?;
     save(&tombstone_of(&file), b"")
 }
 
@@ -322,8 +377,25 @@ pub fn journal_tombstone(
 /// [`journal_remove_domain`] answers about.
 pub fn journal_clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<()> {
     let file = entry_path(state_dir, domain, actor, path)?;
-    remove_if_present(&tombstone_of(&file))?;
-    remove_if_present(&file)?;
+    remove_entry_if_present(&tombstone_of(&file))?;
+    remove_entry_if_present(&file)?;
+    let stop = actor_dir(state_dir, domain, actor)?;
+    prune_empty(file.parent(), &stop);
+    Ok(())
+}
+
+/// Drop only the sidecar of one actor's deletion at `path`, and any folder it
+/// leaves empty. For a deletion whose path is also where another of the actor's
+/// drafts is mirrored: on a disk that folds case `notes/x.md` and `Notes/x.md`
+/// are one file, and [`journal_clear`] would take that draft's only copy.
+pub fn journal_clear_tombstone(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<()> {
+    let file = entry_path(state_dir, domain, actor, path)?;
+    remove_entry_if_present(&tombstone_of(&file))?;
     let stop = actor_dir(state_dir, domain, actor)?;
     prune_empty(file.parent(), &stop);
     Ok(())
@@ -409,6 +481,36 @@ pub fn journal_counts(state_dir: &Path, domain: &str) -> JournalCounts {
         per_actor,
         total: entries.len() as u64,
         unreadable,
+    }
+}
+
+/// How many drafts one actor's folder holds in the journal, and whether anything
+/// in it could not be read. Only that actor's folder is walked, so another
+/// actor's folder that cannot be read says nothing about this one. A name that
+/// cannot address a folder holds nothing here.
+pub fn journal_actor_count(state_dir: &Path, domain: &str, actor: &str) -> (u64, bool) {
+    let Ok(dir) = actor_dir(state_dir, domain, actor) else {
+        return (0, false);
+    };
+    if matches!(std::fs::read_dir(&dir), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return (0, false);
+    }
+    let mut found = Vec::new();
+    let unreadable = collect(&dir, "", actor, false, &mut found);
+    (found.len() as u64, unreadable)
+}
+
+/// Remove one actor's whole folder in a domain: what is mirrored and the files
+/// beside it. Answers how many mirrored drafts went.
+pub fn journal_remove_actor(state_dir: &Path, domain: &str, actor: &str) -> io::Result<u64> {
+    let Ok(dir) = actor_dir(state_dir, domain, actor) else {
+        return Ok(0);
+    };
+    let (held, _) = journal_actor_count(state_dir, domain, actor);
+    match crystalline_core::tree::remove_tree(&dir) {
+        Ok(true) => Ok(held),
+        Ok(false) => Ok(0),
+        Err(e) => Err(e.into()),
     }
 }
 

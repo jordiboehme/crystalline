@@ -100,7 +100,7 @@ fn checked_policy(domain: &str, edit: &PolicyEdit) -> Result<&'static crystallin
         return match edit {
             PolicyEdit::Unset { .. } => Ok(spec),
             PolicyEdit::Set { .. } => Err(EngineError::Invalid(format!(
-                "`{key}` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset {key}), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
+                "`{key}` is filled in by the first scheduled evolve run at an instance with a public address; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset {key}), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
             ))),
         };
     }
@@ -921,7 +921,7 @@ fn policy_json(row: &PolicyRow, may_change: bool, domain: &str) -> Value {
     } else if row.key == crystalline_core::TEAM_KEY {
         "added by the next share from an instance connected to GitHub (through the proposal on a domain that reviews changes); never set by hand".to_string()
     } else if row.key == crystalline_core::EVOLVE_HOME_KEY {
-        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)".to_string()
+        "filled in by the first scheduled evolve run at an instance with a public address; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)".to_string()
     } else if text {
         rename_how(domain)
     } else if row.key == crystalline_core::READ_ONLY_KEY {

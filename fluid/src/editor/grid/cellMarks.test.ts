@@ -78,6 +78,31 @@ afterEach(() => {
   errors.mockRestore();
 });
 
+/**
+ * `press` on a clock that finds a second gone at every look, so a parse takes
+ * one step and stops, at any load: a press whose own parse budget (D35) runs
+ * out. The clock stays ahead afterwards and never goes back.
+ */
+const now = Date.now.bind(Date);
+const clockAhead = { ms: 0 };
+function starved<T>(press: () => T): T {
+  const spy = vi.spyOn(Date, "now");
+  spy.mockImplementation(() => {
+    clockAhead.ms += 1_000;
+    return now() + clockAhead.ms;
+  });
+  try {
+    return press();
+  } finally {
+    spy.mockImplementation(() => now() + clockAhead.ms);
+  }
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  clockAhead.ms = 0;
+});
+
 type Mode = "hidden" | "show";
 
 interface Page {
@@ -841,7 +866,7 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
         }),
       ),
     });
-    keys(view, "Delete");
+    starved(() => keys(view, "Delete"));
     expect(bytes(main.state)).toBe(text);
     expect(said).toEqual([CELL_NOT_READ]);
     // Named as a refusal, as the deletion check names its own.
@@ -886,11 +911,11 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     view.dispatch({
       selection: { anchor: cell.content.from, head: cell.content.to },
     });
-    keys(view, "Mod-b");
+    starved(() => keys(view, "Mod-b"));
     expect(bytes(main.state)).toBe(text);
     // A format waiting for typing: refused too, so the letter is plain.
     view.dispatch({ selection: { anchor: cell.content.to } });
-    keys(view, "Mod-i");
+    starved(() => keys(view, "Mod-i"));
     typeText(view, "x");
     expect(main.state.doc.lineAt(cell.content.from).text).toBe(
       "| label | :status[Done]{green}x |",
@@ -924,16 +949,20 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     view.dispatch({
       selection: { anchor: cell.content.from + 2, head: cell.content.to },
     });
-    typeText(view, "X");
+    starved(() => {
+      typeText(view, "X");
+    });
     expect(bytes(main.state)).toBe(bold);
     // A paste over the selection deletes it the same way.
-    view.dispatch({
-      changes: {
-        from: cell.content.from + 2,
-        to: cell.content.to,
-        insert: "Y",
-      },
-      userEvent: "input.paste",
+    starved(() => {
+      view.dispatch({
+        changes: {
+          from: cell.content.from + 2,
+          to: cell.content.to,
+          insert: "Y",
+        },
+        userEvent: "input.paste",
+      });
     });
     expect(bytes(main.state)).toBe(bold);
     // At a caret only the typed letter is added.
@@ -969,7 +998,7 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
         }),
       ),
     });
-    keys(view, "Backspace");
+    starved(() => keys(view, "Backspace"));
     expect(bytes(main.state)).toBe(loose);
     expect(said).toEqual([CELL_NOT_READ]);
   });

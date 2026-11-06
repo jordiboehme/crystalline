@@ -59,7 +59,14 @@ import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
 import { stepIntoDrawnFence } from "../diagram/draws";
 import { marksHiddenOnLine, pictureForKeys } from "./mode";
-import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import {
+  PARSE_BUDGET,
+  budgetOf,
+  deadlineIn,
+  parsedTo,
+  pressDeadline,
+  viewParsedTo,
+} from "./parse";
 
 type HeadingQuestion = (
   state: EditorState,
@@ -343,6 +350,22 @@ function blockRule(view: EditorView, start: number): boolean {
 }
 
 /**
+ * The caret's line parsed before a key reads it (D35): a tree cut short by a
+ * busy page would show a hidden mark as a letter to delete, the atoms the view
+ * draws from it would not be there to take whole, and a hidden fence line
+ * would be no fence to refuse a join with. So the view itself gets the parse,
+ * not only this press. False, so it fits at the head of a chain of commands.
+ */
+function parsedForKey(view: EditorView): false {
+  viewParsedTo(
+    view,
+    view.state.doc.lineAt(view.state.selection.main.head).to,
+    deadlineIn(PARSE_BUDGET.key),
+  );
+  return false;
+}
+
+/**
  * Backspace (`forward` false) or Delete on a line whose marks are hidden,
  * from an empty caret. Returns false where today's key runs instead: show
  * mode on the line, Raw, a selection, several carets, indentation, a
@@ -358,14 +381,7 @@ export function deleteVisible(view: EditorView, forward: boolean): boolean {
     return false;
   }
   const head = selection.main.head;
-  // The marks are read off a tree that reaches the line (D35): a tree cut
-  // short by a busy page would show a hidden mark as a letter to delete.
-  const state =
-    parsedTo(
-      view.state,
-      view.state.doc.lineAt(head).to,
-      deadlineIn(PARSE_BUDGET.key),
-    ) ?? view.state;
+  const { state } = view;
   const line = state.doc.lineAt(head);
   if (!marksHiddenOnLine(state, line.number)) {
     return false;
@@ -529,6 +545,7 @@ function refuseFenceJoin(view: EditorView, forward: boolean): boolean {
 
 function key(forward: boolean): Command {
   return (view) =>
+    parsedForKey(view) ||
     refuseFenceJoin(view, forward) ||
     deleteVisible(view, forward) ||
     guardShownHeading(view, forward);
@@ -578,15 +595,16 @@ function reach(
 function overHidden(command: Command, forward: boolean): Command {
   const plain = command as unknown as StateCommand;
   return (view) => {
-    const { state } = view;
-    const { selection } = state;
     if (
-      state.readOnly ||
-      selection.ranges.length > 1 ||
-      !selection.main.empty
+      view.state.readOnly ||
+      view.state.selection.ranges.length > 1 ||
+      !view.state.selection.main.empty
     ) {
       return false;
     }
+    parsedForKey(view);
+    const { state } = view;
+    const { selection } = state;
     const head = selection.main.head;
     const line = state.doc.lineAt(head);
     if (!marksHiddenOnLine(state, line.number)) {
@@ -885,7 +903,20 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
   if (deleted.length === 0) {
     return tr;
   }
-  const { kept, dropped } = markFate(start, deleted, inserts);
+  // Judged on a tree that reaches what it takes: a filter cannot publish, and
+  // a short one shows no marks to keep, so a typed, pasted or cut stretch would
+  // leave a lone `**` (D35). Every event alike, as nothing before a filter need
+  // have parsed. Short of time it goes as the page draws it, and the deletion
+  // check, on the same deadline, refuses a delete. Caret typing has returned
+  // above and never pays this.
+  const reach = Math.max(...deleted.map((d) => d.to));
+  const judged =
+    parsedTo(
+      start,
+      start.doc.lineAt(reach).to,
+      pressDeadline(start, budgetOf(event)),
+    ) ?? start;
+  const { kept, dropped } = markFate(judged, deleted, inserts);
   if (kept.length === 0 && dropped.length === 0) {
     return tr;
   }

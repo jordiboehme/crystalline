@@ -42,6 +42,8 @@ struct Inner {
 #[derive(Default)]
 pub struct Forge {
     inner: Mutex<Inner>,
+    /// When set, every new proposal is refused with this sentence.
+    refuse_proposals: Mutex<Option<String>>,
 }
 
 impl Forge {
@@ -57,6 +59,11 @@ impl Forge {
             inner.branches.insert("main".into(), "commit0".into());
         }
         forge
+    }
+
+    /// Refuses every new proposal from now on, with `sentence`.
+    pub fn refuse_proposals(&self, sentence: &str) {
+        *self.refuse_proposals.lock().unwrap() = Some(sentence.to_string());
     }
 
     /// Every write call so far, in order.
@@ -367,6 +374,9 @@ impl Provider for Forge {
         _origin: &OriginSpec,
         req: &ProposalRequest,
     ) -> Result<ProposalHandle, RemoteError> {
+        if let Some(sentence) = self.refuse_proposals.lock().unwrap().clone() {
+            return Err(RemoteError::Refused(sentence));
+        }
         let mut inner = self.inner.lock().unwrap();
         let number = inner.proposals.len() as u64 + 1;
         inner.proposals.insert(

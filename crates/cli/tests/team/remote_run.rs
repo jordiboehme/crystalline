@@ -259,6 +259,75 @@ fn agent_writes(config: &Value) {
     );
 }
 
+/// A share the forge refuses does not vanish: the recorded run and the JSON
+/// both say so, with the fix.
+#[test]
+fn a_refused_share_is_in_the_recorded_run_and_the_json() {
+    let forge = Arc::new(Forge::with_main(repository()));
+    let refusal = "This instance shares with personal GitHub identities through its GitHub App.";
+    forge.refuse_proposals(refusal);
+    let server = CliServer::start_team(forge.clone());
+    let runner = Runner {
+        home: tempfile::tempdir().unwrap(),
+        url: server.origin.clone(),
+        token: server.agent_token("runner"),
+    };
+    runner.fake_claude();
+    let start = Instant::now();
+    while runner.status()["domains"][0]["due"] != true {
+        assert!(start.elapsed() < Duration::from_secs(30), "never due");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let logs = runner.home.path().join("logs");
+    let run = runner
+        .cli(&[
+            "--json",
+            "evolve",
+            "run",
+            "--domain",
+            "brand",
+            "--runner",
+            "k8s",
+            "--log-dir",
+            logs.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let seen = runner.seen();
+    wait_for("the agent start", Duration::from_secs(60), || seen.exists());
+    let config_path = PathBuf::from(std::fs::read_to_string(&seen).unwrap());
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    agent_writes(&config);
+    std::fs::write(runner.go(), b"").unwrap();
+    let out = run.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let answer: Value = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no json answer: {}", explain(&out)));
+    assert_eq!(answer["share"], Value::Null, "{answer}");
+    let error = answer["share_error"].as_str().unwrap_or_default();
+    assert!(error.contains(refusal), "{answer}");
+    assert!(error.contains("not shared"), "{answer}");
+    // A remote runner's token need not be an admin's: no command line for it.
+    assert!(!error.contains("crystalline "), "{answer}");
+    assert!(!error.contains("github."), "{answer}");
+    // The recorded run is read by anybody who may run the loop: plain words,
+    // no command line and no setting.
+    let summary = answer["run"]["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.starts_with("The changes of this run could not be shared"),
+        "{answer}"
+    );
+    assert!(!summary.contains("crystalline "), "{answer}");
+    assert!(!summary.contains("github."), "{answer}");
+    assert!(!summary.contains(refusal), "{answer}");
+}
+
 #[test]
 fn a_remote_evolve_run_shares_the_agents_mcp_write_as_a_pull_request() {
     let forge = Arc::new(Forge::with_main(repository()));

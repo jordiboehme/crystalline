@@ -863,6 +863,40 @@ impl CollabSessions {
         self.sweep_domain(domain, None, discarded, "internal").await
     }
 
+    /// The domain of every room open over a draft of `account`, one per room. A
+    /// socket can outlive its session, so a room is a place a removed account's
+    /// text can still land.
+    pub async fn draft_rooms_of(&self, account: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .await
+            .keys()
+            .filter(|key| key.2.as_deref() == Some(account))
+            .map(|key| key.0.clone())
+            .collect()
+    }
+
+    /// Final-save and close every room over a draft of `account`, because the
+    /// account was removed: what was typed lands in the draft, which stays until
+    /// an admin ends it, and nothing lands there later. Answers how many closed.
+    pub async fn close_drafts_of(&self, account: &str) -> usize {
+        let victims: Vec<Arc<CollabSession>> = {
+            let mut sessions = self.sessions.lock().await;
+            let keys: Vec<RoomKey> = sessions
+                .keys()
+                .filter(|key| key.2.as_deref() == Some(account))
+                .cloned()
+                .collect();
+            keys.iter().filter_map(|key| sessions.remove(key)).collect()
+        };
+        let closed = victims.len();
+        let reason = Some("internal".to_string());
+        if let Err(err) = tokio::spawn(sweep_task(victims, HashSet::new(), reason)).await {
+            tracing::warn!(%err, account, "a room sweep did not finish");
+        }
+        closed
+    }
+
     /// Final-save every room over a document of `kind` in `domain`, then
     /// close it, telling each socket `Closed { reason }`. Answers how many
     /// rooms it closed.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use crystalline_core::config::{EffectiveShareIdentity, GithubAppPresence, ShareIdentityMode};
 use crystalline_remote::github::{GitHubProvider, HttpClient};
 use crystalline_remote::provider::{
     CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
@@ -217,6 +218,18 @@ impl AppHome {
         !self.file_only
             && crystalline_remote::read_marker(&self.dir)
                 .is_some_and(|marker| marker_names_host(&marker, self.api_url.as_deref()))
+    }
+
+    /// Whether an App is configured, from what is cheap to read: the
+    /// environment, the keychain marker for this host and the App file. No
+    /// keychain read, so a report may ask it. What the CLI feeds
+    /// [`EffectiveShareIdentity::resolve`] when it has no engine.
+    pub fn presence(&self, overlay: &EnvOverlay) -> GithubAppPresence {
+        if overlay.github_app(self.api_url.as_deref()).is_some() || self.maybe_saved() {
+            GithubAppPresence::Configured
+        } else {
+            GithubAppPresence::None
+        }
     }
 
     /// One read of the App store for this home.
@@ -626,7 +639,7 @@ pub(crate) enum AppSlot {
 ///
 /// Holds one HTTP client, cloned into every per-call [`GitHubProvider`]: a
 /// client build loads the platform trust store (see the note above
-/// `Engine::resolve_share_credential`), so it is built once per App, not
+/// `Engine::resolve_share_credential_in`), so it is built once per App, not
 /// once per call. A call refused with [`RemoteError::AuthExpired`] (a 401:
 /// the token was revoked or expired early) forgets that installation's token
 /// and runs once more on a fresh one. A 401 means GitHub did not act on the
@@ -1124,6 +1137,68 @@ impl Engine {
         }
     }
 
+    /// The share identity mode in effect and why, for a gate or a report: a
+    /// live read that never waits for the store. An explicit
+    /// `github.share_identity` wins, else a configured App (usable or not) means
+    /// `personal`. While the App is not settled and may be saved, this answers
+    /// `instance`, the narrower share gate, and starts the load in the
+    /// background.
+    ///
+    /// Takes `config.read()` itself and lets go before it looks at the slot: a
+    /// load holds the slot's write lock and reads the config inside it, so never
+    /// call this with a config guard held.
+    pub fn share_identity_effective(&self) -> EffectiveShareIdentity {
+        let setting = self.config.read().unwrap().github_share_identity_setting();
+        self.share_identity_given(setting)
+    }
+
+    /// [`Engine::share_identity_effective`] for a key the caller already holds,
+    /// where the config has not caught up with it yet (`configure` answering a
+    /// change it is about to apply).
+    pub(super) fn share_identity_given(
+        &self,
+        setting: Option<ShareIdentityMode>,
+    ) -> EffectiveShareIdentity {
+        if setting.is_some() {
+            return EffectiveShareIdentity::resolve(setting, GithubAppPresence::None);
+        }
+        let app = match self.github_app_slot_settled() {
+            Some(slot) => slot_presence(&slot),
+            None => {
+                if let Some(governor) = self.github_governor.get() {
+                    governor.preload_app();
+                }
+                if self.github_app_maybe_saved() {
+                    GithubAppPresence::Loading
+                } else {
+                    GithubAppPresence::None
+                }
+            }
+        };
+        EffectiveShareIdentity::resolve(None, app)
+    }
+
+    /// [`Engine::share_identity_effective`] for the origin operations, which
+    /// read the App anyway and need the true answer: this one loads the slot
+    /// when it has to, so it may read the store. The same rule, and the same
+    /// care with the config guard.
+    pub(super) fn share_identity_loaded(&self) -> EffectiveShareIdentity {
+        let setting = self.config.read().unwrap().github_share_identity_setting();
+        if setting.is_some() {
+            return EffectiveShareIdentity::resolve(setting, GithubAppPresence::None);
+        }
+        EffectiveShareIdentity::resolve(None, slot_presence(&self.github_app_slot()))
+    }
+
+    /// Whether every share is refused for the App's own reason: a refused App
+    /// where `personal` is only the default (`Engine::resolve_share_provider`).
+    /// Never waits for the store. What keeps `can_share` from promising a share
+    /// an editor cannot make.
+    pub fn github_app_refuses_shares(&self) -> bool {
+        self.share_identity_effective().is_default()
+            && matches!(self.github_app_slot_settled(), Some(AppSlot::Refused(_)))
+    }
+
     /// Whether an App may be configured, from what is cheap to read: the
     /// environment, the keychain marker for this host and the App file. No
     /// keychain read. Used to fail closed while the App is being loaded.
@@ -1243,6 +1318,20 @@ impl Engine {
             // report stays what it was before the App existed.
             AppSlot::Absent | AppSlot::Unloaded => GithubAppStatus::default(),
         }
+    }
+
+    /// [`Engine::github_app_local_status`] for somebody who is not an admin: the
+    /// error in plain words.
+    pub(super) fn github_app_local_status_plain(&self) -> GithubAppStatus {
+        let mut status = self.github_app_local_status();
+        if status.error.is_some() {
+            let reason = match self.github_app_slot() {
+                AppSlot::Refused(detail) => app_refusal_with_reason(detail).0,
+                _ => super::github::LinkSetupReason::AppUnusable,
+            };
+            status.error = Some(reason.plain_sentence().to_string());
+        }
+        status
     }
 
     /// The App as this engine runs it, with GitHub asked for its slug and
@@ -1395,6 +1484,14 @@ impl Engine {
         self.app_home()
             .map_err(|e| RemoteError::AppCredential(e.to_string()))?
             .lookup()
+    }
+}
+
+/// What the share identity default reads off a slot.
+fn slot_presence(slot: &AppSlot) -> GithubAppPresence {
+    match slot {
+        AppSlot::Ready(_) | AppSlot::Refused(_) => GithubAppPresence::Configured,
+        AppSlot::Absent | AppSlot::Unloaded => GithubAppPresence::None,
     }
 }
 

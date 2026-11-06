@@ -32,7 +32,10 @@
  * share and is still refused the share"). So the checkbox list is on the screen
  * before the connect, which is what makes connecting the last step before a
  * decision rather than a hoop in front of an unknown - while the share itself,
- * one route down, still refuses.
+ * one route down, still refuses. On a domain GitHub governs, the plan is closed
+ * to somebody with no GitHub link, and its refusal says to link; the status
+ * still answers, so the fix is on the screen there too. The mode here is the
+ * one in effect, so it also comes from the default with a GitHub App.
  */
 
 import { useQuery } from "@tanstack/react-query";

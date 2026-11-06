@@ -54,23 +54,48 @@ fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, 
 /// GitHub governs the share follows the same right as a save (R27): the
 /// GitHub role and the write list decide through `require_domain_write`,
 /// whatever the instance role and the share mode say, and the engine's own
-/// checks on the share stay as they are. A caller that also fails that gets
-/// the share role's own refusal, so a governed domain it may not see
-/// answers as every other domain does here.
+/// checks on the share stay as they are. Only an instance admin keeps the role
+/// gate there. Personal mode lets every instance editor past the role gate, and
+/// that must not let one past GitHub's answer on a governed domain. A caller
+/// the role gate refused and that also fails that gets the share role's own
+/// refusal, so a governed domain it may not see answers as every other domain
+/// does here.
 pub(crate) async fn require_share_role_on(
     state: &RestState,
     identity: &Identity,
     domain: &str,
 ) -> Result<Caller, ApiError> {
-    match require_share_role(state, identity) {
-        Ok(caller) => Ok(caller),
-        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN && state.access.governs(domain) => {
+    let role = require_share_role(state, identity);
+    if !state.access.governs(domain) {
+        return role;
+    }
+    match role {
+        Ok(caller) if identity.require_admin().is_ok() => Ok(caller),
+        Ok(_) => crate::require_domain_write(state, identity, domain).await,
+        // The refusal that names the link comes only after the domain was found
+        // readable, so it says nothing about a domain the caller may not see.
+        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN => {
             crate::require_domain_write(state, identity, domain)
                 .await
-                .map_err(|_| e)
+                .map_err(|refused| {
+                    if refused.detail == crate::LINK_GITHUB_TO_WRITE {
+                        refused
+                    } else {
+                        e
+                    }
+                })
         }
         Err(e) => Err(e),
     }
+}
+
+/// What a status route leaves out of the `connection` block for a non-admin: see
+/// [`crate::engine::leave_out_for_non_admin`].
+fn connection_for(identity: &Identity, mut connection: Value) -> Value {
+    if identity.require_admin().is_err() {
+        crate::engine::leave_out_for_non_admin(&mut connection);
+    }
+    connection
 }
 
 /// Refuse a share surface that changes something (the preview, the share,
@@ -870,7 +895,7 @@ fn single_domain(
     summary = "Where a team domain stands relative to its GitHub origin.",
     description = "Admin only, or an editor when this instance shares with \
                    personal GitHub identities (`github.share_identity` = \
-                   `personal`): this is the report every share surface is \
+                   `personal`, the default with a GitHub App): this is the report every share surface is \
                    drawn from, so it is gated with the share verbs rather \
                    than with the plain admin reads. A pure read, served even \
                    on a read-only \
@@ -905,6 +930,13 @@ fn single_domain(
                            yours`. It is null when the request carries no \
                            session account or the domain's origin state cannot \
                            be read, which is a different thing from zero; \
+                           `may_share` says whether this caller may share here: \
+                           on a domain GitHub governs, an account that may read \
+                           the domain gets this report with `may_share` false \
+                           when it may not share, so a client can say what is \
+                           missing (often only a GitHub link). In `connection`, \
+                           `share_identity_reason`, `owner_identity` and \
+                           `agent_identity` are for an instance admin only; \
                            `probe_error` is set when the live check could not \
                            reach GitHub and the rest of the report came from \
                            local state alone; `connection.connected` is false \
@@ -1013,7 +1045,7 @@ fn single_domain(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1043,8 +1075,26 @@ pub async fn sync_status(
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     // The share verbs' own gate: whoever may share reads the report they would
-    // be sharing into. See the doc comment.
-    let caller = require_share_role_on(&state, &identity, &domain).await?;
+    // be sharing into. See the doc comment. On a domain GitHub governs an account
+    // that may read the domain reads it too, with `may_share` false, so a share
+    // dialog can say what is missing: often only a GitHub link. Every share verb
+    // stays closed to it. Where GitHub does not govern, nothing changes.
+    let (caller, may_share) = match require_share_role_on(&state, &identity, &domain).await {
+        Ok(caller) => (caller, true),
+        Err(e) if e.status == StatusCode::FORBIDDEN && state.access.governs(&domain) => {
+            let Ok(account) = identity.require_account() else {
+                return Err(e);
+            };
+            if require_domain_read(&state, &identity, &domain)
+                .await
+                .is_err()
+            {
+                return Err(e);
+            }
+            (Caller::Account(account), false)
+        }
+        Err(e) => return Err(e),
+    };
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -1078,8 +1128,12 @@ pub async fn sync_status(
     // degraded: `connected: false` is "connect GitHub", while a set
     // `probe_error` on a connected instance is "could not reach it".
     if let Some(connection) = connection {
-        report.insert("connection".to_string(), connection);
+        report.insert(
+            "connection".to_string(),
+            connection_for(&identity, connection),
+        );
     }
+    report.insert("may_share".to_string(), Value::from(may_share));
     Ok(Json(Value::Object(report)))
 }
 
@@ -1124,7 +1178,7 @@ pub async fn sync_status(
     summary = "Where every team domain on this instance stands, in counts.",
     description = "Admin only, or an editor when this instance shares with \
                    personal GitHub identities (`github.share_identity` = \
-                   `personal`): this is what a share action reads before it \
+                   `personal`, the default with a GitHub App): this is what a share action reads before it \
                    draws itself, so it is gated with the share verbs rather \
                    than with the plain admin reads. One instance-wide answer \
                    to `does anything \
@@ -1204,7 +1258,7 @@ pub async fn sync_status(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), or the \
+                           `github.share_identity` is `personal`, the default with a GitHub App), or the \
                            trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
@@ -1278,7 +1332,10 @@ pub async fn sync_summary(
         domains.push(summarize_origin_domain(entry, owned));
     }
     Ok(Json(serde_json::json!({
-        "connection": aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        "connection": connection_for(
+            &identity,
+            aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        ),
         "domains": domains,
         "errors": aggregate
             .get("errors")
@@ -1476,7 +1533,7 @@ pub async fn sync_now(
     summary = "Preview what sharing this team domain would do.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Pulls the origin first, then reports the \
+                   `personal`, the default with a GitHub App). Pulls the origin first, then reports the \
                    action a share would take (`create`, `update` with the \
                    proposal number and url, `stack` with the layer it would \
                    sit on, `amend` with the layer it would land on, \
@@ -1587,7 +1644,7 @@ pub async fn sync_now(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), this \
                            instance is read-only, or the trusted-header \
                            identity names a disabled account.",
@@ -1712,7 +1769,7 @@ pub struct ShareBody {
     summary = "Share a team domain's local changes as a proposal.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Opens a pull request against the domain's \
+                   `personal`, the default with a GitHub App). Opens a pull request against the domain's \
                    origin, stacks a new layer on the chain already open, or \
                    updates the one living proposal in place. With `proposal` \
                    in the body it amends that open layer instead, rebuilding \
@@ -1823,7 +1880,7 @@ pub struct ShareBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
@@ -1923,7 +1980,7 @@ pub struct WithdrawBody {
     summary = "Withdraw one of a team domain's open proposals.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Closes the proposal's pull request, retires \
+                   `personal`, the default with a GitHub App). Closes the proposal's pull request, retires \
                    its branch and records it as withdrawn. The branch is \
                    deleted unless an open pull request is based on it or \
                    comes from it; then it is kept and the sync status \
@@ -1981,7 +2038,7 @@ pub struct WithdrawBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
@@ -2057,7 +2114,7 @@ pub async fn withdraw_proposal(
     summary = "One recorded conflict, with every side.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Reads the conflict the domain's origin state \
+                   `personal`, the default with a GitHub App). Reads the conflict the domain's origin state \
                    recorded under this id: the base and upstream sides kept \
                    beside it, plus the current local content. A side that \
                    exists but is not UTF-8 comes back null with `note` saying \
@@ -2093,7 +2150,7 @@ pub async fn withdraw_proposal(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled \
                            account.",
@@ -2172,7 +2229,7 @@ pub struct ResolveBody {
     summary = "Resolve one recorded conflict by id.",
     description = "Admin only, or an editor when this instance shares with personal \
                    GitHub identities (`github.share_identity` = \
-                   `personal`). Settles the conflict by keeping the local \
+                   `personal`, the default with a GitHub App). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
                    re-indexes the domain. Entirely local - no GitHub \
@@ -2201,7 +2258,7 @@ pub struct ResolveBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`; on a domain \
+                           `github.share_identity` is `personal`, the default with a GitHub App; on a domain \
                            GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \

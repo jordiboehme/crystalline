@@ -1600,12 +1600,111 @@ async fn github_admins_and_maintainers_manage_and_writers_write() {
     }
 }
 
+/// Personal mode opens the share role to every instance editor, and that must
+/// not open a governed domain beyond what GitHub says: an editor GitHub lists
+/// as a reader, or does not list, or who never linked, stays out of every share
+/// route there, by default and with the key set alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn personal_sharing_opens_no_governed_domain_beyond_github() {
+    for explicit in [false, true] {
+        let fx = instance(true).await;
+        if explicit {
+            fx.eng
+                .configure(&ConfigureAction::Set {
+                    key: "github.share_identity".to_string(),
+                    value: "personal".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(fx.eng.share_identity_mode().as_str(), "personal");
+        let routes = [
+            (reqwest::Method::GET, "sync/changes".to_string(), None),
+            (
+                reqwest::Method::POST,
+                "sync/share".to_string(),
+                Some(json!({})),
+            ),
+            (
+                reqwest::Method::POST,
+                "sync/proposals/999/withdraw".to_string(),
+                Some(json!({})),
+            ),
+            (
+                reqwest::Method::POST,
+                "sync/conflicts/nope/resolve".to_string(),
+                Some(json!({ "resolution": "theirs" })),
+            ),
+        ];
+        for name in ["gread", "gnone", "ueditor", "gtriage"] {
+            let session = login(fx.addr, name).await.unwrap();
+            for (method, route, body) in &routes {
+                let path = format!("/api/v1/domains/{SHARED}/{route}");
+                let (status, answer) =
+                    send(&fx, Some(&session), method.clone(), &path, body.clone()).await;
+                assert!(
+                    [403, 404].contains(&status),
+                    "{name} is kept out of {path}, explicit {explicit}: {status} {answer}"
+                );
+            }
+        }
+        // A GitHub writer and an instance admin pass the gate, and an editor
+        // still may on the domain GitHub does not govern.
+        for (name, domain) in [("gwrite", SHARED), ("root", SHARED), ("gread", PLAIN)] {
+            let session = login(fx.addr, name).await.unwrap();
+            let path = format!("/api/v1/domains/{domain}/sync/proposals/999/withdraw");
+            let (status, answer) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::POST,
+                &path,
+                Some(json!({})),
+            )
+            .await;
+            assert!(
+                ![401, 403].contains(&status),
+                "{name} passes the gate of {path}, explicit {explicit}: {status} {answer}"
+            );
+        }
+        // The listing says the same, per domain.
+        let gread = login(fx.addr, "gread").await.unwrap();
+        let (_, listing) = send(
+            &fx,
+            Some(&gread),
+            reqwest::Method::GET,
+            "/api/v1/domains",
+            None,
+        )
+        .await;
+        let row = |name: &str| {
+            listing["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in {listing}"))
+                .clone()
+        };
+        assert_eq!(row(SHARED)["may_share"], false, "{listing}");
+        assert_eq!(row(PLAIN)["may_share"], true, "{listing}");
+    }
+}
+
 /// R27: on a governed domain sharing, withdrawing and resolving a conflict
 /// follow the same right as a save. An instance viewer with GitHub write
 /// passes the role gate; a GitHub reader does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sharing_on_a_governed_domain_follows_the_write_right() {
     let fx = instance(true).await;
+    // The bot's commit below is the App opening the proposal, which an admin
+    // chooses: the default with an App is each person's own identity.
+    fx.eng
+        .configure(&ConfigureAction::Set {
+            key: "github.share_identity".to_string(),
+            value: "instance".to_string(),
+        })
+        .await
+        .unwrap();
     let root = login(fx.addr, "root").await.unwrap();
     for name in ["vwrite", "gwrite"] {
         let session = login(fx.addr, name).await.unwrap();
@@ -1643,7 +1742,7 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             );
         }
     }
-    // Decision 4, with `github.share_identity` at its default (`instance`):
+    // Decision 4, with `github.share_identity` set to `instance`:
     // the share goes out through the App, authored by the person and
     // committed by the App's bot.
     let commits = fx.forge.commits();
@@ -1655,10 +1754,21 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             "{commit}"
         );
     }
-    // The three share reads beside them: a GitHub writer passes the gate, a
-    // GitHub reader does not.
+    // The share reads beside them: a GitHub writer passes the gate, a GitHub
+    // reader does not. The report itself a reader may read, with `may_share`
+    // false.
     let vwrite = login(fx.addr, "vwrite").await.unwrap();
     let gread = login(fx.addr, "gread").await.unwrap();
+    let (status, report) = send(
+        &fx,
+        Some(&gread),
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{SHARED}/sync"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["may_share"], false, "{report}");
     for path in [
         format!("/api/v1/domains/{SHARED}/sync"),
         format!("/api/v1/domains/{SHARED}/sync/changes"),
@@ -1669,6 +1779,9 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             ![401, 403].contains(&status),
             "vwrite passes the gate of {path}: {status} {answer}"
         );
+        if path.ends_with("/sync") {
+            continue;
+        }
         let (status, answer) = send(&fx, Some(&gread), reqwest::Method::GET, &path, None).await;
         assert_eq!(status, 403, "a GitHub reader is refused {path}: {answer}");
     }
@@ -1969,14 +2082,14 @@ async fn the_listing_says_per_domain_what_the_write_and_share_routes_serve() {
                 &fx,
                 session.as_ref(),
                 reqwest::Method::GET,
-                &format!("/api/v1/domains/{d}/sync"),
+                &format!("/api/v1/domains/{d}/sync/changes"),
                 None,
             )
             .await;
             let served = ![401, 403].contains(&status);
             if row["may_share"] != json!(served) {
                 wrong.push(format!(
-                    "{who} / {d}: may_share {} but the sync route answered {status}",
+                    "{who} / {d}: may_share {} but the share gate answered {status}",
                     row["may_share"]
                 ));
             }

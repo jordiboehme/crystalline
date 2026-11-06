@@ -2200,8 +2200,8 @@ impl McpServer {
 
     /// Who a write verb over this connection acts as, when this instance
     /// shares with personal GitHub identities (`github.share_identity =
-    /// personal`). Inert in the default `instance` mode, where one credential
-    /// does everything.
+    /// personal`, the default with a GitHub App). Inert in `instance` mode,
+    /// where one credential does everything.
     ///
     /// **An authenticated session IS its account.** A stdio session is a
     /// process this machine's harness started, so it is the machine owner in
@@ -4105,7 +4105,15 @@ impl McpServer {
         // announced it, and reports what applied before it stopped.
         self.apply_settings(&p).await?;
 
-        let mut snapshot = self.engine.configure_snapshot().await.map_err(to_error)?;
+        let admin = matches!(
+            self.scope_of(&ctx),
+            Scope::Unrestricted | Scope::User { admin: true, .. }
+        );
+        let mut snapshot = self
+            .engine
+            .configure_snapshot_for(admin)
+            .await
+            .map_err(to_error)?;
         snapshot["domain_settings"] = json!(CONFIGURE_DOMAIN_HINT);
         self.ok_list(snapshot)
     }
@@ -4127,8 +4135,8 @@ impl McpServer {
         if crystalline_engine::read_limit::current().is_some() {
             return refuse(crystalline_engine::engine::UNATTENDED_LINK);
         }
-        let account = match self.scope_of(ctx) {
-            Scope::User { account, .. } => account,
+        let (account, admin) = match self.scope_of(ctx) {
+            Scope::User { account, admin } => (account, admin),
             Scope::Unrestricted => {
                 return ok(json!({
                     "connected": false,
@@ -4152,7 +4160,11 @@ impl McpServer {
             return ok(json!({
                 "connected": false,
                 "url": Value::Null,
-                "next_steps": GITHUB_LINK_NO_PUBLIC_URL,
+                "next_steps": if admin {
+                    GITHUB_LINK_NO_PUBLIC_URL
+                } else {
+                    crate::engine::LinkSetupReason::NoPublicUrl.plain_sentence()
+                },
             }));
         };
         let nonce = self.engine.mint_github_link(&account).map_err(to_error)?;
@@ -4382,7 +4394,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; while one of your proposals is open, a share that names it with proposal amends it, a share with as_proposal: true stacks on it or amends it, and after a refusal a share does that on its own; any other direct share refuses while one of your proposals is open (merge or withdraw it first); another person's open proposal does not stop your direct commit, and files that only that proposal changed stay out of your commit. Another person's proposal is never yours to amend or extend: as_proposal: true or a proposal number naming it is refused while it is open. A direct share answers branch_protected when the branch's rules do not accept your direct commits. When that answer carries fallback, it offers the same changes as a proposal: offer it to the user and call again with as_proposal: true. Without fallback (another person's proposal is open), relay its guidance as given. After such a refusal, later shares try the direct commit and fall back to a proposal on their own, and a receipt with fell_back says so; as_proposal: false tries the direct commit only. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; while one of your proposals is open, a share that names it with proposal amends it, a share with as_proposal: true stacks on it or amends it, and after a refusal a share does that on its own; any other direct share refuses while one of your proposals is open (merge or withdraw it first); another person's open proposal does not stop your direct commit, and files that only that proposal changed stay out of your commit. Another person's proposal is never yours to amend or extend: as_proposal: true or a proposal number naming it is refused while it is open. A direct share answers branch_protected when the branch's rules do not accept your direct commits. When that answer carries fallback, it offers the same changes as a proposal: offer it to the user and call again with as_proposal: true. Without fallback (another person's proposal is open), relay its guidance as given. After such a refusal, later shares try the direct commit and fall back to a proposal on their own, and a receipt with fell_back says so; as_proposal: false tries the direct commit only. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance shares with personal identities (github.share_identity personal, the default with a GitHub App), the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -4490,7 +4502,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). When the branch refused a direct commit made under the GitHub login your shares go out on, direct_refused names the branch, the forge's message and the date, and its line says that your shares now go as proposals; relay that line as given. It is null otherwise, and another person's refusal never shows here. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). When the branch refused a direct commit made under the GitHub login your shares go out on, direct_refused names the branch, the forge's message and the date, and its line says that your shares now go as proposals; relay that line as given. It is null otherwise, and another person's refusal never shows here. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -4522,7 +4534,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4595,7 +4607,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, retires its share branch and clears the proposal record from this domain's state. The branch is deleted unless an open pull request is based on it or comes from it; then it is kept, and origin_status names it under kept_branches until the next sync can delete it. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call withdraws at once, with no question to the user.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, retires its share branch and clears the proposal record from this domain's state. The branch is deleted unless an open pull request is based on it or comes from it; then it is kept, and origin_status names it under kept_branches until the next sync can delete it. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance shares with personal identities (github.share_identity personal, the default with a GitHub App), closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call withdraws at once, with no question to the user.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -5574,10 +5586,13 @@ impl ServerHandler for McpServer {
         };
         // As one MCP request: only then does the open tier act as
         // `github.agent_identity` on a domain GitHub governs.
+        let scope = self.scope_of(&context);
+        let may_change_instance = self.refuse_instance_change(&scope).is_none();
         let response = crystalline_engine::engine::as_mcp_call(
             crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context)),
         )
         .await;
+        let response = reader_response(response, &scope, may_change_instance);
         match (note, response) {
             (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
                 result.content.push(ContentBlock::text(note));
@@ -6898,6 +6913,54 @@ fn present_names(present: &[String]) -> String {
         false => present.join(", "),
     }
 }
+
+/// A tool's answer in the words of who reads it, for every tool in one place: only
+/// an admin and the machine owner read a sentence with a command line, a setting or
+/// a host. The open tier may turn GitHub on, so it still reads how.
+fn reader_response(
+    response: Result<rmcp::model::CallToolResponse, ErrorData>,
+    scope: &Scope,
+    may_change_instance: bool,
+) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+    if matches!(scope, Scope::Unrestricted | Scope::User { admin: true, .. }) {
+        return response;
+    }
+    let reword = |text: &str| -> Option<String> {
+        if may_change_instance && text == RemoteError::NotEnabled.to_string() {
+            return None;
+        }
+        crate::engine::plain_refusal_text(text)
+    };
+    match response {
+        Err(mut error) => {
+            if let Some(plain) = reword(&error.message) {
+                error.message = plain.into();
+            }
+            Err(error)
+        }
+        Ok(rmcp::model::CallToolResponse::Complete(mut result)) => {
+            for block in &mut result.content {
+                let Some(text) = block.as_text() else {
+                    continue;
+                };
+                let was = text.text.clone();
+                let mut now = reword(&was);
+                // The rename guidance names a command only the machine owner runs.
+                if !may_change_instance && was.contains(RENAME_OWNER_COMMAND) {
+                    now = Some(was.replace(RENAME_OWNER_COMMAND, ""));
+                }
+                if let Some(now) = now {
+                    *block = ContentBlock::text(now);
+                }
+            }
+            Ok(rmcp::model::CallToolResponse::Complete(result))
+        }
+        other => other,
+    }
+}
+
+/// The part of the rename guidance only the machine owner can use.
+const RENAME_OWNER_COMMAND: &str = " or with `crystalline doctor --fix`";
 
 /// A call-time refusal: the tool ran and could not do its job because a
 /// server-side condition is off.

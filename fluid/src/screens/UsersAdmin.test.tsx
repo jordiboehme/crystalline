@@ -112,6 +112,104 @@ beforeEach(() => {
 });
 
 describe("the user admin screen", () => {
+  it("ends a removed account's drafts only once the name is typed twice", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/ada/drafts": () => ({
+        account: "ada",
+        domains: [{ domain: "team", discarded: 2, left: [] }],
+      }),
+    });
+    renderApp("/users");
+    const end = await screen.findByRole("button", { name: "End these drafts" });
+    expect(end).toBeDisabled();
+
+    await user.type(screen.getByLabelText("Removed account's name"), "ada");
+    expect(end).toBeDisabled();
+    await user.type(screen.getByLabelText("Type the name again"), "adb");
+    expect(end).toBeDisabled();
+    await user.clear(screen.getByLabelText("Type the name again"));
+    await user.type(screen.getByLabelText("Type the name again"), "ada");
+    expect(end).toBeEnabled();
+    await user.click(end);
+
+    expect(await screen.findByText(/team: 2 ended/)).toBeVisible();
+    expect(
+      apiMock.mock.calls.some(
+        ([sent, init]) =>
+          sent === "/users/ada/drafts" && init?.method === "DELETE",
+      ),
+    ).toBe(true);
+  });
+
+  it("says what stayed when another instance hosts a domain or it failed half way", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/ada/drafts": () => ({
+        account: "ada",
+        domains: [
+          {
+            domain: "far",
+            discarded: 1,
+            left: [],
+            not_hosted: true,
+            where: "Another instance hosts this domain. Run this there",
+          },
+          { domain: "team", discarded: 3, left: [], error: "disk full" },
+        ],
+      }),
+    });
+    renderApp("/users");
+    await user.type(
+      await screen.findByLabelText("Removed account's name"),
+      "ada",
+    );
+    await user.type(screen.getByLabelText("Type the name again"), "ada");
+    await user.click(screen.getByRole("button", { name: "End these drafts" }));
+    const said = await screen.findByText(/team: 3 ended/);
+    expect(said).toHaveAttribute("role", "alert");
+    expect(said).toHaveTextContent("Another instance hosts this domain");
+    expect(said).toHaveTextContent("disk full");
+  });
+
+  it("does not say a name holds no drafts when its kept texts could not be read", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/gone/drafts": () => ({
+        account: "gone",
+        domains: [],
+        error: "the kept texts of domain 'team' could not be read",
+      }),
+    });
+    renderApp("/users");
+    await user.type(
+      await screen.findByLabelText("Removed account's name"),
+      "gone",
+    );
+    await user.type(screen.getByLabelText("Type the name again"), "gone");
+    await user.click(screen.getByRole("button", { name: "End these drafts" }));
+    const said = await screen.findByText(/could not be read/);
+    expect(said).toHaveAttribute("role", "alert");
+    expect(screen.queryByText(/holds no drafts/)).toBeNull();
+  });
+
+  it("shows the server's refusal for a name with an account", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/eddy/drafts": () => {
+        throw new ApiProblem(409, "conflict", "'eddy' is an account");
+      },
+    });
+    renderApp("/users");
+    await user.type(
+      await screen.findByLabelText("Removed account's name"),
+      "eddy",
+    );
+    await user.type(screen.getByLabelText("Type the name again"), "eddy");
+    await user.click(screen.getByRole("button", { name: "End these drafts" }));
+    expect(await screen.findByText("'eddy' is an account")).toBeVisible();
+  });
+
   it("sets the Reflection level beside the role, and shows curator for editors", async () => {
     serveAs("admin");
     renderApp("/users");

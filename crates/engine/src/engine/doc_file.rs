@@ -124,16 +124,22 @@ impl Engine {
     /// lock keys, so two callers that each want two of the same files take
     /// them in one order and cannot wait on each other. Two paths that name
     /// one file take its lock once. Held until the value drops.
+    ///
+    /// **The mutexes are resolved once, up front, and those are what is locked.**
+    /// While this waits for the first, a missing file can appear under another
+    /// spelling, after which a fresh lookup of the second path on a disk that
+    /// folds case answers with the first: the lock this already holds. A mutex
+    /// keeps the key it was made under, so the order between any two mutexes
+    /// never changes, however the paths resolve later.
     pub(super) async fn lock_files(&self, paths: &[&Path]) -> Vec<FileLock> {
-        let mut keyed: Vec<(String, &Path)> = paths
-            .iter()
-            .map(|abs| (super::lock_key(abs), *abs))
-            .collect();
+        let mut keyed: Vec<_> = paths.iter().map(|abs| self.keyed_write_lock(abs)).collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        keyed.dedup_by(|a, b| a.0 == b.0);
+        keyed.dedup_by(|a, b| Arc::ptr_eq(&a.1, &b.1));
         let mut locks = Vec::with_capacity(keyed.len());
-        for (_, abs) in keyed {
-            locks.push(self.lock_file(abs).await);
+        for (_, lock) in keyed {
+            locks.push(FileLock {
+                _guard: lock.lock_owned().await,
+            });
         }
         locks
     }

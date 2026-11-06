@@ -1,6 +1,270 @@
 use super::*;
 
 impl Engine {
+    /// What `account` holds in drafts, per domain, counted by name and never
+    /// read: rows, what only the journal holds so far (a sync would bring it
+    /// back), the files beside them, and the texts kept from its drafts. A
+    /// domain that does not review changes right now is asked too: its leftovers
+    /// come back if it reviews again.
+    ///
+    /// Fails rather than answers "nothing" when a place this name's drafts can
+    /// live in cannot be read, and names the domain. A folder only another
+    /// account's drafts live in is not such a place.
+    pub async fn account_drafts(&self, account: &str) -> Result<Vec<(String, u64)>> {
+        let mut held: BTreeMap<String, u64> = BTreeMap::new();
+        for domain in self.registered_domain_names() {
+            let entries = self
+                .drafts_in_domain(&domain, account)
+                .await
+                .map_err(|why| {
+                    tracing::warn!(domain = %domain, "the drafts of '{account}' could not be read: {why}");
+                    EngineError::Internal(format!(
+                        "the drafts of domain '{domain}' could not be read"
+                    ))
+                })?;
+            if entries > 0 {
+                held.insert(domain, entries);
+            }
+        }
+        for kept in self.kept_held_by(account)? {
+            *held.entry(kept.domain).or_default() += 1;
+        }
+        // A room still open over a draft saves into it when it closes, so it
+        // counts even before it has saved anything.
+        if let Some(rooms) = self.collab_rooms() {
+            for domain in rooms.draft_rooms_of(account).await {
+                held.entry(domain).or_insert(1);
+            }
+        }
+        Ok(held.into_iter().collect())
+    }
+
+    /// What `account` holds in one domain's rows, journal and files.
+    async fn drafts_in_domain(
+        &self,
+        domain: &str,
+        account: &str,
+    ) -> std::result::Result<u64, String> {
+        let rows = {
+            let store = self.store.lock().await;
+            match store.domain_id(domain).await.map_err(|e| e.to_string())? {
+                Some(id) => store
+                    .overlay_paths(id, account)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .len() as u64,
+                None => 0,
+            }
+        };
+        let state_dir = match self.journal_state_dir() {
+            Ok(state_dir) => state_dir,
+            // A process with no state directory never wrote an overlay. Only a
+            // domain that reviews changes makes that an unknown.
+            Err(_) if !self.reviews_changes(domain) => return Ok(rows),
+            Err(e) => return Err(e.to_string()),
+        };
+        let (journal, journal_unreadable) =
+            crate::overlay_journal::journal_actor_count(&state_dir, domain, account);
+        let files = crate::overlay_files::actor_entries(&state_dir, domain, account);
+        if journal_unreadable || files.unreadable {
+            return Err("its overlay folder could not be read".to_string());
+        }
+        // The journal mirrors the rows, so one draft is not two.
+        Ok(rows.max(journal) + files.entries.len() as u64)
+    }
+
+    /// An admin's explicit end of everything a removed account's name still
+    /// holds in drafts, so the name can be used again. Nothing calls this but
+    /// that admin action.
+    ///
+    /// Refuses the machine owner, whose drafts are live work, and a name with an
+    /// account, whose drafts are that person's own. The check is here so every
+    /// caller meets it.
+    ///
+    /// The line that says who asked is logged before anything goes, and one line
+    /// per domain says what finished. A domain never stops the others: one this
+    /// instance does not host is reported with `not_hosted`, and one that fails
+    /// half way is reported with `error` and what went before the failure.
+    ///
+    /// A draft open in a live editor is left and named, and then the files beside
+    /// it stay too: the room's own save would write the draft straight back. Each
+    /// row goes the way a discard takes it, so its journal entry and the links
+    /// its owner gave to others go with it. Kept texts are deleted, not set
+    /// aside, since a text set aside could still be read on this machine by name.
+    pub async fn discard_account_drafts(&self, account: &str, by: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let account = crate::auth_store::normalize_account_name(account)
+            .map_err(|e| EngineError::Invalid(format!("{e:#}")))?;
+        let account = account.as_str();
+        if account == OWNER_IDENTITY_NAME {
+            return Err(EngineError::Conflict(format!(
+                "'{account}' is the name this machine's own work is filed under, and its drafts are live work; this is for a name whose account was removed"
+            )));
+        }
+        if let Some(access) = self.domain_access.get()
+            && access
+                .account_born(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?
+                .is_some()
+        {
+            return Err(EngineError::Conflict(format!(
+                "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
+            )));
+        }
+        let kept_read = self.kept_held_by(account);
+        let kept_error = kept_read.as_ref().err().map(ToString::to_string);
+        let kept = kept_read.unwrap_or_default();
+        let mut names: BTreeSet<String> = self.registered_domain_names().into_iter().collect();
+        names.extend(kept.iter().map(|k| k.domain.clone()));
+        tracing::warn!(
+            account,
+            by,
+            domains = names.len(),
+            "an admin is ending the drafts of a removed account"
+        );
+        let mut domains = Vec::new();
+        for domain in names {
+            let own_kept: Vec<&crystalline_core::kept::KeptText> =
+                kept.iter().filter(|k| k.domain == domain).collect();
+            let registered = self.registered_domain_names().contains(domain.as_str());
+            // A read that fails is no reason to skip the domain: it may be only
+            // one folder, and the discard reports what it could not do.
+            let held = match registered {
+                true => self.drafts_in_domain(&domain, account).await,
+                false => Ok(0),
+            };
+            if matches!(held, Ok(0)) && own_kept.is_empty() {
+                continue;
+            }
+            let mut discarded = 0u64;
+            let mut left: Vec<String> = Vec::new();
+            let mut failed = self.drop_kept(&own_kept, &mut discarded).err();
+            let mut not_hosted = false;
+            if registered && !matches!(held, Ok(0)) {
+                match self
+                    .discard_in_domain(&domain, account, &mut discarded, &mut left)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) if super::fence::is_file_host_refusal(&e) => not_hosted = true,
+                    Err(e) => failed = failed.or(Some(e)),
+                }
+            }
+            tracing::warn!(
+                account,
+                by,
+                domain = %domain,
+                discarded,
+                left = left.len(),
+                not_hosted,
+                failed = failed.as_ref().map(ToString::to_string),
+                "the end of a removed account's drafts in this domain"
+            );
+            let mut row = json!({ "domain": domain, "discarded": discarded, "left": left });
+            if not_hosted {
+                row["not_hosted"] = json!(true);
+                row["where"] = json!(
+                    "Another instance hosts this domain. Run this there, or the name stays refused."
+                );
+            }
+            if let Some(e) = failed {
+                row["error"] = json!(e.to_string());
+            }
+            domains.push(row);
+        }
+        let mut report = json!({ "account": account, "domains": domains });
+        if let Some(error) = kept_error {
+            report["error"] = json!(error);
+        }
+        Ok(report)
+    }
+
+    /// Delete `kept`, counting each one as it goes.
+    fn drop_kept(
+        &self,
+        kept: &[&crystalline_core::kept::KeptText],
+        discarded: &mut u64,
+    ) -> Result<()> {
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let root = self.kept_dir().ok_or_else(|| {
+            EngineError::Internal("this process knows no state folder".to_string())
+        })?;
+        for text in kept {
+            crystalline_core::kept::remove(&root, text).map_err(|source| EngineError::Io {
+                path: text.file.display().to_string(),
+                source,
+            })?;
+            *discarded += 1;
+        }
+        Ok(())
+    }
+
+    /// One domain's half of [`Engine::discard_account_drafts`]. `discarded` and
+    /// `left` hold what happened even when this fails half way.
+    async fn discard_in_domain(
+        &self,
+        domain: &str,
+        account: &str,
+        discarded: &mut u64,
+        left: &mut Vec<String>,
+    ) -> Result<()> {
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        self.require_file_host(domain, &crate::scope::Scope::Unrestricted)
+            .await?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        };
+        if let Some(domain_id) = domain_id {
+            let paths = {
+                let store = self.store.lock().await;
+                store.overlay_paths(domain_id, account).await?
+            };
+            let view =
+                crate::domain_view::DomainView::for_actor(self, domain, &HashSet::new(), account)?;
+            for (path, _tombstone) in paths {
+                let held = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, account, &path).await?
+                };
+                let open = match (self.collab_rooms(), &held) {
+                    (Some(rooms), Some(held)) => {
+                        rooms
+                            .has_live_room(domain, &held.permalink, Some(account))
+                            .await
+                    }
+                    _ => false,
+                };
+                if open {
+                    left.push(path);
+                    continue;
+                }
+                view.drop(domain_id, &path).await?;
+                *discarded += 1;
+            }
+        }
+        // While a draft stays because it is open, its files stay beside it.
+        if !left.is_empty() {
+            return Ok(());
+        }
+        let state_dir = self.journal_state_dir()?;
+        let io = |source| EngineError::Io {
+            path: domain.to_string(),
+            source,
+        };
+        *discarded +=
+            crate::overlay_files::remove_actor(&state_dir, domain, account).map_err(io)?;
+        *discarded += crate::overlay_journal::journal_remove_actor(&state_dir, domain, account)
+            .map_err(io)?;
+        Ok(())
+    }
+
     // --- review mode -------------------------------------------------------
 
     /// The sessions this process is holding joins for. See [`crate::join`].
@@ -559,7 +823,7 @@ impl Engine {
             .iter()
             .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
             .collect();
-        if let Some(refusal) = review::collision(domain, &folding, &base) {
+        if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             return Err(EngineError::Conflict(refusal));
         }
 
@@ -649,7 +913,7 @@ impl Engine {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
         };
-        if let Some(refusal) = review::collision(domain, &folding, &base) {
+        if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             // A fold that would switch the Reflection off has closed its rooms
             // with `switched_off` already, and nothing was folded. That is
             // harmless: each of those rooms saved its text first, and its
@@ -671,7 +935,26 @@ impl Engine {
                 Some(FoldChoice::Fold) => {
                     let (mut written, mut deleted) = (0u64, 0u64);
                     if let Some(root) = &root {
-                        for draft in &held.entries {
+                        // Path order, except that a tombstone folding onto a
+                        // draft of the same actor goes first. That pair is a
+                        // case-only move, and on a disk that folds case the two
+                        // are one file: written first, the draft would then be
+                        // what the deletion removes, and neither text would be
+                        // left. Every other deletion stays where it sorts, so a
+                        // write that fails costs no more files than it must.
+                        let landing: HashSet<String> = held
+                            .entries
+                            .iter()
+                            .filter(|draft| !draft.tombstone)
+                            .map(|draft| crystalline_core::fold_path_case(&draft.path))
+                            .collect();
+                        let (first, rest): (Vec<_>, Vec<_>) =
+                            held.entries.iter().partition(|draft| {
+                                draft.tombstone
+                                    && landing
+                                        .contains(&crystalline_core::fold_path_case(&draft.path))
+                            });
+                        for draft in first.into_iter().chain(rest) {
                             let abs = join_rel(root, &draft.path);
                             if draft.tombstone {
                                 match std::fs::remove_file(&abs) {
@@ -1540,6 +1823,59 @@ impl Engine {
 /// switches the Reflection of the domain at `root` off: the MANIFEST in the
 /// folder says `reflection: on` and the one the fold leaves does not (a
 /// deleted MANIFEST says nothing, so it is off too).
+/// Whether the folder a file at `rel` would land in may treat two spellings as
+/// one name: the nearest folder that exists, since a symlink or a mount inside a
+/// domain can stand on another disk from its root.
+///
+/// Nothing is written. A name the folder lists is looked up in the other case:
+/// not there means it keeps them apart, and there without being listed means it
+/// folds. **A folder that cannot say counts as folding**, an empty one included:
+/// a wrong "folds" costs a refusal with a way out, and a wrong "keeps apart"
+/// costs somebody's text with no warning.
+pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+    let landing = join_rel(root, rel);
+    let Some(dir) = landing.ancestors().skip(1).find(|dir| dir.is_dir()) else {
+        return true;
+    };
+    if !dir.starts_with(root) {
+        return true;
+    }
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let Ok(names) = listing
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()
+    else {
+        return true;
+    };
+    let other_case = |name: &str| -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    };
+    let Some(swapped) = names
+        .iter()
+        .filter_map(|name| name.to_str())
+        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))
+    else {
+        return true;
+    };
+    if names.iter().any(|listed| listed.to_str() == Some(&swapped)) {
+        return false;
+    }
+    match dir.join(&swapped).symlink_metadata() {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 fn folds_switch_off(root: &Path, folding: &[&ActorDrafts]) -> bool {
     let landing = folding
         .iter()
@@ -1568,4 +1904,51 @@ fn folds_switch_on(root: &Path, folding: &[&ActorDrafts]) -> bool {
     !draft.tombstone
         && super::reflection::declares_on(&draft.content)
         && !super::reflection::declares_on(&before)
+}
+
+#[cfg(test)]
+mod folder_case_tests {
+    use super::folder_may_fold_case;
+
+    /// A folder that lists a name answers for itself. Nothing to compare with is
+    /// no answer, and no answer counts as folding, since a refusal beats a lost
+    /// text.
+    #[test]
+    fn a_folder_is_asked_about_itself_and_no_answer_counts_as_folding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(folder_may_fold_case(root, "new/Zed.md"), "an empty folder");
+
+        std::fs::write(root.join("Probe.md"), "x").unwrap();
+        let folds = root.join("probe.md").exists();
+        assert_eq!(folder_may_fold_case(root, "Zed.md"), folds);
+        assert_eq!(
+            folder_may_fold_case(root, "not/made/yet/Zed.md"),
+            folds,
+            "a folder not made yet lands in the nearest one that is"
+        );
+
+        std::fs::create_dir(root.join("sub")).unwrap();
+        assert!(
+            folder_may_fold_case(root, "sub/Zed.md"),
+            "the folder the file lands in, which is empty, and not the one above"
+        );
+        assert!(
+            folder_may_fold_case(&root.join("gone"), "Zed.md"),
+            "a root that is not there cannot answer"
+        );
+    }
+
+    /// A real pair of spellings is the answer "keeps apart".
+    #[test]
+    fn two_real_spellings_mean_the_folder_keeps_them_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Pair.md"), "upper").unwrap();
+        std::fs::write(tmp.path().join("pair.md"), "lower").unwrap();
+        if std::fs::read_to_string(tmp.path().join("Pair.md")).unwrap() == "lower" {
+            eprintln!("skipped: {} folds case", tmp.path().display());
+            return;
+        }
+        assert!(!folder_may_fold_case(tmp.path(), "Zed.md"));
+    }
 }
