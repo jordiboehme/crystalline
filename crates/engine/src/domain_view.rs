@@ -1289,6 +1289,35 @@ impl<'a> DomainView<'a> {
                 p.domain
             )));
         }
+        // Another spelling of a path somebody else stands at is taken too: no
+        // macOS or Windows checkout can hold the two, and on such a disk the
+        // fold would write over that file with no warning. Its own other
+        // spelling is the one that is free, since that is a rename of itself.
+        let folded = crystalline_core::fold_path_case(dest_rel);
+        let other_spelling =
+            |path: &str| path != src.path && crystalline_core::fold_path_case(path) == folded;
+        let drafted = store
+            .overlay_entries(src.domain_id, actor)
+            .await?
+            .into_iter()
+            .find(|entry| !entry.tombstone && other_spelling(&entry.path))
+            .map(|entry| entry.path);
+        let held = match drafted {
+            Some(path) => Some(path),
+            None => store
+                .list_engrams(&p.domain, None, None)
+                .await?
+                .into_iter()
+                .find(|found| other_spelling(&found.path))
+                .map(|found| found.path),
+        };
+        if let Some(held) = held {
+            return Err(EngineError::Conflict(format!(
+                "'{dest_rel}' is another spelling of '{held}', which already holds an engram in \
+                 domain '{}', and a disk that folds case cannot hold the two",
+                p.domain
+            )));
+        }
         Ok(())
     }
 
@@ -2613,7 +2642,12 @@ impl<'a> DomainView<'a> {
             };
             write_staged_file(staging.root(), rel, &content)?;
         }
-        for entry in entries {
+        // The deletions first, as a fold takes them: a case-only move is a
+        // tombstone at one spelling and a draft at the other, and on a disk that
+        // folds case a deletion taken second would remove the draft just staged.
+        // The proposal would then read as the team's file deleted.
+        let (gone, landing): (Vec<_>, Vec<_>) = entries.iter().partition(|entry| entry.tombstone);
+        for entry in gone.into_iter().chain(landing) {
             // The write verbs normalize a draft's path before it becomes a row, so
             // this is the second assertion rather than the first - and it is here
             // because a path that escaped would write outside the staged tree, which

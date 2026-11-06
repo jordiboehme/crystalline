@@ -6216,6 +6216,9 @@ impl Engine {
         }
         let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
         let addresses = pulled_addresses(&state_dir, &touched)?;
+        let base_paths: HashSet<String> = crystalline_remote::state::OriginState::load(&state_dir)?
+            .map(|state| state.files.into_keys().collect())
+            .unwrap_or_default();
 
         let mut cleared = 0u64;
         // The drafts this pass ended, announced when it ends or stops, collapsed.
@@ -6234,9 +6237,15 @@ impl Engine {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths);
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
-                match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
+                let settled = if ended.contains(entry.path.as_str()) {
+                    Settle::Clear
+                } else {
+                    settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own)
+                };
+                match settled {
                     Settle::Leave => {}
                     Settle::Clear => {
                         view.drop(domain_id, &entry.path).await?;
@@ -8761,34 +8770,34 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
     parse_engram(&source).ok()
 }
 
-/// A registered file domain's root, canonicalized. Falls back to the expanded
-/// (non-canonical) path when it no longer resolves, so a domain whose folder
-/// moved away still compares by its last-known path instead of silently
-/// dropping out of the comparison. A virtual domain has no path, so `None`.
 /// The [`Engine::write_locks`] key for a file: its canonical path wherever the
 /// filesystem can resolve one, so two spellings of one file - a symlinked
 /// domain root, a `..` segment, a case difference the filesystem folds - share
 /// a lock instead of each getting their own.
 ///
-/// A file that does not exist yet cannot be canonicalized, and a create is
-/// exactly that case, so the parent folder is resolved instead and the filename
-/// joined back on. When even the parent is missing (a create that will also
-/// make the folder) the path as given is the key: still stable, and still the
-/// same string for two creates racing on one target, since both derive it from
-/// the same registered root. The same fallback ladder
-/// [`canonicalized_file_path`] uses for a domain root, one level deeper.
+/// **One key from before the folder exists to after the file does.** A file
+/// not created yet is spelled as its nearest existing ancestor, canonicalized,
+/// with the rest appended ([`crate::rename::canonical_path`]). The key must not
+/// change while a create runs: the first writer makes the missing folders while
+/// it holds the lock, so a second writer asks for the lock in that moment, and
+/// a different key would hand it a mutex of its own. Both would then find the
+/// path free and both would write. A relative path is made absolute first, so
+/// it does not change once it can be resolved.
+///
+/// What stays as spelled is the part that does not exist yet: on a filesystem
+/// that folds case, `assets/a.png` and `assets/A.png` have two keys until one
+/// of them is created.
 fn lock_key(abs: &Path) -> String {
-    if let Ok(canonical) = std::fs::canonicalize(abs) {
-        return canonical.to_string_lossy().into_owned();
-    }
-    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name())
-        && let Ok(canonical) = std::fs::canonicalize(parent)
-    {
-        return canonical.join(name).to_string_lossy().into_owned();
-    }
-    abs.to_string_lossy().into_owned()
+    let absolute = std::path::absolute(abs);
+    crate::rename::canonical_path(absolute.as_deref().unwrap_or(abs))
+        .to_string_lossy()
+        .into_owned()
 }
 
+/// A registered file domain's root, canonicalized. Falls back to the expanded
+/// (non-canonical) path when it no longer resolves, so a domain whose folder
+/// moved away still compares by its last-known path instead of silently
+/// dropping out of the comparison. A virtual domain has no path, so `None`.
 fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
     crystalline_core::config::registration::canonical_root(entry)
 }
@@ -10325,6 +10334,50 @@ fn settle_overlay_entry(
     }
 }
 
+/// The tombstones that end with their draft: the deletion half of a case-only
+/// move whose text the base has caught up with.
+///
+/// On a disk that folds case the base copy of `plan.md` also answers to
+/// `Plan.md`, so a draft at `Plan.md` is found equal once a share has landed its
+/// text, and its row is cleared. The tombstone at `plan.md` was half of the same
+/// move, and left standing alone it says the opposite of what the person did:
+/// it hides the file from them and their next share proposes the deletion.
+///
+/// `base_paths` is what tells this from two real files: the draft's own spelling
+/// must not be in the snapshot, and the tombstone's must. On a disk that keeps
+/// `Note.md` and `note.md` apart this finds nothing.
+fn tombstones_of_settled_case_moves<'a>(
+    entries: &'a [StoredEngram],
+    state_dir: &Path,
+    base_paths: &HashSet<String>,
+) -> HashSet<&'a str> {
+    // A base copy that cannot be read settles nothing here. This look runs ahead
+    // of the pass, so failing here would stop it before it ended a single draft;
+    // the pass reaches that copy in its own turn and stops there, with what it
+    // already ended announced.
+    let mut settled = HashSet::new();
+    for draft in entries.iter().filter(|entry| !entry.tombstone) {
+        if !base_paths.contains(&draft.path)
+            && crystalline_remote::state::read_base_file(state_dir, &draft.path)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(draft.content.as_bytes())
+        {
+            settled.insert(crystalline_core::fold_path_case(&draft.path));
+        }
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.tombstone
+                && base_paths.contains(&entry.path)
+                && settled.contains(&crystalline_core::fold_path_case(&entry.path))
+        })
+        .map(|entry| entry.path.as_str())
+        .collect()
+}
+
 /// What one pull leaves one overlay FILE to be. Pure, beside
 /// [`settle_overlay_entry`] and answering the same four-way question with the
 /// two arms that cannot apply to a file left out.
@@ -10905,6 +10958,93 @@ mod lock_tests {
             Err(other) => panic!("expected a conflict, got {other}"),
             Ok(_) => panic!("a write into a name nobody registers was counted"),
         }
+    }
+
+    /// Asks for the lock of `abs` before each missing folder above it is made,
+    /// after each one and after the file itself, and wants one lock throughout.
+    /// A writer makes the folders while it holds the lock, so a second writer
+    /// asks in the middle of this, and a different answer there means two
+    /// writers each holding a lock of their own over one file.
+    async fn assert_one_lock_while_folders_appear(abs: &Path, stop: &Path) {
+        let engine = engine_with_domains(&["known"]).await;
+        let first = engine.write_lock(abs);
+        let mut missing: Vec<&Path> = abs
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != stop)
+            .collect();
+        missing.reverse();
+        assert!(missing.len() > 1, "more than one folder to make: {abs:?}");
+        for dir in missing {
+            std::fs::create_dir(dir).unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &engine.write_lock(abs)),
+                "making {dir:?} moved the lock of {abs:?}"
+            );
+        }
+        std::fs::write(abs, "x").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &engine.write_lock(abs)),
+            "writing {abs:?} moved its lock"
+        );
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 1);
+    }
+
+    /// A temp folder as the system names it, on every platform: on Windows a
+    /// canonical path carries the verbatim prefix this one lacks, and on macOS
+    /// the temp folder stands behind the `/var` link. On Linux the two spellings
+    /// are usually one, so the symlinked test below is the one that bites there.
+    #[tokio::test]
+    async fn a_lock_stays_one_lock_while_its_folders_appear() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_one_lock_while_folders_appear(&tmp.path().join("assets/a/b/x.png"), tmp.path())
+            .await;
+    }
+
+    /// The same through a symlink above the missing folders, which is the shape
+    /// that makes the raw and the canonical spelling differ on every Unix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lock_stays_one_lock_while_its_folders_appear_under_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert_one_lock_while_folders_appear(&linked.join("assets/a/b/x.png"), &linked).await;
+    }
+
+    /// A root written as a relative path resolves against the working folder
+    /// from the first ask on, so it does not move either.
+    #[tokio::test]
+    async fn a_lock_on_a_relative_path_stays_one_lock_while_its_folders_appear() {
+        let tmp = tempfile::Builder::new()
+            .prefix(".lock-key-probe")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = Path::new(tmp.path().file_name().unwrap());
+        assert_one_lock_while_folders_appear(&relative.join("assets/a/b/x.png"), relative).await;
+    }
+
+    /// Where the filesystem folds case, a folder on disk spelled differently
+    /// from the path asked for still gives one lock before and after the file
+    /// exists. Says so and returns where case does not fold.
+    #[tokio::test]
+    async fn a_lock_follows_the_folder_spelling_on_a_folding_filesystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("Assets")).unwrap();
+        if !tmp.path().join("assets").exists() {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let engine = engine_with_domains(&["known"]).await;
+        let lower = tmp.path().join("assets/x.png");
+        let upper = tmp.path().join("Assets/x.png");
+        let unborn = engine.write_lock(&lower);
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&upper)));
+        std::fs::write(&lower, "x").unwrap();
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&lower)));
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&upper)));
     }
 
     /// One lock per file, whoever asks for it.

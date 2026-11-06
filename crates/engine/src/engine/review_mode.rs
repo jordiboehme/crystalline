@@ -671,7 +671,26 @@ impl Engine {
                 Some(FoldChoice::Fold) => {
                     let (mut written, mut deleted) = (0u64, 0u64);
                     if let Some(root) = &root {
-                        for draft in &held.entries {
+                        // Path order, except that a tombstone folding onto a
+                        // draft of the same actor goes first. That pair is a
+                        // case-only move, and on a disk that folds case the two
+                        // are one file: written first, the draft would then be
+                        // what the deletion removes, and neither text would be
+                        // left. Every other deletion stays where it sorts, so a
+                        // write that fails costs no more files than it must.
+                        let landing: HashSet<String> = held
+                            .entries
+                            .iter()
+                            .filter(|draft| !draft.tombstone)
+                            .map(|draft| crystalline_core::fold_path_case(&draft.path))
+                            .collect();
+                        let (first, rest): (Vec<_>, Vec<_>) =
+                            held.entries.iter().partition(|draft| {
+                                draft.tombstone
+                                    && landing
+                                        .contains(&crystalline_core::fold_path_case(&draft.path))
+                            });
+                        for draft in first.into_iter().chain(rest) {
                             let abs = join_rel(root, &draft.path);
                             if draft.tombstone {
                                 match std::fs::remove_file(&abs) {

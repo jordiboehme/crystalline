@@ -219,24 +219,20 @@ impl Engine {
         // moves that cross each other cannot each hold what the other
         // wants. `move_within` refuses a cross-domain move outright, so
         // both paths are this actor's own drafts in this one domain. See
-        // `Engine::draft_lock`.
-        let (first, second) = match src.path.as_str() <= dest_rel {
-            true => (src.path.as_str(), dest_rel),
-            false => (dest_rel, src.path.as_str()),
+        // `Engine::draft_lock`, whose keys these are.
+        //
+        // Through `lock_files`, which compares the keys: a move onto its own
+        // path is the permalink-only rename, and on a disk that folds case
+        // `Note.md` and `note.md` are two strings with one key once the mirror
+        // exists. Either way that is one lock, taken once, since asking for
+        // it twice would wait for ever.
+        let state_dir = self.journal_state_dir()?;
+        let mirror = |path: &str| {
+            crate::overlay_journal::entry_path(&state_dir, &p.domain, who, path)
+                .map_err(|e| EngineError::Invalid(e.to_string()))
         };
-        let low = self.draft_lock(&p.domain, who, first)?;
-        let _low = low.lock().await;
-        // A move onto its own path is the permalink-only rename (the caller
-        // refused a no-op one), and its one path is taken once rather than
-        // twice: one path is one lock.
-        let high = match first == second {
-            true => None,
-            false => Some(self.draft_lock(&p.domain, who, second)?),
-        };
-        let _high = match &high {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
+        let (source, destination) = (mirror(&src.path)?, mirror(dest_rel)?);
+        let _locks = self.lock_files(&[&source, &destination]).await;
         view.move_within(p, src, src_source, dest_rel, cross, asked, mover)
             .await
     }

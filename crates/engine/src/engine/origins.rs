@@ -2271,6 +2271,11 @@ impl Engine {
             .as_ref()
             .and_then(|plan| plan.files.as_deref())
             .or(files);
+        // Read before the share, whose convergence may end these rows.
+        let unshared_spelling = match drafting.as_deref() {
+            Some(who) => self.case_only_moves(domain, who).await?,
+            None => Vec::new(),
+        };
         match ops::propose(
             share_provider,
             &spec,
@@ -2300,6 +2305,13 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
+                if !unshared_spelling.is_empty() {
+                    receipt["spelling_not_shared"] = json!(unshared_spelling);
+                    receipt["spelling_note"] = json!(
+                        "A share does not carry a change of letter case alone, on any platform: \
+                         the team's file keeps its spelling, and any new text lands there"
+                    );
+                }
                 // Only an outcome that carried something to the team carried
                 // the marker; a refusal or a diverged proposal shared nothing,
                 // and the marker it wrote into the folder is taken back.
@@ -2405,6 +2417,29 @@ impl Engine {
                 Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
             }
         }
+    }
+
+    /// One actor's case-only moves in a domain: a tombstone at one spelling and
+    /// a draft at another spelling of the same path. Sharing folds case, so
+    /// these are the moves whose new spelling a share will not carry.
+    async fn case_only_moves(&self, domain: &str, actor: &str) -> Result<Vec<Value>> {
+        let store = self.store.lock().await;
+        let Some(domain_id) = store.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        drop(store);
+        let fold = crystalline_core::fold_path_case;
+        Ok(entries
+            .iter()
+            .filter(|from| from.tombstone)
+            .filter_map(|from| {
+                entries
+                    .iter()
+                    .find(|to| !to.tombstone && fold(&to.path) == fold(&from.path))
+                    .map(|to| json!({ "from": from.path, "to": to.path }))
+            })
+            .collect())
     }
 
     /// Take the team marker a share wrote into the folder back out when the
@@ -3786,10 +3821,10 @@ impl Engine {
     /// two domains registered over one root, or over two spellings of one path,
     /// still serialize on the file itself: the key is
     /// [`canonicalize`](std::fs::canonicalize)d where the filesystem can
-    /// resolve it, which covers symlinks and `..` segments, and falls back to
-    /// the path as given for a file that does not exist yet - a create and a
-    /// save of one engram therefore share a key only once the file is there,
-    /// which is exactly when both are reading it. Taken before the store lock,
+    /// resolve it, which covers symlinks and `..` segments, and for a file that
+    /// does not exist yet is its nearest existing ancestor canonicalized with
+    /// the rest appended, so the key is the same before the folder exists, after
+    /// it does and after the file does (see `lock_key`). Taken before the store lock,
     /// always, so the two never invert; virtual domains take neither, since
     /// their compare-and-swap happens inside a single database statement.
     ///
@@ -3800,15 +3835,24 @@ impl Engine {
     /// **In-process only.** Two Crystalline processes over one domain root are
     /// not held apart by this; the host-lock machinery governs that.
     pub(crate) fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_write_lock(abs).1
+    }
+
+    /// [`Engine::write_lock`] with the key it answers to. One lookup, so a
+    /// caller that orders locks by key orders the very mutexes it will take: a
+    /// second lookup can answer differently once another spelling of a missing
+    /// file has appeared on a disk that folds case.
+    pub(super) fn keyed_write_lock(&self, abs: &Path) -> (String, Arc<tokio::sync::Mutex<()>>) {
         // Computed before the map-wide guard is taken: `canonicalize` is a
         // blocking stat, and every other file's lookup would otherwise queue
         // behind it while it resolves this one's path.
         let key = lock_key(abs);
         let mut locks = self.write_locks.lock().unwrap();
-        locks
-            .entry(key)
+        let lock = locks
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .clone();
+        (key, lock)
     }
 
     /// The one lock a draft is written under, for every verb that writes one.
