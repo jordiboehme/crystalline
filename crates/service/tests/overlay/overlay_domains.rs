@@ -7103,6 +7103,8 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         // Putting paths back the way the team has them: the direction a pull
         // goes, so it stays allowed (decision D5).
         ("engine.rs", "discard_local_changes"),
+        // An admin ending what a removed account left: the same direction.
+        ("engine.rs", "discard_account_drafts"),
         // The GitHub connection and identities.
         ("engine.rs", "connect_github_identity_token"),
         ("engine.rs", "connect_with_token"),
@@ -7168,6 +7170,10 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         // `ShareActor` resolved through `overlay_share_identity` - the caller's
         // own identity, never a name a request carried.
         ("engine.rs", "discard_into_overlay"),
+        // An admin's explicit end of the drafts a removed account left: the
+        // name comes from an admin-only route with no account under it, and it
+        // answers no reader.
+        ("engine.rs", "discard_account_drafts"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
         // A `#[cfg(test)]` unit test standing in for an open co-editing room,
@@ -9383,4 +9389,201 @@ async fn a_folder_count_follows_the_readers_drafts_at_any_depth() {
         .await
         .unwrap();
     assert_eq!(listed["total"], counts(&level), "{listed}");
+}
+
+// --- a removed account's drafts ---------------------------------------------------
+
+async fn users_call(
+    addr: std::net::SocketAddr,
+    session: &(String, String),
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut request = client
+        .request(method, format!("http://{addr}{path}"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let answer = request.send().await.unwrap();
+    let status = answer.status().as_u16();
+    let text = answer.text().await.unwrap_or_default();
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+async fn sign_in(addr: std::net::SocketAddr, name: &str) -> (String, String) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let answer = client
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({ "name": name, "password": "pw12345678" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200, "{name} signs in");
+    let cookie = answer
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| v.strip_prefix("fluid_session="))
+        .and_then(|v| v.split(';').next())
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = answer.json().await.unwrap();
+    (cookie, body["csrf"].as_str().unwrap().to_string())
+}
+
+/// Removing an account ends the links it holds and keeps its drafts. A new
+/// account under the name is refused with what to do, the way out ends the
+/// drafts and is an admin's, and a name with no drafts is made as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_accounts_drafts_stay_and_only_an_admin_ends_them() {
+    let (f, addr, auth) = served_review_instance().await;
+    for (who, role) in [
+        ("root", Role::Admin),
+        ("ada", Role::Editor),
+        ("bob", Role::Editor),
+    ] {
+        auth.add_user(who, who, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    f.draft("team", "ada", "plan.md", ALICE_DRAFT).await;
+    f.file("team", "ada", "assets/deck.png", DECK_PNG).await;
+
+    // A link bob gave and ada redeemed, and one ada gave and bob redeemed.
+    f.draft("team", "bob", "bobs.md", ALICE_NEW).await;
+    let given_to_ada = auth
+        .mint_overlay_grant("team", "bobs.md", "bob", None)
+        .await
+        .unwrap();
+    auth.redeem_overlay_grant(&given_to_ada.token, "ada")
+        .await
+        .unwrap();
+    let given_by_ada = auth
+        .mint_overlay_grant("team", "plan.md", "ada", None)
+        .await
+        .unwrap();
+    auth.redeem_overlay_grant(&given_by_ada.token, "bob")
+        .await
+        .unwrap();
+
+    let root = sign_in(addr, "root").await;
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada",
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "{answer}");
+    assert!(
+        auth.overlay_grants_of("bob", "team", "bobs.md")
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.grantee.as_deref() != Some("ada")),
+        "what ada held went"
+    );
+    assert_eq!(
+        f.engine.account_drafts("ada").await.unwrap(),
+        vec![("team".to_string(), 2)],
+        "her drafts stay, and nobody asked to end them"
+    );
+
+    // Refused, and no account stands.
+    let new = serde_json::json!({ "name": "ada", "password": "pw12345678", "role": "editor" });
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(new.clone()),
+    )
+    .await;
+    assert_eq!(status, 409, "{answer}");
+    let detail = answer["detail"].as_str().unwrap();
+    assert!(detail.contains("2 in team"), "{detail}");
+    assert!(detail.contains("users discard-drafts ada"), "{detail}");
+    assert!(auth.user("ada").await.unwrap().is_none());
+    assert_eq!(f.engine.account_drafts("ada").await.unwrap().len(), 1);
+
+    // Another name is made as before.
+    let other = serde_json::json!({ "name": "cleo", "password": "pw12345678", "role": "editor" });
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(other),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+
+    // The way out is an admin's, and not for a name with an account.
+    let bob = sign_in(addr, "bob").await;
+    let (status, _) = users_call(
+        addr,
+        &bob,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/bob/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(f.engine.account_drafts("bob").await.unwrap().len(), 1);
+
+    let (status, report) = users_call(
+        addr,
+        &root,
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada/drafts",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["domains"][0]["discarded"], 2, "{report}");
+    assert!(f.engine.account_drafts("ada").await.unwrap().is_empty());
+    assert!(
+        auth.overlay_grants_of("ada", "team", "plan.md")
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.revoked_at.is_some()),
+        "the links she gave ended with her drafts"
+    );
+    assert!(
+        overlay_journal::journal_entries(&f.state, "team")
+            .entries
+            .iter()
+            .all(|entry| entry.actor != "ada"),
+        "an index wipe does not bring them back"
+    );
+
+    // Now the name is free.
+    let (status, answer) = users_call(
+        addr,
+        &root,
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(new),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
 }

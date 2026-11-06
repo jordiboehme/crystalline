@@ -268,3 +268,81 @@ fn domain_remove_ends_the_owners_own_drafts_and_refuses_a_stranger() {
         "the operator's own draft went with the domain, unasked: {report}"
     );
 }
+
+/// `users add` refuses a name that still holds a removed account's drafts, says
+/// what to do, and `users discard-drafts` is the way out.
+#[test]
+fn users_add_refuses_a_name_with_drafts_and_discard_drafts_is_the_way_out() {
+    let fx = Fixture::new();
+    // The domain has to be in the index for a draft to be held in it.
+    fx.ok(&["sync", "--config", fx.config.to_str().unwrap()]);
+    // `users` reads the default configuration, so that is this one too.
+    let default_config = fx.home.path().join("config/crystalline/config.yaml");
+    std::fs::create_dir_all(default_config.parent().unwrap()).unwrap();
+    std::fs::copy(&fx.config, &default_config).unwrap();
+    let db = fx.home.path().join("state/crystalline/index.db");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        use crystalline_index::Store as _;
+        let store = crystalline_index::TursoStore::open(&db).await.unwrap();
+        let id = store.domain_id("team").await.unwrap().unwrap();
+        let text = "---\ntype: engram\ntitle: Left\npermalink: left\ntags:\n  - team\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Left\n\nLeft behind.\n";
+        let mut record = crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(text).unwrap(),
+            "left.md",
+            crystalline_index::FileStamp { mtime: 0, size: text.len() as u64, sha256: "0".repeat(64) },
+        );
+        record.content = text.to_string();
+        store.upsert_overlay(id, "gone-ada", &record).await.unwrap();
+    });
+    let add = |args: &mut Command| {
+        args.args([
+            "users",
+            "add",
+            "gone-ada",
+            "--role",
+            "editor",
+            "--password-stdin",
+        ])
+        .write_stdin("hunter2\n");
+    };
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    add(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("1 in team"), "{err}");
+    assert!(err.contains("users discard-drafts gone-ada"), "{err}");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    let out = cmd.args(["users", "list"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("gone-ada"));
+
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    let out = cmd
+        .args(["users", "discard-drafts", "gone-ada"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 discarded"),
+        "{out:?}"
+    );
+
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    add(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    let out = cmd
+        .args(["users", "discard-drafts", "gone-ada"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a name with an account: {out:?}");
+}

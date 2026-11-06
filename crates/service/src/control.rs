@@ -642,6 +642,36 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // happened in the process that sent this - and nothing is refused on a
         // read-only instance, since dropping a cached secret is not a mutation
         // this instance serves.
+        // The drafts a name holds, and an admin's explicit end of them: the
+        // machine owner's, so not on the remote allow list.
+        "account_drafts" => {
+            let Some(account) = req.get("account").and_then(Value::as_str) else {
+                return (
+                    envelope_err("account_drafts needs an account".to_string()),
+                    false,
+                );
+            };
+            match shared.engine.account_drafts(account).await {
+                Ok(drafts) => (envelope_ok(json!({ "drafts": drafts })), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        "discard_account_drafts" => {
+            let Some(account) = req.get("account").and_then(Value::as_str) else {
+                return (
+                    envelope_err("discard_account_drafts needs an account".to_string()),
+                    false,
+                );
+            };
+            match shared
+                .engine
+                .discard_account_drafts(account, crate::engine::OWNER_IDENTITY_NAME)
+                .await
+            {
+                Ok(report) => (envelope_ok(report), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "forget_credential" => {
             let account = match optional_account(req, "account") {
                 Ok(account) => account,

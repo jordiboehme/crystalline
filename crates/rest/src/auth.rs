@@ -607,9 +607,9 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
         // The store folds the name, so a proxy that sends `Ada` today and `ada`
         // tomorrow keeps one account, and it hands disabled accounts back like
         // any other: refusing them is this layer's job.
-        let user = state
+        let (user, created) = state
             .auth
-            .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
+            .ensure_user_created(value, Role::Viewer, state.auth_cfg.max_users)
             .await
             .map_err(|e| {
                 // The header named an identity this instance will not
@@ -623,6 +623,9 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
                     _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
+        if created {
+            super::users_api::sweep_new_account(state, &user.name, false).await?;
+        }
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
@@ -994,7 +997,10 @@ async fn provision_forwarded_user(
         )
         .await;
     match provisioned {
-        Ok(user) => Ok(user),
+        Ok(user) => {
+            super::users_api::sweep_new_account(state, &user.name, false).await?;
+            Ok(user)
+        }
         Err(err) => {
             if let Some(user) = state.auth.linked_user(PROXY_ISSUER, subject).await? {
                 return Ok(user);
@@ -1815,6 +1821,7 @@ pub async fn setup(
         // it, and the answer is the one every later caller gets.
         return Err(gone());
     }
+    super::users_api::sweep_new_account(&state, &body.name, true).await?;
     let user = super::users_api::read_back(&state, &body.name).await?;
     sign_in(&state, jar, &headers, user).await
 }
@@ -2019,7 +2026,7 @@ pub async fn logout(
                    (`needs_setup`, which is what opens `POST /auth/setup`), \
                    whether this session may drive the share surfaces \
                    (`can_share`: an admin always, an editor when \
-                   `github.share_identity` is `personal`), and \
+                   `github.share_identity` is `personal`, the default with a GitHub App), and \
                    which server version it is talking to. Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and an \

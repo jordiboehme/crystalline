@@ -65,6 +65,25 @@ fn team_marker_json() -> Value {
     json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
 }
 
+/// The refusal for a missing personal identity, in the words of who reads it: a
+/// person with a session may not be an admin, so plain words and the fix, while
+/// the machine owner and an agent identity are at a command line or have an
+/// admin behind them.
+fn refusal_for(actor: &ShareActor, e: EngineError) -> EngineError {
+    let ShareActor::Account(_) = actor else {
+        return e;
+    };
+    match &e {
+        EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_LINK_MISSING => {
+            RemoteError::Refused(PERSON_LINK_MISSING.to_string()).into()
+        }
+        EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING => {
+            RemoteError::Refused(PERSON_TOKEN_MISSING.to_string()).into()
+        }
+        _ => e,
+    }
+}
+
 impl Engine {
     // --- origin (GitHub collaboration) ----------------------------------------
 
@@ -4001,14 +4020,21 @@ impl Engine {
         // Once, here: the steps below must agree, or a personal share could
         // fall back to the instance credential when the mode moves between them.
         let effective = self.share_identity_loaded();
-        if let Some(app) = self.instance_share_app(effective)? {
+        if let Some(app) = self.instance_share_app(effective, actor)? {
             let app = self.app_share_router(app, actor, repo).await;
             let login = app.bot_login();
             return Ok((app, login));
         }
         let (api_url, token) = match self.personal_app_identity(actor, effective)? {
-            Some(name) => (self.share_api_url(), self.personal_user_token(&name).await?),
-            None => self.resolve_share_credential_in(actor, effective.mode)?,
+            Some(name) => (
+                self.share_api_url(),
+                self.personal_user_token(&name)
+                    .await
+                    .map_err(|e| refusal_for(actor, e))?,
+            ),
+            None => self
+                .resolve_share_credential_in(actor, effective.mode)
+                .map_err(|e| refusal_for(actor, e))?,
         };
         let login = token.user_display().map(str::to_string);
         Ok((
@@ -4027,7 +4053,7 @@ impl Engine {
             return Some(self.origin_provider_override_login.clone());
         }
         let effective = self.share_identity_loaded();
-        match self.instance_share_app(effective) {
+        match self.instance_share_app(effective, actor) {
             Ok(Some(app)) => return Some(app.bot_login()),
             Ok(None) => {}
             Err(_) => return None,
@@ -4105,19 +4131,24 @@ impl Engine {
     /// when `personal` is only the default: telling a person to link GitHub
     /// through an App that cannot link anybody would send them nowhere. An
     /// admin who set `personal` by name keeps the personal credential.
+    ///
+    /// A scheduled run with no account ([`ShareActor::Machine`]) is the machine's
+    /// own work: it takes the App when `personal` is only the default. An admin
+    /// who set `personal` by name gets the owner's identity there too.
     fn instance_share_app(
         &self,
         effective: EffectiveShareIdentity,
+        actor: &ShareActor,
     ) -> Result<Option<Arc<github_app::AppRouter>>> {
+        let on_the_app = effective.mode == ShareIdentityMode::Instance
+            || (*actor == ShareActor::Machine && effective.is_default());
         match self.github_app_slot() {
             github_app::AppSlot::Refused(detail)
                 if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
             {
                 Err(github_app::app_refusal(detail))
             }
-            github_app::AppSlot::Ready(router) if effective.mode == ShareIdentityMode::Instance => {
-                Ok(Some(router))
-            }
+            github_app::AppSlot::Ready(router) if on_the_app => Ok(Some(router)),
             _ => Ok(None),
         }
     }
@@ -4173,9 +4204,14 @@ impl Engine {
     /// is read live here for the same reason it is read live in
     /// [`Engine::resolve_share_provider`], one call after it, so the two agree
     /// about which credential the call in flight actually used.
+    ///
+    /// A bot is never a person to teach: a run that went through the App reads
+    /// like the instance credential it is.
     fn personal_write_login(&self, login: Option<&str>) -> Option<String> {
         match self.share_identity_loaded().mode {
-            ShareIdentityMode::Personal => login.map(str::to_string),
+            ShareIdentityMode::Personal => login
+                .filter(|login| !login.ends_with("[bot]"))
+                .map(str::to_string),
             ShareIdentityMode::Instance => None,
         }
     }
@@ -4193,7 +4229,7 @@ impl Engine {
         agent_identity: Option<String>,
     ) -> Result<String> {
         let name = match actor {
-            ShareActor::Owner => OWNER_IDENTITY_NAME.to_string(),
+            ShareActor::Owner | ShareActor::Machine => OWNER_IDENTITY_NAME.to_string(),
             ShareActor::Account(name) => name.clone(),
             ShareActor::HttpAgent => agent_identity.ok_or_else(|| {
                 EngineError::Remote(RemoteError::Refused(AGENT_IDENTITY_UNSET.to_string()))

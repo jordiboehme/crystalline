@@ -314,9 +314,16 @@ fn a_refused_share_is_in_the_recorded_run_and_the_json() {
     assert!(error.contains(refusal), "{answer}");
     assert!(error.contains("not shared"), "{answer}");
     assert!(error.contains("origin share brand"), "{answer}");
+    // The recorded run is read by anybody who may run the loop: plain words,
+    // no command line and no setting.
     let summary = answer["run"]["summary"].as_str().unwrap_or_default();
-    assert!(summary.starts_with(error), "{answer}");
-    assert!(summary.len() > error.len(), "and the run's own: {answer}");
+    assert!(
+        summary.starts_with("The changes of this run could not be shared"),
+        "{answer}"
+    );
+    assert!(!summary.contains("crystalline "), "{answer}");
+    assert!(!summary.contains("github."), "{answer}");
+    assert!(!summary.contains(refusal), "{answer}");
 }
 
 #[test]

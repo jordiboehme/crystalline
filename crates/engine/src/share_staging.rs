@@ -72,7 +72,7 @@ pub(crate) const SHARE_HEAD_MOVED: &str = "the team's copy moved while this shar
 /// whole folder going out under nobody's name.
 pub(crate) fn overlay_share_actor(actor: &ShareActor) -> EngineResult<String> {
     match actor {
-        ShareActor::Owner => Ok(OWNER_IDENTITY_NAME.to_string()),
+        ShareActor::Owner | ShareActor::Machine => Ok(OWNER_IDENTITY_NAME.to_string()),
         ShareActor::Account(account) => Ok(account.clone()),
         ShareActor::HttpAgent => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
     }

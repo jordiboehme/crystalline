@@ -235,9 +235,12 @@ pub(super) async fn run_one(
             (None, None)
         };
         // A refused share is in the recorded run, first so the summary's cap
-        // never cuts it: on a server nobody reads this run's stderr.
+        // never cuts it: on a server nobody reads this run's stderr. Anybody
+        // who may run the loop reads this, so it is one plain sentence; the
+        // reason and its fix are in `share_error` and on stderr for whoever
+        // runs this command, and `crystalline doctor` names the fix for an admin.
         let recorded_summary = match &share_error {
-            Some(error) => format!("{error}\n\n{text}"),
+            Some(_) => format!("{RUN_NOT_SHARED}\n\n{text}"),
             None => text.clone(),
         };
         let report = json!({
@@ -333,8 +336,13 @@ async fn share_changes(
     }
 }
 
-/// What a recorded run says about a share that failed: that the changes stayed
-/// here, why, and the fix for an admin. Later runs do not pick these files up,
+/// What a recorded run says about a share that failed, for everybody who may read
+/// it. No command line and no setting: those are for an admin.
+const RUN_NOT_SHARED: &str =
+    "The changes of this run could not be shared and stay on this instance. An admin can see why.";
+
+/// What the operator of a run reads about a share that failed: that the changes
+/// stayed here, why, and the fix. Later runs do not pick these files up,
 /// so the last sentence is the way they still reach the team.
 fn share_failure(domain: &str, error: &str) -> String {
     let mut text = format!("The run's changes were not shared and stay on this machine: {error}");

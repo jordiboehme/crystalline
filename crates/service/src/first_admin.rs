@@ -150,6 +150,13 @@ pub(crate) async fn seed(
     }
 }
 
+/// The admin made from the environment: the line to say, and the name, whose
+/// GitHub token left behind (if any) the caller sweeps.
+pub(crate) struct CreatedAdmin {
+    pub(crate) line: String,
+    pub(crate) name: String,
+}
+
 /// The line said when the admin was created.
 fn created_line(name: &str) -> String {
     format!("created the first admin '{name}' from the environment")
@@ -167,7 +174,7 @@ fn ignored_line(var: &str) -> String {
 /// the setup token's own open stays the only handle.
 pub(crate) async fn seed_from_environment(
     accounts: Option<&Path>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<CreatedAdmin>> {
     let var = |k: &str| std::env::var(k).ok();
     if !any_set(&var) {
         return Ok(None);
@@ -195,7 +202,10 @@ pub(crate) async fn seed_from_environment(
     let seeded = seed(&store, outcome).await;
     drop(store);
     match seeded.map_err(anyhow::Error::msg)? {
-        Seeded::Created => Ok(Some(created_line(&name))),
+        Seeded::Created => Ok(Some(CreatedAdmin {
+            line: created_line(&name),
+            name,
+        })),
         Seeded::Ignored => {
             if let Some(v) = password_variable(&var) {
                 tracing::warn!("{}", ignored_line(v));

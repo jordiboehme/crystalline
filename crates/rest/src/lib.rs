@@ -238,6 +238,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::update,
         users_api::reset_password,
         users_api::remove,
+        users_api::discard_drafts,
         github_settings::status,
         github_settings::access,
         github_settings::connect,
@@ -1108,6 +1109,7 @@ fn routes(state: RestState) -> Router {
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),
         )
+        .route("/users/{name}/drafts", delete(users_api::discard_drafts))
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].

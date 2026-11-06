@@ -87,7 +87,10 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 }
             };
             let issued = match added {
-                Ok(issued) => issued,
+                Ok(issued) => {
+                    sweep_new_account(&store, &name).await?;
+                    issued
+                }
                 Err(e) => {
                     // The store's primary key is what actually refuses a duplicate
                     // (and it is the only thing that can, without racing a second
@@ -385,6 +388,31 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 );
             }
         }
+        UsersCommand::DiscardDrafts { name } => {
+            let account = stored_name(&name);
+            if store.user(&name).await?.is_some() {
+                bail!(
+                    "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
+                );
+            }
+            let report = crystalline_service::client::discard_account_drafts(&account).await?;
+            if json {
+                println!("{report}");
+            } else {
+                let domains = report["domains"].as_array().cloned().unwrap_or_default();
+                if domains.is_empty() {
+                    println!("'{account}' holds no drafts.");
+                }
+                for row in domains {
+                    println!(
+                        "{}: {} discarded, {} left because they are open in an editor",
+                        row["domain"].as_str().unwrap_or("?"),
+                        row["discarded"],
+                        row["left"].as_array().map_or(0, Vec::len),
+                    );
+                }
+            }
+        }
         UsersCommand::Remove { name, force } => {
             if force {
                 store.remove_user_force(&name).await?;
@@ -399,6 +427,17 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 sweep_personal_credential(&name).await;
                 println!(
                     "Removed '{}' and every session it held.",
+                    stored_name(&name)
+                );
+            }
+            // The drafts stay: nothing deletes one without an admin asking.
+            if let Ok(drafts) =
+                crystalline_service::client::account_drafts(&stored_name(&name)).await
+                && !drafts.is_empty()
+            {
+                let count: u64 = drafts.iter().map(|(_, n)| n).sum();
+                println!(
+                    "It still holds {count} drafts, which stay. A new account under this name is refused until they are ended with: crystalline users discard-drafts {}",
                     stored_name(&name)
                 );
             }
@@ -436,11 +475,23 @@ async fn sweep_personal_credential(name: &str) {
         return;
     }
     let identity = crystalline_remote::TokenIdentity::Personal(account);
-    // The host the credential is filed under, from the same config the connect
-    // path reads. A config that will not load is not worth failing an account
-    // change over: github.com is where all but the Enterprise Server installs
-    // keep it anyway.
-    let host = crate::cmd::load(None)
+    let host = credential_host();
+    match crystalline_core::config::origins_state_dir() {
+        Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
+        Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
+    }
+    if let crate::cmd::DaemonNotice::Refused(e) = crate::cmd::notify_daemon_forgot(&identity).await
+    {
+        tracing::debug!("a running daemon still holds the swept credential: {e}");
+    }
+}
+
+/// The host a personal credential is filed under, from the same config the
+/// connect path reads. A config that will not load is not worth failing an
+/// account change over: github.com is where all but the Enterprise Server
+/// installs keep it anyway.
+fn credential_host() -> Option<String> {
+    crate::cmd::load(None)
         .ok()
         .and_then(|loaded| {
             loaded
@@ -451,15 +502,57 @@ async fn sweep_personal_credential(name: &str) {
         })
         .and_then(|api_url| {
             crate::cmd::bare_host(&crystalline_remote::github::auth::auth_base(Some(&api_url)))
-        });
-    match crystalline_core::config::origins_state_dir() {
-        Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
-        Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
+        })
+}
+
+/// An account was just made: a GitHub token left under its name goes before the
+/// account can act, and a running daemon is told. When the token cannot be
+/// deleted the account is taken back out, so it never stands on a token that is
+/// not its own, and adding it again sweeps again.
+async fn sweep_new_account(store: &AuthStore, name: &str) -> Result<()> {
+    let account = stored_name(name);
+    // A name that still holds a removed account's drafts is refused: the new
+    // person would inherit them, and only an admin may end them.
+    let drafts = match crystalline_service::client::account_drafts(&account).await {
+        Ok(drafts) => drafts,
+        Err(e) => {
+            store.remove_user_force(name).await?;
+            bail!(
+                "the drafts under '{account}' could not be read, so the account was not made: {e:#}"
+            );
+        }
+    };
+    if !drafts.is_empty() {
+        store.remove_user_force(name).await?;
+        let held = drafts
+            .iter()
+            .map(|(domain, entries)| format!("{entries} in {domain}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account}, and add the account again"
+        );
     }
-    if let crate::cmd::DaemonNotice::Refused(e) = crate::cmd::notify_daemon_forgot(&identity).await
-    {
-        tracing::debug!("a running daemon still holds the swept credential: {e}");
+    sweep_personal_credential(name).await;
+    if !crystalline_remote::valid_identity_name(&account) {
+        return Ok(());
     }
+    let identity = crystalline_remote::TokenIdentity::Personal(account.clone());
+    let left = crystalline_core::config::origins_state_dir()
+        .ok()
+        .and_then(|dir| {
+            let host = credential_host();
+            crystalline_remote::TokenStore::resolve_and_load_for(&identity, host.as_deref(), &dir)
+                .ok()
+        })
+        .is_some_and(|(_store, token)| token.is_some());
+    if left {
+        store.remove_user_force(name).await?;
+        bail!(
+            "a GitHub token is still saved under '{account}' and could not be deleted, so the account was not made; fix the permissions of the state directory, or unlock the keychain, and add it again"
+        );
+    }
+    Ok(())
 }
 
 /// Store the write list of an account created a moment ago, and take the

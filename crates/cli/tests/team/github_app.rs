@@ -311,6 +311,19 @@ fn doctor_and_status_say_whose_identity_shares_run_on_and_why() {
         report["github"]["share_identity_reason"],
         "default, because a GitHub App is configured"
     );
+    assert_eq!(
+        report["github"]["owner_identity_missing"],
+        Value::Null,
+        "a run goes through the App: {report}"
+    );
+    let personal = doctor_with_app(
+        &github,
+        &[("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "personal")],
+    );
+    assert_eq!(
+        personal["github"]["owner_identity_missing"], true,
+        "{personal}"
+    );
     // A key always wins.
     let report = doctor_with_app(
         &github,

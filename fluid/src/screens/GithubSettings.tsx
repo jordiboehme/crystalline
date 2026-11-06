@@ -188,6 +188,8 @@ function GithubPanel() {
       <AppSection
         app={connection?.app ?? null}
         loading={status.isPending || connection?.app?.loading === true}
+        shareIdentity={connection?.shareIdentity ?? null}
+        shareIdentityDefault={connection?.shareIdentityDefault === true}
       />
 
       {status.error && (
@@ -508,12 +510,33 @@ function ClientSecretLine({ app }: { app: GithubApp }) {
  * `app=created`; that is read once into the notice and then taken out of the
  * address, so a reload does not say it again.
  */
+/**
+ * Who opens proposals now and how to change it. This screen is admin only, so
+ * it may name the setting.
+ */
+function whoOpensProposals(
+  mode: string | null,
+  isDefault: boolean,
+): string | null {
+  if (mode === "personal") {
+    return `${isDefault ? "By default with a GitHub App, each" : "Each"} person opens proposals under their own GitHub account, linked once in their profile. To have this App open them, set github.share_identity to instance.`;
+  }
+  if (mode === "instance") {
+    return "This App opens proposals and names the person as commit author. To have each person open their own, set github.share_identity to personal.";
+  }
+  return null;
+}
+
 function AppSection({
   app,
   loading,
+  shareIdentity,
+  shareIdentityDefault,
 }: {
   app: GithubApp | null;
   loading: boolean;
+  shareIdentity: string | null;
+  shareIdentityDefault: boolean;
 }) {
   const { capabilities } = useAuth();
   const orgField = useId();
@@ -588,6 +611,11 @@ function AppSection({
             {app.source !== null && ` (${app.source})`}
           </p>
           <ClientSecretLine app={app} />
+          {whoOpensProposals(shareIdentity, shareIdentityDefault) !== null && (
+            <p className="text-sm">
+              {whoOpensProposals(shareIdentity, shareIdentityDefault)}
+            </p>
+          )}
           {app.error !== null && (
             <p
               role="alert"

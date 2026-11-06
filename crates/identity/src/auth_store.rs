@@ -1849,6 +1849,7 @@ impl AuthStore {
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
+            self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1896,6 +1897,7 @@ impl AuthStore {
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
+            self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1999,6 +2001,17 @@ impl AuthStore {
     /// racing writers, which is acceptable for a mitigation whose job is
     /// stopping *unbounded* minting, not enforcing an exact ceiling.
     pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
+        Ok(self.ensure_user_created(name, role, cap).await?.0)
+    }
+
+    /// [`AuthStore::ensure_user`], and whether this call made the account, so
+    /// the caller can do what a new account needs once.
+    pub async fn ensure_user_created(
+        &self,
+        name: &str,
+        role: Role,
+        cap: usize,
+    ) -> Result<(User, bool)> {
         let display = name.trim().to_string();
         let name = normalize_new_account_name(name)?;
         let _guard = self.guard.lock().await;
@@ -2028,7 +2041,8 @@ impl AuthStore {
                 ));
             }
         }
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO users
                      (name, display, email, role, pass_hash, disabled, created_at)
@@ -2052,13 +2066,15 @@ impl AuthStore {
             )
             .await
             .context("stamping last_seen_at")?;
-        self.query_first(
-            &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-            vec![Value::Text(name.clone())],
-        )
-        .await?
-        .map(|row| user_from_row(&row))
-        .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+        let user = self
+            .query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
+        Ok((user, inserted > 0))
     }
 
     /// The account an external provider's `(issuer, subject)` pair names, or
@@ -5390,6 +5406,20 @@ impl AuthStore {
 
     /// Delete every write-list row of one account. Inside the caller's
     /// transaction; no lock taken.
+    /// Ends every draft grant `name` holds as grantee, so an account made later
+    /// under the name opens nobody's draft. What `name` gave to others ends with
+    /// each of its drafts ([`AuthStore::end_overlay_grants`]).
+    async fn delete_overlay_grants_held_by(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM overlay_grant WHERE grantee = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the draft grants of user '{name}'"))?;
+        Ok(())
+    }
+
     async fn delete_write_list_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(

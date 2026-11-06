@@ -212,12 +212,13 @@ fn refreshes(forge: &Forge) -> Vec<String> {
     forge.refreshes.lock().unwrap().clone()
 }
 
-/// The refusal a `personal` share without an App user token gets: it names
-/// the App's way to link, never the OAuth connect.
+/// The refusal a person's `personal` share without an App user token gets: it
+/// names the link, in words, with no command line.
 fn is_personal_token_missing(e: &EngineError) -> bool {
     let text = e.to_string();
-    text.starts_with("This instance shares with personal GitHub identities through its GitHub App")
-        && text.contains("crystalline connect github --personal --as <account>")
+    text.starts_with("This instance shares with personal GitHub identities.")
+        && text.contains("Link yours in your profile")
+        && !text.contains("crystalline ")
 }
 
 #[tokio::test]

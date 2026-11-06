@@ -176,6 +176,29 @@ export default function Profile() {
  * server refuses them that route, so the card does not go and ask - it says
  * why there is nothing here for them.
  */
+/**
+ * What the card says, which follows whose name a proposal really carries. A
+ * reader who may not share is told only why the link is there; an older server
+ * names no mode and gets today's text.
+ */
+function identityCardText(
+  appConfigured: boolean,
+  sharer: boolean,
+  mode: string | null,
+): string {
+  if (appConfigured) {
+    if (!sharer) {
+      return "Link your GitHub account once so this instance knows who you are there.";
+    }
+    return mode === "instance"
+      ? "This instance opens proposals with its GitHub App. Link your GitHub account so your commits carry your name."
+      : "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name.";
+  }
+  return mode === "instance"
+    ? "Shares from this instance use its own GitHub credential. Your GitHub identity is used only if an admin turns on personal sharing."
+    : "The account your shared work is opened under. Proposals you share from this instance carry your GitHub name, so it needs write access to the repositories your team domains track.";
+}
+
 function GithubIdentityCard() {
   const { capabilities } = useAuth();
   const sharer =
@@ -214,11 +237,11 @@ function GithubIdentityCard() {
           GitHub identity
         </h2>
         <p className={`mt-1 ${MUTED}`}>
-          {app
-            ? sharer
-              ? "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name."
-              : "Link your GitHub account once so this instance knows who you are there."
-            : "The account your shared work is opened under. Proposals you share from this instance carry your GitHub name, so it needs write access to the repositories your team domains track."}
+          {identityCardText(
+            app !== null,
+            sharer,
+            link.data?.shareIdentity ?? null,
+          )}
         </p>
       </div>
       {landing && <NoticeLine notice={landing} />}

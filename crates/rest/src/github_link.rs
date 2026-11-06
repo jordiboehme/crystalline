@@ -138,10 +138,15 @@ pub struct GithubLinkResponse {
     /// its GitHub card by it.
     #[schema(example = true)]
     pub app_configured: bool,
+    /// Whose identity shares on this instance run on, the mode in effect:
+    /// `instance` or `personal`. What the profile card says follows it.
+    #[schema(example = "personal")]
+    pub share_identity: String,
 }
 
 fn view(v: GithubLinkView) -> GithubLinkResponse {
     GithubLinkResponse {
+        share_identity: v.share_identity,
         linked: v.linked,
         login: v.login,
         github_id: v.github_id,

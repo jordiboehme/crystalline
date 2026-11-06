@@ -612,6 +612,22 @@ impl Engine {
         let verification_url = start.verification_url.clone();
         let expires_in_secs = start.expires_in_secs;
         let record_slot = outcome_slot.clone();
+        // A flow with no App link saves the token with no row to refuse it, so
+        // the account is asked right before the save. The owner and an agent
+        // identity have no account to ask about, and neither has an engine with
+        // no accounts store.
+        let must_exist = match (identity, self.domain_access.get()) {
+            (TokenIdentity::Personal(name), Some(access)) if name != OWNER_IDENTITY_NAME => {
+                let agent = self
+                    .config
+                    .read()
+                    .unwrap()
+                    .github_agent_identity()
+                    .map(str::to_string);
+                (agent.as_deref() != Some(name.as_str())).then(|| (access.clone(), name.clone()))
+            }
+            _ => None,
+        };
         let task = tokio::spawn(async move {
             let result: std::result::Result<String, (&'static str, RemoteError)> = async {
                 if let Some(flow) = link {
@@ -656,6 +672,16 @@ impl Engine {
                     expires_at: None,
                     refresh_expires_at: None,
                 };
+                if let Some((access, name)) = &must_exist
+                    && matches!(access.account_contact(name).await, Ok(None))
+                {
+                    return Err((
+                        "save",
+                        RemoteError::Refused(format!(
+                            "the account '{name}' no longer exists, so this sign-in saved nothing"
+                        )),
+                    ));
+                }
                 // The save touches the OS keychain, which is a blocking call
                 // with a bound but no cancellation: off the runtime's worker
                 // it goes, so a slow keychain cannot stall unrelated work.
@@ -896,12 +922,8 @@ impl Engine {
     /// memory precisely where the instance can still write with it.
     ///
     /// The pending device-flow record for the same identity is dropped too,
-    /// exactly as [`Engine::disconnect_github_identity`] drops it. That frees
-    /// the one-flow-at-a-time slot and forgets the flow's outcome; it does not
-    /// stop the spawned exchange itself, which on a later completion still
-    /// saves its token and re-fills the cache - a residue both disconnect
-    /// paths share (see plans/backlog.md), narrow because that flow was
-    /// user-initiated moments earlier.
+    /// and for a person the spawned exchange is stopped with it, so it cannot
+    /// save a token later under a name that has changed hands.
     pub fn forget_cached_credential(&self, account: Option<&str>) -> Result<()> {
         let identity = match account {
             None => TokenIdentity::Instance,
@@ -913,6 +935,15 @@ impl Engine {
             .unwrap()
             .retain(|key, _| !key.starts_with(&prefix));
         self.forget_token_missing(&prefix);
+        // One person's flow is stopped, not only forgotten: it would save its
+        // token under a name that may belong to somebody else by then.
+        if account.is_some()
+            && let Some(flow) = self.pending_connect.lock().unwrap().as_ref()
+            && flow.identity == identity
+            && let Some(abort) = &flow.abort
+        {
+            abort.abort();
+        }
         self.clear_pending_for(&identity);
         // The CLI sends this when it removes an account, so a single-use
         // link that account still holds goes with it.
@@ -1135,6 +1166,7 @@ impl Engine {
             None => None,
         };
         Ok(GithubLinkView {
+            share_identity: self.share_identity_effective().mode.as_str().to_string(),
             linked: link.is_some(),
             login: link.as_ref().map(|l| l.login.clone()),
             github_id: link.as_ref().map(|l| l.github_id),
@@ -1306,27 +1338,67 @@ impl Engine {
     /// same in the CLI process and tells a running daemon over the control
     /// socket (`sweep_personal_credential`), without the revoke.
     pub async fn forget_removed_account(&self, account: &str) {
-        let Ok(identity) = personal_identity(account) else {
-            return;
-        };
-        let host = self.github_token_host();
-        match self.github_credential_for(&identity, host.as_deref()) {
-            Ok((_, Some(token))) => {
-                if matches!(self.github_app_slot(), super::github_app::AppSlot::Ready(_)) {
-                    self.revoke_user_token(account, &token).await;
-                }
-            }
-            Ok((_, None)) => {}
-            Err(e) => tracing::warn!("the GitHub token of {account} could not be read: {e}"),
-        }
-        if let Err(e) = self.forget_personal_token(&identity, host.as_deref()) {
+        if let Err(e) = self.sweep_account_credential(account).await {
             tracing::warn!(
-                "the GitHub token of the removed account {account} could not be deleted: {e}; an account made under that name would inherit it, so delete it by hand"
+                "the GitHub token of the removed account {account} could not be deleted: {e}; it is tried again when an account is made under that name"
             );
         }
-        if let Err(e) = self.forget_cached_credential(Some(account)) {
-            tracing::warn!("the cached GitHub token of {account} could not be dropped: {e}");
+    }
+
+    /// The sentence an admin is refused a new account with while its name still
+    /// holds drafts, or `None` when it holds none: how many, where, and what to
+    /// do. For an admin only: it names domains and a command.
+    pub async fn new_account_draft_refusal(&self, account: &str) -> Result<Option<String>> {
+        let drafts = self.account_drafts(account).await?;
+        if drafts.is_empty() {
+            return Ok(None);
         }
+        let held = drafts
+            .iter()
+            .map(|(domain, entries)| format!("{entries} in {domain}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(format!(
+            "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account} (DELETE /api/v1/users/{account}/drafts), and add the account again"
+        )))
+    }
+
+    /// An account was just made: nothing another account left under its name
+    /// may reach it, whether an earlier removal could not delete it or the
+    /// token landed afterwards. An error means a token is still there, and the
+    /// caller must not let the account act.
+    pub async fn forget_new_account_credential(&self, account: &str) -> Result<()> {
+        self.sweep_account_credential(account).await
+    }
+
+    /// What both ends of an account's life do: revoke the token when an App
+    /// can, delete it in every store it resolves to (the keychain, then the
+    /// file a keychain failure left), and drop the cache, the device flow and
+    /// the single-use link. Asks the store again at the end, so `Ok` means no
+    /// token is left. A name no credential can be addressed by never had one.
+    async fn sweep_account_credential(&self, account: &str) -> Result<()> {
+        let Ok(identity) = personal_identity(account) else {
+            return Ok(());
+        };
+        let host = self.github_token_host();
+        let dropped = self.forget_cached_credential(Some(account));
+        for _ in 0..2 {
+            let (_, token) = self.github_credential_for(&identity, host.as_deref())?;
+            let Some(token) = token else {
+                return dropped;
+            };
+            if matches!(self.github_app_slot(), super::github_app::AppSlot::Ready(_)) {
+                self.revoke_user_token(account, &token).await;
+            }
+            self.forget_personal_token(&identity, host.as_deref())?;
+        }
+        let (_, token) = self.github_credential_for(&identity, host.as_deref())?;
+        if token.is_some() {
+            return Err(EngineError::Internal(format!(
+                "a GitHub token is still saved under '{account}'"
+            )));
+        }
+        dropped
     }
 
     /// Deletes one personal token where it lives and drops its cache slot.

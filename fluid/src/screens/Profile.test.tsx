@@ -1756,6 +1756,48 @@ describe("the GitHub App link card", () => {
     });
   });
 
+  it.each([
+    [
+      "personal with an App",
+      "editor",
+      { share_identity: "personal" },
+      "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name.",
+    ],
+    [
+      "instance with an App",
+      "editor",
+      { share_identity: "instance" },
+      "This instance opens proposals with its GitHub App. Link your GitHub account so your commits carry your name.",
+    ],
+    [
+      "instance with an App, for someone who may not share",
+      "viewer",
+      { share_identity: "instance" },
+      "Link your GitHub account once so this instance knows who you are there.",
+    ],
+    [
+      "personal with no App",
+      "editor",
+      { share_identity: "personal", app_configured: false },
+      "The account your shared work is opened under. Proposals you share from this instance carry your GitHub name, so it needs write access to the repositories your team domains track.",
+    ],
+    [
+      "instance with no App",
+      "editor",
+      { share_identity: "instance", app_configured: false },
+      "Shares from this instance use its own GitHub credential. Your GitHub identity is used only if an admin turns on personal sharing.",
+    ],
+  ] as const)(
+    "says whose name a proposal carries: %s",
+    async (_label, role, link, text) => {
+      serveAs(role, { "/me/github-link": () => linkView(link) });
+      renderApp("/profile");
+      const line = await screen.findByText(text);
+      expect(line).toBeInTheDocument();
+      expect(line.textContent).not.toMatch(/crystalline |share_identity/);
+    },
+  );
+
   it("tells a viewer what linking is for", async () => {
     serveAs("viewer", { "/me/github-link": () => linkView() });
     renderApp("/profile");

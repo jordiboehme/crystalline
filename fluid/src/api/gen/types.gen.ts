@@ -769,6 +769,11 @@ export type GithubLinkResponse = {
     login?: string | null;
     pending?: GithubPendingView | null;
     /**
+     * Whose identity shares on this instance run on, the mode in effect:
+     * `instance` or `personal`. What the profile card says follows it.
+     */
+    share_identity: string;
+    /**
      * False once the user token is known to be gone (revoked, or its
      * refresh token expired). The link stays; linking again restores it.
      */
@@ -839,6 +844,16 @@ export type GithubStatusResponse = {
      */
     error?: string | null;
     pending?: GithubPendingView | null;
+    /**
+     * Whose identity shares on this instance run on, the mode in effect:
+     * `instance` or `personal`. Admin only, like this whole route.
+     */
+    share_identity: string;
+    /**
+     * Whether that mode is the default rather than the
+     * `github.share_identity` key.
+     */
+    share_identity_default: boolean;
     /**
      * keyring | file | environment; null when disconnected.
      */
@@ -6318,7 +6333,7 @@ export type GetDomainSyncStatusErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6412,7 +6427,7 @@ export type GetDomainShareChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6460,7 +6475,7 @@ export type GetDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6508,7 +6523,7 @@ export type ResolveDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6564,7 +6579,7 @@ export type WithdrawDomainProposalErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6612,7 +6627,7 @@ export type ShareDomainErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -8432,7 +8447,7 @@ export type GetSyncSummaryErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -8629,6 +8644,46 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
+
+export type DiscardUserDraftsData = {
+    body?: never;
+    path: {
+        /**
+         * The name, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/drafts';
+};
+
+export type DiscardUserDraftsErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin.
+     */
+    403: ProblemDetail;
+    /**
+     * The name has an account.
+     */
+    409: ProblemDetail;
+};
+
+export type DiscardUserDraftsError = DiscardUserDraftsErrors[keyof DiscardUserDraftsErrors];
+
+export type DiscardUserDraftsResponses = {
+    /**
+     * What went, per domain.
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type DiscardUserDraftsResponse = DiscardUserDraftsResponses[keyof DiscardUserDraftsResponses];
 
 export type UnlinkUserGithubLinkData = {
     body?: never;

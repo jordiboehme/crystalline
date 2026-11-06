@@ -248,9 +248,64 @@ pub async fn create(
         ))
         .await?
         .map_err(|e| store_error(e, &body.name))?;
+    sweep_new_account(&state, &body.name, true).await?;
     let user = read_back(&state, &body.name).await?;
     crate::readers_changed(&state);
     Ok((StatusCode::CREATED, Json(UserResponse { user })))
+}
+
+/// An account was just made, before it can act. A name that still holds the
+/// drafts of a removed account is refused: the new person would inherit them,
+/// and nothing deletes a draft without an admin asking for it. Then a GitHub
+/// token left under the name goes, whoever left it. When either fails the
+/// account is taken back out, so the next try asks again.
+///
+/// `admin_reads` says whether an admin is at the other end: the sentence with
+/// the domains and the command is theirs, and anybody else (a first sign-in
+/// through a proxy or a provider) is told to ask one.
+pub(crate) async fn sweep_new_account(
+    state: &RestState,
+    name: &str,
+    admin_reads: bool,
+) -> Result<(), ApiError> {
+    let Ok(account) = crate::auth_store::normalize_account_name(name) else {
+        return Ok(());
+    };
+    let take_back = async {
+        if let Err(undo) = state.auth.remove_user_force(&account).await {
+            tracing::warn!("the account '{account}' could not be taken back out: {undo:#}");
+        }
+    };
+    match state.engine.new_account_draft_refusal(&account).await {
+        Ok(None) => {}
+        Ok(Some(sentence)) => {
+            take_back.await;
+            tracing::warn!("{sentence}");
+            return Err(ApiError::conflict(if admin_reads {
+                sentence
+            } else {
+                "An account cannot be made under this name yet. Ask an admin of this instance."
+                    .to_string()
+            }));
+        }
+        Err(e) => {
+            take_back.await;
+            tracing::warn!("the drafts under '{account}' could not be read: {e}");
+            return Err(ApiError::internal(
+                "the drafts under this name could not be read, so the account was not made; try again",
+            ));
+        }
+    }
+    match state.engine.forget_new_account_credential(&account).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            take_back.await;
+            tracing::warn!("a GitHub token left under '{account}' could not be deleted: {e}");
+            Err(ApiError::internal(
+                "an old GitHub token is still saved under this name and could not be deleted, so the account was not made; look at this instance's log and try again",
+            ))
+        }
+    }
 }
 
 /// What `PATCH /users/{name}` takes: whichever of the four an admin wants to
@@ -617,6 +672,75 @@ pub async fn remove(
         state.engine.forget_removed_account(&account).await;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /users/{name}/drafts` - end every draft a name still holds.
+///
+/// Admin only, and never automatic: this is the way out when a removed account
+/// left drafts and its name is wanted again. Works on a name with no account,
+/// and refuses one that has an account, whose drafts are that person's own.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/users/{name}/drafts",
+    tag = "users",
+    operation_id = "discard_user_drafts",
+    summary = "End every draft a removed account left under its name.",
+    description = "Admin only. Drafts of a removed account stay until an admin \
+                   asks for this, and a new account under that name is refused \
+                   while they do. Logged with who asked. A draft open in a live \
+                   editor is left, and named under `left`. Refused for a name \
+                   with an account.",
+    params(("name" = String, Path, description = "The name, in any casing.")),
+    responses(
+        (
+            status = 200,
+            description = "What went, per domain.",
+            body = Object,
+            example = json!({
+                "account": "ada",
+                "domains": [{ "domain": "eng", "discarded": 3, "left": [] }]
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The name has an account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn discard_drafts(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    let account =
+        crate::auth_store::normalize_account_name(&name).map_err(|e| store_error(e, &name))?;
+    if state.auth.user(&account).await?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
+        )));
+    }
+    Ok(Json(
+        state
+            .engine
+            .discard_account_drafts(&account, caller.name())
+            .await?,
+    ))
 }
 
 /// `DELETE /users/{name}/github-link` - unlink another account from GitHub.

@@ -314,11 +314,13 @@ async fn a_real_share_goes_where_the_mode_says_in_every_cell() {
                 }
                 (App::Ready, true, _) => {
                     let text = answer.as_ref().expect_err(&label).to_string();
-                    assert!(text.contains("through its GitHub App"), "{label}");
+                    assert!(text.contains("Link yours in your profile"), "{label}");
+                    assert!(!text.contains("crystalline "), "no command line: {label}");
                 }
                 (_, true, _) => {
                     let text = answer.as_ref().expect_err(&label).to_string();
-                    assert!(text.contains("Connect yours in Fluid"), "{label}");
+                    assert!(text.contains("Connect yours in your profile"), "{label}");
+                    assert!(!text.contains("crystalline "), "no command line: {label}");
                 }
                 (App::Ready, false, _) => {
                     assert_eq!(answer.as_ref().unwrap()["outcome"], "proposed", "{label}");
@@ -914,4 +916,401 @@ async fn amend_and_withdraw_by_default_run_on_the_persons_token() {
     let all = writes(&fx.forge);
     assert!(all.len() > 3, "{all:?}");
     assert!(all.iter().all(|a| *a == bearer("ghu_ada")), "{all:?}");
+}
+
+// --- a token left under a name ---------------------------------------------------
+
+fn token_file(root: &Path, account: &str) -> std::path::PathBuf {
+    root.join("tokens")
+        .join(format!("github-token-personal-{account}.json"))
+}
+
+fn leave_token(root: &Path, account: &str) {
+    crystalline_remote::TokenStore::file_fallback_for(
+        &crystalline_remote::TokenIdentity::Personal(account.to_string()),
+        &root.join("tokens"),
+    )
+    .unwrap()
+    .save(&stored("ghu_left"))
+    .unwrap();
+}
+
+fn set_writable(dir: &Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(
+        dir,
+        std::fs::Permissions::from_mode(if writable { 0o755 } else { 0o555 }),
+    )
+    .unwrap();
+}
+
+async fn create_account(fx: &Case, session: &(String, String), name: &str) -> (u16, Value) {
+    rest(
+        fx,
+        Some(session),
+        reqwest::Method::POST,
+        "/api/v1/users",
+        Some(json!({ "name": name, "password": PASSWORD, "role": "editor" })),
+    )
+    .await
+}
+
+/// A token an earlier removal left behind, cached or not, is gone before a new
+/// account under that name can act.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creating_an_account_sweeps_a_token_left_under_its_name() {
+    let fx = case(App::Ready, None).await;
+    let root = login(fx.addr, "root").await.unwrap();
+    leave_token(fx.tmp.path(), "newbie");
+    // Cached, as a daemon that read it has it.
+    let before = fx.eng.github_identity_status("newbie").await.unwrap();
+    assert!(before.connected);
+    let (status, answer) = create_account(&fx, &root, "newbie").await;
+    assert_eq!(status, 201, "{answer}");
+    assert!(!token_file(fx.tmp.path(), "newbie").exists());
+    let after = fx.eng.github_identity_status("newbie").await.unwrap();
+    assert!(!after.connected, "the cache went too");
+}
+
+/// A delete that failed at the removal is made good when the name is taken
+/// again, and a delete that fails then refuses the new account, leaving none.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_delete_never_reaches_a_new_account() {
+    let fx = case(App::None, Some("personal")).await;
+    give_ada_a_token(&fx, App::None).await;
+    let root = login(fx.addr, "root").await.unwrap();
+    let tokens = fx.tmp.path().join("tokens");
+    set_writable(&tokens, false);
+    let (status, answer) = rest(
+        &fx,
+        Some(&root),
+        reqwest::Method::DELETE,
+        "/api/v1/users/ada",
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "the removal stands: {answer}");
+    assert!(
+        token_file(fx.tmp.path(), "ada").exists(),
+        "the delete failed"
+    );
+
+    let (status, answer) = create_account(&fx, &root, "ada").await;
+    set_writable(&tokens, true);
+    assert_eq!(status, 500, "{answer}");
+    assert!(
+        fx.auth.user("ada").await.unwrap().is_none(),
+        "no account stands on a token it could inherit"
+    );
+
+    let (status, answer) = create_account(&fx, &root, "ada").await;
+    assert_eq!(status, 201, "{answer}");
+    assert!(!token_file(fx.tmp.path(), "ada").exists());
+}
+
+/// A device flow still running when its account goes never saves a token: the
+/// removal stops it, and a flow nobody told refuses when it lands.
+#[tokio::test]
+async fn a_late_device_flow_saves_nothing_for_a_removed_account() {
+    use crate::support::{device_flow_start, fake_auth};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+
+    // Nobody told the engine: the account went in another process.
+    let stub = fake_auth(
+        Ok(device_flow_start()),
+        Ok("gho_late".to_string()),
+        Ok("late-gh".to_string()),
+    );
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    auth.add_user("ada", "Ada", None, Role::Editor, PASSWORD)
+        .await
+        .unwrap();
+    let eng = base_engine(tmp.path(), &url)
+        .await
+        .with_connect_auth(stub.clone());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    eng.start_github_identity_device_flow("ada", false)
+        .await
+        .unwrap();
+    auth.remove_user("ada").await.unwrap();
+    stub.run_gate.notify_one();
+    let mut error = None;
+    for _ in 0..400 {
+        error = eng.github_identity_status("ada").await.unwrap().error;
+        if error.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no longer exists"),
+        "{error:?}"
+    );
+    assert!(!token_file(tmp.path(), "ada").exists());
+
+    // Told: the flow stops, and an account made meanwhile gets nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = fake_auth(
+        Ok(device_flow_start()),
+        Ok("gho_late".to_string()),
+        Ok("late-gh".to_string()),
+    );
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    auth.add_user("ada", "Ada", None, Role::Editor, PASSWORD)
+        .await
+        .unwrap();
+    let eng = base_engine(tmp.path(), &url)
+        .await
+        .with_connect_auth(stub.clone());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    eng.start_github_identity_device_flow("ada", false)
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if stub.run_was_entered() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    auth.remove_user("ada").await.unwrap();
+    eng.forget_removed_account("ada").await;
+    auth.add_user("ada", "Another", None, Role::Editor, PASSWORD)
+        .await
+        .unwrap();
+    stub.run_gate.notify_one();
+    for _ in 0..100 {
+        if stub.run_was_abandoned() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(stub.run_was_abandoned());
+    assert!(!token_file(tmp.path(), "ada").exists());
+}
+
+/// First-run setup and a trusted proxy header make accounts too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_other_ways_to_make_an_account_sweep_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(url.clone()),
+            ..GitHubConfig::default()
+        }),
+        auth: Some(AuthConfig {
+            oauth: Some(false),
+            trusted_header: Some("x-remote-user".to_string()),
+            ..AuthConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    let config_path = tmp.path().join("config.yaml");
+    save_yaml(&config_path, &cfg).unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg,
+            None,
+            Some(config_path),
+        )
+        .with_origins_dir(tmp.path().join("origins"))
+        .with_state_dir(tmp.path().to_path_buf())
+        .with_token_store_dir(tmp.path().join("tokens"))
+        .with_env_overlay(EnvOverlay::default()),
+    );
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let router = http_router(
+        eng.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    leave_token(tmp.path(), "first");
+    let setup = client()
+        .post(format!("http://{addr}/api/v1/auth/setup"))
+        .json(&json!({ "name": "first", "password": PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert!(setup.status().is_success(), "{setup:?}");
+    assert!(!token_file(tmp.path(), "first").exists(), "setup swept");
+
+    leave_token(tmp.path(), "proxied");
+    let me = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("x-remote-user", "proxied")
+        .send()
+        .await
+        .unwrap();
+    assert!(me.status().is_success(), "{me:?}");
+    assert!(auth.user("proxied").await.unwrap().is_some());
+    assert!(!token_file(tmp.path(), "proxied").exists(), "header swept");
+    // Only the first request makes the account: a token connected afterwards
+    // is that person's own and stays.
+    leave_token(tmp.path(), "proxied");
+    client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("x-remote-user", "proxied")
+        .send()
+        .await
+        .unwrap();
+    assert!(token_file(tmp.path(), "proxied").exists());
+}
+
+// --- a scheduled run ------------------------------------------------------------
+
+/// One run on `kb` with no account, as a scheduled run on a server is: lease,
+/// a change made during the run, the share.
+async fn run_shares(fx: &Case) -> Result<Value, EngineError> {
+    use crystalline_core::automation::Loop;
+    let take = fx
+        .eng
+        .automation_lease_take(Loop::Evolve, "kb", "cron", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let token = take["token"].as_str().unwrap().to_string();
+    change(fx, "run");
+    fx.eng
+        .automation_share(Loop::Evolve, "kb", &token, "The run", &Scope::Unrestricted)
+        .await
+}
+
+fn only_the_runs_file_went_out(answer: &Value, label: &str) {
+    assert_eq!(answer["outcome"], "shared", "{label}: {answer}");
+    assert_eq!(answer["attributed"], false, "{label}: {answer}");
+}
+
+/// Who a scheduled run shares as, row by row (ruling S7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scheduled_run_shares_as_the_machine() {
+    // Key absent, App ready: through the App, with the bot as the author.
+    let fx = case(App::Ready, None).await;
+    let answer = run_shares(&fx).await.unwrap();
+    only_the_runs_file_went_out(&answer, "absent, ready");
+    let all = writes(&fx.forge);
+    assert!(!all.is_empty());
+    assert!(all.iter().all(|a| *a == bearer("ghs_test")), "{all:?}");
+    let commits = fx.forge.commits();
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    let keys: Vec<&String> = commits[0].as_object().unwrap().keys().collect();
+    assert!(
+        !keys.iter().any(|k| *k == "author" || *k == "committer"),
+        "the commit names nobody but the bot: {keys:?}"
+    );
+    let state = crystalline_remote::state::OriginState::load(&fx.tmp.path().join("origins/kb"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("crystalline-acme[bot]")
+    );
+
+    // Explicit `instance`: the App, as ever.
+    let fx = case(App::Ready, Some("instance")).await;
+    only_the_runs_file_went_out(&run_shares(&fx).await.unwrap(), "instance, ready");
+    assert!(writes(&fx.forge).iter().all(|a| *a == bearer("ghs_test")));
+
+    // Explicit `personal`, App ready: the linked owner identity or a refusal.
+    let fx = case(App::Ready, Some("personal")).await;
+    let refused = run_shares(&fx).await.unwrap_err().to_string();
+    assert!(refused.contains("through its GitHub App"), "{refused}");
+    assert!(writes(&fx.forge).is_empty());
+    let fx = case(App::Ready, Some("personal")).await;
+    fx.forge
+        .users
+        .lock()
+        .unwrap()
+        .insert("ghu_owner".to_string(), (2002, "owner-gh".to_string()));
+    leave_owner_token(fx.tmp.path());
+    only_the_runs_file_went_out(&run_shares(&fx).await.unwrap(), "personal, owner linked");
+    let all = writes(&fx.forge);
+    assert!(all.iter().all(|a| *a == bearer("ghu_owner")), "{all:?}");
+
+    // A refused App with no key: the App's own reason.
+    let fx = case(App::Refused, None).await;
+    let refused = run_shares(&fx).await.unwrap_err();
+    assert!(
+        matches!(&refused, EngineError::Remote(RemoteError::AppCredential(_))),
+        "{refused:?}"
+    );
+    assert!(writes(&fx.forge).is_empty());
+
+    // No App: the instance credential, and explicit `personal` the owner's.
+    let fx = case(App::None, None).await;
+    only_the_runs_file_went_out(&run_shares(&fx).await.unwrap(), "absent, none");
+    assert!(
+        writes(&fx.forge)
+            .iter()
+            .all(|a| *a == bearer(INSTANCE_TOKEN))
+    );
+    let fx = case(App::None, Some("personal")).await;
+    let refused = run_shares(&fx).await.unwrap_err().to_string();
+    assert!(refused.contains("connect github --personal"), "{refused}");
+    assert!(writes(&fx.forge).is_empty());
+}
+
+fn leave_owner_token(root: &Path) {
+    crystalline_remote::TokenStore::file_fallback_for(
+        &crystalline_remote::TokenIdentity::Personal("owner".to_string()),
+        &root.join("tokens"),
+    )
+    .unwrap()
+    .save(&stored("ghu_owner"))
+    .unwrap();
+}
+
+/// A person at the machine stays a person: every other way to share as the
+/// owner is refused with no owner identity, however a run would go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_at_the_machine_never_takes_the_runs_way_out() {
+    let fx = case(App::Ready, None).await;
+    let refused = fx
+        .eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("through its GitHub App"), "{refused}");
+    assert!(writes(&fx.forge).is_empty());
+    for source in [
+        include_str!("../../src/control.rs"),
+        include_str!("../../src/client.rs"),
+        include_str!("../../src/remote_ctl.rs"),
+        include_str!("../../src/mcp.rs"),
+    ] {
+        assert!(!source.contains("ShareActor::Machine"));
+    }
 }

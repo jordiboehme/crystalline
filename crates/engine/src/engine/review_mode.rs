@@ -1,6 +1,107 @@
 use super::*;
 
 impl Engine {
+    /// What `account` holds in drafts, per domain: rows and files beside them,
+    /// counted by name and never read. Fails rather than answers "nothing" when
+    /// a domain cannot be asked.
+    pub async fn account_drafts(&self, account: &str) -> Result<Vec<(String, u64)>> {
+        let names: Vec<String> = self
+            .config
+            .read()
+            .unwrap()
+            .domains
+            .keys()
+            .cloned()
+            .collect();
+        let mut out = Vec::new();
+        for name in names {
+            let counts = self.overlay_counts_by_actor(&name).await.ok_or_else(|| {
+                EngineError::Internal(format!("the drafts of domain '{name}' could not be read"))
+            })?;
+            if let Some((_, entries)) = counts.iter().find(|(actor, n)| actor == account && *n > 0)
+            {
+                out.push((name, *entries));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// An admin's explicit end of every draft a name still holds, for a removed
+    /// account whose name is wanted again. Nothing calls this but that admin
+    /// action, and it is logged with who asked. A draft open in a live editor is
+    /// left and named: the room's own save would write it straight back. Each
+    /// row goes the way a discard takes it, so its journal entry and the links
+    /// its owner gave to others go with it.
+    pub async fn discard_account_drafts(&self, account: &str, by: &str) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let mut domains = Vec::new();
+        for (domain, entries) in self.account_drafts(account).await? {
+            let lock = self.origin_lock_registered(&domain)?;
+            let _guard = lock.lock().await;
+            self.require_file_host(&domain, &crate::scope::Scope::Unrestricted)
+                .await?;
+            let domain_id = {
+                let store = self.store.lock().await;
+                store.domain_id(&domain).await?
+            };
+            let mut discarded = 0u64;
+            let mut left: Vec<String> = Vec::new();
+            if let Some(domain_id) = domain_id {
+                let paths = {
+                    let store = self.store.lock().await;
+                    store.overlay_paths(domain_id, account).await?
+                };
+                let view = crate::domain_view::DomainView::for_actor(
+                    self,
+                    &domain,
+                    &HashSet::new(),
+                    account,
+                )?;
+                for (path, _tombstone) in paths {
+                    let held = {
+                        let store = self.store.lock().await;
+                        store.overlay_entry(domain_id, account, &path).await?
+                    };
+                    let open = match (self.collab_rooms(), &held) {
+                        (Some(rooms), Some(held)) => {
+                            rooms
+                                .has_live_room(&domain, &held.permalink, Some(account))
+                                .await
+                        }
+                        _ => false,
+                    };
+                    if open {
+                        left.push(path);
+                        continue;
+                    }
+                    view.drop(domain_id, &path).await?;
+                    discarded += 1;
+                }
+            }
+            let state_dir = self.journal_state_dir()?;
+            discarded += crate::overlay_files::remove_actor(&state_dir, &domain, account).map_err(
+                |source| EngineError::Io {
+                    path: domain.clone(),
+                    source,
+                },
+            )?;
+            tracing::warn!(
+                account,
+                by,
+                domain = %domain,
+                held = entries,
+                discarded,
+                left = left.len(),
+                "an admin discarded the drafts of a removed account"
+            );
+            domains.push(json!({ "domain": domain, "discarded": discarded, "left": left }));
+        }
+        Ok(json!({ "account": account, "domains": domains }))
+    }
+
     // --- review mode -------------------------------------------------------
 
     /// The sessions this process is holding joins for. See [`crate::join`].

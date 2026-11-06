@@ -365,6 +365,47 @@ fn disabling_and_removing_an_account_forget_its_github_identity() {
     assert!(credential("ada").exists());
 }
 
+/// A token left under a name (an earlier removal whose delete failed) is gone
+/// before a new account under that name can act, and a delete that fails now
+/// leaves no account.
+#[test]
+#[cfg(unix)]
+fn adding_an_account_sweeps_a_token_left_under_its_name() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = tempfile::tempdir().unwrap();
+    let origins = home.path().join("state/crystalline/origins");
+    std::fs::create_dir_all(&origins).unwrap();
+    let credential = origins.join("github-token-personal-sweep-new.json");
+    let left = r#"{"access_token":"gho_x","host":"github.com","user":"probe","created_at":"2026-08-29T00:00:00Z"}"#;
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    std::fs::write(&credential, left).unwrap();
+    std::fs::set_permissions(&origins, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let err = users_err(
+        home.path(),
+        &["add", "sweep-new", "--role", "editor", "--password-stdin"],
+        Some("hunter2\n"),
+    );
+    std::fs::set_permissions(&origins, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(err.contains("GitHub token"), "{err}");
+    assert!(credential.exists());
+    let list = users_ok(home.path(), &["list"], None);
+    assert!(!list.contains("sweep-new"), "{list}");
+
+    users_ok(
+        home.path(),
+        &["add", "sweep-new", "--role", "editor", "--password-stdin"],
+        Some("hunter2\n"),
+    );
+    assert!(!credential.exists(), "swept");
+    let list = users_ok(home.path(), &["list"], None);
+    assert!(list.contains("sweep-new"), "{list}");
+}
+
 #[test]
 fn an_empty_list_says_so() {
     let home = tempfile::tempdir().unwrap();

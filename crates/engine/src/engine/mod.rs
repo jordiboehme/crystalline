@@ -1640,6 +1640,13 @@ pub enum ShareActor {
     /// authenticate, so the transport carries no user auth and there is nobody
     /// to be: resolved through the `github.agent_identity` setting.
     HttpAgent,
+    /// A scheduled or headless reflect or evolve run with no account: the
+    /// machine's own work, not a person's. With a usable GitHub App and no
+    /// `github.share_identity` it goes through the App, so the bot authors it.
+    /// Otherwise it is [`ShareActor::Owner`]. Only
+    /// `Engine::automation_share` takes this actor: a person at the machine (the
+    /// CLI, the control socket, stdio MCP) is a person.
+    Machine,
 }
 
 /// What a removal knows about how much knowledge is at stake.
@@ -1842,6 +1849,14 @@ const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub 
 /// `--as`; its token alone is what its shares go out on.
 const PERSONAL_LINK_MISSING: &str = "This instance shares with personal GitHub identities through its GitHub App. Link yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal --as <account>' (without --as for this machine's owner), then share again.";
 
+/// [`PERSONAL_TOKEN_MISSING`] for a person, who shares from a session and may
+/// not be an admin: plain words and the fix, no command line.
+const PERSON_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in your profile, under GitHub identity, then share again.";
+
+/// [`PERSONAL_LINK_MISSING`] for a person: plain words and the fix, no command
+/// line.
+const PERSON_LINK_MISSING: &str = "This instance shares with personal GitHub identities. Link yours in your profile, under GitHub identity, then share again.";
+
 /// The refusal an HTTP-MCP write gets when this instance shares personally and
 /// no agent identity is configured. HTTP MCP carries no user auth, so there is
 /// nobody to resolve a credential for until an admin names the account those
@@ -1907,7 +1922,13 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 /// to keep standing for both kinds of caller.
 fn is_personal_token_missing(e: &EngineError) -> bool {
     matches!(e, EngineError::Remote(RemoteError::Refused(text))
-        if text == PERSONAL_TOKEN_MISSING || text == PERSONAL_LINK_MISSING)
+        if [
+            PERSONAL_TOKEN_MISSING,
+            PERSONAL_LINK_MISSING,
+            PERSON_TOKEN_MISSING,
+            PERSON_LINK_MISSING,
+        ]
+        .contains(&text.as_str()))
 }
 
 /// Turns a write failure on a PERSONAL credential into the teaching error that
@@ -1937,7 +1958,7 @@ fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> Remote
             "your GitHub account @{login} needs write access to {repo} - ask a maintainer to add you as a collaborator."
         )),
         RemoteError::AuthExpired => RemoteError::Refused(format!(
-            "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity (Fluid profile, or 'crystalline connect github --personal')."
+            "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity in your profile, or from the command line if you share from there."
         )),
         other => other,
     }
@@ -7787,6 +7808,9 @@ pub struct GithubIdentity {
 /// whether the user token is still live, and the device flow's poll.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GithubLinkView {
+    /// Whose identity shares on this instance run on: `instance` or
+    /// `personal`, the mode in effect.
+    pub share_identity: String,
     /// Whether the account is linked.
     pub linked: bool,
     /// The GitHub login last seen for the linked id.
@@ -8922,7 +8946,7 @@ impl Drop for AudienceHold<'_> {
 fn share_actor_label(actor: &ShareActor) -> Option<String> {
     match actor {
         ShareActor::Account(name) => Some(name.clone()),
-        ShareActor::Owner | ShareActor::HttpAgent => None,
+        ShareActor::Owner | ShareActor::HttpAgent | ShareActor::Machine => None,
     }
 }
 
@@ -12382,7 +12406,7 @@ mod share_actor_tests {
         // and this slice stops being its body - so move the pattern with it.
         let body = &rest[..rest.find("\n    }").unwrap_or(rest.len())];
         assert!(
-            body.contains("self.resolve_share_credential_in(actor, effective.mode)?"),
+            body.contains(".resolve_share_credential_in(actor, effective.mode)"),
             "the provider resolves the same credential: {body}"
         );
         assert!(
@@ -12492,10 +12516,10 @@ mod share_actor_tests {
             err.to_string().contains("reconnect your GitHub identity"),
             "{err}"
         );
+        assert!(err.to_string().contains("in your profile"), "{err}");
         assert!(
-            err.to_string()
-                .contains("crystalline connect github --personal"),
-            "{err}"
+            !err.to_string().contains("crystalline "),
+            "a person may not be an admin: {err}"
         );
     }
 

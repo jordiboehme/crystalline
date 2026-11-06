@@ -68,6 +68,13 @@ pub struct GithubStatusResponse {
     /// App and where to install it, never a secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<GithubAppView>,
+    /// Whose identity shares on this instance run on, the mode in effect:
+    /// `instance` or `personal`. Admin only, like this whole route.
+    #[schema(example = "personal")]
+    pub share_identity: String,
+    /// Whether that mode is the default rather than the
+    /// `github.share_identity` key.
+    pub share_identity_default: bool,
 }
 
 /// The instance's GitHub App as the settings screen shows it.
@@ -167,7 +174,10 @@ pub struct GithubPendingView {
 }
 
 fn view(state: &RestState, c: crate::engine::GithubConnection) -> GithubStatusResponse {
+    let share_identity = state.engine.share_identity_effective();
     GithubStatusResponse {
+        share_identity: share_identity.mode.as_str().to_string(),
+        share_identity_default: share_identity.is_default(),
         app: app_view(state),
         enabled: c.enabled,
         connected: c.connected,

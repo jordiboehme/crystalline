@@ -2155,6 +2155,54 @@ pub async fn origin_share(
         .await?)
 }
 
+/// The engine for an account question when no daemon answered, or `None` when
+/// this machine has no index to ask: nothing has been indexed, so nothing is
+/// drafted, and asking must not create one.
+async fn account_engine() -> anyhow::Result<Option<Engine>> {
+    let loaded = overlay::load(None)?;
+    let db_path = resolve_db(None)?;
+    if loaded.effective.database().backend == crystalline_core::config::DatabaseBackend::Turso
+        && !db_path.exists()
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        open_standalone_reporting(loaded, &db_path, false, None, None).await?,
+    ))
+}
+
+/// What a name holds in drafts, per domain, from the daemon when one runs.
+pub async fn account_drafts(account: &str) -> anyhow::Result<Vec<(String, u64)>> {
+    if let Some(data) =
+        ctl_routed(serde_json::json!({ "v": 1, "cmd": "account_drafts", "account": account }))
+            .await?
+    {
+        return Ok(serde_json::from_value(data["drafts"].clone())?);
+    }
+    match account_engine().await? {
+        Some(engine) => Ok(engine.account_drafts(account).await?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// An admin's explicit end of every draft a name holds, from the daemon when
+/// one runs.
+pub async fn discard_account_drafts(account: &str) -> anyhow::Result<Value> {
+    if let Some(data) = ctl_routed(
+        serde_json::json!({ "v": 1, "cmd": "discard_account_drafts", "account": account }),
+    )
+    .await?
+    {
+        return Ok(data);
+    }
+    match account_engine().await? {
+        Some(engine) => Ok(engine
+            .discard_account_drafts(account, crate::engine::OWNER_IDENTITY_NAME)
+            .await?),
+        None => Ok(serde_json::json!({ "account": account, "domains": [] })),
+    }
+}
+
 /// The control-socket request [`origin_share`] sends, built in one place so
 /// the daemon's reader (`control::share_request`) is tested against exactly
 /// these keys: a key spelled differently on one side would read as absent,

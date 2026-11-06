@@ -2085,7 +2085,10 @@ async fn resolve_oidc_identity(
         )
         .await
     {
-        Ok(user) => Ok(user),
+        Ok(user) => {
+            super::users_api::sweep_new_account(state, &user.name, false).await?;
+            Ok(user)
+        }
         Err(err) => {
             // Two first sign-ins for one subject can race: both miss the
             // lookup, one provisions and the other's link is refused. The

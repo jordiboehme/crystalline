@@ -4047,9 +4047,7 @@ async fn a_personal_share_without_a_connected_identity_teaches_the_fix() {
     let problem: serde_json::Value = refused.json().await.unwrap();
     assert_eq!(
         problem["detail"],
-        "This instance shares with personal GitHub identities. Connect yours \
-         in Fluid (profile > GitHub identity) or run 'crystalline connect \
-         github --personal', then share again."
+        "This instance shares with personal GitHub identities. Connect yours in your profile, under GitHub identity, then share again."
     );
 }
 
@@ -4158,9 +4156,7 @@ async fn a_disconnected_editor_previews_a_share_and_is_still_refused_the_share()
     let problem: serde_json::Value = refused.json().await.unwrap();
     assert_eq!(
         problem["detail"],
-        "This instance shares with personal GitHub identities. Connect yours \
-         in Fluid (profile > GitHub identity) or run 'crystalline connect \
-         github --personal', then share again."
+        "This instance shares with personal GitHub identities. Connect yours in your profile, under GitHub identity, then share again."
     );
 }
 

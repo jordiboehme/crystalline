@@ -79,7 +79,7 @@ fn loop_caller(scope: &Scope) -> ReflectionCaller {
 /// Who a run shares as.
 fn share_actor(scope: &Scope) -> ShareActor {
     match scope {
-        Scope::Unrestricted => ShareActor::Owner,
+        Scope::Unrestricted => ShareActor::Machine,
         Scope::User { account, .. } => ShareActor::Account(account.clone()),
         Scope::Anonymous | Scope::Agent { .. } => ShareActor::HttpAgent,
     }
