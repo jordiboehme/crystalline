@@ -14,11 +14,13 @@
 //! **The name is a hash of the exact path.** `note.md` and `Note.md` are two
 //! rows and two records on every disk, where a sidecar beside the mirror would
 //! be one file on a disk that folds case. The record's `path` field guards the
-//! hash: a record that does not name the asked path reads as no record.
+//! hash: a record that does not name the asked path is a broken record.
 //!
-//! **No record means unknown, the safe side.** A missing file, a file that is
-//! not a record and a record of another path all answer the same, and a caller
-//! reads that as "we cannot tell", never as "nothing changed".
+//! **Missing and broken are two answers.** A missing file is `Ok(None)`, which
+//! is an old draft or a draft from another machine, and a caller reads that as
+//! "we cannot tell". A file that is not a record, an empty one after a power loss
+//! among them, or a record of another path is an error of kind `InvalidData`. A
+//! gate refuses on it, so a corrupt record can never read as a clean new file.
 //!
 //! **The journal walk never reads one as a draft.** It keeps only `.md` and
 //! `.md.tombstone`, and a record ends in `.json`. Removing an actor or a domain
@@ -31,6 +33,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,11 @@ const STARTS_DIR: &str = ".draft-starts";
 
 /// The ending of a record's file name.
 const RECORD_SUFFIX: &str = ".json";
+
+/// How long [`save`] waits before each extra try. Short, since it can run on an
+/// async worker, but long enough for a scanner to let go of a file on Windows.
+/// The wait is outside the journal's lock, which each try takes for itself.
+const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(50)];
 
 /// Where one overlay row started.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,31 +92,30 @@ fn record_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::R
     Ok(starts_dir(state_dir, domain, actor)?.join(name))
 }
 
-/// Read one record file. A file that is not there, or is not a record, answers
-/// `None`; only a read that failed for another reason is an error.
-fn read_record(file: &Path, domain: &str, actor: &str) -> io::Result<Option<DraftStart>> {
+/// The error of a file that does not hold the record it should.
+fn broken(file: &Path, why: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the draft start record {} is broken: {why}", file.display()),
+    )
+}
+
+/// Read one record file. Only a file that is not there answers `None`; a file
+/// that is not a record is [`io::ErrorKind::InvalidData`].
+fn read_record(file: &Path) -> io::Result<Option<DraftStart>> {
     let bytes = match std::fs::read(file) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(record) => Ok(Some(record)),
-        Err(e) => {
-            tracing::warn!(
-                domain = domain,
-                actor = actor,
-                file = %file.display(),
-                "a draft start record could not be read and counts as unknown: {e}"
-            );
-            Ok(None)
-        }
-    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| broken(file, e))
 }
 
-/// The record of one row, or `None` when there is none to go by: no file,
-/// unreadable JSON (logged), or a record that names another path. All of them
-/// read as "unknown".
+/// The record of one row. `Ok(None)` means no file, and only that: broken JSON,
+/// an empty file or a record that names another path is an error of kind
+/// [`io::ErrorKind::InvalidData`], and any other failed read is an error too.
 pub fn load(
     state_dir: &Path,
     domain: &str,
@@ -116,26 +123,40 @@ pub fn load(
     path: &str,
 ) -> io::Result<Option<DraftStart>> {
     let file = record_file(state_dir, domain, actor, path)?;
-    let record = read_record(&file, domain, actor)?;
-    Ok(record.filter(|record| {
-        let same = record.path == path;
-        if !same {
-            tracing::warn!(
-                domain = domain,
-                actor = actor,
-                file = %file.display(),
-                "a draft start record names another path and counts as unknown"
-            );
+    match read_record(&file)? {
+        Some(record) if record.path != path => Err(broken(&file, "it names another path")),
+        record => Ok(record),
+    }
+}
+
+/// Run `attempt`, and on any error run it up to two more times, answering the
+/// last error.
+///
+/// Any error, because the kind says nothing: `overlay_journal::save` wraps the
+/// error so its kind is lost.
+fn with_retries(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    for wait in RETRY_WAITS {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(e) => tracing::debug!("a draft start record is tried again: {e}"),
         }
-        same
-    }))
+        std::thread::sleep(wait);
+    }
+    attempt()
 }
 
 /// Write one row's record, atomically through `overlay_journal::save`.
+///
+/// A prune in this process cannot take the folder from under it: the journal's
+/// lock holds them apart. It still tries up to three times, for the two things
+/// that lock cannot reach, because a failure here refuses a person's edit: a file
+/// a scanner holds open on Windows, where the rename answers `PermissionDenied`
+/// for a moment, and a second process pruning this actor's folder, which a
+/// one-shot command with its own `--db` or `--config` beside a daemon can be.
 pub fn save(state_dir: &Path, domain: &str, actor: &str, start: &DraftStart) -> io::Result<()> {
     let file = record_file(state_dir, domain, actor, &start.path)?;
     let bytes = serde_json::to_vec_pretty(start).map_err(io::Error::other)?;
-    crate::overlay_journal::save(&file, &bytes)
+    with_retries(|| crate::overlay_journal::save(&file, &bytes))
 }
 
 /// Drop one row's record, and any folder that leaves empty, up to and including
@@ -154,11 +175,11 @@ pub fn clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Res
 
 /// Every record one actor holds in a domain, ordered by path.
 ///
-/// This folder only, not `files/` below it, and only what [`load`] would answer:
-/// a broken record, or one whose path does not hash to its file name, is left
-/// out. A file that is not named like a record is passed over in silence, the
-/// atomic write's temporary sibling and a draft in a folder of this name among
-/// them.
+/// This folder only, not `files/` below it. A broken record, or one whose path
+/// does not hash to its file name, is an error of kind
+/// [`io::ErrorKind::InvalidData`] and not a record left out, as with [`load`]. A
+/// file not named like a record is passed over in silence, the atomic write's
+/// temporary sibling and a draft in a folder of this name among them.
 pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftStart>> {
     let dir = starts_dir(state_dir, domain, actor)?;
     let entries = match std::fs::read_dir(&dir) {
@@ -173,17 +194,13 @@ pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftS
         if !entry.file_name().to_string_lossy().ends_with(RECORD_SUFFIX) || !file.is_file() {
             continue;
         }
-        let Some(record) = read_record(&file, domain, actor)? else {
+        // A record cleared since the folder was listed is simply gone.
+        let Some(record) = read_record(&file)? else {
             continue;
         };
         match record_file(state_dir, domain, actor, &record.path) {
             Ok(expected) if expected == file => records.push(record),
-            _ => tracing::warn!(
-                domain = domain,
-                actor = actor,
-                file = %file.display(),
-                "a draft start record names another path and counts as unknown"
-            ),
+            _ => return Err(broken(&file, "its name is not the hash of its path")),
         }
     }
     // `read_dir` order is unspecified, and callers act on the order.
@@ -195,9 +212,12 @@ pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftS
 mod tests {
     use super::*;
     use crate::overlay_journal::{
-        JournalEntry, journal_actor_count, journal_counts, journal_entries, journal_remove_actor,
-        journal_write,
+        JournalEntry, journal_actor_count, journal_clear, journal_counts, journal_entries,
+        journal_remove_actor, journal_write,
     };
+
+    #[cfg(unix)]
+    const RACE_ROUNDS: usize = 3000;
 
     const DRAFT: &str =
         "---\ntype: engram\ntitle: Plan\npermalink: plan\nstatus: draft\n---\n\n# Plan\n";
@@ -377,9 +397,10 @@ mod tests {
         assert_eq!(all(state, "team", "bob").unwrap(), vec![bob]);
     }
 
-    /// Unknown is the safe side, for every way a file can fail to be a record.
+    /// A later gate refuses on any error, so a corrupt record can never read as
+    /// a clean new file. A power loss can leave an empty one.
     #[test]
-    fn broken_json_reads_as_no_record() {
+    fn broken_json_is_an_error_and_never_a_missing_record() {
         let broken: [&[u8]; 5] = [
             b"",
             b"{ not json",
@@ -394,21 +415,37 @@ mod tests {
             let good = record("good.md", "good\n");
             save(state, "team", "alice", &good).unwrap();
 
-            assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
             assert_eq!(
-                all(state, "team", "alice").unwrap(),
-                vec![good],
-                "a broken record does not hide a good one"
+                load(state, "team", "alice", "note.md").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                all(state, "team", "alice").unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "a broken record is not skipped"
             );
 
-            // And it does not stand in the way of a new one.
+            // A new record replaces it, and then all is well again.
             let fresh = record("note.md", "fresh\n");
             save(state, "team", "alice", &fresh).unwrap();
             assert_eq!(
-                load(state, "team", "alice", "note.md").unwrap(),
-                Some(fresh)
+                load(state, "team", "alice", "note.md").unwrap().as_ref(),
+                Some(&fresh)
             );
+            assert_eq!(all(state, "team", "alice").unwrap(), vec![good, fresh]);
         }
+    }
+
+    /// Only a file that is not there is an answer of "no record".
+    #[test]
+    fn a_missing_record_is_none() {
+        let tmp = dir();
+        let state = tmp.path();
+        assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
+        assert_eq!(all(state, "team", "alice").unwrap(), Vec::new());
+
+        save(state, "team", "alice", &record("other.md", "text\n")).unwrap();
+        assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
     }
 
     #[test]
@@ -468,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn a_record_of_another_path_reads_as_no_record() {
+    fn a_record_of_another_path_is_an_error() {
         let tmp = dir();
         let state = tmp.path();
         plant(
@@ -477,12 +514,194 @@ mod tests {
             &serde_json::to_vec(&record("a.md", "a\n")).unwrap(),
         );
 
-        assert_eq!(load(state, "team", "alice", "b.md").unwrap(), None);
         assert_eq!(
-            all(state, "team", "alice").unwrap(),
-            Vec::new(),
-            "all answers only what load would answer"
+            load(state, "team", "alice", "b.md").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
+        assert_eq!(
+            all(state, "team", "alice").unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "the name does not hash from the path it holds"
+        );
+    }
+
+    /// A record whose name is the hash of its own path is still broken if no row
+    /// could stand at that path.
+    #[test]
+    fn a_record_of_a_path_the_journal_refuses_is_an_error_to_all() {
+        let tmp = dir();
+        let state = tmp.path();
+        let path = "../up.md";
+        let starts = starts_dir(state, "team", "alice").unwrap();
+        std::fs::create_dir_all(&starts).unwrap();
+        std::fs::write(
+            starts.join(format!("{}{RECORD_SUFFIX}", sha256_hex(path.as_bytes()))),
+            serde_json::to_vec(&record(path, "text\n")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            all(state, "team", "alice").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn a_failed_try_is_tried_again() {
+        let mut tries = 0;
+        let got = with_retries(|| {
+            tries += 1;
+            if tries < 3 {
+                Err(io::Error::other("the folder went away"))
+            } else {
+                Ok(())
+            }
+        });
+        got.unwrap();
+        assert_eq!(tries, 3, "two extra tries");
+    }
+
+    #[test]
+    fn a_good_try_is_not_repeated() {
+        let mut tries = 0;
+        with_retries(|| {
+            tries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tries, 1);
+    }
+
+    #[test]
+    fn three_failed_tries_answer_the_last_error() {
+        let mut tries = 0;
+        let error = with_retries(|| {
+            tries += 1;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("try {tries}"),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(tries, 3, "the retry is bounded");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "try 3");
+    }
+
+    /// A save that can never land still says so: a folder stands where the file
+    /// has to go.
+    #[test]
+    fn a_save_that_cannot_land_is_an_error() {
+        let tmp = dir();
+        let state = tmp.path();
+        let start = record("note.md", "text\n");
+        let file = record_file(state, "team", "alice", "note.md").unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+
+        save(state, "team", "alice", &start).unwrap_err();
+    }
+
+    /// Run `other` in a hot loop on a second thread while `round` runs
+    /// [`RACE_ROUNDS`] times on this one, and answer the rounds that failed.
+    /// Unix only: on Windows a hot loop of deletes meets its own pending deletes,
+    /// which says nothing about these races.
+    #[cfg(unix)]
+    fn failures_beside(
+        state: &Path,
+        other: impl Fn(&Path) + Send + 'static,
+        mut round: impl FnMut() -> io::Result<()>,
+    ) -> Vec<io::Error> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (state, stop) = (state.to_path_buf(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    other(&state);
+                }
+            })
+        };
+        let failed = (0..RACE_ROUNDS).filter_map(|_| round().err()).collect();
+        stop.store(true, Ordering::Relaxed);
+        thread.join().unwrap();
+        failed
+    }
+
+    /// One try of a save, with the retry in [`save`] out of the way: it must not
+    /// be what makes these tests green.
+    #[cfg(unix)]
+    fn save_one_try(state: &Path, start: &DraftStart) -> io::Result<()> {
+        let file = record_file(state, "team", "alice", &start.path).unwrap();
+        let bytes = serde_json::to_vec_pretty(start).unwrap();
+        crate::overlay_journal::save(&file, &bytes)
+    }
+
+    /// Clearing the actor's last record prunes the folders while a save of
+    /// another path is between making them and writing into them.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_is_never_hit_by_a_record_clear_pruning_the_folder() {
+        let tmp = dir();
+        let state = tmp.path();
+        let start = record("note.md", "text\n");
+        let failed = failures_beside(
+            state,
+            |state| {
+                let _ = save_one_try(state, &record("sibling.md", "text\n"));
+                let _ = clear(state, "team", "alice", "sibling.md");
+            },
+            || {
+                let saved = save_one_try(state, &start);
+                clear(state, "team", "alice", "note.md").unwrap();
+                saved
+            },
+        );
+        assert_eq!(failed.len(), 0, "{:?}", failed.first());
+    }
+
+    /// The journal prunes the actor's folder too, which `save` is making on its
+    /// way to the record's folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_is_never_hit_by_the_journal_pruning_the_actor_folder() {
+        let tmp = dir();
+        let state = tmp.path();
+        let start = record("note.md", "text\n");
+        let failed = failures_beside(
+            state,
+            |state| {
+                let _ = journal_write(state, "team", "alice", "draft.md", DRAFT);
+                let _ = journal_clear(state, "team", "alice", "draft.md");
+            },
+            || {
+                let saved = save_one_try(state, &start);
+                clear(state, "team", "alice", "note.md").unwrap();
+                saved
+            },
+        );
+        assert_eq!(failed.len(), 0, "{:?}", failed.first());
+    }
+
+    /// The other way round: a record's clear must not refuse a person's draft by
+    /// pruning the actor's folder under the journal's write.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_write_is_never_hit_by_a_record_clear_pruning_the_actor_folder() {
+        let tmp = dir();
+        let state = tmp.path();
+        let failed = failures_beside(
+            state,
+            |state| {
+                let _ = save_one_try(state, &record("sibling.md", "text\n"));
+                let _ = clear(state, "team", "alice", "sibling.md");
+            },
+            || {
+                let written = journal_write(state, "team", "alice", "draft.md", DRAFT);
+                journal_clear(state, "team", "alice", "draft.md").unwrap();
+                written
+            },
+        );
+        assert_eq!(failed.len(), 0, "{:?}", failed.first());
     }
 
     #[test]
