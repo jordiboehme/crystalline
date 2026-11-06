@@ -1659,7 +1659,8 @@ pub struct ShareOptions<'a> {
     /// Whether stacked proposals may be used at all (github.stacks config).
     pub stacks_allowed: bool,
     /// The GitHub login this share acts as, recorded on the proposal record it
-    /// creates or rewrites (see [`Proposal::author_login`]).
+    /// creates (see [`Proposal::author_login`]). An update or an amend leaves a
+    /// recorded author alone.
     ///
     /// Opaque here: the caller resolves who is sharing and hands the answer
     /// down as a string, so nothing in this crate learns what an identity is.
@@ -3906,11 +3907,11 @@ async fn update_open_proposal(
     if let Some(t) = title {
         record.title = t.to_string();
     }
-    // The credential that just rewrote the proposal is whose it is now. An
-    // unknown login leaves the recorded one standing: see
-    // [`ShareOptions::author_login`].
-    if let Some(login) = author_login {
-        record.author_login = Some(login.to_string());
+    // Whoever opened the proposal stays its author: on GitHub it is still theirs,
+    // whoever pushed last. The new commit names who made it. A record with no
+    // author yet takes this one.
+    if record.author_login.is_none() {
+        record.author_login = author_login.map(str::to_string);
     }
     state.save(state_dir)?;
 
@@ -4499,12 +4500,11 @@ async fn amend_layer(
         if let Some(t) = title {
             record.title = t.to_string();
         }
-        // The amended layer becomes the amender's: their credential rewrote
-        // it. Only this one - the layers the cascade replays below keep the
-        // author they were shared under, since a replay moves a commit onto a
-        // new parent and proposes nothing of its own.
-        if let Some(login) = author_login {
-            record.author_login = Some(login.to_string());
+        // The layer stays its author's, as a proposal an update reaches does:
+        // the amender's commit names who made it. A record with no author yet
+        // takes this one.
+        if record.author_login.is_none() {
+            record.author_login = author_login.map(str::to_string);
         }
     }
     state.save(state_dir)?;

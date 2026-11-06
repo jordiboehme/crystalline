@@ -88,7 +88,16 @@ pub(crate) fn reflection_error(e: EngineError) -> ApiError {
                 || text == REFUSED_HOMELESS
                 || text.contains(REFUSED_UNCONNECTED_TEAM) =>
         {
-            ApiError::conflict(text.clone())
+            // Worded before anybody knows who asked, so the full text, with its
+            // command line, goes to the log like `From<EngineError>` does.
+            let detail = match crate::engine::neutral_refusal_text(text) {
+                Some(plain) => {
+                    tracing::warn!("a request was refused: {text}");
+                    plain
+                }
+                None => text.clone(),
+            };
+            ApiError::conflict(detail)
         }
         // The anonymous visitor of a public domain reads and never comments:
         // logging in is what fixes it, so 401 like every other anonymous write.
@@ -1956,6 +1965,17 @@ mod tests {
             assert_eq!(e.status, StatusCode::CONFLICT, "{text}");
             assert!(e.home_url.is_none(), "{text}");
         }
+        // The hosted refusal is read in plain words: the command line is not in
+        // the answer (it goes to the log).
+        let hosted = reflection_error(EngineError::Refused(format!(
+            "{REFUSED_HOSTED_START}alpha; move it with crystalline serve --take-over"
+        )));
+        assert!(!hosted.detail.contains("take-over"), "{}", hosted.detail);
+        assert!(
+            hosted.detail.contains("An admin can move it"),
+            "{}",
+            hosted.detail
+        );
         // Any other refusal keeps the shared mapping.
         let other = reflection_error(EngineError::Refused("PACT.md is the domain's".into()));
         assert_eq!(other.status, StatusCode::UNPROCESSABLE_ENTITY);

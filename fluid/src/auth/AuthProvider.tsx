@@ -29,6 +29,7 @@ import type { ReactNode } from "react";
 import { ApiProblem, api, setCsrfToken } from "../api/client";
 import type { LoginResponse, MeResponse, SetupBody } from "../api/model";
 import { AccountDisabled } from "../components/AccountDisabled";
+import { NoAccountYet } from "../components/NoAccountYet";
 import { ServerDown } from "../components/ServerDown";
 import { AuthContext } from "./AuthContext";
 import type { AuthValue, Capabilities } from "./AuthContext";
@@ -206,6 +207,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   if (problem && !refused && me.data === undefined) {
     if (problem instanceof ApiProblem && problem.status === 403) {
       return <AccountDisabled detail={problem.detail} />;
+    }
+    // The server is fine: a first sign-in was refused until an admin acts, so
+    // trying again would not help and the words about a server down are wrong.
+    if (problem instanceof ApiProblem && problem.status === 409) {
+      return <NoAccountYet detail={problem.detail} />;
     }
     return (
       <ServerDown

@@ -6854,9 +6854,9 @@ async fn amending_the_bottom_layer_cascades_force_replays_above() {
         );
     }
 
-    // The amender's token rewrote the bottom layer, so that layer is theirs
-    // now. The layers above were replayed, not re-authored: a cascade moves a
-    // commit onto a new parent and says nothing about who proposed it.
+    // The amender's token rewrote the bottom layer, and the layer stays with who
+    // opened it, as the pull request does on the forge. The layers above were
+    // replayed: a cascade moves a commit onto a new parent.
     let authors: Vec<Option<&str>> = state
         .proposals
         .iter()
@@ -6864,8 +6864,8 @@ async fn amending_the_bottom_layer_cascades_force_replays_above() {
         .collect();
     assert_eq!(
         authors,
-        vec![Some("dave"), Some("bob"), Some("carol")],
-        "only the amended layer is re-attributed"
+        vec![Some("alice"), Some("bob"), Some("carol")],
+        "no layer changes its author"
     );
 
     // An amend changes no base ref, so the stack's membership holds and no
@@ -10787,13 +10787,66 @@ async fn a_share_with_no_login_to_name_records_none() {
     );
 }
 
+/// A record with no author yet (shared before logins were recorded, or on a
+/// credential that names nobody) takes the first login that can name itself, and
+/// keeps it after that. Both ways a share can reach an open record.
 #[tokio::test]
-async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_known() {
+async fn a_record_with_no_author_takes_the_first_login() {
+    let mock = MockProvider::new();
+    let (sub, _first) = shared_once(&mock).await;
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].author_login = None;
+    state.save(&sub.state_dir).unwrap();
+    let share = |login: &'static str, stacks: bool, proposal: Option<u64>| {
+        let (mock, sub) = (&mock, &sub);
+        async move {
+            propose(
+                mock,
+                &spec(),
+                &sub.domain_root,
+                "eng",
+                &sub.state_dir,
+                ShareOptions {
+                    proposal,
+                    stacks_allowed: stacks,
+                    author_login: Some(login),
+                    sharing: Sharing::Proposal,
+                    ..ShareOptions::default()
+                },
+            )
+            .await
+            .expect("the open proposal is updated")
+        }
+    };
+    let author = |sub: &Subscribed| load_state(&sub.state_dir).proposals[0].author_login.clone();
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    share("bob", false, None).await;
+    assert_eq!(author(&sub).as_deref(), Some("bob"));
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    share("carol", false, None).await;
+    assert_eq!(author(&sub).as_deref(), Some("bob"), "the first one stays");
+
+    // The amend's own path, on a chain.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].author_login = None;
+    state.save(&sub.state_dir).unwrap();
+    write(&sub.domain_root.join("notes/a.md"), b"amended\n");
+    updated(amend_share_as(&mock, &sub, layers[0].number, Some("dave")).await);
+    assert_eq!(author(&sub).as_deref(), Some("dave"));
+}
+
+#[tokio::test]
+async fn updating_the_living_proposal_never_changes_its_author() {
     let mock = MockProvider::new();
     let (sub, first) = shared_once(&mock).await;
     set_authors(&sub.state_dir, &[(first.number, "alice")]);
 
-    // An update by bob is bob's work on bob's credential: the record follows.
+    // An update by bob goes out on bob's credential, and the proposal stays with
+    // who opened it, as the pull request does on the forge.
     write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
     let report = updated(
         propose(
@@ -10822,7 +10875,7 @@ async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_know
         load_state(&sub.state_dir).proposals[0]
             .author_login
             .as_deref(),
-        Some("bob")
+        Some("alice")
     );
 
     // An update with no login to name leaves the recorded author alone rather
@@ -10842,7 +10895,7 @@ async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_know
         load_state(&sub.state_dir).proposals[0]
             .author_login
             .as_deref(),
-        Some("bob"),
+        Some("alice"),
         "an unknown login never overwrites a recorded one"
     );
 }

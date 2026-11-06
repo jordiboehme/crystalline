@@ -1849,6 +1849,7 @@ impl AuthStore {
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
+            self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1896,6 +1897,7 @@ impl AuthStore {
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
+            self.delete_overlay_grants_held_by(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1930,6 +1932,30 @@ impl AuthStore {
             )
             .await?
             .map(|row| user_from_row(&row)))
+    }
+
+    /// The name [`AuthStore::provision_linked_user`] would give a new account
+    /// wanting `desired` right now.
+    pub async fn free_name_from(&self, desired: &str) -> Result<String> {
+        let base = normalize_new_account_name(desired)?;
+        let _guard = self.guard.lock().await;
+        self.free_account_name(&base).await
+    }
+
+    /// When the account under `name` was made, or `None` when the name holds no
+    /// account. Accounts cannot be renamed, so this tells two accounts under one
+    /// name apart: something that began for one of them can ask, before it
+    /// writes, whether the name still holds that account.
+    pub async fn account_born(&self, name: &str) -> Result<Option<String>> {
+        let name = normalize_account_name(name)?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                "SELECT created_at FROM users WHERE name = ?1",
+                vec![Value::Text(name)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
     }
 
     /// Every account, by name. Names sort byte-wise, which is the ordering
@@ -1999,6 +2025,17 @@ impl AuthStore {
     /// racing writers, which is acceptable for a mitigation whose job is
     /// stopping *unbounded* minting, not enforcing an exact ceiling.
     pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
+        Ok(self.ensure_user_created(name, role, cap).await?.0)
+    }
+
+    /// [`AuthStore::ensure_user`], and whether this call made the account, so
+    /// the caller can do what a new account needs once.
+    pub async fn ensure_user_created(
+        &self,
+        name: &str,
+        role: Role,
+        cap: usize,
+    ) -> Result<(User, bool)> {
         let display = name.trim().to_string();
         let name = normalize_new_account_name(name)?;
         let _guard = self.guard.lock().await;
@@ -2028,7 +2065,8 @@ impl AuthStore {
                 ));
             }
         }
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO users
                      (name, display, email, role, pass_hash, disabled, created_at)
@@ -2052,13 +2090,15 @@ impl AuthStore {
             )
             .await
             .context("stamping last_seen_at")?;
-        self.query_first(
-            &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-            vec![Value::Text(name.clone())],
-        )
-        .await?
-        .map(|row| user_from_row(&row))
-        .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+        let user = self
+            .query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
+        Ok((user, inserted > 0))
     }
 
     /// The account an external provider's `(issuer, subject)` pair names, or
@@ -2252,6 +2292,34 @@ impl AuthStore {
         github_id: u64,
         login: &str,
     ) -> Result<GithubLink> {
+        self.link_github_inner(account, None, host, github_id, login)
+            .await
+    }
+
+    /// [`AuthStore::link_github`] for a sign-in that began earlier: refused with
+    /// [`RefusalKind::NoSuchAccount`] unless the name still holds the account
+    /// made at `born` ([`AuthStore::account_born`]). Asked inside the write's
+    /// transaction, so a link never lands on a later account under the name.
+    pub async fn link_github_if_born(
+        &self,
+        account: &str,
+        born: &str,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
+        self.link_github_inner(account, Some(born), host, github_id, login)
+            .await
+    }
+
+    async fn link_github_inner(
+        &self,
+        account: &str,
+        born: Option<&str>,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
         let account = normalize_account_name(account)?;
         let host = normalize_github_host(host)?;
         let id = i64::try_from(github_id).context("a GitHub id out of range")?;
@@ -2260,14 +2328,19 @@ impl AuthStore {
             .await
             .with_context(|| format!("linking GitHub to user '{account}'"))?;
         let result = async {
-            if self
+            let found = self
                 .query_first(
-                    "SELECT 1 FROM users WHERE name = ?1",
+                    "SELECT created_at FROM users WHERE name = ?1",
                     vec![Value::Text(account.clone())],
                 )
                 .await?
-                .is_none()
-            {
+                .and_then(|row| cell_text(&row, 0));
+            let same = match (&found, born) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(found), Some(born)) => found == born,
+            };
+            if !same {
                 return Err(refuse(
                     RefusalKind::NoSuchAccount,
                     format!("no such user: '{account}'"),
@@ -3715,6 +3788,27 @@ impl AuthStore {
                     Value::Text(domain.to_string()),
                     Value::Text(owner.clone()),
                     Value::Text(path.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("ending the draft share-links of '{owner}'"))?;
+        Ok(changed)
+    }
+
+    /// End every link `owner` gave, in every domain: a name is about to be used
+    /// again, and a link the old person gave must not open what the new person
+    /// drafts at that path.
+    pub async fn end_overlay_grants_of_owner(&self, owner: &str) -> Result<u64> {
+        let owner = normalize_account_name(owner)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE overlay_grant SET revoked_at = ?1
+                 WHERE owner = ?2 AND revoked_at IS NULL",
+                vec![
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(owner.clone()),
                 ],
             )
             .await
@@ -5386,6 +5480,20 @@ impl AuthStore {
             }
         }
         Ok((!out.is_empty()).then_some(out))
+    }
+
+    /// Ends every draft grant `name` holds as grantee, so an account made later
+    /// under the name opens nobody's draft. What `name` gave to others ends with
+    /// each of its drafts ([`AuthStore::end_overlay_grants`]).
+    async fn delete_overlay_grants_held_by(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM overlay_grant WHERE grantee = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the draft grants of user '{name}'"))?;
+        Ok(())
     }
 
     /// Delete every write-list row of one account. Inside the caller's

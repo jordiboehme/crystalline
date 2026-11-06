@@ -1241,6 +1241,33 @@ impl DomainAccess {
         self.auth.link_github(account, host, github_id, login).await
     }
 
+    /// End every link `owner` gave. See
+    /// [`crate::auth_store::AuthStore::end_overlay_grants_of_owner`].
+    pub async fn end_overlay_grants_of_owner(&self, owner: &str) -> Result<u64> {
+        self.auth.end_overlay_grants_of_owner(owner).await
+    }
+
+    /// When the account under `account` was made, or `None` when the name holds
+    /// none. See [`crate::auth_store::AuthStore::account_born`].
+    pub async fn account_born(&self, account: &str) -> Result<Option<String>> {
+        self.auth.account_born(account).await
+    }
+
+    /// [`DomainAccess::link_github`] for a sign-in that began earlier. See
+    /// [`crate::auth_store::AuthStore::link_github_if_born`].
+    pub async fn link_github_if_born(
+        &self,
+        account: &str,
+        born: &str,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
+        self.auth
+            .link_github_if_born(account, born, host, github_id, login)
+            .await
+    }
+
     /// Say that the stored user token of `account` is gone (revoked or
     /// expired); the link stays. Answers whether a row was marked.
     pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {

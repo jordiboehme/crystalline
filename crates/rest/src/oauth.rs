@@ -1986,6 +1986,9 @@ struct IssuedCode {
     code_challenge: String,
     resource: String,
     user: String,
+    /// When that account was made, so a code cannot be spent on a later account
+    /// under the same name. `None` only where no account was read.
+    born: Option<String>,
     issued: Instant,
 }
 
@@ -2060,6 +2063,7 @@ fn code_for(record: &PendingAuthorization, user: &str) -> IssuedCode {
         code_challenge: record.code_challenge.clone(),
         resource: record.resource.clone(),
         user: user.to_string(),
+        born: None,
         issued: Instant::now(),
     }
 }
@@ -2728,12 +2732,19 @@ pub async fn decide(
     let mut params: Vec<(&str, &str)> = Vec::new();
     let code = match body.decision {
         Decision::Allow => {
+            let born = state
+                .auth
+                .account_born(&account.name)
+                .await
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             let code = random_hex_32();
-            oauth
-                .codes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .issue(sha256_hex(&code), code_for(&record, &account.name));
+            oauth.codes.lock().unwrap_or_else(|e| e.into_inner()).issue(
+                sha256_hex(&code),
+                IssuedCode {
+                    born,
+                    ..code_for(&record, &account.name)
+                },
+            );
             // Here and nowhere earlier: the thirty-day prune collects a
             // registration nobody has any use for, and the first moment one is
             // of use to somebody is a person allowing it. Stamping it at the
@@ -3180,7 +3191,13 @@ async fn exchange_code(
         .await
         .map_err(|error| store_unavailable("reading the account that consented", &error))?
         .is_some_and(|user| !user.disabled);
-    if !live {
+    let same = state
+        .auth
+        .account_born(&issued.user)
+        .await
+        .map_err(|error| store_unavailable("reading the account that consented", &error))?
+        == issued.born;
+    if !live || !same {
         return Err(OauthError::invalid_grant(BAD_CODE));
     }
 

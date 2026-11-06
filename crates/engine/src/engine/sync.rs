@@ -886,6 +886,15 @@ impl Engine {
             "contradictions": contradictions,
             "activity": activity,
         });
+        // Only where shares exist at all, so a local install reports what it did.
+        if self.github_enabled() {
+            let share_identity = self.share_identity_effective();
+            result["share_identity"] = json!({
+                "mode": share_identity.mode.as_str(),
+                "default": share_identity.is_default(),
+                "reason": share_identity.reason_text(),
+            });
+        }
         let pruned: Vec<Value> = self
             .model_cache_pruned
             .read()

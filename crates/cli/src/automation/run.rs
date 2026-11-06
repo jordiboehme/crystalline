@@ -189,6 +189,15 @@ pub(super) async fn run_one(
         domain,
         token: &token,
     };
+    // A run that could not share its work does not start, unless it was not going
+    // to share anyway.
+    if !args.no_share
+        && let Some(refused) = take["share_refused"].as_str()
+    {
+        return lease
+            .fail_and_err(&started, anyhow::anyhow!("{refused}"), stop.clone())
+            .await;
+    }
 
     let (log_path, log) = match open_log(args.log_dir.as_deref(), lp, domain, &started) {
         Ok(opened) => opened,
@@ -229,22 +238,35 @@ pub(super) async fn run_one(
     // The share and the record, with the lease kept fresh beside them until
     // the record answers.
     let finish = async {
-        let share = if share_it {
+        let (share, share_error) = if share_it {
             share_changes(&lease, &text, stop.clone()).await
         } else {
-            None
+            (None, None)
+        };
+        // A refused share is in the recorded run, first so the summary's cap
+        // never cuts it: on a server nobody reads this run's stderr. Anybody
+        // who may run the loop reads this, so it is one plain sentence; the
+        // reason and its fix are in `share_error` and on stderr for whoever
+        // runs this command, and `crystalline doctor` names the fix for an admin.
+        let recorded_summary = match &share_error {
+            Some(_) => format!("{RUN_NOT_SHARED}\n\n{text}"),
+            None => text.clone(),
         };
         let report = json!({
             "started_at": started.to_rfc3339(),
             "outcome": outcome,
             "done": done,
-            "summary": text,
+            "summary": recorded_summary,
         });
-        (share, lease.record(&report, stop.clone()).await)
+        (
+            share,
+            share_error,
+            lease.record(&report, stop.clone()).await,
+        )
     };
     tokio::pin!(finish);
     let mut lost_at_end = None;
-    let (share, record) = if renewing {
+    let (share, share_error, record) = if renewing {
         tokio::select! {
             finished = &mut finish => finished,
             why = renewer.as_mut() => {
@@ -279,6 +301,7 @@ pub(super) async fn run_one(
                 "exit_code": exit,
                 "log": log_path,
                 "share": share,
+                "share_error": share_error,
                 "run": record["run"],
             })
         );
@@ -295,12 +318,13 @@ pub(super) async fn run_one(
 }
 
 /// Share the run's changes as a pull request: the share's answer, or `None`
-/// when it failed or a stop signal came first.
+/// when it failed or a stop signal came first, and for a failure what to record
+/// about it.
 async fn share_changes(
     lease: &Lease<'_>,
     summary: &str,
     mut stop: watch::Receiver<bool>,
-) -> Option<Value> {
+) -> (Option<Value>, Option<String>) {
     let share = lease.client.verb(
         "automation_share",
         lease.lp,
@@ -308,17 +332,47 @@ async fn share_changes(
     );
     tokio::select! {
         answer = share => match answer {
-            Ok(answer) => Some(answer),
+            Ok(answer) => (Some(answer), None),
             Err(e) => {
                 eprintln!("Sharing the run's changes failed: {e:#}");
-                None
+                let remote = matches!(lease.client, AutomationClient::Remote(_));
+                (None, Some(share_failure(lease.domain, &format!("{e:#}"), remote)))
             }
         },
         _ = stop.wait_for(|stopped| *stopped) => {
             eprintln!("Stopped before the run's changes were shared.");
-            None
+            (None, None)
         }
     }
+}
+
+/// What a recorded run says about a share that failed, for everybody who may read
+/// it. No command line and no setting: those are for an admin.
+const RUN_NOT_SHARED: &str =
+    "The changes of this run could not be shared and stay on this instance. An admin can see why.";
+
+/// What the operator of a run reads about a share that failed: that the changes
+/// stayed here, why, and the fix. Later runs do not pick these files up,
+/// so the last sentence is the way they still reach the team.
+///
+/// A remote runner's token need not be an admin's, so it reads only the reason,
+/// which the server already put in plain words.
+fn share_failure(domain: &str, error: &str, remote: bool) -> String {
+    if remote {
+        return format!(
+            "The run's changes were not shared and stay on the server: {error} An admin can share them once that is fixed."
+        );
+    }
+    let mut text = format!("The run's changes were not shared and stay on this machine: {error}");
+    if error.contains("personal GitHub identities") {
+        text.push_str(
+            " An admin can also set github.share_identity to instance, so the instance credential opens the proposals.",
+        );
+    }
+    text.push_str(&format!(
+        " Once that is fixed, share them with: crystalline origin share {domain}"
+    ));
+    text
 }
 
 /// A take refusal that means "not now": a run is going, or the loop runs on
@@ -817,6 +871,28 @@ pub(super) fn stop_signal() -> watch::Receiver<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_share_names_why_and_the_way_out() {
+        let text = share_failure(
+            "kb",
+            "This instance shares with personal GitHub identities through its GitHub App.",
+            false,
+        );
+        assert!(text.contains("not shared"), "{text}");
+        assert!(text.contains("through its GitHub App"), "{text}");
+        assert!(text.contains("github.share_identity to instance"), "{text}");
+        assert!(text.ends_with("crystalline origin share kb"), "{text}");
+        let other = share_failure("kb", "GitHub could not be reached", false);
+        assert!(!other.contains("github.share_identity"), "{other}");
+        let remote = share_failure(
+            "kb",
+            "This instance shares with personal GitHub identities through its GitHub App.",
+            true,
+        );
+        assert!(!remote.contains("github.share_identity"), "{remote}");
+        assert!(!remote.contains("crystalline "), "{remote}");
+    }
 
     fn summary(done: u64) -> RunSummary {
         RunSummary {

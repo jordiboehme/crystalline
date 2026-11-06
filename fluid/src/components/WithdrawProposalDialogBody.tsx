@@ -137,7 +137,7 @@ export default function WithdrawProposalDialogBody({
                 identity, the way to get one takes its place - everything
                 above it is a read, and stays. */}
             {identity.mustConnect ? (
-              <ConnectToShare />
+              <ConnectToShare onLeave={onClose} />
             ) : (
               <button
                 type="button"

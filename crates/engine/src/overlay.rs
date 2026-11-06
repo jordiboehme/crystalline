@@ -1289,8 +1289,8 @@ mod tests {
         // A headless node configures personal mode and its bot account purely
         // from the environment, with no config file to edit.
         assert_eq!(
-            effective.github_share_identity(),
-            ShareIdentityMode::Personal
+            effective.github_share_identity_setting(),
+            Some(ShareIdentityMode::Personal)
         );
         assert_eq!(effective.github_agent_identity(), Some("share-bot"));
         assert!(effective.read_only());

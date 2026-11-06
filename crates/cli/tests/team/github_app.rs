@@ -302,6 +302,120 @@ fn doctor_names_the_permissions_the_app_lacks() {
 }
 
 #[test]
+fn doctor_and_status_say_whose_identity_shares_run_on_and_why() {
+    let github = FakeGithub::start(0);
+    // With an App and no key.
+    let report = doctor_with_app(&github, &[]);
+    assert_eq!(report["github"]["share_identity"], "personal", "{report}");
+    assert_eq!(
+        report["github"]["share_identity_reason"],
+        "default, because a GitHub App is configured"
+    );
+    assert_eq!(
+        report["github"]["owner_identity_missing"],
+        Value::Null,
+        "a run goes through the App: {report}"
+    );
+    let personal = doctor_with_app(
+        &github,
+        &[("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "personal")],
+    );
+    assert_eq!(
+        personal["github"]["owner_identity_missing"], true,
+        "{personal}"
+    );
+    // A key always wins.
+    let report = doctor_with_app(
+        &github,
+        &[("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "instance")],
+    );
+    assert_eq!(report["github"]["share_identity"], "instance", "{report}");
+    assert_eq!(
+        report["github"]["share_identity_reason"],
+        "set by github.share_identity"
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let config = write_config(work.path(), &github.url);
+    let status = |json: bool, app: bool| {
+        let mut cmd = crate::common::crystalline();
+        isolate(&mut cmd, home.path());
+        if app {
+            cmd.env("CRYSTALLINE_GITHUB_APP_ID", "7")
+                .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+                .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM);
+        }
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .args(["status", "--config"])
+            .arg(&config)
+            .arg("--db")
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let with_app: Value = serde_json::from_str(&status(true, true)).unwrap();
+    assert_eq!(with_app["share_identity"]["mode"], "personal", "{with_app}");
+    assert_eq!(with_app["share_identity"]["default"], true, "{with_app}");
+    let human = status(false, true);
+    assert!(
+        human.contains("personal identity (default, because a GitHub App is configured)"),
+        "{human}"
+    );
+    let without: Value = serde_json::from_str(&status(true, false)).unwrap();
+    assert_eq!(without["share_identity"]["mode"], "instance", "{without}");
+    assert_eq!(
+        without["share_identity"]["reason"],
+        "default, because no GitHub App is configured"
+    );
+}
+
+/// With no daemon, `config show` and `config unset` say the mode in effect: an
+/// admin who clears the key sees what the App makes of it.
+#[test]
+fn config_show_and_unset_say_the_mode_in_effect_with_an_app() {
+    let github = FakeGithub::start(0);
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let config = write_config(work.path(), &github.url);
+    let run = |args: &[&str]| {
+        let mut cmd = crate::common::crystalline();
+        isolate(&mut cmd, home.path());
+        let out = cmd
+            .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+            .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+            .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM)
+            .arg("--json")
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        serde_json::from_str::<Value>(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))
+    };
+    let shown = run(&["config", "show"]);
+    let row = shown["settings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{shown}"))
+        .iter()
+        .find(|row| row["key"] == "github.share_identity")
+        .unwrap()
+        .clone();
+    assert_eq!(row["value"], "personal", "{row}");
+    assert_eq!(row["source"], "default", "{row}");
+
+    run(&["config", "set", "github.share_identity", "instance"]);
+    let unset = run(&["config", "unset", "github.share_identity"]);
+    assert_eq!(unset["value"], "personal", "{unset}");
+    assert_eq!(unset["source"], "default", "{unset}");
+}
+
+#[test]
 fn doctor_says_connected_through_a_healthy_app() {
     let github = FakeGithub::start(0);
     let report = doctor_with_app(&github, &[]);

@@ -609,6 +609,117 @@ test("an admin creates the GitHub App with a real form post to GitHub", async ({
   await expect(page).toHaveURL((url) => !url.search.includes("app="));
 });
 
+test("an unlinked editor opens the share dialog on an App instance and sees the link fix", async ({
+  page,
+}) => {
+  // The daemon here has no App, so the answers an App instance gives this
+  // person are canned, each in the shape the routes send: the report with
+  // `may_share` false and no admin keys, the plan refused with the link
+  // sentence, and no identity on file.
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  expect(me.ok()).toBe(true);
+  const body = (await me.json()) as {
+    user?: { role: string } | null;
+    can_share?: boolean;
+  };
+  body.user!.role = "editor";
+  body.can_share = true;
+  await page.route("**/api/v1/auth/me", (route) =>
+    route.fulfill({ json: body }),
+  );
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync`, (route) =>
+    route.fulfill({
+      json: {
+        domain: DOMAIN,
+        mode: "github",
+        repo: "acme/knowledge",
+        branch: "main",
+        base_commit: "9f3c1a2",
+        behind: false,
+        local_changes: 1,
+        last_checked: "2026-10-09T08:00:00Z",
+        probe_error: null,
+        may_share: false,
+        connection: {
+          connected: true,
+          user: null,
+          token_store: "keyring",
+          share_identity: "personal",
+          share_identity_default: true,
+        },
+        open_proposals: [],
+        declined_proposals: [],
+        conflicts: [],
+      },
+    }),
+  );
+  const refusal =
+    "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync/changes`, (route) =>
+    route.fulfill({
+      status: 403,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        type: "about:blank",
+        title: "forbidden",
+        status: 403,
+        detail: refusal,
+      }),
+    }),
+  );
+  await page.route("**/api/v1/me/github-identity", (route) =>
+    route.fulfill({
+      json: {
+        account: "smoke",
+        connected: false,
+        login: null,
+        connected_at: null,
+        token_store: null,
+        pending: null,
+        error: null,
+        warning: null,
+      },
+    }),
+  );
+  await page.route("**/api/v1/me/github-link", (route) =>
+    route.fulfill({
+      json: {
+        linked: false,
+        login: null,
+        github_id: null,
+        host: null,
+        linked_at: null,
+        token_live: false,
+        pending: null,
+        error: null,
+        app_configured: true,
+        share_identity: "personal",
+      },
+    }),
+  );
+
+  await page.goto(`d/${DOMAIN}`);
+  await page.getByRole("button", { name: "Share changes" }).first().click();
+  const dialog = page.getByRole("dialog", { name: /share/i });
+  await expect(dialog.getByText(refusal)).toBeVisible();
+  const fix = dialog.getByRole("link", { name: "Connect GitHub to share" });
+  await expect(fix).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Share" })).toHaveCount(0);
+  await expect(dialog).not.toContainText("crystalline ");
+  await expect(dialog).not.toContainText("share_identity");
+
+  await fix.click();
+  await expect(page).toHaveURL(/\/profile/);
+  await expect(
+    page.getByText(
+      "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Connect GitHub" }),
+  ).toBeVisible();
+});
+
 test("a refused direct share offers to share as a proposal", async ({
   page,
 }) => {

@@ -268,19 +268,20 @@ pub struct Proposal {
     /// Set on every share-update and feedback refresh.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
-    /// The GitHub login the share that wrote this record acted as, recorded at
-    /// share time from the acting credential's stored user.
+    /// The GitHub login the share that opened this proposal acted as, recorded
+    /// at share time from the acting credential's stored user.
     ///
     /// A chain's layers may be authored by different people, so this is per
     /// proposal rather than per domain: it is what a stack rail names each
-    /// layer's owner from. A layer amended by somebody else becomes theirs -
-    /// their credential rewrote it - while a layer a cascade merely replayed
-    /// onto a new parent keeps the author it had.
+    /// layer's owner from. It never changes once set, matching the forge, where
+    /// a pull request stays with whoever opened it: a person or a run that
+    /// updates or amends it adds a commit under its own credential, and that
+    /// commit is what names who made the change.
     ///
     /// `None` on a record written before this field existed and whenever the
     /// acting credential carries no login to name (the environment token),
-    /// which is unknown rather than nobody: a share that cannot name its author
-    /// leaves a recorded one standing.
+    /// which is unknown rather than nobody: the next share that can name itself
+    /// fills it in.
     #[serde(default)]
     pub author_login: Option<String>,
 }

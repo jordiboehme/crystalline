@@ -116,6 +116,8 @@ describe("the admin client layer", () => {
       },
       error: null,
       app: null,
+      shareIdentity: null,
+      shareIdentityDefault: false,
     });
   });
 
@@ -172,6 +174,8 @@ describe("the admin client layer", () => {
       pending: null,
       error: "authorization denied",
       app: null,
+      shareIdentity: null,
+      shareIdentityDefault: false,
     });
   });
 
@@ -230,6 +234,8 @@ describe("the admin client layer", () => {
       pending: null,
       error: null,
       app: null,
+      shareIdentity: null,
+      shareIdentityDefault: false,
     });
   });
 
@@ -298,6 +304,7 @@ describe("the admin client layer", () => {
       tokenLive: true,
       pending: null,
       error: null,
+      shareIdentity: null,
     });
     // An older server says nothing about an App: the profile keeps its
     // older card rather than offering a link that cannot start.

@@ -22,11 +22,19 @@ import { BUTTON } from "./primitives";
  * started here: connecting is a device code typed in another window or a token
  * pasted, both of which live on the profile card and neither of which belongs
  * inside a dialog about a proposal.
+ *
+ * `onLeave` closes the dialog: one opened from the top bar outlives the route
+ * change, and would stay over the profile the link just opened.
  */
-export function ConnectToShare(): ReactElement {
+export function ConnectToShare({
+  onLeave,
+}: {
+  onLeave: () => void;
+}): ReactElement {
   return (
     <Link
       to={profileRoute()}
+      onClick={onLeave}
       {...PREFETCH.profile}
       className={`inline-block ${BUTTON.primary}`}
     >
