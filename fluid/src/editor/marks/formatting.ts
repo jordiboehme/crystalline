@@ -729,12 +729,13 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
   if (!writable(view.state)) {
     return true;
   }
-  // One bound for the whole press (D35). The gates read the view's tree, and
-  // a tree a reparse left short is no reason to refuse: the press parses
-  // first, and a gate speaks only when its own parse did not reach the lines.
+  // One bound for the whole press (D35). The gates and the refusal of a
+  // picture read the view's tree, and on a tree a reparse left short they would
+  // find nothing to refuse or refuse for nothing: the press parses first. Main
+  // with a caret reads nothing here, so it does not wait.
   const deadline = deadlineIn(PARSE_BUDGET.command);
   const gates = view.state.facet(formatGate);
-  if (gates.length > 0) {
+  if (gates.length > 0 || !view.state.selection.main.empty) {
     viewParsedTo(
       view,
       view.state.doc.lineAt(view.state.selection.main.to).to,

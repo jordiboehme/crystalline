@@ -57,7 +57,7 @@ import { scanMarks, walkTree } from "./hiddenMarks";
 import { composing } from "./caret";
 import { droppable, judgedElsewhere } from "./deleting";
 import { marksHiddenOnLine } from "./mode";
-import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import { PAGE_LOADING, budgetOf, deadlineIn, parsedTo } from "./parse";
 import type { Deadline } from "./parse";
 
 /** What a refused deletion says. It names no mode: a Reflection has no Raw. */
@@ -716,15 +716,6 @@ export function judgeDeletion(
   }
   if (exactIsSame()) return asIs;
   return timedOut ? LOADING : { outcome: "refused", said: CANNOT_JOIN };
-}
-
-/** The bound of one press of `event` (D35). */
-export function budgetOf(event: string): number {
-  return event === "delete.selection" ||
-    event === "delete.cut" ||
-    event === "delete.picture"
-    ? PARSE_BUDGET.gesture
-    : PARSE_BUDGET.key;
 }
 
 /**

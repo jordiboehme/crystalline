@@ -58,7 +58,13 @@ import {
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
 import { marksHiddenOnLine, pictureForKeys } from "./mode";
-import { PARSE_BUDGET, deadlineIn, viewParsedTo } from "./parse";
+import {
+  PARSE_BUDGET,
+  budgetOf,
+  deadlineIn,
+  parsedTo,
+  viewParsedTo,
+} from "./parse";
 
 type HeadingQuestion = (
   state: EditorState,
@@ -886,7 +892,21 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
   if (deleted.length === 0) {
     return tr;
   }
-  const { kept, dropped } = markFate(start, deleted, inserts);
+  // Judged on a tree that reaches what it takes: a filter cannot publish, and
+  // a short one shows no marks to keep, so a typed or pasted letter would leave
+  // a lone `**` (D35). Short of time it goes as the page draws it; caret typing
+  // has returned above and never pays this. A delete does not parse here: the
+  // deletion check after this filter does, and refuses past the press's one
+  // bound (`parse.test.ts`).
+  const reach = Math.max(...deleted.map((d) => d.to));
+  const judged = tr.isUserEvent("delete")
+    ? start
+    : (parsedTo(
+        start,
+        start.doc.lineAt(reach).to,
+        deadlineIn(budgetOf(event)),
+      ) ?? start);
+  const { kept, dropped } = markFate(judged, deleted, inserts);
   if (kept.length === 0 && dropped.length === 0) {
     return tr;
   }

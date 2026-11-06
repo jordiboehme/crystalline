@@ -32,11 +32,7 @@ import {
   isolateHistory,
   undo as historyUndo,
 } from "@codemirror/commands";
-import {
-  ensureSyntaxTree,
-  syntaxHighlighting,
-  syntaxTree,
-} from "@codemirror/language";
+import { ensureSyntaxTree, syntaxHighlighting } from "@codemirror/language";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
@@ -64,12 +60,12 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
 import { canonical, markSegment, stepVisible, viewAtoms } from "../marks/caret";
-import { budgetOf, deletionOutcome } from "../marks/deleteCheck";
+import { deletionOutcome } from "../marks/deleteCheck";
 import { judgedElsewhere, keptWhole } from "../marks/deleting";
 import { documentLanguage, editorHighlight } from "../setup";
 import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
-import { PARSE_BUDGET } from "../marks/parse";
+import { budgetOf, isReadTo } from "../marks/parse";
 import { roomUndo } from "../roomUndo";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
@@ -983,19 +979,23 @@ export const CELL_NOT_READ =
 /** Whether the cell's row is not read yet: the parse stops above it. */
 function rowUnread(state: EditorState): boolean {
   const cell = state.field(rangeField, false);
-  return cell !== undefined && syntaxTree(state).length < cell.to;
+  if (cell === undefined) return false;
+  return !isReadTo(state, state.doc.lineAt(cell.to).to);
 }
 
 /**
  * Whether the row stays unread after `budget` milliseconds of parsing: a
- * tree a reparse left short is no reason to refuse (D35). Reads the parse
- * itself, as a filter cannot publish it; what judges the edit next parses its
- * own state.
+ * tree a reparse left short is no reason to refuse (D35). A filter cannot
+ * publish this parse, so `tr.startState` still holds the short tree: every
+ * filter that judges the edit after this one reads through `parsedTo`, which
+ * finds the row's line parsed here and hands back a state that holds it. So an
+ * edit goes on only when it can be judged on a tree that reaches the row.
  */
 function rowUnreadAfter(state: EditorState, budget: number): boolean {
   if (!rowUnread(state)) return false;
   const cell = state.field(rangeField);
-  return ensureSyntaxTree(state, cell.to, budget) === null;
+  const line = state.doc.lineAt(cell.to);
+  return ensureSyntaxTree(state, line.to, budget) === null;
 }
 
 /**
@@ -1014,7 +1014,6 @@ function rowUnreadAfter(state: EditorState, budget: number): boolean {
  * browser's to finish.
  */
 const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
-  if (!rowUnread(tr.startState)) return tr;
   const overSelection =
     tr.isUserEvent("input") &&
     !tr.isUserEvent("input.type.compose") &&
@@ -1028,14 +1027,9 @@ const unreadRowGuard = EditorState.transactionFilter.of((tr) => {
     (tr.startState.field(pendingFormat, false) ?? null) === null &&
     (tr.state.field(pendingFormat, false) ?? null) !== null;
   if (!command && !waiting) return tr;
-  // The bound the check after this one gets for the same press (D35).
+  // The bound the filters after this one get for the same press (D35).
   const event = tr.annotation(Transaction.userEvent) ?? "";
-  const budget = tr.isUserEvent("delete")
-    ? budgetOf(event)
-    : event === "input.type"
-      ? PARSE_BUDGET.key
-      : PARSE_BUDGET.gesture;
-  if (!rowUnreadAfter(tr.startState, budget)) return tr;
+  if (!rowUnreadAfter(tr.startState, budgetOf(event))) return tr;
   return {
     selection: tr.startState.selection,
     effects: [

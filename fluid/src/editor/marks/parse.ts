@@ -23,6 +23,7 @@
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
+import type { Tree } from "@lezer/common";
 import type { EditorView } from "@codemirror/view";
 
 /** What a press refused for want of a parse says. */
@@ -40,12 +41,46 @@ export const PARSE_BUDGET = {
 /**
  * The parse time past the lines a press asks about, per press. A line's
  * reference links read their definitions, which can stand anywhere below it,
- * so a press wants the whole document (D35). After an edit that is one step,
- * as the rest of the tree is reused; on a page whose first parse is still
- * running it is not, and the press does not wait for that: it reads what the
- * page draws.
+ * so a press on such a block wants the whole document (D35). After an edit
+ * that is one step, as the rest of the tree is reused; on a page whose first
+ * parse is still running it is not, and the press does not wait for that: it
+ * reads what the page draws. The next edit drops what this parse did not
+ * finish, so a press on any other block spends none of it (`readsBelow`).
  */
 const REST_OF_PAGE_MS = 10;
+
+/** The lines of a block looked at either way; a longer one counts as asking. */
+const BLOCK_LINES = 200;
+
+/**
+ * Brackets that can be a reference: a pair not followed by `(` or `]`, which
+ * leaves out an inline link, a wikilink's and an image's address. A task box
+ * at a line's start is taken out first, so a list does not ask on every line.
+ */
+const REFERENCE = /\[[^\]]*\](?![(\]])/;
+const TASK_BOX = /^\s*(?:[-*+]|\d+[.)])\s+\[.\]/gm;
+
+/**
+ * Whether the block around `upto` holds text whose meaning stands below it:
+ * a reference link and its definition. Nothing else a press reads does, so
+ * this is what the rest of the page is parsed for.
+ */
+function readsBelow(state: EditorState, upto: number): boolean {
+  const { doc } = state;
+  const at = doc.lineAt(Math.min(upto, doc.length)).number;
+  const lines: string[] = [];
+  for (const step of [-1, 1]) {
+    for (let n = step < 0 ? at : at + 1, seen = 0; ; n += step, seen += 1) {
+      if (n < 1 || n > doc.lines) break;
+      if (seen >= BLOCK_LINES) return true;
+      const { text } = doc.line(n);
+      if (text.trim() === "") break;
+      lines.push(text);
+    }
+    if (step < 0) lines.reverse();
+  }
+  return REFERENCE.test(lines.join("\n").replace(TASK_BOX, ""));
+}
 
 /**
  * What is left of one press's parse time. Only time spent parsing counts
@@ -67,39 +102,90 @@ export function deadlineIn(budget: number): Deadline {
   };
 }
 
+/** The bound of one press that writes an edit of `event` (D35). */
+export function budgetOf(event: string): number {
+  return event === "input.type" ||
+    event === "delete.backward" ||
+    event === "delete.forward"
+    ? PARSE_BUDGET.key
+    : PARSE_BUDGET.gesture;
+}
+
 /**
- * Parses `state` to `upto` and, with what `deadline` allows, on to the end of
- * the document: true when the parse context got anywhere new. The tree stays
- * in the parse context the state shares with the view.
+ * How far each finished tree is known to reach. The parse context cannot say
+ * for a page with a fence whose language is still loading: the parse covers
+ * every character but leaves no fragment over the fence, so the context never
+ * calls itself done and each ask would parse again.
+ */
+const knownReach = new WeakMap<Tree, number>();
+
+function noteReach(tree: Tree, upto: number): void {
+  knownReach.set(tree, Math.max(knownReach.get(tree) ?? -1, upto));
+}
+
+/**
+ * The tree that is parsed to `upto` with no parse time spent, or null. A look
+ * at no clock when it is done. The one way to ask how far a state is read: a
+ * cut tree's `length` overstates it (`advance`).
+ */
+function readTo(state: EditorState, upto: number): Tree | null {
+  const held = syntaxTree(state);
+  if ((knownReach.get(held) ?? -1) >= upto) return held;
+  const done = ensureSyntaxTree(state, upto, 0);
+  if (done) noteReach(done, upto);
+  return done;
+}
+
+/** Whether `state` is read to `upto`. */
+export function isReadTo(state: EditorState, upto: number): boolean {
+  return readTo(state, upto) !== null;
+}
+
+/** `ensureSyntaxTree` on the press's clock, after asking with no time. */
+function timed(
+  state: EditorState,
+  upto: number,
+  deadline: Deadline,
+  most: number,
+): Tree | null {
+  const done = readTo(state, upto);
+  if (done) return done;
+  const began = Date.now();
+  const tree = ensureSyntaxTree(state, upto, Math.max(0, most));
+  const spent = Math.max(0, Date.now() - began);
+  deadline.left -= spent;
+  deadline.rest -= spent;
+  if (tree) noteReach(tree, upto);
+  return tree;
+}
+
+/**
+ * Parses `state` to `upto` and, where the block asks and `deadline` allows, on
+ * to the end of the document: the tree that reaches `upto`, or null when the
+ * time ran out first. The work stays in the parse context the state shares
+ * with the view.
+ *
+ * This asks the parse context and never `tree.length`, which overstates a cut
+ * parse: a tree cut inside a quote or a list is as long as the blocks it closed,
+ * with the lines past the cut unread. A trial cut like that read the next
+ * line's markers as absent and refused every place for Enter, so `**` went
+ * onto the new line.
  */
 function advance(
   state: EditorState,
   upto: number,
   deadline: Deadline,
-): boolean {
-  const end = state.doc.length;
-  const held = syntaxTree(state).length;
-  let advanced = false;
-  if (held < upto) {
-    const began = Date.now();
-    advanced =
-      ensureSyntaxTree(state, upto, Math.max(0, deadline.left)) !== null;
-    deadline.left -= Math.max(0, Date.now() - began);
-    if (!advanced) return false;
-  }
-  if (held < end && deadline.rest > 0) {
-    const began = Date.now();
-    const whole = ensureSyntaxTree(
-      state,
-      end,
-      Math.max(0, Math.min(deadline.rest, deadline.left)),
-    );
-    const spent = Math.max(0, Date.now() - began);
-    deadline.rest -= spent;
-    deadline.left -= spent;
-    advanced ||= whole !== null;
-  }
-  return advanced;
+): Tree | null {
+  const reached = timed(state, upto, deadline, deadline.left);
+  if (!reached) return null;
+  if (deadline.rest <= 0 || !readsBelow(state, upto)) return reached;
+  const whole = timed(
+    state,
+    state.doc.length,
+    deadline,
+    Math.min(deadline.rest, deadline.left),
+  );
+  return whole ?? reached;
 }
 
 /**
@@ -115,11 +201,13 @@ export function parsedTo(
   upto: number,
   deadline: Deadline,
 ): EditorState | null {
-  if (!advance(state, upto, deadline)) {
-    return syntaxTree(state).length >= upto ? state : null;
-  }
+  const tree = advance(state, upto, deadline);
+  if (!tree) return null;
+  if (tree === syntaxTree(state)) return state;
   const settled = state.update({}).state;
-  return syntaxTree(settled).length >= upto ? settled : null;
+  // Its update can run the parse again, on a page the context never calls done.
+  noteReach(syntaxTree(settled), upto);
+  return settled;
 }
 
 /**
@@ -137,8 +225,11 @@ export function viewParsedTo(
   upto: number,
   deadline: Deadline,
 ): boolean {
-  if (advance(view.state, upto, deadline)) {
+  const tree = advance(view.state, upto, deadline);
+  if (!tree) return false;
+  if (tree !== syntaxTree(view.state)) {
     view.dispatch({});
+    noteReach(syntaxTree(view.state), upto);
   }
-  return syntaxTree(view.state).length >= upto;
+  return true;
 }
