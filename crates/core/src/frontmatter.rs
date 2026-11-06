@@ -559,15 +559,13 @@ fn pick(
     }
     // `generated` is the provenance of the last write, not a person's words:
     // both sides touching it is the normal case for any two writes, so the
-    // line with the later `at` wins whole (upstream's on a tie or when either
-    // time does not read) instead of colliding as one line.
+    // line with the later `at` wins whole (a readable time beats an unreadable
+    // one, then the greater text, so both merge orders agree) instead of colliding as one line.
     if let (Some(l), Some(u)) = (local, upstream)
         && is_generated(l)
     {
-        let newer = match (generated_at(&l.value), generated_at(&u.value)) {
-            (Some(lt), Some(ut)) if lt > ut => l,
-            _ => u,
-        };
+        let rank = |b: &KeyBlock| (generated_at(&b.value), b.text.clone());
+        let newer = if rank(l) > rank(u) { l } else { u };
         return Ok(Some(newer.text.clone()));
     }
     if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
@@ -615,7 +613,7 @@ fn generated_at(value: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> 
 /// | L equals U | U's text when L's text is byte-equal to U's or B's (absent on both: the key is gone); L's text when U's text is byte-equal to B's (only local re-spelled it); no B (both added it): U's text; when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text |
 /// | L equals B | U's text when L's text is byte-equal to B's (only upstream changed or removed it); when local re-spelled it (a comment, say) and U is present, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with U's value; else conflict, so a local comment is never dropped silently |
 /// | U equals B | L's text when U's text is byte-equal to B's (only local changed, added or removed it); when upstream re-spelled it and L is present, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value; else conflict, so an upstream comment is never dropped silently |
-/// | otherwise, key `generated` with L and U both present | the block whose `at` reads as the later instant; U's on a tie or when either does not read |
+/// | otherwise, key `generated` with L and U both present | the block whose `at` reads as the later instant; a readable `at` beats an unreadable one, then the greater block text, so both merge orders give one line |
 /// | otherwise, all three present | the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key |
 /// | otherwise | conflict |
 ///
