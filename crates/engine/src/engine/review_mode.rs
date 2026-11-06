@@ -823,9 +823,7 @@ impl Engine {
             .iter()
             .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
             .collect();
-        if let Some(refusal) =
-            review::collision(domain, &folding, &base, disk_folds_case(root.as_deref()))
-        {
+        if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             return Err(EngineError::Conflict(refusal));
         }
 
@@ -915,9 +913,7 @@ impl Engine {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
         };
-        if let Some(refusal) =
-            review::collision(domain, &folding, &base, disk_folds_case(root.as_deref()))
-        {
+        if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             // A fold that would switch the Reflection off has closed its rooms
             // with `switched_off` already, and nothing was folded. That is
             // harmless: each of those rooms saved its text first, and its
@@ -1827,18 +1823,57 @@ impl Engine {
 /// switches the Reflection of the domain at `root` off: the MANIFEST in the
 /// folder says `reflection: on` and the one the fold leaves does not (a
 /// deleted MANIFEST says nothing, so it is off too).
-/// Whether a domain folder's disk treats two spellings as one name, asked of the
-/// MANIFEST every file domain has. A folder that cannot answer reads as a disk
-/// that keeps them apart, which leaves the exact-path rule standing.
-fn disk_folds_case(root: Option<&Path>) -> bool {
-    root.is_some_and(|root| {
-        is_case_only_rename(
-            &root.join("MANIFEST.md"),
-            &root.join("manifest.md"),
-            "MANIFEST.md",
-            "manifest.md",
-        )
-    })
+/// Whether the folder a file at `rel` would land in may treat two spellings as
+/// one name: the nearest folder that exists, since a symlink or a mount inside a
+/// domain can stand on another disk from its root.
+///
+/// Nothing is written. A name the folder lists is looked up in the other case:
+/// not there means it keeps them apart, and there without being listed means it
+/// folds. **A folder that cannot say counts as folding**, an empty one included:
+/// a wrong "folds" costs a refusal with a way out, and a wrong "keeps apart"
+/// costs somebody's text with no warning.
+pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+    let landing = join_rel(root, rel);
+    let Some(dir) = landing.ancestors().skip(1).find(|dir| dir.is_dir()) else {
+        return true;
+    };
+    if !dir.starts_with(root) {
+        return true;
+    }
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let Ok(names) = listing
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()
+    else {
+        return true;
+    };
+    let other_case = |name: &str| -> String {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    };
+    let Some(swapped) = names
+        .iter()
+        .filter_map(|name| name.to_str())
+        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))
+    else {
+        return true;
+    };
+    if names.iter().any(|listed| listed.to_str() == Some(&swapped)) {
+        return false;
+    }
+    match dir.join(&swapped).symlink_metadata() {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 fn folds_switch_off(root: &Path, folding: &[&ActorDrafts]) -> bool {
@@ -1869,4 +1904,51 @@ fn folds_switch_on(root: &Path, folding: &[&ActorDrafts]) -> bool {
     !draft.tombstone
         && super::reflection::declares_on(&draft.content)
         && !super::reflection::declares_on(&before)
+}
+
+#[cfg(test)]
+mod folder_case_tests {
+    use super::folder_may_fold_case;
+
+    /// A folder that lists a name answers for itself. Nothing to compare with is
+    /// no answer, and no answer counts as folding, since a refusal beats a lost
+    /// text.
+    #[test]
+    fn a_folder_is_asked_about_itself_and_no_answer_counts_as_folding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(folder_may_fold_case(root, "new/Zed.md"), "an empty folder");
+
+        std::fs::write(root.join("Probe.md"), "x").unwrap();
+        let folds = root.join("probe.md").exists();
+        assert_eq!(folder_may_fold_case(root, "Zed.md"), folds);
+        assert_eq!(
+            folder_may_fold_case(root, "not/made/yet/Zed.md"),
+            folds,
+            "a folder not made yet lands in the nearest one that is"
+        );
+
+        std::fs::create_dir(root.join("sub")).unwrap();
+        assert!(
+            folder_may_fold_case(root, "sub/Zed.md"),
+            "the folder the file lands in, which is empty, and not the one above"
+        );
+        assert!(
+            folder_may_fold_case(&root.join("gone"), "Zed.md"),
+            "a root that is not there cannot answer"
+        );
+    }
+
+    /// A real pair of spellings is the answer "keeps apart".
+    #[test]
+    fn two_real_spellings_mean_the_folder_keeps_them_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Pair.md"), "upper").unwrap();
+        std::fs::write(tmp.path().join("pair.md"), "lower").unwrap();
+        if std::fs::read_to_string(tmp.path().join("Pair.md")).unwrap() == "lower" {
+            eprintln!("skipped: {} folds case", tmp.path().display());
+            return;
+        }
+        assert!(!folder_may_fold_case(tmp.path(), "Zed.md"));
+    }
 }

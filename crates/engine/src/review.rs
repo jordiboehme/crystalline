@@ -323,19 +323,19 @@ pub(crate) fn choices(
 /// if alice's deletion is being folded too. Here the deletions being folded
 /// are exactly the ones that free anything.
 ///
-/// `folds_case` is whether the folder's disk treats two spellings as one name.
-/// There two people folding `Zed.md` and `zed.md` are folding one file; on a disk
-/// that keeps them apart they are two files, and both land. One actor's own pair
-/// is a case-only move and is no collision either way.
+/// `root` is the domain's folder, where two people folding `Zed.md` and `zed.md`
+/// may be folding one file. The folder they land in answers that, and is only
+/// asked about such a pair. One actor's own pair is a case-only move and is no
+/// collision either way.
 pub(crate) fn collision(
     domain: &str,
     folding: &[&ActorDrafts],
     base: &[EngramDescriptor],
-    folds_case: bool,
+    root: Option<&std::path::Path>,
 ) -> Option<String> {
     // Two actors folding one path: whoever went second would be the file,
     // which is not an answer either of them gave.
-    let mut owner: HashMap<String, (&str, &str)> = HashMap::new();
+    let mut owner: HashMap<String, Vec<(&str, &str)>> = HashMap::new();
     for held in folding {
         // The rows and the files share one map, so one path two actors are
         // folding is refused in one sentence whichever kind of thing stands
@@ -347,31 +347,33 @@ pub(crate) fn collision(
             .map(|draft| draft.path.as_str())
             .chain(held.files.iter().map(|file| file.path.as_str()))
         {
-            let key = if folds_case {
-                crystalline_core::fold_path_case(path)
-            } else {
-                path.to_string()
-            };
-            let Some((first, first_path)) = owner.insert(key, (held.actor.as_str(), path)) else {
-                continue;
-            };
-            if first_path == path {
-                return Some(format!(
-                    "'{first}' and '{}' are both drafting {path} in domain '{domain}', and only \
-                     one of them can be the file: fold one of them and discard the other, or \
-                     let them settle it between themselves first",
-                    held.actor
-                ));
+            let same_name = owner
+                .entry(crystalline_core::fold_path_case(path))
+                .or_default();
+            for &(first, first_path) in same_name.iter() {
+                if first_path == path {
+                    return Some(format!(
+                        "'{first}' and '{}' are both drafting {path} in domain '{domain}', and \
+                         only one of them can be the file: fold one of them and discard the \
+                         other, or let them settle it between themselves first",
+                        held.actor
+                    ));
+                }
+                let may_be_one_file = root.is_some_and(|root| {
+                    crate::engine::folder_may_fold_case(root, first_path)
+                        || crate::engine::folder_may_fold_case(root, path)
+                });
+                if first != held.actor && may_be_one_file {
+                    return Some(format!(
+                        "'{first}' is drafting {first_path} and '{}' is drafting {path} in \
+                         domain '{domain}'. The folder they land in may treat those two names \
+                         as one file, so only one of them can land: fold one of them and \
+                         discard the other, or let them settle it between themselves first",
+                        held.actor
+                    ));
+                }
             }
-            if first != held.actor {
-                return Some(format!(
-                    "'{first}' is drafting {first_path} and '{}' is drafting {path} in domain \
-                     '{domain}'. This disk treats those two names as one file, so only one of \
-                     them can be the file: fold one of them and discard the other, or let them \
-                     settle it between themselves first",
-                    held.actor
-                ));
-            }
+            same_name.push((held.actor.as_str(), path));
         }
     }
     // What the folder would answer to afterwards: the projection every
