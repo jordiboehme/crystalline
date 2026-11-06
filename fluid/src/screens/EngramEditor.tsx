@@ -1374,7 +1374,9 @@ function Surface({
                 The name you were typing in the diagram could not be kept. Copy
                 it if you need it:
               </span>
-              <q className="select-all">{fieldSettled.lost}</q>
+              <q className="block max-h-40 w-full overflow-auto wrap-anywhere whitespace-pre-wrap select-all">
+                {fieldSettled.lost}
+              </q>
             </p>
           )}
           {/*

@@ -731,3 +731,37 @@ test("a room closing with a refused draft shows the text and stays until the per
   await page.getByRole("link", { name: "Done", exact: true }).click();
   await expect(page.locator(".cm-content")).toHaveCount(0);
 });
+
+test("a very long lost text stays inside its notice, scrolls, and is all there", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  const long = `a %%{ ${"x".repeat(5_000)} ${"word ".repeat(1_500)}end`;
+  await field(page).fill(long);
+  await page.keyboard.press("ControlOrMeta+k");
+  await page.keyboard.type("Home");
+  await page.waitForTimeout(400);
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  const note = page.locator(".cm-diagram-lost-draft");
+  await expect(note).toBeVisible();
+  const place = await note.boundingBox();
+  const size = page.viewportSize();
+  if (place === null || size === null) throw new Error("no notice");
+  expect(place.y).toBeGreaterThanOrEqual(0);
+  expect(place.y + place.height).toBeLessThanOrEqual(size.height);
+  expect(place.x + place.width).toBeLessThanOrEqual(size.width);
+  const text = note.locator("q");
+  const sizes = await text.evaluate((el) => ({
+    scrolls: el.scrollHeight > el.clientHeight,
+    wide: el.scrollWidth > el.clientWidth,
+    all: el.textContent,
+  }));
+  expect(sizes.scrolls).toBe(true);
+  expect(sizes.wide).toBe(false);
+  expect(sizes.all?.endsWith("end")).toBe(true);
+  await expect(note.getByText("was not saved")).toBeInViewport();
+  await note.getByRole("button", { name: "Dismiss" }).click();
+  await expect(note).toHaveCount(0);
+});

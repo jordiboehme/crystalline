@@ -691,6 +691,24 @@ describe("an arrow held through a peer's duplicates (C1, R94)", () => {
     expect(bytes(local.state)).not.toContain("renamed");
   });
 
+  it("answers with the sentence when a duplicate came after the open and its own then went (P1)", async () => {
+    const { local, peer, sync } = await roomOf("A -->|mine| B");
+    const field = openArrow(local, 0);
+    type(field, "renamed");
+    insertAt(peer, atLine(peer, "    A -->|mine|"), "    A -->|peers| B\n");
+    sync();
+    await flush();
+    delLine(peer, "\n    A -->|mine| B");
+    sync();
+    await flush();
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(notice(local)).toContain(NOTICES.arrowChanged);
+    });
+    expect(bytes(local.state)).toBe(body("A -->|peers| B"));
+    expect(fieldOf(local)).toBe(field);
+  });
+
   it("takes the one arrow left of that pair when its own was rewritten", async () => {
     const { local, peer, sync } = await roomOf("A -->|one| B");
     const field = openArrow(local, 0);

@@ -480,19 +480,30 @@ function refuse(open: OpenField, code: RefusalCode, way: Way): void {
   }
 }
 
+/**
+ * An arrow stops being sole once a duplicate has been seen, and stays so: its own
+ * going later must not hand the label to the peer's (R94).
+ */
+function noteDuplicates(open: OpenField, model: FlowModel): void {
+  if (open.target.kind === "edge") {
+    open.sole &&= flowPairCount(model, open.target.key) <= 1;
+  }
+}
+
 /** The op for what is typed, worked out on each read of the fence (R94). */
 function opFor(
   main: EditorView,
-  target: TargetKey,
-  arrow: number | null,
-  sole: boolean,
+  open: OpenField,
   text: string,
 ): OpResolver<FlowModel, FlowOp> | null {
+  const { target, arrow } = open;
   if (target.kind === "canvas") {
     return null;
   }
   return (model, bodyFrom) => {
-    const held = heldTarget(main, target, arrow, sole, model, bodyFrom);
+    // A line landing during the verify counts as one before it.
+    noteDuplicates(open, model);
+    const held = heldTarget(main, target, arrow, open.sole, model, bodyFrom);
     if (typeof held === "string") {
       return { refused: held === "stale" ? "arrowChanged" : held };
     }
@@ -505,7 +516,7 @@ function opFor(
 async function commitNow(open: OpenField, way: Way): Promise<void> {
   const { main, el, target } = open;
   const typed = tidyLabel(el.value);
-  const op = opFor(main, target, open.arrow, open.sole, typed);
+  const op = opFor(main, open, typed);
   // What was typed counts against the label as it stands now, so the old name
   // typed back over a peer's rename is written. The op answers no-op on the same.
   if (op === null || !open.typed || (target.kind === "node" && typed === "")) {
@@ -607,6 +618,7 @@ function reconcile(main: EditorView): void {
     // No reading of it now: the verdict decides, and the field waits.
     return;
   }
+  noteDuplicates(open, model);
   const held =
     fence === null
       ? target
@@ -1028,12 +1040,12 @@ const rawNoteTheme = EditorView.baseTheme({
  * outside the layer says so (R97).
  */
 async function commitForRaw(open: OpenField): Promise<void> {
-  const { main, el, target, anchor, arrow, sole } = open;
+  const { main, el, target, anchor, arrow } = open;
   fields.delete(main);
   const typed = tidyLabel(el.value);
   el.remove();
   syncGuards(main);
-  const op = opFor(main, target, arrow, sole, typed);
+  const op = opFor(main, open, typed);
   const refused =
     op === null || !open.typed || (target.kind === "node" && typed === "")
       ? null
@@ -1045,11 +1057,11 @@ async function commitForRaw(open: OpenField): Promise<void> {
     return;
   }
   const place = nextAnchorTicket();
-  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. Leaving asks first, and leaving again goes without it.`;
+  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. Leaving is stopped once. Leaving again goes without it.`;
   rawDrafts.set(main, {
     target,
     arrow,
-    sole,
+    sole: open.sole,
     place,
     baseline: open.baseline,
     draft: el.value,
@@ -1101,7 +1113,7 @@ function restoreRawDraft(main: EditorView): void {
     !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
   ) {
     // Text under the caret, or a verdict to come: the next change of those tries.
-    const waiting = `"${raw.draft}" comes back in its field when this diagram draws: move the caret out of it. Leaving asks first, and leaving again goes without it.`;
+    const waiting = `"${raw.draft}" comes back in its field when this diagram draws: move the caret out of it. Leaving is stopped once. Leaving again goes without it.`;
     if (main.state.field(rawNote, false) !== waiting) {
       main.dispatch({ effects: rawNoteShown.of(waiting) });
     }
@@ -1151,6 +1163,9 @@ function hasDraft(open: OpenField): boolean {
   );
 }
 
+const LOST_TEXT =
+  "block max-h-40 w-full overflow-auto wrap-anywhere whitespace-pre-wrap select-all";
+
 /**
  * A draft went with no way to keep it. Outside the editor, which may be gone, and
  * with no timer: the person has to be able to read and copy it.
@@ -1165,7 +1180,8 @@ function showLostDraft(main: EditorView, text: string): void {
   sentence.textContent =
     "The name you were typing in a diagram was not saved. Copy it if you need it:";
   const kept = doc.createElement("q");
-  kept.className = "select-all";
+  // Its own scroller, so a long text leaves the sentence and Dismiss in the window.
+  kept.className = LOST_TEXT;
   kept.textContent = text;
   const close = doc.createElement("button");
   close.type = "button";

@@ -1300,6 +1300,8 @@ describe("a refused draft under Raw has an end (N3)", () => {
   it("says how to leave, and a second try leaves, naming the text", async () => {
     const view = await under();
     expect(note(view)).toContain("again");
+    expect(note(view)).toContain("stopped once");
+    expect(note(view)).not.toContain("asks");
     const went = vi.fn();
     const link = document.createElement("a");
     link.href = "#x";
