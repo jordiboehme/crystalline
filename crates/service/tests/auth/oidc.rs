@@ -2252,14 +2252,10 @@ async fn the_identity_link_routes_need_a_session() {
     );
 }
 
-/// The account cap is respected, and the refusal is the operator-facing 403
-/// that names the setting rather than a 500.
-///
-/// The status is what this pins: the mapping reads the store's own sentence,
-/// so a reworded cap message would silently turn an operator's 403 into an
-/// unexplained server error, and nothing else in the suite would notice.
+/// The account cap is respected. The person reads a plain 403 on a page, and the
+/// sentence that names the setting goes to the log.
 #[tokio::test]
-async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
+async fn a_sign_in_past_the_account_cap_is_refused_in_plain_words() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::build_capped(
         Some(OidcConfig {
@@ -2280,7 +2276,8 @@ async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
     let refused = ctx.sign_in().await;
     assert_eq!(refused.status(), 403);
     let body = refused.text().await.unwrap();
-    assert!(body.contains("auth.max_users"), "{body}");
+    assert!(body.contains("Ask an admin"), "{body}");
+    assert!(!body.contains("auth.max_users"), "{body}");
     assert!(
         ctx.user("ada.lovelace").await.is_none(),
         "a refused provisioning leaves no account behind"

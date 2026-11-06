@@ -273,6 +273,17 @@ pub(crate) async fn clear_name_for_new_account(
     if state.auth.user(&account).await?.is_some() {
         return Ok(());
     }
+    // The step deletes what is saved under the name, and the bot's token is saved
+    // under this one. Only an admin who adds that account may do that, not a
+    // stranger's first sign-in.
+    if !admin_reads && state.engine.config().github_agent_identity() == Some(account.as_str()) {
+        tracing::warn!(
+            "a first sign-in under '{account}' was refused: github.agent_identity names it, so an admin adds that account"
+        );
+        return Err(ApiError::conflict(
+            crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN,
+        ));
+    }
     let Err(refusal) = state.engine.clear_name_for_new_account(&account).await else {
         return Ok(());
     };
@@ -283,6 +294,13 @@ pub(crate) async fn clear_name_for_new_account(
         (_, true) => ApiError::internal(refusal.admin_sentence()),
         (_, false) => ApiError::conflict(crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN),
     })
+}
+
+/// The refusal a person reads at a first sign-in past the account cap. The store's
+/// sentence names the setting and the fix, so it goes to the log for the operator.
+pub(crate) fn account_cap_refusal(err: &anyhow::Error) -> ApiError {
+    tracing::warn!("a first sign-in was refused: {err:#}");
+    ApiError::forbidden(crystalline_core::account::NEW_ACCOUNT_CAP_REACHED)
 }
 
 /// A first sign-in's provisioning with the same step before it. The store picks

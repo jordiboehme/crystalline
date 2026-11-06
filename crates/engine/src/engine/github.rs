@@ -364,6 +364,13 @@ impl Engine {
     /// `github.enabled` off still reports the connection and says so in its
     /// note. Connecting and enabling are independent and either order works.
     pub async fn configure_snapshot(&self) -> Result<Value> {
+        self.configure_snapshot_for(true).await
+    }
+
+    /// [`Engine::configure_snapshot`] for who reads it. The page is open to every
+    /// caller, and the App's own sentence holds a command line, a setting and a
+    /// host, so anybody but an admin or the machine owner reads the plain one.
+    pub async fn configure_snapshot_for(&self, admin: bool) -> Result<Value> {
         if !self.github_enabled() {
             return self.configure_snapshot_with(json!({
                 "github_enabled": false,
@@ -373,7 +380,11 @@ impl Engine {
         let mut github = self.configure_connection_block().await?;
         // Read only, and from what this engine already holds: no secret, and
         // no request to GitHub, since agents call configure often.
-        github["app"] = json!(self.github_app_local_status());
+        github["app"] = json!(if admin {
+            self.github_app_local_status()
+        } else {
+            self.github_app_local_status_plain()
+        });
         self.configure_snapshot_with(github)
     }
 

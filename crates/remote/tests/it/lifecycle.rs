@@ -10787,6 +10787,58 @@ async fn a_share_with_no_login_to_name_records_none() {
     );
 }
 
+/// A record with no author yet (shared before logins were recorded, or on a
+/// credential that names nobody) takes the first login that can name itself, and
+/// keeps it after that. Both ways a share can reach an open record.
+#[tokio::test]
+async fn a_record_with_no_author_takes_the_first_login() {
+    let mock = MockProvider::new();
+    let (sub, _first) = shared_once(&mock).await;
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].author_login = None;
+    state.save(&sub.state_dir).unwrap();
+    let share = |login: &'static str, stacks: bool, proposal: Option<u64>| {
+        let (mock, sub) = (&mock, &sub);
+        async move {
+            propose(
+                mock,
+                &spec(),
+                &sub.domain_root,
+                "eng",
+                &sub.state_dir,
+                ShareOptions {
+                    proposal,
+                    stacks_allowed: stacks,
+                    author_login: Some(login),
+                    sharing: Sharing::Proposal,
+                    ..ShareOptions::default()
+                },
+            )
+            .await
+            .expect("the open proposal is updated")
+        }
+    };
+    let author = |sub: &Subscribed| load_state(&sub.state_dir).proposals[0].author_login.clone();
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    share("bob", false, None).await;
+    assert_eq!(author(&sub).as_deref(), Some("bob"));
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    share("carol", false, None).await;
+    assert_eq!(author(&sub).as_deref(), Some("bob"), "the first one stays");
+
+    // The amend's own path, on a chain.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].author_login = None;
+    state.save(&sub.state_dir).unwrap();
+    write(&sub.domain_root.join("notes/a.md"), b"amended\n");
+    updated(amend_share_as(&mock, &sub, layers[0].number, Some("dave")).await);
+    assert_eq!(author(&sub).as_deref(), Some("dave"));
+}
+
 #[tokio::test]
 async fn updating_the_living_proposal_never_changes_its_author() {
     let mock = MockProvider::new();

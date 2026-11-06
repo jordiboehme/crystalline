@@ -92,6 +92,16 @@ async fn case_with_auth(
     now: Arc<std::sync::Mutex<std::time::Instant>>,
     connect_auth: Option<Arc<crate::support::StubConnectAuth>>,
 ) -> Case {
+    case_full(app, key, now, connect_auth, None).await
+}
+
+async fn case_full(
+    app: App,
+    key: Option<&str>,
+    now: Arc<std::sync::Mutex<std::time::Instant>>,
+    connect_auth: Option<Arc<crate::support::StubConnectAuth>>,
+    mcp_auth: Option<bool>,
+) -> Case {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (forge, url) = spawn_forge(
@@ -113,6 +123,7 @@ async fn case_with_auth(
         }),
         auth: Some(AuthConfig {
             oauth: Some(false),
+            mcp: mcp_auth,
             ..AuthConfig::default()
         }),
         ..GlobalConfig::default()
@@ -1822,4 +1833,98 @@ async fn an_unlinked_agent_account_hears_it_cannot_share_at_the_take() {
     if let Ok(take) = take {
         assert!(take["share_refused"].is_null(), "{take}");
     }
+}
+
+/// Bare `configure` over MCP is the last door to the App's own sentence: a person
+/// who is not an admin reads the plain one, with no command line, setting or host.
+/// An admin keeps the full text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bare_configure_gives_a_non_admin_the_plain_app_sentence() {
+    use super::github_governed::Mcp;
+    let fx = case_full(
+        App::Refused,
+        None,
+        Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        None,
+        Some(true),
+    )
+    .await;
+    let editor = fx.auth.issue_mcp_token("ada", "t").await.unwrap().token;
+    let mcp = Mcp::open(fx.addr, Some(editor)).await.unwrap();
+    let answer = mcp.call("configure", json!({})).await.unwrap();
+    assert!(answer.contains("cannot be used right now"), "{answer}");
+    assert!(!answer.contains("save the App again"), "{answer}");
+    assert!(!answer.contains("saved App belongs"), "{answer}");
+
+    let admin = fx.auth.issue_mcp_token("root", "t").await.unwrap().token;
+    let mcp = Mcp::open(fx.addr, Some(admin)).await.unwrap();
+    let answer = mcp.call("configure", json!({})).await.unwrap();
+    assert!(answer.contains("save the App again"), "{answer}");
+}
+
+/// The step before an account deletes what is saved under the name. A stranger's
+/// first sign-in under the name `github.agent_identity` holds must not delete the
+/// bot's token: only an admin who adds that account may. It is refused instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_sign_in_under_the_agent_identity_leaves_its_token_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            agent_identity: Some("bot".to_string()),
+            ..GitHubConfig::default()
+        }),
+        auth: Some(AuthConfig {
+            oauth: Some(false),
+            trusted_header: Some("x-remote-user".to_string()),
+            ..AuthConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    let config_path = tmp.path().join("config.yaml");
+    save_yaml(&config_path, &cfg).unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg,
+            None,
+            Some(config_path),
+        )
+        .with_origins_dir(tmp.path().join("origins"))
+        .with_state_dir(tmp.path().to_path_buf())
+        .with_token_store_dir(tmp.path().join("tokens"))
+        .with_env_overlay(EnvOverlay::default()),
+    );
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let router = http_router(
+        eng.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    leave_token(tmp.path(), "bot");
+    let me = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("x-remote-user", "bot")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), 409);
+    assert!(token_file(tmp.path(), "bot").exists(), "the bot's token");
+    assert!(auth.user("bot").await.unwrap().is_none());
 }

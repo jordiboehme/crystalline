@@ -40,3 +40,8 @@ impl NewAccountRefusal {
 /// a name: it names neither who held the name nor what they left.
 pub const NEW_ACCOUNT_ASK_AN_ADMIN: &str =
     "An account cannot be made under this name yet. Ask an admin of this instance.";
+
+/// What a person who is not an admin reads when a first sign-in meets the account
+/// cap. The sentence that names the setting goes to the log.
+pub const NEW_ACCOUNT_CAP_REACHED: &str =
+    "This instance cannot take a new account right now. Ask an admin of this instance.";

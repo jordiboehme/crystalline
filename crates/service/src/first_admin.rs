@@ -208,13 +208,22 @@ pub(crate) async fn seed_from_environment(
     if !accounts_exist
         && outcome.is_ok()
         && let Ok(account) = crystalline_identity::auth_store::normalize_new_account_name(&name)
-        && let Err(refusal) = engine.clear_name_for_new_account(&account).await
     {
-        tracing::error!(
-            "the admin '{account}' from the environment was not created: {}",
-            refusal.admin_sentence()
-        );
-        return Ok(None);
+        if let Err(refusal) = engine.clear_name_for_new_account(&account).await {
+            tracing::error!(
+                "the admin '{account}' from the environment was not created: {}",
+                refusal.admin_sentence()
+            );
+            return Ok(None);
+        }
+        // The engine has no accounts handle yet at this point of a start, so the
+        // step above could not end the links the old person gave. This store can.
+        if let Err(e) = store.end_overlay_grants_of_owner(&account).await {
+            tracing::error!(
+                "the admin '{account}' from the environment was not created: the draft links under this name could not be ended ({e:#})"
+            );
+            return Ok(None);
+        }
     }
     let seeded = seed(&store, outcome).await;
     drop(store);

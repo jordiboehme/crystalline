@@ -401,7 +401,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                     println!("{error}");
                 }
                 let domains = report["domains"].as_array().cloned().unwrap_or_default();
-                if domains.is_empty() {
+                if domains.is_empty() && report["error"].is_null() {
                     println!("'{account}' holds no drafts.");
                 }
                 for row in domains {

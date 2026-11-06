@@ -956,8 +956,8 @@ async fn trusted_header_provisioning_is_capped() {
     );
     let body: serde_json::Value = refused.json().await.unwrap();
     assert!(
-        body["detail"].as_str().unwrap().contains("auth.max_users"),
-        "the refusal names the setting: {body}"
+        !body["detail"].as_str().unwrap().contains("auth.max_users"),
+        "a person reads plain words, and the setting goes to the log: {body}"
     );
 
     // The existing account still resolves, whatever the count-vs-cap state.
@@ -1216,8 +1216,8 @@ async fn proxy_header_provisioning_is_capped() {
     assert_eq!(refused.status(), 403);
     let body: serde_json::Value = refused.json().await.unwrap();
     assert!(
-        body["detail"].as_str().unwrap().contains("auth.max_users"),
-        "the refusal names the setting: {body}"
+        !body["detail"].as_str().unwrap().contains("auth.max_users"),
+        "a person reads plain words, and the setting goes to the log: {body}"
     );
 
     let still = client()

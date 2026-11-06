@@ -141,14 +141,15 @@ function UsersPanel() {
 
   const endDrafts = useMutation({
     mutationFn: discardUserDrafts,
-    onSuccess: (domains, name) => {
+    onSuccess: ({ domains, error }, name) => {
       setNotice({
         kind:
+          error ||
           domains.some((row) => row.error ?? row.not_hosted) ||
           domains.some((row) => row.left.length > 0)
             ? "problem"
             : "done",
-        text: endedDraftsText(name, domains),
+        text: endedDraftsText(name, domains, error),
       });
     },
     onError: (error: Error) => {
@@ -272,9 +273,13 @@ function UsersPanel() {
 }
 
 /** What ending a name's drafts did, in one sentence per domain. */
-function endedDraftsText(name: string, domains: DiscardedDrafts[]): string {
+function endedDraftsText(
+  name: string,
+  domains: DiscardedDrafts[],
+  error?: string,
+): string {
   if (domains.length === 0) {
-    return `${name} holds no drafts.`;
+    return error ? `${error}.` : `${name} holds no drafts.`;
   }
   const lines = domains.map((row) => {
     const parts = [`${row.domain}: ${row.discarded} ended`];
@@ -289,7 +294,8 @@ function endedDraftsText(name: string, domains: DiscardedDrafts[]): string {
     }
     return parts.join(", ");
   });
-  return `Drafts under ${name}. ${lines.join(". ")}.`;
+  const also = error ? ` ${error}.` : "";
+  return `Drafts under ${name}. ${lines.join(". ")}.${also}`;
 }
 
 /**

@@ -172,6 +172,27 @@ describe("the user admin screen", () => {
     expect(said).toHaveTextContent("disk full");
   });
 
+  it("does not say a name holds no drafts when its kept texts could not be read", async () => {
+    const user = userEvent.setup();
+    serveAs("admin", {
+      "/users/gone/drafts": () => ({
+        account: "gone",
+        domains: [],
+        error: "the kept texts of domain 'team' could not be read",
+      }),
+    });
+    renderApp("/users");
+    await user.type(
+      await screen.findByLabelText("Removed account's name"),
+      "gone",
+    );
+    await user.type(screen.getByLabelText("Type the name again"), "gone");
+    await user.click(screen.getByRole("button", { name: "End these drafts" }));
+    const said = await screen.findByText(/could not be read/);
+    expect(said).toHaveAttribute("role", "alert");
+    expect(screen.queryByText(/holds no drafts/)).toBeNull();
+  });
+
   it("shows the server's refusal for a name with an account", async () => {
     const user = userEvent.setup();
     serveAs("admin", {

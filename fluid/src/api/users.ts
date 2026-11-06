@@ -82,10 +82,13 @@ export interface DiscardedDrafts {
  */
 export async function discardUserDrafts(
   name: string,
-): Promise<DiscardedDrafts[]> {
-  const report = await api<{ domains?: DiscardedDrafts[] }>(
+): Promise<{ domains: DiscardedDrafts[]; error?: string }> {
+  const report = await api<{ domains?: DiscardedDrafts[]; error?: string }>(
     `/users/${encodeSegment(name)}/drafts`,
     { method: "DELETE" },
   );
-  return report.domains ?? [];
+  return {
+    domains: report.domains ?? [],
+    ...(report.error ? { error: report.error } : {}),
+  };
 }

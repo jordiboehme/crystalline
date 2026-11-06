@@ -4105,7 +4105,15 @@ impl McpServer {
         // announced it, and reports what applied before it stopped.
         self.apply_settings(&p).await?;
 
-        let mut snapshot = self.engine.configure_snapshot().await.map_err(to_error)?;
+        let admin = matches!(
+            self.scope_of(&ctx),
+            Scope::Unrestricted | Scope::User { admin: true, .. }
+        );
+        let mut snapshot = self
+            .engine
+            .configure_snapshot_for(admin)
+            .await
+            .map_err(to_error)?;
         snapshot["domain_settings"] = json!(CONFIGURE_DOMAIN_HINT);
         self.ok_list(snapshot)
     }

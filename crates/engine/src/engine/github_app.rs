@@ -1320,6 +1320,20 @@ impl Engine {
         }
     }
 
+    /// [`Engine::github_app_local_status`] for somebody who is not an admin: the
+    /// error in plain words.
+    pub(super) fn github_app_local_status_plain(&self) -> GithubAppStatus {
+        let mut status = self.github_app_local_status();
+        if status.error.is_some() {
+            let reason = match self.github_app_slot() {
+                AppSlot::Refused(detail) => app_refusal_with_reason(detail).0,
+                _ => super::github::LinkSetupReason::AppUnusable,
+            };
+            status.error = Some(reason.plain_sentence().to_string());
+        }
+        status
+    }
+
     /// The App as this engine runs it, with GitHub asked for its slug and
     /// the accounts it is installed on.
     pub async fn github_app_status(&self) -> GithubAppStatus {

@@ -624,9 +624,8 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
                 // apart by kind rather than by substring, so rewording the
                 // store's sentence cannot turn this into a 500.
                 match StoreRefusal::kind_of(&e) {
-                    Some(RefusalKind::CapReached | RefusalKind::InvalidName) => {
-                        ApiError::forbidden(format!("{e:#}"))
-                    }
+                    Some(RefusalKind::CapReached) => super::users_api::account_cap_refusal(&e),
+                    Some(RefusalKind::InvalidName) => ApiError::forbidden(format!("{e:#}")),
                     _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
@@ -1014,7 +1013,7 @@ async fn provision_forwarded_user(
             // the desired name is derived, so both are names by the time the
             // store sees them.
             match StoreRefusal::kind_of(&err) {
-                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                Some(RefusalKind::CapReached) => Err(super::users_api::account_cap_refusal(&err)),
                 _ => Err(ApiError::internal(format!("{err:#}"))),
             }
         }

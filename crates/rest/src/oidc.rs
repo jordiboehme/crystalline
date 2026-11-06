@@ -1607,8 +1607,8 @@ pub async fn callback(
         Ok(user) => user,
         // A person's browser lands here, and only an admin can act on this.
         Err(err)
-            if err.status == StatusCode::CONFLICT
-                && err.detail == crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN =>
+            if err.detail == crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN
+                || err.detail == crystalline_core::account::NEW_ACCOUNT_CAP_REACHED =>
         {
             let page = super::github_link::plain_page(err.status, "Sign in", &err.detail);
             return Ok((jar, super::auth::no_store(), page).into_response());
@@ -2117,7 +2117,7 @@ async fn resolve_oidc_identity(
             // by kind, so rewording the store's sentence cannot turn a 403 into
             // a 500.
             match StoreRefusal::kind_of(&err) {
-                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                Some(RefusalKind::CapReached) => Err(super::users_api::account_cap_refusal(&err)),
                 _ => Err(ApiError::internal(format!("{err:#}"))),
             }
         }
