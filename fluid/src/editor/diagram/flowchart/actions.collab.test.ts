@@ -603,6 +603,97 @@ describe("an arrow once chosen is that arrow or nothing (R94)", () => {
       expect(text(local)).toBe(page(AFTER));
     });
 
+    describe("the first writing key after the stop was moved (R102)", () => {
+      const moved = async () => {
+        const peers = await heldOnStop();
+        swapInOne(peers.peer);
+        peers.sync();
+        await settle();
+        expect(intentOf(peers.local)?.target).toEqual(NODE_A);
+        expect(active()).toBe(nodeOf(peers.local, "A"));
+        return peers;
+      };
+      const announced = (view: EditorView) =>
+        view.dom.querySelector(".cm-announced")?.textContent;
+
+      it("Delete takes nothing and says it again, and only a second Delete takes the box", async () => {
+        const { local } = await moved();
+        press("Delete");
+        await settle();
+        expect(text(local)).toBe(page(AFTER));
+        expect(noticeOf(local)).toBe(NOTICES.stale);
+        expect(announced(local)).toBe(NOTICES.stale);
+        press("Delete");
+        await vi.waitFor(() => {
+          expect(text(local)).not.toContain("|peers|");
+        });
+      });
+
+      it.each([
+        ["Enter", {}],
+        ["F2", {}],
+        ["F10", { shiftKey: true }],
+        ["ContextMenu", {}],
+      ] as const)("%s opens nothing the first time", async (key, options) => {
+        const { local } = await moved();
+        press(key, options);
+        await settle();
+        expect(
+          local.dom.querySelector(".cm-diagram-overlay textarea"),
+        ).toBeNull();
+        expect(menus()).toHaveLength(0);
+        expect(noticeOf(local)).toBe(NOTICES.stale);
+        press(key, options);
+        await settle();
+        const opened =
+          menus().length +
+          local.dom.querySelectorAll(".cm-diagram-overlay textarea").length;
+        expect(opened).toBe(1);
+      });
+
+      it("a held Delete does not use up the guard", async () => {
+        const { local } = await moved();
+        press("Delete", { repeat: true });
+        press("Delete");
+        await settle();
+        expect(text(local)).toBe(page(AFTER));
+      });
+
+      it("an arrow key clears it", async () => {
+        const { local } = await moved();
+        press("ArrowRight");
+        press("ArrowLeft");
+        await settle();
+        expect(active()).toBe(nodeOf(local, "A"));
+        press("Delete");
+        await vi.waitFor(() => {
+          expect(text(local)).not.toContain("|peers|");
+        });
+      });
+
+      it("a click is a choice, and clears it", async () => {
+        const { local } = await moved();
+        nodeOf(local, "A").dispatchEvent(
+          new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+        );
+        expect(menus()).toHaveLength(1);
+        press("Escape");
+        press("Delete");
+        await vi.waitFor(() => {
+          expect(text(local)).not.toContain("|peers|");
+        });
+      });
+
+      it("guards nothing on a stop the person walked to by themselves", async () => {
+        const { local } = await heldOnStop();
+        press("Home");
+        press("Delete");
+        await vi.waitFor(() => {
+          expect(text(local)).not.toContain("|mine|");
+        });
+      });
+    });
+
     it("follows its arrow when a twin lands above it", async () => {
       const { local, peer, sync } = await room(TWO);
       focusTarget(local, text(local).indexOf("```"), SECOND);

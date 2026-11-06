@@ -311,6 +311,14 @@ function boxStops(stops: TargetKey[]): TargetKey[] {
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
 const held = new WeakMap<EditorView, boolean>();
 
+/**
+ * A peer's edit took a stop off its arrow and put it on the arrow's start box. The
+ * person may press without having read that, so the next writing key does nothing but
+ * say it again, and no box goes that nobody chose. An arrow key, Escape or the pointer
+ * is a choice, and ends this (R102).
+ */
+const movedStops = new WeakSet<EditorView>();
+
 /** Connect mode ignored a menu key: that key's own `contextmenu` is no right click. */
 const keyMenuOwed = new WeakSet<EditorView>();
 
@@ -534,6 +542,7 @@ function onKey(
   const connecting = intent?.mode === "connect" && intent.anchor === from;
   if (key === "Escape") {
     if (!event.repeat) {
+      movedStops.delete(main);
       if (connecting) {
         connectHooks?.cancel(main);
       } else {
@@ -556,6 +565,11 @@ function onKey(
   if (connecting && (menu || remove || key === "F2")) {
     // By reading only: on Windows that key's `contextmenu` comes after its keyup.
     keyMenuOwed.add(main);
+    return true;
+  }
+  // A peer's edit moved the stop here, and this key was meant for the arrow (R102).
+  if (movedStops.delete(main) && !WALK_KEYS.has(key)) {
+    sayAt(main, from, "stale");
     return true;
   }
   if (staleNow(main, host, from)) {
@@ -874,6 +888,7 @@ const focusPlugin = ViewPlugin.fromClass(
      */
     readonly pressOutside = (event: Event): void => {
       keyMenuOwed.delete(this.view);
+      movedStops.delete(this.view);
       const el = event.target;
       if (
         el instanceof Element &&
@@ -885,6 +900,7 @@ const focusPlugin = ViewPlugin.fromClass(
       }
     };
     readonly click = (event: Event): void => {
+      movedStops.delete(this.view);
       const place = this.place(event);
       if (place === null) {
         return;
@@ -921,6 +937,7 @@ const focusPlugin = ViewPlugin.fromClass(
       );
     };
     readonly contextmenu = (event: Event): void => {
+      movedStops.delete(this.view);
       const place = this.place(event);
       // A page that takes no writes has no menu of ours, and keeps the browser's.
       if (place === null || !place.host.writable()) {
@@ -1209,6 +1226,7 @@ const focusPlugin = ViewPlugin.fromClass(
             target: { kind: "node", id: key.start },
           }),
         });
+        movedStops.add(view);
         sayAt(view, intent.anchor, "stale");
       } else if (!sameEdgeKey(now, key)) {
         hold.key = now;
