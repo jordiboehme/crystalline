@@ -203,7 +203,7 @@ jobs:
       # osv-scanner can name the crates inside a shipped binary or container
       # image long after the release. The install action fetches a prebuilt
       # binary and checks it against the SHA-256 in its manifest.
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-auditable@0.7.7
 
@@ -431,7 +431,7 @@ jobs:
       # before, never the unpinned cargo-binstall download.
       - name: Install cargo-deb
         if: matrix.musl
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-deb@3.8.0
           fallback: cargo-install

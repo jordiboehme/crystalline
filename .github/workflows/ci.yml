@@ -313,10 +313,11 @@ jobs:
         if: ${{ env.IDLE != 'true' }}
         run: rustup show
 
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         if: ${{ env.IDLE != 'true' }}
         with:
           tool: nextest@0.9.150
+          fallback: none
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ env.IDLE != 'true' }}
@@ -465,9 +466,10 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: nextest@0.9.150
+          fallback: none
 
       # Restores what the test legs saved on main and saves nothing.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
