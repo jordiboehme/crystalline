@@ -17,6 +17,13 @@ import { join } from "node:path";
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
 const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
 const DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
+// The picture is made in the browser and never asks the server, so the path has
+// no part in it, and the first run covers it. These journeys take minutes.
+test.skip(
+  Boolean(process.env.FLUID_E2E_BASE_PATH),
+  "the run without a path covers this",
+);
+
 const OUT = process.env.FLUID_PNG_OUT;
 
 const NOT_SHARP =
