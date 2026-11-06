@@ -559,7 +559,9 @@ impl Engine {
             .iter()
             .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
             .collect();
-        if let Some(refusal) = review::collision(domain, &folding, &base) {
+        if let Some(refusal) =
+            review::collision(domain, &folding, &base, disk_folds_case(root.as_deref()))
+        {
             return Err(EngineError::Conflict(refusal));
         }
 
@@ -649,7 +651,9 @@ impl Engine {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
         };
-        if let Some(refusal) = review::collision(domain, &folding, &base) {
+        if let Some(refusal) =
+            review::collision(domain, &folding, &base, disk_folds_case(root.as_deref()))
+        {
             // A fold that would switch the Reflection off has closed its rooms
             // with `switched_off` already, and nothing was folded. That is
             // harmless: each of those rooms saved its text first, and its
@@ -1559,6 +1563,20 @@ impl Engine {
 /// switches the Reflection of the domain at `root` off: the MANIFEST in the
 /// folder says `reflection: on` and the one the fold leaves does not (a
 /// deleted MANIFEST says nothing, so it is off too).
+/// Whether a domain folder's disk treats two spellings as one name, asked of the
+/// MANIFEST every file domain has. A folder that cannot answer reads as a disk
+/// that keeps them apart, which leaves the exact-path rule standing.
+fn disk_folds_case(root: Option<&Path>) -> bool {
+    root.is_some_and(|root| {
+        is_case_only_rename(
+            &root.join("MANIFEST.md"),
+            &root.join("manifest.md"),
+            "MANIFEST.md",
+            "manifest.md",
+        )
+    })
+}
+
 fn folds_switch_off(root: &Path, folding: &[&ActorDrafts]) -> bool {
     let landing = folding
         .iter()

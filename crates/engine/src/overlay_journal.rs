@@ -370,6 +370,23 @@ pub fn journal_clear(state_dir: &Path, domain: &str, actor: &str, path: &str) ->
     Ok(())
 }
 
+/// Drop only the sidecar of one actor's deletion at `path`, and any folder it
+/// leaves empty. For a deletion whose path is also where another of the actor's
+/// drafts is mirrored: on a disk that folds case `notes/x.md` and `Notes/x.md`
+/// are one file, and [`journal_clear`] would take that draft's only copy.
+pub fn journal_clear_tombstone(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<()> {
+    let file = entry_path(state_dir, domain, actor, path)?;
+    remove_entry_if_present(&tombstone_of(&file))?;
+    let stop = actor_dir(state_dir, domain, actor)?;
+    prune_empty(file.parent(), &stop);
+    Ok(())
+}
+
 /// Remove every folder from `from` up to and including `stop` that is empty,
 /// stopping at the first one that is not. Best effort: a folder that could not
 /// be read or removed is left where it is.

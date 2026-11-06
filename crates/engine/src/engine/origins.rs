@@ -64,6 +64,18 @@ fn team_marker_json() -> Value {
     json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
 }
 
+/// Put the case-only moves a share will not carry on its plan or its receipt.
+/// Nothing is added when there are none.
+fn note_unshared_spelling(answer: &mut Value, moves: &[Value]) {
+    if !moves.is_empty() {
+        answer["spelling_not_shared"] = json!(moves);
+        answer["spelling_note"] = json!(
+            "A share does not carry a change of letter case. The team's file keeps its name, \
+             and any new text lands there."
+        );
+    }
+}
+
 impl Engine {
     // --- origin (GitHub collaboration) ----------------------------------------
 
@@ -2273,7 +2285,7 @@ impl Engine {
             .or(files);
         // Read before the share, whose convergence may end these rows.
         let unshared_spelling = match drafting.as_deref() {
-            Some(who) => self.case_only_moves(domain, who).await?,
+            Some(who) => self.case_only_moves(domain, who, &state_dir).await?,
             None => Vec::new(),
         };
         match ops::propose(
@@ -2305,13 +2317,7 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
-                if !unshared_spelling.is_empty() {
-                    receipt["spelling_not_shared"] = json!(unshared_spelling);
-                    receipt["spelling_note"] = json!(
-                        "A share does not carry a change of letter case alone, on any platform: \
-                         the team's file keeps its spelling, and any new text lands there"
-                    );
-                }
+                note_unshared_spelling(&mut receipt, &unshared_spelling);
                 // Only an outcome that carried something to the team carried
                 // the marker; a refusal or a diverged proposal shared nothing,
                 // and the marker it wrote into the folder is taken back.
@@ -2421,8 +2427,18 @@ impl Engine {
 
     /// One actor's case-only moves in a domain: a tombstone at one spelling and
     /// a draft at another spelling of the same path. Sharing folds case, so
-    /// these are the moves whose new spelling a share will not carry.
-    async fn case_only_moves(&self, domain: &str, actor: &str) -> Result<Vec<Value>> {
+    /// these are the moves whose new spelling a share will not carry. The base
+    /// snapshot tells a move from two real files: it holds the old spelling and
+    /// not the new one.
+    async fn case_only_moves(
+        &self,
+        domain: &str,
+        actor: &str,
+        state_dir: &Path,
+    ) -> Result<Vec<Value>> {
+        let base = crystalline_remote::state::OriginState::load(state_dir)?
+            .map(|state| state.files)
+            .unwrap_or_default();
         let store = self.store.lock().await;
         let Some(domain_id) = store.domain_id(domain).await? else {
             return Ok(Vec::new());
@@ -2432,11 +2448,15 @@ impl Engine {
         let fold = crystalline_core::fold_path_case;
         Ok(entries
             .iter()
-            .filter(|from| from.tombstone)
+            .filter(|from| from.tombstone && base.contains_key(&from.path))
             .filter_map(|from| {
                 entries
                     .iter()
-                    .find(|to| !to.tombstone && fold(&to.path) == fold(&from.path))
+                    .find(|to| {
+                        !to.tombstone
+                            && fold(&to.path) == fold(&from.path)
+                            && !base.contains_key(&to.path)
+                    })
                     .map(|to| json!({ "from": from.path, "to": to.path }))
             })
             .collect())
@@ -2719,6 +2739,12 @@ impl Engine {
         // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);
+        // The same word the share's receipt will carry, so the dialog does not
+        // say the team has everything before the share either.
+        if let Some(who) = drafting.as_deref() {
+            let moves = self.case_only_moves(domain, who, &state_dir).await?;
+            note_unshared_spelling(&mut plan, &moves);
+        }
         Ok(plan)
     }
 

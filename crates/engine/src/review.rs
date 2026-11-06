@@ -322,14 +322,20 @@ pub(crate) fn choices(
 /// transfer to a fold, where alice's deletion frees an address for bob only
 /// if alice's deletion is being folded too. Here the deletions being folded
 /// are exactly the ones that free anything.
+///
+/// `folds_case` is whether the folder's disk treats two spellings as one name.
+/// There two people folding `Zed.md` and `zed.md` are folding one file; on a disk
+/// that keeps them apart they are two files, and both land. One actor's own pair
+/// is a case-only move and is no collision either way.
 pub(crate) fn collision(
     domain: &str,
     folding: &[&ActorDrafts],
     base: &[EngramDescriptor],
+    folds_case: bool,
 ) -> Option<String> {
     // Two actors folding one path: whoever went second would be the file,
     // which is not an answer either of them gave.
-    let mut owner: HashMap<&str, &str> = HashMap::new();
+    let mut owner: HashMap<String, (&str, &str)> = HashMap::new();
     for held in folding {
         // The rows and the files share one map, so one path two actors are
         // folding is refused in one sentence whichever kind of thing stands
@@ -341,11 +347,28 @@ pub(crate) fn collision(
             .map(|draft| draft.path.as_str())
             .chain(held.files.iter().map(|file| file.path.as_str()))
         {
-            if let Some(first) = owner.insert(path, held.actor.as_str()) {
+            let key = if folds_case {
+                crystalline_core::fold_path_case(path)
+            } else {
+                path.to_string()
+            };
+            let Some((first, first_path)) = owner.insert(key, (held.actor.as_str(), path)) else {
+                continue;
+            };
+            if first_path == path {
                 return Some(format!(
                     "'{first}' and '{}' are both drafting {path} in domain '{domain}', and only \
                      one of them can be the file: fold one of them and discard the other, or \
                      let them settle it between themselves first",
+                    held.actor
+                ));
+            }
+            if first != held.actor {
+                return Some(format!(
+                    "'{first}' is drafting {first_path} and '{}' is drafting {path} in domain \
+                     '{domain}'. This disk treats those two names as one file, so only one of \
+                     them can be the file: fold one of them and discard the other, or let them \
+                     settle it between themselves first",
                     held.actor
                 ));
             }

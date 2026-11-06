@@ -6535,6 +6535,22 @@ async fn a_case_only_move_of_a_team_file_folds_to_the_new_spelling() {
     }
 }
 
+/// This fixture's engine again over an empty index, as after a `reindex --wipe`:
+/// only the journal can bring the drafts back.
+async fn rebuilt_index(f: &Fixture) -> Arc<Engine> {
+    let config_path = f.root.join("config.yaml");
+    let config: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let rebuilt = Arc::new(
+        Engine::new(store, config, None, Some(config_path))
+            .with_state_dir(f.state.clone())
+            .with_origins_dir(f.origins.clone()),
+    );
+    rebuilt.sync(None).await.unwrap();
+    rebuilt
+}
+
 /// **A case-only move of a team file survives a rebuild of the index.** The
 /// journal is the only copy of the move, and it holds the tombstone beside the
 /// draft, so the rows come back as they were: the new spelling answers, with
@@ -6556,16 +6572,7 @@ async fn a_case_only_move_of_a_team_file_survives_a_rebuild() {
         wanted.sort();
         assert_eq!(journal, wanted, "{from} -> {to}, draft {draft}");
 
-        let config_path = f.root.join("config.yaml");
-        let config: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
-        let store: Arc<Mutex<dyn Store>> =
-            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
-        let rebuilt = Arc::new(
-            Engine::new(store, config, None, Some(config_path))
-                .with_state_dir(f.state.clone())
-                .with_origins_dir(f.origins.clone()),
-        );
-        rebuilt.sync(None).await.unwrap();
+        let rebuilt = rebuilt_index(&f).await;
 
         let read_back = rebuilt.read_engram(&read("note"), &alice).await.unwrap();
         assert_eq!(read_back["path"], to, "{from} -> {to}, draft {draft}");
@@ -6632,9 +6639,27 @@ async fn sharing_a_case_only_move_keeps_the_teams_file() {
         .move_engram(&draft_move("plan", "Plan.md"), &alice)
         .await
         .unwrap();
+    let plan = f
+        .engine
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+            crystalline_service::engine::PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert!(plan["spelling_note"].is_string(), "{plan}");
     let receipt = share(&f).await;
     assert_eq!(receipt["outcome"], "nothing_to_share", "{receipt}");
     names_the_move(&receipt);
+    assert_eq!(
+        receipt["spelling_note"],
+        "A share does not carry a change of letter case. The team's file keeps its name, and \
+         any new text lands there."
+    );
     assert!(f.domain_root("team").join("plan.md").is_file());
 
     let f = reviewed_direct_origin_fixture().await;
@@ -6789,6 +6814,195 @@ async fn a_draft_move_onto_another_spelling_of_a_team_file_is_refused() {
         .move_engram(&draft_move("a", "A.md"), &alice)
         .await
         .unwrap();
+}
+
+/// **Discarding the deletion half of a folder-only case move keeps her text.**
+///
+/// On a disk that folds case `notes/x.md` and `Notes/x.md` are one mirror file,
+/// which holds her draft while the deletion has a row and no sidecar. Ending the
+/// deletion's row must not take that file away: it is the only copy a rebuild
+/// can bring her text back from. Runs on either kind of disk, since a
+/// case-sensitive one keeps two mirrors and must keep the draft too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discarding_the_deletion_of_a_folder_case_move_keeps_her_text() {
+    let alice = account("alice");
+    let f = reviewed_origin_fixture().await;
+    let dir = f.domain_root("team").join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("x.md"),
+        "---\ntitle: X\ntype: note\nstatus: draft\npermalink: notes/x\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let mut edit = write_params("team", "X", "her body");
+    edit.folder = Some("notes".to_string());
+    edit.overwrite = true;
+    f.engine.write_engram_as(&edit, None, &alice).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("notes/x", "Notes/x.md"), &alice)
+        .await
+        .unwrap();
+
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "notes/x.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    let mirrored = crystalline_service::overlay_journal::journal_entries(&f.state, "team").entries;
+    assert!(
+        mirrored.iter().any(|entry| entry
+            .content
+            .as_deref()
+            .is_some_and(|t| t.contains("her body"))),
+        "the journal still holds her text: {mirrored:?}"
+    );
+    let rebuilt = rebuilt_index(&f).await;
+    let plan = rebuilt
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Preview,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan_entries(&plan, "alice").len(), 1, "{plan}");
+    // Where the disk folds case the mirror answers at the team's spelling, so
+    // the address reads her draft. On a disk that keeps them apart the draft
+    // stays at `Notes/x.md` and the address is still the team's file.
+    if f.root.join("TEAM").exists() {
+        let held = rebuilt.read_engram(&read("notes/x"), &alice).await.unwrap();
+        assert!(
+            held["content"].as_str().unwrap().contains("her body"),
+            "{held}"
+        );
+    }
+}
+
+/// **Two people folding two spellings of one new path do not silently lose one
+/// text.** On a disk that folds case those are one file, so the fold refuses as
+/// it does for two people on one exact path, and nothing is written. On a disk
+/// that keeps them apart they are two files, and both land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_people_folding_two_spellings_of_one_path() {
+    let (alice, bob) = (account("alice"), account("bob"));
+    let f = review_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::write(
+        root.join("a.md"),
+        "---\ntitle: A\ntype: note\nstatus: draft\npermalink: a\n---\n\na body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("a", "Zed.md"), &alice)
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(&write_params("team", "Zed", "bob body"), None, &bob)
+        .await
+        .unwrap();
+
+    let both = folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)]);
+    let folded = f
+        .engine
+        .set_review_mode("team", None, both, &Scope::Unrestricted)
+        .await;
+    if f.root.join("TEAM").exists() {
+        let refusal = folded.expect_err("one file cannot hold both").to_string();
+        assert!(
+            refusal.contains("Zed.md") && refusal.contains("zed.md"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("alice") && refusal.contains("bob"),
+            "{refusal}"
+        );
+        assert!(root.join("a.md").is_file(), "nothing was folded");
+        assert!(!root.join("zed.md").exists(), "nothing was folded");
+
+        // One of them folding on their own is no conflict.
+        f.engine
+            .set_review_mode(
+                "team",
+                None,
+                folds(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Discard)]),
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(root.join("Zed.md")).unwrap();
+        assert!(text.contains("a body"), "{text}");
+    } else {
+        folded.unwrap();
+        let (upper, lower) = (
+            std::fs::read_to_string(root.join("Zed.md")).unwrap(),
+            std::fs::read_to_string(root.join("zed.md")).unwrap(),
+        );
+        assert!(upper.contains("a body"), "{upper}");
+        assert!(lower.contains("bob body"), "{lower}");
+    }
+}
+
+/// **A second case move of her own file is told about her own file.** The other
+/// spelling is the team's file she already moved, not a different one, so the
+/// refusal says that and what to do. A real other file gets the plain sentence.
+#[tokio::test]
+async fn a_refused_case_move_names_what_the_other_spelling_really_is() {
+    let alice = account("alice");
+    let f = team_file_moved_by_case("note.md", "Note.md", false).await;
+    let third = f
+        .engine
+        .move_engram(&draft_move("note", "NOTE.md"), &alice)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        third,
+        "'NOTE.md' differs only in letter case from 'note.md', the team's file you \
+         already moved to 'Note.md'. Discard that move, then move it again."
+    );
+    let back = f
+        .engine
+        .move_engram(&draft_move("note", "note.md"), &alice)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        back,
+        "'note.md' is the team's file you already moved to 'Note.md'. Discard that \
+         move to go back."
+    );
+
+    let f = review_fixture().await;
+    for name in ["a", "b"] {
+        std::fs::write(
+            f.domain_root("team").join(format!("{name}.md")),
+            format!(
+                "---\ntitle: {name}\ntype: note\nstatus: draft\npermalink: {name}\n---\n\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+    let other = f
+        .engine
+        .move_engram(&draft_move("a", "B.md"), &alice)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        other,
+        "'B.md' differs only in letter case from 'b.md', which is already an engram \
+         in domain 'team'. macOS and Windows cannot hold the two, so pick another name."
+    );
 }
 
 /// One address claimed at two paths by two people is a collision the plan has

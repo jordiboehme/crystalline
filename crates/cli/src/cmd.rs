@@ -1036,9 +1036,12 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
             }
         }
         "nothing_to_share" => {
-            lines.push(format!(
-                "Nothing to share: '{domain}' already matches its origin."
-            ));
+            // Not "already matches" when a change of letter case did not travel.
+            lines.push(if data["spelling_note"].is_string() {
+                format!("Nothing to share in '{domain}'.")
+            } else {
+                format!("Nothing to share: '{domain}' already matches its origin.")
+            });
             lines.extend(skipped_large_lines(&data["skipped_large"]));
         }
         "conflicts_pending" => {
@@ -1060,6 +1063,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         other => lines.push(format!(
             "origin share '{domain}': unexpected outcome '{other}'"
         )),
+    }
+    if let Some(note) = data["spelling_note"].as_str() {
+        lines.push(note.to_string());
     }
     lines
 }
@@ -4469,6 +4475,37 @@ fn print_report(r: &crystalline_index::SyncReport) {
 #[cfg(test)]
 mod origin_share_tests {
     use super::origin_share_lines;
+
+    #[test]
+    fn a_share_says_when_a_spelling_did_not_travel() {
+        let note = "A share does not carry a change of letter case.";
+        let lines = origin_share_lines(
+            "team",
+            &serde_json::json!({ "outcome": "nothing_to_share", "spelling_note": note }),
+        );
+        assert_eq!(
+            lines,
+            vec!["Nothing to share in 'team'.".to_string(), note.to_string()]
+        );
+
+        let lines = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "committed", "sha": "abc1234def", "branch": "main",
+                "spelling_note": note,
+            }),
+        );
+        assert_eq!(lines.last().map(String::as_str), Some(note), "{lines:?}");
+
+        let lines = origin_share_lines(
+            "team",
+            &serde_json::json!({ "outcome": "nothing_to_share" }),
+        );
+        assert_eq!(
+            lines,
+            vec!["Nothing to share: 'team' already matches its origin.".to_string()]
+        );
+    }
     use serde_json::json;
 
     #[test]

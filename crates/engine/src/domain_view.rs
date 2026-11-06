@@ -921,13 +921,38 @@ impl<'a> DomainView<'a> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
         let state_dir = self.engine.journal_state_dir()?;
-        crate::overlay_journal::journal_clear(&state_dir, domain, actor, path).map_err(
-            |source| EngineError::Io {
-                path: state_dir.display().to_string(),
-                source,
-            },
-        )?;
         let store = self.engine.store();
+        // A deletion with a draft of this actor at another spelling of its path
+        // gives up its sidecar and nothing else. That draft may be mirrored in
+        // the very file this path names, where a folder-only case move leaves
+        // it, and the mirror is the one copy a rebuild can bring it back from.
+        let keeps_mirror = {
+            let store = store.lock().await;
+            let is_deletion = store
+                .overlay_entry(domain_id, actor, path)
+                .await?
+                .is_some_and(|entry| entry.tombstone);
+            let folded = crystalline_core::fold_path_case(path);
+            is_deletion
+                && store
+                    .overlay_entries(domain_id, actor)
+                    .await?
+                    .iter()
+                    .any(|entry| {
+                        !entry.tombstone
+                            && entry.path != path
+                            && crystalline_core::fold_path_case(&entry.path) == folded
+                    })
+        };
+        let mirrored = if keeps_mirror {
+            crate::overlay_journal::journal_clear_tombstone(&state_dir, domain, actor, path)
+        } else {
+            crate::overlay_journal::journal_clear(&state_dir, domain, actor, path)
+        };
+        mirrored.map_err(|source| EngineError::Io {
+            path: state_dir.display().to_string(),
+            source,
+        })?;
         let store = store.lock().await;
         store.begin().await?;
         let done = async {
@@ -1273,50 +1298,67 @@ impl<'a> DomainView<'a> {
         let actor = self.writing_actor()?;
         let store = self.engine.store();
         let store = store.lock().await;
-        let taken = store
-            .overlay_entry(src.domain_id, actor, dest_rel)
-            .await?
-            .map(|entry| !entry.tombstone)
-            .unwrap_or(false)
-            || store
-                .list_engrams(&p.domain, Some(dest_rel), None)
-                .await?
+        let drafts = store.overlay_entries(src.domain_id, actor).await?;
+        let team = store.list_engrams(&p.domain, None, None).await?;
+        // A path differing only in case from the source, which this actor
+        // already deleted, is not somebody else's: it is the team's file this
+        // draft was moved from, and the sentence has to say so.
+        let folded = crystalline_core::fold_path_case(dest_rel);
+        let same_name =
+            |path: &str| path != src.path && crystalline_core::fold_path_case(path) == folded;
+        let moved_from = |path: &str| {
+            drafts
                 .iter()
-                .any(|found| found.path == dest_rel);
-        if taken {
-            return Err(EngineError::Conflict(format!(
-                "'{dest_rel}' already holds an engram in domain '{}'",
-                p.domain
-            )));
+                .any(|entry| entry.tombstone && entry.path == path)
+                && crystalline_core::fold_path_case(&src.path) == folded
+        };
+        let exact = drafts
+            .iter()
+            .any(|entry| !entry.tombstone && entry.path == dest_rel)
+            || team.iter().any(|found| found.path == dest_rel);
+        if exact {
+            return Err(EngineError::Conflict(if moved_from(dest_rel) {
+                format!(
+                    "'{dest_rel}' is the team's file you already moved to '{}'. Discard that \
+                     move to go back.",
+                    src.path
+                )
+            } else {
+                format!(
+                    "'{dest_rel}' already holds an engram in domain '{}'",
+                    p.domain
+                )
+            }));
         }
         // Another spelling of a path somebody else stands at is taken too: no
         // macOS or Windows checkout can hold the two, and on such a disk the
-        // fold would write over that file with no warning. Its own other
-        // spelling is the one that is free, since that is a rename of itself.
-        let folded = crystalline_core::fold_path_case(dest_rel);
-        let other_spelling =
-            |path: &str| path != src.path && crystalline_core::fold_path_case(path) == folded;
-        let drafted = store
-            .overlay_entries(src.domain_id, actor)
-            .await?
-            .into_iter()
-            .find(|entry| !entry.tombstone && other_spelling(&entry.path))
-            .map(|entry| entry.path);
-        let held = match drafted {
-            Some(path) => Some(path),
-            None => store
-                .list_engrams(&p.domain, None, None)
-                .await?
-                .into_iter()
-                .find(|found| other_spelling(&found.path))
-                .map(|found| found.path),
-        };
+        // fold would write over that file with no warning. The source's own
+        // other spelling is the one that is free, since that is a rename of
+        // itself.
+        let held = drafts
+            .iter()
+            .find(|entry| !entry.tombstone && same_name(&entry.path))
+            .map(|entry| entry.path.as_str())
+            .or_else(|| {
+                team.iter()
+                    .find(|found| same_name(&found.path))
+                    .map(|found| found.path.as_str())
+            });
         if let Some(held) = held {
-            return Err(EngineError::Conflict(format!(
-                "'{dest_rel}' is another spelling of '{held}', which already holds an engram in \
-                 domain '{}', and a disk that folds case cannot hold the two",
-                p.domain
-            )));
+            return Err(EngineError::Conflict(if moved_from(held) {
+                format!(
+                    "'{dest_rel}' differs only in letter case from '{held}', the team's file you \
+                     already moved to '{}'. Discard that move, then move it again.",
+                    src.path
+                )
+            } else {
+                format!(
+                    "'{dest_rel}' differs only in letter case from '{held}', which is already an \
+                     engram in domain '{}'. macOS and Windows cannot hold the two, so pick \
+                     another name.",
+                    p.domain
+                )
+            }));
         }
         Ok(())
     }
