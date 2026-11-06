@@ -25,18 +25,14 @@ import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Range, Transaction } from "@codemirror/state";
 import { MapMode, StateEffect, StateField } from "@codemirror/state";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
-import {
-  Decoration,
-  EditorView,
-  ViewPlugin,
-  WidgetType,
-} from "@codemirror/view";
+import { Decoration, EditorView, ViewPlugin } from "@codemirror/view";
 
 import { parseAdvanced } from "../parseProgress";
 import { diagramKindOf, EDITABLE_KINDS } from "./draws";
 import { mermaidFences } from "./fence";
 import { closeDiagramIntent } from "./intent";
 import { requestVerdict, verdictFor } from "./verdict";
+import { DiagramWidget } from "./widget";
 
 /** A fence the layer draws, at document positions. */
 export interface DrawnFence {
@@ -69,6 +65,11 @@ export const pointerDown = StateEffect.define<boolean>();
 
 interface DiagramFieldValue {
   fences: DrawnFence[];
+  /**
+   * Each drawn fence's lasting identity by its `from`. It follows the fence
+   * through changes, so a widget can tell its own box from another fence's.
+   */
+  keys: ReadonlyMap<number, number>;
   /** Whether a pointer selection was running at the last build. */
   pointer: boolean;
   decorations: DecorationSet;
@@ -78,31 +79,7 @@ interface DiagramFieldValue {
   exempt: number[];
 }
 
-/** The placeholder until Task 9's widget: the skeleton box the fence became. */
-class DiagramPlaceholder extends WidgetType {
-  readonly body: string;
-
-  constructor(body: string) {
-    super();
-    this.body = body;
-  }
-
-  override eq(other: DiagramPlaceholder): boolean {
-    return other.body === this.body;
-  }
-
-  override toDOM(): HTMLElement {
-    const box = document.createElement("div");
-    box.className = "cm-diagram";
-    box.setAttribute("role", "group");
-    box.setAttribute("aria-label", "Flowchart");
-    return box;
-  }
-
-  override ignoreEvent(): boolean {
-    return true;
-  }
-}
+let nextKey = 0;
 
 /** The fences of `state` the layer could draw, whatever their verdict. */
 export function candidateFences(state: EditorState): DrawnFence[] {
@@ -147,12 +124,22 @@ export function carryFences(
   return carried;
 }
 
-function decorate(state: EditorState, fences: readonly DrawnFence[]) {
+function decorate(
+  state: EditorState,
+  fences: readonly DrawnFence[],
+  keys: ReadonlyMap<number, number>,
+) {
   const doc = state.doc;
+  const dark = state.facet(EditorView.darkTheme);
   const ranges: Range<Decoration>[] = fences.map((fence) =>
     Decoration.replace({
       block: true,
-      widget: new DiagramPlaceholder(fence.body),
+      widget: new DiagramWidget(
+        fence.body,
+        dark,
+        keys.get(fence.from) ?? 0,
+        doc.lineAt(fence.from).number + 1,
+      ),
     }).range(doc.lineAt(fence.from).from, doc.lineAt(fence.to).to),
   );
   return Decoration.set(ranges, true);
@@ -160,7 +147,7 @@ function decorate(state: EditorState, fences: readonly DrawnFence[]) {
 
 function build(
   state: EditorState,
-  wasDrawn: (from: number) => boolean,
+  drawnBefore: ReadonlyMap<number, number>,
   carried: (candidates: DrawnFence[]) => DrawnFence[],
   exempt: readonly number[],
   pointer: boolean,
@@ -170,7 +157,7 @@ function build(
   let held = false;
   const fences = candidates.filter((fence) => {
     const verdict = verdictFor(fence.body);
-    if (wasDrawn(fence.from)) {
+    if (drawnBefore.has(fence.from)) {
       // An edit keeps a drawn fence drawn, whatever its new verdict is until
       // it arrives; a refusal takes it back.
       return verdict === undefined || verdict.ok;
@@ -192,15 +179,21 @@ function build(
   });
   fences.push(...carried(candidates));
   fences.sort((a, b) => a.from - b.from);
-  const drawn = new Set(fences.map((fence) => fence.from));
+  const keys = new Map(
+    fences.map((fence) => [
+      fence.from,
+      drawnBefore.get(fence.from) ?? (nextKey += 1),
+    ]),
+  );
   return {
     fences,
-    decorations: decorate(state, fences),
+    keys,
+    decorations: decorate(state, fences, keys),
     pointer,
     held,
     exempt: exempt.filter(
       (from) =>
-        !drawn.has(from) && candidates.some((fence) => fence.from === from),
+        !keys.has(from) && candidates.some((fence) => fence.from === from),
     ),
   };
 }
@@ -219,14 +212,7 @@ function placeAfter(tr: Transaction, from: number): number | null {
 }
 
 export const diagramField = StateField.define<DiagramFieldValue>({
-  create: (state) =>
-    build(
-      state,
-      () => false,
-      () => [],
-      [],
-      false,
-    ),
+  create: (state) => build(state, new Map(), () => [], [], false),
   update: (value, tr) => {
     let pointer = value.pointer;
     for (const effect of tr.effects) {
@@ -247,16 +233,22 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       pointer === value.pointer &&
       !(value.held && tr.selection !== undefined) &&
       exemptNow.length === value.exempt.length &&
-      !tr.effects.some((effect) => effect.is(drawUnderCaret))
+      !tr.effects.some((effect) => effect.is(drawUnderCaret)) &&
+      tr.startState.facet(EditorView.darkTheme) ===
+        tr.state.facet(EditorView.darkTheme)
     ) {
       return value;
     }
-    const before = new Set(
-      value.fences.flatMap((f) => placeAfter(tr, f.from) ?? []),
-    );
+    const before = new Map<number, number>();
+    for (const [from, key] of value.keys) {
+      const at = placeAfter(tr, from);
+      if (at !== null) {
+        before.set(at, key);
+      }
+    }
     return build(
       tr.state,
-      (from) => before.has(from),
+      before,
       (candidates) =>
         carryFences(value.fences, tr, syntaxTree(tr.state).length, candidates),
       exemptNow,
@@ -448,10 +440,3 @@ export const pointerWatcher = ViewPlugin.fromClass(
     }
   },
 );
-
-export const diagramTheme = EditorView.baseTheme({
-  ".cm-diagram": {
-    minHeight: "3rem",
-    padding: "0.5rem 0.75rem",
-  },
-});

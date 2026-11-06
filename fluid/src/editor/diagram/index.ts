@@ -9,22 +9,22 @@
 import type { Extension } from "@codemirror/state";
 
 import { diagramLoaded, drawnDiagrams } from "./draws";
-import {
-  diagramField,
-  diagramTheme,
-  pointerWatcher,
-  verdictWatcher,
-} from "./field";
+import { diagramField, pointerWatcher, verdictWatcher } from "./field";
+import { diagramIntent, intentWatcher } from "./intent";
+import { diagramTheme } from "./widget";
 
 export function diagramExtension(): Extension {
   return [
     diagramLoaded.of(true),
     diagramField,
+    // After the field: it reads the fences the field draws.
+    diagramIntent,
     drawnDiagrams.compute([diagramField], (state) =>
       state.field(diagramField).fences.map((fence) => fence.from),
     ),
     verdictWatcher,
     pointerWatcher,
+    intentWatcher,
     diagramTheme,
   ];
 }

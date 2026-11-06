@@ -45,7 +45,10 @@ vi.mock("./verdict", () => ({
 }));
 
 const closeDiagramIntent = vi.hoisted(() => vi.fn());
-vi.mock("./intent", () => ({ closeDiagramIntent }));
+vi.mock("./intent", async (original) => ({
+  ...(await original<typeof import("./intent")>()),
+  closeDiagramIntent,
+}));
 
 // Imported after the mocks.
 const { diagramExtension } = await import("./index");

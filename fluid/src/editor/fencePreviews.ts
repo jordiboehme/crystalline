@@ -225,6 +225,38 @@ function captionFor(preview: Preview): string {
   });
 }
 
+/**
+ * Hands over the SVG the preview of one fence already drew, taking it out of
+ * the box, or null when it has drawn nothing. The diagram layer calls it at the
+ * moment the fence flips, so the drawing stays on screen in the new box and only
+ * the source lines' height moves (R54).
+ *
+ * `firstLine` says which fence: another fence of the same body, in a quote or
+ * held by the caret, keeps its preview and never draws it again.
+ */
+export function takePreviewDrawing(
+  root: HTMLElement,
+  source: string,
+  dark: boolean,
+  firstLine: number,
+): SVGSVGElement | null {
+  for (const box of root.querySelectorAll<HTMLElement>(".cm-mermaid-preview")) {
+    const widget = previews.get(box)?.widget;
+    if (
+      widget?.source === source &&
+      widget.dark === dark &&
+      widget.firstLine === firstLine
+    ) {
+      const svg = box.querySelector<SVGSVGElement>(":scope > svg");
+      if (svg !== null) {
+        svg.remove();
+      }
+      return svg;
+    }
+  }
+  return null;
+}
+
 class MermaidPreviewWidget extends WidgetType {
   // Assigned in the body rather than declared as constructor parameters: the
   // build erases types, it does not run a TypeScript transform, and
