@@ -48,8 +48,8 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   // Chromium runs every journey. WebKit runs the questions only it can
-  // answer - mermaid labels under Safari's page zoom, and a page printed from
-  // a wide window - and nothing else, so the suite does not double its run
+  // answer - mermaid labels under Safari's page zoom, a page printed from a
+  // wide window, and a diagram turned into a PNG - and nothing else, so the suite does not double its run
   // time for answers chromium already gives.
   projects: [
     {
@@ -60,7 +60,7 @@ export default defineConfig({
     {
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
-      testMatch: /(mermaid-zoom|print)\.spec\.ts/,
+      testMatch: /(mermaid-zoom|print|diagram-png)\.spec\.ts/,
     },
   ],
   // No preview server for the run against the embedded UI. Spread rather

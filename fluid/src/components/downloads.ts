@@ -11,6 +11,14 @@
 const FNV_OFFSET = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
 
+/**
+ * What is said when a diagram's PNG cannot be made. Here rather than with the
+ * code that makes one, because that code is loaded on the click, and failing
+ * to load it is one of the ways this happens.
+ */
+export const PNG_FAILED =
+  "The PNG could not be made, so no file was saved. Use Download SVG instead.";
+
 /** FNV-1a over the UTF-16 code units, as eight lowercase hex characters. */
 export function fnv1a32(text: string): string {
   let hash = FNV_OFFSET;
@@ -28,7 +36,7 @@ export function fnv1a32(text: string): string {
 export function diagramFileName(
   slug: string | undefined,
   source: string,
-  extension: "mmd" | "svg",
+  extension: "mmd" | "svg" | "png",
 ): string {
   const base = slug === undefined ? "diagram" : `${slug}-diagram`;
   return `${base}-${fnv1a32(source).slice(0, 4)}.${extension}`;
