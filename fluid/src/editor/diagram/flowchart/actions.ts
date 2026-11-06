@@ -39,7 +39,7 @@ import {
   sayAt,
   targetElement,
 } from "../focus";
-import type { FlowTarget, TargetKey } from "../intent";
+import type { FlowTarget, IntentCloseReason, TargetKey } from "../intent";
 import {
   closeDiagramIntent,
   diagramIntent,
@@ -63,11 +63,10 @@ import { hostOf } from "../widget";
 import { COLOUR_KEYS, readDirection } from "./checked";
 import type { ArrowHold } from "./heldArrow";
 import {
-  heldEdge,
-  heldTarget,
   holdArrow,
   letGoOfArrow,
-  noteDuplicates,
+  resolveArrow,
+  resolveTarget,
 } from "./heldArrow";
 import { flowLabelOf } from "./hit";
 import type { ColourPreset } from "./labels";
@@ -151,7 +150,7 @@ async function runOp(
         if (hold === null) {
           return { refused: "gone" };
         }
-        const edge = heldEdge(main, hold, model, bodyFrom);
+        const edge = resolveArrow(main, hold, model, bodyFrom);
         return typeof edge === "string" ? { refused: edge } : op(edge);
       },
     );
@@ -373,7 +372,7 @@ function editLabel(main: EditorView, anchor: number, hold: ArrowHold): void {
   const edge =
     fence === null || model === null
       ? "gone"
-      : heldEdge(main, hold, model, fence.bodyFrom);
+      : resolveArrow(main, hold, model, fence.bodyFrom);
   letGoOfArrow(main, hold);
   if (typeof edge === "string") {
     sayAt(main, place, edge);
@@ -486,10 +485,13 @@ function dismissingClick(main: EditorView): void {
   const stop = () => {
     window.removeEventListener("click", swallow, { capture: true });
     window.removeEventListener("contextmenu", stop, { capture: true });
+    window.removeEventListener("mousedown", stop, { capture: true });
   };
   window.addEventListener("click", swallow, { capture: true, once: true });
   // A right button's press has no click, and on some systems no mouse up.
   window.addEventListener("contextmenu", stop, { capture: true, once: true });
+  // Nor has a press that started a drag: the next press is a click of its own.
+  window.addEventListener("mousedown", stop, { capture: true, once: true });
   window.addEventListener(
     "mouseup",
     () => {
@@ -511,14 +513,10 @@ function menuClosed(open: OpenMenu, reason: MenuClose): void {
     const fence = fenceAt(main.state, anchor);
     const model = fence && modelNow(fence);
     if (fence !== null && model !== null) {
-      if (hold !== undefined) {
-        noteDuplicates(hold, model);
-      }
-      const held = heldTarget(
+      const held = resolveTarget(
         main,
         open.target,
-        hold?.ticket ?? null,
-        hold?.sole ?? true,
+        hold ?? null,
         model,
         fence.bodyFrom,
       );
@@ -592,7 +590,6 @@ function openFlowMenu(
   // Connect mode waiting on another fence: its end must not reach this menu's hold.
   const waiting = connects.get(main);
   if (waiting !== undefined) {
-    waiting.cancelled = true;
     endConnect(waiting);
   }
   const fence = fenceNow(main, anchor);
@@ -663,15 +660,10 @@ function reconcileMenu(main: EditorView, open: OpenMenu): void {
     return;
   }
   open.body = fence.body;
-  const hold = holds.get(main);
-  if (hold !== undefined) {
-    noteDuplicates(hold, model);
-  }
-  const held = heldTarget(
+  const held = resolveTarget(
     main,
     open.target,
-    hold?.ticket ?? null,
-    hold?.sole ?? true,
+    holds.get(main) ?? null,
     model,
     fence.bodyFrom,
   );
@@ -705,7 +697,7 @@ interface Connecting {
   bar: HTMLElement;
   /** A choice is being verified. */
   running: boolean;
-  /** Left while a choice was being verified: that choice is not written. */
+  /** Left, by any route, while a choice was being verified: it is not written. */
   cancelled: boolean;
   stopGuard: () => void;
 }
@@ -745,6 +737,7 @@ function makeBar(main: EditorView): HTMLElement {
  */
 function endConnect(open: Connecting): void {
   const { main, bar } = open;
+  open.cancelled = true;
   connects.delete(main);
   bar.closest(`.${CONNECTING_CLASS}`)?.classList.remove(CONNECTING_CLASS);
   bar.remove();
@@ -819,7 +812,6 @@ function cancelConnect(main: EditorView): void {
   if (open === undefined) {
     return;
   }
-  open.cancelled = true;
   const place = placeNow(main, open.anchor);
   const stop = backFromConnect(open, open.source);
   endConnect(open);
@@ -940,8 +932,11 @@ registerIntentReopen("connect", (main, intent, host) => {
 /** Views whose close listener is in: it outlives the plugin, as Raw takes that. */
 const hooked = new WeakSet<EditorView>();
 
-function onClosed(main: EditorView, gone: boolean): void {
-  const intent = main.state.field(diagramIntent, false);
+function onClosed(main: EditorView, reason: IntentCloseReason): void {
+  const gone = reason === "gone";
+  // A destroyed view's state still shows the intent, with nobody left to end it.
+  const intent =
+    reason === "destroy" ? null : main.state.field(diagramIntent, false);
   const menu = menus.get(main);
   const connect = connects.get(main);
   let told = false;
@@ -957,7 +952,6 @@ function onClosed(main: EditorView, gone: boolean): void {
     connect !== undefined &&
     !(intent?.mode === "connect" && intent.anchor === connect.anchor)
   ) {
-    connect.cancelled = true;
     endConnect(connect);
     told = true;
   }
@@ -975,7 +969,7 @@ export const flowActions = ViewPlugin.fromClass(
       if (!hooked.has(view)) {
         hooked.add(view);
         onIntentClosed(view, (reason) => {
-          onClosed(view, reason === "gone");
+          onClosed(view, reason);
         });
       }
     }
@@ -993,18 +987,6 @@ export const flowActions = ViewPlugin.fromClass(
         }
         if (connect !== undefined) {
           connect.anchor = update.changes.mapPos(connect.anchor, 1);
-        }
-        // Here and not in the microtask: two edits in one tick, a duplicate and
-        // then the person's own arrow going, must not pass as one (R94).
-        const hold = holds.get(view);
-        const at = update.state.field(diagramIntent)?.anchor;
-        const fence =
-          hold === undefined || at === undefined
-            ? null
-            : fenceAt(update.state, at);
-        const model = fence && modelNow(fence);
-        if (hold !== undefined && model !== null) {
-          noteDuplicates(hold, model);
         }
       }
       queueMicrotask(() => {

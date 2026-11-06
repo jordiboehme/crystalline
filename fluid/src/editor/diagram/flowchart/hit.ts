@@ -129,10 +129,9 @@ function arrowLabel(model: FlowModel, edge: FlowEdge): string {
 /**
  * The arrow of (`start`, `end`) that stands at `offset`, a position in the body;
  * an arrow's occurrence moves with every duplicate added or removed before it, and
- * its token does not. With no such token: "gone" when the pair has no arrow left.
- * Otherwise the only arrow of that pair, but only when `sole` says the field opened
- * with no duplicate: among duplicates the person's arrow may be the very one that
- * went, and the one left is somebody else's, so it answers "stale" (R94).
+ * its token does not. With no such token: "gone" when the pair has no arrow left,
+ * otherwise "stale", unless `sole` lets the only arrow of the pair answer. Only
+ * `resolveArrow` calls this, and it says when `sole` may (R94).
  */
 export function flowEdgeAt(
   model: FlowModel,

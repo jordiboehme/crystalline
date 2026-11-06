@@ -175,6 +175,10 @@ export function openMenu(
   let owner: HTMLElement | null = null;
   let closed = false;
   let hover: ReturnType<typeof setTimeout> | null = null;
+  /** The row a hover waits on. */
+  let hoverRow: HTMLElement | null = null;
+  /** Where the pointer was last seen; it stands still until this changes. */
+  let pointerAt: { x: number; y: number } | null = null;
 
   const levels = () => (sub === null ? [top] : [top, sub]);
   const inside = (node: EventTarget | null) =>
@@ -195,6 +199,19 @@ export function openMenu(
       clearTimeout(hover);
       hover = null;
     }
+    hoverRow = null;
+  }
+
+  /**
+   * Whether the pointer really moved. A browser sends mouse events to an element that
+   * appears under a pointer at rest, and a menu opened by a key must not take the
+   * focus from them, or Enter runs what the pointer happens to rest on. The first
+   * event only says where the pointer is.
+   */
+  function pointerMoved(event: MouseEvent): boolean {
+    const was = pointerAt;
+    pointerAt = { x: event.clientX, y: event.clientY };
+    return was !== null && (was.x !== pointerAt.x || was.y !== pointerAt.y);
   }
 
   function closeSub(focusOwner: boolean): void {
@@ -259,6 +276,11 @@ export function openMenu(
 
   function move(row: HTMLElement, key: string): void {
     const { rows } = levelOf(row);
+    // A submenu a hover opened goes when a key walks the menu beside it.
+    if (levelOf(row) === top) {
+      stopHover();
+      closeSub(false);
+    }
     const at = rows.indexOf(row);
     const next =
       key === "Home"
@@ -347,14 +369,21 @@ export function openMenu(
       row.addEventListener("click", () => {
         run(row);
       });
-      row.addEventListener("mouseover", () => {
+      row.addEventListener("mousemove", (event) => {
+        if (!pointerMoved(event)) {
+          return;
+        }
         if (doc.activeElement !== row) {
           show(row, true);
         }
-        stopHover();
-        if (level === top && owner !== row) {
+        if (level !== top || owner === row) {
+          stopHover();
+        } else if (hoverRow !== row) {
+          stopHover();
+          hoverRow = row;
           hover = setTimeout(() => {
             hover = null;
+            hoverRow = null;
             closeSub(false);
             openSub(row, false);
           }, HOVER_MS);

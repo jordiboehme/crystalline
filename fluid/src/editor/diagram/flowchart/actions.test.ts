@@ -31,6 +31,7 @@ import { prefetchDiagrams } from "../loader";
 import { requestVerdict } from "../verdict";
 import { forgetDrawings, NOTICE_MS } from "../widget";
 import { flowMenu } from "./actions";
+import { resolveArrow } from "./heldArrow";
 import type { EdgeKey } from "./model";
 import type { FlowOp } from "./ops";
 import { compileFlowOp } from "./ops";
@@ -679,14 +680,46 @@ describe("what cannot be done", () => {
   });
 });
 
+describe("resolveArrow with no ticket asked for", () => {
+  const key = AB;
+  const noTicket = () => ({ ticket: null, key, sole: true });
+
+  it("lets a sole arrow answer, and a duplicate seen once ends that for good", async () => {
+    const view = await drawn();
+    const hold = noTicket();
+    const one = parseFlowchart("flowchart TD\n    A -->|x| B");
+    const two = parseFlowchart("flowchart TD\n    A -->|x| B\n    A -->|y| B");
+    const none = parseFlowchart("flowchart TD\n    A --> C");
+    expect(resolveArrow(view, hold, one, 0)).toEqual(key);
+    expect(resolveArrow(view, hold, two, 0)).toBe("stale");
+    expect(resolveArrow(view, hold, one, 0)).toBe("stale");
+    expect(resolveArrow(view, hold, none, 0)).toBe("gone");
+  });
+
+  it("does not let an arrow answer once a ticket was asked for and lost", async () => {
+    const view = await drawn();
+    const one = parseFlowchart("flowchart TD\n    A -->|x| B");
+    const hold = { ticket: 987_654, key, sole: true };
+    expect(resolveArrow(view, hold, one, 0)).toBe("stale");
+  });
+});
+
 describe("what an arrow's menu holds", () => {
-  const held = (view: EditorView) => view.state.field(diagramAnchors).size;
+  /** Beyond the one the stop itself holds, when the keyboard stands on an arrow. */
+  const held = (view: EditorView) => {
+    const size = view.state.field(diagramAnchors).size;
+    return intentOf(view)?.mode === "focus" &&
+      intentOf(view)?.target.kind === "edge"
+      ? size - 1
+      : size;
+  };
 
   it("lets go when it closes unused", async () => {
     const view = await drawn();
     openMenuOn(view, EDGE_AB);
     expect(held(view)).toBe(1);
     press("Escape");
+    await flush();
     expect(held(view)).toBe(0);
   });
 
@@ -803,6 +836,20 @@ describe("the focus around a menu", () => {
     await flush();
     // The next click is an ordinary one.
     click(nodeOf(view, "A"));
+    expect(fieldOf(view)).not.toBeNull();
+  });
+
+  it("a dismissing press with no mouse up does not eat a later click", async () => {
+    const view = await drawn();
+    openMenuOn(view, NODE_B);
+    const a = nodeOf(view, "A");
+    a.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await flush();
+    expect(menus()).toHaveLength(0);
+    // A native drag took the mouse up. The next press is a click of its own.
+    a.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    a.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    click(a);
     expect(fieldOf(view)).not.toBeNull();
   });
 
@@ -978,6 +1025,14 @@ describe("a page that takes no writes", () => {
     expect(rightClick(nodeOf(view, "B")).defaultPrevented).toBe(false);
     expect(menus()).toHaveLength(0);
     expect(view.dom.querySelectorAll("[aria-haspopup]")).toHaveLength(0);
+  });
+
+  it("leaves Shift+F10 and the ContextMenu key to the browser", async () => {
+    const view = await readOnly();
+    focusTarget(view, fromOf(view), NODE_B);
+    expect(press("F10", { shiftKey: true }).defaultPrevented).toBe(false);
+    expect(press("ContextMenu").defaultPrevented).toBe(false);
+    expect(menus()).toHaveLength(0);
   });
 
   it("opens nothing on Shift+F10, and the walk still goes", async () => {
@@ -1226,6 +1281,91 @@ describe("connect mode", () => {
     expect(text(view)).toBe(page(SKELETON));
     expect(noticeOf(view)).toBe("");
     expect(promptOf(view)).toBeNull();
+  });
+
+  it("leaving by a focus move during the check writes nothing", async () => {
+    // A body of its own: a verdict already known would leave no time to leave in.
+    const body = "flowchart TD\n    A[Only here] --> B[Next step]";
+    const view = await drawn(page(body));
+    startOn(view);
+    press("ArrowRight");
+    press("Enter");
+    const other = document.createElement("input");
+    document.body.append(other);
+    const from = active();
+    other.focus();
+    from.dispatchEvent(
+      new FocusEvent("blur", { bubbles: false, relatedTarget: other }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(text(view)).toBe(page(body));
+    expect(promptOf(view)).toBeNull();
+    expect(active()).toBe(other);
+  });
+
+  it("leaving by a click on another diagram during the check writes nothing", async () => {
+    const view = await drawn(TWO_FENCES);
+    startOn(view);
+    press("ArrowRight");
+    press("Enter");
+    click(nodeOf(view, "C"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(text(view)).toBe(TWO_FENCES);
+    expect(promptOf(view)).toBeNull();
+  });
+
+  it("does not end on the ContextMenu key's own contextmenu event", async () => {
+    const view = await drawn();
+    startOn(view);
+    press("ContextMenu");
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    });
+    active().dispatchEvent(event);
+    await flush();
+    expect(event.defaultPrevented).toBe(true);
+    expect(intentOf(view)?.mode).toBe("connect");
+    // The key may have sent none, so a real right click still gets out.
+    nodeOf(view, "B").dispatchEvent(
+      new MouseEvent("mousedown", { bubbles: true, button: 2 }),
+    );
+    rightClick(nodeOf(view, "B"));
+    await flush();
+    expect(promptOf(view)).toBeNull();
+  });
+
+  it("a key that sent no contextmenu of its own does not eat a later right click", async () => {
+    const view = await drawn();
+    startOn(view);
+    press("ContextMenu");
+    nodeOf(view, "B").dispatchEvent(
+      new MouseEvent("mousedown", { bubbles: true, button: 2 }),
+    );
+    rightClick(nodeOf(view, "B"));
+    await flush();
+    expect(promptOf(view)).toBeNull();
+  });
+
+  it("a destroyed editor takes its Escape guard along", async () => {
+    const view = await drawn();
+    startOn(view);
+    view.destroy();
+    await flush();
+    const event = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    let reached = false;
+    const listener = () => {
+      reached = true;
+    };
+    document.addEventListener("keydown", listener);
+    document.body.dispatchEvent(event);
+    document.removeEventListener("keydown", listener);
+    expect(event.defaultPrevented).toBe(false);
+    expect(reached).toBe(true);
   });
 
   it("the focus leaving the diagram ends it, and nothing stays parked", async () => {

@@ -214,6 +214,63 @@ test("a held Enter on a menu item runs it once", async ({ page }) => {
   await expect(page.locator(".cm-diagram-label-field")).toHaveCount(0);
 });
 
+test("a pointer resting where a key's menu opens takes nothing", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await expect(nodeOf(page, "A")).toBeVisible();
+  const before = await docText(page);
+  // Where the menu will stand: learnt by opening it once.
+  await stopOn(page, "Box: First");
+  await page.keyboard.press("Shift+F10");
+  const rowAt = await page
+    .getByRole("menuitem", { name: "Delete" })
+    .boundingBox();
+  if (rowAt === null) throw new Error("no row");
+  await page.keyboard.press("Escape");
+  await expect(menus(page)).toHaveCount(0);
+  await page.mouse.move(rowAt.x + 30, rowAt.y + rowAt.height / 2);
+  await page.keyboard.press("Shift+F10");
+  await expect(menus(page)).toHaveCount(1);
+  expect(await focusedName(page)).toBe("Rename");
+  await page.waitForTimeout(400);
+  expect(await focusedName(page)).toBe("Rename");
+  await page.keyboard.press("ArrowDown");
+  expect(await focusedName(page)).toBe("Add child");
+  await page.keyboard.press("Escape");
+  expect(await docText(page)).toBe(before);
+  // A real move still takes it, in two steps, and the submenu opens under it.
+  await page.keyboard.press("Shift+F10");
+  await page.mouse.move(rowAt.x + 31, rowAt.y + rowAt.height / 2);
+  await page.mouse.move(rowAt.x + 32, rowAt.y + rowAt.height / 2);
+  expect(await focusedName(page)).toBe("Delete");
+});
+
+test("after Back, an Escape on the page is the page's again", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await expect(nodeOf(page, "A")).toBeVisible();
+  await nodeOf(page, "A").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Connect to..." }).click();
+  await expect(page.locator(".cm-diagram-connect")).toBeVisible();
+  await page.goBack();
+  await expect(page.locator(".cm-content")).toHaveCount(0);
+  // The guard acts with the focus on the body, so that is where it has to be.
+  const answer = await page.evaluate(() => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    const onBody = document.activeElement === document.body;
+    const event = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    return { onBody, prevented: event.defaultPrevented };
+  });
+  expect(answer).toEqual({ onBody: true, prevented: false });
+});
+
 test("a real right click opens our menu inside the window, and Escape goes back", async ({
   page,
 }) => {

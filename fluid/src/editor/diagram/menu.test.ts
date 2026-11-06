@@ -51,6 +51,13 @@ function open(items = ITEMS()) {
 const active = () => document.activeElement as HTMLElement;
 const menus = () => [...document.querySelectorAll('[role="menu"]')];
 
+/** A pointer event over `el`, at a place in the window. */
+function pointer(el: Element | null | undefined, x: number, y = 5): void {
+  el?.dispatchEvent(
+    new MouseEvent("mousemove", { bubbles: true, clientX: x, clientY: y }),
+  );
+}
+
 function press(key: string, options: KeyboardEventInit = {}): KeyboardEvent {
   const event = new KeyboardEvent("keydown", {
     key,
@@ -321,7 +328,8 @@ describe("the submenu", () => {
     press("ArrowDown");
     press("ArrowRight");
     const first = menus()[0]?.querySelector('[role="menuitem"]');
-    first?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    pointer(first, 1);
+    pointer(first, 2);
     expect(active().textContent).toBe("One");
     expect(menus()).toHaveLength(2);
     vi.runAllTimers();
@@ -335,10 +343,9 @@ describe("the submenu", () => {
     press("ArrowDown");
     press("ArrowRight");
     const first = menus()[0]?.querySelector('[role="menuitem"]');
-    first?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
-    menus()[1]
-      ?.querySelector('[role="menuitemradio"]')
-      ?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    pointer(first, 1);
+    pointer(first, 2);
+    pointer(menus()[1]?.querySelector('[role="menuitemradio"]'), 3);
     vi.runAllTimers();
     expect(menus()).toHaveLength(2);
     expect(active().textContent).toBe("Rectangle");
@@ -349,7 +356,8 @@ describe("the submenu", () => {
     vi.useFakeTimers();
     open();
     const parent = menus()[0]?.querySelector('[aria-haspopup="menu"]');
-    parent?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    pointer(parent, 1);
+    pointer(parent, 2);
     vi.runAllTimers();
     expect(menus()).toHaveLength(2);
     expect(active()).toBe(parent);
@@ -359,11 +367,54 @@ describe("the submenu", () => {
   it("does not scroll under a pointer, or the next item comes under it", () => {
     open();
     const spy = vi.spyOn(HTMLElement.prototype, "focus");
-    menus()[0]
-      ?.querySelector('[aria-haspopup="menu"]')
-      ?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    const parent = menus()[0]?.querySelector('[aria-haspopup="menu"]');
+    pointer(parent, 1);
+    pointer(parent, 2);
     expect(spy).toHaveBeenCalledWith({ preventScroll: true });
     spy.mockRestore();
+  });
+
+  it("does not move the focus for a pointer that rests where the menu opened", () => {
+    vi.useFakeTimers();
+    open();
+    const last = menus()[0]?.querySelector('[aria-haspopup="menu"]');
+    // What a browser sends when an element appears under a still pointer.
+    last?.dispatchEvent(
+      new MouseEvent("mouseover", { bubbles: true, clientX: 9, clientY: 9 }),
+    );
+    pointer(last, 9, 9);
+    pointer(last, 9, 9);
+    vi.runAllTimers();
+    expect(active().textContent).toBe("One");
+    expect(menus()).toHaveLength(1);
+    press("Enter");
+    expect(ran).toEqual(["One"]);
+    vi.useRealTimers();
+  });
+
+  it("does not move the focus for a pointer resting where a submenu opened", () => {
+    open();
+    press("ArrowDown");
+    press("ArrowRight");
+    const circle = menus()[1]?.querySelectorAll('[role="menuitemradio"]')[1];
+    pointer(circle, 9, 9);
+    pointer(circle, 9, 9);
+    expect(active().textContent).toBe("Rectangle");
+    pointer(circle, 10, 9);
+    expect(active().textContent).toBe("Circle");
+  });
+
+  it("takes a standing submenu down when a key walks the top menu", () => {
+    vi.useFakeTimers();
+    open();
+    const parent = menus()[0]?.querySelector('[aria-haspopup="menu"]');
+    pointer(parent, 1);
+    pointer(parent, 2);
+    vi.runAllTimers();
+    expect(menus()).toHaveLength(2);
+    press("ArrowDown");
+    expect(menus()).toHaveLength(1);
+    vi.useRealTimers();
   });
 });
 

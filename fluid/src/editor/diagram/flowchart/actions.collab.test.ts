@@ -420,6 +420,223 @@ describe("an arrow's menu among duplicates (R94)", () => {
   });
 });
 
+describe("an arrow once chosen is that arrow or nothing (R94)", () => {
+  const SOLE = "flowchart TD\n    A -->|mine| B\n    C --> D";
+  const AFTER = "flowchart TD\n    C --> D\n    A -->|peers| B";
+
+  /** One peer transaction, as a merged update after a reconnect arrives. */
+  function swapInOne(peer: EditorView) {
+    const body = text(peer);
+    const line = "    A -->|mine| B\n";
+    const at = body.indexOf(line);
+    const end = body.indexOf("    C --> D\n") + "    C --> D\n".length;
+    peer.dispatch({
+      changes: [
+        { from: at, to: at + line.length },
+        { from: end, insert: "    A -->|peers| B\n" },
+      ],
+    });
+  }
+
+  function swapInTwo(peer: EditorView) {
+    peerInsert(peer, "    C --> D", "    A -->|peers| B\n");
+    peerDeleteLine(peer, "    A -->|mine| B");
+  }
+
+  const ITEMS: [string, string[]][] = [
+    ["Delete", ["Delete"]],
+    ["Line", ["Line", "Dotted"]],
+    ["Arrowhead", ["Arrowhead", "None"]],
+    ["Reverse", ["Reverse"]],
+  ];
+
+  it.each(ITEMS)(
+    "input A: %s, with both edits during its verify, leaves the peer's arrow",
+    async (_name, path) => {
+      const { local, peer, sync } = await room(SOLE);
+      openOn(local, FIRST);
+      choose(...path);
+      swapInTwo(peer);
+      sync();
+      await settle();
+      expect(text(local)).toContain("A -->|peers| B");
+      expect(text(local)).not.toContain("|mine|");
+      expect(noticeOf(local)).toBe(NOTICES.stale);
+    },
+  );
+
+  it.each([
+    ["two dispatches in one tick", swapInTwo],
+    ["one transaction", swapInOne],
+  ])("input B: the Delete key, with %s during its verify", async (_n, swap) => {
+    const { local, peer, sync } = await room(SOLE);
+    focusTarget(local, text(local).indexOf("```"), FIRST);
+    press("Delete");
+    swap(peer);
+    sync();
+    await settle();
+    expect(text(local)).toContain("|peers|");
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+  });
+
+  it("input B, a microtask apart", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    focusTarget(local, text(local).indexOf("```"), FIRST);
+    press("Delete");
+    peerInsert(peer, "    C --> D", "    A -->|peers| B\n");
+    sync();
+    await Promise.resolve();
+    peerDeleteLine(peer, "    A -->|mine| B");
+    sync();
+    await settle();
+    expect(text(local)).toContain("|peers|");
+  });
+
+  it.each(ITEMS)(
+    "input C: %s after one transaction took my arrow and added a twin",
+    async (_name, path) => {
+      const { local, peer, sync } = await room(SOLE);
+      openOn(local, FIRST);
+      swapInOne(peer);
+      sync();
+      await settle();
+      expect(text(local)).toBe(page(AFTER));
+      choose(...path);
+      await vi.waitFor(() => {
+        expect(noticeOf(local)).toBe(NOTICES.stale);
+      });
+      expect(text(local)).toBe(page(AFTER));
+    },
+  );
+
+  it("input C: Edit label opens no field on the peer's arrow", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    openOn(local, FIRST);
+    swapInOne(peer);
+    sync();
+    await settle();
+    choose("Edit label");
+    expect(local.dom.querySelector(".cm-diagram-overlay textarea")).toBeNull();
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+  });
+
+  const typeLabel = (view: EditorView, label: string) => {
+    focusTarget(view, text(view).indexOf("```"), FIRST);
+    press("Enter");
+    const field = view.dom.querySelector<HTMLTextAreaElement>(
+      ".cm-diagram-overlay textarea",
+    );
+    if (field === null) throw new Error("no field");
+    field.value = label;
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    return field;
+  };
+
+  it("input D: the field, one transaction, then Enter", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    const field = typeLabel(local, "renamed");
+    swapInOne(peer);
+    sync();
+    await settle();
+    press("Enter");
+    await settle();
+    expect(text(local)).toBe(page(AFTER));
+    expect(noticeOf(local)).toContain(NOTICES.arrowChanged);
+    expect(field.isConnected).toBe(true);
+  });
+
+  it("input D, during the field's own verify", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    typeLabel(local, "renamed");
+    press("Enter");
+    swapInOne(peer);
+    sync();
+    await settle();
+    expect(text(local)).toBe(page(AFTER));
+  });
+
+  it("a whole token rewritten by a peer is that arrow no more: the field says so", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    typeLabel(local, "renamed");
+    const at = text(peer).indexOf("-->|mine|");
+    peer.dispatch({ changes: { from: at, to: at + 3, insert: "-.->" } });
+    sync();
+    await settle();
+    press("Enter");
+    await settle();
+    expect(text(local)).not.toContain("renamed");
+    expect(noticeOf(local)).toContain(NOTICES.arrowChanged);
+  });
+
+  it("a peer's edit that leaves the token alone keeps the arrow, label and all", async () => {
+    const { local, peer, sync } = await room(SOLE);
+    openOn(local, FIRST);
+    const at = text(peer).indexOf("mine");
+    peer.dispatch({ changes: { from: at, to: at + 4, insert: "theirs" } });
+    peerInsert(peer, "    C --> D", "    %% note\n");
+    sync();
+    await settle();
+    choose("Line", "Dotted");
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("A -.->|theirs| B");
+    });
+  });
+
+  describe("a stop, with nothing open", () => {
+    const heldOnStop = async () => {
+      const peers = await room(SOLE);
+      focusTarget(peers.local, text(peers.local).indexOf("```"), FIRST);
+      await flush();
+      return peers;
+    };
+
+    it("after one transaction: the ring leaves, and Delete cannot take the peer's arrow", async () => {
+      const { local, peer, sync } = await heldOnStop();
+      swapInOne(peer);
+      sync();
+      await settle();
+      expect(intentOf(local)?.target).toEqual({ kind: "node", id: "A" });
+      expect(noticeOf(local)).toBe(NOTICES.stale);
+      expect(text(local)).toBe(page(AFTER));
+    });
+
+    it("follows its arrow when a twin lands above it", async () => {
+      const { local, peer, sync } = await room(TWO);
+      focusTarget(local, text(local).indexOf("```"), SECOND);
+      await flush();
+      peerInsert(peer, "    A -->|one|", "    A -->|peers| B\n");
+      sync();
+      await settle();
+      expect(intentOf(local)?.target).toEqual({
+        kind: "edge",
+        key: { start: "A", end: "B", occurrence: 2 },
+      });
+      press("Delete");
+      await vi.waitFor(() => {
+        expect(text(local)).not.toContain("two");
+      });
+      expect(text(local)).toContain("|peers|");
+      expect(text(local)).toContain("|one|");
+    });
+
+    it("stays on its arrow through its own Line and its own label", async () => {
+      const { local } = await heldOnStop();
+      openOn(local, FIRST);
+      choose("Line", "Dotted");
+      await vi.waitFor(() => {
+        expect(text(local)).toContain("A -.->|mine| B");
+      });
+      await settle();
+      expect(intentOf(local)?.target).toEqual(FIRST);
+      expect(noticeOf(local)).toBe("");
+      press("Delete");
+      await vi.waitFor(() => {
+        expect(text(local)).not.toContain("|mine|");
+      });
+    });
+  });
+});
+
 describe("connect mode with a peer", () => {
   function startOn(view: EditorView, target: TargetKey = NODE_A) {
     openOn(view, target);

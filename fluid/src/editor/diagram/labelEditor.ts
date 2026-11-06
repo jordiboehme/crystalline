@@ -65,8 +65,9 @@ import {
   verdictArrived,
   showFenceSource,
 } from "./field";
-import { flowEdgeSpanOf, flowLabelOf, flowPairCount } from "./flowchart/hit";
-import { heldTarget } from "./flowchart/heldArrow";
+import { flowLabelOf } from "./flowchart/hit";
+import type { ArrowHold } from "./flowchart/heldArrow";
+import { holdArrow, holdEffect, resolveTarget } from "./flowchart/heldArrow";
 import { tidyLabel } from "./flowchart/labels";
 import type { FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
@@ -121,10 +122,8 @@ interface OpenField {
   goneWaits: boolean;
   /** The commit running now. */
   checking: Promise<void> | null;
-  /** The ticket holding an arrow's place in the text (R94); null for a box. */
-  arrow: number | null;
-  /** Whether the arrow had no duplicate when the field opened. */
-  sole: boolean;
+  /** The arrow's place in the text (R94); null for a box. */
+  hold: ArrowHold | null;
   /** What a refusal said, while the text it refused still stands. */
   refused: RefusalCode | null;
   /** Letters typed while the box was away: they go in when it is back (R98). */
@@ -274,7 +273,8 @@ function mount(
 
 /** The field out of the record and the page. The caller says where the focus goes. */
 function detach(open: OpenField): void {
-  const { main, arrow } = open;
+  const { main, hold } = open;
+  const arrow = hold?.ticket ?? null;
   fields.delete(main);
   open.el.remove();
   syncGuards(main);
@@ -292,12 +292,12 @@ function detach(open: OpenField): void {
 
 /** The stop the person was on, or the canvas when it went. */
 function backToStop(open: OpenField): void {
-  const { main, anchor, target, arrow, sole } = open;
+  const { main, anchor, target, hold } = open;
   const fence = fenceNow(main, anchor);
   const model = fence && modelOf(fence.body);
   const held =
     fence && model?.understood
-      ? heldTarget(main, target, arrow, sole, model, fence.bodyFrom)
+      ? resolveTarget(main, target, hold, model, fence.bodyFrom)
       : "gone";
   const stands =
     typeof held !== "string" &&
@@ -443,30 +443,18 @@ function refuse(open: OpenField, code: RefusalCode, way: Way): void {
   }
 }
 
-/**
- * An arrow stops being sole once a duplicate has been seen, and stays so: its own
- * going later must not hand the label to the peer's (R94).
- */
-function noteDuplicates(open: OpenField, model: FlowModel): void {
-  if (open.target.kind === "edge") {
-    open.sole &&= flowPairCount(model, open.target.key) <= 1;
-  }
-}
-
 /** The op for what is typed, worked out on each read of the fence (R94). */
 function opFor(
   main: EditorView,
   open: OpenField,
   text: string,
 ): OpResolver<FlowModel, FlowOp> | null {
-  const { target, arrow } = open;
+  const { target, hold } = open;
   if (target.kind === "canvas") {
     return null;
   }
   return (model, bodyFrom) => {
-    // A line landing during the verify counts as one before it.
-    noteDuplicates(open, model);
-    const held = heldTarget(main, target, arrow, open.sole, model, bodyFrom);
+    const held = resolveTarget(main, target, hold, model, bodyFrom);
     if (typeof held === "string") {
       return { refused: held === "stale" ? "arrowChanged" : held };
     }
@@ -580,11 +568,10 @@ function reconcile(main: EditorView): void {
     // No reading of it now: the verdict decides, and the field waits.
     return;
   }
-  noteDuplicates(open, model);
   const held =
     fence === null
       ? target
-      : heldTarget(main, target, open.arrow, open.sole, model, fence.bodyFrom);
+      : resolveTarget(main, target, open.hold, model, fence.bodyFrom);
   if (held === "stale") {
     // Not said until it matters: at the commit, with a sentence.
     return;
@@ -651,8 +638,7 @@ function makeField(
     composing: false,
     goneWaits: false,
     checking: null,
-    arrow: null,
-    sole: true,
+    hold: null,
     refused: null,
     queued: "",
     lockTop: null,
@@ -821,20 +807,13 @@ export function openLabelEditor(
   }
   const text = options.initial ?? label;
   const created = makeField(main, fence.from, target, label, text);
-  created.sole =
-    target.kind !== "edge" || flowPairCount(model, target.key) <= 1;
-  const span =
-    target.kind === "edge" ? flowEdgeSpanOf(model, target.key) : null;
-  // Inside the token, so a change right at its edge stays clear of the ticket.
   const arrowEffect: StateEffect<unknown>[] = [];
-  if (span !== null) {
-    created.arrow = nextAnchorTicket();
-    arrowEffect.push(
-      trackAnchor.of({
-        ticket: created.arrow,
-        pos: fence.bodyFrom + span + 1,
-      }),
-    );
+  if (target.kind === "edge") {
+    const { hold, effect } = holdEffect(model, target.key, fence.bodyFrom);
+    created.hold = hold;
+    if (effect !== null) {
+      arrowEffect.push(effect);
+    }
   }
   fields.set(main, created);
   syncGuards(main);
@@ -945,8 +924,7 @@ function onClosing(
 /** A refused draft waiting for Raw to go off (R97). */
 interface RawDraft {
   target: TargetKey;
-  arrow: number | null;
-  sole: boolean;
+  hold: ArrowHold | null;
   /** The ticket holding the fence's place. */
   place: number;
   baseline: string;
@@ -1004,7 +982,8 @@ const rawNoteTheme = EditorView.baseTheme({
  * outside the layer says so (R97).
  */
 async function commitForRaw(open: OpenField): Promise<void> {
-  const { main, el, target, anchor, arrow } = open;
+  const { main, el, target, anchor, hold } = open;
+  const arrow = hold?.ticket ?? null;
   fields.delete(main);
   const typed = tidyLabel(el.value);
   el.remove();
@@ -1024,8 +1003,7 @@ async function commitForRaw(open: OpenField): Promise<void> {
   const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. Leaving is stopped once. Leaving again goes without it.`;
   rawDrafts.set(main, {
     target,
-    arrow,
-    sole: open.sole,
+    hold,
     place,
     baseline: open.baseline,
     draft: el.value,
@@ -1060,14 +1038,7 @@ function restoreRawDraft(main: EditorView): void {
   const held =
     fence === null || model === null
       ? "gone"
-      : heldTarget(
-          main,
-          raw.target,
-          raw.arrow,
-          raw.sole,
-          model,
-          fence.bodyFrom,
-        );
+      : resolveTarget(main, raw.target, raw.hold, model, fence.bodyFrom);
   if (fence === null || model === null || typeof held === "string") {
     end();
     showLostDraft(main, raw.draft);
@@ -1101,7 +1072,7 @@ function restoreRawDraft(main: EditorView): void {
 
 /** The label as it stands now, or the one the person saw when that cannot be read. */
 function labelNow(open: OpenField): string {
-  const { main, anchor, target, arrow, sole } = open;
+  const { main, anchor, target, hold } = open;
   const fence =
     main.state.field(diagramField, false) && anchor <= main.state.doc.length
       ? fenceAt(main.state, anchor)
@@ -1110,7 +1081,7 @@ function labelNow(open: OpenField): string {
   if (fence === null || model === null) {
     return open.baseline;
   }
-  const held = heldTarget(main, target, arrow, sole, model, fence.bodyFrom);
+  const held = resolveTarget(main, target, hold, model, fence.bodyFrom);
   return (
     (typeof held === "string" ? null : flowLabelOf(model, held)) ??
     open.baseline
@@ -1194,7 +1165,7 @@ function dropRawDraft(main: EditorView, raw: RawDraft): void {
   main.dispatch({
     effects: [
       untrackAnchor.of(raw.place),
-      ...(raw.arrow === null ? [] : [untrackAnchor.of(raw.arrow)]),
+      ...(raw.hold?.ticket == null ? [] : [untrackAnchor.of(raw.hold.ticket)]),
       ...(main.state.field(rawNote, false) === undefined
         ? []
         : [rawNoteShown.of(null)]),
@@ -1462,6 +1433,10 @@ registerIntentReopen("rename", (main, intent, host) => {
       label,
       intent.draft ?? label,
     );
+    // With no reading of its fence no ticket can be asked for: `resolveArrow`'s case.
+    if (intent.target.kind === "edge" && model !== null && fence !== null) {
+      open.hold = holdArrow(main, model, intent.target.key, fence.bodyFrom);
+    }
     fields.set(main, open);
   }
   mount(open, host, "back");
@@ -1577,16 +1552,6 @@ export const labelEditorPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate): void {
       const { view } = this;
       const open = fields.get(view);
-      // Here and not in the microtask: two edits in one tick, a duplicate and then
-      // the person's own arrow going, must not pass as one (R94).
-      if (open !== undefined && update.docChanged) {
-        const at = update.state.field(diagramIntent)?.anchor;
-        const fence = at === undefined ? null : fenceAt(update.state, at);
-        const model = fence && modelNow(fence);
-        if (model !== null) {
-          noteDuplicates(open, model);
-        }
-      }
       // Whatever changes what is drawn: an edit, the caret leaving a fence it held
       // as text, a verdict landing (N3).
       if (

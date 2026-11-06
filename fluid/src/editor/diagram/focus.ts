@@ -19,7 +19,13 @@
 
 import { forceParsing, syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
-import { EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
+import {
+  EditorState,
+  Prec,
+  StateEffect,
+  StateField,
+  Transaction,
+} from "@codemirror/state";
 import type { Command, ViewUpdate } from "@codemirror/view";
 import {
   EditorView,
@@ -44,12 +50,14 @@ import {
 } from "./field";
 import {
   decorateFlow,
+  flowEdgeSpanOf,
   flowElementOf,
   flowStops,
   flowTargetOf,
 } from "./flowchart/hit";
-import { heldEdge, holdArrow, letGoOfArrow } from "./flowchart/heldArrow";
-import type { FlowModel } from "./flowchart/model";
+import type { ArrowHold } from "./flowchart/heldArrow";
+import { holdArrow, letGoOfArrow, resolveArrow } from "./flowchart/heldArrow";
+import type { EdgeKey, FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
 import { parseFlowchart } from "./flowchart/parse";
 import type { DiagramIntent, TargetKey } from "./intent";
@@ -297,6 +305,9 @@ function boxStops(stops: TargetKey[]): TargetKey[] {
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
 const held = new WeakMap<EditorView, boolean>();
 
+/** Connect mode ignored a menu key: that key's own `contextmenu` is no right click. */
+const keyMenuOwed = new WeakSet<EditorView>();
+
 /** Views whose held key just took a fence: its repeats take nothing more (N6). */
 const spentHold = new WeakSet<EditorView>();
 
@@ -400,7 +411,7 @@ async function deleteStop(
         if (hold === null) {
           return { refused: "gone" };
         }
-        const edge = heldEdge(main, hold, model, bodyFrom);
+        const edge = resolveArrow(main, hold, model, bodyFrom);
         return typeof edge === "string"
           ? { refused: edge }
           : { op: "deleteEdge", edge };
@@ -509,6 +520,10 @@ function onKey(
   if (event.shiftKey && !menu) {
     return false;
   }
+  // No menu of ours on a page that takes no writes: the browser's own stands.
+  if (menu && !host.writable()) {
+    return false;
+  }
   const intent = main.state.field(diagramIntent);
   const connecting = intent?.mode === "connect" && intent.anchor === from;
   if (key === "Escape") {
@@ -533,6 +548,8 @@ function onKey(
   }
   // Waiting for its box: a walk or a choice, and no other key takes anything.
   if (connecting && (menu || remove || key === "F2")) {
+    // By reading only: on Windows that key's `contextmenu` comes after its keyup.
+    keyMenuOwed.add(main);
     return true;
   }
   if (staleNow(main, host, from)) {
@@ -730,6 +747,12 @@ export function sayAt(
   }
 }
 
+/** Views whose plugin ended: Raw too, so a microtask queued before it does nothing. */
+const destroyedViews = new WeakSet<EditorView>();
+
+const sameEdgeKey = (a: EdgeKey, b: EdgeKey) =>
+  a.start === b.start && a.end === b.end && a.occurrence === b.occurrence;
+
 /** The views this layer runs in: a filter has only a state to go by. */
 const liveViews = new Set<EditorView>();
 
@@ -783,6 +806,10 @@ const focusPlugin = ViewPlugin.fromClass(
     lookOn: DiagramHost | null = null;
     /** Takes a refusal's panel away again. */
     panelTimer: ReturnType<typeof setTimeout> | null = null;
+    /** The arrow the keyboard stands on, by its place (R94). */
+    stopHold: ArrowHold | null = null;
+    /** The person's own edit came: it may rewrite the token, and it means no harm. */
+    ownEdit = false;
 
     readonly mousedown = (event: Event): void => {
       // The click decides; a press alone moves neither focus nor selection.
@@ -796,6 +823,7 @@ const focusPlugin = ViewPlugin.fromClass(
      * caret is not brought to its canonical place.
      */
     readonly pressOutside = (event: Event): void => {
+      keyMenuOwed.delete(this.view);
       const el = event.target;
       if (
         el instanceof Element &&
@@ -857,6 +885,9 @@ const focusPlugin = ViewPlugin.fromClass(
       }
       event.preventDefault();
       const intent = this.view.state.field(diagramIntent);
+      if (keyMenuOwed.delete(this.view)) {
+        return;
+      }
       if (intent?.mode === "connect" && intent.anchor === place.from) {
         connectHooks?.cancel(this.view);
         return;
@@ -1072,8 +1103,90 @@ const focusPlugin = ViewPlugin.fromClass(
       }
     }
 
+    /** Stop holding the stop's arrow. */
+    dropStopHold(): void {
+      if (this.stopHold !== null) {
+        letGoOfArrow(this.view, this.stopHold);
+        this.stopHold = null;
+      }
+    }
+
+    /**
+     * A stop on an arrow is a choice too: it follows that arrow when a duplicate
+     * moves its occurrence, and leaves when it cannot tell, so the ring never comes
+     * to stand on another arrow that the next key would take.
+     */
+    followStop(): void {
+      const { view } = this;
+      const intent = view.state.field(diagramIntent, false);
+      const key =
+        intent?.mode === "focus" && intent.target.kind === "edge"
+          ? intent.target.key
+          : null;
+      if (intent === null || intent === undefined || key === null) {
+        this.ownEdit = false;
+        this.dropStopHold();
+        return;
+      }
+      const fence = fenceAt(view.state, intent.anchor);
+      if (fence === null || fenceIsBehind(view.state, intent.anchor)) {
+        return;
+      }
+      const model = modelOf(fence.body);
+      if (!model.understood) {
+        return;
+      }
+      const own = this.ownEdit;
+      this.ownEdit = false;
+      const hold = this.stopHold;
+      if (hold === null || own || !sameEdgeKey(hold.key, key)) {
+        this.dropStopHold();
+        if (flowEdgeSpanOf(model, key) !== null) {
+          this.stopHold = holdArrow(view, model, key, fence.bodyFrom);
+        }
+        return;
+      }
+      const now = resolveArrow(view, hold, model, fence.bodyFrom);
+      if (now === "gone") {
+        // `settle` gives the stop to what stands in its place.
+        this.dropStopHold();
+      } else if (now === "stale") {
+        this.dropStopHold();
+        view.dispatch({
+          effects: setDiagramIntent.of({
+            ...intent,
+            target: { kind: "node", id: key.start },
+          }),
+        });
+        sayAt(view, intent.anchor, "stale");
+      } else if (!sameEdgeKey(now, key)) {
+        hold.key = now;
+        view.dispatch({
+          effects: setDiagramIntent.of({
+            ...intent,
+            target: { kind: "edge", key: now },
+          }),
+        });
+      }
+    }
+
     update(update: ViewUpdate): void {
       const { view } = this;
+      if (
+        update.docChanged ||
+        update.startState.field(diagramIntent) !==
+          update.state.field(diagramIntent)
+      ) {
+        this.ownEdit ||= update.transactions.some(
+          (tr) =>
+            tr.docChanged && tr.annotation(Transaction.userEvent) !== undefined,
+        );
+        queueMicrotask(() => {
+          if (!destroyedViews.has(view)) {
+            this.followStop();
+          }
+        });
+      }
       if (
         update.transactions.some((tr) =>
           tr.effects.some((e) => e.is(verdictArrived)),
@@ -1259,6 +1372,7 @@ const focusPlugin = ViewPlugin.fromClass(
     }
 
     destroy(): void {
+      destroyedViews.add(this.view);
       liveViews.delete(this.view);
       const dom = this.view.contentDOM;
       dom.removeEventListener("mousedown", this.mousedown);

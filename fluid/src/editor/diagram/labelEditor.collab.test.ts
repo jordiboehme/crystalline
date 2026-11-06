@@ -709,7 +709,7 @@ describe("an arrow held through a peer's duplicates (C1, R94)", () => {
     expect(fieldOf(local)).toBe(field);
   });
 
-  it("takes the one arrow left of that pair when its own was rewritten", async () => {
+  it("does not take the one arrow left of that pair when its token was rewritten", async () => {
     const { local, peer, sync } = await roomOf("A -->|one| B");
     const field = openArrow(local, 0);
     type(field, "renamed");
@@ -720,8 +720,12 @@ describe("an arrow held through a peer's duplicates (C1, R94)", () => {
     });
     sync();
     await flush();
-    await enter(local, field);
-    expect(bytes(local.state)).toContain("A -.->|renamed| B");
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(notice(local)).toContain(NOTICES.arrowChanged);
+    });
+    expect(bytes(local.state)).toContain("A -.->|re| B");
+    expect(fieldOf(local)).toBe(field);
   });
 
   it("closes as gone when a peer deletes the arrow, with its boxes left", async () => {
