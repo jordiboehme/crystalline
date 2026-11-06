@@ -8928,16 +8928,26 @@ async fn the_close_folder_budget_starts_once_the_store_lock_is_held() {
 /// per-file lock. Two tabs of one account race on 50 fresh paths; each path
 /// answers one Ok and one create-only refusal, and the stored bytes are the
 /// winner's.
+///
+/// Each path stands in a folder of its own, because the first upload makes the
+/// folder while it holds the lock, and a second one asking for the lock in that
+/// moment has to get the same lock. The second upload starts a little later
+/// each round, spun rather than slept since a timer is too coarse on Windows,
+/// so the rounds sweep across that moment on a fast disk and a slow one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_create_only_overlay_uploads_of_one_path_land_once() {
     use crystalline_service::EngineError;
     use crystalline_service::engine::ASSET_EXISTS;
     let f = review_fixture().await;
-    for i in 0..50 {
-        let path = format!("assets/race-{i}.png");
-        let write = |bytes: &'static [u8]| {
+    for i in 0..50u64 {
+        let path = format!("assets/race-{i}/x.png");
+        let write = |bytes: &'static [u8], head_start: std::time::Duration| {
             let (engine, path) = (f.engine.clone(), path.clone());
             tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                while start.elapsed() < head_start {
+                    std::hint::spin_loop();
+                }
                 engine
                     .attachment_write_joined(
                         "team",
@@ -8950,7 +8960,11 @@ async fn two_create_only_overlay_uploads_of_one_path_land_once() {
                     .await
             })
         };
-        let (a, b) = tokio::join!(write(b"first"), write(b"second"));
+        let later = std::time::Duration::from_micros(i * 40);
+        let (a, b) = tokio::join!(
+            write(b"first", std::time::Duration::ZERO),
+            write(b"second", later)
+        );
         let (a, b) = (a.unwrap(), b.unwrap());
         let winner: &[u8] = match (&a, &b) {
             (Ok(_), Err(EngineError::Conflict(text))) if text.ends_with(ASSET_EXISTS) => b"first",

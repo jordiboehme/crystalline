@@ -3786,10 +3786,10 @@ impl Engine {
     /// two domains registered over one root, or over two spellings of one path,
     /// still serialize on the file itself: the key is
     /// [`canonicalize`](std::fs::canonicalize)d where the filesystem can
-    /// resolve it, which covers symlinks and `..` segments, and falls back to
-    /// the path as given for a file that does not exist yet - a create and a
-    /// save of one engram therefore share a key only once the file is there,
-    /// which is exactly when both are reading it. Taken before the store lock,
+    /// resolve it, which covers symlinks and `..` segments, and for a file that
+    /// does not exist yet is its nearest existing ancestor canonicalized with
+    /// the rest appended, so the key is the same before the folder exists, after
+    /// it does and after the file does (see `lock_key`). Taken before the store lock,
     /// always, so the two never invert; virtual domains take neither, since
     /// their compare-and-swap happens inside a single database statement.
     ///
