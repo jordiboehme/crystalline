@@ -58,6 +58,12 @@ import {
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { roomUndo } from "./roomUndo";
 import { insertMarkdownLink } from "./toolbar";
+import {
+  PAGE_LOADING,
+  PARSE_BUDGET,
+  deadlineIn,
+  viewParsedTo,
+} from "./marks/parse";
 
 export type ElementEdit =
   | {
@@ -393,6 +399,15 @@ export function commitElementEdit(
     return false;
   }
   const { view, edit } = request;
+  // The commit judges as `editLink` does: the tree may have gone short while
+  // the popover was open. A bare `input`, so nothing after this judges it.
+  const at = edit.kind === "new-link" ? edit.range.to : edit.at;
+  const line = view.state.doc.lineAt(Math.min(at, view.state.doc.length));
+  if (!viewParsedTo(view, line.to, deadlineIn(PARSE_BUDGET.command))) {
+    view.dispatch({ effects: EditorView.announce.of(PAGE_LOADING) });
+    view.focus();
+    return false;
+  }
   const { state } = view;
   const end = elementEnd(state, edit);
   // Main is the page: a cell's commit is forwarded there, so both must take it.
@@ -609,10 +624,22 @@ export const CANNOT_LINK = "A link cannot go here.";
  * lines) nothing is written and `CANNOT_LINK` is announced.
  */
 export function editLink(view: EditorView): boolean {
-  const { state } = view;
-  if (!writable(state)) {
+  if (!writable(view.state)) {
     return true;
   }
+  // The test below takes "no marks, no code, no link found" as allowed, so it
+  // reads a tree that reaches the selection, or says the page is loading (D35).
+  if (
+    !viewParsedTo(
+      view,
+      view.state.doc.lineAt(view.state.selection.main.to).to,
+      deadlineIn(PARSE_BUDGET.command),
+    )
+  ) {
+    view.dispatch({ effects: EditorView.announce.of(PAGE_LOADING) });
+    return true;
+  }
+  const { state } = view;
   const range = state.selection.main;
   if (range.empty) {
     const link = linkAt(state, range.head);

@@ -28,6 +28,7 @@
  * send, and the back button moves between them.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import {
   useInfiniteQuery,
   useMutation,
@@ -156,6 +157,10 @@ export default function DomainHome() {
   // is a wrong address, not an empty shelf - and what the folder buttons on
   // both pages are drawn from. Read here, once, so neither page asks twice.
   const tree = useQuery(treeQuery(domain, path));
+  // The domain's name once it is known to exist, and the folder after it.
+  usePageTitle(
+    isMissing(tree.error) ? null : path === "" ? domain : `${domain} / ${path}`,
+  );
   if (isMissing(tree.error)) {
     return <MissingOrReflection domain={domain} />;
   }

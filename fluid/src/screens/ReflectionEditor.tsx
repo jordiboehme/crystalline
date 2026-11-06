@@ -20,6 +20,7 @@
  * room over a status refetch would drop text the server has not saved.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -524,6 +525,7 @@ function Surface({
   const [resolveProblem, setResolveProblem] = useState<string | null>(null);
   const [mountText] = useState(() => ytext.toJSON());
   const [title] = useState(() => titleOf(mountText, path));
+  usePageTitle(title);
   const [mountEnded] = useState(ended);
   const [view, setView] = useState<EditorView | null>(null);
   /*

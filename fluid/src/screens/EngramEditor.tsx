@@ -9,6 +9,7 @@
  * editing a page that now 404s.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -332,6 +333,7 @@ export default function EngramEditor() {
     staleTime: DETAIL_STALE_MS,
   });
 
+  usePageTitle(canWrite && !detail.error ? detail.data?.title : null);
   if (!canWrite) {
     return <NotFound />;
   }

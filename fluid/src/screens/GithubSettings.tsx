@@ -14,6 +14,7 @@
  * screen that is simply open.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
@@ -75,6 +76,7 @@ const APP_STORE = "GitHub App";
 
 export default function GithubSettings() {
   const { capabilities } = useAuth();
+  usePageTitle(capabilities.canAdminister ? "GitHub" : null);
   if (!capabilities.canAdminister) {
     return <NotFound />;
   }

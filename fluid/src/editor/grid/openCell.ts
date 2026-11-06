@@ -197,9 +197,8 @@ export function parseThrough(main: EditorView, pos: number): void {
   const line = doc.lineAt(Math.max(0, Math.min(pos, doc.length)));
   const upto =
     line.number < doc.lines ? doc.line(line.number + 1).to : doc.length;
-  if (syntaxTree(main.state).length >= upto) return;
-  ensureSyntaxTree(main.state, upto, LANDING_PARSE_MS);
-  main.dispatch({});
+  const tree = ensureSyntaxTree(main.state, upto, LANDING_PARSE_MS);
+  if (tree !== syntaxTree(main.state)) main.dispatch({});
 }
 
 export const openCellField = StateField.define<OpenCell | null>({

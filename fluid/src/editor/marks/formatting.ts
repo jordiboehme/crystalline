@@ -55,7 +55,13 @@ import type { Mark, MarkRun } from "./hiddenMarks";
 import { marksOnLine, runsOf } from "./hiddenMarks";
 import { selectedPicture } from "../pictures/refs";
 import { hiddenMarkLayerOn, marksHiddenOnLine, pictureInline } from "./mode";
-import { PAGE_LOADING, PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
+import {
+  PAGE_LOADING,
+  PARSE_BUDGET,
+  deadlineIn,
+  parsedTo,
+  viewParsedTo,
+} from "./parse";
 import type { Deadline } from "./parse";
 
 export type Format = "strong" | "em" | "strike" | "code";
@@ -605,10 +611,13 @@ function refuse(view: EditorView, said = CANNOT_FORMAT): void {
   view.dispatch({ effects: EditorView.announce.of(said) });
 }
 
-function formatSelection(view: EditorView, format: Format): void {
+function formatSelection(
+  view: EditorView,
+  format: Format,
+  deadline: Deadline,
+): void {
   // One bound for the whole press (D35): the start state is parsed first, to
   // the selection's last line, so the trial reparses only what it changed.
-  const deadline = deadlineIn(PARSE_BUDGET.command);
   const state = parsedTo(
     view.state,
     view.state.doc.lineAt(view.state.selection.main.to).to,
@@ -720,7 +729,20 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
   if (!writable(view.state)) {
     return true;
   }
-  for (const gate of view.state.facet(formatGate)) {
+  // One bound for the whole press (D35). The gates and the refusal of a
+  // picture read the view's tree, and on a tree a reparse left short they would
+  // find nothing to refuse or refuse for nothing: the press parses first. Main
+  // with a caret reads nothing here, so it does not wait.
+  const deadline = deadlineIn(PARSE_BUDGET.command);
+  const gates = view.state.facet(formatGate);
+  if (gates.length > 0 || !view.state.selection.main.empty) {
+    viewParsedTo(
+      view,
+      view.state.doc.lineAt(view.state.selection.main.to).to,
+      deadline,
+    );
+  }
+  for (const gate of gates) {
     const said = gate(view.state);
     if (said !== null) {
       view.dispatch({ effects: EditorView.announce.of(said) });
@@ -755,7 +777,7 @@ export function toggleFormat(view: EditorView, format: Format): boolean {
   }
   // Where the marks show too: the visible characters picked change format,
   // so a pair the selection falls inside is split, never broken by a wrap.
-  formatSelection(view, format);
+  formatSelection(view, format, deadline);
   view.focus();
   return true;
 }

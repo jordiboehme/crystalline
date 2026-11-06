@@ -31,6 +31,7 @@ import type { EditorState } from "@codemirror/state";
 import type { InsertAction } from "./inserts";
 import { INSERT_ACTIONS } from "./inserts";
 import { inCompletableProse } from "./prose";
+import { PARSE_BUDGET, deadlineIn, parsedTo } from "./marks/parse";
 
 /** A slash, then nothing or a word and more words: the whole line so far. */
 const QUERY = /^\/(?:\w[\w ]*)?$/;
@@ -102,10 +103,22 @@ export const slashCompletions: CompletionSource = (
 ): CompletionResult | null => {
   const line = context.state.doc.lineAt(context.pos);
   const before = context.state.sliceDoc(line.from, context.pos);
+  if (!QUERY.test(before)) {
+    return null;
+  }
+  // Typing the `/` is itself an edit that can leave the tree short, and a short
+  // tree holds no fence: a pick would write its element into one (D35). Only a
+  // line that asks gets this parse; short of time, no menu rather than a wrong
+  // one, and the next letter asks again.
+  const state = parsedTo(
+    context.state,
+    line.to,
+    deadlineIn(PARSE_BUDGET.typing),
+  );
   if (
-    !QUERY.test(before) ||
-    !inCompletableProse(context.state, context.pos) ||
-    insideClosedBlock(context.state, context.pos)
+    !state ||
+    !inCompletableProse(state, context.pos) ||
+    insideClosedBlock(state, context.pos)
   ) {
     return null;
   }

@@ -40,6 +40,7 @@
  * never by this screen.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy } from "lucide-react";
 import { Dialog } from "radix-ui";
@@ -120,6 +121,7 @@ const MUTED = "text-sm text-slate-500 dark:text-slate-400";
 export default function Profile() {
   const { user, capabilities } = useAuth();
   const location = useLocation();
+  usePageTitle(user ? "Profile" : null);
   // A profile is an account's, and an anonymous session has none. The address
   // then says exactly as much as a mistyped one does. The one exception is a
   // GitHub link coming back to a browser that lost its session: on an
