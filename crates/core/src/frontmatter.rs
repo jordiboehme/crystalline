@@ -557,12 +557,40 @@ fn pick(
         }
         return Err(());
     }
+    // `generated` is the provenance of the last write, not a person's words:
+    // both sides touching it is the normal case for any two writes, so the
+    // line with the later `at` wins whole (upstream's on a tie or when either
+    // time does not read) instead of colliding as one line.
+    if let (Some(l), Some(u)) = (local, upstream)
+        && is_generated(l)
+    {
+        let newer = match (generated_at(&l.value), generated_at(&u.value)) {
+            (Some(lt), Some(ut)) if lt > ut => l,
+            _ => u,
+        };
+        return Ok(Some(newer.text.clone()));
+    }
     if let (Some(b), Some(l), Some(u)) = (base, local, upstream)
         && let Some((merged, _)) = merge_block(b, l, u, line_merge)
     {
         return Ok(Some(merged));
     }
     Err(())
+}
+
+fn is_generated(block: &KeyBlock) -> bool {
+    matches!(&block.parsed_key, Value::String(k) if k == "generated")
+}
+
+/// The instant a `generated` mapping's `at` names, when it reads as RFC 3339.
+fn generated_at(value: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let Value::Mapping(map) = value else {
+        return None;
+    };
+    let Value::String(at) = map.get("at")? else {
+        return None;
+    };
+    chrono::DateTime::parse_from_rfc3339(at).ok()
 }
 
 /// Merge three frontmatters key by key. `base` is `None` when both sides
@@ -587,6 +615,7 @@ fn pick(
 /// | L equals U | U's text when L's text is byte-equal to U's or B's (absent on both: the key is gone); L's text when U's text is byte-equal to B's (only local re-spelled it); no B (both added it): U's text; when both re-spelled it, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value, else L's text |
 /// | L equals B | U's text when L's text is byte-equal to B's (only upstream changed or removed it); when local re-spelled it (a comment, say) and U is present, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with U's value; else conflict, so a local comment is never dropped silently |
 /// | U equals B | L's text when U's text is byte-equal to B's (only local changed, added or removed it); when upstream re-spelled it and L is present, the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key with L's value; else conflict, so an upstream comment is never dropped silently |
+/// | otherwise, key `generated` with L and U both present | the block whose `at` reads as the later instant; U's on a tie or when either does not read |
 /// | otherwise, all three present | the three block texts line-merged by `line_merge`, taken when the result is exactly one block of the same key |
 /// | otherwise | conflict |
 ///
