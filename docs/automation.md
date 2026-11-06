@@ -108,7 +108,7 @@ On a team domain with a GitHub origin, `run` itself (not the agent) shares the r
 - The changes of a run that was stopped are not shared, by this run or by a later one. They stay local for a person.
 - A domain with no origin, or an instance with GitHub off, shares nothing (`no_origin`). `--no-share` keeps everything local too.
 
-A local `run` against your own daemon acts as the machine owner, not as an account, so it cannot tell its own writes from yours. It shares the files that are new or changed since the lease was taken instead, still holding back what you had unshared at the start. Do not edit the domain on that machine while such a run works it, or give the runner its own account and run it in remote mode.
+A local `run` against your own daemon acts as the machine owner, not as an account, so it cannot tell its own writes from yours. With a GitHub App and `github.share_identity` unset, its proposal goes through the App, so the App's bot opens it. With `personal` set it needs `crystalline connect github --personal`. It shares the files that are new or changed since the lease was taken instead, still holding back what you had unshared at the start. Do not edit the domain on that machine while such a run works it, or give the runner its own account and run it in remote mode.
 
 ## The lease and the run record
 
@@ -148,7 +148,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:/home/you/.local/bin
 30 6 * * * crystalline evolve run --domain eng >> /home/you/crystalline-evolve.log 2>&1
 ```
 
-A local run acts as the machine owner (see [Sharing as a pull request](#sharing-as-a-pull-request)), so use it on a machine only you use. On a team server, use remote mode with an agent account, as [A scheduled run](reflection.md#a-scheduled-run) shows for systemd.
+A local run acts as the machine owner (see [Sharing as a pull request](#sharing-as-a-pull-request)), so use it on a machine only you use. On a team server, use remote mode with an agent account, as [A scheduled run](reflection.md#a-scheduled-run) shows for systemd. That run is the agent account, so with a GitHub App the account needs its own link: add the account, then run `crystalline connect github --personal --as <agent-account>` on the server. Without a link the run stops when it takes the lease and says so, unless you pass `--no-share`.
 
 ## At home: n8n
 

@@ -2699,11 +2699,15 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
         // No index on this machine yet: the same "nothing synced" report the
         // direct path used to build for an absent database file.
         IndexRoute::Absent(db) => {
-            return Ok(serde_json::json!({
+            let mut report = serde_json::json!({
                 "indexed": false,
                 "db_path": db.display().to_string(),
                 "registered": registered,
-            }));
+            });
+            if let Some(share_identity) = share_identity_report(cfg) {
+                report["share_identity"] = share_identity;
+            }
+            return Ok(report);
         }
         IndexRoute::Unreachable(why) => return Err(index_unreachable("status", &why)),
         // The dispatch renders the daemon's own report and never sends one
@@ -2812,6 +2816,9 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             "lines_eligible": null,
         },
     });
+    if let Some(share_identity) = share_identity_report(cfg) {
+        report["share_identity"] = share_identity;
+    }
     // The daemon's two reflection keys, under its rule: only while a
     // Reflection holds a chunk, so the output stays byte-stable without one.
     if reflection.total_chunks > 0
@@ -2827,6 +2834,46 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
         );
     }
     Ok(report)
+}
+
+/// The `share_identity` block of a direct `status`, as the daemon's report has
+/// it: only where shares exist at all. No engine here and no keychain read on a
+/// status: the App is asked of what is cheap to read.
+fn share_identity_report(cfg: &GlobalConfig) -> Option<serde_json::Value> {
+    if !cfg.github_enabled() {
+        return None;
+    }
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    let home = match test_token_store_dir() {
+        Some(dir) => Some(crystalline_service::engine::AppHome::new(
+            api_url, dir, true,
+        )),
+        None => config::origins_state_dir()
+            .ok()
+            .map(|dir| crystalline_service::engine::AppHome::new(api_url, dir, false)),
+    };
+    let app = home.map_or(crystalline_core::config::GithubAppPresence::None, |home| {
+        home.presence(&crystalline_service::EnvOverlay::from_process_env().unwrap_or_default())
+    });
+    let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        app,
+    );
+    Some(serde_json::json!({
+        "mode": share_identity.mode.as_str(),
+        "default": share_identity.is_default(),
+        "reason": share_identity.reason_text(),
+    }))
+}
+
+/// One human line for a report's `share_identity` block, when it has one.
+fn print_share_identity(data: &serde_json::Value) {
+    if let Some(mode) = data["share_identity"]["mode"].as_str() {
+        println!(
+            "Shares run on: {mode} identity ({})",
+            data["share_identity"]["reason"].as_str().unwrap_or("?")
+        );
+    }
 }
 
 /// The one-line reason the contradiction check is not simply "N pairs
@@ -2983,6 +3030,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     use serde_json::Value;
 
     println!("Daemon: {daemon_note}");
+    print_share_identity(data);
     // Only the daemon's own report carries these; a direct index read has no
     // daemon to describe, so the line is absent rather than guessed at. The
     // phrasing says "asked to bind" on purpose: these are the exposure facts
@@ -3580,6 +3628,8 @@ pub async fn connect_github(
         .and_then(|g| g.oauth_client_id.clone())
         .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string());
 
+    // Read before the sign-in, which can take minutes.
+    let account_then = AccountThen::read(identity).await?;
     let (access_token, login) = match token {
         Some(pat) => {
             let login = crystalline_remote::github::auth::validate_token(api_url.as_deref(), pat)
@@ -3601,6 +3651,7 @@ pub async fn connect_github(
         expires_at: None,
         refresh_expires_at: None,
     };
+    account_then.refuse_if_changed().await?;
     let store = save_credential(
         identity,
         token_host.as_deref(),
@@ -3608,14 +3659,21 @@ pub async fn connect_github(
         token_store_dir,
         &stored,
     )?;
+    account_then.take_back_if_changed(&store, &stored).await?;
 
     // A personal connect that lands on an instance-mode installation is a
     // credential nothing will use yet, so the mode is named where it is
     // actionable. `github.enabled` is left to the instance connect to hint at:
     // turning collaboration on is an instance-wide decision, not something a
     // person connecting their own identity is making.
+    if !instance {
+        // A running daemon remembers for a short time that this token was
+        // missing; this ends that.
+        let _ = notify_daemon_forgot(identity).await;
+    }
+    let share_identity = share_identity_here(&loaded, cfg);
     let personal_mode = matches!(
-        cfg.github_share_identity(),
+        share_identity.mode,
         crystalline_core::config::ShareIdentityMode::Personal
     );
     if json {
@@ -3627,7 +3685,7 @@ pub async fn connect_github(
         if !instance {
             report["identity"] = serde_json::json!("personal");
             report["account"] = serde_json::json!(identity_label(identity));
-            report["share_identity"] = serde_json::json!(cfg.github_share_identity().as_str());
+            report["share_identity"] = serde_json::json!(share_identity.mode.as_str());
         }
         println!("{report}");
     } else if instance {
@@ -3651,6 +3709,69 @@ pub async fn connect_github(
         }
     }
     Ok(())
+}
+
+/// Which account a person's name held when this connect began. This process
+/// polls for minutes while the account can be removed and made again, and removal
+/// tells only the daemon, so it asks again right before it saves and once after.
+struct AccountThen {
+    /// The accounts database and the name, for a person on a machine that has one.
+    asks: Option<(crystalline_service::rest::AuthStore, String)>,
+    born: Option<String>,
+}
+
+impl AccountThen {
+    async fn read(identity: &crystalline_remote::TokenIdentity) -> Result<AccountThen> {
+        let nobody = AccountThen {
+            asks: None,
+            born: None,
+        };
+        let crystalline_remote::TokenIdentity::Personal(name) = identity else {
+            return Ok(nobody);
+        };
+        if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            return Ok(nobody);
+        }
+        let path = config::web_auth_db_path()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+        if !path.exists() {
+            return Ok(nobody);
+        }
+        let store = crystalline_service::rest::AuthStore::open(&path).await?;
+        let born = store.account_born(name).await?;
+        Ok(AccountThen {
+            asks: Some((store, name.clone())),
+            born,
+        })
+    }
+
+    /// Refuses unless the name still holds what it held. A read that fails refuses.
+    async fn refuse_if_changed(&self) -> Result<()> {
+        let Some((store, name)) = &self.asks else {
+            return Ok(());
+        };
+        if store.account_born(name).await? != self.born {
+            bail!("the account '{name}' changed during this sign-in, so nothing was saved");
+        }
+        Ok(())
+    }
+
+    /// The same after a save, taking back the token that lost the race.
+    async fn take_back_if_changed(
+        &self,
+        saved: &crystalline_remote::TokenStore,
+        stored: &crystalline_remote::StoredToken,
+    ) -> Result<()> {
+        let Err(refused) = self.refuse_if_changed().await else {
+            return Ok(());
+        };
+        if let Ok(Some(held)) = saved.load()
+            && held.access_token == stored.access_token
+        {
+            saved.delete().map_err(|e| anyhow!("{e}"))?;
+        }
+        Err(refused)
+    }
 }
 
 /// Saves `stored` as `identity`'s credential: under `token_store_dir` when
@@ -3754,6 +3875,8 @@ impl PersonalApp<'_> {
     async fn connect(&self, json: bool) -> Result<()> {
         let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
         let accounts = self.link_target().await?;
+        // Read before the sign-in, which can take minutes.
+        let account_then = AccountThen::read(self.identity).await?;
         let credentials = app.credentials();
         let auth_base = app.auth_base();
         let grant = device_flow_grant(auth_base, &credentials.client_id, None)
@@ -3770,9 +3893,11 @@ impl PersonalApp<'_> {
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
         let name = self.name();
+        account_then.refuse_if_changed().await?;
         if let Some(store) = &accounts {
+            let born = account_then.born.as_deref().unwrap_or_default();
             store
-                .link_github(name, &credentials.host, user.id, &user.login)
+                .link_github_if_born(name, born, &credentials.host, user.id, &user.login)
                 .await?;
         }
         let stored = crystalline_remote::StoredToken {
@@ -3807,11 +3932,17 @@ impl PersonalApp<'_> {
                 return Err(e);
             }
         };
+        account_then.take_back_if_changed(&store, &stored).await?;
         // A running daemon may hold an older token of this identity in its
         // cache; a relink replaces it.
         let told = notify_daemon_forgot(self.identity).await;
+        // This path runs on the App, so an absent key means personal.
+        let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+            self.cfg.github_share_identity_setting(),
+            crystalline_core::config::GithubAppPresence::Configured,
+        );
         let personal_mode = matches!(
-            self.cfg.github_share_identity(),
+            share_identity.mode,
             crystalline_core::config::ShareIdentityMode::Personal
         );
         if json {
@@ -3821,7 +3952,7 @@ impl PersonalApp<'_> {
                 "github_enabled": self.cfg.github_enabled(),
                 "identity": "personal",
                 "account": identity_label(self.identity),
-                "share_identity": self.cfg.github_share_identity().as_str(),
+                "share_identity": share_identity.mode.as_str(),
                 "github_app": true,
                 "linked": accounts.is_some(),
                 "daemon": told.as_str(),
@@ -5236,6 +5367,22 @@ fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
         bail!("{flag} names {}, which is empty", path.display());
     }
     Ok(value)
+}
+
+/// The share identity mode in effect for this process, which has no engine:
+/// the App is asked of what is cheap to read.
+fn share_identity_here(
+    loaded: &crystalline_service::LoadedConfig,
+    cfg: &GlobalConfig,
+) -> crystalline_core::config::EffectiveShareIdentity {
+    let app = match app_home(loaded, test_token_store_dir().as_deref()) {
+        Ok(home) => home.presence(&loaded.overlay),
+        Err(_) => crystalline_core::config::GithubAppPresence::None,
+    };
+    crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        app,
+    )
 }
 
 /// Where this CLI process finds and keeps the GitHub App: the effective

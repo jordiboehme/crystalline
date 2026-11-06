@@ -222,8 +222,16 @@ pub(crate) async fn dispatch(
     match answer {
         Ok(data) if ETAG_COMMANDS.contains(&cmd) => conditional(request, data),
         Ok(data) => envelope_ok(data),
-        Err(message) => envelope_err(message),
+        Err(message) => envelope_err(reader_message(identity, message)),
     }
+}
+
+/// A refusal in the words of who reads it: a runner's token need not be an admin's.
+fn reader_message(identity: &McpIdentity, message: String) -> String {
+    if identity.admin {
+        return message;
+    }
+    crate::engine::plain_refusal_text(&message).unwrap_or(message)
 }
 
 /// The envelope of a verb's answer: an argument error carries its kind.

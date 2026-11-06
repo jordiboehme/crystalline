@@ -275,6 +275,20 @@ impl Engine {
         }
     }
 
+    /// The kept texts a name's drafts count: see [`kept::held_by`]. Fails naming
+    /// the domain whose folder could not be read.
+    pub(super) fn kept_held_by(&self, account: &str) -> Result<Vec<KeptText>> {
+        let Some(root) = self.kept_dir() else {
+            return Ok(Vec::new());
+        };
+        kept::held_by(&root, account).map_err(|domain| {
+            tracing::warn!("the kept texts of '{account}' in '{domain}' could not be read");
+            EngineError::Internal(format!(
+                "the kept texts of domain '{domain}' could not be read"
+            ))
+        })
+    }
+
     fn kept_root(&self) -> Result<std::path::PathBuf> {
         self.kept_dir()
             .ok_or_else(|| EngineError::Internal("this process knows no state folder".to_string()))

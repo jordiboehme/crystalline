@@ -91,6 +91,23 @@ describe("the bootstrap probe", () => {
     expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
   });
 
+  it("says no account yet on a 409, with no retry and no word of a server down", async () => {
+    const sentence =
+      "An account cannot be made under this name yet. Ask an admin of this instance.";
+    serve({
+      "/auth/me": () => {
+        throw new ApiProblem(409, "conflict", sentence);
+      },
+    });
+    renderApp("/");
+    expect(
+      await screen.findByRole("heading", { name: "No account yet" }),
+    ).toBeVisible();
+    expect(screen.getByText(sentence)).toBeVisible();
+    expect(screen.queryByText("Cannot reach Crystalline")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
   it("shows the account-disabled screen on a 403, never the login form", async () => {
     serve({
       "/auth/me": () => {

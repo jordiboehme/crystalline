@@ -413,6 +413,15 @@ pub struct GithubDoctor {
     /// a keychain that could not be read). Absent without an App.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AppDoctor>,
+    /// Whose identity shares run on: `instance` or `personal`.
+    pub share_identity: String,
+    /// Why, in words: the key, or the default and what it followed.
+    pub share_identity_reason: String,
+    /// `github.share_identity` says `personal` and this machine's owner has no
+    /// identity, so a scheduled reflect or evolve run is refused. With an App
+    /// and no key such a run goes through the App instead.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub owner_identity_missing: bool,
 }
 
 /// What `doctor` found out about this instance's GitHub App. No secret is
@@ -4445,12 +4454,33 @@ async fn check_github(
     }
 
     let app = check_github_app(cfg, overlay).await;
+    let share_identity = crystalline_core::config::EffectiveShareIdentity::resolve(
+        cfg.github_share_identity_setting(),
+        if app.is_some() {
+            crystalline_core::config::GithubAppPresence::Configured
+        } else {
+            crystalline_core::config::GithubAppPresence::None
+        },
+    );
     // An App GitHub accepts is a connection of its own: reading, pulling and
     // sharing go through it without an instance token.
     let app_connected = app
         .as_ref()
         .is_some_and(|a| a.problem.is_none() && a.jwt_accepted == Some(true));
+    let owner_identity_missing = share_identity.mode
+        == crystalline_core::config::ShareIdentityMode::Personal
+        && !share_identity.is_default()
+        && config::origins_state_dir().is_ok_and(|dir| {
+            let owner = crystalline_remote::TokenIdentity::Personal(
+                crystalline_service::engine::OWNER_IDENTITY_NAME.to_string(),
+            );
+            TokenStore::resolve_and_load_for(&owner, host.as_deref(), &dir)
+                .is_ok_and(|(_store, token)| token.is_none())
+        });
     Ok(GithubDoctor {
+        owner_identity_missing,
+        share_identity: share_identity.mode.as_str().to_string(),
+        share_identity_reason: share_identity.reason_text().to_string(),
         connected: token.is_some() || app_connected,
         connected_through_app: token.is_none() && app_connected,
         user: token
@@ -5635,6 +5665,17 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(g) = &report.github {
         let _ = writeln!(out, "github:");
+        let _ = writeln!(
+            out,
+            "  shares run on: {} identity ({})",
+            g.share_identity, g.share_identity_reason
+        );
+        if g.owner_identity_missing {
+            let _ = writeln!(
+                out,
+                "  this machine's owner has no GitHub identity, so a scheduled reflect or evolve run cannot share and its changes stay here; run: crystalline connect github --personal, or set github.share_identity to instance"
+            );
+        }
         if g.connected_through_app {
             let _ = writeln!(
                 out,

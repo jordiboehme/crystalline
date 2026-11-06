@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use crystalline_core::base::{BasePath, PathProblem, PublicBase};
 use crystalline_core::config::{
-    AuthConfig, AutomationConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, EvolveConfig,
-    GitHubConfig, GlobalConfig, HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig,
-    RecallConfig, RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
-    SkillsConfig, SkillsServe, WebhookConfig,
+    AuthConfig, AutomationConfig, CaptureConfig, DatabaseBackend, DatabaseConfig,
+    EffectiveShareIdentity, EvolveConfig, GitHubConfig, GithubAppPresence, GlobalConfig,
+    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig, RemoteConfig,
+    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    WebhookConfig,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -199,7 +200,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "github.share_identity",
-            doc: "Whose GitHub identity shares run under: instance (default) shares with the instance credential, which with a GitHub App is the App, named as committer, with the person as commit author; personal requires each person to link their own GitHub identity for sharing, while pulling stays on the instance credential or the App",
+            doc: "Whose GitHub identity shares run under: instance shares with the instance credential, which with a GitHub App is the App, named as committer, with the person as commit author; personal requires each person to link their own GitHub identity for sharing, while pulling stays on the instance credential or the App. When unset: personal with a GitHub App configured, instance without one",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
@@ -986,7 +987,7 @@ fn stacks_effective(config: &GlobalConfig) -> (String, bool) {
 
 /// The strict half of the share-identity pair. Only the two words this
 /// registry knows are ever stored, so
-/// [`GlobalConfig::github_share_identity`] - which tolerates anything else by
+/// [`GlobalConfig::github_share_identity_setting`] - which tolerates anything else by
 /// reading it as `instance`, because a config file is hand-editable - always
 /// reads back exactly what was set here.
 fn set_share_identity(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1013,16 +1014,28 @@ fn clear_share_identity(config: &mut GlobalConfig) {
     drop_github_if_empty(config);
 }
 
+/// What a config alone can say: the key, or with no key the answer for an
+/// instance with no GitHub App. A config cannot know about the App, so a caller
+/// that can ([`with_effective_share_identity`]) puts the mode in effect on the
+/// row.
 fn share_identity_effective(config: &GlobalConfig) -> (String, bool) {
-    let is_default = config
-        .github
-        .as_ref()
-        .and_then(|g| g.share_identity.as_deref())
-        .is_none();
-    (
-        config.github_share_identity().as_str().to_string(),
-        is_default,
-    )
+    let setting = config.github_share_identity_setting();
+    let effective = EffectiveShareIdentity::resolve(setting, GithubAppPresence::None);
+    (effective.mode.as_str().to_string(), setting.is_none())
+}
+
+/// Puts the mode in effect on a `github.share_identity` row that comes from the
+/// default. A row whose value was set says that value already.
+pub fn with_effective_share_identity(
+    mut views: Vec<SettingView>,
+    effective: EffectiveShareIdentity,
+) -> Vec<SettingView> {
+    for view in &mut views {
+        if view.key == "github.share_identity" && view.source == SettingSource::Default {
+            view.value = effective.mode.as_str().to_string();
+        }
+    }
+    views
 }
 
 // --- github.agent_identity ----------------------------------------------------
@@ -3281,26 +3294,32 @@ mod tests {
     /// only the two words it knows, so a value Crystalline wrote always reads
     /// back as what was set.
     #[test]
-    fn apply_github_share_identity_round_trips_and_defaults_to_instance() {
+    fn apply_github_share_identity_round_trips_and_clears() {
         let mut cfg = GlobalConfig::default();
         assert_eq!(
-            cfg.github_share_identity(),
-            ShareIdentityMode::Instance,
-            "the instance token shares until someone says otherwise"
+            cfg.github_share_identity_setting(),
+            None,
+            "nobody said anything yet"
         );
 
         apply(&mut cfg, "github.share_identity", "personal").unwrap();
-        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Personal);
+        assert_eq!(
+            cfg.github_share_identity_setting(),
+            Some(ShareIdentityMode::Personal)
+        );
         assert_eq!(
             cfg.github.as_ref().unwrap().share_identity.as_deref(),
             Some("personal")
         );
 
         apply(&mut cfg, "github.share_identity", "instance").unwrap();
-        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Instance);
+        assert_eq!(
+            cfg.github_share_identity_setting(),
+            Some(ShareIdentityMode::Instance)
+        );
 
         unset(&mut cfg, "github.share_identity").unwrap();
-        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Instance);
+        assert_eq!(cfg.github_share_identity_setting(), None);
         assert!(cfg.github.is_none(), "and the emptied block goes with it");
     }
 

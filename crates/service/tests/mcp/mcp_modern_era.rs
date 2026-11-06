@@ -2518,7 +2518,7 @@ async fn a_legacy_direct_share_commits_in_one_call() {
 /// they travel to the caller verbatim, so a paraphrase here would pass while
 /// the product said something else.
 const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
-const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured. Ask an admin to name the account agents share as, or share from Fluid or the CLI.";
 
 /// **A stdio session shares as the machine owner**, so an instance sharing
 /// personally with no owner connection on file teaches the two ways to make

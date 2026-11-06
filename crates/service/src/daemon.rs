@@ -648,7 +648,8 @@ pub async fn run_serve(
     // it opens is dropped inside, so `setup_token_for`'s own open is the only
     // handle left. A refused configuration fails the start here, with a
     // sentence that never carries the password.
-    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
+    let created_admin =
+        crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
     let setup_token = match http_addr.as_deref() {
         Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
@@ -697,7 +698,7 @@ pub async fn run_serve(
                 }
             }
         }
-        if let Some(line) = &created_admin {
+        if let Some(crate::first_admin::CreatedAdmin { line, .. }) = &created_admin {
             eprintln!("{line}");
         }
         if read_only {
@@ -709,7 +710,7 @@ pub async fn run_serve(
             );
         }
     } else {
-        if let Some(line) = &created_admin {
+        if let Some(crate::first_admin::CreatedAdmin { line, .. }) = &created_admin {
             tracing::info!("{line}");
         }
         if let (Some(addr), Some(drawn)) = (&http_addr, &setup_token) {

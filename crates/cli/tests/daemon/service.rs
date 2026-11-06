@@ -6812,6 +6812,125 @@ fn serve_creates_the_first_admin_from_the_environment_once() {
     let _ = child.wait();
 }
 
+/// The first admin from the environment takes the same check as every other new
+/// account. A refusal does not stop the start, because the way out needs this
+/// daemon: no account is made, the log says why, and the next start tries again.
+#[test]
+fn serve_refuses_the_first_admin_on_a_name_with_drafts_and_keeps_serving() {
+    let env = Env::new("admindrafts");
+    env.setup_domain("eng");
+    crystalline_core::kept::write(
+        &env.state_dir().join(crystalline_core::kept::KEPT_DIR),
+        "eng",
+        Some("ada"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        chrono::Utc::now(),
+        "OLD ADA PRIVATE TEXT",
+    )
+    .unwrap();
+    let secret = env.dir.join("admin-password");
+    std::fs::write(&secret, "first-password\n").unwrap();
+    let addr = format!("0.0.0.0:{}", free_port());
+    let probe = addr.replace("0.0.0.0", "127.0.0.1");
+
+    let log = env.dir.join("serve1.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("created the first admin"), "{text}");
+    assert!(text.contains("was not created"), "{text}");
+    assert!(!text.contains("PRIVATE"), "{text}");
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 401);
+
+    // The way out reaches this daemon, and the next start makes the admin.
+    let (ok, out) = env.run(&["users", "discard-drafts", "ada"]);
+    assert!(ok, "{out}");
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+    wait_lock_released(&env);
+
+    let log = env.dir.join("serve2.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("created the first admin 'ada' from the environment"),
+        "{text}"
+    );
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 200);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
+/// The first admin from the environment ends the links the old person gave, as
+/// every other new account does, so a link cannot open what the new person
+/// drafts at that path. It runs before the daemon's own accounts handle exists.
+#[test]
+fn serve_ends_the_links_of_the_old_person_when_it_makes_the_first_admin() {
+    use crystalline_service::rest::{AuthStore, Role};
+    let env = Env::new("adminlinks");
+    env.setup_domain("eng");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let db = env.state_dir().join("web-auth.db");
+    std::fs::create_dir_all(env.state_dir()).unwrap();
+    let link = rt.block_on(async {
+        let auth = AuthStore::open(&db).await.unwrap();
+        auth.add_user("ada", "ada", None, Role::Admin, "old-password")
+            .await
+            .unwrap();
+        let link = auth
+            .mint_overlay_grant("eng", "plan.md", "ada", None)
+            .await
+            .unwrap();
+        auth.remove_user_force("ada").await.unwrap();
+        assert_eq!(auth.user_count().await.unwrap(), 0);
+        link
+    });
+    let secret = env.dir.join("admin-password");
+    std::fs::write(&secret, "first-password\n").unwrap();
+    let addr = format!("0.0.0.0:{}", free_port());
+    let probe = addr.replace("0.0.0.0", "127.0.0.1");
+    let log = env.dir.join("serve.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("created the first admin 'ada'"), "{text}");
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+    wait_lock_released(&env);
+    rt.block_on(async {
+        let auth = AuthStore::open(&db).await.unwrap();
+        // A later account cannot redeem it, which is what let it open a draft.
+        auth.add_user("cy", "cy", None, Role::Editor, "cy-password")
+            .await
+            .unwrap();
+        let redeemed = auth.redeem_overlay_grant(&link.token, "cy").await;
+        assert!(
+            !matches!(redeemed, Ok(Some(_))),
+            "the old person's link still stands: {redeemed:?}"
+        );
+    });
+}
+
 /// A half done configuration stops the first start with a sentence naming the
 /// variable, and never echoes the password.
 #[test]

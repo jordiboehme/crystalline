@@ -1298,6 +1298,40 @@ describe("the share dialog", () => {
     expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
   });
 
+  it("offers the link fix to an unlinked person when the mode is the default and the plan is closed", async () => {
+    const refusal =
+      "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+    serve({
+      // No `owner_identity`: the server sends that to an admin only.
+      "/domains/eng/sync": () =>
+        syncResponse({
+          may_share: false,
+          connection: {
+            connected: true,
+            user: null,
+            token_store: "keyring",
+            share_identity: "personal",
+            share_identity_default: true,
+          },
+        }),
+      "/me/github-identity": () => identityPayload(),
+      "/domains/eng/sync/changes": () => {
+        throw new ApiProblem(403, "forbidden", refusal);
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(await within(dialog).findByText(refusal)).toBeInTheDocument();
+    const fix = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(fix).toHaveAttribute("href", "/profile");
+    expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
+    expect(dialog.textContent).not.toMatch(/crystalline |share_identity/);
+  });
+
   it("names the identity a share would go out on", async () => {
     serve({
       "/domains/eng/sync": () =>

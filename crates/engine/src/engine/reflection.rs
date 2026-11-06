@@ -316,14 +316,14 @@ pub(crate) fn screen_home(after: &str, facts: &SwitchFacts) -> Result<()> {
     if facts.origin {
         let Some(own) = facts.own_url.as_deref() else {
             return Err(EngineError::Invalid(
-                "switch Reflection on at the team server: this instance has no service.public_url, so it cannot be the home of a shared domain's Reflection".to_string(),
+                "switch Reflection on at the team server: this instance has no public address, so it cannot be the home of a shared domain's Reflection".to_string(),
             ));
         };
         // The same rule the stored key meets, so a home this instance writes
         // is always one it reads back as its own.
         if let Err(why) = crystalline_core::validate_reflection_home(own) {
             return Err(EngineError::Invalid(format!(
-                "this instance's service.public_url cannot be a Reflection's home: {why}"
+                "this instance's public address cannot be a Reflection's home: {why}"
             )));
         }
         if declared_home(after).as_deref() != Some(own) {

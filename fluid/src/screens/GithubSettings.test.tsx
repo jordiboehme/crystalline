@@ -189,6 +189,25 @@ describe("the GitHub settings screen", () => {
     ).toBeInTheDocument();
   });
 
+  it("says who opens proposals on the App card, and how to change it", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          app: { app_id: 7, slug: "acme", source: "file" },
+          share_identity: "personal",
+          share_identity_default: true,
+        }),
+    });
+    renderApp("/settings/github");
+    expect(
+      await screen.findByText(
+        /By default with a GitHub App, each person opens proposals under their own GitHub account.*set github.share_identity to instance/,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("names a GitHub App plainly, even before GitHub named its bot", async () => {
     serveAs("admin", {
       "/settings/github": () =>

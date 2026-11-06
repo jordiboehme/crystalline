@@ -2155,6 +2155,54 @@ pub async fn origin_share(
         .await?)
 }
 
+/// The engine for an account question when no daemon answered, or `None` when
+/// this machine has no index to ask: nothing has been indexed, so nothing is
+/// drafted, and asking must not create one.
+async fn account_engine() -> anyhow::Result<Option<Engine>> {
+    let loaded = overlay::load(None)?;
+    let db_path = resolve_db(None)?;
+    if loaded.effective.database().backend == crystalline_core::config::DatabaseBackend::Turso
+        && !db_path.exists()
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        open_standalone_reporting(loaded, &db_path, false, None, None).await?,
+    ))
+}
+
+/// What a name holds in drafts, per domain, from the daemon when one runs.
+pub async fn account_drafts(account: &str) -> anyhow::Result<Vec<(String, u64)>> {
+    if let Some(data) =
+        ctl_routed(serde_json::json!({ "v": 1, "cmd": "account_drafts", "account": account }))
+            .await?
+    {
+        return Ok(serde_json::from_value(data["drafts"].clone())?);
+    }
+    match account_engine().await? {
+        Some(engine) => Ok(engine.account_drafts(account).await?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// An admin's explicit end of every draft a name holds, from the daemon when
+/// one runs.
+pub async fn discard_account_drafts(account: &str) -> anyhow::Result<Value> {
+    if let Some(data) = ctl_routed(
+        serde_json::json!({ "v": 1, "cmd": "discard_account_drafts", "account": account }),
+    )
+    .await?
+    {
+        return Ok(data);
+    }
+    match account_engine().await? {
+        Some(engine) => Ok(engine
+            .discard_account_drafts(account, crate::engine::OWNER_IDENTITY_NAME)
+            .await?),
+        None => Ok(serde_json::json!({ "account": account, "domains": [] })),
+    }
+}
+
 /// The control-socket request [`origin_share`] sends, built in one place so
 /// the daemon's reader (`control::share_request`) is tested against exactly
 /// these keys: a key spelled differently on one side would read as absent,
@@ -2337,9 +2385,7 @@ pub async fn configure(
     // path, so no environment value ever bakes into the saved file.
     let loaded = overlay::load(config_path)?;
     match action {
-        "show" => Ok(json!({
-            "settings": crate::settings::snapshot(&loaded.file, &loaded.overlay)
-        })),
+        "show" => Ok(json!({ "settings": standalone_snapshot(&loaded.file, &loaded.overlay) })),
         "set" => {
             if loaded.effective.read_only() {
                 anyhow::bail!("{}", crate::engine::EngineError::ReadOnly);
@@ -2365,6 +2411,27 @@ pub async fn configure(
     }
 }
 
+/// [`crate::settings::snapshot`] with no engine to ask: the App is asked of what
+/// is cheap to read, so the `github.share_identity` row says the mode in effect.
+fn standalone_snapshot(
+    file: &crystalline_core::config::GlobalConfig,
+    overlay: &overlay::EnvOverlay,
+) -> Vec<crate::settings::SettingView> {
+    let effective = overlay.apply(file);
+    let api_url = effective.github.as_ref().and_then(|g| g.api_url.clone());
+    let app = match crystalline_core::config::origins_state_dir() {
+        Ok(dir) => crate::engine::AppHome::new(api_url, dir, false).presence(overlay),
+        Err(_) => crystalline_core::config::GithubAppPresence::None,
+    };
+    crate::settings::with_effective_share_identity(
+        crate::settings::snapshot(file, overlay),
+        crystalline_core::config::EffectiveShareIdentity::resolve(
+            effective.github_share_identity_setting(),
+            app,
+        ),
+    )
+}
+
 /// The just-applied setting's snapshot entry, as a JSON value, with a `note`
 /// field attached when [`crate::settings::change_note`] has one (a
 /// startup-effective reminder, an active env override, or both). `file` is the
@@ -2377,7 +2444,7 @@ fn setting_view(
     key: &str,
     overlay: &overlay::EnvOverlay,
 ) -> Value {
-    crate::settings::snapshot(file, overlay)
+    standalone_snapshot(file, overlay)
         .into_iter()
         .find(|v| v.key == key)
         .map(|v| {

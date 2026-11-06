@@ -878,7 +878,7 @@ export default function ShareDialogBody({
                     plan above stays exactly as it is, because reading it
                     needed nobody's credential. */}
                 {identity.mustConnect ? (
-                  <ConnectToShare />
+                  <ConnectToShare onLeave={onClose} />
                 ) : (
                   <button
                     type="submit"
