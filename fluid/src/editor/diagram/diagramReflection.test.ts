@@ -44,10 +44,10 @@ const REST =
 const fence = (body: string) => `\`\`\`mermaid\n${body}\n\`\`\``;
 const DOC = `${HEAD}${fence(BODY)}\n${REST}`;
 
-async function drawn() {
+async function drawn(doc = DOC) {
   kit.settled.set(BODY, OK);
   const mode = cellMarksMode();
-  const view = markView(DOC, {
+  const view = markView(doc, {
     adapter: "reflection",
     ...(mode === "off" ? {} : { mode }),
   });
@@ -90,15 +90,49 @@ describe("a Reflection", () => {
     undoOnce(view);
     expect(view.state.doc.toString()).toBe(DOC);
   });
+});
 
-  it("changes nothing but one line break on Backspace on the blank line after it", async () => {
-    const view = await drawn();
-    const below = HEAD.length + fence(BODY).length + 1;
-    setCaret(view, below);
+// R73: today's bytes, wrong on purpose. Task 10 binds these keys, on this branch
+// and before the PR, and flips each of these.
+describe("Backspace on the line right after a drawn fence, until Task 10", () => {
+  const ID_NEXT = "## Next\n<!-- r:0b1c2d3e -->\n\nMore.\n";
+  const mode = () => (cellMarksMode() === "show" ? "show" : "hidden");
+
+  async function press(doc: string, at: string) {
+    const view = await drawn(doc);
+    setCaret(view, doc.indexOf(at));
     keys(view, "Backspace");
-    const text = view.state.doc.toString();
-    expect(text.startsWith(`${HEAD}${fence(BODY)}`)).toBe(true);
-    expect(text.endsWith(REST)).toBe(true);
+    return view;
+  }
+
+  it("a blank line goes, and one undo gives it back", async () => {
+    const view = await press(DOC, "\nDeploys");
+    expect(view.state.doc.toString()).toBe(
+      DOC.replace("\n\nDeploys", "\nDeploys"),
+    );
     expect(hidesIdLines(view.state)).toBe(true);
+    undoOnce(view);
+    expect(view.state.doc.toString()).toBe(DOC);
+  });
+
+  it("a section heading: joins in show mode, nothing in hidden mode", async () => {
+    const doc = `${HEAD}${fence(BODY)}\n${ID_NEXT}`;
+    const view = await press(doc, "## Next");
+    expect(view.state.doc.toString()).toBe(
+      mode() === "show" ? `${HEAD}${fence(BODY)}${ID_NEXT}` : doc,
+    );
+    expect(hidesIdLines(view.state)).toBe(true);
+    if (mode() === "show") {
+      undoOnce(view);
+    }
+    expect(view.state.doc.toString()).toBe(doc);
+  });
+
+  it("text: joins the closing mark, and one undo gives the bytes back", async () => {
+    const doc = `${HEAD}${fence(BODY)}\nBelow\n`;
+    const view = await press(doc, "Below");
+    expect(view.state.doc.toString()).toBe(`${HEAD}${fence(BODY)}Below\n`);
+    undoOnce(view);
+    expect(view.state.doc.toString()).toBe(doc);
   });
 });

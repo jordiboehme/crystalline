@@ -5,7 +5,8 @@
  * `intent.marks-show.test.ts` run this file again in each marks mode.
  */
 
-import { EditorState, StateEffect } from "@codemirror/state";
+import { syntaxTree } from "@codemirror/language";
+import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,8 +17,11 @@ import {
   markPeers,
   markView,
   remoteInsert,
+  setCaret,
   setRaw,
+  typeText,
 } from "../../test/markKit";
+import { parsedState, parsedView } from "../../test/parse";
 import { documentLanguage } from "../setup";
 import { diagramField } from "./field";
 import type { DiagramIntent, IntentCloseReason } from "./intent";
@@ -25,6 +29,7 @@ import {
   beforeClose,
   closeDiagramIntent,
   diagramIntent,
+  intentStale,
   noteIntentDraft,
   onIntentClosed,
   registerIntentReopen,
@@ -157,6 +162,16 @@ describe("the field", () => {
     remoteInsert(view, view.state.doc.toString().indexOf("Next"), "X");
     await flush();
     expect(intentOf(view)?.anchor).toBe(FROM + 2);
+    expect(reasons).toEqual([]);
+  });
+
+  it("keeps the intent for a line a peer inserts exactly at the fence's first mark", async () => {
+    const view = await drawn();
+    open(view);
+    const reasons = closes(view);
+    view.dispatch({ changes: { from: FROM, insert: "Peer\n\n" } });
+    await flush();
+    expect(intentOf(view)?.anchor).toBe(FROM + 6);
     expect(reasons).toEqual([]);
   });
 
@@ -367,6 +382,19 @@ describe("a draft", () => {
     expect(seen).toEqual(["Abc"]);
   });
 
+  it("does not follow the intent into another mode on the same target", async () => {
+    const view = await drawn();
+    open(view, "rename");
+    noteIntentDraft(view, "Old");
+    open(view, "menu");
+    const seen: (string | undefined)[] = [];
+    beforeClose(view, (_reason, intent) => {
+      seen.push(intent.draft);
+    });
+    closeDiagramIntent(view, "user");
+    expect(seen).toEqual([undefined]);
+  });
+
   it("does not follow the intent to another target", async () => {
     const view = await drawn();
     open(view, "rename");
@@ -518,6 +546,31 @@ describe("a fence coming back", () => {
     outside.remove();
   });
 
+  it("does not take the focus to another fence that mounts", async () => {
+    const doc = `${LONG}${fence(OTHER)}\n\nEnd`;
+    kit.settled.set(OTHER, OK);
+    const view = await drawn(doc, {}, [BODY]);
+    const scroll = (pos: number) => {
+      view.dispatch({ effects: EditorView.scrollIntoView(pos) });
+      measured(view);
+    };
+    scroll(view.state.doc.length);
+    await flush();
+    const far = view.state.doc.toString().lastIndexOf("```mermaid");
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
+      expect(
+        view.state.field(diagramField).fences.map((f) => f.from),
+      ).toContain(far);
+    });
+    open(view, "focus", far);
+    (document.activeElement as HTMLElement | null)?.blur();
+    scroll(0);
+    await flush();
+    expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
+    expect(document.activeElement).toBe(document.body);
+  });
+
   it("leaves a box with no intent alone", async () => {
     const view = await drawn(LONG);
     view.contentDOM.focus();
@@ -526,6 +579,247 @@ describe("a fence coming back", () => {
     back(view);
     await flush();
     expect(document.activeElement).toBe(document.body);
+  });
+});
+
+describe("leaving a diagram with no line to stand on (R74)", () => {
+  const box = (view: EditorView, index = 0) => {
+    const found = view.dom.querySelectorAll<HTMLElement>(".cm-diagram")[index];
+    if (found === undefined) throw new Error("no box");
+    return found;
+  };
+
+  /** A key pressed on the box, as a browser sends it. */
+  function pressOn(target: HTMLElement, key: string) {
+    target.dispatchEvent(
+      new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+    );
+  }
+
+  it("keeps the focus on the box when the fence is last, and typing leaves its marks alone", async () => {
+    const doc = `Top\n\n${fence(BODY)}`;
+    const view = await drawn(doc);
+    open(view);
+    const reasons = closes(view);
+    box(view).focus();
+    closeDiagramIntent(view, "user");
+    expect(reasons).toEqual(["user"]);
+    expect(intentOf(view)).toBeNull();
+    expect(document.activeElement).toBe(box(view));
+    pressOn(box(view), "x");
+    expect(view.state.doc.toString()).toBe(doc);
+    typeText(view, "x");
+    expect(view.state.doc.toString()).toBe(`x${doc}`);
+    expect(view.dom.querySelectorAll(".cm-diagram")).toHaveLength(1);
+  });
+
+  it("takes a caret off the closing mark of a last fence, to the line above", async () => {
+    const doc = `Top\n\n${fence(BODY)}`;
+    const view = await drawn(doc);
+    setCaret(view, doc.length);
+    open(view);
+    closeDiagramIntent(view, "user");
+    expect(view.state.selection.main.head).toBe(4);
+    typeText(view, "x");
+    expect(view.state.doc.toString()).toBe(`Top\nx\n${fence(BODY)}`);
+    expect(view.dom.querySelectorAll(".cm-diagram")).toHaveLength(1);
+  });
+
+  it("keeps the focus on the box when another fence follows at once, and typing leaves that fence alone", async () => {
+    const doc = `Top\n\n${fence(BODY)}\n${fence(OTHER)}\n\nEnd`;
+    const view = await drawn(doc, {}, [BODY, OTHER]);
+    open(view);
+    box(view).focus();
+    closeDiagramIntent(view, "user");
+    expect(document.activeElement).toBe(box(view));
+    expect(view.state.selection.main.head).toBe(0);
+    typeText(view, "x");
+    expect(view.state.doc.toString()).toBe(`x${doc}`);
+    expect(view.dom.querySelectorAll(".cm-diagram")).toHaveLength(2);
+  });
+
+  it("treats any fence right below the same way, a code fence too", async () => {
+    const code = "```ts\nconst a = 1;\n```";
+    const doc = `Top\n\n${fence(BODY)}\n${code}\n\nEnd`;
+    const view = await drawn(doc);
+    open(view);
+    closeDiagramIntent(view, "user");
+    expect(view.state.selection.main.head).toBe(0);
+    expect(document.activeElement).toBe(box(view));
+  });
+
+  it("does not stand on a next fence's mark when Raw comes on, focus in the main view", async () => {
+    const doc = `Top\n\n${fence(BODY)}\n${fence(OTHER)}\n\nEnd`;
+    const view = await drawn(doc, {}, [BODY, OTHER]);
+    open(view);
+    setRaw(view, true);
+    await flush();
+    expect(view.state.selection.main.head).toBe(0);
+    expect(document.activeElement).toBe(view.contentDOM);
+  });
+
+  it("does not move the caret past the end when Raw comes on with the fence last", async () => {
+    const doc = `Top\n\n${fence(BODY)}`;
+    const view = await drawn(doc);
+    open(view);
+    setRaw(view, true);
+    await flush();
+    expect(view.state.selection.main.head).toBe(0);
+    expect(document.activeElement).toBe(view.contentDOM);
+  });
+});
+
+describe("where a close leaves the caret", () => {
+  it("leaves it alone on gone, when another fence took the anchor's place", async () => {
+    const doc = `Top\n\n${fence(BODY)}\n\n${fence(OTHER)}\n\nEnd`;
+    const view = await drawn(doc, {}, [BODY, OTHER]);
+    open(view);
+    view.dispatch({
+      changes: { from: FROM, to: doc.lastIndexOf("```mermaid") },
+    });
+    await flush();
+    expect(view.state.selection.main.head).toBe(0);
+  });
+
+  it("leaves it alone on swap, where the anchor names a place in another document", async () => {
+    const view = await drawn();
+    open(view);
+    view.setState(
+      parsedState(
+        EditorState.create({
+          doc: DOC,
+          selection: EditorSelection.cursor(1),
+          extensions: [documentLanguage, diagramLayer()],
+        }),
+      ),
+    );
+    await flush();
+    expect(view.state.selection.main.head).toBe(1);
+  });
+});
+
+describe("a body edit with the parse behind (R75)", () => {
+  /** Runs `edit` with a clock that jumps, so the parse budget is gone at once. */
+  function withNoBudget(edit: () => void) {
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 1_000;
+      return now;
+    });
+    try {
+      edit();
+    } finally {
+      clock.mockRestore();
+    }
+  }
+
+  it("holds the intent as stale, keeps the box, and closes nothing until the parse answers", async () => {
+    const view = await drawn(DOC, { room: true });
+    open(view, "rename");
+    const dom = view.dom.querySelector(".cm-diagram");
+    const reasons = closes(view);
+    expect(intentStale(view.state)).toBe(false);
+    withNoBudget(() => {
+      remoteInsert(view, view.state.doc.toString().indexOf("Next"), "X");
+    });
+    expect(syntaxTree(view.state).length).toBeLessThan(view.state.doc.length);
+    expect(intentOf(view)?.mode).toBe("rename");
+    expect(intentStale(view.state)).toBe(true);
+    expect(view.dom.querySelector(".cm-diagram")).toBe(dom);
+    await flush();
+    expect(reasons).toEqual([]);
+
+    parsedView(view);
+    expect(syntaxTree(view.state).length).toBe(view.state.doc.length);
+    expect(intentStale(view.state)).toBe(false);
+    expect(intentOf(view)?.mode).toBe("rename");
+    expect(view.dom.querySelector(".cm-diagram")).toBe(dom);
+    await flush();
+    expect(reasons).toEqual([]);
+  });
+
+  it("lets the verdict decide once the parse has answered", async () => {
+    const view = await drawn(DOC, { room: true });
+    open(view);
+    const reasons = closes(view);
+    withNoBudget(() => {
+      remoteInsert(view, view.state.doc.toString().indexOf("Next"), "X");
+    });
+    parsedView(view);
+    await flush();
+    const body = BODY.replace("Next", "XNext");
+    await vi.waitFor(() => {
+      expect(kit.waiting.has(body)).toBe(true);
+    });
+    kit.settled.set(body, NO);
+    kit.waiting.get(body)?.(NO);
+    await flush();
+    expect(intentOf(view)).toBeNull();
+    expect(reasons).toEqual(["gone"]);
+  });
+
+  it("closes as gone when the edit took the fence's first line", async () => {
+    const view = await drawn();
+    open(view);
+    const reasons = closes(view);
+    withNoBudget(() => {
+      view.dispatch({ changes: { from: FROM, to: FROM + 3 } });
+    });
+    await flush();
+    expect(intentOf(view)).toBeNull();
+    expect(reasons).toEqual(["gone"]);
+  });
+});
+
+describe("an intent opened on another fence", () => {
+  const TWO = `Top\n\n${fence(BODY)}\n\n${fence(OTHER)}\n\nEnd`;
+
+  it("closes the first as gone, with its draft, when its fence went in the same tick", async () => {
+    const view = await drawn(TWO, {}, [BODY, OTHER]);
+    open(view, "rename");
+    noteIntentDraft(view, "New");
+    const reasons = closes(view);
+    const seen: [IntentCloseReason, string | undefined, string][] = [];
+    beforeClose(view, (reason, intent) => {
+      seen.push([reason, intent.draft, intent.mode]);
+    });
+    view.dispatch({
+      changes: { from: FROM, to: TWO.lastIndexOf("```mermaid") },
+    });
+    open(view, "focus", FROM);
+    expect(intentOf(view)?.mode).toBe("focus");
+    await flush();
+    expect(seen).toEqual([["gone", "New", "rename"]]);
+    expect(reasons).toEqual(["gone"]);
+    // The new one stands, and is not closed by the old one's microtask.
+    expect(intentOf(view)?.mode).toBe("focus");
+    closeDiagramIntent(view, "user");
+    expect(reasons).toEqual(["gone", "user"]);
+  });
+
+  it("closes the first as user when its fence is still there", async () => {
+    const view = await drawn(TWO, {}, [BODY, OTHER]);
+    open(view, "rename");
+    noteIntentDraft(view, "New");
+    const reasons = closes(view);
+    const drafts: (string | undefined)[] = [];
+    beforeClose(view, (_reason, intent) => {
+      drafts.push(intent.draft);
+    });
+    open(view, "focus", TWO.lastIndexOf("```mermaid"));
+    await flush();
+    expect(reasons).toEqual(["user"]);
+    expect(drafts).toEqual(["New"]);
+    expect(intentOf(view)?.mode).toBe("focus");
+  });
+
+  it("does not close when the mode changes on the same fence", async () => {
+    const view = await drawn();
+    open(view, "rename");
+    const reasons = closes(view);
+    open(view, "focus");
+    await flush();
+    expect(reasons).toEqual([]);
   });
 });
 

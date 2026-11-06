@@ -14,7 +14,10 @@
  *
  * Past where the parse reaches (a paste or an undo above a fence can leave the
  * new tree short) a drawn fence stays drawn at its mapped place until the tree
- * reaches it, as the grid keeps its tables (D58).
+ * reaches it, as the grid keeps its tables (D58). So does a fence whose body was
+ * edited while the tree is short, unless the edit took its first line: it shows
+ * the drawing of its old body, counts as behind (`fenceIsBehind`) and is not gone,
+ * and the verdict decides once the tree reaches it (R75).
  *
  * A `StateField`, not a plugin: a block replacement may not come from a
  * plugin. The plugin beside it only asks for verdicts and reports the
@@ -77,6 +80,8 @@ interface DiagramFieldValue {
   held: boolean;
   /** `from` of the fences exempt from that hold (`drawUnderCaret`). */
   exempt: number[];
+  /** `from` of the carried fences whose text changed since the tree last read them. */
+  behind: readonly number[];
 }
 
 let nextKey = 0;
@@ -99,8 +104,9 @@ export function candidateFences(state: EditorState): DrawnFence[] {
 /**
  * The fences drawn before `tr` that the tree does not reach yet, at their
  * mapped places: the ones to keep drawn (D58). Not those the tree reaches
- * (it decides), not those a change touched (their text is not what was
- * checked) and not those a candidate already covers.
+ * (it decides), not those whose first line a change touched (that may be no
+ * fence any more) and not those a candidate already covers. One whose body was
+ * touched stays, with the body that was checked (R75).
  */
 export function carryFences(
   previous: readonly DrawnFence[],
@@ -114,7 +120,10 @@ export function carryFences(
     const to = tr.changes.mapPos(fence.to, -1);
     if (
       to <= treeLength ||
-      tr.changes.touchesRange(fence.from, fence.to) !== false ||
+      tr.changes.touchesRange(
+        fence.from,
+        tr.startState.doc.lineAt(fence.from).to,
+      ) !== false ||
       candidates.some((c) => c.from <= to && from <= c.to)
     ) {
       continue;
@@ -151,6 +160,7 @@ function build(
   carried: (candidates: DrawnFence[]) => DrawnFence[],
   exempt: readonly number[],
   pointer: boolean,
+  behindBefore: readonly number[],
 ): DiagramFieldValue {
   const candidates = candidateFences(state);
   const { from: head, to: tail } = state.selection.main;
@@ -177,7 +187,8 @@ function build(
     }
     return true;
   });
-  fences.push(...carried(candidates));
+  const kept = carried(candidates);
+  fences.push(...kept);
   fences.sort((a, b) => a.from - b.from);
   const keys = new Map(
     fences.map((fence) => [
@@ -189,6 +200,9 @@ function build(
     fences,
     keys,
     decorations: decorate(state, fences, keys),
+    behind: kept
+      .map((fence) => fence.from)
+      .filter((from) => behindBefore.includes(from)),
     pointer,
     held,
     exempt: exempt.filter(
@@ -212,7 +226,7 @@ function placeAfter(tr: Transaction, from: number): number | null {
 }
 
 export const diagramField = StateField.define<DiagramFieldValue>({
-  create: (state) => build(state, new Map(), () => [], [], false),
+  create: (state) => build(state, new Map(), () => [], [], false, []),
   update: (value, tr) => {
     let pointer = value.pointer;
     for (const effect of tr.effects) {
@@ -246,6 +260,14 @@ export const diagramField = StateField.define<DiagramFieldValue>({
         before.set(at, key);
       }
     }
+    const behind = [
+      ...value.behind.flatMap((from) => placeAfter(tr, from) ?? []),
+      ...value.fences.flatMap((fence) =>
+        tr.changes.touchesRange(fence.from, fence.to) === false
+          ? []
+          : (placeAfter(tr, fence.from) ?? []),
+      ),
+    ];
     return build(
       tr.state,
       before,
@@ -253,6 +275,7 @@ export const diagramField = StateField.define<DiagramFieldValue>({
         carryFences(value.fences, tr, syntaxTree(tr.state).length, candidates),
       exemptNow,
       pointer,
+      behind,
     );
   },
   provide: (field) => [
@@ -263,6 +286,14 @@ export const diagramField = StateField.define<DiagramFieldValue>({
     ),
   ],
 });
+
+/**
+ * Whether the drawn fence at `from` was edited and the parse has not read it
+ * yet: what shows is its old body, so an action on it waits (R75).
+ */
+export function fenceIsBehind(state: EditorState, from: number): boolean {
+  return state.field(diagramField, false)?.behind.includes(from) ?? false;
+}
 
 /**
  * Asks for every missing verdict, reports the settled ones, and tells the

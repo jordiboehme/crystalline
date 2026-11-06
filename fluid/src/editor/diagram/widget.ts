@@ -97,6 +97,9 @@ interface Box {
 const boxes = new WeakMap<HTMLElement, Box>();
 
 let renders = 0;
+/** The theme mermaid was last given, and how often that changed. */
+let lastDark: boolean | null = null;
+let themeChanges = 0;
 let renderer: Promise<
   [typeof import("mermaid"), typeof import("../../theme/mermaidText")]
 > | null = null;
@@ -297,16 +300,33 @@ function render(box: Box): void {
   void loadRenderer()
     .then(async ([{ default: mermaid }, { drawnLabels }]) => {
       mermaid.initialize(mermaidConfig(dark));
+      if (lastDark !== null && lastDark !== dark) {
+        themeChanges += 1;
+      }
+      lastDark = dark;
+      const theme = themeChanges;
       const rendered = await mermaid.render(id, body);
-      return drawnLabels(rendered.svg);
+      return {
+        svg: drawnLabels(rendered.svg),
+        sameTheme: theme === themeChanges,
+      };
     })
     .then(
-      (svg) => {
-        // Worth keeping whoever asked: an undo brings this body back.
-        keep(drawings, key, { svg, id }, DRAWINGS_KEPT);
+      ({ svg, sameTheme }) => {
+        // Mermaid queues its renders and reads the configuration when a render's
+        // turn comes, so one that waited across a theme change drew in the other
+        // theme. It is no drawing of this key, for this box or for the cache.
+        if (sameTheme) {
+          // Worth keeping whoever asked: an undo brings this body back.
+          keep(drawings, key, { svg, id }, DRAWINGS_KEPT);
+        }
         if (token === box.token && !box.dead) {
           box.running = null;
-          paste(box, key, body, svg, id);
+          if (sameTheme) {
+            paste(box, key, body, svg, id);
+          } else {
+            render(box);
+          }
         }
       },
       () => {

@@ -286,6 +286,22 @@ describe("the host", () => {
   });
 });
 
+describe("events on the box", () => {
+  it("leaves the document alone for a key pressed on it (Task 10's keys rest on this)", async () => {
+    const doc = `Top line\n\n${fence(BODY)}\n\nEnd`;
+    const view = await drawn(doc);
+    setCaret(view, 8);
+    box(view).focus();
+    for (const key of ["Backspace", "Delete", "Enter", "x"]) {
+      box(view).dispatchEvent(
+        new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }),
+      );
+    }
+    expect(view.state.doc.toString()).toBe(doc);
+    expect(view.state.selection.main.head).toBe(8);
+  });
+});
+
 describe("a change to the fence", () => {
   it("keeps the box and its overlay child, and swaps the SVG when the render lands", async () => {
     const view = await drawn(DOC, { room: true });
@@ -337,6 +353,60 @@ describe("a change to the fence", () => {
     await flush();
     expect(box(view).querySelector("svg")?.id).toBe(newer?.id);
     expect(hostOf(view, DOC.indexOf("```"))?.renderedBody()).toBe(newer?.body);
+  });
+
+  it("lets a late render lose when an undo went back to a body at hand in the cache", async () => {
+    const view = await drawn();
+    const at = view.state.doc.toString().indexOf("Next");
+    // Body 1 on screen, then body 2, so body 1 is in the cache and not on screen.
+    view.dispatch({ changes: { from: at, insert: "X" } });
+    await vi.waitFor(() => {
+      expect(hostOf(view, 5)?.renderedBody()).toContain("XNext");
+    });
+    kit.hold.value = true;
+    view.dispatch({ changes: { from: at, insert: "Y" } });
+    await flush();
+    const late = renders().at(-1);
+    expect(late?.body).toContain("YXNext");
+    view.dispatch({ changes: { from: at, to: at + 2 } });
+    expect(hostOf(view, 5)?.renderedBody()).toBe(BODY);
+    late?.resolve(recordedAs(late.id));
+    await flush();
+    await flush();
+    expect(hostOf(view, 5)?.renderedBody()).toBe(BODY);
+    expect(box(view).querySelector("svg")?.id).not.toBe(late?.id);
+  });
+
+  it("starts no retry and keeps the newer render when an older one fails", async () => {
+    const view = await drawn();
+    kit.hold.value = true;
+    const at = view.state.doc.toString().indexOf("Next");
+    view.dispatch({ changes: { from: at, insert: "X" } });
+    await flush();
+    const older = renders().at(-1);
+    view.dispatch({ changes: { from: at, insert: "Y" } });
+    await flush();
+    const newer = renders().at(-1);
+    expect(newer).not.toBe(older);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    older?.reject(new Error("no"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const count = renders().length;
+    vi.advanceTimersByTime(60_000);
+    await Promise.resolve();
+    expect(renders()).toHaveLength(count);
+    // An edit that leaves the same body asks nothing new either: it is running.
+    view.dispatch({ changes: { from: 0, insert: "a" } });
+    await Promise.resolve();
+    expect(renders()).toHaveLength(count);
+    vi.useRealTimers();
+    newer?.resolve(recordedAs(newer.id));
+    await vi.waitFor(() => {
+      expect(box(view).querySelector("svg")?.id).toBe(newer?.id);
+    });
   });
 
   it("lets a late render lose when an undo went back to what is on screen", async () => {
@@ -416,22 +486,26 @@ describe("a change to the fence", () => {
     );
   });
 
-  it("counts two fences of one body as two widgets, so neither takes the other's box", () => {
-    expect(
-      new DiagramWidget(BODY, false, 1, 1).eq(
-        new DiagramWidget(BODY, false, 2, 1),
-      ),
-    ).toBe(false);
-    expect(
-      new DiagramWidget(BODY, false, 1, 1).eq(
-        new DiagramWidget(BODY, false, 1, 1),
-      ),
-    ).toBe(true);
-    expect(
-      new DiagramWidget(BODY, true, 1, 1).eq(
-        new DiagramWidget(BODY, false, 1, 1),
-      ),
-    ).toBe(false);
+  // R76: CodeMirror reuses a box on an `eq` match without asking `updateDOM`.
+  it("gives a far fence of the same body its own box when scrolling to it", async () => {
+    const filler = "Line of text\n\n".repeat(8000);
+    const doc = `Top\n\n${fence(BODY)}\n\n${filler}${fence(BODY)}\n\nEnd`;
+    const view = await drawn(doc);
+    const first = box(view);
+    const id = first.querySelector("svg")?.id;
+    first
+      .querySelector(".cm-diagram-overlay")
+      ?.append(document.createElement("textarea"));
+    view.dispatch({
+      effects: EditorView.scrollIntoView(view.state.doc.length),
+    });
+    measured(view);
+    const second = box(view);
+    expect(second).not.toBe(first);
+    expect(second.querySelector(".cm-diagram-overlay")?.childElementCount).toBe(
+      0,
+    );
+    expect(second.querySelector("svg")?.id).not.toBe(id);
   });
 
   it("keeps the second box when the first of two fences of one body goes", async () => {
@@ -651,6 +725,21 @@ describe("off screen", () => {
     expect(widgetOf(other).estimatedHeight).toBeGreaterThan(short);
   });
 
+  it("estimates a sideways diagram lower than a tall one, and caps a long source", () => {
+    const edges = (n: number) =>
+      Array.from(
+        { length: n },
+        (_, i) => `    N${String(i)} --> N${String(i + 1)}`,
+      ).join("\n");
+    const of = (body: string) =>
+      new DiagramWidget(body, false, 1, 1).estimatedHeight;
+    expect(of(`flowchart TD\n${edges(3)}`)).toBe(374);
+    expect(of(`flowchart LR\n${edges(3)}`)).toBe(216);
+    expect(of(`graph RL\n${edges(3)}`)).toBe(216);
+    expect(of(`flowchart TD\n${edges(50)}`)).toBe(800);
+    expect(of(`flowchart LR\n${edges(50)}`)).toBe(800);
+  });
+
   it("gives the height map the measured height once one is known", async () => {
     const body = "flowchart TD\n    M --> N";
     const spy = vi
@@ -700,7 +789,7 @@ describe("off screen", () => {
   });
 
   describe("a drawing landing above the window, the page scrolling outside the editor", () => {
-    function rects(top: number) {
+    function rects(top: number, bodyTop = 0) {
       return vi
         .spyOn(HTMLElement.prototype, "getBoundingClientRect")
         .mockImplementation(function rect(this: HTMLElement) {
@@ -712,7 +801,11 @@ describe("off screen", () => {
           return {
             height,
             width: 0,
-            top: this.classList.contains("cm-diagram") ? top : 0,
+            top: this.classList.contains("cm-diagram")
+              ? top
+              : this === document.body
+                ? bodyTop
+                : 0,
             left: 0,
             right: 0,
             bottom: top + height,
@@ -757,10 +850,72 @@ describe("off screen", () => {
       });
     });
 
+    it("finds a scroller further out, and reads the window's top from it", async () => {
+      const scrollBy = vi.fn();
+      const scroller = document.body;
+      scroller.scrollBy = scrollBy;
+      // A rule, not the style attribute: jsdom's computed style may leave that out.
+      const rule = document.createElement("style");
+      rule.textContent = "body { overflow-y: auto; }";
+      document.head.append(rule);
+      const heights = vi
+        .spyOn(scroller, "scrollHeight", "get")
+        .mockReturnValue(5_000);
+      const fallback = vi.fn();
+      document.documentElement.scrollBy = fallback;
+      Object.defineProperty(document, "scrollingElement", {
+        configurable: true,
+        value: document.documentElement,
+      });
+      kit.hold.value = true;
+      const view = await drawn();
+      // The box is below the page's top and above the top of its scroller.
+      const spy = rects(50, 100);
+      try {
+        const render = renders().at(-1);
+        render?.resolve(recordedAs(render.id));
+        await vi.waitFor(() => {
+          expect(box(view).querySelector("svg")).not.toBeNull();
+        });
+        measured(view);
+        expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+        expect(fallback).not.toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+        heights.mockRestore();
+        rule.remove();
+      }
+    });
+
     it("leaves the scroller alone when the box is in the window", async () => {
       const scrollBy = await land(100);
       expect(scrollBy).not.toHaveBeenCalled();
     });
+  });
+
+  it("has a flipped fence's drawing at hand when it comes back, with no render", async () => {
+    const long = `${DOC}${"Line of text\n\n".repeat(8000)}`;
+    const view = markView(long, modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    await vi.waitFor(() => {
+      expect(kit.waiting.has(BODY)).toBe(true);
+    });
+    await settle(BODY);
+    const id = box(view).querySelector("svg")?.id;
+    view.dispatch({
+      effects: EditorView.scrollIntoView(view.state.doc.length),
+    });
+    measured(view);
+    expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+    const count = kit.asked.length;
+    view.dispatch({ effects: EditorView.scrollIntoView(0) });
+    measured(view);
+    expect(box(view).querySelector("svg")?.id).toBe(id);
+    await flush();
+    expect(kit.asked).toHaveLength(count);
   });
 
   it("gives a box that left and a render still running no way back in", async () => {
@@ -856,6 +1011,57 @@ describe("render ids and what mermaid leaves behind", () => {
       expect(document.getElementById(temp.id)).toBeNull();
     });
     expect(box(view).querySelector("svg")).toBeNull();
+  });
+});
+
+describe("a theme change while a render is queued (mermaid's queue)", () => {
+  it("does not cache a drawing that ran under the other theme", async () => {
+    kit.hold.value = true;
+    const view = await drawn();
+    const light = renders().at(-1);
+    expect(light?.body).toBe(BODY);
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(EditorView.darkTheme.of(true)),
+    });
+    await vi.waitFor(() => {
+      expect(kit.initialize).toHaveBeenLastCalledWith(mermaidConfig(true));
+    });
+    // The queued light render finishes under the dark configuration.
+    light?.resolve(recordedAs(light.id));
+    await flush();
+    await flush();
+    // A light view of this body has nothing at hand: it asks for its own render.
+    const before = renders().length;
+    kit.hold.value = false;
+    const other = await drawn();
+    await vi.waitFor(() => {
+      expect(box(other).querySelector("svg")).not.toBeNull();
+    });
+    expect(renders().length).toBeGreaterThan(before);
+    expect(box(other).querySelector("svg")?.id).not.toBe(light?.id);
+  });
+
+  it("renders again when the box still wants what ran under the other theme", async () => {
+    kit.hold.value = true;
+    const one = await drawn();
+    const first = renders().at(-1);
+    // Another box's render of the dark theme comes in between.
+    const body = "flowchart TD\n    C --> D";
+    kit.settled.set(body, OK);
+    const dark = markView(`Top\n\n${fence(body)}\n\nEnd`, modeOptions());
+    dark.dispatch({
+      effects: StateEffect.appendConfig.of(EditorView.darkTheme.of(true)),
+    });
+    await vi.waitFor(() => {
+      expect(kit.initialize).toHaveBeenLastCalledWith(mermaidConfig(true));
+    });
+    first?.resolve(recordedAs(first.id));
+    await vi.waitFor(() => {
+      expect(renders().filter((r) => r.body === BODY).length).toBeGreaterThan(
+        1,
+      );
+    });
+    expect(box(one).querySelector("svg")).toBeNull();
   });
 });
 

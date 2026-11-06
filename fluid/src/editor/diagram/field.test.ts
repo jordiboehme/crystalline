@@ -254,6 +254,22 @@ describe("carryFences", () => {
   });
 });
 
+describe("carryFences and a touched body (R75)", () => {
+  const LINES = "```mermaid\nflowchart TD\n  A --> B\n```\n";
+  const body = "flowchart TD\n  A --> B";
+
+  it("keeps a fence whose body was edited, and drops one whose first line was", () => {
+    const state = EditorState.create({ doc: `${LINES}${"x".repeat(300)}` });
+    const drawn = { from: 0, to: LINES.length - 1, body, kind: "flowchart" };
+    const inBody = state.update({ changes: { from: 15, insert: "z" } });
+    expect(carryFences([drawn], inBody, 5, []).map((f) => f.to)).toEqual([
+      drawn.to + 1,
+    ]);
+    const first = state.update({ changes: { from: 3, insert: "z" } });
+    expect(carryFences([drawn], first, 5, [])).toEqual([]);
+  });
+});
+
 describe("asking for verdicts ends", () => {
   const many = (prefix: string, count: number) =>
     Array.from({ length: count }, (_, i) =>

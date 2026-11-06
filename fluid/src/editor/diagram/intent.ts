@@ -18,7 +18,8 @@
  * keeps the draft current with `noteIntentDraft`.
  */
 
-import type { EditorState } from "@codemirror/state";
+import { syntaxTree } from "@codemirror/language";
+import type { EditorState, Line } from "@codemirror/state";
 import {
   EditorSelection,
   MapMode,
@@ -26,11 +27,12 @@ import {
   StateField,
 } from "@codemirror/state";
 import type { EditorView, ViewUpdate } from "@codemirror/view";
+import type { SyntaxNode } from "@lezer/common";
 import { ViewPlugin } from "@codemirror/view";
 
 import { writable } from "../elementEdit";
-import { fenceAt } from "./fence";
-import { diagramField } from "./field";
+import { fenceAt, type MermaidFence } from "./fence";
+import { diagramField, fenceIsBehind } from "./field";
 import type { EdgeKey } from "./flowchart/model";
 import type { DiagramHost } from "./widget";
 import { hostOf, onBoxMounted } from "./widget";
@@ -58,7 +60,11 @@ export type IntentCloseReason = "user" | "gone" | "raw" | "swap" | "destroy";
 /** Where the focus goes after the intent closed. */
 export type IntentFocus = "main-after" | "none";
 
-/** Opens (or with null closes, without any teardown) the intent. Prefer `closeDiagramIntent`. */
+/**
+ * Opens an intent. On another fence it closes the one that was open, in a
+ * microtask. With null it closes through the teardown as "gone", whatever the
+ * fence does, focus included: use `closeDiagramIntent` to give a reason.
+ */
 export const setDiagramIntent = StateEffect.define<DiagramIntent | null>();
 
 /**
@@ -84,6 +90,16 @@ function settled(
     : { ...intent, anchor: fence.from };
 }
 
+/**
+ * Whether the open intent's fence was edited and the parse has not read it yet
+ * (R75). The intent stays open, and what it acts on is out of date: an action
+ * answers "stale" until this turns false, and the verdict then decides.
+ */
+export function intentStale(state: EditorState): boolean {
+  const intent = state.field(diagramIntent, false);
+  return intent != null && fenceIsBehind(state, intent.anchor);
+}
+
 export const diagramIntent = StateField.define<DiagramIntent | null>({
   create: () => null,
   update: (value, tr) => {
@@ -106,6 +122,8 @@ export const diagramIntent = StateField.define<DiagramIntent | null>({
 interface OpenRecord {
   intent: DiagramIntent;
   draft?: string;
+  /** The field dropped it and its close is due. */
+  lost?: true;
 }
 
 const opens = new WeakMap<EditorView, OpenRecord>();
@@ -185,23 +203,77 @@ function focusIsElsewhere(main: EditorView): boolean {
   );
 }
 
-/** Moves the caret to the line after the fence, when a fence is still there. */
-function caretAfterFence(main: EditorView, anchor: number): void {
+/** Whether a fenced block, of any language, opens on `line`. */
+function opensFence(state: EditorState, line: Line): boolean {
+  let found = false;
+  syntaxTree(state).iterate({
+    from: line.from,
+    to: line.to,
+    enter: (node) => {
+      found ||=
+        node.name === "FencedCode" &&
+        state.doc.lineAt(node.from).number === line.number;
+      return !found;
+    },
+  });
+  return found;
+}
+
+/** Whether `pos` is inside a fenced block. */
+function inFence(state: EditorState, pos: number): boolean {
+  for (
+    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 0);
+    node !== null;
+    node = node.parent
+  ) {
+    if (node.name === "FencedCode") {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The start of the line after the fence, or null when there is no line to stand
+ * on: the fence is last, or another one opens right below. A caret on a fence
+ * mark turns the next key into a broken fence (R74).
+ */
+function placeAfterFence(
+  state: EditorState,
+  fence: MermaidFence,
+): number | null {
+  const line = state.doc.lineAt(fence.to);
+  if (line.number === state.doc.lines) {
+    return null;
+  }
+  const next = state.doc.line(line.number + 1);
+  return opensFence(state, next) ? null : next.from;
+}
+
+/**
+ * With no line after the fence: a caret on this fence or on the one right below
+ * goes to the end of the line above, when that is no fence's own line. Otherwise
+ * it stays where it is, and the focus stays off the text.
+ */
+function caretOffMarks(main: EditorView, fence: MermaidFence): void {
   const { state } = main;
-  const fence = anchor <= state.doc.length ? fenceAt(state, anchor) : null;
-  if (fence === null) {
+  const { from, to } = state.selection.main;
+  const line = state.doc.lineAt(fence.to);
+  const below =
+    line.number < state.doc.lines
+      ? state.doc.line(line.number + 1).to
+      : line.to;
+  const above = state.doc.lineAt(fence.from).number - 1;
+  if (from > below || to < fence.from || above < 1) {
     return;
   }
-  const line = state.doc.lineAt(fence.to);
-  const after =
-    line.number < state.doc.lines
-      ? state.doc.line(line.number + 1).from
-      : line.to;
-  main.dispatch({
-    selection: EditorSelection.cursor(after),
-    scrollIntoView: true,
-    userEvent: "select",
-  });
+  const place = state.doc.line(above).to;
+  if (!inFence(state, place)) {
+    main.dispatch({
+      selection: EditorSelection.cursor(place),
+      userEvent: "select",
+    });
+  }
 }
 
 function placeFocus(
@@ -215,10 +287,52 @@ function placeFocus(
   }
   // After a swap the anchor names a place in another document, and after "gone"
   // no fence is left to stand after.
-  if (reason === "user" || reason === "raw") {
-    caretAfterFence(main, anchor);
+  const { state } = main;
+  const fence =
+    (reason === "user" || reason === "raw") && anchor <= state.doc.length
+      ? fenceAt(state, anchor)
+      : null;
+  if (fence !== null) {
+    const after = placeAfterFence(state, fence);
+    if (after !== null) {
+      main.dispatch({
+        selection: EditorSelection.cursor(after),
+        scrollIntoView: true,
+        userEvent: "select",
+      });
+    } else {
+      caretOffMarks(main, fence);
+      // Raw has no box: its text is the source, and that takes the focus.
+      const host = reason === "user" ? hostOf(main, anchor) : null;
+      if (host !== null) {
+        host.container.focus({ preventScroll: true });
+        return;
+      }
+    }
   }
   main.focus();
+}
+
+function withDraft(open: OpenRecord): DiagramIntent {
+  return open.draft === undefined
+    ? open.intent
+    : { ...open.intent, draft: open.draft };
+}
+
+function runBeforeClose(
+  main: EditorView,
+  reason: IntentCloseReason,
+  open: OpenRecord,
+) {
+  for (const hook of beforeCloseHooks.get(main) ?? []) {
+    hook(reason, withDraft(open));
+  }
+}
+
+function tellClosed(main: EditorView, reason: IntentCloseReason) {
+  for (const listener of closeListeners.get(main) ?? []) {
+    listener(reason);
+  }
 }
 
 /**
@@ -240,27 +354,17 @@ export function closeDiagramIntent(
     return;
   }
   opens.delete(main);
-  const intent =
-    open.draft === undefined
-      ? open.intent
-      : { ...open.intent, draft: open.draft };
-  for (const hook of beforeCloseHooks.get(main) ?? []) {
-    hook(reason, intent);
-  }
+  runBeforeClose(main, reason, open);
   if (destroyed(main)) {
-    for (const listener of closeListeners.get(main) ?? []) {
-      listener(reason);
-    }
+    tellClosed(main, reason);
     return;
   }
   if (main.state.field(diagramIntent, false)) {
     main.dispatch({ effects: setDiagramIntent.of(null) });
   }
-  for (const listener of closeListeners.get(main) ?? []) {
-    listener(reason);
-  }
+  tellClosed(main, reason);
   if (focusTo === "main-after" && reason !== "destroy") {
-    placeFocus(main, reason, intent.anchor);
+    placeFocus(main, reason, open.intent.anchor);
   }
 }
 
@@ -306,9 +410,30 @@ export const intentWatcher = ViewPlugin.fromClass(
       const next = update.state.field(diagramIntent);
       const open = opens.get(this.view);
       if (next !== null) {
+        // Where the open one is now; null when its fence went.
+        const was =
+          open === undefined || open.lost
+            ? null
+            : update.changes.mapPos(open.intent.anchor, 1, MapMode.TrackAfter);
+        const elsewhere = open !== undefined && was !== next.anchor;
+        if (elsewhere) {
+          // Replaced by one on another fence: its close is still owed. The
+          // focus is the new one's, so only the hooks and the listeners run.
+          const reason =
+            was !== null &&
+            update.state
+              .field(diagramField)
+              .fences.some((f) => f.from <= was && was <= f.to)
+              ? "user"
+              : "gone";
+          queueMicrotask(() => {
+            runBeforeClose(this.view, reason, open);
+            tellClosed(this.view, reason);
+          });
+        }
         const draft =
           next.draft ??
-          (open !== undefined && sameTarget(open.intent, next)
+          (open !== undefined && !elsewhere && sameTarget(open.intent, next)
             ? open.draft
             : undefined);
         opens.set(
@@ -316,6 +441,7 @@ export const intentWatcher = ViewPlugin.fromClass(
           draft === undefined ? { intent: next } : { intent: next, draft },
         );
       } else if (open !== undefined) {
+        open.lost = true;
         queueMicrotask(() => {
           closeDiagramIntent(this.view, "gone");
         });

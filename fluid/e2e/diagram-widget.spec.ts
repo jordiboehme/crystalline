@@ -11,9 +11,13 @@
  * - STILL_PX: after the flip, across a drawing landing or a scroll settling, within this.
  * - STILL_PX also: an edit's new drawing landing moves the text below in one step,
  *   by the new height less the old, and the box never drops below its old height.
+ * - RESERVED_SLACK_PX: a plain chain with nothing to reuse, first drawn in the
+ *   window: what its reserved height was off by.
+ * - The flip back to text: the page ends where the source and the caption put it,
+ *   in at most 3 positions.
  * - SCROLL_JUMP_PX: a line in the window, any frame of a scroll over diagrams not
  *   drawn yet, against the same walk with no diagram. Measured: 4, in the frame a
- *   600 px wheel step applied in.
+ *   600 px wheel step applied in. With the scroller's correction taken out: 12.
  *
  * Shares the daemon, the fixture domain and the accounts `run-smoke.sh` sets
  * up; run it the same way (`bash fluid/e2e/run-smoke.sh e2e/diagram-widget.spec.ts`).
@@ -30,6 +34,7 @@ const BASE_PATH = process.env.FLUID_E2E_BASE_PATH ?? "";
 const FLIP_SLACK_PX = 2;
 const STILL_PX = 2;
 const SCROLL_JUMP_PX = 6;
+const RESERVED_SLACK_PX = 8;
 
 let unique = 0;
 const made: string[] = [];
@@ -206,6 +211,8 @@ test("a cold open comes to rest", async ({ page }, info) => {
       box: number;
       svg: boolean;
       preview: boolean;
+      editor: number;
+      above: string;
     }[] = [];
     (window as unknown as { __cold: unknown }).__cold = samples;
     const tick = () => {
@@ -219,6 +226,28 @@ test("a cold open comes to rest", async ({ page }, info) => {
           box: box?.getBoundingClientRect().height ?? 0,
           svg: box?.querySelector("svg") != null,
           preview: document.querySelector(".cm-mermaid-preview svg") != null,
+          editor:
+            document.querySelector(".cm-editor")?.getBoundingClientRect().top ??
+            0,
+          // What stands above the editor in its own column, by height.
+          above: [
+            ...(document.querySelector("main")?.querySelectorAll("*") ?? []),
+          ]
+            .filter((el) => {
+              const rect = el.getBoundingClientRect();
+              const editor = document.querySelector(".cm-editor");
+              return (
+                editor !== null &&
+                rect.height > 0 &&
+                rect.bottom <= editor.getBoundingClientRect().top + 0.5 &&
+                el.childElementCount === 0
+              );
+            })
+            .map(
+              (el) =>
+                `${el.tagName}:${(el.textContent ?? "").slice(0, 18)}:${String(Math.round(el.getBoundingClientRect().height))}`,
+            )
+            .join("|"),
         });
       }
       requestAnimationFrame(tick);
@@ -240,12 +269,18 @@ test("a cold open comes to rest", async ({ page }, info) => {
             box: number;
             svg: boolean;
             preview: boolean;
+            editor: number;
+            above: string;
           }[];
         }
       ).__cold,
   );
   const changes = all.filter(
-    (s, i) => i === 0 || s.top !== all[i - 1]?.top || s.svg !== all[i - 1]?.svg,
+    (s, i) =>
+      i === 0 ||
+      s.top !== all[i - 1]?.top ||
+      s.svg !== all[i - 1]?.svg ||
+      s.editor !== all[i - 1]?.editor,
   );
   info.annotations.push({ type: "cold", description: JSON.stringify(changes) });
   // At rest: the last second moved nothing.
@@ -439,6 +474,8 @@ test("scrolling a long document with several diagrams does not jump", async ({
   expect(report.boxes).toBeGreaterThan(0);
   expect(report.deepest).toBeGreaterThan(5000);
   expect(report.worst).toBeLessThanOrEqual(control.worst + SCROLL_JUMP_PX);
+  // The walk did reach a diagram landing above the window, and the correction ran.
+  expect(report.shifted).toBeGreaterThan(0);
 });
 
 test("a new drawing landing after an edit does not collapse the box, and moves the text once", async ({
@@ -528,6 +565,182 @@ test("a new drawing landing after an edit does not collapse the box, and moves t
   expect(
     Math.abs((tops.at(-1) ?? 0) - (tops[0] ?? 0) - (newHeight - oldHeight)),
   ).toBeLessThanOrEqual(STILL_PX);
+});
+
+/** Logs each painted frame: where a line stands, and the box. */
+async function sampleFrames(page: Page, text: string): Promise<void> {
+  await page.evaluate((wanted) => {
+    const frames: { top: number; box: number; svg: boolean }[] = [];
+    (window as unknown as { __frames: typeof frames }).__frames = frames;
+    const channel = new MessageChannel();
+    const after = () => {
+      channel.port2.postMessage(null);
+    };
+    channel.port1.onmessage = () => {
+      const below = [
+        ...document.querySelectorAll(".cm-content > .cm-line"),
+      ].find((el) => el.textContent === wanted);
+      const box = document.querySelector(".cm-diagram");
+      frames.push({
+        top: below?.getBoundingClientRect().top ?? -1,
+        box: box?.getBoundingClientRect().height ?? 0,
+        svg: box?.querySelector("svg") != null,
+      });
+      requestAnimationFrame(after);
+    };
+    requestAnimationFrame(after);
+  }, text);
+}
+
+const framesOf = (page: Page) =>
+  page.evaluate(
+    () =>
+      (
+        window as unknown as {
+          __frames: { top: number; box: number; svg: boolean }[];
+        }
+      ).__frames,
+  );
+
+/** Scrolls whatever scrolls the editor so the first fence stands in the window. */
+async function jumpToFence(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const content = document.querySelector(".cm-content") as unknown as {
+      cmTile: {
+        view: {
+          state: { doc: { toString(): string } };
+          lineBlockAt(pos: number): { top: number };
+          documentTop: number;
+        };
+      };
+    };
+    const { view } = content.cmTile;
+    const block = view.lineBlockAt(
+      view.state.doc.toString().indexOf("```mermaid"),
+    );
+    let el: Element | null = document.querySelector(".cm-editor");
+    while (el !== null) {
+      if (
+        /auto|scroll/.test(getComputedStyle(el).overflowY) &&
+        el.scrollHeight > el.clientHeight + 10
+      ) {
+        break;
+      }
+      el = el.parentElement;
+    }
+    const scroller = el ?? document.documentElement;
+    scroller.scrollTop += view.documentTop + block.top - 150;
+  });
+}
+
+/** A first draw inside the window: the box's blank height, and what the SVG moved. */
+async function firstDrawInWindow(page: Page, body: string) {
+  const filler = (from: number) =>
+    Array.from(
+      { length: 80 },
+      (_, i) => `Filler line ${String(from + i)}`,
+    ).join("\n\n");
+  await openEditor(
+    page,
+    `${filler(0)}\n\n\`\`\`mermaid\n${body}\n\`\`\`\n\nBelow marker\n\n${filler(100)}\n`,
+  );
+  await expect(line(page, "Filler line 0")).toBeVisible();
+  await settle(page);
+  // The verdict has come, and the fence was never on screen: no preview to take.
+  await expect(page.locator(".cm-diagram")).toHaveCount(0);
+  await expect(page.locator(".cm-mermaid-preview")).toHaveCount(0);
+  await sampleFrames(page, "Below marker");
+  await jumpToFence(page);
+  await expect(page.locator(".cm-diagram svg")).toBeVisible();
+  await settle(page, 800);
+  const frames = await framesOf(page);
+  const blank = frames.filter((frame) => frame.box > 0 && !frame.svg);
+  const drawn = frames.filter((frame) => frame.svg);
+  return {
+    blankFrames: blank.length,
+    reserved: blank.at(-1)?.box ?? 0,
+    height: drawn.at(-1)?.box ?? 0,
+    moved: (drawn.at(-1)?.top ?? 0) - (blank.at(-1)?.top ?? 0),
+  };
+}
+
+test("a first draw in the window holds its height, and its SVG moves a plain chain's text by little", async ({
+  page,
+}, info) => {
+  const chain = await firstDrawInWindow(
+    page,
+    "flowchart TD\n  A --> B\n  B --> C\n  C --> D",
+  );
+  info.annotations.push({ type: "chain", description: JSON.stringify(chain) });
+  expect(chain.blankFrames).toBeGreaterThan(0);
+  expect(chain.reserved).toBeGreaterThan(48);
+  expect(Math.abs(chain.moved)).toBeLessThanOrEqual(RESERVED_SLACK_PX);
+});
+
+test("a first draw in the window: how far a diagram that is no chain moves the text", async ({
+  page,
+}, info) => {
+  // The estimate counts statements, and this one is wide: stated, with no promise
+  // beyond the box holding a height and the text moving once.
+  const wide = await firstDrawInWindow(
+    page,
+    "flowchart TD\n  A --> B\n  A --> C\n  B --> D\n  C --> D",
+  );
+  info.annotations.push({ type: "wide", description: JSON.stringify(wide) });
+  expect(wide.blankFrames).toBeGreaterThan(0);
+  expect(wide.reserved).toBeGreaterThan(48);
+});
+
+test("the flip back to text ends where the source and the caption put the page", async ({
+  page,
+}, info) => {
+  await openEditor(
+    page,
+    "Above\n\n```mermaid\nflowchart TD\n  A --> B\n  B --> C\n```\n\nBelow marker\n\nLast line\n",
+  );
+  await expect(page.locator(".cm-diagram svg")).toBeVisible();
+  await settle(page);
+  const boxHeight = (await page.locator(".cm-diagram").boundingBox())?.height;
+  if (boxHeight === undefined) throw new Error("no box");
+  await sampleFrames(page, "Below marker");
+  // A peer's edit that mermaid refuses: the last arrow has no end.
+  await page.evaluate(() => {
+    const content = document.querySelector(".cm-content") as unknown as {
+      cmTile: {
+        view: {
+          state: { doc: { toString(): string } };
+          dispatch(spec: { changes: { from: number; insert: string } }): void;
+        };
+      };
+    };
+    const { view } = content.cmTile;
+    const at = view.state.doc.toString().indexOf("  B --> C") + 9;
+    view.dispatch({ changes: { from: at, insert: "\n  C -->" } });
+  });
+  await expect(page.locator(".cm-diagram")).toHaveCount(0);
+  await expect(page.locator(".cm-mermaid-error")).toBeVisible();
+  await settle(page, 800);
+  const source = await page.evaluate(() =>
+    [...document.querySelectorAll(".cm-content > .cm-line")]
+      .filter((el) => el.classList.contains("cm-fence-mono"))
+      .reduce((sum, el) => sum + el.getBoundingClientRect().height, 0),
+  );
+  const preview = (await page.locator(".cm-mermaid-preview").boundingBox())
+    ?.height;
+  if (preview === undefined) throw new Error("no preview");
+  const frames = await framesOf(page);
+  const tops = frames
+    .map((frame) => frame.top)
+    .filter((top, i, all) => top !== all[i - 1]);
+  const moved = (tops.at(-1) ?? 0) - (tops[0] ?? 0);
+  info.annotations.push({
+    type: "flip back",
+    description: JSON.stringify({ boxHeight, source, preview, tops, moved }),
+  });
+  expect(Math.abs(moved - (source + preview - boxHeight))).toBeLessThanOrEqual(
+    STILL_PX,
+  );
+  expect(tops.length).toBeLessThanOrEqual(3);
 });
 
 test("a label goes through drawnLabels, a fence coming back has its drawing at once, and nothing is left behind", async ({
