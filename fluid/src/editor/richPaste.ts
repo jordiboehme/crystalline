@@ -25,6 +25,7 @@ import { EditorView } from "@codemirror/view";
 
 import { transferFiles } from "./attachments";
 import { carriesText, isOwnCopy, textOf } from "./clipboardHtml";
+import { PARSE_BUDGET, deadlineIn, viewParsedTo } from "./marks/parse";
 
 type Converter = typeof import("./htmlToMarkdown");
 
@@ -70,6 +71,16 @@ function isPlainPasteKey(event: KeyboardEvent): boolean {
     (event.metaKey || event.ctrlKey) &&
     event.shiftKey &&
     (event.code === "KeyV" || event.key.toLowerCase() === "v")
+  );
+}
+
+function parsedForPaste(view: EditorView): boolean {
+  const { doc, selection } = view.state;
+  const last = selection.ranges.at(-1) ?? selection.main;
+  return viewParsedTo(
+    view,
+    doc.lineAt(last.to).to,
+    deadlineIn(PARSE_BUDGET.gesture),
   );
 }
 
@@ -154,7 +165,10 @@ export function richPaste(): Extension {
           return false;
         }
         const plain = data.getData("text/plain");
-        if (plainKey || inCode(view.state)) {
+        // Parsed first (D35): a short tree holds no fence, and the paste would
+        // write converted Markdown into one. Past the budget plain text goes
+        // in, which is never wrong there.
+        if (plainKey || !parsedForPaste(view) || inCode(view.state)) {
           if (files.length === 0) {
             return false;
           }

@@ -45,6 +45,7 @@ import { frontmatterRegion } from "../frontmatterRegion";
 import { parkingChanged } from "../parkedSelection";
 import { parseAdvanced } from "../parseProgress";
 import { roomUndo } from "../roomUndo";
+import { PARSE_BUDGET, deadlineIn, viewParsedTo } from "./parse";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine } from "./hiddenMarks";
 import {
@@ -563,6 +564,13 @@ interface Continuation {
   removeFrom: number;
 }
 
+/** The lines of `view`'s selection parsed, with the bound of a key (D35). */
+function parseKeyLines(view: EditorView): void {
+  const { doc, selection } = view.state;
+  const last = selection.ranges.at(-1) ?? selection.main;
+  viewParsedTo(view, doc.lineAt(last.to).to, deadlineIn(PARSE_BUDGET.key));
+}
+
 /** The marker chain of the line the caret is on, or null off a list or quote. */
 function continuation(
   state: EditorState,
@@ -631,10 +639,13 @@ function continuation(
  * is not handled and CodeMirror's Enter runs.
  */
 function listEnterCommand(view: EditorView): boolean {
-  const { state } = view;
-  if (state.readOnly || completionStatus(state) === "active") {
+  if (view.state.readOnly || completionStatus(view.state) === "active") {
     return false;
   }
+  // The markers are read off the tree: on one a reparse left short the line
+  // would look like no list, and Enter would drop the next marker (D35).
+  parseKeyLines(view);
+  const { state } = view;
   const found = state.selection.ranges.map((range) =>
     continuation(state, range),
   );
@@ -674,6 +685,7 @@ function listEnterCommand(view: EditorView): boolean {
 
 /** Mod-Enter on a task line: open to done to open, not applicable to open. */
 function cycleTask(view: EditorView): boolean {
+  parseKeyLines(view);
   const { state } = view;
   const at = state.selection.main.head;
   const current = taskStateAt(state, at);
