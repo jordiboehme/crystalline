@@ -49,6 +49,7 @@ fn refusal(label: &str) -> String {
 
 /// The same refusal as REST words it: it answers before it knows who asked, so
 /// the command stays in the server log.
+#[cfg(feature = "postgres")]
 fn rest_refusal(label: &str) -> String {
     format!(
         "this domain's Reflection is served by {label}. An admin can move it, and the server log says how."
