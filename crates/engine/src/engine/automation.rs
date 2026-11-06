@@ -1006,7 +1006,7 @@ impl Engine {
             return (
                 None,
                 Some(format!(
-                    "'{domain}' names an evolve_home that is not a server address (`{declared}`, verify reports it as M013), so every clone of it may run evolve. Remove the line, and the next scheduled evolve run at an instance with service.public_url claims the home."
+                    "'{domain}' names an evolve_home that is not a server address (`{declared}`, verify reports it as M013), so every clone of it may run evolve. Remove the line, and the next scheduled evolve run at an instance with a public address claims the home."
                 )),
             );
         }
@@ -1025,7 +1025,7 @@ impl Engine {
             return (
                 None,
                 Some(format!(
-                    "'{domain}' has no evolve_home yet, so every clone of it may run evolve. This instance has no service.public_url, so it cannot become the home: the first scheduled evolve run at an instance with one claims it."
+                    "'{domain}' has no evolve_home yet, so every clone of it may run evolve. This instance has no public address, so it cannot become the home: the first scheduled evolve run at an instance with one claims it."
                 )),
             );
         };

@@ -7578,8 +7578,8 @@ mod evolve;
 mod fence;
 mod github;
 pub use github::{
-    LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP,
-    UNATTENDED_LINK,
+    GITHUB_OFF_PLAIN, LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK,
+    OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK, plain_refusal_text,
 };
 mod github_access;
 pub use github_access::{
@@ -12350,6 +12350,44 @@ mod share_actor_tests {
             .expect_err("no agent identity is configured");
         assert_eq!(err.to_string(), AGENT_IDENTITY_UNSET);
         assert!(!err.to_string().contains("github."), "{err}");
+    }
+
+    /// Every sentence that holds a command line, a setting or a host has plain
+    /// words, and none of them holds any of those.
+    #[test]
+    fn every_refusal_with_admin_detail_has_plain_words() {
+        for text in [
+            github_app::KEYCHAIN_REFUSAL.to_string(),
+            format!("{} (the keychain is locked)", github_app::KEYCHAIN_REFUSAL),
+            RemoteError::AppCredential(
+                "the saved App belongs to github.com but github.api_url points at 10.0.0.1"
+                    .to_string(),
+            )
+            .to_string(),
+            NO_CLIENT_SECRET_TO_LINK.to_string(),
+            RemoteError::NotEnabled.to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            }
+            .to_string(),
+            PERSONAL_TOKEN_MISSING.to_string(),
+            PERSONAL_LINK_MISSING.to_string(),
+            reflection::hosted_refusal("alpha").to_string(),
+        ] {
+            let plain =
+                plain_refusal_text(&text).unwrap_or_else(|| panic!("no plain words: {text}"));
+            for detail in [
+                "crystalline ",
+                "github.",
+                "service.",
+                "CRYSTALLINE_",
+                "10.0.0.1",
+            ] {
+                assert!(!plain.contains(detail), "{plain}");
+            }
+        }
+        assert_eq!(plain_refusal_text("the domain is not there"), None);
     }
 
     /// With one configured, the agent writes as that account's connected

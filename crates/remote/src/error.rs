@@ -207,7 +207,7 @@ pub enum RemoteError {
     /// direct share; `ops` pulls once more and retries once before it answers
     /// `BranchMoved`.
     #[error(
-        "the branch {branch} moved while this share was prepared; run update_domain (or `crystalline origin update`) and share again"
+        "the branch {branch} moved while this share was prepared; run update_domain and share again"
     )]
     NotFastForward {
         /// The branch that moved.
@@ -473,7 +473,7 @@ pub fn no_write_access_guidance(repo: &str) -> String {
 /// race too ("moved again").
 pub fn branch_moved_guidance(branch: &str) -> String {
     format!(
-        "the branch {branch} moved again while this share was prepared; run update_domain (or `crystalline origin update`) and share again"
+        "the branch {branch} moved again while this share was prepared; run update_domain and share again"
     )
 }
 

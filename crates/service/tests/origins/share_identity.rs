@@ -32,6 +32,8 @@ enum App {
     None,
     Ready,
     Refused,
+    /// Saved in a keychain that cannot be read.
+    Locked,
 }
 
 const APPS: [App; 3] = [App::None, App::Ready, App::Refused];
@@ -92,7 +94,7 @@ async fn case_with_auth(
     now: Arc<std::sync::Mutex<std::time::Instant>>,
     connect_auth: Option<Arc<crate::support::StubConnectAuth>>,
 ) -> Case {
-    case_full(app, key, now, connect_auth, None).await
+    case_full(app, key, now, connect_auth, None, true).await
 }
 
 async fn case_full(
@@ -101,6 +103,7 @@ async fn case_full(
     now: Arc<std::sync::Mutex<std::time::Instant>>,
     connect_auth: Option<Arc<crate::support::StubConnectAuth>>,
     mcp_auth: Option<bool>,
+    public_url: bool,
 ) -> Case {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -118,7 +121,7 @@ async fn case_full(
             ..GitHubConfig::default()
         }),
         service: Some(ServiceConfig {
-            public_url: Some("https://kb.example.com".into()),
+            public_url: public_url.then(|| "https://kb.example.com".into()),
             ..Default::default()
         }),
         auth: Some(AuthConfig {
@@ -151,7 +154,17 @@ async fn case_full(
         let host = url.trim_start_matches("http://").to_string();
         let dir = root.join("tokens");
         let broken = broken.clone();
+        let locked = app == App::Locked;
+        let broke = broken.clone();
         eng = eng.with_app_store_lookup(Arc::new(move || {
+            if locked && broke.load(Ordering::SeqCst) {
+                return Ok(AppLookup {
+                    store: AppStore::file_fallback(&dir),
+                    credentials: None,
+                    keychain_failed: Some("the keychain is locked".to_string()),
+                    marker: Some(String::new()),
+                });
+            }
             let host = if broken.load(Ordering::SeqCst) {
                 "github.com"
             } else {
@@ -177,7 +190,7 @@ async fn case_full(
         engram("New", "new", "brand new content"),
     )
     .unwrap();
-    if app == App::Refused {
+    if app == App::Refused || app == App::Locked {
         broken.store(true, Ordering::SeqCst);
         eng.reset_github_app();
     }
@@ -1849,6 +1862,7 @@ async fn bare_configure_gives_a_non_admin_the_plain_app_sentence() {
         Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
         None,
         Some(true),
+        true,
     )
     .await;
     let editor = fx.auth.issue_mcp_token("ada", "t").await.unwrap().token;
@@ -1864,11 +1878,8 @@ async fn bare_configure_gives_a_non_admin_the_plain_app_sentence() {
     assert!(answer.contains("save the App again"), "{answer}");
 }
 
-/// The step before an account deletes what is saved under the name. A stranger's
-/// first sign-in under the name `github.agent_identity` holds must not delete the
-/// bot's token: only an admin who adds that account may. It is refused instead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_first_sign_in_under_the_agent_identity_leaves_its_token_alone() {
+/// A trusted-header instance whose `github.agent_identity` is `bot`.
+async fn agent_identity_instance() -> (tempfile::TempDir, std::net::SocketAddr, Arc<AuthStore>) {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
@@ -1919,6 +1930,15 @@ async fn a_first_sign_in_under_the_agent_identity_leaves_its_token_alone() {
         .await
         .unwrap();
     });
+    (tmp, addr, auth)
+}
+
+/// The step before an account deletes what is saved under the name. A stranger's
+/// first sign-in under the name `github.agent_identity` holds must not delete the
+/// bot's token: only an admin who adds that account may. It is refused instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_sign_in_under_the_agent_identity_leaves_its_token_alone() {
+    let (tmp, addr, auth) = agent_identity_instance().await;
     leave_token(tmp.path(), "bot");
     let me = client()
         .get(format!("http://{addr}/api/v1/auth/me"))
@@ -1929,4 +1949,133 @@ async fn a_first_sign_in_under_the_agent_identity_leaves_its_token_alone() {
     assert_eq!(me.status(), 409);
     assert!(token_file(tmp.path(), "bot").exists(), "the bot's token");
     assert!(auth.user("bot").await.unwrap().is_none());
+}
+
+/// An instance with `auth.mcp` on, and an MCP session for a real editor and for a
+/// real admin. Without `auth.mcp` the token is not read and the caller is the open
+/// tier.
+async fn editor_and_admin(
+    app: App,
+    public_url: bool,
+) -> (
+    Case,
+    super::github_governed::Mcp,
+    super::github_governed::Mcp,
+) {
+    use super::github_governed::Mcp;
+    let fx = case_full(
+        app,
+        None,
+        Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        None,
+        Some(true),
+        public_url,
+    )
+    .await;
+    let editor = fx.auth.issue_mcp_token("ada", "t").await.unwrap().token;
+    let admin = fx.auth.issue_mcp_token("root", "t").await.unwrap().token;
+    let editor = Mcp::open(fx.addr, Some(editor)).await.unwrap();
+    let admin = Mcp::open(fx.addr, Some(admin)).await.unwrap();
+    (fx, editor, admin)
+}
+
+/// What a tool call answered, a refusal or not.
+fn said(answer: Result<String, String>) -> String {
+    answer.unwrap_or_else(|refusal| refusal)
+}
+
+fn no_admin_detail(text: &str) {
+    assert!(!text.contains("crystalline "), "{text}");
+    assert!(!text.contains("github.api_url"), "{text}");
+    assert!(!text.contains("service.public_url"), "{text}");
+    assert!(!text.contains("127.0.0.1"), "{text}");
+    assert!(text.contains("Ask an admin"), "{text}");
+}
+
+/// `configure` with `connect: "github"` is open to every account, so a real editor
+/// reads plain words for each way the link cannot start. An admin keeps the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_github_link_asked_by_an_editor_reads_plain_words() {
+    let connect = json!({ "connect": "github" });
+
+    let (_fx, editor, admin) = editor_and_admin(App::Locked, true).await;
+    no_admin_detail(&said(editor.call("configure", connect.clone()).await));
+    let full = said(admin.call("configure", connect.clone()).await);
+    assert!(full.contains("crystalline github app remove"), "{full}");
+
+    let (_fx, editor, admin) = editor_and_admin(App::Refused, true).await;
+    no_admin_detail(&said(editor.call("configure", connect.clone()).await));
+    let full = said(admin.call("configure", connect.clone()).await);
+    assert!(full.contains("github.api_url"), "{full}");
+
+    let (_fx, editor, admin) = editor_and_admin(App::Ready, false).await;
+    no_admin_detail(&said(editor.call("configure", connect.clone()).await));
+    let full = said(admin.call("configure", connect.clone()).await);
+    assert!(full.contains("service.public_url"), "{full}");
+}
+
+/// The same sentences on the verbs an editor runs every day: `update_domain` puts
+/// them in a row of its answer, and a share refuses with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_verbs_an_editor_runs_read_plain_words_about_the_app() {
+    for app in [App::Refused, App::Locked] {
+        let (_fx, editor, admin) = editor_and_admin(app, true).await;
+        no_admin_detail(&said(
+            editor
+                .call("update_domain", json!({ "domain": "kb" }))
+                .await,
+        ));
+        // The gate answers first here, in its own plain words.
+        let share = said(
+            editor
+                .call("share_changes", json!({ "domain": "kb" }))
+                .await,
+        );
+        assert!(!share.contains("crystalline "), "{share}");
+        assert!(!share.contains("github.api_url"), "{share}");
+        let full = said(admin.call("update_domain", json!({ "domain": "kb" })).await);
+        assert!(
+            full.contains("github.api_url") || full.contains("crystalline github app remove"),
+            "{full}"
+        );
+    }
+}
+
+/// With GitHub off, an editor cannot turn it on, so the refusal does not teach the
+/// key. An admin can, and reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn github_off_tells_an_editor_to_ask_an_admin() {
+    let (fx, editor, admin) = editor_and_admin(App::None, true).await;
+    fx.eng
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "false".to_string(),
+        })
+        .await
+        .unwrap();
+    no_admin_detail(&said(
+        editor
+            .call("update_domain", json!({ "domain": "kb" }))
+            .await,
+    ));
+    let bare = said(editor.call("configure", json!({})).await);
+    assert!(!bare.contains("set github.enabled true"), "{bare}");
+    let full = said(admin.call("update_domain", json!({ "domain": "kb" })).await);
+    assert!(full.contains("github.enabled"), "{full}");
+}
+
+/// The refusal under the agent identity's name protects a token. With no token
+/// saved there is nothing to protect, so the person signs in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_sign_in_under_the_agent_identity_with_no_token_is_let_in() {
+    let (tmp, addr, auth) = agent_identity_instance().await;
+    let me = client()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .header("x-remote-user", "bot")
+        .send()
+        .await
+        .unwrap();
+    assert!(me.status().is_success(), "{me:?}");
+    assert!(auth.user("bot").await.unwrap().is_some());
+    drop(tmp);
 }

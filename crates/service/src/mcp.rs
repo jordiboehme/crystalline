@@ -4135,8 +4135,8 @@ impl McpServer {
         if crystalline_engine::read_limit::current().is_some() {
             return refuse(crystalline_engine::engine::UNATTENDED_LINK);
         }
-        let account = match self.scope_of(ctx) {
-            Scope::User { account, .. } => account,
+        let (account, admin) = match self.scope_of(ctx) {
+            Scope::User { account, admin } => (account, admin),
             Scope::Unrestricted => {
                 return ok(json!({
                     "connected": false,
@@ -4160,7 +4160,11 @@ impl McpServer {
             return ok(json!({
                 "connected": false,
                 "url": Value::Null,
-                "next_steps": GITHUB_LINK_NO_PUBLIC_URL,
+                "next_steps": if admin {
+                    GITHUB_LINK_NO_PUBLIC_URL
+                } else {
+                    crate::engine::LinkSetupReason::NoPublicUrl.plain_sentence()
+                },
             }));
         };
         let nonce = self.engine.mint_github_link(&account).map_err(to_error)?;
@@ -5582,10 +5586,13 @@ impl ServerHandler for McpServer {
         };
         // As one MCP request: only then does the open tier act as
         // `github.agent_identity` on a domain GitHub governs.
+        let scope = self.scope_of(&context);
+        let may_change_instance = self.refuse_instance_change(&scope).is_none();
         let response = crystalline_engine::engine::as_mcp_call(
             crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context)),
         )
         .await;
+        let response = reader_response(response, &scope, may_change_instance);
         match (note, response) {
             (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
                 result.content.push(ContentBlock::text(note));
@@ -6919,6 +6926,54 @@ fn present_names(present: &[String]) -> String {
 /// `handler/server.rs:454-480`, `model.rs:3892-3913`). The message names the
 /// condition and how to change it, which is the same thing the tool's
 /// description says, exactly as SEP-2567 prescribes.
+/// A tool's answer in the words of who reads it, for every tool in one place: only
+/// an admin and the machine owner read a sentence with a command line, a setting or
+/// a host. The open tier may turn GitHub on, so it still reads how.
+fn reader_response(
+    response: Result<rmcp::model::CallToolResponse, ErrorData>,
+    scope: &Scope,
+    may_change_instance: bool,
+) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+    if matches!(scope, Scope::Unrestricted | Scope::User { admin: true, .. }) {
+        return response;
+    }
+    let reword = |text: &str| -> Option<String> {
+        if may_change_instance && text == RemoteError::NotEnabled.to_string() {
+            return None;
+        }
+        crate::engine::plain_refusal_text(text)
+    };
+    match response {
+        Err(mut error) => {
+            if let Some(plain) = reword(&error.message) {
+                error.message = plain.into();
+            }
+            Err(error)
+        }
+        Ok(rmcp::model::CallToolResponse::Complete(mut result)) => {
+            for block in &mut result.content {
+                let Some(text) = block.as_text() else {
+                    continue;
+                };
+                let was = text.text.clone();
+                let mut now = reword(&was);
+                // The rename guidance names a command only the machine owner runs.
+                if !may_change_instance && was.contains(RENAME_OWNER_COMMAND) {
+                    now = Some(was.replace(RENAME_OWNER_COMMAND, ""));
+                }
+                if let Some(now) = now {
+                    *block = ContentBlock::text(now);
+                }
+            }
+            Ok(rmcp::model::CallToolResponse::Complete(result))
+        }
+        other => other,
+    }
+}
+
+/// The part of the rename guidance only the machine owner can use.
+const RENAME_OWNER_COMMAND: &str = " or with `crystalline doctor --fix`";
+
 fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(
         message.into(),

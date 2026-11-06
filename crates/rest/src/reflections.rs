@@ -88,7 +88,9 @@ pub(crate) fn reflection_error(e: EngineError) -> ApiError {
                 || text == REFUSED_HOMELESS
                 || text.contains(REFUSED_UNCONNECTED_TEAM) =>
         {
-            ApiError::conflict(text.clone())
+            ApiError::conflict(
+                crate::engine::plain_refusal_text(text).unwrap_or_else(|| text.clone()),
+            )
         }
         // The anonymous visitor of a public domain reads and never comments:
         // logging in is what fixes it, so 401 like every other anonymous write.

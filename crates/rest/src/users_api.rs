@@ -273,12 +273,15 @@ pub(crate) async fn clear_name_for_new_account(
     if state.auth.user(&account).await?.is_some() {
         return Ok(());
     }
-    // The step deletes what is saved under the name, and the bot's token is saved
-    // under this one. Only an admin who adds that account may do that, not a
-    // stranger's first sign-in.
-    if !admin_reads && state.engine.config().github_agent_identity() == Some(account.as_str()) {
+    // The step deletes what is saved under the name, and here that is the bot's
+    // token. Only an admin who adds that account may do that, not a stranger's first
+    // sign-in. With no token saved there is nothing to protect.
+    if !admin_reads
+        && state.engine.config().github_agent_identity() == Some(account.as_str())
+        && state.engine.personal_token_saved(&account)
+    {
         tracing::warn!(
-            "a first sign-in under '{account}' was refused: github.agent_identity names it, so an admin adds that account"
+            "a first sign-in under '{account}' was refused: github.agent_identity names it and a GitHub token is saved under it. Add the account first, or unset the key"
         );
         return Err(ApiError::conflict(
             crystalline_core::account::NEW_ACCOUNT_ASK_AN_ADMIN,

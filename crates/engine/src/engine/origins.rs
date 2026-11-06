@@ -65,6 +65,20 @@ fn team_marker_json() -> Value {
     json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
 }
 
+/// The text of an error a list answer carries in a row, in the words of who reads
+/// it: the same list as [`plain_refusal_text`], here where the caller is known.
+fn row_error(scope: &crate::scope::Scope, e: &EngineError) -> String {
+    let text = e.to_string();
+    let admin = matches!(
+        scope,
+        crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+    );
+    if admin {
+        return text;
+    }
+    plain_refusal_text(&text).unwrap_or(text)
+}
+
 /// What the `connection` block of a status leaves out for a non-admin: the reason
 /// names a setting, the owner's and the agent's slots are about who else this
 /// instance shares as, and the App's sentences hold a command line and an
@@ -1103,7 +1117,7 @@ impl Engine {
         for (name, entry) in targets {
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => domains.push(v),
-                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+                Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
             }
         }
         // Once every pull has finished and let go of its origin lock, which a
@@ -1564,7 +1578,7 @@ impl Engine {
                 Some(who) => match self.local_change_sides(&name, who).await {
                     Ok(sides) => Some(sides),
                     Err(e) => {
-                        errors.push(json!({ "domain": name, "error": e.to_string() }));
+                        errors.push(json!({ "domain": name, "error": row_error(scope, &e) }));
                         continue;
                     }
                 },
@@ -1583,7 +1597,7 @@ impl Engine {
                 .await
             {
                 Ok(v) => domains.push(v),
-                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+                Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
             }
         }
         Ok(json!({ "connection": connection, "domains": domains, "errors": errors }))
@@ -2654,7 +2668,11 @@ impl Engine {
                 if credential == PreviewCredential::ReadScopeFallback
                     && is_personal_token_missing(&e) =>
             {
-                (self.resolve_origin_provider()?, None)
+                (
+                    self.resolve_origin_provider()
+                        .map_err(|e| refusal_for(&actor, e))?,
+                    None,
+                )
             }
             Err(e) => return Err(e),
         };

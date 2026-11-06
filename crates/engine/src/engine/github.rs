@@ -372,9 +372,14 @@ impl Engine {
     /// host, so anybody but an admin or the machine owner reads the plain one.
     pub async fn configure_snapshot_for(&self, admin: bool) -> Result<Value> {
         if !self.github_enabled() {
+            let note = if admin {
+                "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection."
+            } else {
+                GITHUB_OFF_PLAIN
+            };
             return self.configure_snapshot_with(json!({
                 "github_enabled": false,
-                "note": "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection.",
+                "note": note,
             }));
         }
         let mut github = self.configure_connection_block().await?;
@@ -1189,6 +1194,17 @@ impl Engine {
         self.link_github_begun(account, born, grant).await
     }
 
+    /// Whether a GitHub token is saved under `account`. A store that cannot be read
+    /// answers yes: the caller is about to delete what is there, or refuse.
+    pub fn personal_token_saved(&self, account: &str) -> bool {
+        let Ok(identity) = personal_identity(account) else {
+            return false;
+        };
+        let host = self.github_token_host();
+        self.github_credential_for(&identity, host.as_deref())
+            .map_or(true, |(_, token)| token.is_some())
+    }
+
     /// When the account under `account` was made, `None` when the name holds
     /// none or this process keeps no accounts. Something that takes a while asks
     /// this when it begins and hands it to [`Engine::link_github_begun`].
@@ -1756,6 +1772,52 @@ pub const UNATTENDED_LINK: &str = "an unattended session cannot hand out a link 
 /// What a link is refused with when the GitHub App has no client secret, so
 /// the browser flow could not exchange GitHub's code.
 pub const NO_CLIENT_SECRET_TO_LINK: &str = "the GitHub App has no client secret, so the browser link cannot exchange GitHub's code; an admin adds it with: crystalline github app set --app-id <id> --client-id <id> --private-key-file <file> --client-secret-file <file> (add --webhook-secret-file <file> when the App has a webhook secret, because set replaces the saved App), or sets CRYSTALLINE_GITHUB_APP_CLIENT_SECRET when the App comes from the environment";
+
+/// A refusal in the words of somebody who is not an admin, or `None` when it holds
+/// nothing only an admin can use: no command line, setting or host. The one list of
+/// such sentences, so every surface that knows its caller asks here.
+///
+/// The surfaces that know their caller keep the full text for an admin and the
+/// machine owner. The JSON API words an error before it knows who asked, so it uses
+/// this for everybody, and logs the full text.
+pub fn plain_refusal_text(text: &str) -> Option<String> {
+    let plain = |reason: LinkSetupReason| Some(reason.plain_sentence().to_string());
+    if text.starts_with(super::github_app::KEYCHAIN_REFUSAL) {
+        return plain(LinkSetupReason::Keychain);
+    }
+    if text.starts_with("The GitHub App credential is unusable") {
+        return plain(LinkSetupReason::AppUnusable);
+    }
+    if text == NO_CLIENT_SECRET_TO_LINK {
+        return plain(LinkSetupReason::NoClientSecret);
+    }
+    if text == NO_APP_TO_LINK {
+        return plain(LinkSetupReason::NoApp);
+    }
+    if text.starts_with("This GitHub server does not offer") {
+        return Some(
+            "This GitHub server does not offer what the GitHub App needs. Ask an admin to check it."
+                .to_string(),
+        );
+    }
+    if text == RemoteError::NotEnabled.to_string() {
+        return Some(GITHUB_OFF_PLAIN.to_string());
+    }
+    if text == PERSONAL_TOKEN_MISSING {
+        return Some(PERSON_TOKEN_MISSING.to_string());
+    }
+    if text == PERSONAL_LINK_MISSING {
+        return Some(PERSON_LINK_MISSING.to_string());
+    }
+    if let Some(hosted) = text.strip_suffix("; move it with crystalline serve --take-over") {
+        return Some(format!("{hosted}. Ask an admin to move it."));
+    }
+    None
+}
+
+/// What somebody who cannot turn it on reads while GitHub collaboration is off.
+pub const GITHUB_OFF_PLAIN: &str =
+    "GitHub collaboration is not on for this instance. Ask an admin to turn it on.";
 
 /// What a link is refused with when no GitHub App is configured.
 const NO_APP_TO_LINK: &str = "linking a GitHub account needs a GitHub App, and none is configured on this instance; an admin sets one up with: crystalline github app set";

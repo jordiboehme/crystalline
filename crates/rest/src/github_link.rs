@@ -338,7 +338,11 @@ async fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, A
         .engine
         .github_link_app_explained()
         .map_err(|refusal| {
-            let error = ApiError::from(refusal.error);
+            // The full sentence: the caller of this function words it for who reads
+            // it, and an admin keeps it.
+            let full = refusal.error.to_string();
+            let mut error = ApiError::from(refusal.error);
+            error.detail = full;
             match refusal.reason {
                 Some(reason) => error.reason(reason),
                 None => error,

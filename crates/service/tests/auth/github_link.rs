@@ -1466,7 +1466,7 @@ async fn an_anonymous_agent_is_told_to_link_from_the_profile() {
 /// Without `service.public_url` there is no address to build a link with:
 /// nothing is minted, and the answer says what an admin sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_public_url_the_answer_names_the_setting() {
+async fn without_a_public_url_an_editor_reads_plain_words() {
     let github = FakeGithub::start().await;
     let ctx = Ctx::with(
         &github,
@@ -1487,14 +1487,9 @@ async fn without_a_public_url_the_answer_names_the_setting() {
     let answer = session
         .call_tool("configure", serde_json::json!({ "connect": "github" }))
         .await;
-    assert!(
-        answer.contains(
-            "Linking GitHub through the App needs service.public_url, which this instance does \
-             not have. An admin sets it (crystalline config set service.public_url <url>), then \
-             ask again."
-        ),
-        "{answer}"
-    );
+    assert!(answer.contains("Ask an admin to set it"), "{answer}");
+    assert!(!answer.contains("service.public_url"), "{answer}");
+    assert!(!answer.contains("crystalline config"), "{answer}");
     assert!(!answer.contains("profile"), "{answer}");
     assert!(!answer.contains(GO_PATH), "{answer}");
 }
