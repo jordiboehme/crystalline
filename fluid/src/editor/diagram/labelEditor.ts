@@ -1398,15 +1398,18 @@ registerStopAction("rename", (main, anchor, target) => {
   openLabelEditor(main, anchor, target, { selectAll: true });
 });
 
-registerClickGate((main, target, go) => {
+registerClickGate((main, target, go, stay) => {
   const open = fields.get(main);
   if (open === undefined) {
     go();
   } else if (sameTarget(open.target, target)) {
     open.el.focus();
+    stay();
   } else {
     void commit(open, "switch").then(() => {
-      if (!fields.has(main)) {
+      if (fields.has(main)) {
+        stay();
+      } else {
         go();
       }
     });

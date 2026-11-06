@@ -37,6 +37,7 @@ import {
 
 import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
+import { roomUndo } from "../roomUndo";
 import { flowKind, removeFence, runDiagramOp } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
@@ -100,13 +101,18 @@ export function registerStopAction(
   stopActions.set(name, action);
 }
 
-type ClickGate = (main: EditorView, target: TargetKey, go: () => void) => void;
+type ClickGate = (
+  main: EditorView,
+  target: TargetKey,
+  go: () => void,
+  stay: () => void,
+) => void;
 
 let clickGate: ClickGate | null = null;
 
 /**
  * What stands before a click on a stop: an open rename field writes its draft
- * first, and `go` then takes the click, unless the field stays open.
+ * first, and `go` then takes the click. If the field stays open it calls `stay`.
  */
 export function registerClickGate(gate: ClickGate): void {
   clickGate = gate;
@@ -592,17 +598,62 @@ function askMenu(
   target: TargetKey,
   at?: { x: number; y: number },
 ): void {
+  throughGate(main, where, target, (anchor, now) => {
+    const host = hostOf(main, anchor);
+    if (host !== null) {
+      stopActions.get("menu")?.(main, anchor, now, host, at);
+    }
+  });
+}
+
+/**
+ * Runs `act` once a rename field has written its draft, which waits for a verify. A
+ * peer's duplicate can land in that wait, so an arrow is held by its place from now,
+ * and `act` gets it as it stands then, or the person a sentence (R94).
+ */
+function throughGate(
+  main: EditorView,
+  where: () => number | null,
+  target: TargetKey,
+  act: (anchor: number, target: TargetKey) => void,
+): void {
+  const at = where();
+  const fence = at === null ? null : fenceAt(main.state, at);
+  const hold =
+    target.kind === "edge" && fence !== null
+      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+      : null;
+  const letGo = () => {
+    if (hold !== null) {
+      letGoOfArrow(main, hold);
+    }
+  };
   const go = () => {
     const anchor = where();
-    const host = anchor === null ? null : hostOf(main, anchor);
-    if (host !== null && anchor !== null) {
-      stopActions.get("menu")?.(main, anchor, target, host, at);
+    if (anchor === null) {
+      letGo();
+      return;
     }
+    let now = target;
+    if (hold !== null) {
+      const stands = fenceAt(main.state, anchor);
+      const edge =
+        stands === null
+          ? "gone"
+          : resolveArrow(main, hold, modelOf(stands.body), stands.bodyFrom);
+      letGo();
+      if (typeof edge === "string") {
+        sayAt(main, anchor, edge);
+        return;
+      }
+      now = { kind: "edge", key: edge };
+    }
+    act(anchor, now);
   };
   if (clickGate === null) {
     go();
   } else {
-    clickGate(main, target, go);
+    clickGate(main, target, go, letGo);
   }
 }
 
@@ -747,9 +798,6 @@ export function sayAt(
   }
 }
 
-/** Views whose plugin ended: Raw too, so a microtask queued before it does nothing. */
-const destroyedViews = new WeakSet<EditorView>();
-
 const sameEdgeKey = (a: EdgeKey, b: EdgeKey) =>
   a.start === b.start && a.end === b.end && a.occurrence === b.occurrence;
 
@@ -810,6 +858,8 @@ const focusPlugin = ViewPlugin.fromClass(
     stopHold: ArrowHold | null = null;
     /** The person's own edit came: it may rewrite the token, and it means no harm. */
     ownEdit = false;
+    /** This plugin ended, as Raw ends it. A view that comes back gets a new one. */
+    ended = false;
 
     readonly mousedown = (event: Event): void => {
       // The click decides; a press alone moves neither focus nor selection.
@@ -855,24 +905,20 @@ const focusPlugin = ViewPlugin.fromClass(
       // Found again from the box, as a rename field's draft may move it. The intent's
       // own anchor would be the other fence's when the click came from there.
       const box = place.host.container;
-      const go = () => {
-        const from = box.isConnected ? fenceFromOf(view, box) : null;
-        if (from === null) {
-          return;
-        }
-        focusTarget(view, from, target);
-        if (target.kind !== "canvas" && writable(view.state)) {
-          const host = hostOf(view, from);
-          if (host !== null) {
-            stopActions.get("rename")?.(view, from, target, host);
+      throughGate(
+        view,
+        () => (box.isConnected ? fenceFromOf(view, box) : null),
+        target,
+        (from, now) => {
+          focusTarget(view, from, now);
+          if (now.kind !== "canvas" && writable(view.state)) {
+            const host = hostOf(view, from);
+            if (host !== null) {
+              stopActions.get("rename")?.(view, from, now, host);
+            }
           }
-        }
-      };
-      if (clickGate === null) {
-        go();
-      } else {
-        clickGate(view, target, go);
-      }
+        },
+      );
     };
     readonly contextmenu = (event: Event): void => {
       const place = this.place(event);
@@ -1139,14 +1185,19 @@ const focusPlugin = ViewPlugin.fromClass(
       const own = this.ownEdit;
       this.ownEdit = false;
       const hold = this.stopHold;
-      if (hold === null || own || !sameEdgeKey(hold.key, key)) {
+      const now =
+        hold === null || !sameEdgeKey(hold.key, key)
+          ? null
+          : resolveArrow(view, hold, model, fence.bodyFrom);
+      // A new stop, or the person's own edit took the token, as a Line and its undo
+      // do. That is the same arrow, so the ticket goes back in it.
+      if (hold === null || now === null || (own && typeof now === "string")) {
         this.dropStopHold();
         if (flowEdgeSpanOf(model, key) !== null) {
           this.stopHold = holdArrow(view, model, key, fence.bodyFrom);
         }
         return;
       }
-      const now = resolveArrow(view, hold, model, fence.bodyFrom);
       if (now === "gone") {
         // `settle` gives the stop to what stands in its place.
         this.dropStopHold();
@@ -1177,12 +1228,18 @@ const focusPlugin = ViewPlugin.fromClass(
         update.startState.field(diagramIntent) !==
           update.state.field(diagramIntent)
       ) {
+        // A room's undo and redo reach the text with no user event, as a peer's edit
+        // does. Only the manager says they are the person's own.
+        const room = update.state.facet(roomUndo);
         this.ownEdit ||= update.transactions.some(
           (tr) =>
-            tr.docChanged && tr.annotation(Transaction.userEvent) !== undefined,
+            tr.docChanged &&
+            (tr.annotation(Transaction.userEvent) !== undefined ||
+              room?.undoing === true ||
+              room?.redoing === true),
         );
         queueMicrotask(() => {
-          if (!destroyedViews.has(view)) {
+          if (!this.ended) {
             this.followStop();
           }
         });
@@ -1372,7 +1429,11 @@ const focusPlugin = ViewPlugin.fromClass(
     }
 
     destroy(): void {
-      destroyedViews.add(this.view);
+      this.ended = true;
+      // Not during the reconfigure that ends this: Raw keeps the anchors, and the view.
+      queueMicrotask(() => {
+        this.dropStopHold();
+      });
       liveViews.delete(this.view);
       const dom = this.view.contentDOM;
       dom.removeEventListener("mousedown", this.mousedown);

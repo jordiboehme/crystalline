@@ -680,6 +680,41 @@ describe("what cannot be done", () => {
   });
 });
 
+describe("a person's own undo, solo", () => {
+  it("keeps a stop on its arrow through Line, undo and redo", async () => {
+    const view = await drawn();
+    openMenuOn(view, EDGE_AB);
+    choose("Line", "Dotted");
+    await changed(view, page(SKELETON));
+    await flush();
+    undoOnce(view);
+    await flush();
+    expect(text(view)).toBe(page(SKELETON));
+    expect(intentOf(view)?.target).toEqual(EDGE_AB);
+    expect(view.dom.querySelector(".cm-diagram-refusal")).toBeNull();
+    expect(noticeOf(view)).toBe("");
+  });
+
+  it("follows its arrow when an undo brings a twin back above it", async () => {
+    const body = "flowchart TD\n    A -->|one| B\n    A -->|two| B";
+    const view = await drawn(page(body));
+    openMenuOn(view, EDGE_AB);
+    choose("Delete");
+    await changed(view, page(body));
+    await flush();
+    focusTarget(view, fromOf(view), EDGE_AB);
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    undoOnce(view);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(text(view)).toBe(page(body));
+    expect(intentOf(view)?.target).toEqual({
+      kind: "edge",
+      key: { start: "A", end: "B", occurrence: 1 },
+    });
+  });
+});
+
 describe("resolveArrow with no ticket asked for", () => {
   const key = AB;
   const noTicket = () => ({ ticket: null, key, sole: true });

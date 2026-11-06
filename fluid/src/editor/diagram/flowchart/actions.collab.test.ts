@@ -13,8 +13,11 @@ import {
   bytes,
   cleanupMarkViews,
   markPeers,
+  redoOnce,
+  setRaw,
   undoOnce,
 } from "../../../test/markKit";
+import { diagramAnchors } from "../../diagramAnchors";
 import { NOTICES } from "../edits";
 import { focusTarget } from "../focus";
 import type { TargetKey } from "../intent";
@@ -634,6 +637,208 @@ describe("an arrow once chosen is that arrow or nothing (R94)", () => {
         expect(text(local)).not.toContain("|mine|");
       });
     });
+  });
+});
+
+describe("a person's own undo is no peer's edit", () => {
+  const panel = (view: EditorView) =>
+    view.dom.querySelector(".cm-diagram-refusal");
+  const fenceOf = (view: EditorView) => text(view).indexOf("```");
+
+  it("a stop stays on its arrow through its own Line, undo and redo, and Delete takes the arrow", async () => {
+    const body = "flowchart TD\n    A[First] --> B[Second]";
+    const { local } = await room(body);
+    openOn(local, FIRST);
+    choose("Line", "Dotted");
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("-.->");
+    });
+    await settle();
+    undoOnce(local);
+    await settle();
+    expect(text(local)).toBe(page(body));
+    expect(intentOf(local)?.target).toEqual(FIRST);
+    expect(noticeOf(local)).toBe("");
+    expect(panel(local)).toBeNull();
+    redoOnce(local);
+    await settle();
+    expect(text(local)).toContain("-.->");
+    expect(intentOf(local)?.target).toEqual(FIRST);
+    expect(panel(local)).toBeNull();
+    press("Delete");
+    await vi.waitFor(() => {
+      expect(text(local)).not.toContain("-.->");
+    });
+    expect(text(local)).toContain("A[First]");
+    expect(text(local)).toContain("B[Second]");
+  });
+
+  it("follows its arrow when its own undo brings a twin back above it", async () => {
+    const { local } = await room(TWO);
+    openOn(local, FIRST);
+    choose("Delete");
+    await vi.waitFor(() => {
+      expect(text(local)).not.toContain("|one|");
+    });
+    await settle();
+    focusTarget(local, fenceOf(local), FIRST);
+    await settle();
+    undoOnce(local);
+    await settle();
+    expect(text(local)).toBe(page(TWO));
+    expect(intentOf(local)?.target).toEqual(SECOND);
+  });
+
+  it("still reads a peer's rewrite as a peer's, right after an own undo", async () => {
+    const body = "flowchart TD\n    A[First] --> B[Second]";
+    const { local, peer, sync } = await room(body);
+    openOn(local, FIRST);
+    choose("Line", "Dotted");
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("-.->");
+    });
+    await settle();
+    undoOnce(local);
+    await settle();
+    sync();
+    await settle();
+    const at = text(peer).indexOf("-->");
+    peer.dispatch({ changes: { from: at, to: at + 3, insert: "==>" } });
+    sync();
+    await settle();
+    expect(intentOf(local)?.target).toEqual({ kind: "node", id: "A" });
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+  });
+});
+
+describe("a view that comes back from Raw", () => {
+  it("follows its arrow again, and Delete takes that arrow", async () => {
+    const { local, peer, sync } = await room(TWO);
+    setRaw(local, true);
+    await flush();
+    setRaw(local, false);
+    await vi.waitFor(() => {
+      expect(local.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+    });
+    await settle();
+    focusTarget(local, text(local).indexOf("```"), SECOND);
+    await settle();
+    peerInsert(peer, "    A -->|one|", "    A -->|peers| B\n");
+    sync();
+    await settle();
+    expect(intentOf(local)?.target).toEqual({
+      kind: "edge",
+      key: { start: "A", end: "B", occurrence: 2 },
+    });
+    press("Delete");
+    await vi.waitFor(() => {
+      expect(text(local)).not.toContain("|two|");
+    });
+    expect(text(local)).toContain("|one|");
+    expect(text(local)).toContain("|peers|");
+  });
+
+  it("leaves no ticket behind when Raw takes the stop", async () => {
+    const { local } = await room(TWO);
+    focusTarget(local, text(local).indexOf("```"), SECOND);
+    await settle();
+    expect(local.state.field(diagramAnchors).size).toBe(1);
+    setRaw(local, true);
+    await settle();
+    expect(local.state.field(diagramAnchors).size).toBe(0);
+  });
+});
+
+describe("a click during a field's commit", () => {
+  const BODY3 =
+    "flowchart TD\n    A -->|one| B\n    A -->|two| B\n    C[Other]";
+  const hitOf = (view: EditorView, occurrence: number) => {
+    const id = occurrence === 0 ? "L_A_B_0" : `L_A_B_${String(occurrence + 1)}`;
+    const found = view.dom.querySelector(
+      `path[data-et="edge"][data-id="${id}"]`,
+    );
+    if (found === null) throw new Error(`no arrow ${id}`);
+    return found;
+  };
+  const openDraft = (view: EditorView) => {
+    focusTarget(view, text(view).indexOf("```"), { kind: "node", id: "C" });
+    press("Enter");
+    const field = view.dom.querySelector<HTMLTextAreaElement>(
+      ".cm-diagram-overlay textarea",
+    );
+    if (field === null) throw new Error("no field");
+    field.value = "Typed";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const twinAbove = (peer: EditorView, sync: () => void) => {
+    peerInsert(peer, "    A -->|one|", "    A -->|peers| B\n");
+    sync();
+  };
+
+  it("a right click: the twin landing in the verify opens the menu on my arrow", async () => {
+    const { local, peer, sync } = await room(BODY3);
+    openDraft(local);
+    hitOf(local, 1).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    twinAbove(peer, sync);
+    await settle();
+    expect(text(local)).toContain("C[Typed]");
+    expect(menus()).toHaveLength(1);
+    expect(intentOf(local)?.target).toEqual({
+      kind: "edge",
+      key: { start: "A", end: "B", occurrence: 2 },
+    });
+    choose("Delete");
+    await vi.waitFor(() => {
+      expect(text(local)).not.toContain("|two|");
+    });
+    expect(text(local)).toContain("|one|");
+    expect(text(local)).toContain("|peers|");
+  });
+
+  it("a left click: the field opens on my arrow, and what is typed lands there", async () => {
+    const { local, peer, sync } = await room(BODY3);
+    openDraft(local);
+    hitOf(local, 1).dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    twinAbove(peer, sync);
+    await settle();
+    const field = local.dom.querySelector<HTMLTextAreaElement>(
+      ".cm-diagram-overlay textarea",
+    );
+    expect(field?.value).toBe("two");
+  });
+
+  it("my arrow going in the verify answers with a sentence and opens nothing", async () => {
+    const { local, peer, sync } = await room(BODY3);
+    openDraft(local);
+    hitOf(local, 1).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    peerDeleteLine(peer, "    A -->|two| B");
+    sync();
+    await settle();
+    expect(menus()).toHaveLength(0);
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+    expect(text(local)).toContain("|one|");
+    expect(local.state.field(diagramAnchors).size).toBeLessThanOrEqual(1);
+  });
+
+  it("a refused draft opens nothing, and leaves no ticket for the click", async () => {
+    const { local } = await room(BODY3);
+    openDraft(local);
+    const field = local.dom.querySelector<HTMLTextAreaElement>(
+      ".cm-diagram-overlay textarea",
+    );
+    if (field === null) throw new Error("no field");
+    field.value = "%%{x";
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+    hitOf(local, 1).dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    await settle();
+    expect(menus()).toHaveLength(0);
+    expect(local.state.field(diagramAnchors).size).toBe(0);
   });
 });
 

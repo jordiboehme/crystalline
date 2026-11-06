@@ -544,3 +544,53 @@ test("connect mode through its box scrolled away: Escape gets out, and the promp
   await expect.poll(() => focusedLabel(page)).toBe("Box: First");
   expect(await docText(page)).toBe(before);
 });
+
+/** Line, undo and redo by real keys, then Delete: all of it on the one arrow. */
+async function ownUndoJourney(page: Page): Promise<void> {
+  await expect(nodeOf(page, "A")).toBeVisible();
+  const arrow = "Arrow from First to Second";
+  const noPanel = () =>
+    expect(page.locator(".cm-diagram-refusal")).toHaveCount(0);
+  await page.locator(".cm-diagram [data-hit-for]").first().click({
+    button: "right",
+    force: true,
+  });
+  await page.getByRole("menuitem", { name: "Line" }).click();
+  await page.getByRole("menuitemradio", { name: "Dotted" }).click();
+  await expect.poll(() => docText(page)).toContain("-.->");
+  await expect.poll(() => focusedLabel(page)).toBe(arrow);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(() => docText(page)).not.toContain("-.->");
+  await expect.poll(() => docText(page)).toContain("-->");
+  await expect.poll(() => focusedLabel(page)).toBe(arrow);
+  await noPanel();
+  await page.keyboard.press("ControlOrMeta+Shift+z");
+  await expect.poll(() => docText(page)).toContain("-.->");
+  await expect.poll(() => focusedLabel(page)).toBe(arrow);
+  await noPanel();
+  await page.keyboard.press("Delete");
+  await expect.poll(() => docText(page)).not.toContain("-.->");
+  const text = await docText(page);
+  expect(text).toContain("A[First]");
+  expect(text).toContain("B[Second]");
+}
+
+test("in a room: a stop stays on its arrow through its own undo and redo", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await expect(page.getByRole("button", { name: "Save" })).toHaveCount(0);
+  await ownUndoJourney(page);
+});
+
+test("solo: a stop stays on its arrow through its own undo and redo", async ({
+  page,
+}) => {
+  // No room to join, so the editor falls back to its solo surface.
+  await page.routeWebSocket(/\/collab\//, (socket) => {
+    void socket.close();
+  });
+  await openEditor(page, DOC);
+  await ownUndoJourney(page);
+  await expect(page.getByRole("button", { name: "Save" })).toBeVisible();
+});
