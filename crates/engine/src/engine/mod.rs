@@ -6237,7 +6237,7 @@ impl Engine {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths)?;
+            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths);
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
                 let settled = if ended.contains(entry.path.as_str()) {
@@ -10350,17 +10350,24 @@ fn tombstones_of_settled_case_moves<'a>(
     entries: &'a [StoredEngram],
     state_dir: &Path,
     base_paths: &HashSet<String>,
-) -> Result<HashSet<&'a str>> {
+) -> HashSet<&'a str> {
+    // A base copy that cannot be read settles nothing here. This look runs ahead
+    // of the pass, so failing here would stop it before it ended a single draft;
+    // the pass reaches that copy in its own turn and stops there, with what it
+    // already ended announced.
     let mut settled = HashSet::new();
     for draft in entries.iter().filter(|entry| !entry.tombstone) {
         if !base_paths.contains(&draft.path)
-            && crystalline_remote::state::read_base_file(state_dir, &draft.path)?.as_deref()
+            && crystalline_remote::state::read_base_file(state_dir, &draft.path)
+                .ok()
+                .flatten()
+                .as_deref()
                 == Some(draft.content.as_bytes())
         {
             settled.insert(crystalline_core::fold_path_case(&draft.path));
         }
     }
-    Ok(entries
+    entries
         .iter()
         .filter(|entry| {
             entry.tombstone
@@ -10368,7 +10375,7 @@ fn tombstones_of_settled_case_moves<'a>(
                 && settled.contains(&crystalline_core::fold_path_case(&entry.path))
         })
         .map(|entry| entry.path.as_str())
-        .collect())
+        .collect()
 }
 
 /// What one pull leaves one overlay FILE to be. Pure, beside
