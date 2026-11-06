@@ -1,0 +1,1179 @@
+//! Every draft write keeps the record of where the draft started.
+//!
+//! A row with no record reads as "we cannot tell", so a write path that forgets
+//! the record turns a new draft into an old one, and a path that writes the
+//! wrong one reads a stale draft as in step, which is the silent overwrite the
+//! record exists to stop. So every way a row gets written or taken away is here,
+//! asserted on `draft_start::load`.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ReviewMode};
+use crystalline_core::parse_engram;
+use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
+use crystalline_remote::ops::DiscardTarget;
+use crystalline_remote::state::{BaseStamp, OriginState, remove_base_file, write_base_file};
+use crystalline_service::draft_start::{self, DraftStart};
+use crystalline_service::overlay_journal;
+use crystalline_service::params::{
+    DeleteParams, EditParams, MoveParams, ReadParams, SaveParams, SplitParams, WriteParams,
+};
+use crystalline_service::{Engine, FoldChoice, ReviewModeConfirm, Scope, ShareActor};
+use tokio::sync::Mutex;
+
+const MANIFEST: &str = "---\ntype: manifest\ntitle: team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
+const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan as the team has it #team\n";
+/// What the team's plan says after a colleague's change.
+const PLAN_LATER: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan after bob's change #team\n";
+/// A team file with no `permalink:` line, whose address is its path's slug.
+const LOOSE: &str = "---\ntype: engram\ntitle: Loose\ntags:\n  - team\nstatus: stable\n---\n\n# Loose\n\n- [fact] no permalink line here #team\n";
+const NOTE: &str =
+    "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n";
+const RICH: &str = "---\ntype: engram\ntitle: Rich\npermalink: rich\ntags:\n  - team\nstatus: stable\n---\n\n# Rich\n\n- [decision] the first thing #team\n- [decision] the second thing #team\n- [idea] the third thing #team\n- [idea] the fourth thing #team\n";
+
+/// A draft nobody else holds, answering to an address no file has.
+fn own_text(address: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {address}\npermalink: {address}\nstatus: draft\n---\n\n{body}\n"
+    )
+}
+
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    engine: Arc<Engine>,
+    store: Arc<Mutex<dyn Store>>,
+    state: PathBuf,
+    origins: PathBuf,
+    mock: Option<Arc<crate::support::MockProvider>>,
+}
+
+/// A reviewing team domain with an origin, whose base snapshot says what the
+/// folder says: the MANIFEST and `files`.
+async fn fixture(files: &[(&str, &str)]) -> Fixture {
+    build(files, true).await
+}
+
+/// The same domain with no origin and so no base snapshot at all.
+async fn fixture_with_no_snapshot(files: &[(&str, &str)]) -> Fixture {
+    build(files, false).await
+}
+
+async fn build(files: &[(&str, &str)], origin: bool) -> Fixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    let mut entry = DomainEntry::file(dir);
+    entry.review = Some(ReviewMode::Overlay);
+    if origin {
+        entry.origin = Some(OriginConfig {
+            repo: "acme/team".to_string(),
+            path: None,
+            branch: Some("main".to_string()),
+            poll_secs: None,
+        });
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        });
+    }
+    cfg.domains.insert("team".to_string(), entry);
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let state = root.join("state");
+    let origins = root.join("origins");
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let mut engine = Engine::new(store.clone(), cfg, None, Some(config_path))
+        .with_state_dir(state.clone())
+        .with_origins_dir(origins.clone());
+    let mut mock = None;
+    if origin {
+        let provider = Arc::new(crate::support::MockProvider::new());
+        let mut held = BTreeMap::from([("MANIFEST.md".to_string(), MANIFEST.as_bytes().to_vec())]);
+        for (name, text) in files {
+            held.insert((*name).to_string(), text.as_bytes().to_vec());
+        }
+        let commit = provider.add_commit(held);
+        provider.set_branch("main", &commit);
+        engine = engine.with_origin_provider(provider.clone());
+        mock = Some(provider);
+        let mut snapshot = OriginState::new("acme/team", "main");
+        snapshot.base_commit = commit;
+        let team_dir = origins.join("team");
+        std::fs::create_dir_all(&team_dir).unwrap();
+        snapshot.save(&team_dir).unwrap();
+    }
+    let engine = Arc::new(engine);
+    engine.sync(None).await.unwrap();
+    let f = Fixture {
+        _tmp: tmp,
+        root,
+        engine,
+        store,
+        state,
+        origins,
+        mock,
+    };
+    if origin {
+        f.team_has("MANIFEST.md", MANIFEST.as_bytes());
+        for (name, text) in files {
+            f.team_has(name, text.as_bytes());
+        }
+    }
+    f
+}
+
+fn alice() -> Scope {
+    Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    }
+}
+
+impl Fixture {
+    fn snapshot_dir(&self) -> PathBuf {
+        self.origins.join("team")
+    }
+
+    /// The base snapshot now holds `bytes` at `path`, as after a pull.
+    fn team_has(&self, path: &str, bytes: &[u8]) {
+        let dir = self.snapshot_dir();
+        let mut state = OriginState::load(&dir).unwrap().unwrap();
+        state.files.insert(
+            path.to_string(),
+            BaseStamp {
+                sha256: crate::support::sha256_hex(bytes),
+                size: bytes.len() as u64,
+            },
+        );
+        write_base_file(&dir, path, bytes).unwrap();
+        state.save(&dir).unwrap();
+    }
+
+    fn start(&self, path: &str) -> Option<DraftStart> {
+        draft_start::load(&self.state, "team", "alice", path).unwrap()
+    }
+
+    async fn domain_id(&self, store: &dyn Store) -> crystalline_index::DomainId {
+        store
+            .upsert_domain(
+                "team",
+                Some(&self.root.join("team").to_string_lossy()),
+                DomainKind::File,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A draft from before the record existed: a row and its mirror, no record.
+    async fn old_draft(&self, path: &str, text: &str) {
+        let mut record = EngramRecord::from_engram(
+            &parse_engram(text).unwrap(),
+            path,
+            FileStamp {
+                mtime: 0,
+                size: text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        );
+        record.content = text.to_string();
+        let store = self.store.lock().await;
+        let id = self.domain_id(&*store).await;
+        store.upsert_overlay(id, "alice", &record).await.unwrap();
+        overlay_journal::journal_write(&self.state, "team", "alice", path, text).unwrap();
+    }
+
+    /// The exact paths alice holds a row at, with whether each is a tombstone.
+    async fn rows(&self) -> Vec<(String, bool)> {
+        let store = self.store.lock().await;
+        let id = self.domain_id(&*store).await;
+        let mut rows: Vec<(String, bool)> = store
+            .overlay_entries(id, "alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path, entry.tombstone))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Alice's first draft of the team's plan.
+    async fn draft_plan(&self) {
+        let mut over = write_params("Plan", "her body");
+        over.overwrite = true;
+        self.engine
+            .write_engram_as(&over, None, &alice())
+            .await
+            .unwrap();
+    }
+
+    async fn delete(&self, identifier: &str) {
+        self.engine
+            .delete_engram_as(
+                &DeleteParams {
+                    identifier: identifier.to_string(),
+                    domain: "team".to_string(),
+                    expected_checksum: None,
+                },
+                None,
+                &alice(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn moved(&self, identifier: &str, destination: &str) {
+        self.engine
+            .move_engram(&draft_move(identifier, destination), &alice())
+            .await
+            .unwrap();
+    }
+
+    async fn reads(&self, identifier: &str) -> String {
+        self.engine
+            .read_engram(&read(identifier), &alice())
+            .await
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Stand a folder where the record of `path` has to go, so writing it fails
+    /// however often it is tried. Portable, as a mode bit is not.
+    fn block_the_record(&self, path: &str) -> PathBuf {
+        let file = draft_start::record_file(&self.state, "team", "alice", path).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        file
+    }
+
+    /// The team moves the plan to `to` in one commit, and this machine pulls.
+    async fn team_renames_plan_and_pull(&self, to: &str) {
+        let mock = self.mock.as_ref().unwrap();
+        let commit = mock.add_commit(BTreeMap::from([
+            ("MANIFEST.md".to_string(), MANIFEST.as_bytes().to_vec()),
+            (to.to_string(), PLAN.as_bytes().to_vec()),
+        ]));
+        mock.set_branch("main", &commit);
+        self.engine
+            .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+}
+
+fn write_params(title: &str, content: &str) -> WriteParams {
+    WriteParams {
+        path: None,
+        base64: None,
+        domain: "team".to_string(),
+        title: title.to_string(),
+        content: Some(content.to_string()),
+        folder: None,
+        engram_type: None,
+        tags: vec!["team".to_string()],
+        status: None,
+        metadata: None,
+        overwrite: false,
+        share_link: None,
+        model: None,
+        expected_checksum: None,
+    }
+}
+
+fn read(identifier: &str) -> ReadParams {
+    ReadParams {
+        identifier: identifier.to_string(),
+        domain: Some("team".to_string()),
+        share_link: None,
+        include_images: None,
+    }
+}
+
+fn draft_move(identifier: &str, destination: &str) -> MoveParams {
+    MoveParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        destination: destination.to_string(),
+        destination_domain: None,
+        permalink: None,
+        update_links: None,
+    }
+}
+
+fn edit_append(identifier: &str, line: &str) -> EditParams {
+    EditParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        operation: "append".to_string(),
+        content: Some(line.to_string()),
+        key: None,
+        value: None,
+        values: None,
+        find_text: None,
+        expected_replacements: None,
+        section: None,
+        include_subsections: false,
+        expected_checksum: None,
+        ack_scope: None,
+        share_link: None,
+        model: None,
+    }
+}
+
+/// Whether `dir`'s filesystem folds letter case.
+fn folds_case(dir: &Path) -> bool {
+    let probe = dir.join("Probe");
+    std::fs::create_dir(&probe).unwrap();
+    let folds = dir.join("probe").exists();
+    std::fs::remove_dir(&probe).unwrap();
+    folds
+}
+
+/// The record a path has when it stands where it started, on the team's text.
+fn in_step(path: &str, text: &str) -> DraftStart {
+    DraftStart {
+        path: path.to_string(),
+        from: Some(path.to_string()),
+        start: Some(text.to_string()),
+        shared: None,
+        merged_at: None,
+    }
+}
+
+#[tokio::test]
+async fn a_new_draft_records_the_teams_text_and_a_second_write_does_not_move_it() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+
+    // The team moves on, and she writes again: where the draft started did not
+    // change, and reading it from the snapshot again would hide bob's change.
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    let mut again = write_params("Plan", "her second body");
+    again.overwrite = true;
+    f.engine
+        .write_engram_as(&again, None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+/// The team's text is read from the snapshot and not the folder, as LF.
+#[tokio::test]
+async fn a_new_draft_records_the_snapshot_as_lf_and_not_the_folder() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.team_has("plan.md", PLAN_LATER.replace('\n', "\r\n").as_bytes());
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN_LATER)));
+}
+
+#[tokio::test]
+async fn a_new_file_records_no_start() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.start("fresh.md"),
+        Some(DraftStart {
+            path: "fresh.md".to_string(),
+            from: None,
+            start: None,
+            shared: None,
+            merged_at: None,
+        }),
+        "a record that says new, which no record at all could not"
+    );
+}
+
+/// `read_base_file("Note.md")` answers with `note.md`'s bytes on a disk that
+/// folds case, so only asking for a real key gives one answer on both disks.
+#[tokio::test]
+async fn a_new_spelling_of_a_team_file_is_a_new_file_on_either_disk() {
+    let f = fixture(&[("note.md", NOTE)]).await;
+    eprintln!(
+        "the temp folder folds case: {}",
+        folds_case(f.root.as_path())
+    );
+    f.engine
+        .restore_engram(
+            "team",
+            "Note.md",
+            &own_text("another-address", "another file"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    let record = f.start("Note.md").unwrap();
+    assert_eq!(record.from, None);
+    assert_eq!(record.start, None);
+}
+
+#[tokio::test]
+async fn a_delete_records_the_teams_text_even_after_a_draft_of_it() {
+    // With no draft of it.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.delete("plan").await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+
+    // After a draft of it, with the team moved on since: the deletion stands on
+    // what the draft started from, not on what the team says today.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    f.delete("plan").await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+/// A file in the folder the snapshot does not hold, which nobody has shared: its
+/// deletion still names its own path, and says the team has no text there. A move
+/// of it carries that, so the draft knows where it came from.
+#[tokio::test]
+async fn a_tombstone_names_its_own_path_when_the_snapshot_does_not_hold_it() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    std::fs::write(
+        f.root.join("team/stray.md"),
+        own_text("stray", "not shared"),
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    let held_here = |path: &str, from: &str| DraftStart {
+        path: path.to_string(),
+        from: Some(from.to_string()),
+        start: None,
+        shared: None,
+        merged_at: None,
+    };
+
+    f.delete("stray").await;
+    assert_eq!(f.start("stray.md"), Some(held_here("stray.md", "stray.md")));
+
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    std::fs::write(
+        f.root.join("team/stray.md"),
+        own_text("stray", "not shared"),
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.moved("stray", "kept.md").await;
+    assert_eq!(f.start("stray.md"), Some(held_here("stray.md", "stray.md")));
+    assert_eq!(f.start("kept.md"), Some(held_here("kept.md", "stray.md")));
+}
+
+/// Recording today's text over an old draft's deletion would make a stale
+/// delete read as in step.
+#[tokio::test]
+async fn a_delete_of_an_old_draft_writes_no_record() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("plan.md", &PLAN.replace("as the team", "as alice"))
+        .await;
+    f.delete("plan").await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// A draft of a path no file holds ends with its delete, and so does its record.
+#[tokio::test]
+async fn a_delete_of_her_own_new_file_takes_the_record() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    assert!(f.start("fresh.md").is_some());
+    f.delete("fresh").await;
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("fresh.md"), None);
+}
+
+#[tokio::test]
+async fn a_move_carries_the_start_at_any_permalink() {
+    // (source, its address, its text, the destination, a new named permalink)
+    let shapes: [(&str, &str, &str, &str, Option<&str>); 3] = [
+        ("plan.md", "plan", PLAN, "renamed.md", None),
+        ("plan.md", "plan", PLAN, "renamed.md", Some("a-new-address")),
+        ("loose.md", "loose", LOOSE, "elsewhere/tidy.md", None),
+    ];
+    for (src, address, team_text, dest, permalink) in shapes {
+        for with_a_draft in [false, true] {
+            let f = fixture(&[(src, team_text)]).await;
+            if with_a_draft {
+                f.engine
+                    .edit_engram_as(&edit_append(address, "- [fact] hers #team"), None, &alice())
+                    .await
+                    .unwrap();
+            }
+            let mut asked = draft_move(address, dest);
+            asked.permalink = permalink.map(str::to_string);
+            f.engine.move_engram(&asked, &alice()).await.unwrap();
+
+            let at_dest = f.start(dest).expect("the draft carries a record");
+            assert_eq!(at_dest.path, dest, "{dest}, draft {with_a_draft}");
+            assert_eq!(
+                at_dest.from.as_deref(),
+                Some(src),
+                "{dest}, draft {with_a_draft}"
+            );
+            assert_eq!(
+                at_dest.start.as_deref(),
+                Some(team_text),
+                "{dest}, draft {with_a_draft}"
+            );
+            let tombstone = f.start(src).expect("the tombstone carries its own");
+            assert_eq!(tombstone, in_step(src, team_text), "draft {with_a_draft}");
+        }
+    }
+}
+
+/// The team moved on before she moved: the draft she moved is still based on
+/// what it started from, and a fresh look at the snapshot would hide bob's edit.
+#[tokio::test]
+async fn a_move_of_a_draft_keeps_the_start_it_had_and_not_todays_text() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    f.moved("plan", "renamed.md").await;
+    assert_eq!(f.start("renamed.md").unwrap().start.as_deref(), Some(PLAN));
+    assert_eq!(f.start("plan.md").unwrap().start.as_deref(), Some(PLAN));
+}
+
+/// A new file stays a new file wherever it goes: its `from` is not its old path,
+/// which never was a team path, and no tombstone is left behind.
+#[tokio::test]
+async fn a_move_of_her_own_new_file_stays_new() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    f.moved("fresh", "later.md").await;
+    assert_eq!(f.rows().await, vec![("later.md".to_string(), false)]);
+    assert_eq!(f.start("fresh.md"), None);
+    let record = f.start("later.md").unwrap();
+    assert_eq!(record.from, None);
+    assert_eq!(record.start, None);
+}
+
+/// The permalink-only rename: one write at the path it has.
+#[tokio::test]
+async fn a_permalink_only_move_starts_or_keeps_the_record_at_its_own_path() {
+    // First touch of the team's file.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    let mut asked = draft_move("plan", "plan.md");
+    asked.permalink = Some("a-new-address".to_string());
+    f.engine.move_engram(&asked, &alice()).await.unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+
+    // Over a draft, with the team moved on: left alone.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    let mut asked = draft_move("plan", "plan.md");
+    asked.permalink = Some("a-new-address".to_string());
+    f.engine.move_engram(&asked, &alice()).await.unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+#[tokio::test]
+async fn a_second_move_hands_the_record_on_and_leaves_none_behind() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.moved("plan", "first.md").await;
+    f.moved("plan", "second.md").await;
+
+    assert_eq!(
+        f.start("first.md"),
+        None,
+        "nothing stays at the middle path"
+    );
+    let record = f.start("second.md").unwrap();
+    assert_eq!(record.path, "second.md");
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(PLAN));
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+/// A move back is reachable only for another spelling of the file: onto a path a
+/// different team file stands at, `refuse_taken_draft_destination` refuses it.
+#[tokio::test]
+async fn a_move_back_keeps_the_start() {
+    let f = fixture(&[("note.md", NOTE)]).await;
+    f.moved("note", "Note.md").await;
+    f.moved("note", "note.md").await;
+
+    assert_eq!(f.rows().await, vec![("note.md".to_string(), false)]);
+    assert_eq!(f.start("note.md"), Some(in_step("note.md", NOTE)));
+    assert_eq!(f.start("Note.md"), None, "nothing stays at the other end");
+}
+
+/// The other move back is refused as it was, and costs no record.
+#[tokio::test]
+async fn a_refused_move_back_to_a_team_path_changes_no_record() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.moved("plan", "renamed.md").await;
+    let before = (f.start("plan.md"), f.start("renamed.md"));
+    f.engine
+        .move_engram(&draft_move("plan", "plan.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!((f.start("plan.md"), f.start("renamed.md")), before);
+}
+
+#[tokio::test]
+async fn a_case_move_keeps_two_records_on_either_disk() {
+    let f = fixture(&[("note.md", NOTE)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.moved("note", "Note.md").await;
+
+    assert_eq!(f.start("note.md"), Some(in_step("note.md", NOTE)));
+    let draft = f.start("Note.md").unwrap();
+    assert_eq!(draft.path, "Note.md");
+    assert_eq!(draft.from.as_deref(), Some("note.md"));
+    assert_eq!(draft.start.as_deref(), Some(NOTE));
+}
+
+#[tokio::test]
+async fn a_move_of_an_old_draft_writes_no_record() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("plan.md", &PLAN.replace("as the team", "as alice"))
+        .await;
+    // A record left at the destination by an earlier failure is not hers to
+    // inherit: it would read a draft of unknown start as known.
+    draft_start::save(
+        &f.state,
+        "team",
+        "alice",
+        &in_step("renamed.md", "a text nobody started from\n"),
+    )
+    .unwrap();
+
+    f.moved("plan", "renamed.md").await;
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("plan.md".to_string(), true),
+            ("renamed.md".to_string(), false)
+        ]
+    );
+    assert_eq!(f.start("renamed.md"), None);
+    assert_eq!(f.start("plan.md"), None, "the tombstone half is as unknown");
+}
+
+/// A record whose row went away is nobody's. It is written over, never read.
+#[tokio::test]
+async fn a_new_row_does_not_inherit_a_record_left_behind() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    let left = in_step("plan.md", "a text nobody started from\n");
+    draft_start::save(&f.state, "team", "alice", &left).unwrap();
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+
+    draft_start::save(&f.state, "team", "alice", &left).unwrap();
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    draft_start::save(&f.state, "team", "alice", &left).unwrap();
+    f.delete("plan").await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+#[tokio::test]
+async fn the_record_survives_a_rebuild() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.moved("plan", "renamed.md").await;
+    let before = (f.start("plan.md").unwrap(), f.start("renamed.md").unwrap());
+    let config_path = f.root.join("config.yaml");
+    let config: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let rebuilt = Arc::new(
+        Engine::new(store, config, None, Some(config_path))
+            .with_state_dir(f.state.clone())
+            .with_origins_dir(f.origins.clone()),
+    );
+    rebuilt.sync(None).await.unwrap();
+
+    let back = rebuilt
+        .read_engram(&read("plan"), &alice())
+        .await
+        .expect("the row came back from the journal");
+    assert_eq!(back["path"], "renamed.md", "{back}");
+    assert_eq!(
+        (f.start("plan.md").unwrap(), f.start("renamed.md").unwrap()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_discard_takes_the_record() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    assert!(f.start("plan.md").is_some());
+    f.engine
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: None,
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// Taking the team's side ends the draft through the same drop.
+#[tokio::test]
+async fn a_resolve_for_theirs_takes_the_record_and_a_merged_one_keeps_it() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    f.engine
+        .origin_resolve(
+            "team",
+            "plan.md",
+            None,
+            Some(PLAN.replace("as the team", "merged").as_bytes()),
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.start("plan.md"),
+        Some(in_step("plan.md", PLAN)),
+        "moving the start is Task 9's, not this writer's"
+    );
+
+    f.engine
+        .origin_resolve(
+            "team",
+            "plan.md",
+            Some("theirs"),
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// Leaving review ends every draft through the same drop.
+#[tokio::test]
+async fn a_fold_takes_the_records() {
+    let f = fixture(&[("plan.md", PLAN), ("note.md", NOTE)]).await;
+    f.draft_plan().await;
+    f.delete("note").await;
+    assert!(f.start("plan.md").is_some() && f.start("note.md").is_some());
+    f.engine
+        .set_review_mode(
+            "team",
+            None,
+            ReviewModeConfirm::Confirmed {
+                folds: [("alice".to_string(), FoldChoice::Fold)]
+                    .into_iter()
+                    .collect(),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), None);
+    assert_eq!(f.start("note.md"), None);
+}
+
+/// Every verb that writes a row, on its first write of a team's file: each lands
+/// the record, and none of them does it by a way of its own.
+#[tokio::test]
+async fn every_writer_of_a_new_draft_keeps_the_record() {
+    let checksum = |text: &str| crate::support::sha256_hex(text.as_bytes());
+
+    // MCP and REST `write_engram`.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "write");
+
+    // MCP and REST `edit_engram`, and a room's source edit.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .edit_engram_as(&edit_append("plan", "- [fact] hers #team"), None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "edit");
+
+    // Fluid's save, and through `save_into_overlay` a room's save.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .save_engram(
+            &SaveParams {
+                domain: "team".to_string(),
+                identifier: "plan".to_string(),
+                content: PLAN.replace("as the team", "saved by alice"),
+                expected_checksum: checksum(PLAN),
+            },
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)), "save");
+
+    // A restore of an earlier version, a room's undo of its own save among them.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .restore_engram(
+            "team",
+            "plan.md",
+            &PLAN.replace("as the team", "restored"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.start("plan.md"),
+        Some(in_step("plan.md", PLAN)),
+        "restore"
+    );
+
+    // A split: the source is a first edit, the new engram is a new file.
+    let f = fixture(&[("rich.md", RICH)]).await;
+    let source = f.engine.read_engram(&read("rich"), &alice()).await.unwrap();
+    let lines: Vec<usize> = source["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["line"].as_u64().unwrap() as usize)
+        .take(1)
+        .collect();
+    f.engine
+        .split_engram_as(
+            &SplitParams {
+                domain: "team".to_string(),
+                identifier: "rich".to_string(),
+                title: "The Split Out Part".to_string(),
+                folder: None,
+                observations: lines,
+                sections: Vec::new(),
+                expected_checksum: Some(source["checksum"].as_str().unwrap().to_string()),
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.start("rich.md"), Some(in_step("rich.md", RICH)), "split");
+    let split = f.start("the-split-out-part.md").expect("split out");
+    assert_eq!((split.from, split.start), (None, None));
+}
+
+/// Nothing is known about a domain with no base snapshot, so no record claims
+/// anything: `from: None` would say "a new file" about a file the folder holds.
+#[tokio::test]
+async fn a_domain_with_no_snapshot_records_nothing() {
+    let f = fixture_with_no_snapshot(&[("plan.md", PLAN), ("note.md", NOTE)]).await;
+    f.draft_plan().await;
+    assert_eq!(f.start("plan.md"), None);
+    f.moved("note", "moved.md").await;
+    assert_eq!(f.start("moved.md"), None);
+    assert_eq!(f.start("note.md"), None);
+    f.delete("plan").await;
+    assert_eq!(f.start("plan.md"), None);
+    assert!(f.reads("note").await.contains("team body"));
+}
+
+/// A key with no readable copy cannot say what the team has. The write lands
+/// with no record, which reads as "we cannot tell". Recording `start: None` would
+/// read a file the team has as a new file, and a record left there is not hers.
+#[tokio::test]
+async fn a_key_with_no_readable_copy_writes_no_record_and_the_row_lands() {
+    let left = in_step("plan.md", "a text nobody started from\n");
+    for no_copy in [true, false] {
+        let damaged = async || {
+            let f = fixture(&[("plan.md", PLAN)]).await;
+            if no_copy {
+                remove_base_file(&f.snapshot_dir(), "plan.md").unwrap();
+            } else {
+                write_base_file(&f.snapshot_dir(), "plan.md", b"\xff\xfe not text").unwrap();
+            }
+            draft_start::save(&f.state, "team", "alice", &left).unwrap();
+            f
+        };
+
+        let f = damaged().await;
+        f.draft_plan().await;
+        assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+        assert_eq!(f.start("plan.md"), None, "no copy: {no_copy}");
+
+        let f = damaged().await;
+        f.delete("plan").await;
+        assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+        assert_eq!(f.start("plan.md"), None, "no copy: {no_copy}");
+    }
+}
+
+/// A state file that does not parse is an error, as it is to a pull and a share,
+/// so nothing can be told from it and the write refuses, row and all.
+#[tokio::test]
+async fn a_state_file_that_does_not_parse_refuses_a_new_draft_and_leaves_nothing() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    std::fs::write(f.snapshot_dir().join("state.json"), b"{ not json").unwrap();
+    let mut over = write_params("Plan", "her body");
+    over.overwrite = true;
+    f.engine
+        .write_engram_as(&over, None, &alice())
+        .await
+        .unwrap_err();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// C1: a broken record is an error and never a missing one. The move refuses
+/// while nothing has changed, so no destination can read as an old draft.
+#[tokio::test]
+async fn a_move_of_a_draft_with_a_broken_record_refuses_and_changes_nothing() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
+    std::fs::write(&file, b"{ not json").unwrap();
+
+    f.engine
+        .move_engram(&draft_move("plan", "renamed.md"), &alice())
+        .await
+        .unwrap_err();
+
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert!(f.reads("plan").await.contains("her body"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
+    assert_eq!(f.start("renamed.md"), None);
+}
+
+/// The row after the record failed: the row's address is taken by the column a
+/// tombstone holds its path in, so the store refuses what the check let through.
+/// The record saved for a row that never landed goes with it.
+#[tokio::test]
+async fn a_failed_row_write_leaves_no_record_behind() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.delete("plan").await;
+    f.engine
+        .restore_engram(
+            "team",
+            "other.md",
+            &own_text("plan.md", "an address a tombstone's row holds"),
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(f.start("other.md"), None);
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
+}
+
+/// The same for a deletion: her draft elsewhere holds the column the tombstone's
+/// row needs, so the store refuses it, and the record it saved goes with it.
+#[tokio::test]
+async fn a_failed_tombstone_row_leaves_no_record_behind() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .restore_engram(
+            "team",
+            "other.md",
+            &own_text("plan.md", "an address that is the plan's path"),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("other.md".to_string(), false)]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// A destination that cannot be written, in each shape a source can have: the
+/// source goes back to exactly what it held, the record included.
+#[tokio::test]
+async fn a_failed_move_destination_restores_the_source_record() {
+    let edited = PLAN.replace("as the team", "as alice");
+
+    // Her draft of a team file: the tombstone kept the record, and it stays.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    let before = f.start("plan.md").unwrap();
+    f.block_the_record("renamed.md");
+    f.engine
+        .move_engram(&draft_move("plan", "renamed.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert!(f.reads("plan").await.contains("her body"));
+    assert_eq!(f.start("plan.md"), Some(before), "her draft's start");
+
+    // Her own new file: its row and its record were dropped, and both come back
+    // as they were, even though the team has since added a file at that path.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.engine
+        .write_engram_as(&write_params("Fresh", "only hers"), None, &alice())
+        .await
+        .unwrap();
+    let before = f.start("fresh.md").unwrap();
+    f.team_has("fresh.md", PLAN_LATER.as_bytes());
+    f.block_the_record("later.md");
+    f.engine
+        .move_engram(&draft_move("fresh", "later.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("fresh.md".to_string(), false)]);
+    assert_eq!(f.start("fresh.md"), Some(before), "still a new file");
+
+    // An old draft of a file only she has: back with no record, not a fresh one.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("fresh.md", &own_text("fresh", "only hers"))
+        .await;
+    f.block_the_record("later.md");
+    f.engine
+        .move_engram(&draft_move("fresh", "later.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("fresh.md".to_string(), false)]);
+    assert_eq!(f.start("fresh.md"), None, "still unknown");
+
+    // An old draft of a team file: the same, over the tombstone.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("plan.md", &edited).await;
+    f.block_the_record("renamed.md");
+    f.engine
+        .move_engram(&draft_move("plan", "renamed.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.start("plan.md"), None, "still unknown");
+
+    // The team's file with no draft: nothing of hers stands at all afterwards,
+    // and so no record either.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.block_the_record("renamed.md");
+    f.engine
+        .move_engram(&draft_move("plan", "renamed.md"), &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None, "the base shows through again");
+}
+
+#[tokio::test]
+async fn a_failed_follow_of_a_team_rename_restores_the_source_record() {
+    // Her draft, with a record.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    let before = f.start("plan.md").unwrap();
+    f.block_the_record("plan-v2.md");
+    f.team_renames_plan_and_pull("plan-v2.md").await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.start("plan.md"), Some(before));
+
+    // An old draft: the snapshot no longer holds the path, and it comes back
+    // with no record rather than one calling it a new file.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("plan.md", &PLAN.replace("as the team", "as alice"))
+        .await;
+    f.block_the_record("plan-v2.md");
+    f.team_renames_plan_and_pull("plan-v2.md").await;
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// C1 on the pass's side: a broken record stops the follow before anything is
+/// dropped, so the draft stands where it was and never reads as an old draft.
+#[tokio::test]
+async fn a_follow_of_a_draft_with_a_broken_record_leaves_it_where_it_was() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
+    std::fs::write(&file, b"{ not json").unwrap();
+
+    f.team_renames_plan_and_pull("plan-v2.md").await;
+
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ not json");
+    assert_eq!(f.start("plan-v2.md"), None);
+}
+
+/// The team moved the file, so the draft's team path moved with it, and what it
+/// started from did not: a colleague's edit in the same pull is still a change.
+#[tokio::test]
+async fn a_followed_team_rename_points_the_record_at_the_new_path() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.draft_plan().await;
+    f.team_renames_plan_and_pull("plan-v2.md").await;
+
+    assert_eq!(f.rows().await, vec![("plan-v2.md".to_string(), false)]);
+    assert_eq!(f.start("plan.md"), None);
+    assert_eq!(
+        f.start("plan-v2.md"),
+        Some(DraftStart {
+            path: "plan-v2.md".to_string(),
+            from: Some("plan-v2.md".to_string()),
+            start: Some(PLAN.to_string()),
+            shared: None,
+            merged_at: None,
+        })
+    );
+
+    // An old draft follows and stays unknown.
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft("plan.md", &PLAN.replace("as the team", "as alice"))
+        .await;
+    f.team_renames_plan_and_pull("plan-v2.md").await;
+    assert_eq!(f.rows().await, vec![("plan-v2.md".to_string(), false)]);
+    assert_eq!(f.start("plan-v2.md"), None);
+}

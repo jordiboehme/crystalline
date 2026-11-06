@@ -5937,6 +5937,12 @@ impl Engine {
     ///
     /// Answers `Some(warning)` for a mirror that failed after the row landed,
     /// for the reason [`Engine::write_overlay_entry`] gives at length.
+    ///
+    /// **A held row keeps its record, or keeps having none.** The deletion stands
+    /// on what the draft it replaces started from, and an old draft's deletion
+    /// stays unknown: today's team text would make a stale delete read as in step.
+    /// With no row held the record is new, and it goes down before the row, as in
+    /// [`DomainView::put`].
     pub(crate) async fn write_overlay_tombstone(
         &self,
         domain: &str,
@@ -5975,8 +5981,41 @@ impl Engine {
             actor: String::new(),
             tombstone: true,
         };
-        self.commit_overlay_row(desc.domain_id, actor, &record)
-            .await?;
+        let held = {
+            let store = self.store.lock().await;
+            store
+                .overlay_entry(desc.domain_id, actor, &desc.path)
+                .await?
+                .is_some()
+        };
+        if !held {
+            let start = self.fresh_tombstone_start(domain, &desc.path)?;
+            let saved = match &start {
+                Some(start) => crate::draft_start::save(&state_dir, domain, actor, start),
+                None => crate::draft_start::clear(&state_dir, domain, actor, &desc.path),
+            };
+            saved.map_err(|source| EngineError::Io {
+                path: format!("the draft start record of '{}'", desc.path),
+                source,
+            })?;
+        }
+        if let Err(e) = self
+            .commit_overlay_row(desc.domain_id, actor, &record)
+            .await
+        {
+            // No row was held, so what stands is the record just written.
+            if !held
+                && let Err(left) = crate::draft_start::clear(&state_dir, domain, actor, &desc.path)
+            {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = desc.path.as_str(),
+                    "a deletion failed and the record of where it started stays behind: {left}"
+                );
+            }
+            return Err(e);
+        }
         self.announce(Change::Engram(EngramChanged {
             domain: domain.to_string(),
             permalink: desc.permalink.clone(),
@@ -6006,6 +6045,83 @@ impl Engine {
             tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
         }
         Ok(warning)
+    }
+
+    /// The team's text at `path` for a new record: `Some(None)` when the snapshot
+    /// does not hold the path, else the text as LF. `None` when nothing can be
+    /// said, which is a domain with no base snapshot, or a key whose copy is
+    /// missing or is not text. The caller then writes no record, which reads as
+    /// "we cannot tell", where calling either of them absent would record a file
+    /// the team has as a new file. A state file that does not parse is an error.
+    ///
+    /// **The path has to be a key of [`OriginState::files`]**, since on a disk that
+    /// folds case [`read_base_file`] answers `Note.md` with `note.md`'s bytes. Asking
+    /// only for a real key gives one answer on both disks.
+    ///
+    /// [`OriginState::files`]: crystalline_remote::state::OriginState::files
+    /// [`read_base_file`]: crystalline_remote::state::read_base_file
+    fn team_text_for_a_start(&self, domain: &str, path: &str) -> Result<Option<Option<String>>> {
+        let dir = self.origin_state_dir(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&dir)? else {
+            return Ok(None);
+        };
+        if !state.files.contains_key(path) {
+            return Ok(Some(None));
+        }
+        let Some(bytes) = crystalline_remote::state::read_base_file(&dir, path)? else {
+            tracing::warn!(
+                domain,
+                path,
+                "the base snapshot has no copy of this file, so a draft of it has no known start"
+            );
+            return Ok(None);
+        };
+        match crystalline_core::utf8_to_lf(&bytes) {
+            Ok(text) => Ok(Some(Some(text))),
+            Err(_) => {
+                tracing::warn!(
+                    domain,
+                    path,
+                    "the base snapshot's copy of this file is not text, so a draft of it has no \
+                     known start"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The record of a new row at `path`: the team's text there, or a new file if
+    /// the team has none. `None` where the snapshot cannot say, and no record is
+    /// the honest answer, since `from: None` would call a file the team has a new
+    /// one.
+    pub(crate) fn fresh_start(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        Ok(self
+            .team_text_for_a_start(domain, path)?
+            .map(|text| crate::draft_start::DraftStart {
+                path: path.to_string(),
+                from: text.is_some().then(|| path.to_string()),
+                start: text,
+                shared: None,
+                merged_at: None,
+            }))
+    }
+
+    /// The record of a new tombstone at `path`, whose `from` is always its path.
+    fn fresh_tombstone_start(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        Ok(self
+            .fresh_start(domain, path)?
+            .map(|start| crate::draft_start::DraftStart {
+                from: Some(path.to_string()),
+                ..start
+            }))
     }
 
     /// Whether this actor's deletion at `path` stands beside a draft of theirs at
@@ -6479,6 +6595,7 @@ impl Engine {
         let landed = crystalline_remote::state::read_base_file(state_dir, dest)?
             .is_some_and(|base| base == entry.content.as_bytes());
         let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        let source_start = view.start_of(&entry.path)?;
         // The removal defers the ending of this draft's share-links and joins,
         // because a move that could not write its destination puts the source
         // back and did not happen - and a move that did not happen must not
@@ -6493,7 +6610,17 @@ impl Engine {
             self.end_draft_grants(domain, actor, &entry.path).await;
             return Ok(true);
         }
-        match view.write(domain_id, dest, &entry.content).await {
+        let followed = source_start.clone().map(|start| {
+            let from = match start.from {
+                Some(from) if from == entry.path => Some(dest.to_string()),
+                from => from,
+            };
+            crate::draft_start::DraftStart { from, ..start }
+        });
+        match view
+            .write_moved(domain_id, dest, &entry.content, followed)
+            .await
+        {
             Ok(None) => {}
             // The row landed and its mirror did not. Logged rather than
             // swallowed: the index serves the row either way, and it is the
@@ -6501,7 +6628,12 @@ impl Engine {
             Ok(Some(warning)) => tracing::warn!(domain, actor, path = dest, "{warning}"),
             Err(e) => {
                 if let Err(undo) = view
-                    .write_unchecked(domain_id, &entry.path, &entry.content)
+                    .write_unchecked(
+                        domain_id,
+                        &entry.path,
+                        &entry.content,
+                        source_start.as_ref(),
+                    )
                     .await
                 {
                     tracing::error!(

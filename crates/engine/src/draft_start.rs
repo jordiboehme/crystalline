@@ -85,8 +85,10 @@ fn starts_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf
 
 /// The file the record of `path` stands in, the bytes of the path hashed as they
 /// are: no case folding and no Unicode normalizing, since each spelling is a row
-/// of its own.
-fn record_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<PathBuf> {
+/// of its own. Public for a test that has to stand something in the record's
+/// way; nothing else outside this module should know where a record lives.
+#[doc(hidden)]
+pub fn record_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<PathBuf> {
     entry_path(state_dir, domain, actor, path)?;
     let name = format!("{}{RECORD_SUFFIX}", sha256_hex(path.as_bytes()));
     Ok(starts_dir(state_dir, domain, actor)?.join(name))
@@ -100,12 +102,21 @@ fn broken(file: &Path, why: impl std::fmt::Display) -> io::Error {
     )
 }
 
+/// Whether a failed call says the file is not there: nothing at the name, or a
+/// file standing where one of its folders would be, which holds no record either.
+fn no_such_file(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 /// Read one record file. Only a file that is not there answers `None`; a file
 /// that is not a record is [`io::ErrorKind::InvalidData`].
 fn read_record(file: &Path) -> io::Result<Option<DraftStart>> {
     let bytes = match std::fs::read(file) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if no_such_file(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
     serde_json::from_slice(&bytes)
@@ -167,7 +178,10 @@ pub fn save(state_dir: &Path, domain: &str, actor: &str, start: &DraftStart) -> 
 /// the name is a lowercase hash, so no other spelling of it is another record.
 pub fn clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<()> {
     let file = record_file(state_dir, domain, actor, path)?;
-    remove_if_present(&file)?;
+    match remove_if_present(&file) {
+        Err(e) if !no_such_file(&e) => return Err(e),
+        _ => {}
+    }
     let stop = actor_dir(state_dir, domain, actor)?;
     prune_empty(file.parent(), &stop);
     Ok(())
@@ -446,6 +460,21 @@ mod tests {
 
         save(state, "team", "alice", &record("other.md", "text\n")).unwrap();
         assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
+    }
+
+    /// A journal folder broken by a file in its place holds no record, so an
+    /// ordinary write with no record to keep is not refused for it. A save has
+    /// something to lose, and says so.
+    #[test]
+    fn a_file_where_a_folder_belongs_holds_no_record() {
+        let tmp = dir();
+        let state = tmp.path();
+        std::fs::create_dir_all(state.join("overlays")).unwrap();
+        std::fs::write(state.join("overlays").join("team"), b"not a folder").unwrap();
+
+        assert_eq!(load(state, "team", "alice", "note.md").unwrap(), None);
+        clear(state, "team", "alice", "note.md").unwrap();
+        save(state, "team", "alice", &record("note.md", "text\n")).unwrap_err();
     }
 
     #[test]
