@@ -190,6 +190,8 @@ export interface DirectiveLine {
  */
 export interface Subgraph {
   id: string;
+  /** The title as written, quotes included; null when the line gives only an id. */
+  title: string | null;
   openLine: number;
   endLine: number;
   parent: string | null;

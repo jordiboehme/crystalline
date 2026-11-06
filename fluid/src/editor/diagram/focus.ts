@@ -17,7 +17,7 @@
 
 import { forceParsing, syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
-import { EditorState, Prec } from "@codemirror/state";
+import { EditorState, Prec, StateEffect } from "@codemirror/state";
 import type { Command, ViewUpdate } from "@codemirror/view";
 import {
   EditorView,
@@ -26,12 +26,18 @@ import {
   runScopeHandlers,
 } from "@codemirror/view";
 
+import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
 import { flowKind, removeFence, runDiagramOp } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
 import { fenceAt } from "./fence";
-import { diagramField, fenceIsBehind, verdictArrived } from "./field";
+import {
+  diagramField,
+  fenceIsBehind,
+  showFenceSource,
+  verdictArrived,
+} from "./field";
 import {
   decorateFlow,
   flowElementOf,
@@ -224,9 +230,17 @@ export function focusTarget(
   el.focus();
 }
 
-/** The chunk's side of the hand-off from the hidden-mark keys (R13). */
+/** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
+const held = new WeakMap<EditorView, boolean>();
+
+/**
+ * The chunk's side of the hand-off from the hidden-mark keys (R13). A held key
+ * is spent here: it stops at the fence, and only a new press goes in.
+ */
 export function enterCanvas(main: EditorView, pos: number): void {
-  focusTarget(main, pos, CANVAS);
+  if (held.get(main) !== true) {
+    focusTarget(main, pos, CANVAS);
+  }
 }
 
 registerIntentReopen("focus", (main, intent, host) => {
@@ -377,13 +391,20 @@ function onKey(
     return false;
   }
   if (key === "Escape") {
-    leave(main, host, main.state.field(diagramIntent));
+    if (!event.repeat) {
+      leave(main, host, main.state.field(diagramIntent));
+    }
     return true;
   }
-  const rename = key === "Enter" || key === "F2";
+  // Space as a button takes it, or the browser scrolls the page (R87).
+  const rename = key === "Enter" || key === "F2" || key === " ";
   const remove = key === "Delete" || key === "Backspace";
   if (!menu && !rename && !remove && !WALK_KEYS.has(key)) {
     return false;
+  }
+  // Held, the walk may run on within the drawing; nothing else repeats (R81).
+  if (event.repeat && !WALK_KEYS.has(key)) {
+    return true;
   }
   if (staleNow(main, host, from)) {
     return true;
@@ -418,6 +439,15 @@ function settle(main: EditorView, host: DiagramHost): void {
   if (reading !== null && !decorated.has(reading.svg)) {
     decorated.add(reading.svg);
     decorateFlow(reading.svg, reading.svgId, reading.model, reading.verdict);
+  }
+  // Only a page that takes writes has a menu to offer (R87).
+  if (reading !== null) {
+    for (const el of reading.svg.querySelectorAll('[role="button"]')) {
+      el.toggleAttribute("aria-haspopup", false);
+      if (host.writable()) {
+        el.setAttribute("aria-haspopup", "menu");
+      }
+    }
   }
   const intent = main.state.field(diagramIntent);
   if (intent === null || hostOf(main, intent.anchor) !== host) {
@@ -487,6 +517,8 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
     readonly stop: (() => void)[];
     /** The box wearing a search hit's look. */
     lookOn: DiagramHost | null = null;
+    /** Where a refusal's sentence waits for a box off screen to arrive. */
+    owedNotice: number | null = null;
 
     readonly mousedown = (event: Event): void => {
       // The click decides; a press alone moves neither focus nor selection.
@@ -561,7 +593,22 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
         event.preventDefault();
       }
     };
+    readonly noteKey = (event: KeyboardEvent): void => {
+      held.set(this.view, event.repeat);
+    };
+    readonly keyUp = (): void => {
+      if (held.get(this.view) === true) {
+        held.set(this.view, false);
+        this.ruleOnSelection();
+      }
+    };
     readonly focusIn = (event: Event): void => {
+      if (event.target === this.view.contentDOM) {
+        queueMicrotask(() => {
+          this.mainFocused();
+        });
+        return;
+      }
       const box = boxOf(event);
       if (box === null) {
         return;
@@ -590,6 +637,8 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
       const dom = view.contentDOM;
       dom.addEventListener("mousedown", this.mousedown);
       view.dom.addEventListener("mousedown", this.pressOutside, true);
+      view.dom.addEventListener("keydown", this.noteKey, true);
+      view.dom.addEventListener("keyup", this.keyUp, true);
       dom.addEventListener("click", this.click);
       dom.addEventListener("contextmenu", this.contextmenu);
       dom.addEventListener("keydown", this.keydown);
@@ -601,6 +650,13 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
         }),
         onBoxMounted(view, (host) => {
           settle(view, host);
+          if (
+            this.owedNotice !== null &&
+            hostOf(view, this.owedNotice) === host
+          ) {
+            this.owedNotice = null;
+            host.notice("breaksFence");
+          }
         }),
       ];
     }
@@ -674,6 +730,21 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
           this.redecorate();
         });
       }
+      if (writable(update.startState) !== writable(update.state)) {
+        queueMicrotask(() => {
+          this.redecorate();
+        });
+      }
+      for (const tr of update.transactions) {
+        for (const effect of tr.effects) {
+          if (effect.is(fenceEditRefused)) {
+            const refused = effect.value;
+            queueMicrotask(() => {
+              this.refused(refused);
+            });
+          }
+        }
+      }
       if (!update.selectionSet) {
         return;
       }
@@ -699,10 +770,71 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
         }
         if (search) {
           this.showHit(from);
-        } else if (view.hasFocus && !view.composing) {
-          focusTarget(view, from, CANVAS);
+        } else {
+          this.ruleOnSelection();
         }
       });
+    }
+
+    /** A selection in a drawn fence with main focused: the canvas takes over. */
+    ruleOnSelection(): void {
+      const { view } = this;
+      const { from, to } = view.state.selection.main;
+      if (
+        held.get(view) !== true &&
+        view.hasFocus &&
+        !view.composing &&
+        view.state
+          .facet(drawnFenceLines)
+          .some((f) => f.from <= from && to <= f.to)
+      ) {
+        focusTarget(view, from, CANVAS);
+      }
+    }
+
+    /**
+     * Main took the focus with its selection in a drawn fence: by Escape from a
+     * search, or Shift+Tab off the box. The fence shows as text, so what the next
+     * key writes can be seen (R80).
+     */
+    mainFocused(): void {
+      const { view } = this;
+      if (!view.hasFocus) {
+        return;
+      }
+      const { state } = view;
+      const { from, to } = state.selection.main;
+      const lines = state
+        .facet(drawnFenceLines)
+        .find((f) => f.from <= from && to <= f.to);
+      const fence =
+        lines &&
+        state
+          .field(diagramField)
+          .fences.find((f) => lines.from <= f.from && f.to <= lines.to);
+      if (fence) {
+        view.dispatch({ effects: showFenceSource.of(fence.from) });
+      }
+    }
+
+    /** What a person hears about an edit `fenceMarksGuard` stopped. */
+    refused({ at, handOff, say }: FenceEditRefusal): void {
+      const { view } = this;
+      if (handOff) {
+        focusTarget(view, at, CANVAS);
+      }
+      if (say) {
+        const host = hostOf(view, at);
+        if (host !== null) {
+          host.notice("breaksFence");
+        } else {
+          // Off screen, nothing shows why the command did nothing: go and say so.
+          this.owedNotice = at;
+          view.dispatch({
+            effects: EditorView.scrollIntoView(at, { y: "center" }),
+          });
+        }
+      }
     }
 
     redecorate(): void {
@@ -747,6 +879,8 @@ export const diagramFocus: Extension = ViewPlugin.fromClass(
       const dom = this.view.contentDOM;
       dom.removeEventListener("mousedown", this.mousedown);
       this.view.dom.removeEventListener("mousedown", this.pressOutside, true);
+      this.view.dom.removeEventListener("keydown", this.noteKey, true);
+      this.view.dom.removeEventListener("keyup", this.keyUp, true);
       dom.removeEventListener("click", this.click);
       dom.removeEventListener("contextmenu", this.contextmenu);
       dom.removeEventListener("keydown", this.keydown);
@@ -822,11 +956,26 @@ export const diagramEntryKeys: Extension = Prec.high(
   ]),
 );
 
+/** The guard's answer: its transaction carries this instead of the edit. */
+interface FenceEditRefusal {
+  /** A position in the fence. */
+  at: number;
+  /** The edit came from a selection inside the fence: the box takes the keyboard. */
+  handOff: boolean;
+  say: boolean;
+}
+
+const fenceEditRefused = StateEffect.define<FenceEditRefusal>();
+
 /**
  * Refuses a person's edit that would break a drawn fence's marks: a line joined
- * to one, a line moved past one (R73), text glued on by a selection that ends
- * at one. An edit inside the body or across the whole fence passes, and so do a
- * peer's edit and an undo, which carry no such event. A refusal beats a wrong edit.
+ * to one, a line moved past one (R73), a prefix or a Replace all that reaches
+ * one. Also any edit from a selection inside a drawn fence, except the search
+ * panel's Replace, which names its text: the rest would skip the op layer and
+ * its verify (R80). An edit inside the body or across the whole fence passes,
+ * and so do a peer's edit and an undo, which carry no such event. A refusal
+ * beats a wrong edit, and it says so, except for a lone key at a line's edge,
+ * which is spent like the code box's (R82).
  */
 export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
   (tr) => {
@@ -842,16 +991,42 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
     ) {
       return tr;
     }
-    const { doc } = tr.startState;
+    const { doc, selection } = tr.startState;
+    const loneKey =
+      tr.isUserEvent("move.line") ||
+      ((tr.isUserEvent("delete.backward") ||
+        tr.isUserEvent("delete.forward")) &&
+        selection.ranges.every((range) => range.empty));
     for (const fence of tr.startState.facet(drawnFenceLines)) {
       if (tr.changes.touchesRange(fence.from, fence.to) === false) {
         continue;
       }
-      const from = tr.changes.mapPos(fence.from, 1);
-      const to = tr.changes.mapPos(fence.to, -1);
-      if (from >= to) {
+      if (
+        !tr.isUserEvent("input.replace") &&
+        selection.ranges.some(
+          (range) =>
+            fence.from <= range.from &&
+            range.to <= fence.to &&
+            (range.from !== fence.from || range.to !== fence.to),
+        )
+      ) {
+        return {
+          effects: fenceEditRefused.of({
+            at: fence.to,
+            handOff: true,
+            say: false,
+          }),
+        };
+      }
+      let whole = false;
+      tr.changes.iterChanges((fromA, toA) => {
+        whole ||= fromA <= fence.from && fence.to <= toA;
+      });
+      if (whole) {
         continue;
       }
+      const from = tr.changes.mapPos(fence.from, 1);
+      const to = tr.changes.mapPos(fence.to, -1);
       const first = tr.newDoc.lineAt(from);
       const last = tr.newDoc.lineAt(to);
       if (
@@ -860,7 +1035,13 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
         first.text !== doc.lineAt(fence.from).text ||
         last.text !== doc.lineAt(fence.to).text
       ) {
-        return [];
+        return {
+          effects: fenceEditRefused.of({
+            at: fence.to,
+            handOff: false,
+            say: !loneKey,
+          }),
+        };
       }
     }
     return tr;

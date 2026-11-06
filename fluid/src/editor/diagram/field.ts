@@ -66,6 +66,13 @@ export const drawUnderCaret = StateEffect.define<number>();
  */
 export const pointerDown = StateEffect.define<boolean>();
 
+/**
+ * A fence that goes back to its source: main took the focus with its selection
+ * in it, and a person must see what their next key writes (R80). The value is
+ * the fence's `from`. R52's hold then keeps it as text until the caret leaves.
+ */
+export const showFenceSource = StateEffect.define<number>();
+
 interface DiagramFieldValue {
   fences: DrawnFence[];
   /**
@@ -251,7 +258,9 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       pointer === value.pointer &&
       !(value.held && tr.selection !== undefined) &&
       exemptNow.length === value.exempt.length &&
-      !tr.effects.some((effect) => effect.is(drawUnderCaret)) &&
+      !tr.effects.some(
+        (effect) => effect.is(drawUnderCaret) || effect.is(showFenceSource),
+      ) &&
       tr.startState.facet(EditorView.darkTheme) ===
         tr.state.facet(EditorView.darkTheme)
     ) {
@@ -263,6 +272,12 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       if (at !== null) {
         before.set(at, key);
       }
+    }
+    const shown = tr.effects.flatMap((effect) =>
+      effect.is(showFenceSource) ? [effect.value] : [],
+    );
+    for (const from of shown) {
+      before.delete(from);
     }
     const behind = [
       ...value.behind.flatMap((from) => placeAfter(tr, from) ?? []),
@@ -276,7 +291,12 @@ export const diagramField = StateField.define<DiagramFieldValue>({
       tr.state,
       before,
       (candidates) =>
-        carryFences(value.fences, tr, syntaxTree(tr.state).length, candidates),
+        carryFences(
+          value.fences,
+          tr,
+          syntaxTree(tr.state).length,
+          candidates,
+        ).filter((fence) => !shown.includes(fence.from)),
       exemptNow,
       pointer,
       behind,

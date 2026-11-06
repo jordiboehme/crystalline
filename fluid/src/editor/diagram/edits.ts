@@ -35,7 +35,8 @@ export type RefusalCode =
   | "group"
   | "chain"
   | "unsupported"
-  | "unchecked";
+  | "unchecked"
+  | "breaksFence";
 
 /**
  * What an op compiler returns: the edits (and what they create, of a type each
@@ -56,6 +57,7 @@ export const NOTICES: Record<RefusalCode, string> = {
     "This diagram uses something the editor does not know yet, so it was not changed.",
   unchecked:
     "The diagram could not be checked, so it was not changed. Try again.",
+  breaksFence: "That would break a diagram here, so nothing was changed.",
 };
 
 /**

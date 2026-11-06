@@ -101,8 +101,12 @@ export function flowElementOf(
   return null;
 }
 
-/** A box's label as it is drawn; its id when it has none. */
+/** A box's or a subgraph's label as it is drawn; its id when it has none. */
 function boxLabel(model: FlowModel, id: string): string {
+  const title = model.subgraphs.find((s) => s.id === id)?.title ?? null;
+  if (title !== null) {
+    return decodeLabel(title, title.startsWith('"')) || id;
+  }
   const shape = model.nodes.get(id)?.defining?.shape ?? null;
   if (shape === null) {
     return id;
@@ -150,6 +154,7 @@ export function decorateFlow(
     }
     el.setAttribute("tabindex", "-1");
     el.setAttribute("role", "button");
+    el.setAttribute("aria-haspopup", "menu");
     el.setAttribute("aria-label", arrowLabel(model, edge));
     const hit = document.createElementNS(SVG_NS, "path");
     hit.setAttribute("d", el.getAttribute("d") ?? "");

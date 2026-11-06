@@ -158,6 +158,7 @@ function refuse(message: string): never {
 interface OpenSubgraph {
   /** null: mermaid numbers it `subGraph<N>` when it closes. */
   named: string | null;
+  title: string | null;
   openLine: number;
   parent: OpenSubgraph | null;
   /** Ids the statements directly inside name, child subgraph ids included. */
@@ -388,6 +389,7 @@ class Parser {
   private openSubgraph(span: Span, line: ScannedLine): void {
     const rest = this.text(span).slice("subgraph".length);
     let named: string | null;
+    let title: string | null = null;
     if (rest.trim() === "") {
       // mermaid 12.2.0 throws on a subgraph line without a title.
       refuse("a subgraph line without an id or title.");
@@ -399,11 +401,13 @@ class Parser {
       const titled = /^([^\s[]+)\s*\[([^[\]]*)\]$/.exec(words);
       if (titled) {
         named = this.subgraphId(defined(titled[1]));
+        title = defined(titled[2]);
       } else if (/^"[^"]*"$/.test(words)) {
         if (!/\s/.test(words.slice(1, -1))) {
           refuse("a quoted subgraph title without a space.");
         }
         named = null;
+        title = words;
       } else if (/\s/.test(words)) {
         if (
           !/^[A-Za-z0-9_ .,:'!?-]+$/.test(words) ||
@@ -413,12 +417,14 @@ class Parser {
           refuse("a subgraph title it cannot read.");
         }
         named = null;
+        title = words;
       } else {
         named = this.subgraphId(words);
       }
     }
     const open: OpenSubgraph = {
       named,
+      title,
       openLine: line.index,
       parent: this.stack[this.stack.length - 1] ?? null,
       direct: [],
@@ -453,6 +459,7 @@ class Parser {
     }
     const subgraph: Subgraph = {
       id,
+      title: open.title,
       openLine: open.openLine,
       endLine: line.index,
       parent: null,

@@ -210,7 +210,7 @@ function focusIsElsewhere(main: EditorView): boolean {
  * Whether a block no caret can stand on opens on `line`: a fenced block of any
  * language, or a table, where the next key would go into its first row (R79 N4).
  */
-function opensBlock(state: EditorState, line: Line): boolean {
+export function opensBlock(state: EditorState, line: Line): boolean {
   let found = false;
   syntaxTree(state).iterate({
     from: line.from,

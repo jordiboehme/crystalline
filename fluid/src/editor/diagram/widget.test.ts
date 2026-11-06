@@ -23,7 +23,7 @@ import {
   setRaw,
   undoOnce,
 } from "../../test/markKit";
-import { mermaidConfig } from "../../theme/mermaid";
+import { initializeMermaid, mermaidConfig } from "../../theme/mermaid";
 import SKELETON from "../fixtures/diagrams/svg/f01-skeleton.svg?raw";
 import { diagramField, drawUnderCaret } from "./field";
 import { prefetchDiagrams } from "./loader";
@@ -942,6 +942,34 @@ describe("off screen", () => {
     expect(box(view).querySelector("svg")?.id).toBe(id);
     await flush();
     expect(kit.asked).toHaveLength(count);
+  });
+
+  it("takes no preview drawn across a theme change (R88)", async () => {
+    kit.hold.value = true;
+    const view = markView(DOC, modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(
+        (kit.asked as Asked[]).some((r) => r.id.startsWith("cm-mermaid-")),
+      ).toBe(true);
+    });
+    const preview = (kit.asked as Asked[]).find((r) =>
+      r.id.startsWith("cm-mermaid-"),
+    );
+    // Another surface asks for the other theme and back while it waits.
+    const other = { initialize: vi.fn() };
+    initializeMermaid(other, true);
+    initializeMermaid(other, false);
+    preview?.resolve(recordedAs(preview.id));
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    await vi.waitFor(() => {
+      expect(kit.waiting.has(BODY)).toBe(true);
+    });
+    await settle(BODY);
+    expect(box(view).querySelector("svg")?.id ?? "").not.toBe(preview?.id);
+    expect(renders().length).toBeGreaterThan(0);
   });
 
   it("gives a box that left and a render still running no way back in", async () => {

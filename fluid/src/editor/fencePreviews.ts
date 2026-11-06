@@ -31,7 +31,7 @@ import { Decoration, EditorView, WidgetType } from "@codemirror/view";
 
 import { statusColour } from "../markdown/directives";
 import { labelPlainWords, statusPieces } from "../markdown/statusText";
-import { initializeMermaid } from "../theme/mermaid";
+import { initializeMermaid, mermaidThemeChanges } from "../theme/mermaid";
 import { drawnDiagrams } from "./diagram/draws";
 import { mermaidFence } from "./elementVerbs";
 import { gridDraws, gridLoaded, gridUnavailable } from "./grid/draws";
@@ -212,6 +212,8 @@ interface Preview {
   widget: MermaidPreviewWidget;
   /** Wrapped, because a rejection is allowed to BE undefined. */
   cause?: { of: unknown };
+  /** A theme change came while it rendered, so it may be in the other theme. */
+  themeMoved?: boolean;
 }
 
 const previews = new WeakMap<HTMLElement, Preview>();
@@ -241,8 +243,10 @@ export function takePreviewDrawing(
   firstLine: number,
 ): SVGSVGElement | null {
   for (const box of root.querySelectorAll<HTMLElement>(".cm-mermaid-preview")) {
-    const widget = previews.get(box)?.widget;
+    const preview = previews.get(box);
+    const widget = preview?.widget;
     if (
+      !preview?.themeMoved &&
       widget?.source === source &&
       widget.dark === dark &&
       widget.firstLine === firstLine
@@ -345,8 +349,10 @@ class MermaidPreviewWidget extends WidgetType {
         // teardown - where they accumulate for the whole session. A broken
         // diagram draws no diagram; what it draws instead is the caption
         // below, and the source is right above it.
-        initializeMermaid(mermaid, dark);
+        const theme = initializeMermaid(mermaid, dark);
         const rendered = await mermaid.render(id, source);
+        // It may have drawn in the other theme, so the widget does not take it.
+        preview.themeMoved = theme !== mermaidThemeChanges();
         if (box.isConnected || box.childElementCount === 0) {
           box.innerHTML = drawnLabels(rendered.svg);
         }

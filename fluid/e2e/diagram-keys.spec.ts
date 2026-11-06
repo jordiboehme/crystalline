@@ -130,7 +130,7 @@ test("Tab goes in and out in one stop", async ({ page }) => {
   expect(await focusedLabel(page)).toBe("Box: First");
 });
 
-test("a click maps to its box and its arrow, also for duplicates and odd ids", async ({
+test("a click maps to its box, and duplicates and odd ids get their own hit paths", async ({
   page,
 }) => {
   await openEditor(
@@ -199,4 +199,147 @@ test("a self-loop's arrow is a stop like any other", async ({ page }) => {
   await box(page).focus();
   await page.keyboard.press("End");
   expect(await focusedLabel(page)).toBe("Arrow from One to One");
+});
+
+test("a click on an arrow's wide hit path selects that arrow", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  const arrow = await box(page).locator("[data-hit-for]").boundingBox();
+  if (arrow === null) throw new Error("no arrow");
+  await page.mouse.click(
+    arrow.x + arrow.width / 2 + 4,
+    arrow.y + arrow.height / 2,
+  );
+  expect(await focusedLabel(page)).toBe("Arrow from First to Second");
+});
+
+/** The document's exact bytes, as the view holds them. */
+const docText = (page: Page) =>
+  page.evaluate(() => {
+    const content = document.querySelector(".cm-content") as unknown as {
+      cmTile: { view: { state: { doc: { toString(): string } } } };
+    };
+    return content.cmTile.view.state.doc.toString();
+  });
+
+const sourceShown = (page: Page) =>
+  page.locator(".cm-content > .cm-line", { hasText: "A[First]" });
+
+for (const key of ["Backspace", "ControlOrMeta+x"]) {
+  test(`a search hit left with Escape shows the fence as text, and ${key} takes only the hit`, async ({
+    page,
+  }) => {
+    await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+    await expect(box(page).locator("svg")).toBeVisible();
+    await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+    const before = await docText(page);
+    await page.keyboard.press("ControlOrMeta+f");
+    await page.keyboard.type("Second");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Escape");
+    await expect(sourceShown(page)).toBeVisible();
+    await expect(box(page)).toHaveCount(0);
+    await page.keyboard.press(key);
+    await expect.poll(() => docText(page)).toBe(before.replace("Second", ""));
+    await expect(sourceShown(page)).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+z");
+    await expect.poll(() => docText(page)).toBe(before);
+  });
+}
+
+test("a fence shown as text draws again when the caret leaves", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\nBelow marker\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ControlOrMeta+f");
+  await page.keyboard.type("Second");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Escape");
+  await expect(box(page)).toHaveCount(0);
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await expect(box(page).locator("svg")).toBeVisible();
+});
+
+test("Mod-End then Shift+Tab lands on a fence shown as text", async ({
+  page,
+}) => {
+  await openEditor(page, `Above\n${FENCE}\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  // A hand-written file with no final line break; the app writes one.
+  await page.evaluate(() => {
+    const content = document.querySelector(".cm-content") as unknown as {
+      cmTile: {
+        view: {
+          state: { doc: { length: number; toString(): string } };
+          dispatch(spec: { changes: { from: number; to: number } }): void;
+        };
+      };
+    };
+    const { view } = content.cmTile;
+    const end = view.state.doc.length;
+    if (view.state.doc.toString().endsWith("\n")) {
+      view.dispatch({ changes: { from: end - 1, to: end } });
+    }
+  });
+  await page.locator(".cm-content > .cm-line", { hasText: "Above" }).click();
+  await page.keyboard.press("ControlOrMeta+End");
+  await expect.poll(() => focusedIsBox(page)).toBe(true);
+  await page.keyboard.press("Shift+Tab");
+  await expect(sourceShown(page)).toBeVisible();
+  await expect(box(page)).toHaveCount(0);
+  await expect(page.locator(".cm-content")).toContainText("flowchart TD");
+  // A visible edit of one character; the fence going whole was the defect.
+  const before = await docText(page);
+  // Past the history's grouping time, so the setup's edit is an undo step apart.
+  await page.waitForTimeout(600);
+  await page.keyboard.press("Backspace");
+  await expect.poll(() => docText(page)).toBe(before.slice(0, -1));
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(() => docText(page)).toBe(before);
+});
+
+test("holding Backspace stops at the fence, and one undo gives back the word", async ({
+  page,
+}) => {
+  await openEditor(page, `Para above\n${FENCE}\nBelow\n`);
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.locator(".cm-content > .cm-line", { hasText: /^Below$/ }).click();
+  await page.keyboard.press("End");
+  const before = await docText(page);
+  for (let n = 0; n < 13; n += 1) {
+    await page.keyboard.down("Backspace");
+  }
+  await page.keyboard.up("Backspace");
+  await expect
+    .poll(() => docText(page))
+    .toBe(before.replace("\nBelow\n", "\n\n"));
+  await expect(box(page).locator("g.node")).toHaveCount(2);
+  expect(await focusedIsBox(page)).toBe(false);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(() => docText(page)).toBe(before);
+  await expect(box(page).locator("g.node")).toHaveCount(2);
+});
+
+test("holding Delete on a box takes only that box", async ({ page }) => {
+  await openEditor(
+    page,
+    "Above\n```mermaid\nflowchart TD\n  A[First] --> B[Second]\n  B --> C[Third]\n```\nBelow\n",
+  );
+  await expect(box(page).locator("g.node")).toHaveCount(3);
+  const before = await docText(page);
+  await box(page).locator("g.node", { hasText: "Third" }).click();
+  await page.keyboard.down("Delete");
+  await expect(box(page).locator("g.node")).toHaveCount(2);
+  for (let n = 0; n < 8; n += 1) {
+    await page.keyboard.down("Delete");
+  }
+  await page.keyboard.up("Delete");
+  await expect(box(page).locator("g.node")).toHaveCount(2);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(() => docText(page)).toBe(before);
+  await expect(box(page).locator("g.node")).toHaveCount(3);
 });

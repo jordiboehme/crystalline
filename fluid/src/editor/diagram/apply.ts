@@ -19,10 +19,8 @@
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import type { SyntaxNode } from "@lezer/common";
 
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { judgeBeforeCommand } from "../marks/commandJudge";
@@ -38,6 +36,7 @@ import { type MermaidFence, fenceAt } from "./fence";
 import type { FlowCreated, FlowModel } from "./flowchart/model";
 import { type FlowOp, compileFlowOp } from "./flowchart/ops";
 import { parseFlowchart } from "./flowchart/parse";
+import { opensBlock } from "./intent";
 import { type Verdict, requestVerdict } from "./verdict";
 
 /**
@@ -146,9 +145,9 @@ function trackedFence(view: EditorView, ticket: number): MermaidFence | null {
 }
 
 /**
- * Removes the whole fence at `anchor`: its lines and one line break, the one
- * after it when a line follows, as one undo step. The caret goes where no next
- * key lands on a mark: the line above when another block opens right below.
+ * Removes the whole fence at `anchor` as one undo step: its lines and the line
+ * break after them when a plain line follows. No next key lands on a mark: with
+ * no such line the fence's line stays, empty, and takes the caret.
  * Same refusals as an op, and synchronous, since nothing is left to verify.
  */
 export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
@@ -174,21 +173,20 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
     const first = doc.lineAt(fence.from);
     const last = doc.lineAt(fence.to);
     const below = last.number < doc.lines ? doc.line(last.number + 1) : null;
-    const above = first.number > 1 ? doc.line(first.number - 1) : null;
-    const from = below === null && above !== null ? above.to : first.from;
-    const to = below === null ? last.to : below.from;
-    const caret =
-      below !== null &&
-      above !== null &&
-      startsBlock(state, below.from) &&
-      !startsBlock(state, above.to)
-        ? above.to
-        : from;
+    const from = first.from;
+    // With a plain line below it takes the caret. With a block below, or nothing,
+    // there is none to stand on, so the fence's line stays, empty, and what is
+    // typed next has a line of its own (R83).
+    const to =
+      below === null || opensBlock(state, below) ? last.to : below.from;
     dispatchIsolated(view, {
       changes: { from, to },
-      selection: EditorSelection.cursor(caret),
+      selection: EditorSelection.cursor(from),
       userEvent: "delete.diagram",
     });
+    if (view.state.doc === doc) {
+      return refusal("invalid");
+    }
     return { applied: true };
   } finally {
     if (
@@ -198,20 +196,6 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
       view.dispatch({ effects: untrackAnchor.of(ticket) });
     }
   }
-}
-
-/** Whether `pos` lies in a fenced block or a table: no place for a caret. */
-function startsBlock(state: EditorState, pos: number): boolean {
-  for (
-    let node: SyntaxNode | null = syntaxTree(state).resolveInner(pos, 1);
-    node !== null;
-    node = node.parent
-  ) {
-    if (node.name === "FencedCode" || node.name === "Table") {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -289,6 +273,7 @@ export async function runDiagramOp<M, O, Created>(
       if (!verdict.ok) {
         return refusal(verdict.unavailable ? "unchecked" : "invalid");
       }
+      const written = view.state.doc;
       dispatchIsolated(view, {
         changes: toChanges(
           now.bodyFrom,
@@ -298,6 +283,9 @@ export async function runDiagramOp<M, O, Created>(
         ),
         userEvent: "input.diagram",
       });
+      if (view.state.doc === written) {
+        return refusal("invalid");
+      }
       return result.created === undefined
         ? { applied: true }
         : { applied: true, created: result.created };
