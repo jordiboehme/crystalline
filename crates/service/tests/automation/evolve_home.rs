@@ -432,7 +432,7 @@ async fn without_a_public_url_a_team_domain_runs_and_says_there_is_no_home() {
     assert!(taken.get("evolve_home").is_none(), "{taken}");
     assert_eq!(
         taken["note"],
-        "'brand' has no evolve_home yet, so every clone of it may run evolve. This instance has no service.public_url, so it cannot become the home: the first scheduled evolve run at an instance with one claims it.",
+        "'brand' has no evolve_home yet, so every clone of it may run evolve. This instance has no public address, so it cannot become the home: the first scheduled evolve run at an instance with one claims it.",
         "{taken}"
     );
     assert_eq!(manifest_text(&root), before);
@@ -490,7 +490,7 @@ async fn the_home_moves_by_removing_it_where_evolve_should_run() {
         .unwrap_err();
     assert_eq!(
         set.to_string(),
-        "`evolve_home` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset evolve_home), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
+        "`evolve_home` is filled in by the first scheduled evolve run at an instance with a public address; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset evolve_home), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
     );
     // Through configure, as an agent or a person removes it.
     eng.change_domain_settings(
@@ -529,7 +529,7 @@ async fn the_policies_view_says_how_the_home_is_filled_in() {
     assert_eq!(row["can_change"], false, "{row}");
     assert_eq!(
         row["how"],
-        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)",
+        "filled in by the first scheduled evolve run at an instance with a public address; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)",
         "{row}"
     );
 }

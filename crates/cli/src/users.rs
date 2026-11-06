@@ -20,7 +20,7 @@
 
 use std::io::{IsTerminal, Read, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crystalline_core::config::registration::{
     DOMAIN_NAME_RULE, MAX_DOMAIN_NAME_CHARS, validate_domain_name,
@@ -57,6 +57,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             // Checked before anything is created, so a bad entry leaves no
             // account behind.
             let writes = writes.as_deref().map(parse_write_list).transpose()?;
+            clear_name_for_new_account(&store, &name).await?;
             let added = match &mcp_token {
                 // An account for an agent: no password to ask for, and the
                 // token is issued in the same transaction as the account.
@@ -385,6 +386,40 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 );
             }
         }
+        UsersCommand::DiscardDrafts { name } => {
+            let account = stored_name(&name);
+            if store.user(&name).await?.is_some() {
+                bail!(
+                    "'{account}' is an account, and its drafts are its own; this is for a name whose account was removed"
+                );
+            }
+            let report = crystalline_service::client::discard_account_drafts(&account).await?;
+            if json {
+                println!("{report}");
+            } else {
+                if let Some(error) = report["error"].as_str() {
+                    println!("{error}");
+                }
+                let domains = report["domains"].as_array().cloned().unwrap_or_default();
+                if domains.is_empty() && report["error"].is_null() {
+                    println!("'{account}' holds no drafts.");
+                }
+                for row in domains {
+                    let domain = row["domain"].as_str().unwrap_or("?");
+                    println!(
+                        "{domain}: {} discarded, {} left because they are open in an editor",
+                        row["discarded"],
+                        row["left"].as_array().map_or(0, Vec::len),
+                    );
+                    if let Some(place) = row["where"].as_str() {
+                        println!("{domain}: {place}");
+                    }
+                    if let Some(error) = row["error"].as_str() {
+                        println!("{domain}: this stopped here: {error}");
+                    }
+                }
+            }
+        }
         UsersCommand::Remove { name, force } => {
             if force {
                 store.remove_user_force(&name).await?;
@@ -402,6 +437,17 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                     stored_name(&name)
                 );
             }
+            // The drafts stay: nothing deletes one without an admin asking.
+            if let Ok(drafts) =
+                crystalline_service::client::account_drafts(&stored_name(&name)).await
+                && !drafts.is_empty()
+            {
+                let count: u64 = drafts.iter().map(|(_, n)| n).sum();
+                println!(
+                    "It still holds {count} drafts, which stay. A new account under this name is refused until they are ended with: crystalline users discard-drafts {}",
+                    stored_name(&name)
+                );
+            }
         }
     }
     Ok(())
@@ -413,22 +459,18 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
 /// resolve or delete is an orphan rather than a failure - it addresses nothing
 /// once no account carries the name, and reconnecting overwrites it.
 ///
-/// Silent by design (a debug log, findable with `RUST_LOG=debug`): the command's own
-/// confirmation line is about the account, and a person who never connected an
-/// identity - the common case - must not be told about a credential that was
-/// never there. The name is folded exactly as the auth store folds it, so the
-/// credential swept is the one that account's own connect would have written;
+/// Quiet about the delete (a debug log, findable with `RUST_LOG=debug`): the
+/// command's own confirmation line is about the account, and a person who never
+/// connected an identity - the common case - must not be told about a credential
+/// that was never there. The name is folded exactly as the auth store folds it, so
+/// the credential swept is the one that account's own connect would have written;
 /// a name the credential allowlist cannot address never had one.
 ///
-/// A running daemon is told, exactly as `connect github --disconnect` tells
-/// it: this is the second writer of the credential store, and it is the
-/// "person leaving" case - the daemon's process cache would otherwise go on
-/// holding a token for an account that no longer exists until it restarted.
-/// The telling stays silent whatever it comes to, unlike the disconnect verb's:
-/// there the caller asked to forget a credential and a daemon that refused is
-/// news, while here the sweep is a side effect they were never told about, so
-/// a line about an unreachable daemon would name a credential the operator
-/// does not know was in play.
+/// A running daemon is told, exactly as `connect github --disconnect` tells it:
+/// this is the second writer of the credential store, and it is the "person
+/// leaving" case - the daemon's process cache would otherwise go on holding a
+/// token for an account that no longer exists until it restarted. A daemon that
+/// refuses the message is a warning, because it may go on writing on that token.
 async fn sweep_personal_credential(name: &str) {
     let account = stored_name(name);
     if !crystalline_remote::valid_identity_name(&account) {
@@ -436,11 +478,26 @@ async fn sweep_personal_credential(name: &str) {
         return;
     }
     let identity = crystalline_remote::TokenIdentity::Personal(account);
-    // The host the credential is filed under, from the same config the connect
-    // path reads. A config that will not load is not worth failing an account
-    // change over: github.com is where all but the Enterprise Server installs
-    // keep it anyway.
-    let host = crate::cmd::load(None)
+    let host = credential_host();
+    match crystalline_core::config::origins_state_dir() {
+        Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
+        Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
+    }
+    if let crate::cmd::DaemonNotice::Refused(e) = crate::cmd::notify_daemon_forgot(&identity).await
+    {
+        eprintln!(
+            "warning: a running daemon could not be told ({e}). Restart it, because it may still hold the GitHub token of '{}'.",
+            stored_name(name)
+        );
+    }
+}
+
+/// The host a personal credential is filed under, from the same config the
+/// connect path reads. A config that will not load is not worth failing an
+/// account change over: github.com is where all but the Enterprise Server
+/// installs keep it anyway.
+fn credential_host() -> Option<String> {
+    crate::cmd::load(None)
         .ok()
         .and_then(|loaded| {
             loaded
@@ -451,15 +508,64 @@ async fn sweep_personal_credential(name: &str) {
         })
         .and_then(|api_url| {
             crate::cmd::bare_host(&crystalline_remote::github::auth::auth_base(Some(&api_url)))
-        });
-    match crystalline_core::config::origins_state_dir() {
-        Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
-        Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
-    }
-    if let crate::cmd::DaemonNotice::Refused(e) = crate::cmd::notify_daemon_forgot(&identity).await
+        })
+}
+
+/// The step before an account is made, while the name holds none, as REST takes
+/// it (`Engine::clear_name_for_new_account`): a name with drafts is refused, links
+/// the old person gave end, and a GitHub token left under the name goes, with a
+/// running daemon told. Anything that cannot be read or deleted refuses: nothing
+/// may stand on a token the store could not answer about. A name that holds an
+/// account, or that no account can have, is left alone, so the insert answers it.
+async fn clear_name_for_new_account(store: &AuthStore, name: &str) -> Result<()> {
+    if crystalline_service::rest::normalize_new_account_name(name).is_err()
+        || store.user(name).await?.is_some()
     {
-        tracing::debug!("a running daemon still holds the swept credential: {e}");
+        return Ok(());
     }
+    let account = stored_name(name);
+    let drafts = crystalline_service::client::account_drafts(&account)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "the drafts under '{account}' could not be read, so the account was not made: {e:#}"
+            )
+        })?;
+    if !drafts.is_empty() {
+        let held = drafts
+            .iter()
+            .map(|(domain, entries)| format!("{entries} in {domain}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the name '{account}' still holds drafts of a removed account: {held}. No account was made, because the new person would inherit them. Use another name, or, once nobody needs those drafts, end them with: crystalline users discard-drafts {account}, and add the account again"
+        );
+    }
+    store.end_overlay_grants_of_owner(&account).await?;
+    sweep_personal_credential(name).await;
+    if !crystalline_remote::valid_identity_name(&account) {
+        return Ok(());
+    }
+    let identity = crystalline_remote::TokenIdentity::Personal(account.clone());
+    let dir = crystalline_core::config::origins_state_dir().map_err(|e| {
+        anyhow!("the state directory could not be found, so the account was not made: {e}")
+    })?;
+    let (_store, token) = crystalline_remote::TokenStore::resolve_and_load_for(
+        &identity,
+        credential_host().as_deref(),
+        &dir,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "the GitHub token store could not be read, so the account was not made: {e}. Unlock the keychain or fix the state directory, and add it again"
+        )
+    })?;
+    if token.is_some() {
+        bail!(
+            "a GitHub token is still saved under '{account}' and could not be deleted, so the account was not made; fix the permissions of the state directory, or unlock the keychain, and add it again"
+        );
+    }
+    Ok(())
 }
 
 /// Store the write list of an account created a moment ago, and take the

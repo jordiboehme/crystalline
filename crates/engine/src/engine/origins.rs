@@ -1,5 +1,6 @@
 use super::*;
 use crate::params::Readers;
+use crystalline_core::config::EffectiveShareIdentity;
 
 /// What a connect to GitHub on an instance with a GitHub App is told when
 /// it does not say who may read the domain. Access there follows GitHub, so
@@ -62,6 +63,72 @@ struct TeamMarker {
 /// The receipt and preview entry for a share that carries the team marker.
 fn team_marker_json() -> Value {
     json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
+}
+
+/// Put the case-only moves a share will not carry on its plan or its receipt.
+/// Nothing is added when there are none.
+fn note_unshared_spelling(answer: &mut Value, moves: &[Value]) {
+    if !moves.is_empty() {
+        answer["spelling_not_shared"] = json!(moves);
+        answer["spelling_note"] = json!(
+            "A share does not carry a change of letter case. The team's file keeps its name, \
+             and any new text lands there."
+        );
+    }
+}
+
+/// The text of an error a list answer carries in a row, in the words of who reads
+/// it: the same list as [`plain_refusal_text`], here where the caller is known.
+fn row_error(scope: &crate::scope::Scope, e: &EngineError) -> String {
+    let text = e.to_string();
+    let admin = matches!(
+        scope,
+        crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+    );
+    if admin {
+        return text;
+    }
+    plain_refusal_text(&text).unwrap_or(text)
+}
+
+/// What the `connection` block of a status leaves out for a non-admin: the reason
+/// names a setting, the owner's and the agent's slots are about who else this
+/// instance shares as, and the App's sentences hold a command line and an
+/// internal host. The mode stays, because the share surfaces branch on it.
+pub fn leave_out_for_non_admin(connection: &mut Value) {
+    if let Value::Object(map) = connection {
+        map.remove("share_identity_reason");
+        map.remove("owner_identity");
+        map.remove("agent_identity");
+        map.remove("app");
+    }
+}
+
+/// A share refusal in the words of who reads it. A person with a session or an
+/// agent over HTTP may not be an admin, so plain words and the fix. The machine
+/// owner is at a command line. The App's own sentences hold a command line and a
+/// host, so they go to the log here.
+fn refusal_for(actor: &ShareActor, e: EngineError) -> EngineError {
+    if !matches!(actor, ShareActor::Account(_) | ShareActor::HttpAgent) {
+        return e;
+    }
+    match &e {
+        EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_LINK_MISSING => {
+            RemoteError::Refused(PERSON_LINK_MISSING.to_string()).into()
+        }
+        EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING => {
+            RemoteError::Refused(PERSON_TOKEN_MISSING.to_string()).into()
+        }
+        EngineError::Remote(RemoteError::AppCredential(_)) => {
+            tracing::warn!("a share was refused: {e}");
+            RemoteError::Refused(LinkSetupReason::AppUnusable.plain_sentence().to_string()).into()
+        }
+        EngineError::Conflict(text) if text == github_app::KEYCHAIN_REFUSAL => {
+            tracing::warn!("a share was refused: {e}");
+            RemoteError::Refused(LinkSetupReason::Keychain.plain_sentence().to_string()).into()
+        }
+        _ => e,
+    }
 }
 
 impl Engine {
@@ -1062,7 +1129,7 @@ impl Engine {
         for (name, entry) in targets {
             match self.origin_update_one(&name, &entry).await {
                 Ok(v) => domains.push(v),
-                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+                Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
             }
         }
         // Once every pull has finished and let go of its origin lock, which a
@@ -1431,7 +1498,13 @@ impl Engine {
         let detail = detail || diff;
         let hidden = self.hidden_for(scope).await?;
         let targets = self.origin_targets(domain, &hidden)?;
-        let connection = self.origin_status_connection().await?;
+        let mut connection = self.origin_status_connection().await?;
+        if !matches!(
+            scope,
+            crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+        ) {
+            leave_out_for_non_admin(&mut connection);
+        }
 
         let actor = crate::scope::overlay_actor(scope);
         // Who is asking, as a share would act: whose changes a `diff`
@@ -1517,7 +1590,7 @@ impl Engine {
                 Some(who) => match self.local_change_sides(&name, who).await {
                     Ok(sides) => Some(sides),
                     Err(e) => {
-                        errors.push(json!({ "domain": name, "error": e.to_string() }));
+                        errors.push(json!({ "domain": name, "error": row_error(scope, &e) }));
                         continue;
                     }
                 },
@@ -1536,7 +1609,7 @@ impl Engine {
                 .await
             {
                 Ok(v) => domains.push(v),
-                Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
+                Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
             }
         }
         Ok(json!({ "connection": connection, "domains": domains, "errors": errors }))
@@ -1591,10 +1664,9 @@ impl Engine {
         // A probe is best-effort: no connection, or a provider that fails to
         // build, must never turn a status call into a hard failure.
         let probe = self.resolve_origin_provider().ok();
-        let settle_owed_link = {
-            let config = self.config.read().unwrap();
-            config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
-        };
+        let stacks = self.config.read().unwrap().github_stacks();
+        let settle_owed_link =
+            stacks && self.share_identity_loaded().mode == ShareIdentityMode::Instance;
         let change_detail = || {
             let mut block = detail
                 .then(|| origin::local_change_detail(&root, &state_dir, reflection))
@@ -2146,7 +2218,7 @@ impl Engine {
     ///
     /// `actor` is who the share runs as, which decides the credential the
     /// forge writes go out on (see `Engine::resolve_share_provider`); it is
-    /// inert while `github.share_identity` is `instance`, the default.
+    /// inert while the share identity mode is `instance`.
     ///
     /// The login that credential was connected as is recorded on the proposal
     /// this share creates or rewrites, in both modes
@@ -2271,6 +2343,11 @@ impl Engine {
             .as_ref()
             .and_then(|plan| plan.files.as_deref())
             .or(files);
+        // Read before the share, whose convergence may end these rows.
+        let unshared_spelling = match drafting.as_deref() {
+            Some(who) => self.case_only_moves(domain, who, &state_dir).await?,
+            None => Vec::new(),
+        };
         match ops::propose(
             share_provider,
             &spec,
@@ -2300,6 +2377,7 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
+                note_unshared_spelling(&mut receipt, &unshared_spelling);
                 // Only an outcome that carried something to the team carried
                 // the marker; a refusal or a diverged proposal shared nothing,
                 // and the marker it wrote into the folder is taken back.
@@ -2405,6 +2483,43 @@ impl Engine {
                 Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
             }
         }
+    }
+
+    /// One actor's case-only moves in a domain: a tombstone at one spelling and
+    /// a draft at another spelling of the same path. Sharing folds case, so
+    /// these are the moves whose new spelling a share will not carry. The base
+    /// snapshot tells a move from two real files: it holds the old spelling and
+    /// not the new one.
+    async fn case_only_moves(
+        &self,
+        domain: &str,
+        actor: &str,
+        state_dir: &Path,
+    ) -> Result<Vec<Value>> {
+        let base = crystalline_remote::state::OriginState::load(state_dir)?
+            .map(|state| state.files)
+            .unwrap_or_default();
+        let store = self.store.lock().await;
+        let Some(domain_id) = store.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let entries = store.overlay_entries(domain_id, actor).await?;
+        drop(store);
+        let fold = crystalline_core::fold_path_case;
+        Ok(entries
+            .iter()
+            .filter(|from| from.tombstone && base.contains_key(&from.path))
+            .filter_map(|from| {
+                entries
+                    .iter()
+                    .find(|to| {
+                        !to.tombstone
+                            && fold(&to.path) == fold(&from.path)
+                            && !base.contains_key(&to.path)
+                    })
+                    .map(|to| json!({ "from": from.path, "to": to.path }))
+            })
+            .collect())
     }
 
     /// Take the team marker a share wrote into the folder back out when the
@@ -2608,7 +2723,11 @@ impl Engine {
                 if credential == PreviewCredential::ReadScopeFallback
                     && is_personal_token_missing(&e) =>
             {
-                (self.resolve_origin_provider()?, None)
+                (
+                    self.resolve_origin_provider()
+                        .map_err(|e| refusal_for(&actor, e))?,
+                    None,
+                )
             }
             Err(e) => return Err(e),
         };
@@ -2684,6 +2803,12 @@ impl Engine {
         // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);
+        // The same word the share's receipt will carry, so the dialog does not
+        // say the team has everything before the share either.
+        if let Some(who) = drafting.as_deref() {
+            let moves = self.case_only_moves(domain, who, &state_dir).await?;
+            note_unshared_spelling(&mut plan, &moves);
+        }
         Ok(plan)
     }
 
@@ -3786,10 +3911,10 @@ impl Engine {
     /// two domains registered over one root, or over two spellings of one path,
     /// still serialize on the file itself: the key is
     /// [`canonicalize`](std::fs::canonicalize)d where the filesystem can
-    /// resolve it, which covers symlinks and `..` segments, and falls back to
-    /// the path as given for a file that does not exist yet - a create and a
-    /// save of one engram therefore share a key only once the file is there,
-    /// which is exactly when both are reading it. Taken before the store lock,
+    /// resolve it, which covers symlinks and `..` segments, and for a file that
+    /// does not exist yet is its nearest existing ancestor canonicalized with
+    /// the rest appended, so the key is the same before the folder exists, after
+    /// it does and after the file does (see `lock_key`). Taken before the store lock,
     /// always, so the two never invert; virtual domains take neither, since
     /// their compare-and-swap happens inside a single database statement.
     ///
@@ -3800,15 +3925,24 @@ impl Engine {
     /// **In-process only.** Two Crystalline processes over one domain root are
     /// not held apart by this; the host-lock machinery governs that.
     pub(crate) fn write_lock(&self, abs: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        self.keyed_write_lock(abs).1
+    }
+
+    /// [`Engine::write_lock`] with the key it answers to. One lookup, so a
+    /// caller that orders locks by key orders the very mutexes it will take: a
+    /// second lookup can answer differently once another spelling of a missing
+    /// file has appeared on a disk that folds case.
+    pub(super) fn keyed_write_lock(&self, abs: &Path) -> (String, Arc<tokio::sync::Mutex<()>>) {
         // Computed before the map-wide guard is taken: `canonicalize` is a
         // blocking stat, and every other file's lookup would otherwise queue
         // behind it while it resolves this one's path.
         let key = lock_key(abs);
         let mut locks = self.write_locks.lock().unwrap();
-        locks
-            .entry(key)
+        let lock = locks
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+            .clone();
+        (key, lock)
     }
 
     /// The one lock a draft is written under, for every verb that writes one.
@@ -3968,8 +4102,11 @@ impl Engine {
     /// false`, so a mode flipped through `configure` is honoured by the very
     /// next share with no restart.
     ///
-    /// - `instance` (the default): byte for byte what the read side does, the
-    ///   one instance credential, whoever the actor is.
+    /// With the key absent the mode follows the App
+    /// ([`Engine::share_identity_effective`]).
+    ///
+    /// - `instance`: byte for byte what the read side does, the one instance
+    ///   credential, whoever the actor is.
     /// - `personal`: the actor's own credential -
     ///   [`ShareActor::Owner`] the fixed `owner` slot, [`ShareActor::Account`]
     ///   that account's, [`ShareActor::HttpAgent`] the account
@@ -3995,14 +4132,30 @@ impl Engine {
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
-        if let Some(app) = self.instance_share_app()? {
+        // Once, here: the steps below must agree, or a personal share could
+        // fall back to the instance credential when the mode moves between them.
+        let effective = self.share_identity_loaded();
+        if let Some(app) = self
+            .instance_share_app(effective, actor)
+            .map_err(|e| refusal_for(actor, e))?
+        {
             let app = self.app_share_router(app, actor, repo).await;
             let login = app.bot_login();
             return Ok((app, login));
         }
-        let (api_url, token) = match self.personal_app_identity(actor)? {
-            Some(name) => (self.share_api_url(), self.personal_user_token(&name).await?),
-            None => self.resolve_share_credential(actor)?,
+        let (api_url, token) = match self
+            .personal_app_identity(actor, effective)
+            .map_err(|e| refusal_for(actor, e))?
+        {
+            Some(name) => (
+                self.share_api_url(),
+                self.personal_user_token(&name)
+                    .await
+                    .map_err(|e| refusal_for(actor, e))?,
+            ),
+            None => self
+                .resolve_share_credential_in(actor, effective.mode)
+                .map_err(|e| refusal_for(actor, e))?,
         };
         let login = token.user_display().map(str::to_string);
         Ok((
@@ -4020,29 +4173,59 @@ impl Engine {
         if self.origin_provider_override.is_some() {
             return Some(self.origin_provider_override_login.clone());
         }
-        match self.instance_share_app() {
+        let effective = self.share_identity_loaded();
+        match self.instance_share_app(effective, actor) {
             Ok(Some(app)) => return Some(app.bot_login()),
             Ok(None) => {}
             Err(_) => return None,
         }
-        let (_, token) = self.resolve_share_credential(actor).ok()?;
+        if effective.mode == ShareIdentityMode::Personal {
+            // A status asks this on every read, so a token that is not there is
+            // not looked for again each time.
+            let agent = self
+                .config
+                .read()
+                .unwrap()
+                .github_agent_identity()
+                .map(str::to_string);
+            let name = self.acting_identity_name(actor, agent).ok()?;
+            let token = self.personal_token_for_report(&name)?;
+            return Some(token.user_display().map(str::to_string));
+        }
+        let (_, token) = self
+            .resolve_share_credential_in(actor, effective.mode)
+            .ok()?;
         Some(token.user_display().map(str::to_string))
+    }
+
+    /// [`Engine::resolve_share_credential_in`] on the mode in effect, for the
+    /// tests that exercise its matrix.
+    #[cfg(test)]
+    pub(super) fn resolve_share_credential(
+        &self,
+        actor: &ShareActor,
+    ) -> Result<(Option<String>, StoredToken)> {
+        let mode = self.share_identity_loaded().mode;
+        self.resolve_share_credential_in(actor, mode)
     }
 
     /// The personal identity a share by `actor` runs under when it goes out
     /// on a GitHub App user token: in `personal` mode with a usable App. That
     /// token is renewed before use ([`Engine::personal_user_token`]); without
     /// an App, or with one that cannot be used, the personal credential is
-    /// read as before ([`Engine::resolve_share_credential`]).
-    fn personal_app_identity(&self, actor: &ShareActor) -> Result<Option<String>> {
-        let (mode, agent_identity) = {
-            let config = self.config.read().unwrap();
-            (
-                config.github_share_identity(),
-                config.github_agent_identity().map(str::to_string),
-            )
-        };
-        if mode != ShareIdentityMode::Personal
+    /// read as before ([`Engine::resolve_share_credential_in`]).
+    fn personal_app_identity(
+        &self,
+        actor: &ShareActor,
+        effective: EffectiveShareIdentity,
+    ) -> Result<Option<String>> {
+        let agent_identity = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        if effective.mode != ShareIdentityMode::Personal
             || !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
         {
             return Ok(None);
@@ -4062,17 +4245,32 @@ impl Engine {
 
     /// The App a share goes out through, when it goes out through one: in
     /// `instance` mode with an App configured, the same
-    /// [`github_app::AppRouter`] the read side uses, and an unusable App
-    /// refuses. `personal` mode never takes the App: a person's write runs
-    /// on that person's own credential, as before.
-    fn instance_share_app(&self) -> Result<Option<Arc<github_app::AppRouter>>> {
-        if self.config.read().unwrap().github_share_identity() != ShareIdentityMode::Instance {
-            return Ok(None);
-        }
+    /// [`github_app::AppRouter`] the read side uses. `personal` mode never
+    /// takes the App: a person's write runs on that person's own credential.
+    ///
+    /// An unusable App refuses with its own reason, in `instance` mode and also
+    /// when `personal` is only the default: telling a person to link GitHub
+    /// through an App that cannot link anybody would send them nowhere. An
+    /// admin who set `personal` by name keeps the personal credential.
+    ///
+    /// A scheduled run with no account ([`ShareActor::Machine`]) is the machine's
+    /// own work: it takes the App when `personal` is only the default. An admin
+    /// who set `personal` by name gets the owner's identity there too.
+    fn instance_share_app(
+        &self,
+        effective: EffectiveShareIdentity,
+        actor: &ShareActor,
+    ) -> Result<Option<Arc<github_app::AppRouter>>> {
+        let on_the_app = effective.mode == ShareIdentityMode::Instance
+            || (*actor == ShareActor::Machine && effective.is_default());
         match self.github_app_slot() {
-            github_app::AppSlot::Ready(router) => Ok(Some(router)),
-            github_app::AppSlot::Refused(detail) => Err(github_app::app_refusal(detail)),
-            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => Ok(None),
+            github_app::AppSlot::Refused(detail)
+                if effective.mode == ShareIdentityMode::Instance || effective.is_default() =>
+            {
+                Err(github_app::app_refusal(detail))
+            }
+            github_app::AppSlot::Ready(router) if on_the_app => Ok(Some(router)),
+            _ => Ok(None),
         }
     }
 
@@ -4084,15 +4282,15 @@ impl Engine {
     /// mechanical, and because a `reqwest` client build loads the platform
     /// trust store, which is slow enough to be worth keeping out of the tests
     /// that exercise this matrix.
-    pub(super) fn resolve_share_credential(
+    fn resolve_share_credential_in(
         &self,
         actor: &ShareActor,
+        mode: ShareIdentityMode,
     ) -> Result<(Option<String>, StoredToken)> {
-        let (api_url, mode, agent_identity) = {
+        let (api_url, agent_identity) = {
             let config = self.config.read().unwrap();
             (
                 config.github.as_ref().and_then(|g| g.api_url.clone()),
-                config.github_share_identity(),
                 config.github_agent_identity().map(str::to_string),
             )
         };
@@ -4127,9 +4325,14 @@ impl Engine {
     /// is read live here for the same reason it is read live in
     /// [`Engine::resolve_share_provider`], one call after it, so the two agree
     /// about which credential the call in flight actually used.
+    ///
+    /// A bot is never a person to teach: a run that went through the App reads
+    /// like the instance credential it is.
     fn personal_write_login(&self, login: Option<&str>) -> Option<String> {
-        match self.config.read().unwrap().github_share_identity() {
-            ShareIdentityMode::Personal => login.map(str::to_string),
+        match self.share_identity_loaded().mode {
+            ShareIdentityMode::Personal => login
+                .filter(|login| !login.ends_with("[bot]"))
+                .map(str::to_string),
             ShareIdentityMode::Instance => None,
         }
     }
@@ -4147,7 +4350,7 @@ impl Engine {
         agent_identity: Option<String>,
     ) -> Result<String> {
         let name = match actor {
-            ShareActor::Owner => OWNER_IDENTITY_NAME.to_string(),
+            ShareActor::Owner | ShareActor::Machine => OWNER_IDENTITY_NAME.to_string(),
             ShareActor::Account(name) => name.clone(),
             ShareActor::HttpAgent => agent_identity.ok_or_else(|| {
                 EngineError::Remote(RemoteError::Refused(AGENT_IDENTITY_UNSET.to_string()))
@@ -4250,21 +4453,23 @@ impl Engine {
     /// than failing the whole status read: this is a report, and every other
     /// line of it survives an unreadable credential store.
     ///
-    /// The cost, stated rather than hidden: only a PRESENT token is cached
-    /// ([`Engine::github_credential_for`]), so an instance in personal mode
-    /// whose owner has connected nothing pays one credential-store read per
-    /// `origin status` - deliberate, since it is also what lets a standalone
-    /// `crystalline connect github --personal` be seen without a restart.
+    /// A token that is not there is looked for at most once per
+    /// [`TOKEN_MISSING_FOR`] ([`Engine::personal_token_for_report`]), so a
+    /// standalone `crystalline connect github --personal` is seen when it tells
+    /// the daemon, or at the latest when that memory runs out.
     async fn origin_status_connection(&self) -> Result<Value> {
         let mut connection = self.origin_connection_json().await?;
-        let (mode, agent) = {
-            let config = self.config.read().unwrap();
-            (
-                config.github_share_identity(),
-                config.github_agent_identity().map(str::to_string),
-            )
-        };
+        let agent = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        let effective = self.share_identity_loaded();
+        let mode = effective.mode;
         connection["share_identity"] = json!(mode.as_str());
+        connection["share_identity_default"] = json!(effective.is_default());
+        connection["share_identity_reason"] = json!(effective.reason_text());
         // A configured App that cannot be used refuses every origin
         // operation; this is where the status says why.
         if let github_app::AppSlot::Refused(detail) = self.github_app_slot() {
@@ -4312,12 +4517,7 @@ impl Engine {
                 Value::Null,
             )
         } else {
-            let identity = TokenIdentity::Personal(account.to_string());
-            let host = self.github_token_host();
-            let token = self
-                .github_credential_for(&identity, host.as_deref())
-                .ok()
-                .and_then(|(_store, token)| token);
+            let token = self.personal_token_for_report(account);
             (
                 token.is_some(),
                 json!(token.as_ref().and_then(|t| t.user_display())),
@@ -4328,6 +4528,50 @@ impl Engine {
             "connected": connected,
             "user": user,
         })
+    }
+
+    /// One personal token for a status read, which asks on every poll: a token
+    /// the store just did not have is remembered as missing for
+    /// [`TOKEN_MISSING_FOR`], so a server whose owner never connected does not
+    /// read the store each time. A saved token is in the cache and wins at once,
+    /// and the CLI tells a running daemon about a token it wrote
+    /// (`forget_cached_credential`). The write paths never read this memory.
+    pub(super) fn personal_token_for_report(&self, account: &str) -> Option<StoredToken> {
+        let identity = TokenIdentity::Personal(account.to_string());
+        let host = self.github_token_host();
+        let key = credential_cache_key(&identity, host.as_deref());
+        if let Some(cached) = self.github_tokens.lock().unwrap().get(&key) {
+            return Some(cached.token.clone());
+        }
+        let now = (self.app_clock)();
+        let remembered = self
+            .github_tokens_missing
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|at| now.saturating_duration_since(*at) < TOKEN_MISSING_FOR);
+        if remembered {
+            return None;
+        }
+        // A store that cannot be read is not remembered: it may answer next.
+        let (_store, token) = self
+            .github_credential_for(&identity, host.as_deref())
+            .ok()?;
+        let mut missing = self.github_tokens_missing.lock().unwrap();
+        if token.is_none() {
+            missing.insert(key, now);
+        } else {
+            missing.remove(&key);
+        }
+        token
+    }
+
+    /// Forgets every remembered missing token whose key starts with `prefix`.
+    pub(super) fn forget_token_missing(&self, prefix: &str) {
+        self.github_tokens_missing
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(prefix));
     }
 
     /// The INSTANCE GitHub token store for `host` and the token it holds -
@@ -4414,7 +4658,43 @@ impl Engine {
 
     /// The plan a connect flow saves the INSTANCE credential through.
     pub(super) fn github_save_plan(&self, host: Option<&str>) -> Result<TokenSavePlan> {
-        self.github_save_plan_for(&TokenIdentity::Instance, host)
+        self.token_save_plan(&TokenIdentity::Instance, host)
+    }
+
+    /// The plan a person's credential is saved through: the same, and bound to
+    /// the account the name holds right now, so the write is refused if the name
+    /// holds another by the time it lands. Asked when the work begins, not when
+    /// it ends. A read that fails refuses here rather than guessing.
+    pub(super) async fn github_save_plan_for(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<TokenSavePlan> {
+        let mut plan = self.token_save_plan(identity, host)?;
+        let TokenIdentity::Personal(name) = identity else {
+            return Ok(plan);
+        };
+        let Some(access) = self.domain_access.get() else {
+            return Ok(plan);
+        };
+        let agent = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        let born = access
+            .account_born(name)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        plan.owner = Some(TokenOwner {
+            access: access.clone(),
+            name: name.clone(),
+            born,
+            no_account_is_right: name == OWNER_IDENTITY_NAME
+                || agent.as_deref() == Some(name.as_str()),
+        });
+        Ok(plan)
     }
 
     /// The plan a connect flow saves its token through: the test file override
@@ -4427,7 +4707,7 @@ impl Engine {
     /// refreshes - so a person's connect can never overwrite the machine's
     /// credential, nor leave the machine's client cached under a name it no
     /// longer belongs to.
-    pub(super) fn github_save_plan_for(
+    fn token_save_plan(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
@@ -4447,6 +4727,8 @@ impl Engine {
             host: host.map(str::to_string),
             target,
             cache: Arc::clone(&self.github_tokens),
+            owner: None,
+            gate: self.token_writes.clone(),
         })
     }
 

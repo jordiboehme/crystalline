@@ -249,28 +249,27 @@ impl GlobalConfig {
         self.github.as_ref().and_then(|g| g.stacks).unwrap_or(true)
     }
 
-    /// Whose GitHub identity a share runs under, from `github.share_identity`.
-    /// Absent config or an absent key means [`ShareIdentityMode::Instance`]:
-    /// the one connected instance token performs every read and every write,
-    /// which is the behavior an install has always had. Only the exact word
-    /// `personal` selects [`ShareIdentityMode::Personal`].
+    /// What `github.share_identity` says, and nothing more: `None` when the
+    /// key is absent, the raw half of the answer. Whose identity a share runs
+    /// under also depends on whether a GitHub App is configured, which a config
+    /// cannot know, so a reader asks [`EffectiveShareIdentity::resolve`] (in the
+    /// engine, `Engine::share_identity_effective`).
     ///
-    /// Any other stored value also reads as `Instance`, and that tolerance is
-    /// deliberate: a config file is hand-editable, so a typo (or a spelling a
-    /// newer build writes) must not silently move an instance into or out of
-    /// the stricter mode. The settings registry is the asymmetric half of this
-    /// pair - it refuses anything but the two words on the way in, so a value
-    /// Crystalline itself wrote always reads back as what was set.
-    pub fn github_share_identity(&self) -> ShareIdentityMode {
-        match self
-            .github
-            .as_ref()
-            .and_then(|g| g.share_identity.as_deref())
-            .map(str::trim)
-        {
-            Some("personal") => ShareIdentityMode::Personal,
+    /// Only the exact word `personal` selects [`ShareIdentityMode::Personal`].
+    /// Any other stored value, an empty one too, reads as
+    /// [`ShareIdentityMode::Instance`], and that tolerance is deliberate: a
+    /// config file is hand-editable, so a typo (or a spelling a newer build
+    /// writes) must not silently move an instance into or out of the stricter
+    /// mode, nor hand the choice back to the default. The settings registry is
+    /// the asymmetric half of this pair - it refuses anything but the two words
+    /// on the way in, so a value Crystalline itself wrote always reads back as
+    /// what was set.
+    pub fn github_share_identity_setting(&self) -> Option<ShareIdentityMode> {
+        let value = self.github.as_ref()?.share_identity.as_deref()?;
+        Some(match value.trim() {
+            "personal" => ShareIdentityMode::Personal,
             _ => ShareIdentityMode::Instance,
-        }
+        })
     }
 
     /// The Crystalline account whose connected GitHub identity an agent share
@@ -803,8 +802,9 @@ pub struct GitHubConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacks: Option<bool>,
     /// Whose GitHub identity shares run under, `instance` or `personal`.
-    /// Absent means `instance`. Read through
-    /// [`GlobalConfig::github_share_identity`], which is tolerant of a value
+    /// Absent means `personal` with a GitHub App configured and `instance`
+    /// without one ([`EffectiveShareIdentity`]). Read through
+    /// [`GlobalConfig::github_share_identity_setting`], which is tolerant of a value
     /// it does not know; the settings registry refuses one on a write. See
     /// the `configure` tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,14 +828,15 @@ pub struct GitHubConfig {
 
 /// How shares are credentialed: one instance token, or each person's own.
 ///
-/// The value set of the `github.share_identity` setting, read from a config
-/// through [`GlobalConfig::github_share_identity`].
+/// The value set of the `github.share_identity` setting. A config says only
+/// what the key holds ([`GlobalConfig::github_share_identity_setting`]); the
+/// mode in effect is an [`EffectiveShareIdentity`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareIdentityMode {
-    /// The default and the pre-feature behavior: the one connected instance
-    /// token performs every read and every write against an origin.
+    /// One credential performs every read and every write against an origin:
+    /// the connected instance token, or the GitHub App.
     Instance,
-    /// Reads stay on the instance token; every origin write runs on the
+    /// Reads stay on the instance credential; every origin write runs on the
     /// acting person's own connected GitHub identity, and a person without one
     /// is refused rather than falling back.
     Personal,
@@ -848,6 +849,81 @@ impl ShareIdentityMode {
         match self {
             ShareIdentityMode::Instance => "instance",
             ShareIdentityMode::Personal => "personal",
+        }
+    }
+}
+
+/// What is known about this instance's GitHub App, as far as the share identity
+/// default cares. Plain facts: finding them out is the engine's and the CLI's
+/// job, and core reads no store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GithubAppPresence {
+    /// No App is configured.
+    None,
+    /// An App is configured, usable or not.
+    Configured,
+    /// An App may be saved and has not been read yet.
+    Loading,
+}
+
+/// Why a [`EffectiveShareIdentity`] holds its mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareIdentityReason {
+    /// `github.share_identity` is set.
+    Setting,
+    /// The key is absent and no App is configured.
+    NoApp,
+    /// The key is absent and an App is configured.
+    App,
+    /// The key is absent and an App may be saved but has not been read: the
+    /// narrower share gate holds until it has.
+    AppLoading,
+}
+
+/// The share identity mode in effect, and why. The single rule every reader
+/// goes through: an explicit key always wins, else `personal` with a GitHub App
+/// configured and `instance` without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectiveShareIdentity {
+    /// The mode in effect.
+    pub mode: ShareIdentityMode,
+    /// Why this is the mode.
+    pub reason: ShareIdentityReason,
+}
+
+impl EffectiveShareIdentity {
+    /// The mode for what the key says and what is known about the App.
+    pub fn resolve(
+        setting: Option<ShareIdentityMode>,
+        app: GithubAppPresence,
+    ) -> EffectiveShareIdentity {
+        let (mode, reason) = match (setting, app) {
+            (Some(mode), _) => (mode, ShareIdentityReason::Setting),
+            (None, GithubAppPresence::None) => {
+                (ShareIdentityMode::Instance, ShareIdentityReason::NoApp)
+            }
+            (None, GithubAppPresence::Configured) => {
+                (ShareIdentityMode::Personal, ShareIdentityReason::App)
+            }
+            (None, GithubAppPresence::Loading) => {
+                (ShareIdentityMode::Instance, ShareIdentityReason::AppLoading)
+            }
+        };
+        EffectiveShareIdentity { mode, reason }
+    }
+
+    /// Whether the mode came from the default rather than the key.
+    pub fn is_default(&self) -> bool {
+        self.reason != ShareIdentityReason::Setting
+    }
+
+    /// The reason in words, for a status report an admin reads.
+    pub fn reason_text(&self) -> &'static str {
+        match self.reason {
+            ShareIdentityReason::Setting => "set by github.share_identity",
+            ShareIdentityReason::NoApp => "default, because no GitHub App is configured",
+            ShareIdentityReason::App => "default, because a GitHub App is configured",
+            ShareIdentityReason::AppLoading => "default, until the GitHub App has been read",
         }
     }
 }
@@ -1987,32 +2063,41 @@ mod tests {
         assert!(config.github_stacks());
     }
 
-    /// Absent means the instance token does everything (today's behavior), and
-    /// only the exact word `personal` selects the split. Anything else - a
+    /// Absent says nothing, so the mode follows the App
+    /// ([`EffectiveShareIdentity`]), and only the exact word `personal` selects
+    /// the split. Anything else - a
     /// typo, or a spelling from a newer build - reads as `Instance`: a config
     /// file is hand-edited, so a mistyped value must not silently move an
     /// instance into or out of the stricter mode. The settings registry is
     /// what refuses a bad value on the way in.
     #[test]
-    fn github_share_identity_defaults_to_instance_and_tolerates_a_typo() {
+    fn github_share_identity_setting_reads_the_key_and_tolerates_a_typo() {
         let mut config = GlobalConfig::default();
         assert_eq!(
-            config.github_share_identity(),
-            ShareIdentityMode::Instance,
-            "absent github block means the instance token shares"
+            config.github_share_identity_setting(),
+            None,
+            "an absent github block says nothing"
         );
+        config.github = Some(GitHubConfig::default());
+        assert_eq!(config.github_share_identity_setting(), None);
 
         config.github = Some(GitHubConfig {
             share_identity: Some("personal".to_string()),
             ..Default::default()
         });
-        assert_eq!(config.github_share_identity(), ShareIdentityMode::Personal);
+        assert_eq!(
+            config.github_share_identity_setting(),
+            Some(ShareIdentityMode::Personal)
+        );
 
         config.github = Some(GitHubConfig {
             share_identity: Some("instance".to_string()),
             ..Default::default()
         });
-        assert_eq!(config.github_share_identity(), ShareIdentityMode::Instance);
+        assert_eq!(
+            config.github_share_identity_setting(),
+            Some(ShareIdentityMode::Instance)
+        );
 
         for garbage in ["sideways", "Personal", "", "  ", "personnel"] {
             config.github = Some(GitHubConfig {
@@ -2020,11 +2105,39 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(
-                config.github_share_identity(),
-                ShareIdentityMode::Instance,
-                "'{garbage}' must read as the safe default"
+                config.github_share_identity_setting(),
+                Some(ShareIdentityMode::Instance),
+                "'{garbage}' must read as instance and never follow the App"
             );
         }
+    }
+
+    /// The rule itself: an explicit key wins whatever the App, an absent key
+    /// follows the App, and an App not read yet keeps the narrower mode.
+    #[test]
+    fn the_effective_share_identity_follows_the_key_then_the_app() {
+        use GithubAppPresence as App;
+        use ShareIdentityMode::{Instance, Personal};
+        for app in [App::None, App::Configured, App::Loading] {
+            for mode in [Instance, Personal] {
+                let effective = EffectiveShareIdentity::resolve(Some(mode), app);
+                assert_eq!(effective.mode, mode, "{app:?}");
+                assert!(!effective.is_default());
+            }
+        }
+        for (app, mode, reason) in [
+            (App::None, Instance, ShareIdentityReason::NoApp),
+            (App::Configured, Personal, ShareIdentityReason::App),
+            (App::Loading, Instance, ShareIdentityReason::AppLoading),
+        ] {
+            let effective = EffectiveShareIdentity::resolve(None, app);
+            assert_eq!((effective.mode, effective.reason), (mode, reason));
+            assert!(effective.is_default());
+        }
+        assert_eq!(
+            EffectiveShareIdentity::resolve(None, App::Configured).reason_text(),
+            "default, because a GitHub App is configured"
+        );
     }
 
     /// The configured agent account is trimmed, and an empty or blank value is

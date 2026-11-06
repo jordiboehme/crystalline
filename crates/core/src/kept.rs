@@ -367,6 +367,43 @@ pub fn scan(root: &Path) -> Vec<KeptText> {
     found
 }
 
+/// The kept texts of one account under `root`, as a name's drafts count them:
+/// those kept from its review drafts, and the comments it is the recorded sender
+/// of, which its reading right alone reaches. A text set aside with a removed
+/// domain or left unfinished is never served, so it does not count.
+///
+/// Unlike [`scan`] this fails, naming the domain whose folder could not be read,
+/// because the caller decides who may take the name: a folder that cannot be
+/// read is not a folder that holds nothing. Another account's folder inside it
+/// is not asked.
+pub fn held_by(root: &Path, account: &str) -> Result<Vec<KeptText>, String> {
+    let readable = |dir: &Path| match std::fs::read_dir(dir) {
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        Ok(_) => true,
+    };
+    if !readable(root) {
+        return Err(root.display().to_string());
+    }
+    for entry in dir_entries(root) {
+        if !entry.is_dir || entry.name == REMOVED_DIR || entry.name.starts_with('.') {
+            continue;
+        }
+        if !readable(&entry.path.join(DRAFT_DIR).join(account)) {
+            return Err(entry.name);
+        }
+    }
+    Ok(scan(root)
+        .into_iter()
+        .filter(|kept| {
+            !kept.removed
+                && !kept.unfinished
+                && (kept.owner.as_deref() == Some(account)
+                    || (kept.kind == KeptKind::Comment
+                        && kept.sender.as_ref().is_some_and(|s| s.account == account)))
+        })
+        .collect())
+}
+
 /// The kept text with `id` under `root`. An id is only ever matched against
 /// what [`scan`] finds, never joined onto a path.
 pub fn find(root: &Path, id: &str) -> Option<KeptText> {

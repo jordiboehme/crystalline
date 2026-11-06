@@ -67,6 +67,8 @@ struct GithubLinkPending {
     /// The account the link lands on: the account of the session that
     /// started it.
     account: String,
+    /// When the account was made, read as the link began.
+    born: Option<String>,
     /// The sha256 of the starting session's CSRF token (see [`session_hash`]).
     session_hash: String,
     /// The redirect uri that went out with the authorize url. GitHub compares
@@ -138,10 +140,15 @@ pub struct GithubLinkResponse {
     /// its GitHub card by it.
     #[schema(example = true)]
     pub app_configured: bool,
+    /// Whose identity shares on this instance run on, the mode in effect:
+    /// `instance` or `personal`. What the profile card says follows it.
+    #[schema(example = "personal")]
+    pub share_identity: String,
 }
 
 fn view(v: GithubLinkView) -> GithubLinkResponse {
     GithubLinkResponse {
+        share_identity: v.share_identity,
         linked: v.linked,
         login: v.login,
         github_id: v.github_id,
@@ -310,7 +317,14 @@ pub async fn start(
     let csrf = identity.csrf.as_deref().ok_or_else(|| {
         ApiError::forbidden("this request carries no session to bind the link to: log in again")
     })?;
-    let authorize_url = begin(&state, &user.name, csrf)?;
+    let admin = user.role == Role::Admin;
+    let authorize_url = begin(&state, &user.name, csrf).await.map_err(|mut error| {
+        // The sentence names a command or a setting only an admin can use.
+        if !admin && let Some(reason) = error.reason {
+            error.detail = reason.plain_sentence().to_string();
+        }
+        error
+    })?;
     Ok((no_store(), Json(StartGithubLinkResponse { authorize_url })).into_response())
 }
 
@@ -318,13 +332,17 @@ pub async fn start(
 /// single-use link an agent session hands out ([`go`]). Mints a state bound
 /// to `account` and to the session whose CSRF token is `csrf`, and answers
 /// GitHub's authorize url.
-fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiError> {
+async fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiError> {
     refuse_read_only(state)?;
     let app = state
         .engine
         .github_link_app_explained()
         .map_err(|refusal| {
-            let error = ApiError::from(refusal.error);
+            // The full sentence: the caller of this function words it for who reads
+            // it, and an admin keeps it.
+            let full = refusal.error.to_string();
+            let mut error = ApiError::from(refusal.error);
+            error.detail = full;
             match refusal.reason {
                 Some(reason) => error.reason(reason),
                 None => error,
@@ -347,8 +365,12 @@ fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiErro
     let redirect_uri = public.join(&format!("/api/v1{CALLBACK_PATH}"));
     let flow_state = new_state();
     let now = state.engine.link_clock_now();
+    // Read as the link begins: the callback comes minutes later, and by then the
+    // name may hold another account.
+    let born = state.engine.account_born(account).await?;
     let pending = GithubLinkPending {
         account: account.to_string(),
+        born,
         session_hash: session_hash(csrf),
         redirect_uri: redirect_uri.clone(),
         started: now,
@@ -403,6 +425,12 @@ const LINK_OTHER_ACCOUNT: &str = "This link was made for another account, so it 
 /// module or a refusal detail written by this server, and it is escaped
 /// all the same.
 fn page(status: StatusCode, text: &str) -> Response {
+    plain_page(status, "Connect GitHub", text)
+}
+
+/// A short page for a browser that landed on a route it was sent to, where a
+/// problem document would show as raw JSON.
+pub(crate) fn plain_page(status: StatusCode, title: &str, text: &str) -> Response {
     let text = text
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -411,9 +439,9 @@ fn page(status: StatusCode, text: &str) -> Response {
     let body = format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Connect GitHub</title></head>\
+         <title>{title}</title></head>\
          <body style=\"font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; \
-         padding: 0 1rem; line-height: 1.5\"><h1>Connect GitHub</h1><p>{text}</p></body></html>\n"
+         padding: 0 1rem; line-height: 1.5\"><h1>{title}</h1><p>{text}</p></body></html>\n"
     );
     (
         status,
@@ -560,7 +588,7 @@ pub async fn go(
         );
         return page(StatusCode::FORBIDDEN, LINK_OTHER_ACCOUNT);
     }
-    match begin(&state, &user.name, csrf) {
+    match begin(&state, &user.name, csrf).await {
         Ok(authorize_url) => see_other(authorize_url),
         Err(e) => {
             tracing::warn!(
@@ -575,39 +603,12 @@ pub async fn go(
 
 /// What the link's page says when the link cannot start: the refusal's own
 /// sentence, except that a person who is not an admin reads a setup
-/// refusal's cause in plain words ([`setup_sentence`]), since the sentence
+/// refusal's cause in plain words ([`LinkSetupReason::plain_sentence`]), since the sentence
 /// names a command or a setting only an admin can use.
 fn refusal_text(error: &ApiError, admin: bool) -> &str {
     match error.reason {
-        Some(reason) if !admin => setup_sentence(reason),
+        Some(reason) if !admin => reason.plain_sentence(),
         _ => &error.detail,
-    }
-}
-
-/// The plain words for a setup refusal, for a person who is not an admin.
-/// Keep in step with `START_REASONS` in `fluid/src/screens/Profile.tsx`,
-/// which says the same on the profile's "Connect GitHub".
-fn setup_sentence(reason: LinkSetupReason) -> &'static str {
-    match reason {
-        LinkSetupReason::NoClientSecret => {
-            "The GitHub App on this instance has no client secret yet, so it cannot link \
-             accounts. Ask an admin to add it."
-        }
-        LinkSetupReason::NoPublicUrl => {
-            "This instance does not know its public address yet, so GitHub cannot send you \
-             back. Ask an admin to set it."
-        }
-        LinkSetupReason::AppUnusable => {
-            "The GitHub App on this instance is set up but cannot be used right now. Ask an \
-             admin to check its settings."
-        }
-        LinkSetupReason::Keychain => {
-            "This instance cannot read the GitHub App's stored keys right now. Ask an admin to \
-             check the server."
-        }
-        LinkSetupReason::NoApp => {
-            "This instance has no GitHub App yet. Ask an admin to set one up."
-        }
     }
 }
 
@@ -793,7 +794,11 @@ async fn finish(
         tracing::warn!("GitHub refused the code of the GitHub link of {account}: {e}");
         "failed"
     })?;
-    match state.engine.link_github(account, grant).await {
+    match state
+        .engine
+        .link_github_begun(account, pending.born.clone(), grant)
+        .await
+    {
         Ok(_) => Ok(()),
         Err(EngineError::Conflict(text)) if text.contains(crate::auth_store::GITHUB_ID_TAKEN) => {
             tracing::warn!(

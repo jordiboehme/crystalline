@@ -61,3 +61,34 @@ export async function resetPassword(
 export async function deleteUser(name: string): Promise<void> {
   await api(`/users/${encodeSegment(name)}`, { method: "DELETE" });
 }
+
+/** What ending a removed account's drafts did in one domain. */
+export interface DiscardedDrafts {
+  domain: string;
+  discarded: number;
+  /** Paths left because they are open in a live editor. */
+  left: string[];
+  /** Set when another instance hosts this domain. */
+  not_hosted?: boolean;
+  /** What to do when another instance hosts this domain. */
+  where?: string;
+  /** Why this domain stopped, after what `discarded` says went. */
+  error?: string;
+}
+
+/**
+ * End every draft a removed account left under its name, so the name can be used
+ * again. Refused for a name with an account.
+ */
+export async function discardUserDrafts(
+  name: string,
+): Promise<{ domains: DiscardedDrafts[]; error?: string }> {
+  const report = await api<{ domains?: DiscardedDrafts[]; error?: string }>(
+    `/users/${encodeSegment(name)}/drafts`,
+    { method: "DELETE" },
+  );
+  return {
+    domains: report.domains ?? [],
+    ...(report.error ? { error: report.error } : {}),
+  };
+}

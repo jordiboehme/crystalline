@@ -286,7 +286,7 @@ A domain export (the archive download in Fluid or `crystalline domain export`) a
 
 `crystalline reflect run` works the queue with a headless agent: it checks whether anything is due, takes the lease, runs Claude Code with the shipped prompt, shares what changed in the engrams as a pull request, records the run and releases the lease. With nothing due it ends at once and starts no agent. `claude` must be on the `PATH` of the run.
 
-On a team server, run it in remote mode against the home (`CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN`) with the `cmt_` token of an agent account that may curate the Reflection. A run in local mode acts as the machine owner, so it cannot tell its own writes from the edits people make in Fluid during the run, and the daemon's socket under the service user is out of reach of other accounts anyway. With systemd, use two files. `/etc/systemd/system/crystalline-reflect.service`:
+On a team server, run it in remote mode against the home (`CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN`) with the `cmt_` token of an agent account that may curate the Reflection. With a GitHub App the agent account needs its own GitHub link, as [Automation](automation.md) says: without one the run stops when it takes the lease. A run in local mode acts as the machine owner, so it cannot tell its own writes from the edits people make in Fluid during the run, and the daemon's socket under the service user is out of reach of other accounts anyway. With systemd, use two files. `/etc/systemd/system/crystalline-reflect.service`:
 
 ```ini
 [Unit]

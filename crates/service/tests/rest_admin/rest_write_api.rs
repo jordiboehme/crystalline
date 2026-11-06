@@ -3527,6 +3527,13 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/users/mark/drafts",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // Starting a single sign-on that links its identity to the caller's
         // account. Viewer-level like the two surfaces below (how somebody
         // signs in is not a privilege) and read-only exempt for the same

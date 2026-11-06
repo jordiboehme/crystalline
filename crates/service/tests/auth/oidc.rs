@@ -744,12 +744,15 @@ impl RestCtx {
         let config_path = tmp.path().join("config.yaml");
         crystalline_core::config::save_yaml(&config_path, &config).unwrap();
         let store = TursoStore::open_in_memory().await.unwrap();
-        let engine = Arc::new(Engine::new(
-            Arc::new(tokio::sync::Mutex::new(store)),
-            config,
-            None,
-            Some(config_path),
-        ));
+        let engine = Arc::new(
+            Engine::new(
+                Arc::new(tokio::sync::Mutex::new(store)),
+                config,
+                None,
+                Some(config_path),
+            )
+            .with_state_dir(tmp.path().to_path_buf()),
+        );
         engine.sync(None).await.unwrap();
         let auth = Arc::new(
             AuthStore::open(&tmp.path().join("web-auth.db"))
@@ -1769,6 +1772,45 @@ async fn a_refused_callback_warns_the_operator_and_leaks_nothing() {
 
 // --- provisioning and the identity key --------------------------------------
 
+/// A first sign-in on a name with a removed account's drafts is refused until an
+/// admin acts. The browser lands on this route, so it reads a page, not raw JSON,
+/// and the page names nothing about the name's past.
+#[tokio::test]
+async fn a_first_sign_in_on_a_name_with_drafts_reads_a_page_that_says_ask_an_admin() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    crystalline_core::kept::write(
+        &ctx._tmp.path().join(crystalline_core::kept::KEPT_DIR),
+        "eng",
+        Some("ada"),
+        crystalline_core::kept::KeptKind::Engram,
+        "plan.md",
+        chrono::Utc::now(),
+        "OLD ADA PRIVATE TEXT",
+    )
+    .unwrap();
+    idp.set_user(IdpUser {
+        subject: "sub-1".to_string(),
+        preferred_username: Some("ada".to_string()),
+        name: Some("Ada".to_string()),
+        email: Some("ada@example.test".to_string()),
+    });
+    let answer = ctx.sign_in().await;
+    assert_eq!(answer.status(), 409);
+    let kind = answer
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(kind.starts_with("text/html"), "{kind}");
+    let body = answer.text().await.unwrap();
+    assert!(body.contains("Ask an admin"), "{body}");
+    assert!(!body.contains("eng"), "no domain is named: {body}");
+    assert!(ctx.user("ada").await.is_none());
+}
+
 /// The first sign-in provisions an account; the second lands in the same one
 /// even though the provider has renamed the person since. `(issuer, sub)` is
 /// the key, and a username is presentation data that follows the rename
@@ -2210,14 +2252,10 @@ async fn the_identity_link_routes_need_a_session() {
     );
 }
 
-/// The account cap is respected, and the refusal is the operator-facing 403
-/// that names the setting rather than a 500.
-///
-/// The status is what this pins: the mapping reads the store's own sentence,
-/// so a reworded cap message would silently turn an operator's 403 into an
-/// unexplained server error, and nothing else in the suite would notice.
+/// The account cap is respected. The person reads a plain 403 on a page, and the
+/// sentence that names the setting goes to the log.
 #[tokio::test]
-async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
+async fn a_sign_in_past_the_account_cap_is_refused_in_plain_words() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::build_capped(
         Some(OidcConfig {
@@ -2238,7 +2276,8 @@ async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
     let refused = ctx.sign_in().await;
     assert_eq!(refused.status(), 403);
     let body = refused.text().await.unwrap();
-    assert!(body.contains("auth.max_users"), "{body}");
+    assert!(body.contains("Ask an admin"), "{body}");
+    assert!(!body.contains("auth.max_users"), "{body}");
     assert!(
         ctx.user("ada.lovelace").await.is_none(),
         "a refused provisioning leaves no account behind"

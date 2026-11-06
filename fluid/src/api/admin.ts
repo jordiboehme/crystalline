@@ -78,6 +78,10 @@ export interface GithubStatus {
   error: string | null;
   /** The instance's GitHub App, or null when none is configured. */
   app: GithubApp | null;
+  /** Whose identity shares run on, the mode in effect, when the server says. */
+  shareIdentity: string | null;
+  /** Whether that mode is the default rather than the setting. */
+  shareIdentityDefault: boolean;
 }
 
 /** The instance's GitHub App. No secret: the server sends none. */
@@ -123,6 +127,8 @@ export function readGithubStatus(payload: unknown): GithubStatus {
     pending: readPending(record?.pending),
     error: asString(record?.error),
     app: readApp(record?.app),
+    shareIdentity: asString(record?.share_identity),
+    shareIdentityDefault: record?.share_identity_default === true,
   };
 }
 
@@ -446,6 +452,11 @@ export interface GithubLink {
   pending: GithubPending | null;
   /** That device flow's failure, in the server's words, reported once. */
   error: string | null;
+  /**
+   * Whose identity shares run on, the mode in effect: `instance`, `personal`,
+   * or null from an older server, which draws today's card.
+   */
+  shareIdentity: string | null;
 }
 
 /**
@@ -469,6 +480,7 @@ export function readMyGithubLink(payload: unknown): GithubLink {
     tokenLive: record?.token_live === true,
     pending: readPending(record?.pending),
     error: asString(record?.error),
+    shareIdentity: asString(record?.share_identity),
   };
 }
 
@@ -989,7 +1001,9 @@ export interface SyncStatus {
 // which `/me/github-identity` answers for, and no screen in this app describes
 // the owner's slot. A reader with nothing behind it is a claim to keep true
 // for nothing, so the key is ignored until a surface asks for it - at which
-// point it is five lines beside `shareIdentity`. The CLI renders it today.
+// point it is five lines beside `shareIdentity`. The CLI renders it today. The
+// server sends it, `agent_identity` and the mode's reason to an admin only, so
+// nothing here may depend on them.
 
 /** One kept share branch, as the sync route reports it. */
 export interface KeptBranch {
@@ -1430,6 +1444,11 @@ export interface SharePlan {
    */
   note: string | null;
   /**
+   * The server's sentence when a change of letter case in this share will not
+   * reach the team; null otherwise, and from an older server.
+   */
+  spellingNote: string | null;
+  /**
    * The team marker this share adds to the MANIFEST, with the server's
    * reason, when it adds one; null otherwise, and from an older server. It
    * is not in `changes`: the folder does not hold it yet, and `changes` is
@@ -1527,6 +1546,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     title: asString(record?.title),
     own: record?.own !== false,
     note: asString(record?.note),
+    spellingNote: asString(record?.spelling_note),
     teamMarker: readTeamMarker(record?.team_marker),
   };
 }

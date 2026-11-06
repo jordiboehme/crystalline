@@ -1101,6 +1101,12 @@ enum KeptCommand {
 
 #[derive(Subcommand, Debug)]
 enum UsersCommand {
+    /// End every draft a removed account left under its name, so the name can
+    /// be used again. Never automatic, and refused for a name with an account.
+    DiscardDrafts {
+        /// The name of the removed account.
+        name: String,
+    },
     /// Create an account. The name is the login name; it is stored trimmed
     /// and lowercased, so `Ada` and `ada` are one account.
     Add {

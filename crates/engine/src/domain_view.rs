@@ -921,13 +921,20 @@ impl<'a> DomainView<'a> {
         let actor = self.writing_actor()?;
         let domain = self.domain.as_str();
         let state_dir = self.engine.journal_state_dir()?;
-        crate::overlay_journal::journal_clear(&state_dir, domain, actor, path).map_err(
-            |source| EngineError::Io {
-                path: state_dir.display().to_string(),
-                source,
-            },
-        )?;
         let store = self.engine.store();
+        let keeps_mirror = self
+            .engine
+            .deletion_shares_a_mirror(domain_id, actor, path)
+            .await?;
+        let mirrored = if keeps_mirror {
+            crate::overlay_journal::journal_clear_tombstone(&state_dir, domain, actor, path)
+        } else {
+            crate::overlay_journal::journal_clear(&state_dir, domain, actor, path)
+        };
+        mirrored.map_err(|source| EngineError::Io {
+            path: state_dir.display().to_string(),
+            source,
+        })?;
         let store = store.lock().await;
         store.begin().await?;
         let done = async {
@@ -1273,19 +1280,57 @@ impl<'a> DomainView<'a> {
         let actor = self.writing_actor()?;
         let store = self.engine.store();
         let store = store.lock().await;
-        let taken = store
-            .overlay_entry(src.domain_id, actor, dest_rel)
-            .await?
-            .map(|entry| !entry.tombstone)
-            .unwrap_or(false)
-            || store
-                .list_engrams(&p.domain, Some(dest_rel), None)
-                .await?
-                .iter()
-                .any(|found| found.path == dest_rel);
-        if taken {
+        let drafts = store.overlay_entries(src.domain_id, actor).await?;
+        let team = store.list_engrams(&p.domain, None, None).await?;
+        // The team's file this very draft was moved from is not in the way: a
+        // draft with no team file of its own, and this actor's deletion on another
+        // spelling of it, are one case-only move. It can move to a third spelling
+        // or back, and a discard is no way out, since that would cost the edit.
+        // Where the draft has a team file of its own, these are two real files.
+        let folded = crystalline_core::fold_path_case(dest_rel);
+        let its_own_move = crystalline_core::fold_path_case(&src.path) == folded
+            && !team.iter().any(|found| found.path == src.path);
+        let moved_from = |path: &str| {
+            its_own_move
+                && drafts
+                    .iter()
+                    .any(|entry| entry.tombstone && entry.path == path)
+        };
+        let exact = drafts
+            .iter()
+            .any(|entry| !entry.tombstone && entry.path == dest_rel)
+            || team.iter().any(|found| found.path == dest_rel);
+        if exact && !moved_from(dest_rel) {
             return Err(EngineError::Conflict(format!(
                 "'{dest_rel}' already holds an engram in domain '{}'",
+                p.domain
+            )));
+        }
+        // Another spelling of a path somebody else stands at is taken too: no
+        // macOS or Windows checkout can hold the two, and on such a disk the
+        // fold would write over that file with no warning. The source's own
+        // other spelling is the one that is free, since that is a rename of
+        // itself.
+        let same_name = |path: &str| {
+            path != src.path
+                && path != dest_rel
+                && crystalline_core::fold_path_case(path) == folded
+                && !moved_from(path)
+        };
+        let held = drafts
+            .iter()
+            .find(|entry| !entry.tombstone && same_name(&entry.path))
+            .map(|entry| entry.path.as_str())
+            .or_else(|| {
+                team.iter()
+                    .find(|found| same_name(&found.path))
+                    .map(|found| found.path.as_str())
+            });
+        if let Some(held) = held {
+            return Err(EngineError::Conflict(format!(
+                "'{dest_rel}' differs only in letter case from '{held}', which is already an \
+                 engram in domain '{}'. macOS and Windows cannot hold the two, so pick another \
+                 name.",
                 p.domain
             )));
         }
@@ -2613,7 +2658,12 @@ impl<'a> DomainView<'a> {
             };
             write_staged_file(staging.root(), rel, &content)?;
         }
-        for entry in entries {
+        // The deletions first, as a fold takes them: a case-only move is a
+        // tombstone at one spelling and a draft at the other, and on a disk that
+        // folds case a deletion taken second would remove the draft just staged.
+        // The proposal would then read as the team's file deleted.
+        let (gone, landing): (Vec<_>, Vec<_>) = entries.iter().partition(|entry| entry.tombstone);
+        for entry in gone.into_iter().chain(landing) {
             // The write verbs normalize a draft's path before it becomes a row, so
             // this is the second assertion rather than the first - and it is here
             // because a path that escaped would write outside the staged tree, which

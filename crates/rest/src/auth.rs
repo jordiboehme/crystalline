@@ -607,6 +607,13 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
         // The store folds the name, so a proxy that sends `Ada` today and `ada`
         // tomorrow keeps one account, and it hands disabled accounts back like
         // any other: refusing them is this layer's job.
+        // Before the account exists, so a second request for the same newcomer
+        // takes the same step and never acts ahead of it.
+        // Past the account cap the store refuses a new name anyway, so a proxy
+        // that sends a new value on every request costs no walk of the drafts.
+        if state.auth.user_count().await? < state.auth_cfg.max_users {
+            super::users_api::clear_name_for_new_account(state, value, false).await?;
+        }
         let user = state
             .auth
             .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
@@ -617,9 +624,8 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
                 // apart by kind rather than by substring, so rewording the
                 // store's sentence cannot turn this into a 500.
                 match StoreRefusal::kind_of(&e) {
-                    Some(RefusalKind::CapReached | RefusalKind::InvalidName) => {
-                        ApiError::forbidden(format!("{e:#}"))
-                    }
+                    Some(RefusalKind::CapReached) => super::users_api::account_cap_refusal(&e),
+                    Some(RefusalKind::InvalidName) => ApiError::forbidden(format!("{e:#}")),
                     _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
@@ -981,9 +987,10 @@ async fn provision_forwarded_user(
     display: Option<&str>,
     email: Option<&str>,
 ) -> Result<User, ApiError> {
-    let provisioned = state
-        .auth
-        .provision_linked_user(
+    let provisioned = super::users_api::provision_clear(
+        state,
+        &desired_account_name(subject),
+        state.auth.provision_linked_user(
             PROXY_ISSUER,
             subject,
             &desired_account_name(subject),
@@ -991,8 +998,9 @@ async fn provision_forwarded_user(
             email,
             state.auth_cfg.proxy_role,
             state.auth_cfg.max_users,
-        )
-        .await;
+        ),
+    )
+    .await?;
     match provisioned {
         Ok(user) => Ok(user),
         Err(err) => {
@@ -1005,7 +1013,7 @@ async fn provision_forwarded_user(
             // the desired name is derived, so both are names by the time the
             // store sees them.
             match StoreRefusal::kind_of(&err) {
-                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                Some(RefusalKind::CapReached) => Err(super::users_api::account_cap_refusal(&err)),
                 _ => Err(ApiError::internal(format!("{err:#}"))),
             }
         }
@@ -1797,6 +1805,7 @@ pub async fn setup(
     }
     super::check_password(&body.password)?;
     authorize_setup(&state, peer, &headers, body.token.as_deref())?;
+    super::users_api::clear_name_for_new_account(&state, &body.name, true).await?;
     // The login name as typed makes the better display name, matching
     // `users_api::create`: the store folds the login name and keeps this one.
     let display = body.name.trim().to_string();
@@ -2019,7 +2028,7 @@ pub async fn logout(
                    (`needs_setup`, which is what opens `POST /auth/setup`), \
                    whether this session may drive the share surfaces \
                    (`can_share`: an admin always, an editor when \
-                   `github.share_identity` is `personal`), and \
+                   `github.share_identity` is `personal`, the default with a GitHub App), and \
                    which server version it is talking to. Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and an \
@@ -2118,7 +2127,10 @@ pub async fn me(
     // the surfaces just opened to them.
     let can_share = identity
         .may_share(state.engine.share_identity_mode())
-        .is_ok();
+        .is_ok()
+        // A refused App refuses every share of a person. An admin keeps the
+        // surface, because that is where the App's reason is read and fixed.
+        && (identity.require_admin().is_ok() || !state.engine.github_app_refuses_shares());
     Ok((
         jar,
         no_store(),
