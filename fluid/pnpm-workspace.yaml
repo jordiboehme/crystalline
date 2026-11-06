@@ -16,10 +16,7 @@ overrides:
   # KaTeX the reader sets math with (0.19.1).
   "katex@<0.19.1": ^0.19.1
   # GHSA-g3hv-75wg-m249: eslint, @eslint/config-array and typescript-estree ask for
-  # minimatch ^10, which has no fix. They use only Minimatch#match, the pattern
-  # and minimatch(), which 11 keeps, so keep it at the fixed release.
+  # minimatch ^10 (eslint 10.14 asks ^10.2.6), and no 10.x release has the fix
+  # (first patched: 11.0.1). They use only Minimatch#match, the pattern and
+  # minimatch(), which 11 keeps, so keep it at the fixed release.
   "minimatch@<11.0.1": ^11.0.4
-  # @tailwindcss/node 4.3.3 pins lightningcss 1.32.0, which does not know the
-  # ::highlight() pseudo-element and warns on every build; 1.33.0 (the one
-  # vite already uses) reads it. One copy for both.
-  "lightningcss@1.32.0": 1.33.0
