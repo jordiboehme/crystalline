@@ -8,7 +8,7 @@
  * run it the same way (`bash fluid/e2e/run-smoke.sh e2e/diagram-rename.spec.ts`).
  */
 
-import type { Page } from "@playwright/test";
+import type { Page, WebSocketRoute } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
@@ -584,8 +584,17 @@ test("a composition keeps the page where it is, and its letter is whole", async 
     selectionStart: 1,
     selectionEnd: 1,
   });
+  // A peer's lines move the field, and from there the page holds (N8).
+  await peerEdit(page, "```mermaid", "peer\n\npeer\n\npeer\n\n");
+  await page.waitForTimeout(300);
+  const moved = (await field(page).boundingBox())?.y ?? 0;
   const content = await page.locator(".cm-content").boundingBox();
   await page.mouse.move((content?.x ?? 0) + 100, 400);
+  await page.mouse.wheel(0, 40);
+  await page.waitForTimeout(400);
+  expect(
+    Math.abs(((await field(page).boundingBox())?.y ?? 0) - moved),
+  ).toBeLessThanOrEqual(2);
   await page.mouse.wheel(0, 100_000);
   await page.waitForTimeout(400);
   await expect(box(page)).toHaveCount(1);
@@ -617,4 +626,108 @@ test("the field keeps its text in the middle of a tall box", async ({
   expect(
     Math.abs(place.y + place.height / 2 - (shape.y + shape.height / 2)),
   ).toBeLessThanOrEqual(2);
+});
+
+test("a refused draft and the search palette: the page goes, and a notice names the text", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  await page.keyboard.press("ControlOrMeta+k");
+  await page.keyboard.type("Home");
+  await page.waitForTimeout(400);
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  const note = page.locator(".cm-diagram-lost-draft");
+  await expect(note).toContainText("a %%{ b");
+  await note.getByRole("button", { name: "Dismiss" }).click();
+  await expect(note).toHaveCount(0);
+});
+
+test("under Raw a refused draft comes back once the caret leaves, and a second leave goes", async ({
+  page,
+}) => {
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  const raw = page.getByRole("button", { name: "Raw", exact: true });
+  await raw.click();
+  const note = page.locator(".cm-diagram-raw-note");
+  await expect(note).toContainText("a %%{ b");
+  await page.locator(".cm-line", { hasText: "B[Second]" }).click();
+  await raw.click();
+  await expect(note).toContainText("caret");
+  await expect(field(page)).toHaveCount(0);
+  await page.locator(".cm-line", { hasText: "Below marker" }).click();
+  await expect(field(page)).toHaveValue("a %%{ b");
+  await expect(note).toHaveCount(0);
+
+  await raw.click();
+  await expect(note).toContainText("a %%{ b");
+  const done = page.getByRole("link", { name: "Done", exact: true });
+  await done.click();
+  await expect(note).toBeVisible();
+  await expect(page.locator(".cm-content")).toHaveCount(1);
+  await done.click();
+  await expect(page.locator(".cm-content")).toHaveCount(0);
+  await expect(page.locator(".cm-diagram-lost-draft")).toContainText("a %%{ b");
+});
+
+/** Passes a room's socket through, and can say to the page the room closed. */
+async function closableRoom(page: Page): Promise<() => void> {
+  const sockets: WebSocketRoute[] = [];
+  await page.routeWebSocket(/\/collab\//, (socket) => {
+    const server = socket.connectToServer();
+    socket.onMessage((message) => {
+      server.send(message);
+    });
+    server.onMessage((message) => {
+      socket.send(message);
+    });
+    sockets.push(socket);
+  });
+  return () => {
+    const json = Buffer.from(
+      JSON.stringify({ kind: "closed", reason: "deleted" }),
+    );
+    for (const socket of sockets) {
+      socket.send(Buffer.concat([Buffer.from([4, json.length]), json]));
+    }
+  };
+}
+
+const storedDrafts = (page: Page) =>
+  page.evaluate(() => JSON.stringify({ ...window.localStorage }));
+
+test("a room closing writes a good draft into the draft the banner promises", async ({
+  page,
+}) => {
+  const close = await closableRoom(page);
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("MyDraftWord");
+  close();
+  await expect(page.getByText("your text is kept as a draft")).toBeVisible();
+  await expect.poll(() => storedDrafts(page)).toContain("B[MyDraftWord]");
+  await expect(page.locator(".cm-content")).toHaveCount(0, { timeout: 5_000 });
+  await expect(page.locator(".cm-diagram-lost-draft")).toHaveCount(0);
+});
+
+test("a room closing with a refused draft shows the text and stays until the person goes", async ({
+  page,
+}) => {
+  const close = await closableRoom(page);
+  await openEditor(page, DOC);
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("a %%{ b");
+  close();
+  const said = page.getByRole("alert").filter({ hasText: "a %%{ b" });
+  await expect(said).toBeVisible();
+  await page.waitForTimeout(2_000);
+  await expect(page.locator(".cm-content")).toHaveCount(1);
+  await expect(said).toBeVisible();
+  await expect(field(page)).toHaveCount(0);
+  await page.getByRole("link", { name: "Done", exact: true }).click();
+  await expect(page.locator(".cm-content")).toHaveCount(0);
 });

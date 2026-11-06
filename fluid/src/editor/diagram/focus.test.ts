@@ -1422,6 +1422,22 @@ describe("after a canvas delete, the next letter is on a line of its own (R83)",
     await deleteAndType(view, box(view), "a | b\nQ\n---|---\n", doc);
   });
 
+  it.each([["- item"], ["> quote"]])(
+    "a paragraph below %j, which would run into it with no byte changed (N7)",
+    async (above) => {
+      const doc = `${above}\n${fence(BODY)}\nfoo\n`;
+      const view = await drawn(doc);
+      await deleteAndType(view, box(view), `${above}\nQ\nfoo\n`, doc);
+    },
+  );
+
+  it("a paragraph below a table's last row, which would become a row (N7)", async () => {
+    const table = "| a | b |\n|---|---|\n| 1 | 2 |";
+    const view = await drawn(`${table}\n${fence(BODY)}\nfoo\n`);
+    expect(removeFence(view, `${table}\n`.length)).toEqual({ applied: true });
+    expect(text(view)).toBe(`${table}\n\nfoo\n`);
+  });
+
   it("an ordinary paragraph below joins as before, with `===` harmless under a heading", async () => {
     const doc = `# Head\n${fence(BODY)}\n===\n`;
     const view = await drawn(doc);

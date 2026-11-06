@@ -23,7 +23,7 @@ import {
 import { mainSelectionParked } from "../parkedSelection";
 import { mermaidFence, MERMAID_STARTER_GROUPS } from "../mermaidStarters";
 import { insertBlock, selectToken } from "../toolbar";
-import { drawnFenceLines } from "./draws";
+import { drawnFenceLines, settleFieldDraft } from "./draws";
 import { NOTICES } from "./edits";
 import { flowKind, runDiagramOp } from "./apply";
 import { parseFlowchart } from "./flowchart/parse";
@@ -159,8 +159,13 @@ async function rename(view: EditorView, id: string, value: string) {
   await closed(view);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   forgetDrawings();
+  // The last test's view went in `afterEach`, and a draft it held said so after.
+  await flush();
+  for (const note of document.querySelectorAll(".cm-diagram-lost-draft")) {
+    note.remove();
+  }
 });
 
 afterEach(() => {
@@ -1142,5 +1147,236 @@ describe("what the field holds to", () => {
     expect(fieldOf(view)).toBe(field);
     press(field, "Escape");
     await closed(view);
+  });
+});
+
+const lostNote = () =>
+  document.querySelector(".cm-diagram-lost-draft")?.textContent ?? "";
+
+describe("a view going away with a draft (N4)", () => {
+  it("names the text when the view goes by a route nothing held", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "My word");
+    view.destroy();
+    await flush();
+    expect(lostNote()).toContain("My word");
+    document
+      .querySelector<HTMLElement>(".cm-diagram-lost-draft button")
+      ?.click();
+    expect(lostNote()).toBe("");
+  });
+
+  it("names a refused one too, and says nothing for a field nobody typed in", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    view.destroy();
+    await flush();
+    expect(lostNote()).toBe("");
+    const other = await drawn();
+    clickNode(other, "B");
+    type(fieldOf(other), "a %%{ b");
+    other.contentDOM.focus();
+    await vi.waitFor(() => {
+      expect(noticeOf(other)).toContain("Escape");
+    });
+    other.destroy();
+    await flush();
+    expect(lostNote()).toContain("a %%{ b");
+  });
+
+  it("names it on a setState", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "New");
+    view.setState(EditorState.create({ doc: "Other text" }));
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lostNote()).toContain("New");
+  });
+
+  it("names it when the page stops taking writes under the field", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "Done");
+    const { StateEffect } = await import("@codemirror/state");
+    view.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    await closed(view);
+    expect(lostNote()).toContain("Done");
+  });
+});
+
+describe("a room closing with a field open (N2, R100)", () => {
+  it("answers at once with no field", async () => {
+    const view = await drawn();
+    expect(settleFieldDraft(view)).toBeNull();
+  });
+
+  it("writes a good draft into the text, for the draft the banner promises", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "Kept");
+    await expect(settleFieldDraft(view)).resolves.toBeNull();
+    expect(text(view)).toBe(withB("Kept"));
+    expect(noField(view)).toBe(true);
+    expect(view.state.field(diagramIntent)).toBeNull();
+  });
+
+  it("names a text it cannot write, and holds nothing after", async () => {
+    const view = await drawn();
+    const went = vi.fn();
+    const link = document.createElement("a");
+    link.href = "#x";
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      went();
+    });
+    document.body.append(link);
+    clickNode(view, "B");
+    type(fieldOf(view), "a %%{ b");
+    await expect(settleFieldDraft(view)).resolves.toBe("a %%{ b");
+    expect(text(view)).toBe(DOC);
+    expect(noField(view)).toBe(true);
+    link.click();
+    expect(went).toHaveBeenCalledTimes(1);
+    view.destroy();
+    await flush();
+    expect(lostNote()).toBe("");
+  });
+
+  it("answers null for a field nobody typed in, and closes it", async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    await expect(settleFieldDraft(view)).resolves.toBeNull();
+    expect(noField(view)).toBe(true);
+  });
+});
+
+describe("a refused draft under Raw has an end (N3)", () => {
+  const under = async () => {
+    const view = await drawn();
+    clickNode(view, "B");
+    type(fieldOf(view), "a %%{ b");
+    setRaw(view, true);
+    await vi.waitFor(() => {
+      expect(
+        view.dom.querySelector(".cm-diagram-raw-note")?.textContent,
+      ).toContain("a %%{ b");
+    });
+    return view;
+  };
+  const note = (view: EditorView) =>
+    view.dom.querySelector(".cm-diagram-raw-note")?.textContent ?? "";
+
+  it("comes back when the caret leaves a fence that Raw off left as text", async () => {
+    const view = await under();
+    setCaret(view, DOC.indexOf("Next"), "select");
+    setRaw(view, false);
+    await flush();
+    await flush();
+    expect(noField(view)).toBe(true);
+    expect(note(view)).toContain("caret");
+    setCaret(view, 2, "select");
+    await vi.waitFor(() => {
+      expect(fieldOf(view).value).toBe("a %%{ b");
+    });
+    expect(note(view)).toBe("");
+  });
+
+  it("comes back when the verdict of a changed fence lands", async () => {
+    const view = await under();
+    const at = DOC.indexOf("    A[First");
+    view.dispatch({
+      changes: { from: at, insert: `    %% n${String(Date.now())}\n` },
+    });
+    setRaw(view, false);
+    await vi.waitFor(() => {
+      expect(fieldOf(view).value).toBe("a %%{ b");
+    });
+  });
+
+  it("says how to leave, and a second try leaves, naming the text", async () => {
+    const view = await under();
+    expect(note(view)).toContain("again");
+    const went = vi.fn();
+    const link = document.createElement("a");
+    link.href = "#x";
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      went();
+    });
+    document.body.append(link);
+    link.click();
+    expect(went).not.toHaveBeenCalled();
+    link.click();
+    expect(went).toHaveBeenCalledTimes(1);
+    expect(lostNote()).toContain("a %%{ b");
+    expect(note(view)).toBe("");
+    setRaw(view, false);
+    await flush();
+    await flush();
+    expect(noField(view)).toBe(true);
+  });
+
+  it("a second Back goes as well", async () => {
+    const router = vi.fn();
+    const forward = vi
+      .spyOn(window.history, "forward")
+      .mockImplementation(() => undefined);
+    window.addEventListener("popstate", router);
+    try {
+      await under();
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      expect(forward).toHaveBeenCalledTimes(1);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      expect(router).not.toHaveBeenCalled();
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      expect(router).toHaveBeenCalledTimes(1);
+      expect(lostNote()).toContain("a %%{ b");
+    } finally {
+      window.removeEventListener("popstate", router);
+      forward.mockRestore();
+    }
+  });
+
+  it("names the text when the view goes while Raw holds it", async () => {
+    const view = await under();
+    view.destroy();
+    await flush();
+    await flush();
+    expect(lostNote()).toContain("a %%{ b");
+  });
+
+  it("ends with the text named when the fence cannot read again", async () => {
+    const view = await under();
+    const at = DOC.indexOf("    A[First");
+    view.dispatch({ changes: { from: at, insert: "    C -->\n" } });
+    setRaw(view, false);
+    await vi.waitFor(() => {
+      expect(lostNote()).toContain("a %%{ b");
+    });
+    expect(note(view)).toBe("");
+  });
+});
+
+describe("two Backs in one tick (N6)", () => {
+  it("writes the draft, and the router hears one", async () => {
+    const router = vi.fn();
+    window.addEventListener("popstate", router);
+    try {
+      const view = await drawn();
+      clickNode(view, "B");
+      type(fieldOf(view), "Twice");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      await vi.waitFor(() => {
+        expect(router).toHaveBeenCalled();
+      });
+      expect(text(view)).toBe(withB("Twice"));
+    } finally {
+      window.removeEventListener("popstate", router);
+    }
   });
 });

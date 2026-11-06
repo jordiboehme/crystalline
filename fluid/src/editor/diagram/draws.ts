@@ -145,3 +145,22 @@ export function stepIntoDrawnFence(
   enter(view, fence.from);
   return true;
 }
+
+/**
+ * What the chunk's open rename field does when the room closes: writes its text
+ * into the document if it can, and answers with what it could not keep.
+ */
+export const fieldSettlers = new WeakMap<
+  EditorView,
+  () => Promise<string | null>
+>();
+
+/**
+ * Settles the view's open rename field, or null at once with none open. The answer
+ * is the text that could not be kept, null when nothing was lost (R100).
+ */
+export function settleFieldDraft(
+  view: EditorView,
+): Promise<string | null> | null {
+  return fieldSettlers.get(view)?.() ?? null;
+}

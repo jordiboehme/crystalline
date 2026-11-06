@@ -229,10 +229,11 @@ export function removeFence(view: EditorView, anchor: number): ApplyOutcome {
 
 /**
  * Whether a letter at the start of `line` is only a letter: blank, or a paragraph
- * that does not change the text above when it moves up under it. A paragraph's
- * `===`, `--` or `---|---` under a line of text would make that line a heading or
- * a table, with no byte of it changed, so the parser is asked rather than a list
- * of such lines kept.
+ * that changes nothing above when it moves up under it. `===` or `---|---` under a
+ * line of text would make that line a heading or a table, and `foo` under a list
+ * item, a quote or a table's row would become part of it, with no byte changed. So
+ * the parser is asked rather than a list of such lines kept: the two lines together
+ * must read as the line above did, plus a paragraph, or as one paragraph.
  */
 function plainLine(
   state: EditorState,
@@ -252,18 +253,32 @@ function plainLine(
     return true;
   }
   const parser = state.facet(language)?.parser;
-  if (parser === undefined || !paragraphAt(parser, above.text)) {
+  if (parser === undefined) {
     return true;
   }
-  return paragraphAt(parser, `${above.text}\n${line.text}`);
+  // The whole block above: a table's last row alone reads as a paragraph.
+  const block = syntaxTree(state).topNode.childAfter(above.from);
+  const text =
+    block !== null && block.from <= above.from
+      ? state.doc.sliceString(block.from, above.to)
+      : above.text;
+  const alone = blocksOf(parser, text);
+  const joined = blocksOf(parser, `${text}\n${line.text}`);
+  const want = alone.at(-1) === "Paragraph" ? alone : [...alone, "Paragraph"];
+  return joined.join() === want.join();
 }
 
-/** Whether `text`, read alone, is one paragraph. */
-function paragraphAt(parser: Parser, text: string): boolean {
-  const top = parser.parse(text).topNode;
-  return (
-    top.firstChild?.name === "Paragraph" && top.firstChild.nextSibling === null
-  );
+/** The names of the top-level blocks `text` reads as, alone. */
+function blocksOf(parser: Parser, text: string): string[] {
+  const names: string[] = [];
+  for (
+    let node = parser.parse(text).topNode.firstChild;
+    node !== null;
+    node = node.nextSibling
+  ) {
+    names.push(node.name);
+  }
+  return names;
 }
 
 /**

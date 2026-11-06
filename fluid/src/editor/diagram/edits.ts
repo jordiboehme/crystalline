@@ -36,7 +36,8 @@ export type RefusalCode =
   | "chain"
   | "unsupported"
   | "unchecked"
-  | "breaksFence";
+  | "breaksFence"
+  | "arrowChanged";
 
 /**
  * What an op compiler returns: the edits (and what they create, of a type each
@@ -58,6 +59,8 @@ export const NOTICES: Record<RefusalCode, string> = {
   unchecked:
     "The diagram could not be checked, so it was not changed. Try again.",
   breaksFence: "That would break a diagram here, so nothing was changed.",
+  arrowChanged:
+    "This arrow changed, so the label was not written. Press Escape and open it again.",
 };
 
 /**

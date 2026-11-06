@@ -57,6 +57,21 @@ vi.mock("../api/client", async (importOriginal) => {
 // socket: what this file is about is the screen's two surfaces, and the hook
 // has its own tests next door. `importOriginal` keeps `fileSpace`, which the
 // screen imports from the same module, real.
+const fieldKit = vi.hoisted(() => ({
+  settle: null as null | (() => Promise<string | null>),
+}));
+
+vi.mock("../editor/diagram/draws", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../editor/diagram/draws")>();
+  return {
+    ...real,
+    settleFieldDraft: (view: Parameters<typeof real.settleFieldDraft>[0]) =>
+      fieldKit.settle === null
+        ? real.settleFieldDraft(view)
+        : fieldKit.settle(),
+  };
+});
+
 vi.mock("../collab/useCollabSession", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../collab/useCollabSession")>();
@@ -3327,6 +3342,59 @@ describe("the engram editor resolving a session conflict", () => {
       await screen.findByRole("heading", { name: "eng" }, { timeout: 3000 }),
     ).toBeInTheDocument();
   });
+  it("names a field's text it could not keep, and does not leave by itself (R100)", async () => {
+    fieldKit.settle = () => Promise.resolve("a %%{ b");
+    try {
+      joinedSession({ closed: true, closedReason: "deleted" });
+      serveEditor({
+        "/domains/eng/manifest": () => ({ content: "# eng\n" }),
+        "/domains/eng/tree": () => ({ folders: [], engrams: [] }),
+        "/domains/eng/tags": () => ({ tags: [] }),
+        "/domains/eng/engrams": () => ({ engrams: [], total: 0 }),
+      });
+      renderApp("/d/eng/edit/alpha");
+      const said = await screen.findByText(/a %%\{ b/);
+      expect(said).toBeVisible();
+      await new Promise((resolve) => setTimeout(resolve, 1600));
+      expect(screen.queryByRole("heading", { name: "eng" })).toBeNull();
+      expect(screen.getByText(/a %%\{ b/)).toBeVisible();
+      expect(readDraft("ada", "eng", "alpha")?.content).toContain("A rule.");
+    } finally {
+      fieldKit.settle = null;
+    }
+  });
+
+  it("waits for a good draft's write before the snapshot and the walk out (R100)", async () => {
+    let answer: (lost: string | null) => void = () => undefined;
+    fieldKit.settle = () =>
+      new Promise((resolve) => {
+        answer = resolve;
+      });
+    try {
+      joinedSession({ closed: true, closedReason: "deleted" });
+      serveEditor({
+        "/domains/eng/manifest": () => ({ content: "# eng\n" }),
+        "/domains/eng/tree": () => ({ folders: [], engrams: [] }),
+        "/domains/eng/tags": () => ({ tags: [] }),
+        "/domains/eng/engrams": () => ({ engrams: [], total: 0 }),
+      });
+      renderApp("/d/eng/edit/alpha");
+      await screen.findByText(
+        "This engram was deleted; your text is kept as a draft",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1400));
+      expect(readDraft("ada", "eng", "alpha")).toBeNull();
+      expect(screen.queryByRole("heading", { name: "eng" })).toBeNull();
+      answer(null);
+      expect(
+        await screen.findByRole("heading", { name: "eng" }, { timeout: 3000 }),
+      ).toBeInTheDocument();
+      expect(readDraft("ada", "eng", "alpha")?.content).toContain("A rule.");
+    } finally {
+      fieldKit.settle = null;
+    }
+  });
+
   it("a moved engram says where it went and opens there with the text carried", async () => {
     const { session } = joinedSession({
       closed: true,

@@ -282,6 +282,18 @@ describe("the field with a peer in the room", () => {
     expect(bytes(local.state)).not.toContain("Peer name");
   });
 
+  it("counts the old name typed back as a draft after a peer's rename, so the page asks (N9)", async () => {
+    const { local, peer, sync } = await room();
+    const field = openOn(local, "B", "Zed");
+    type(field, "Next step");
+    peerRenamesB(peer, "Peer name");
+    sync();
+    await flush();
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
   it("follows the fence through a line above it, then a broken line stays held", async () => {
     const { local, peer, sync } = await room();
     const field = openOn(local, "B", "Don");
@@ -629,10 +641,54 @@ describe("an arrow held through a peer's duplicates (C1, R94)", () => {
     const before = bytes(local.state);
     press(field, "Enter");
     await vi.waitFor(() => {
-      expect(notice(local)).toContain(NOTICES.stale);
+      expect(notice(local)).toContain(NOTICES.arrowChanged);
     });
+    expect(notice(local)).not.toContain("Fix it");
     expect(bytes(local.state)).toBe(before);
     expect(fieldOf(local)).toBe(field);
+  });
+
+  it.each([
+    ["two", 1, "A -->|one| B"],
+    ["one", 0, "A -->|two| B"],
+  ])(
+    "never writes over the other arrow when a peer deletes %s, its own",
+    async (mine, at, left) => {
+      const { local, peer, sync } = await roomOf(
+        "A -->|one| B",
+        "A -->|two| B",
+      );
+      const field = openArrow(local, at);
+      expect(field.value).toBe(mine);
+      type(field, "renamed");
+      delLine(
+        peer,
+        `    A -->|${mine}| B\n`.replace(/\n$/, "") + (at === 1 ? "" : "\n"),
+      );
+      sync();
+      await flush();
+      press(field, "Enter");
+      await vi.waitFor(() => {
+        expect(notice(local)).toContain(NOTICES.arrowChanged);
+      });
+      expect(bytes(local.state)).toContain(left);
+      expect(bytes(local.state)).not.toContain("renamed");
+      expect(fieldOf(local)).toBe(field);
+    },
+  );
+
+  it("the same with the delete landing during the verify", async () => {
+    const { local, peer, sync } = await roomOf("A -->|one| B", "A -->|two| B");
+    const field = openArrow(local, 1);
+    type(field, "renamed");
+    press(field, "Enter");
+    delLine(peer, "\n    A -->|two| B");
+    sync();
+    await vi.waitFor(() => {
+      expect(notice(local)).toContain(NOTICES.arrowChanged);
+    });
+    expect(bytes(local.state)).toContain("A -->|one| B");
+    expect(bytes(local.state)).not.toContain("renamed");
   });
 
   it("takes the one arrow left of that pair when its own was rewritten", async () => {

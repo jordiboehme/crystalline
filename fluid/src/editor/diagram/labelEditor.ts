@@ -26,10 +26,13 @@
  *   the focus back after a blur, so a person can always go on (R96); only leaving
  *   the page is held, as that would lose the draft.
  *
- * Leaving (R95). While a field is open a link, Done and Back wait for its commit,
- * and a refused one stays on the page. Closing the tab cannot wait, so
- * `beforeunload` asks. The view going away with nothing having held it is the one
- * route that still drops a draft.
+ * Leaving (R95, R100). Held, waiting for the commit, and a refused one stays on the
+ * page: a link, Done and Back. Asked by `beforeunload`: closing or reloading the
+ * tab. A room closing writes the draft through `settleFieldDraft`, or its screen
+ * names it. Any other way the view goes (a route from code such as the search
+ * palette, `setState`, the page ceasing to take writes) is not held, so a notice
+ * outside the editor names the text. No route drops a draft unsaid.
+ * A refused draft under Raw is held once only: a second try goes, with that notice.
  *
  * An arrow is held by its place in the text, not by its occurrence, which a peer's
  * duplicate moves (R94): `flowEdgeAt`, read again on each pass of the op.
@@ -46,6 +49,7 @@ import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, showPanel } from "@codemirror/view";
 
 import { backGates } from "../../backGates";
+import { fieldSettlers } from "./draws";
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { writable } from "../elementEdit";
 import { flowKind, nextAnchorTicket, runDiagramOp } from "./apply";
@@ -61,7 +65,12 @@ import {
   verdictArrived,
   showFenceSource,
 } from "./field";
-import { flowEdgeAt, flowEdgeSpanOf, flowLabelOf } from "./flowchart/hit";
+import {
+  flowEdgeAt,
+  flowEdgeSpanOf,
+  flowLabelOf,
+  flowPairCount,
+} from "./flowchart/hit";
 import { tidyLabel } from "./flowchart/labels";
 import type { FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
@@ -117,6 +126,8 @@ interface OpenField {
   checking: Promise<void> | null;
   /** The ticket holding an arrow's place in the text (R94); null for a box. */
   arrow: number | null;
+  /** Whether the arrow had no duplicate when the field opened. */
+  sole: boolean;
   /** What a refusal said, while the text it refused still stands. */
   refused: RefusalCode | null;
   /** Letters typed while the box was away: they go in when it is back (R98). */
@@ -147,6 +158,7 @@ function heldTarget(
   main: EditorView,
   target: TargetKey,
   arrow: number | null,
+  sole: boolean,
   model: FlowModel,
   bodyFrom: number,
 ): TargetKey | "stale" | "gone" {
@@ -161,6 +173,7 @@ function heldTarget(
     model,
     target.key,
     pos === undefined ? null : pos - bodyFrom,
+    sole,
   );
   return typeof edge === "string" ? edge : { kind: "edge", key: edge };
 }
@@ -316,12 +329,12 @@ function detach(open: OpenField): void {
 
 /** The stop the person was on, or the canvas when it went. */
 function backToStop(open: OpenField): void {
-  const { main, anchor, target, arrow } = open;
+  const { main, anchor, target, arrow, sole } = open;
   const fence = fenceNow(main, anchor);
   const model = fence && modelOf(fence.body);
   const held =
     fence && model?.understood
-      ? heldTarget(main, target, arrow, model, fence.bodyFrom)
+      ? heldTarget(main, target, arrow, sole, model, fence.bodyFrom)
       : "gone";
   const stands =
     typeof held !== "string" &&
@@ -402,6 +415,10 @@ function finish(open: OpenField, way: Way): void {
 
 /** What a refused field says as long as it stands, with the way out. */
 function refusalSentence(code: RefusalCode): string {
+  // It says for itself what to do, and no fix of the text helps it.
+  if (code === "arrowChanged") {
+    return NOTICES[code];
+  }
   return `${NOTICES[code]} Fix it, or press Escape in the field to drop it.`;
 }
 
@@ -468,15 +485,16 @@ function opFor(
   main: EditorView,
   target: TargetKey,
   arrow: number | null,
+  sole: boolean,
   text: string,
 ): OpResolver<FlowModel, FlowOp> | null {
   if (target.kind === "canvas") {
     return null;
   }
   return (model, bodyFrom) => {
-    const held = heldTarget(main, target, arrow, model, bodyFrom);
+    const held = heldTarget(main, target, arrow, sole, model, bodyFrom);
     if (typeof held === "string") {
-      return { refused: held };
+      return { refused: held === "stale" ? "arrowChanged" : held };
     }
     return held.kind === "edge"
       ? { op: "edgeLabel", edge: held.key, text }
@@ -487,7 +505,7 @@ function opFor(
 async function commitNow(open: OpenField, way: Way): Promise<void> {
   const { main, el, target } = open;
   const typed = tidyLabel(el.value);
-  const op = opFor(main, target, open.arrow, typed);
+  const op = opFor(main, target, open.arrow, open.sole, typed);
   // What was typed counts against the label as it stands now, so the old name
   // typed back over a peer's rename is written. The op answers no-op on the same.
   if (op === null || !open.typed || (target.kind === "node" && typed === "")) {
@@ -561,7 +579,11 @@ function reconcile(main: EditorView): void {
       void commit(open, "leave");
     } else {
       const held = main.root.activeElement === el;
+      const lost = hasDraft(open) ? el.value : null;
       detach(open);
+      if (lost !== null) {
+        showLostDraft(main, lost);
+      }
       if (held) {
         focusTarget(main, intent.anchor, intent.target);
       }
@@ -571,6 +593,10 @@ function reconcile(main: EditorView): void {
   const host = hostOf(main, intent.anchor);
   if (host !== null) {
     placeField(open, host);
+    // A redraw or a peer's line moved it: the page holds still from here (N8).
+    if (open.lockTop !== null) {
+      open.lockTop = el.getBoundingClientRect().top;
+    }
   }
   if (intentStale(main.state)) {
     return;
@@ -584,7 +610,7 @@ function reconcile(main: EditorView): void {
   const held =
     fence === null
       ? target
-      : heldTarget(main, target, open.arrow, model, fence.bodyFrom);
+      : heldTarget(main, target, open.arrow, open.sole, model, fence.bodyFrom);
   if (held === "stale") {
     // Not said until it matters: at the commit, with a sentence.
     return;
@@ -652,6 +678,7 @@ function makeField(
     goneWaits: false,
     checking: null,
     arrow: null,
+    sole: true,
     refused: null,
     queued: "",
     lockTop: null,
@@ -820,6 +847,8 @@ export function openLabelEditor(
   }
   const text = options.initial ?? label;
   const created = makeField(main, fence.from, target, label, text);
+  created.sole =
+    target.kind !== "edge" || flowPairCount(model, target.key) <= 1;
   const span =
     target.kind === "edge" ? flowEdgeSpanOf(model, target.key) : null;
   // Inside the token, so a change right at its edge stays clear of the ticket.
@@ -913,9 +942,13 @@ function onClosing(
   }
   open.anchor = intent.anchor;
   if (reason === "swap" || reason === "destroy") {
+    const lost = hasDraft(open) ? open.el.value : null;
     fields.delete(main);
     open.el.remove();
     syncGuards(main);
+    if (lost !== null) {
+      showLostDraft(main, lost);
+    }
     return;
   }
   if (open.checking !== null) {
@@ -937,6 +970,7 @@ function onClosing(
 interface RawDraft {
   target: TargetKey;
   arrow: number | null;
+  sole: boolean;
   /** The ticket holding the fence's place. */
   place: number;
   baseline: string;
@@ -994,12 +1028,12 @@ const rawNoteTheme = EditorView.baseTheme({
  * outside the layer says so (R97).
  */
 async function commitForRaw(open: OpenField): Promise<void> {
-  const { main, el, target, anchor, arrow } = open;
+  const { main, el, target, anchor, arrow, sole } = open;
   fields.delete(main);
   const typed = tidyLabel(el.value);
   el.remove();
   syncGuards(main);
-  const op = opFor(main, target, arrow, typed);
+  const op = opFor(main, target, arrow, sole, typed);
   const refused =
     op === null || !open.typed || (target.kind === "node" && typed === "")
       ? null
@@ -1011,10 +1045,11 @@ async function commitForRaw(open: OpenField): Promise<void> {
     return;
   }
   const place = nextAnchorTicket();
-  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off.`;
+  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. Leaving asks first, and leaving again goes without it.`;
   rawDrafts.set(main, {
     target,
     arrow,
+    sole,
     place,
     baseline: open.baseline,
     draft: el.value,
@@ -1024,7 +1059,7 @@ async function commitForRaw(open: OpenField): Promise<void> {
   main.dispatch({
     effects: [
       ...(main.state.field(rawNote, false) === undefined
-        ? [StateEffect.appendConfig.of([rawNote, rawNoteTheme])]
+        ? [StateEffect.appendConfig.of([rawNote, rawNoteTheme, rawWatch])]
         : []),
       trackAnchor.of({ ticket: place, pos: anchor + 1 }),
     ],
@@ -1044,30 +1079,32 @@ function restoreRawDraft(main: EditorView): void {
   const fence = at === undefined ? null : fenceNow(main, at);
   const model = fence && modelNow(fence);
   const end = () => {
-    rawDrafts.delete(main);
-    syncGuards(main);
-    main.dispatch({
-      effects: [
-        untrackAnchor.of(raw.place),
-        ...(raw.arrow === null ? [] : [untrackAnchor.of(raw.arrow)]),
-        ...(main.state.field(rawNote, false) === undefined
-          ? []
-          : [rawNoteShown.of(null)]),
-      ],
-    });
+    dropRawDraft(main, raw);
   };
   const held =
     fence === null || model === null
       ? "gone"
-      : heldTarget(main, raw.target, raw.arrow, model, fence.bodyFrom);
+      : heldTarget(
+          main,
+          raw.target,
+          raw.arrow,
+          raw.sole,
+          model,
+          fence.bodyFrom,
+        );
   if (fence === null || model === null || typeof held === "string") {
     end();
-    say(main, "gone", null);
+    showLostDraft(main, raw.draft);
     return;
   }
   if (
     !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
   ) {
+    // Text under the caret, or a verdict to come: the next change of those tries.
+    const waiting = `"${raw.draft}" comes back in its field when this diagram draws: move the caret out of it. Leaving asks first, and leaving again goes without it.`;
+    if (main.state.field(rawNote, false) !== waiting) {
+      main.dispatch({ effects: rawNoteShown.of(waiting) });
+    }
     return;
   }
   end();
@@ -1086,15 +1123,118 @@ function restoreRawDraft(main: EditorView): void {
   }
 }
 
+/** The label as it stands now, or the one the person saw when that cannot be read. */
+function labelNow(open: OpenField): string {
+  const { main, anchor, target, arrow, sole } = open;
+  const fence =
+    main.state.field(diagramField, false) && anchor <= main.state.doc.length
+      ? fenceAt(main.state, anchor)
+      : null;
+  const model = fence && modelNow(fence);
+  if (fence === null || model === null) {
+    return open.baseline;
+  }
+  const held = heldTarget(main, target, arrow, sole, model, fence.bodyFrom);
+  return (
+    (typeof held === "string" ? null : flowLabelOf(model, held)) ??
+    open.baseline
+  );
+}
+
 /** Whether leaving now would lose what the field holds. */
 function hasDraft(open: OpenField): boolean {
   const typed = tidyLabel(open.el.value);
   return (
     open.typed &&
-    typed !== tidyLabel(open.baseline) &&
+    typed !== tidyLabel(labelNow(open)) &&
     !(open.target.kind === "node" && typed === "")
   );
 }
+
+/**
+ * A draft went with no way to keep it. Outside the editor, which may be gone, and
+ * with no timer: the person has to be able to read and copy it.
+ */
+function showLostDraft(main: EditorView, text: string): void {
+  const doc = main.dom.ownerDocument;
+  const note = doc.createElement("div");
+  note.className =
+    "cm-diagram-lost-draft fixed bottom-4 left-1/2 z-50 flex w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 shadow-xl dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100";
+  note.setAttribute("role", "alert");
+  const sentence = doc.createElement("span");
+  sentence.textContent =
+    "The name you were typing in a diagram was not saved. Copy it if you need it:";
+  const kept = doc.createElement("q");
+  kept.className = "select-all";
+  kept.textContent = text;
+  const close = doc.createElement("button");
+  close.type = "button";
+  close.className = "underline";
+  close.textContent = "Dismiss";
+  close.addEventListener("click", () => {
+    note.remove();
+  });
+  note.append(sentence, kept, close);
+  doc.body.append(note);
+}
+
+/** A room is closing: the text goes into the document, or comes back as an answer. */
+async function settleOpen(main: EditorView): Promise<string | null> {
+  const raw = rawDrafts.get(main);
+  if (raw !== undefined) {
+    dropRawDraft(main, raw);
+    return raw.draft;
+  }
+  const open = fields.get(main);
+  if (open === undefined) {
+    return null;
+  }
+  if (hasDraft(open) || open.checking !== null) {
+    await commit(open, "leave");
+  } else {
+    finish(open, "leave");
+  }
+  let lost: string | null = null;
+  if (fields.get(main) === open) {
+    lost = open.el.value;
+    clearRefusal(open);
+    detach(open);
+  }
+  closeDiagramIntent(main, "user", "none");
+  return lost;
+}
+
+/** A refused draft under Raw given up: nothing holds the page for it any more. */
+function dropRawDraft(main: EditorView, raw: RawDraft): void {
+  rawDrafts.delete(main);
+  syncGuards(main);
+  if (!main.dom.isConnected) {
+    return;
+  }
+  main.dispatch({
+    effects: [
+      untrackAnchor.of(raw.place),
+      ...(raw.arrow === null ? [] : [untrackAnchor.of(raw.arrow)]),
+      ...(main.state.field(rawNote, false) === undefined
+        ? []
+        : [rawNoteShown.of(null)]),
+    ],
+  });
+}
+
+/** Outside the layer too: the one thing alive under Raw when the view goes. */
+const rawWatch = ViewPlugin.define((view) => ({
+  destroy() {
+    queueMicrotask(() => {
+      const raw = rawDrafts.get(view);
+      if (raw !== undefined) {
+        rawDrafts.delete(view);
+        syncGuards(view);
+        showLostDraft(view, raw.draft);
+      }
+    });
+  },
+}));
 
 const guards = new WeakMap<EditorView, () => void>();
 
@@ -1104,15 +1244,28 @@ function syncGuards(main: EditorView): void {
   const stop = guards.get(main);
   if (wanted && stop === undefined) {
     guards.set(main, armGuards(main));
+    fieldSettlers.set(main, () => settleOpen(main));
   } else if (!wanted && stop !== undefined) {
     stop();
     guards.delete(main);
+    fieldSettlers.delete(main);
   }
 }
 
 function armGuards(main: EditorView): () => void {
   let replaying = false;
   let restoring = false;
+  /** A refused draft under Raw holds a leave once; a second one goes (R100). */
+  let warned = false;
+  const secondLeave = (raw: RawDraft): boolean => {
+    if (!warned) {
+      warned = true;
+      return false;
+    }
+    dropRawDraft(main, raw);
+    showLostDraft(main, raw.draft);
+    return true;
+  };
   const historyAt = historyIndex();
 
   const onClick = (event: MouseEvent) => {
@@ -1133,8 +1286,9 @@ function armGuards(main: EditorView): () => void {
       link?.target !== "_blank";
     const open = fields.get(main);
     if (open === undefined) {
-      // A refused draft under Raw: its line stands, and the page stays.
-      if (leaving && rawDrafts.has(main)) {
+      // A refused draft under Raw: its line stands, and the page stays, once.
+      const raw = rawDrafts.get(main);
+      if (leaving && raw !== undefined && !secondLeave(raw)) {
         event.preventDefault();
         event.stopImmediatePropagation();
       }
@@ -1176,7 +1330,8 @@ function armGuards(main: EditorView): () => void {
     };
     const open = fields.get(main);
     if (open === undefined) {
-      if (rawDrafts.has(main)) {
+      const raw = rawDrafts.get(main);
+      if (raw !== undefined && !secondLeave(raw)) {
         event.stopImmediatePropagation();
         undo();
       }
@@ -1442,7 +1597,14 @@ export const labelEditorPlugin = ViewPlugin.fromClass(
     update(update: ViewUpdate): void {
       const { view } = this;
       const open = fields.get(view);
-      if (rawDrafts.has(view) && update.docChanged) {
+      // Whatever changes what is drawn: an edit, the caret leaving a fence it held
+      // as text, a verdict landing (N3).
+      if (
+        rawDrafts.has(view) &&
+        (update.docChanged ||
+          update.startState.field(diagramField).fences !==
+            update.state.field(diagramField).fences)
+      ) {
         queueMicrotask(() => {
           restoreRawDraft(view);
         });

@@ -129,13 +129,16 @@ function arrowLabel(model: FlowModel, edge: FlowEdge): string {
 /**
  * The arrow of (`start`, `end`) that stands at `offset`, a position in the body;
  * an arrow's occurrence moves with every duplicate added or removed before it, and
- * its token does not. With no such token: the only arrow of that pair if there is
- * one, "stale" among several (no guess about which is meant), "gone" with none.
+ * its token does not. With no such token: "gone" when the pair has no arrow left.
+ * Otherwise the only arrow of that pair, but only when `sole` says the field opened
+ * with no duplicate: among duplicates the person's arrow may be the very one that
+ * went, and the one left is somebody else's, so it answers "stale" (R94).
  */
 export function flowEdgeAt(
   model: FlowModel,
   key: EdgeKey,
   offset: number | null,
+  sole: boolean,
 ): EdgeKey | "stale" | "gone" {
   const pair = model.edges.filter(
     (edge) => edge.start === key.start && edge.end === key.end,
@@ -147,11 +150,18 @@ export function flowEdgeAt(
           const span = model.chains[edge.chain]?.links[edge.link]?.arrow.span;
           return span !== undefined && span.from <= offset && offset < span.to;
         });
-  const edge = held ?? (pair.length === 1 ? pair[0] : undefined);
+  const edge = held ?? (sole && pair.length === 1 ? pair[0] : undefined);
   if (edge !== undefined) {
     return edgeKey(edge);
   }
   return pair.length === 0 ? "gone" : "stale";
+}
+
+/** How many arrows join the same two boxes as `key`. */
+export function flowPairCount(model: FlowModel, key: EdgeKey): number {
+  return model.edges.filter(
+    (edge) => edge.start === key.start && edge.end === key.end,
+  ).length;
 }
 
 /** Where an arrow's token starts in the body, or null with no such arrow. */
