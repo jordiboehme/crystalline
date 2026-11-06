@@ -6216,6 +6216,9 @@ impl Engine {
         }
         let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
         let addresses = pulled_addresses(&state_dir, &touched)?;
+        let base_paths: HashSet<String> = crystalline_remote::state::OriginState::load(&state_dir)?
+            .map(|state| state.files.into_keys().collect())
+            .unwrap_or_default();
 
         let mut cleared = 0u64;
         // The drafts this pass ended, announced when it ends or stops, collapsed.
@@ -6234,9 +6237,15 @@ impl Engine {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths)?;
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
-                match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
+                let settled = if ended.contains(entry.path.as_str()) {
+                    Settle::Clear
+                } else {
+                    settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own)
+                };
+                match settled {
                     Settle::Leave => {}
                     Settle::Clear => {
                         view.drop(domain_id, &entry.path).await?;
@@ -10323,6 +10332,43 @@ fn settle_overlay_entry(
             (false, None) => Settle::Leave,
         },
     }
+}
+
+/// The tombstones that end with their draft: the deletion half of a case-only
+/// move whose text the base has caught up with.
+///
+/// On a disk that folds case the base copy of `plan.md` also answers to
+/// `Plan.md`, so a draft at `Plan.md` is found equal once a share has landed its
+/// text, and its row is cleared. The tombstone at `plan.md` was half of the same
+/// move, and left standing alone it says the opposite of what the person did:
+/// it hides the file from them and their next share proposes the deletion.
+///
+/// `base_paths` is what tells this from two real files: the draft's own spelling
+/// must not be in the snapshot, and the tombstone's must. On a disk that keeps
+/// `Note.md` and `note.md` apart this finds nothing.
+fn tombstones_of_settled_case_moves<'a>(
+    entries: &'a [StoredEngram],
+    state_dir: &Path,
+    base_paths: &HashSet<String>,
+) -> Result<HashSet<&'a str>> {
+    let mut settled = HashSet::new();
+    for draft in entries.iter().filter(|entry| !entry.tombstone) {
+        if !base_paths.contains(&draft.path)
+            && crystalline_remote::state::read_base_file(state_dir, &draft.path)?.as_deref()
+                == Some(draft.content.as_bytes())
+        {
+            settled.insert(crystalline_core::fold_path_case(&draft.path));
+        }
+    }
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            entry.tombstone
+                && base_paths.contains(&entry.path)
+                && settled.contains(&crystalline_core::fold_path_case(&entry.path))
+        })
+        .map(|entry| entry.path.as_str())
+        .collect())
 }
 
 /// What one pull leaves one overlay FILE to be. Pure, beside

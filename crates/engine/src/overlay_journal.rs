@@ -300,8 +300,13 @@ fn remove_entry_if_present(file: &Path) -> io::Result<()> {
     };
     let folded = crystalline_core::path::fold_path_case(name);
     let mut another_spelling = false;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?.file_name();
+    // A folder that cannot be listed cannot say who else stands here, so the
+    // removal goes ahead as asked rather than failing where it used not to.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return remove_if_present(file);
+    };
+    for entry in entries.flatten() {
+        let entry = entry.file_name();
         let Some(entry) = entry.to_str() else {
             continue;
         };

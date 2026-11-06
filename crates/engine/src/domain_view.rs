@@ -1289,6 +1289,35 @@ impl<'a> DomainView<'a> {
                 p.domain
             )));
         }
+        // Another spelling of a path somebody else stands at is taken too: no
+        // macOS or Windows checkout can hold the two, and on such a disk the
+        // fold would write over that file with no warning. Its own other
+        // spelling is the one that is free, since that is a rename of itself.
+        let folded = crystalline_core::fold_path_case(dest_rel);
+        let other_spelling =
+            |path: &str| path != src.path && crystalline_core::fold_path_case(path) == folded;
+        let drafted = store
+            .overlay_entries(src.domain_id, actor)
+            .await?
+            .into_iter()
+            .find(|entry| !entry.tombstone && other_spelling(&entry.path))
+            .map(|entry| entry.path);
+        let held = match drafted {
+            Some(path) => Some(path),
+            None => store
+                .list_engrams(&p.domain, None, None)
+                .await?
+                .into_iter()
+                .find(|found| other_spelling(&found.path))
+                .map(|found| found.path),
+        };
+        if let Some(held) = held {
+            return Err(EngineError::Conflict(format!(
+                "'{dest_rel}' is another spelling of '{held}', which already holds an engram in \
+                 domain '{}', and a disk that folds case cannot hold the two",
+                p.domain
+            )));
+        }
         Ok(())
     }
 

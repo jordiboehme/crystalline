@@ -6319,15 +6319,6 @@ fn draft_move(identifier: &str, destination: &str) -> crystalline_service::param
     }
 }
 
-/// Whether the disk under this fixture treats two spellings as one name.
-fn folds_case(f: &Fixture) -> bool {
-    let folds = f.root.join("TEAM").exists();
-    if !folds {
-        eprintln!("skipped: {} is case-sensitive", f.root.display());
-    }
-    folds
-}
-
 /// The names one actor's journal folder holds at `sub`, as the disk spells them.
 fn mirror_names(f: &Fixture, sub: &str) -> Vec<String> {
     let dir = f.root.join("state/overlays/team/alice").join(sub);
@@ -6345,15 +6336,12 @@ fn mirror_names(f: &Fixture, sub: &str) -> Vec<String> {
 /// move at a time while it waited. Each case stands behind a timeout so a hang
 /// is a failure rather than a stuck run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_case_only_move_of_a_draft_finishes_where_the_disk_folds_case() {
+async fn a_case_only_move_of_a_draft_finishes() {
     let alice = account("alice");
     let in_time = std::time::Duration::from_secs(5);
 
     // Her own draft, lower case to upper.
     let f = review_fixture().await;
-    if !folds_case(&f) {
-        return;
-    }
     f.engine
         .write_engram_as(&write_params("team", "Note", "her body"), None, &alice)
         .await
@@ -6457,10 +6445,15 @@ async fn a_draft_move_takes_both_draft_locks_lower_key_first() {
         tokio::time::timeout(settle, &mut moving).await.is_err(),
         "the move waits for the source's lock"
     );
-    assert!(
-        low.try_lock().is_err(),
-        "and holds the lower key, the destination this time, while it waits"
-    );
+    // A slow machine takes longer to get there, so this asks until it has.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while low.try_lock().is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move holds the lower key, the destination this time, while it waits"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     drop(held);
     moving.await.unwrap().unwrap();
     assert!(mirror("alpha.md").is_file());
@@ -6482,10 +6475,13 @@ async fn team_file_moved_by_case(from: &str, to: &str, draft: bool) -> Fixture {
         over.overwrite = true;
         f.engine.write_engram_as(&over, None, &alice).await.unwrap();
     }
-    f.engine
-        .move_engram(&draft_move("note", to), &alice)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.engine.move_engram(&draft_move("note", to), &alice),
+    )
+    .await
+    .expect("the move hung")
+    .unwrap();
     f
 }
 
@@ -6522,9 +6518,6 @@ const CASE_MOVES: [(&str, &str, bool, &str); 4] = [
 async fn a_case_only_move_of_a_team_file_folds_to_the_new_spelling() {
     for (from, to, draft, body) in CASE_MOVES {
         let f = team_file_moved_by_case(from, to, draft).await;
-        if !folds_case(&f) {
-            return;
-        }
         f.engine
             .set_review_mode(
                 "team",
@@ -6552,9 +6545,6 @@ async fn a_case_only_move_of_a_team_file_survives_a_rebuild() {
     let alice = account("alice");
     for (from, to, draft, body) in CASE_MOVES {
         let f = team_file_moved_by_case(from, to, draft).await;
-        if !folds_case(&f) {
-            return;
-        }
         let mut journal: Vec<(String, bool)> =
             crystalline_service::overlay_journal::journal_entries(&f.state, "team")
                 .entries
@@ -6600,10 +6590,16 @@ async fn a_case_only_move_of_a_team_file_survives_a_rebuild() {
     }
 }
 
-/// **Sharing a case-only move does not delete the team's file.** The staged tree
-/// takes its deletions first, so the file is still there to detect: a share
-/// with a new text changes the team's file at the spelling the team has, and a
-/// share with no new text has nothing to carry.
+/// **Sharing a case-only move does not delete the team's file, then or later.**
+///
+/// Detection folds case on every platform, so the spelling does not travel: a
+/// share with a new text changes the team's file at the spelling the team has,
+/// a share with no new text has nothing to carry, and the receipt says so.
+///
+/// What must not happen is a deletion. On a disk that folds case the first
+/// share's convergence finds the draft equal to the base, and the tombstone
+/// that was half of the same move has to end with it. Left behind it would hide
+/// the file from its author and be shared as a deletion by their next share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sharing_a_case_only_move_keeps_the_teams_file() {
     let alice = account("alice");
@@ -6623,17 +6619,22 @@ async fn sharing_a_case_only_move_keeps_the_teams_file() {
                 .unwrap()
         }
     };
+    let names_the_move = |receipt: &serde_json::Value| {
+        assert_eq!(
+            receipt["spelling_not_shared"],
+            serde_json::json!([{ "from": "plan.md", "to": "Plan.md" }]),
+            "{receipt}"
+        );
+    };
 
     let f = reviewed_direct_origin_fixture().await;
-    if !folds_case(&f) {
-        return;
-    }
     f.engine
         .move_engram(&draft_move("plan", "Plan.md"), &alice)
         .await
         .unwrap();
     let receipt = share(&f).await;
     assert_eq!(receipt["outcome"], "nothing_to_share", "{receipt}");
+    names_the_move(&receipt);
     assert!(f.domain_root("team").join("plan.md").is_file());
 
     let f = reviewed_direct_origin_fixture().await;
@@ -6647,8 +6648,147 @@ async fn sharing_a_case_only_move_keeps_the_teams_file() {
     let receipt = share(&f).await;
     assert_eq!(receipt["outcome"], "committed", "{receipt}");
     assert_eq!(receipt["deleted"], serde_json::json!([]), "{receipt}");
-    let text = std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap();
-    assert!(text.contains("her body"), "{text}");
+    names_the_move(&receipt);
+    let on_disk = || std::fs::read_to_string(f.domain_root("team").join("plan.md")).unwrap();
+    assert!(on_disk().contains("her body"), "{}", on_disk());
+
+    // She can still read it, and sharing again finds nothing to do.
+    let read_back = f.reads("plan", &alice).await.unwrap();
+    assert!(read_back.contains("her body"), "{read_back}");
+    let again = share(&f).await;
+    assert_eq!(again["outcome"], "nothing_to_share", "{again}");
+    assert!(on_disk().contains("her body"), "{}", on_disk());
+}
+
+/// **A move racing the first draft of its own source does not wait on itself.**
+///
+/// A writer holds the lock of a mirror that does not exist yet while the move
+/// works out its two locks, then makes the mirror and lets go. Where the disk
+/// folds case the destination's spelling now resolves to the source's mirror,
+/// so a move that looks its locks up again would ask for one it already holds.
+/// A move that has not reached its locks when the mirror appears sees one lock
+/// from the start and passes too, so being late never fails this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_racing_the_first_draft_of_its_source_finishes() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    let team_file =
+        "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n";
+    std::fs::write(f.domain_root("team").join("Note.md"), team_file).unwrap();
+    f.engine.sync(None).await.unwrap();
+
+    let mirror = f.root.join("state/overlays/team/alice/Note.md");
+    let lock = f.engine.file_write_lock(&mirror);
+    let held = lock.lock().await;
+    let (engine, who) = (f.engine.clone(), alice.clone());
+    let moving = tokio::spawn(async move {
+        engine
+            .move_engram(&draft_move("note", "note.md"), &who)
+            .await
+            .map(|_| ())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::write(&mirror, team_file).unwrap();
+    drop(held);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), moving)
+        .await
+        .expect("the move waited on a lock it already held")
+        .unwrap()
+        .unwrap();
+    let read_back = f.reads("note", &alice).await.unwrap();
+    assert!(read_back.contains("team body"), "{read_back}");
+}
+
+/// **A fold keeps path order, so a failed write costs an ordinary rename no
+/// file.** Only a tombstone that folds onto a draft of the same actor has to go
+/// first. Here the new path sorts first, the write fails, and the old file is
+/// still there for everybody until the same call is made again.
+#[tokio::test]
+async fn a_fold_that_cannot_write_a_rename_leaves_the_old_file_for_the_retry() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    let root = f.domain_root("team");
+    std::fs::write(
+        root.join("zz.md"),
+        "---\ntitle: Zz\ntype: note\nstatus: draft\npermalink: zz\n---\n\nteam body\n",
+    )
+    .unwrap();
+    f.engine.sync(None).await.unwrap();
+    f.engine
+        .move_engram(&draft_move("zz", "sub/zz.md"), &alice)
+        .await
+        .unwrap();
+
+    // A file where the destination's folder has to go.
+    std::fs::write(root.join("sub"), "in the way").unwrap();
+    let fold = || {
+        f.engine.set_review_mode(
+            "team",
+            None,
+            folds(&[("alice", FoldChoice::Fold)]),
+            &Scope::Unrestricted,
+        )
+    };
+    fold().await.expect_err("the destination cannot be written");
+    assert!(root.join("zz.md").is_file(), "the old file is still there");
+
+    std::fs::remove_file(root.join("sub")).unwrap();
+    fold().await.unwrap();
+    assert!(root.join("sub/zz.md").is_file());
+    assert!(!root.join("zz.md").exists());
+}
+
+/// **A draft may not move onto another spelling of somebody else's file.** No
+/// macOS or Windows checkout can hold the two (`E009`), and on such a disk the
+/// fold would write over the team's file with no warning. Its own other spelling
+/// is the one exception, since that is a rename of itself.
+#[tokio::test]
+async fn a_draft_move_onto_another_spelling_of_a_team_file_is_refused() {
+    let alice = account("alice");
+    let f = review_fixture().await;
+    for (name, body) in [("a", "a body"), ("b", "b body")] {
+        std::fs::write(
+            f.domain_root("team").join(format!("{name}.md")),
+            format!(
+                "---\ntitle: {name}\ntype: note\nstatus: draft\npermalink: {name}\n---\n\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+    f.engine.sync(None).await.unwrap();
+    let refused = f
+        .engine
+        .move_engram(&draft_move("a", "B.md"), &alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, crystalline_service::EngineError::Conflict(_)),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("b.md"), "{refused}");
+
+    // The same against a draft of her own that only she holds.
+    f.engine
+        .write_engram_as(&write_params("team", "Fresh", "body"), None, &alice)
+        .await
+        .unwrap();
+    let refused = f
+        .engine
+        .move_engram(&draft_move("a", "FRESH.md"), &alice)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, crystalline_service::EngineError::Conflict(_)),
+        "{refused}"
+    );
+
+    // Its own other spelling is a rename, not a collision.
+    f.engine
+        .move_engram(&draft_move("a", "A.md"), &alice)
+        .await
+        .unwrap();
 }
 
 /// One address claimed at two paths by two people is a collision the plan has
