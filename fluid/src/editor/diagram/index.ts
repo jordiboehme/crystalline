@@ -25,7 +25,12 @@ import {
 } from "./focus";
 import { diagramIntent, intentWatcher } from "./intent";
 import { labelEditorPlugin } from "./labelEditor";
-import { diagramTheme, flipBackHold, scrollAskWatcher } from "./widget";
+import {
+  diagramTheme,
+  firstDrawHold,
+  flipBackHold,
+  scrollAskWatcher,
+} from "./widget";
 
 export function diagramExtension(): Extension {
   return [
@@ -58,6 +63,7 @@ export function diagramExtension(): Extension {
     flowActions,
     flipBackHold,
     scrollAskWatcher,
+    firstDrawHold,
     diagramTheme,
   ];
 }

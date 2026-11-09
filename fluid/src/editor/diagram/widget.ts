@@ -265,6 +265,15 @@ export const ScrollRequest = (View.scrollIntoView(0).value as object)
  */
 const ANCHOR_REACH_PX = 12;
 
+/** Whether an update asks CodeMirror to scroll to a target. */
+function asksScroll(update: ViewUpdate): boolean {
+  return update.transactions.some(
+    (tr) =>
+      tr.scrollIntoView ||
+      tr.effects.some((effect) => effect.value instanceof ScrollRequest),
+  );
+}
+
 /** Views with a scroll to a target asked for since their last measure pass. */
 const scrollAsks = new WeakSet<EditorView>();
 
@@ -274,12 +283,7 @@ const scrollAsks = new WeakSet<EditorView>();
  */
 export const scrollAskWatcher = ViewPlugin.define((view) => ({
   update(update: ViewUpdate) {
-    const asks = update.transactions.some(
-      (tr) =>
-        tr.scrollIntoView ||
-        tr.effects.some((effect) => effect.value instanceof ScrollRequest),
-    );
-    if (!asks) {
+    if (!asksScroll(update)) {
       return;
     }
     scrollAsks.add(view);
@@ -290,6 +294,102 @@ export const scrollAskWatcher = ViewPlugin.define((view) => ({
         // That pass is over once the queue gets here.
         queueMicrotask(() => {
           scrollAsks.delete(view);
+        });
+      },
+    });
+  },
+}));
+
+/** The first of the editor's elements whose top is at or below `top`. */
+function lineAtOrBelow(view: EditorView, top: number): Element | null {
+  const children = view.contentDOM.children;
+  let low = 0;
+  let high = children.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    const child = children[middle];
+    if (child !== undefined && child.getBoundingClientRect().top < top) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return children[low] ?? null;
+}
+
+/**
+ * A fence first drawn wholly above the window, in an update that asks for no
+ * scroll: its box is taller or shorter than its source lines were. CodeMirror's
+ * anchor step keeps the text in the window still through that, but not in a
+ * pass where its scroll offset moved since its last one (something above the
+ * editor grew in between): then it keeps nothing. So the line at the window's
+ * top is noted before the box replaces the source, and whatever of the change
+ * the pass left goes back. A box first drawn in the window or under it moves
+ * the text below it (R77).
+ */
+export const firstDrawHold = ViewPlugin.define((view) => ({
+  update(update: ViewUpdate) {
+    const before = update.startState.field(diagramField, false);
+    const after = update.state.field(diagramField, false);
+    if (before === undefined || after === undefined) {
+      return;
+    }
+    if (before.fences === after.fences || asksScroll(update)) {
+      return;
+    }
+    const known = new Set(before.keys.values());
+    const fresh = [...after.keys.values()].filter((key) => !known.has(key));
+    if (fresh.length === 0) {
+      return;
+    }
+    const scroller = outerScroller(view);
+    if (scroller === null) {
+      return;
+    }
+    // Before CodeMirror's DOM sync: the source lines are still on the page.
+    const line = lineAtOrBelow(view, windowTopOf(scroller));
+    if (line === null) {
+      return;
+    }
+    const text = line.textContent;
+    const offset =
+      line.getBoundingClientRect().top - view.dom.getBoundingClientRect().top;
+    view.requestMeasure({
+      read: () => {
+        const windowTop = windowTopOf(scroller);
+        const above = fresh.some((key) => {
+          const box = boxesByKey.get(view)?.get(key);
+          return (
+            box !== undefined &&
+            !box.dead &&
+            box.dom.getBoundingClientRect().bottom <=
+              windowTop + ANCHOR_REACH_PX
+          );
+        });
+        // The editor's top before any scroll of the pass: the person's is in it.
+        return { above, editorTop: view.dom.getBoundingClientRect().top };
+      },
+      write: ({ above, editorTop }) => {
+        if (!above || scrollAsks.has(view)) {
+          return;
+        }
+        // After the pass, and after a landing's own step in it.
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            // CodeMirror reuses a line's element: the same text, or nothing.
+            if (
+              !view.dom.isConnected ||
+              !line.isConnected ||
+              line.textContent !== text
+            ) {
+              return;
+            }
+            const off = line.getBoundingClientRect().top - (editorTop + offset);
+            // CodeMirror leaves a pixel or less as it is.
+            if (Math.abs(off) >= 1) {
+              scroller.scrollBy({ top: off, behavior: "instant" });
+            }
+          });
         });
       },
     });
