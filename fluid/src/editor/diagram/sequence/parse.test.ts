@@ -569,7 +569,7 @@ describe("the spans of every corpus file", () => {
       expect(reads(body, message.fromSpan)).toBe(message.from);
       expect(reads(body, message.toSpan)).toBe(message.to);
       const token = defined(reads(body, message.arrow.span));
-      expect(MESSAGE_ARROWS).toContain(token.toLowerCase());
+      expect(MESSAGE_ARROWS).toContain(token?.toLowerCase());
       expect(message.span.from).toBe(message.fromSpan.from);
       if (message.arrow.activation) {
         expect(["+", "-"]).toContain(reads(body, message.arrow.activation));
