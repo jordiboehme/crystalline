@@ -362,9 +362,9 @@ function navigate(
   const cell = cellIn(table, row, column);
   if (!cell) return false;
   const mod = isMac() ? event.metaKey : event.ctrlKey;
-  // A Mac's Home and End need fn on a MacBook: Cmd+Up and Cmd+Down go to the
-  // row's ends as they do (R111).
-  const rowEnd =
+  // Cmd+Up and Cmd+Down go to the column's first and last row, as in Numbers
+  // and Excel on a Mac (R111). Home and End stay the row's ends.
+  const columnEnd =
     isMac() &&
     event.metaKey &&
     !event.ctrlKey &&
@@ -390,11 +390,11 @@ function navigate(
       focusAt(root, table, row, column + 1);
       return true;
     case "ArrowUp":
-      if (rowEnd) focusAt(root, table, row, 0);
+      if (columnEnd) focusAt(root, table, 0, column);
       else focusAt(root, table, row - 1, column);
       return true;
     case "ArrowDown":
-      if (rowEnd) focusAt(root, table, row, Infinity);
+      if (columnEnd) focusAt(root, table, last, column);
       else focusAt(root, table, row + 1, column);
       return true;
     case "Home":

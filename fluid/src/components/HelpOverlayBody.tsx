@@ -11,7 +11,7 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
 import { HANDBOOK_URL } from "../handbook";
-import { keyLabel } from "../platform";
+import { isMac, keyLabel } from "../platform";
 import type { HelpOverlayProps } from "./HelpOverlay";
 
 /** The map itself: what to press, and what it does, named as this keyboard names it. */
@@ -23,6 +23,15 @@ const SHORTCUTS: { keys: string; does: string }[] = [
   { keys: keyLabel("Mod-f"), does: "Find in the document (in the editor)" },
   { keys: keyLabel("Mod-b"), does: "Bold (in the editor)" },
   { keys: keyLabel("Mod-i"), does: "Italic (in the editor)" },
+  // A Mac has no menu key, and F10 needs fn there (R111).
+  {
+    keys: keyLabel(isMac() ? "Ctrl-Enter" : "Shift-F10"),
+    does: "Menu for the item you are on (in the editor)",
+  },
+  {
+    keys: keyLabel("Alt-F10"),
+    does: "Toolbar for the selection (in the editor and on a Reflection page)",
+  },
   { keys: keyLabel("Escape"), does: "Close dialogs and menus" },
 ];
 

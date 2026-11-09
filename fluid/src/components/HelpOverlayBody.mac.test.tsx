@@ -24,3 +24,17 @@ it("names ⌘ on a Mac, and no Ctrl", () => {
   }
   expect(within(map).queryByText(/Ctrl/)).toBeNull();
 });
+
+it("names the menu key and the toolbar key, with what they do", () => {
+  render(<HelpOverlayBody onClose={() => undefined} returnFocusTo={null} />);
+  const map = screen.getByRole("dialog", { name: "Keyboard shortcuts" });
+  const does = (keys: string) =>
+    within(map)
+      .getByText(keys, { selector: "kbd" })
+      .closest("div")
+      ?.querySelector("dd")?.textContent;
+  expect(does("⌃↩")).toBe("Menu for the item you are on (in the editor)");
+  expect(does("⌥F10")).toBe(
+    "Toolbar for the selection (in the editor and on a Reflection page)",
+  );
+});

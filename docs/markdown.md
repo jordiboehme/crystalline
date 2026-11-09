@@ -165,6 +165,8 @@ On GitHub: GitHub builds its own outline from the headings.
 
 A flowchart is edited in the page, by its boxes and arrows, and a sequence diagram by its participants and messages, as **Diagrams** above says. The editor has one **Insert** menu with Callout (five kinds), Expand block, Status label, Diagram, Code block, Math and Footnote; Table and Task list have their own buttons. Type `/` at the start of an empty line to open every element at the caret, the table and the task list included, and filter it as you type. It does not open inside a quote or an HTML comment. Escape closes it, and so does a space right after the `/`; a query with no match closes it too. The `/` stays in the text.
 
+In a table the arrow keys move between cells. Home and End go to the start and the end of the row, and Ctrl+Home and Ctrl+End (Cmd+Home and Cmd+End on a Mac) to the first and the last cell. On a Mac, Cmd+Up Arrow and Cmd+Down Arrow go to the first and the last row of the column. Enter or F2 opens a cell, and Shift+F10 (Ctrl+Return on a Mac) opens Cell actions.
+
 While the caret is inside a callout, the toolbar offers the kind and "Starts open", "Starts closed" or "Does not fold". An expand block always folds, so it has no "Does not fold", and when it becomes another kind it keeps its `-` so it stays closed. Inside a status label it offers the six colours. Away from the active line, callouts, labels, swatches and math show as they do on the reading page.
 
 ## Rich paste

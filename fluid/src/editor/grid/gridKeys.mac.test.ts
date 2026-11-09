@@ -2,9 +2,10 @@
  * The grid's keys on a Mac (R111). CodeMirror and `platform.ts` read
  * `navigator.platform` once, when they load, so it is set before any import.
  *
- * A MacBook has no Home and End, so Cmd+Up and Cmd+Down go to the row's ends as
- * they do. Cmd is the grid's modifier for undo and the table's ends, and
- * Ctrl+Return opens Cell actions, as Shift+F10 does.
+ * Cmd+Up and Cmd+Down go to the first and the last row of the column, as in
+ * Numbers and Excel on a Mac; Home and End stay the row's ends. Cmd is the
+ * grid's modifier for undo and the table's ends, and Ctrl+Return opens Cell
+ * actions, as Shift+F10 does.
  */
 
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -99,14 +100,14 @@ test("runs on a Mac", () => {
   expect(isMac()).toBe(true);
 });
 
-describe("the row's ends and the table's", () => {
-  test("Cmd+Down goes to the row's end and Cmd+Up to its start", () => {
+describe("the column's ends, the row's and the table's", () => {
+  test("Cmd+Down goes to the column's last row and Cmd+Up to its first", () => {
     const main = solo();
-    navOn(main, 1, 1);
+    navOn(main, 0, 1);
     expect(keyOn("ArrowDown", { metaKey: true }).defaultPrevented).toBe(true);
-    expect(focused(main)).toEqual([1, 2]);
+    expect(focused(main)).toEqual([2, 1]);
     expect(keyOn("ArrowUp", { metaKey: true }).defaultPrevented).toBe(true);
-    expect(focused(main)).toEqual([1, 0]);
+    expect(focused(main)).toEqual([0, 1]);
     expect(bytes(main.state)).toBe(WIDE);
   });
 
