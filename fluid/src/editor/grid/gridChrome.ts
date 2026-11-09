@@ -578,6 +578,13 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
       el.appendChild(entry);
     }
     el.addEventListener("keydown", (event) => {
+      // The menu key on its own menu opens no second one and runs no item: on a
+      // Mac it is Ctrl+Return, which the Enter case below would take (R111, I3).
+      if (isMenuKey(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
       const entries = [
         ...el.querySelectorAll<HTMLElement>('[role^="menuitem"]'),
       ];
@@ -721,7 +728,8 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
   });
 
   root.addEventListener("keydown", (event) => {
-    if (event.defaultPrevented || event.isComposing) return;
+    // A held key opens the menu once (I3).
+    if (event.defaultPrevented || event.isComposing || event.repeat) return;
     // Shift+F10, the menu key, and on a Mac Ctrl+Return (R111).
     if (!isMenuKey(event) || !gridWritable(main.state)) return;
     const el = cellOf(event.target);

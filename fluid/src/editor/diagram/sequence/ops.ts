@@ -1084,6 +1084,24 @@ const PASSABLE: ReadonlySet<SeqStatement["kind"]> = new Set([
   "autonumber",
 ]);
 
+/** Lines that draw nothing: above only these, a message is at the top (M1). */
+const UNDRAWN: ReadonlySet<SeqStatement["kind"]> = new Set([
+  "declaration",
+  "autonumber",
+  "boxStart",
+  "boxEnd",
+  "link",
+  "title",
+  "acc",
+]);
+
+/** A block's own line: it opens, splits or closes a block. */
+const BLOCK_LINES: ReadonlySet<SeqStatement["kind"]> = new Set([
+  "blockStart",
+  "blockMiddle",
+  "blockEnd",
+]);
+
 /** `records` with `own` taken out and put back before `at`, or after it when `after`. */
 function reordered(
   count: number,
@@ -1219,6 +1237,8 @@ function moveMessage(
   // The statement the move passes last, and the line it lands beside.
   let far: SeqStatement;
   let indent = indentOf(model, statement.line);
+  // Whether it leaves the block it is in: then no section may be left empty (R56).
+  let leaves = false;
   const block = blockOf.get(neighbour);
   if (neighbour.depth < statement.depth) {
     // Its first or last place in a block or a branch: out of the whole block.
@@ -1228,6 +1248,7 @@ function moveMessage(
     }
     far = around;
     indent = indentOf(model, around.line);
+    leaves = true;
   } else if (
     block !== undefined &&
     (neighbour.kind === "blockEnd" || neighbour.kind === "blockStart")
@@ -1262,16 +1283,37 @@ function moveMessage(
       }
       far = around;
       indent = indentOf(model, around.line);
+      leaves = true;
     } else {
       far = neighbour;
     }
+  } else if (
+    up &&
+    neighbour.kind === "autonumber" &&
+    model.statements.slice(0, index).every((s) => UNDRAWN.has(s.kind))
+  ) {
+    // Nothing drawn above: passing `autonumber` would only take its number away.
+    return edge;
   } else if (PASSABLE.has(neighbour.kind)) {
     far = neighbour;
   } else {
     return edge;
   }
+  // Out of a block, the block keeps a message or a note in every section (R56).
+  if (leaves && emptiesSection(model, new Set([statement]))) {
+    return refused("emptiesBlock");
+  }
   // A line it passes is passed whole, every statement on it.
   const onFarLine = model.statements.filter((s) => s.line === far.line);
+  // A block's line that holds more: the message would land outside the block with
+  // the inner indent, or leave it without a step of its own (M2).
+  if (
+    !BLOCK_LINES.has(far.kind) &&
+    onFarLine.length > 1 &&
+    onFarLine.some((s) => BLOCK_LINES.has(s.kind))
+  ) {
+    return refused("mixedLine");
+  }
   const farIndex = model.statements.indexOf(
     (up ? onFarLine[0] : onFarLine.at(-1)) ?? far,
   );
@@ -1297,9 +1339,21 @@ function moveMessage(
   ];
   // The records in their new order: the message's own go before the first record it
   // passes, or after the last.
-  const passed = model.statements
-    .slice(Math.min(farIndex, index + 1), Math.max(farIndex, index - 1) + 1)
-    .flatMap((s) => s.records);
+  const passedStatements = model.statements.slice(
+    Math.min(farIndex, index + 1),
+    Math.max(farIndex, index - 1) + 1,
+  );
+  // Every declaration it passes, not only the next line: past its own participant's,
+  // the first mention moves, and a label below a first mention loses its column (I2).
+  const mine = new Set(statement.actors.map((a) => a.name));
+  if (
+    passedStatements.some(
+      (s) => s.kind === "declaration" && s.actors.some((a) => mine.has(a.name)),
+    )
+  ) {
+    return refused("passesDeclaration");
+  }
+  const passed = passedStatements.flatMap((s) => s.records);
   // A `create` or `destroy` line belongs to the message right after it: landing
   // between them, or before the start of a participant it names, is not a move.
   const ends = new Set(model.destroyed.values());

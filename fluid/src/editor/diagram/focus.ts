@@ -683,18 +683,37 @@ function onMoveKey(
   }
   const direction = event.key === "ArrowUp" ? "up" : "down";
   const turn = moveTurns.get(main) ?? 0;
-  const queued = (moveQueues.get(main) ?? Promise.resolve()).then(() =>
-    queuedMove(main, direction, turn),
-  );
+  const queued = (moveQueues.get(main) ?? Promise.resolve())
+    .then(() => queuedMove(main, direction, turn))
+    .catch(() => {
+      // A press that threw says so, and the queue goes on for the next one (M3).
+      moveFailed(main, from);
+    });
   moveQueues.set(main, queued);
   return true;
+}
+
+/** A move that threw: the presses still waiting go, and one sentence says so. */
+export function moveFailed(main: EditorView, from: number): void {
+  dropQueuedMoves(main);
+  if (main.dom.isConnected) {
+    sayAt(
+      main,
+      main.state.field(diagramIntent, false)?.anchor ?? from,
+      "failed",
+    );
+  }
 }
 
 /** The fence body the person's own last move wrote, per view. */
 const ownMoves = new WeakMap<EditorView, string>();
 /** Each view's presses, one after another: a press waits for the one before. */
 const moveQueues = new WeakMap<EditorView, Promise<void>>();
-/** Raised when a press is answered with a sentence: the presses after it are dropped. */
+/**
+ * Raised when a press is answered with a sentence, and when the person chooses
+ * something else (Escape, a walk, a click, a closed intent): the presses after it
+ * are dropped, and a move in its check does not take the stop back (I4).
+ */
 const moveTurns = new WeakMap<EditorView, number>();
 
 function dropQueuedMoves(main: EditorView): void {
@@ -772,6 +791,7 @@ export async function moveMessageAt(
   direction: "up" | "down",
   given: LineHold | null = null,
 ): Promise<boolean> {
+  const turn = moveTurns.get(main) ?? 0;
   const fence = fenceAt(main.state, from);
   const read = fence === null ? null : modelOf(fence.body);
   const hold =
@@ -803,7 +823,10 @@ export async function moveMessageAt(
       if (body !== undefined) {
         ownMoves.set(main, body);
       }
-      focusTarget(main, anchor, outcome.created);
+      // Only when the person chose nothing else while it was checked (I4).
+      if ((moveTurns.get(main) ?? 0) === turn) {
+        focusTarget(main, anchor, outcome.created);
+      }
     }
     return outcome.applied;
   } finally {
@@ -849,6 +872,7 @@ function onKey(
   const intent = main.state.field(diagramIntent);
   const connecting = intent?.mode === "connect" && intent.anchor === from;
   if (key === "Escape") {
+    dropQueuedMoves(main);
     if (!event.repeat) {
       movedStops.delete(main);
       if (connecting) {
@@ -865,6 +889,8 @@ function onKey(
   if (!menu && !rename && !remove && !WALK_KEYS.has(key)) {
     return false;
   }
+  // Another key on the drawing is another choice: no waiting move goes on (I4).
+  dropQueuedMoves(main);
   // Held, the walk may run on within the drawing; nothing else repeats (R81).
   if (event.repeat && !WALK_KEYS.has(key)) {
     return true;
@@ -1227,6 +1253,7 @@ const focusPlugin = ViewPlugin.fromClass(
       }
       event.preventDefault();
       event.stopPropagation();
+      dropQueuedMoves(view);
       if (event.repeat) {
         return;
       }
@@ -1298,6 +1325,7 @@ const focusPlugin = ViewPlugin.fromClass(
       if (place === null) {
         return;
       }
+      dropQueuedMoves(this.view);
       if (this.connectClick(event, place)) {
         return;
       }
@@ -1332,6 +1360,9 @@ const focusPlugin = ViewPlugin.fromClass(
     readonly contextmenu = (event: Event): void => {
       movedStops.delete(this.view);
       const place = this.place(event);
+      if (place !== null) {
+        dropQueuedMoves(this.view);
+      }
       // A page that takes no writes has no menu of ours, and keeps the browser's.
       if (place === null || !place.host.writable()) {
         return;
@@ -1646,6 +1677,13 @@ const focusPlugin = ViewPlugin.fromClass(
 
     update(update: ViewUpdate): void {
       const { view } = this;
+      if (
+        update.startState.field(diagramIntent) !== null &&
+        update.state.field(diagramIntent) === null
+      ) {
+        // The intent closed: a waiting move has no stop to go on from (I4).
+        dropQueuedMoves(view);
+      }
       if (
         update.docChanged ||
         update.startState.field(diagramIntent) !==

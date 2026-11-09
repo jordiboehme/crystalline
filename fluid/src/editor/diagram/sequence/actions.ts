@@ -27,7 +27,7 @@ import { fenceToAct, placeNow } from "../act";
 import { nextAnchorTicket, runDiagramOp, seqKind } from "../apply";
 import type { RefusalCode } from "../edits";
 import { reasonFor } from "../edits";
-import { moveMessageAt, sayAt } from "../focus";
+import { moveFailed, moveMessageAt, sayAt } from "../focus";
 import type { LineHold } from "../held";
 import {
   heldMessageOp,
@@ -306,7 +306,9 @@ function messageMenu(
           letGoOfLine(main, hold);
           return;
         }
-        void moveMessageAt(main, place, target, direction, hold);
+        moveMessageAt(main, place, target, direction, hold).catch(() => {
+          moveFailed(main, place);
+        });
       },
       ...blockedBy(model, { op: "moveMessage", target, direction }),
     })),

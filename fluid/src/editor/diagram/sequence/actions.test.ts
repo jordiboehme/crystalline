@@ -39,8 +39,29 @@ import type { SeqOp } from "./ops";
 import { compileSeqOp } from "./ops";
 import { parseSequence } from "./parse";
 
-/** How long each render waits: a test may slow the drawing down behind the text. */
-const kit = vi.hoisted(() => ({ renderMs: 0 }));
+/**
+ * How long each render waits: a test may slow the drawing down behind the text.
+ * `opMs` makes each diagram op wait before it runs, as a slow check does, and
+ * `throwOnce` makes the next one throw, as a bug in it would (M3).
+ */
+const kit = vi.hoisted(() => ({ renderMs: 0, opMs: 0, throwOnce: false }));
+
+vi.mock("../apply", async (original) => {
+  const real = await original<typeof import("../apply")>();
+  return {
+    ...real,
+    runDiagramOp: async (...args: Parameters<typeof real.runDiagramOp>) => {
+      if (kit.throwOnce) {
+        kit.throwOnce = false;
+        throw new Error("a bug in the op");
+      }
+      if (kit.opMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, kit.opMs));
+      }
+      return real.runDiagramOp(...args);
+    },
+  };
+});
 
 vi.mock("mermaid", async (original) => {
   const real = (await original<{ default: object }>()).default;
@@ -168,6 +189,8 @@ function typeInField(view: EditorView, value: string) {
 beforeEach(() => {
   forgetDrawings();
   kit.renderMs = 0;
+  kit.throwOnce = false;
+  kit.opMs = 0;
 });
 
 afterEach(() => {
@@ -1104,6 +1127,78 @@ describe("Move up and Move down", () => {
     expect(undoSteps(view)).toBe(steps + 11);
     expect(view.state.field(diagramIntent)?.target).toEqual(
       message("a", "b", "m13"),
+    );
+  });
+
+  it("Escape during the first of three presses: one move, the focus stays in the text (I4)", async () => {
+    const lines = Array.from(
+      { length: 6 },
+      (_, i) => `    a->>b: m${String(i + 1)}`,
+    );
+    const body = `sequenceDiagram\n    participant a\n    participant b\n${lines.join("\n")}`;
+    const view = await drawn(page(body));
+    kit.opMs = 300;
+    focusTarget(view, fromOf(view), message("a", "b", "m6"));
+    const before = text(view);
+    altKey("ArrowUp");
+    altKey("ArrowUp");
+    altKey("ArrowUp");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The first move is in its check, nothing written yet.
+    expect(text(view)).toBe(before);
+    press("Escape");
+    expect(view.state.field(diagramIntent)).toBeNull();
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(text(view)).toBe(
+      page(
+        `sequenceDiagram\n    participant a\n    participant b\n${[...lines.slice(0, 4), lines[5], lines[4]].join("\n")}`,
+      ),
+    );
+    expect(view.state.field(diagramIntent)).toBeNull();
+    expect(active()).toBe(view.contentDOM);
+  });
+
+  it("a walk during a move's check: the stop stays where it went, and the next press waits for none (I4)", async () => {
+    const lines = Array.from(
+      { length: 6 },
+      (_, i) => `    a->>b: m${String(i + 1)}`,
+    );
+    const body = `sequenceDiagram\n    participant a\n    participant b\n${lines.join("\n")}`;
+    const view = await drawn(page(body));
+    kit.opMs = 300;
+    focusTarget(view, fromOf(view), message("a", "b", "m6"));
+    altKey("ArrowUp");
+    altKey("ArrowUp");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    press("Home");
+    const walked = view.state.field(diagramIntent)?.target;
+    expect(walked).toEqual({ kind: "participant", name: "a" });
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // The first move went through; the second press was dropped by the walk.
+    expect(text(view)).toBe(
+      page(
+        `sequenceDiagram\n    participant a\n    participant b\n${[...lines.slice(0, 4), lines[5], lines[4]].join("\n")}`,
+      ),
+    );
+    expect(view.state.field(diagramIntent)?.target).toEqual(walked);
+    expect(active().getAttribute("aria-label")).toBe("Participant: a");
+  });
+
+  it("a press whose move throws says so, and the next press moves (M3)", async () => {
+    const view = await drawn();
+    focusTarget(view, fromOf(view), REPLY);
+    kit.throwOnce = true;
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toBe(NOTICES.failed);
+    });
+    expect(text(view)).toBe(page(STARTER));
+    altKey("ArrowUp");
+    await changed(view, page(STARTER));
+    expect(text(view)).toBe(
+      page(
+        "sequenceDiagram\n    participant caller as Caller\n    participant service as Service\n    service-->>caller: Reply\n    caller->>service: Request",
+      ),
     );
   });
 

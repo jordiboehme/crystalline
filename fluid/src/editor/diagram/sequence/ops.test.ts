@@ -1941,6 +1941,42 @@ describe("moveMessage", () => {
       up(message("a", "b", "x")),
       "gone",
     ],
+    [
+      "the only message of a loop, moving up (I1, R56)",
+      `${HEAD}  loop l\n    a->>b: only\n  end`,
+      up(message("a", "b", "only")),
+      "emptiesBlock",
+    ],
+    [
+      "the only message of an else, moving down (I1, R56)",
+      `${HEAD}  alt y\n    a->>b: 1\n  else n\n    b->>a: only\n  end`,
+      down(message("b", "a", "only")),
+      "emptiesBlock",
+    ],
+    [
+      "the only message of an alt's first branch, moving up (I1, R56)",
+      `${HEAD}  alt y\n    a->>b: only\n  else n\n    b->>a: 2\n  end`,
+      up(message("a", "b", "only")),
+      "emptiesBlock",
+    ],
+    [
+      "the only message of a loop, out past a declaration (I1, R56)",
+      `${HEAD}  loop l\n    participant c as C\n    a->>b: only\n  end`,
+      up(message("a", "b", "only")),
+      "emptiesBlock",
+    ],
+    [
+      "the top below the declarations and autonumber (M1)",
+      `${HEAD}  autonumber\n  a->>b: 1\n  b->>a: 2`,
+      up(message("a", "b", "1")),
+      "atTop",
+    ],
+    [
+      "the top below autonumber and a title (M1)",
+      "sequenceDiagram\n  title T\n  autonumber\n  participant a\n  participant b\n  a->>b: 1",
+      up(message("a", "b", "1")),
+      "atTop",
+    ],
   ])("refuses at %s", (_, body, op, want) => {
     expect(code(body, op)).toBe(want);
   });
@@ -1994,8 +2030,52 @@ describe("moveMessage", () => {
       down(message("a", "c", "hi")),
       "passesStart",
     ],
+    [
+      "an aliased declaration further up in the block, on the way out (I2)",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: 0\n  loop l\n    participant d as D\n    participant c as C\n    a->>d: m\n    a->>b: 2\n  end",
+      up(message("a", "d", "m")),
+      "passesDeclaration",
+    ],
+    [
+      "an aliased declaration further up, the other one named (I2)",
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: 0\n  loop l\n    participant c as C\n    participant d as D\n    a->>c: m\n    a->>b: 2\n  end",
+      up(message("a", "c", "m")),
+      "passesDeclaration",
+    ],
+    [
+      "an aliased declaration, with nothing declared at the top (I2)",
+      "sequenceDiagram\n  a->>b: 0\n  loop l\n    participant d as D\n    participant c as C\n    a->>d: m\n    a->>b: 2\n  end",
+      up(message("a", "d", "m")),
+      "passesDeclaration",
+    ],
+    [
+      "a line that holds a block's start and a message (M2)",
+      `${HEAD}  loop l; a->>b: in\n    b->>a: 2\n  end`,
+      up(message("b", "a", "2")),
+      "mixedLine",
+    ],
+    [
+      "a line that holds a message and a block's end (M2)",
+      `${HEAD}  loop l\n    b->>a: 2\n    a->>b: in; end\n  a->>b: 9`,
+      down(message("b", "a", "2")),
+      "mixedLine",
+    ],
   ])("refuses to cross %s, with a sentence of its own", (_, body, op, want) => {
     expect(code(body, op)).toBe(want);
+  });
+
+  test("a message leaves a block that keeps a note (R56)", () => {
+    const body = `${HEAD}  loop l\n    Note over a: n\n    a->>b: m\n  end`;
+    expect(run(body, down(message("a", "b", "m")))).toBe(
+      `${HEAD}  loop l\n    Note over a: n\n  end\n  a->>b: m`,
+    );
+  });
+
+  test("mid-diagram, a message still passes autonumber (M1)", () => {
+    const body = `${HEAD}  a->>b: 0\n  autonumber\n  b->>a: 1`;
+    expect(run(body, up(message("b", "a", "1")))).toBe(
+      `${HEAD}  a->>b: 0\n  b->>a: 1\n  autonumber`,
+    );
   });
 
   test("a move that keeps the activation whole applies, and mermaid reads it", async () => {

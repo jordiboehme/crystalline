@@ -477,6 +477,51 @@ function movedLine(
   return at < 0 ? "more than its own line changed" : null;
 }
 
+/** How many block sections hold no message and no note (R56). */
+function emptySections(model: SeqModel): number {
+  let count = 0;
+  const open: number[] = [];
+  for (const statement of model.statements) {
+    switch (statement.kind) {
+      case "blockStart":
+        open.push(0);
+        break;
+      case "blockMiddle":
+        count += open.pop() === 0 ? 1 : 0;
+        open.push(0);
+        break;
+      case "blockEnd":
+        count += open.pop() === 0 ? 1 : 0;
+        break;
+      case "message":
+      case "note":
+        open.forEach((_, i) => {
+          open[i] = (open[i] ?? 0) + 1;
+        });
+        break;
+      default:
+        break;
+    }
+  }
+  return count;
+}
+
+/** Whether `op` leaves more empty block sections than `body` had, `null` when not. */
+function emptiedSection(
+  body: string,
+  model: SeqModel,
+  op: SeqOp,
+): string | null {
+  const result = compileSeqOp(model, op);
+  if ("refused" in result) {
+    return null;
+  }
+  const after = parseSequence(applyEdits(body, result.edits));
+  return emptySections(after) > emptySections(model)
+    ? "a block section was left empty"
+    : null;
+}
+
 /** Runs one op on `body` and files the result. */
 async function runOp(
   tally: Tally,
@@ -615,6 +660,12 @@ async function checkBody(body: string): Promise<Tally> {
       if (moved !== null) {
         tally.failures.push(`move message ${String(i)} ${direction}: ${moved}`);
       }
+      const emptied = emptiedSection(body, model, op);
+      if (emptied !== null) {
+        tally.failures.push(
+          `move message ${String(i)} ${direction}: ${emptied}`,
+        );
+      }
       await runOp(
         tally,
         body,
@@ -639,6 +690,8 @@ async function checkBody(body: string): Promise<Tally> {
           "passesEnd",
           "passesStart",
           "passesDeclaration",
+          "mixedLine",
+          "emptiesBlock",
           "changesOrder",
         ],
       );
@@ -769,7 +822,7 @@ describe("every op on the corpus", () => {
     expect(total.applied.renameMessage).toBeGreaterThanOrEqual(243);
     expect(total.applied.arrowStyle).toBeGreaterThanOrEqual(2187);
     expect(total.applied.deleteMessage).toBeGreaterThanOrEqual(203);
-    expect(total.applied.moveMessage).toBeGreaterThanOrEqual(399);
+    expect(total.applied.moveMessage).toBeGreaterThanOrEqual(372);
     expect(total.applied.deleteParticipant).toBeGreaterThanOrEqual(94);
     expect(total.applied.addParticipant).toBe(corpus.length);
     expect(total.applied.addMessage).toBeGreaterThanOrEqual(249);
@@ -1084,13 +1137,16 @@ const CORPUS_REFUSALS: Record<string, number> = {
   // Moves: the top and the bottom of each diagram and of each nested level that has
   // nowhere left to go; a `-` above its `+`; a `create` or `destroy` crossed (c11,
   // c13, s10, s15); s02's undeclared participants, whose column would move; and the
-  // lines that hold two messages.
+  // lines that hold two messages. The top also below `autonumber` with nothing drawn
+  // above it (M1); a block whose section the move would leave empty (R56, I1). That
+  // check comes first, so one move that also crosses a `create` says it instead.
   "moveMessage atBottom": 19,
-  "moveMessage atTop": 28,
+  "moveMessage atTop": 30,
   "moveMessage breaksActivation": 9,
   "moveMessage changesOrder": 2,
+  "moveMessage emptiesBlock": 26,
   "moveMessage passesEnd": 8,
-  "moveMessage passesStart": 17,
+  "moveMessage passesStart": 16,
   "moveMessage sharedLine": 4,
 };
 /**
@@ -1115,7 +1171,8 @@ const EXTRA_REFUSALS: Record<string, number> = {
   "renameParticipant unsupported": 3,
   "moveMessage atBottom": 29,
   "moveMessage atTop": 22,
-  "moveMessage changesOrder": 14,
+  "moveMessage changesOrder": 13,
+  "moveMessage emptiesBlock": 8,
   "moveMessage passesDeclaration": 2,
   "moveMessage passesEnd": 6,
   "moveMessage passesStart": 8,

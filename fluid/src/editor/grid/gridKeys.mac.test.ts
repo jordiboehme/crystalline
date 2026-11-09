@@ -191,6 +191,26 @@ describe("Cell actions on Ctrl+Return", () => {
     expect(bytes(main.state)).toBe(WIDE);
   });
 
+  test("a second Ctrl+Return in the open menu runs no item and writes nothing (I3)", () => {
+    const main = solo();
+    navOn(main, 1, 1);
+    keyOn("Enter", { ctrlKey: true });
+    const first = document.activeElement;
+    expect(keyOn("Enter", { ctrlKey: true }).defaultPrevented).toBe(true);
+    keyOn("Enter", { ctrlKey: true, repeat: true });
+    expect(cellMenu()).not.toBeNull();
+    expect(document.activeElement).toBe(first);
+    expect(bytes(main.state)).toBe(WIDE);
+  });
+
+  test("a held Ctrl+Return opens nothing on a cell (I3)", () => {
+    const main = solo();
+    navOn(main, 1, 1);
+    keyOn("Enter", { ctrlKey: true, repeat: true });
+    expect(cellMenu()).toBeNull();
+    expect(bytes(main.state)).toBe(WIDE);
+  });
+
   test("Return alone still opens the cell", () => {
     const main = solo();
     navOn(main, 1, 1);

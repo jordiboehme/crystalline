@@ -53,7 +53,9 @@ export type RefusalCode =
   | "passesEnd"
   | "passesStart"
   | "passesDeclaration"
-  | "changesOrder";
+  | "mixedLine"
+  | "changesOrder"
+  | "failed";
 
 /**
  * What an op compiler returns: the edits (and what they create, of a type each
@@ -103,8 +105,11 @@ export const NOTICES: Record<RefusalCode, string> = {
     "A message cannot move across the start of a participant, so nothing was changed.",
   passesDeclaration:
     "A message cannot move across the line that declares its participant, so nothing was changed.",
+  mixedLine:
+    "The next line holds a block's start or end and more, so nothing was changed.",
   changesOrder:
     "That would change the order of the participants, so nothing was changed.",
+  failed: "That change did not finish. Look at the diagram and try again.",
 };
 
 /**
@@ -126,6 +131,7 @@ export const REASONS: Partial<Record<RefusalCode, string>> = {
   passesStart: "A message cannot move across the start of a participant.",
   passesDeclaration:
     "A message cannot move across the line that declares its participant.",
+  mixedLine: "The next line holds a block's start or end and more.",
   changesOrder: "That would change the order of the participants.",
 };
 
