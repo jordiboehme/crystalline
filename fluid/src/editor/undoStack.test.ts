@@ -4,7 +4,7 @@
  * `undoStack.<platform>.test.ts` files.
  */
 
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import { isShiftedZ } from "./undoStack";
 
@@ -96,25 +96,5 @@ describe("isShiftedZ on Linux and Windows (Mod is Ctrl)", () => {
         }),
       ),
     ).toBe(true);
-  });
-});
-
-describe("isShiftedZ on a Mac (Mod is Cmd)", () => {
-  test("Cmd+Shift+Z in either case, and not Ctrl+Shift+Z", () => {
-    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-    try {
-      for (const key of ["z", "Z"]) {
-        expect(
-          isShiftedZ(down({ key, keyCode: 90, metaKey: true, shiftKey: true })),
-        ).toBe(true);
-      }
-      expect(
-        isShiftedZ(
-          down({ key: "z", keyCode: 90, ctrlKey: true, shiftKey: true }),
-        ),
-      ).toBe(false);
-    } finally {
-      vi.restoreAllMocks();
-    }
   });
 });

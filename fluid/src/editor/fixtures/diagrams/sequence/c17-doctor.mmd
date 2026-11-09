@@ -1,0 +1,9 @@
+sequenceDiagram
+    %% crystalline doctor, short and flat
+    actor u as User
+    u->>doctor: crystalline doctor
+    doctor->>daemon: status
+    daemon-->>doctor: ok
+    doctor->>keychain: read the credentials
+    keychain-->>doctor: none
+    doctor-->>u: all fine, not connected

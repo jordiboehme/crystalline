@@ -38,6 +38,9 @@ import { type MermaidFence, fenceAt } from "./fence";
 import type { FlowCreated, FlowModel } from "./flowchart/model";
 import { type FlowOp, compileFlowOp } from "./flowchart/ops";
 import { parseFlowchart } from "./flowchart/parse";
+import type { SeqCreated, SeqModel } from "./sequence/model";
+import { type SeqOp, compileSeqOp } from "./sequence/ops";
+import { parseSequence } from "./sequence/parse";
 import { type Verdict, requestVerdict } from "./verdict";
 
 /**
@@ -59,6 +62,17 @@ export type ApplyOutcome<Created = unknown> =
 export const flowKind: DiagramKindOps<FlowModel, FlowOp, FlowCreated> = {
   parse: parseFlowchart,
   compile: compileFlowOp,
+  verify: requestVerdict,
+};
+
+/**
+ * Every sequence op is verified as well: the op's own check cannot see a `-` left
+ * with no `+`, and mermaid throws on it. An op that names a message or a block goes
+ * in through `heldSeqOp` (R94).
+ */
+export const seqKind: DiagramKindOps<SeqModel, SeqOp, SeqCreated> = {
+  parse: parseSequence,
+  compile: compileSeqOp,
   verify: requestVerdict,
 };
 

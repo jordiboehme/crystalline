@@ -402,6 +402,9 @@ for (const [name, doc, start] of [
     await openEditor(page, doc);
     const here = line(page, start);
     if (start === "Last mermaid") {
+      // The box drawn first: this is about the refusal, not about Ctrl+End racing
+      // the first draw (that has a journey of its own below).
+      await expect(box(page).locator("svg")).toBeVisible();
       // Far down the page, so not in the DOM until the caret goes there.
       await page.locator(".cm-content").focus();
       await page.keyboard.press("ControlOrMeta+End");
@@ -420,6 +423,66 @@ for (const [name, doc, start] of [
     expect((await here.boundingBox())?.y).toBe(top);
   });
 }
+
+test("Ctrl+End racing the first draw of a fence above: the end stays in the window", async ({
+  page,
+}) => {
+  // The diagram chunk held, so the fence is still its source at the key.
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(/assets\/(diagram-|mermaid\.core)/, async (route) => {
+    await held;
+    await route.continue();
+  });
+  await openEditor(page, `${FENCE}\n${fillers(17)}\nLast mermaid\n`);
+  const here = line(page, "Last mermaid");
+  await page.locator(".cm-content").focus();
+  await page.keyboard.press("ControlOrMeta+End");
+  await expect(here).toBeInViewport();
+  await expect(box(page)).toHaveCount(0);
+  await page.evaluate(
+    () =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      }),
+  );
+  // The line's place in the editor less the page's scroll: what a person sees
+  // of the text, whatever moves the editor itself (the findings line above it
+  // comes in at no fixed time). The box growing above the line adds to the
+  // first part; only a scroll by the same amount keeps the sum.
+  const seen = () =>
+    here.evaluate(
+      (el) =>
+        el.getBoundingClientRect().top -
+        (el.closest(".cm-editor")?.getBoundingClientRect().top ?? Number.NaN) -
+        (document.scrollingElement?.scrollTop ?? Number.NaN),
+    );
+  const was = await seen();
+  // Something above the editor grows after CodeMirror's last pass and before
+  // the pass that measures the new box (as the findings line can, coming in),
+  // so that pass keeps no anchor of its own.
+  const ABOVE_PX = 8;
+  await page.evaluate((px) => {
+    const content = document.querySelector(".cm-content");
+    if (content === null) return;
+    const watch = new MutationObserver(() => {
+      if (content.querySelector(".cm-diagram") === null) return;
+      watch.disconnect();
+      const above = document.createElement("div");
+      above.style.height = `${String(px)}px`;
+      document.querySelector(".cm-editor")?.before(above);
+    });
+    watch.observe(content, { childList: true });
+  }, ABOVE_PX);
+  release();
+  await expect(box(page).locator("svg")).toBeVisible();
+  await page.waitForTimeout(500);
+  // The box replaced its source above the window; the text in the window stays.
+  await expect(here).toBeInViewport();
+  expect(Math.abs((await seen()) - was)).toBeLessThanOrEqual(2);
+});
 
 /** A hit taken with main focused: the box stays drawn, the selection in its body. */
 async function hitWithMainFocused(page: Page): Promise<string> {

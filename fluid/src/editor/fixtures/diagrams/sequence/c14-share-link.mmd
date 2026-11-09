@@ -1,0 +1,24 @@
+sequenceDiagram
+    %% a share link for a review
+    actor owner as Owner
+    actor guest as Guest
+    participant rest as REST API
+    participant identity as Identity
+    participant ws as Co-editing socket
+    owner->>rest: create a share link
+    rest->>identity: mint the capability
+    identity-->>rest: link
+    rest-->>owner: link
+    owner-)guest: sends the link
+    guest->>rest: open the link
+    rest->>identity: check it
+    alt link is still valid
+        identity-->>rest: fine
+        rest-->>guest: page
+        guest->>ws: join
+        ws-->>guest: state
+    else expired
+        identity-->>rest: expired
+        rest--xguest: 410
+    end
+    Note over guest,ws: a guest sees only this one engram

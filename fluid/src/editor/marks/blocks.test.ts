@@ -6,7 +6,7 @@
 
 import { StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   bytes,
@@ -451,20 +451,12 @@ describe("Enter in a list or a quote", () => {
 });
 
 /**
- * A Ctrl+click on a Mac (`macMenuClick`): the browser sends its context menu
- * after it, so the box opens the task menu and writes nothing. The real
- * press runs in the smoke on a Mac only; here the platform is stubbed, so
- * the branch runs on every host.
+ * A Ctrl+click off a Mac (`macMenuClick`): it is a click there, and flips the
+ * box. jsdom's platform is "", which is no Mac. The Mac's side, where the same
+ * press opens the task menu, is in `blocks.mac.test.ts`: the platform is read
+ * once, when the modules load.
  */
-describe("a Ctrl+click with the platform stubbed", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  function stub(platform: string): void {
-    vi.spyOn(Navigator.prototype, "platform", "get").mockReturnValue(platform);
-  }
-
+describe("a Ctrl+click off a Mac", () => {
   function ctrlClick(el: HTMLElement): void {
     for (const type of ["mousedown", "click", "contextmenu"]) {
       el.dispatchEvent(
@@ -478,34 +470,28 @@ describe("a Ctrl+click with the platform stubbed", () => {
     }
   }
 
-  it("reads a Ctrl+click as the menu's on a Mac only", () => {
-    const press = new MouseEvent("mousedown", { ctrlKey: true });
-    stub("MacIntel");
-    expect(macMenuClick(press)).toBe(true);
-    expect(macMenuClick(new MouseEvent("mousedown"))).toBe(false);
-    stub("Win32");
-    expect(macMenuClick(press)).toBe(false);
-    stub("Linux x86_64");
-    expect(macMenuClick(press)).toBe(false);
+  it("reads no Ctrl+click as the menu's", () => {
+    expect(macMenuClick(new MouseEvent("mousedown", { ctrlKey: true }))).toBe(
+      false,
+    );
   });
 
-  it("opens the task menu on a Mac and does not flip the box", () => {
-    stub("MacIntel");
+  it("flips the box off a Mac, where Ctrl+click is a click", () => {
+    const view = markView("- [ ] t");
+    ctrlClick(box(view));
+    expect(bytes(view.state)).toBe("- [x] t");
+  });
+
+  it("Ctrl+Enter flips a task off a Mac and asks for no menu", () => {
     const heard: (ElementEdit | null)[] = [];
     const view = markView("- [ ] t", {
       onElementEdit: (edit) => {
         heard.push(edit);
       },
     });
-    ctrlClick(box(view));
-    expect(bytes(view.state)).toBe("- [ ] t");
-    expect(heard.at(-1)).toMatchObject({ kind: "task", at: 2 });
-  });
-
-  it("flips the box off a Mac, where Ctrl+click is a click", () => {
-    stub("Win32");
-    const view = markView("- [ ] t");
-    ctrlClick(box(view));
+    setCaret(view, 7);
+    expect(keys(view, "Ctrl-Enter")).toBe(true);
     expect(bytes(view.state)).toBe("- [x] t");
+    expect(heard.filter((edit) => edit !== null)).toEqual([]);
   });
 });

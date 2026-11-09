@@ -51,6 +51,7 @@ import { Dialog } from "radix-ui";
 import { useLocation } from "react-router";
 
 import { problemDetail } from "../api/client";
+import { keyLabel } from "../platform";
 import type {
   AnchorState,
   ReflectionDoc,
@@ -1226,10 +1227,12 @@ export function ReflectionThreads({
     if (barShown && !announced.current) {
       announced.current = true;
       // Below `xl` the column's button is in the sheet.
+      // Words, not signs: a screen reader says this (Option+F10 on a Mac).
+      const barKey = keyLabel("Alt-F10", { words: true });
       say(
         column
-          ? "Comment on the selection with Alt+F10"
-          : "Comment on the selection with Alt+F10 or from the threads",
+          ? `Comment on the selection with ${barKey}`
+          : `Comment on the selection with ${barKey} or from the threads`,
       );
     }
   }, [barShown, captured, column, say]);

@@ -38,7 +38,24 @@ export type RefusalCode =
   | "unchecked"
   | "breaksFence"
   | "needsLineBelow"
-  | "arrowChanged";
+  | "arrowChanged"
+  | "messageChanged"
+  | "emptiesBlock"
+  | "leavesActive"
+  | "participantEnded"
+  | "keptBox"
+  | "keptParticipant"
+  | "keptMessage"
+  | "atTop"
+  | "atBottom"
+  | "sharedLine"
+  | "breaksActivation"
+  | "passesEnd"
+  | "passesStart"
+  | "passesDeclaration"
+  | "mixedLine"
+  | "changesOrder"
+  | "failed";
 
 /**
  * What an op compiler returns: the edits (and what they create, of a type each
@@ -64,7 +81,66 @@ export const NOTICES: Record<RefusalCode, string> = {
     "A diagram at the end of a page needs a line below it, so nothing was changed.",
   arrowChanged:
     "This arrow changed, so the label was not written. Press Escape and open it again.",
+  messageChanged:
+    "This message changed, so what you typed was not written. Press Escape and open it again.",
+  emptiesBlock:
+    "That would leave a block with nothing in it, so nothing was changed.",
+  leavesActive: "That would leave an activation open, so nothing was changed.",
+  participantEnded:
+    "A participant that has ended can take no more messages, so nothing was changed.",
+  keptBox: "The new box stays. Press Delete, or undo once, to take it back.",
+  keptParticipant:
+    "The new participant stays. Press Delete, or undo once, to take it back.",
+  keptMessage:
+    "The new message stays. Press Delete, or undo once, to take it back.",
+  atTop: "This message is already at the top, so nothing was changed.",
+  atBottom: "This message is already at the bottom, so nothing was changed.",
+  sharedLine:
+    "This message shares its line with another statement, so nothing was changed.",
+  breaksActivation:
+    "That would end an activation before it starts, so nothing was changed.",
+  passesEnd:
+    "A message cannot move across the end of a participant, so nothing was changed.",
+  passesStart:
+    "A message cannot move across the start of a participant, so nothing was changed.",
+  passesDeclaration:
+    "A message cannot move across the line that declares its participant, so nothing was changed.",
+  mixedLine:
+    "The next line holds a block's own line (such as loop, else or end) and another statement, so nothing was changed.",
+  changesOrder:
+    "That would change the order of the participants, so nothing was changed.",
+  failed:
+    "Something went wrong with that move. Look at the diagram before you try again.",
 };
+
+/**
+ * What a disabled menu item says before anything was tried: what would happen. A
+ * notice's "so nothing was changed" is for after a try. Codes not here read as their
+ * notice, which already says no more than that.
+ */
+export const REASONS: Partial<Record<RefusalCode, string>> = {
+  invalid: "That change would break the diagram.",
+  unsupported: "This diagram uses something the editor does not know yet.",
+  emptiesBlock: "That would leave a block with nothing in it.",
+  leavesActive: "That would leave an activation open.",
+  participantEnded: "A participant that has ended can take no more messages.",
+  atTop: "This message is already at the top.",
+  atBottom: "This message is already at the bottom.",
+  sharedLine: "This message shares its line with another statement.",
+  breaksActivation: "That would end an activation before it starts.",
+  passesEnd: "A message cannot move across the end of a participant.",
+  passesStart: "A message cannot move across the start of a participant.",
+  passesDeclaration:
+    "A message cannot move across the line that declares its participant.",
+  mixedLine:
+    "The next line holds a block's own line (such as loop, else or end) and another statement.",
+  changesOrder: "That would change the order of the participants.",
+};
+
+/** The reason a disabled item gives for `code`. */
+export function reasonFor(code: RefusalCode): string {
+  return REASONS[code] ?? NOTICES[code];
+}
 
 /**
  * `edits` in source order, checked: each range lies in `0..length` and runs

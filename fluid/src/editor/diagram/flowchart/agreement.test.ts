@@ -426,7 +426,7 @@ describe("the parser agrees with mermaid 12.2.0's db", () => {
 
   const folder = node.process.env.FLUID_DIAGRAM_CORPUS;
   test.skipIf(folder === undefined)(
-    "the opt-in corpus: what is understood agrees",
+    "the opt-in corpus: what is understood agrees; refused files are counted and listed (R57)",
     async () => {
       const dir = folder ?? "";
       const fs = node.process.getBuiltinModule("node:fs") as Fs;
@@ -434,7 +434,7 @@ describe("the parser agrees with mermaid 12.2.0's db", () => {
       let flowcharts = 0;
       let understood = 0;
       let agreeing = 0;
-      let refused = 0;
+      const refused: string[] = [];
       const failures: string[] = [];
       for (const file of files) {
         const body = fs.readFileSync(`${dir}/${file}`, "utf8");
@@ -445,12 +445,13 @@ describe("the parser agrees with mermaid 12.2.0's db", () => {
         flowcharts++;
         const model = parseFlowchart(body);
         if (!model.understood) {
+          refused.push(`${file}: ${model.reasons[0] ?? ""}`);
           continue;
         }
         understood++;
         const view = await flowDbOf(body, false);
         if ("error" in view) {
-          refused++;
+          refused.push(`${file}: mermaid refuses it: ${String(view.error)}`);
           continue;
         }
         const difference = agreesFlow(model, view);
@@ -461,7 +462,10 @@ describe("the parser agrees with mermaid 12.2.0's db", () => {
         }
       }
       console.log(
-        `flowchart corpus: ${understood} of ${flowcharts} understood, ${refused} of those refused by mermaid, ${agreeing} agree with mermaid`,
+        [
+          `flowchart corpus: ${String(understood)} of ${String(flowcharts)} understood, ${String(agreeing)} agree with mermaid, ${String(refused.length)} refused`,
+          ...refused,
+        ].join("\n"),
       );
       expect(failures).toEqual([]);
     },

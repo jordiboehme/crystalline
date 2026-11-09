@@ -21,6 +21,10 @@ const SOURCES = import.meta.glob<string>(
   "../../fixtures/diagrams/flowchart/*.mmd",
   { query: "?raw", import: "default", eager: true },
 );
+const SEQUENCES = import.meta.glob<string>(
+  "../../fixtures/diagrams/sequence/*.mmd",
+  { query: "?raw", import: "default", eager: true },
+);
 const DRAWINGS = import.meta.glob<string>("../../fixtures/diagrams/svg/*.svg", {
   query: "?raw",
   import: "default",
@@ -37,7 +41,13 @@ function byName(files: Record<string, string>): Map<string, string> {
 }
 
 const SOURCE = byName(SOURCES);
-const DRAWING = byName(DRAWINGS);
+const SEQUENCE = byName(SEQUENCES);
+/** The flowchart drawings: a sequence file's and a `y` fallback's are not. */
+const DRAWING = new Map(
+  [...byName(DRAWINGS)].filter(
+    ([name]) => !SEQUENCE.has(name) && !name.startsWith("y"),
+  ),
+);
 const NAMES = [...SOURCE.keys()].sort((a, b) => a.localeCompare(b));
 
 function need<T>(value: T | null | undefined, what: string): T {

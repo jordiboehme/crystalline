@@ -1,7 +1,9 @@
 /**
  * What the menus of a drawn flowchart offer, and connect mode. Every item is a
  * call of `runDiagramOp`, so one undo step and one verify, or of a thing that makes
- * those calls (the rename field, adding a box, removing the fence).
+ * those calls (the rename field, adding a box, removing the fence). The menus of a
+ * sequence diagram open, close and follow a peer here too, and connect mode adds a
+ * message there: `sequence/actions.ts` says what is in those menus.
  *
  * What an item acts on is read when it runs, not when the menu opened: a box by its
  * id, an arrow by its place in the text (R94). With duplicates in play and that
@@ -22,10 +24,11 @@
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { ViewUpdate } from "@codemirror/view";
 
-import { flowKind, runDiagramOp } from "../apply";
+import { fenceToAct, placeNow } from "../act";
+import type { ApplyOutcome } from "../apply";
+import { flowKind, runDiagramOp, seqKind } from "../apply";
 import type { RefusalCode } from "../edits";
-import { NOTICES } from "../edits";
-import type { MermaidFence } from "../fence";
+import { reasonFor } from "../edits";
 import { fenceAt } from "../fence";
 import { diagramField, keepFenceDrawn } from "../field";
 import {
@@ -40,6 +43,14 @@ import {
   targetElement,
 } from "../focus";
 import type { FlowTarget, IntentCloseReason, TargetKey } from "../intent";
+import type { LineHold } from "../held";
+import {
+  holdLine,
+  holdsLine,
+  letGoOfLine,
+  resolveHeldTarget,
+  ticketless,
+} from "../held";
 import {
   closeDiagramIntent,
   diagramIntent,
@@ -56,19 +67,18 @@ import {
 } from "../labelEditor";
 import type { MenuClose, MenuHandle, MenuItem } from "../menu";
 import { openMenu } from "../menu";
+import type { DiagramModel } from "../kinds";
+import {
+  connectIdOf,
+  connectStopOf,
+  connectable,
+  labelOfTarget,
+} from "../kinds";
+import { SEQ_CONNECT_PROMPT, seqMenu } from "../sequence/actions";
 import type { Verdict } from "../verdict";
-import { verdictFor } from "../verdict";
 import type { DiagramHost } from "../widget";
 import { hostOf } from "../widget";
 import { COLOUR_KEYS, readDirection } from "./checked";
-import type { ArrowHold } from "./heldArrow";
-import {
-  holdArrow,
-  letGoOfArrow,
-  resolveArrow,
-  resolveTarget,
-} from "./heldArrow";
-import { flowLabelOf } from "./hit";
 import type { ColourPreset } from "./labels";
 import { COLOUR_PRESETS, SHAPES } from "./labels";
 import type { Arrow, EdgeKey, FlowModel } from "./model";
@@ -83,55 +93,30 @@ const CONNECTING_CLASS = "cm-diagram-connecting";
 /** Off the corner of the box, for a menu on a canvas opened by a key. */
 const CANVAS_INSET = 12;
 
-/** The arrow an open menu or its running item holds. */
-const holds = new WeakMap<EditorView, ArrowHold>();
+/** The arrow or message an open menu or its running item holds. */
+const holds = new WeakMap<EditorView, LineHold>();
 
 function holdFor(
   main: EditorView,
   anchor: number,
-  key: EdgeKey,
-  model: FlowModel,
-): ArrowHold {
+  target: Extract<TargetKey, { kind: "edge" | "message" }>,
+  model: DiagramModel,
+): LineHold {
   const had = holds.get(main);
-  if (had?.key.start === key.start && had.key.end === key.end) {
+  if (had !== undefined && holdsLine(had, target)) {
     return had;
   }
-  const hold = holdArrow(
-    main,
-    model,
-    key,
-    fenceAt(main.state, anchor)?.bodyFrom ?? 0,
-  );
+  const hold =
+    holdLine(main, model, target, fenceAt(main.state, anchor)?.bodyFrom ?? 0) ??
+    ticketless(target);
   holds.set(main, hold);
   return hold;
-}
-
-/** Where the fence is now: the intent follows it through what a peer writes. */
-function placeNow(main: EditorView, anchor: number): number {
-  return main.state.field(diagramIntent, false)?.anchor ?? anchor;
-}
-
-/**
- * The fence an item can act on, or null with the person told. The parse may be
- * behind, or a peer's line may read wrong just now, and a later try can differ.
- */
-function fenceToAct(main: EditorView, anchor: number): MermaidFence | null {
-  const fence = fenceNow(main, anchor);
-  if (fence === null) {
-    sayAt(main, anchor, "gone");
-    return null;
-  }
-  if (intentStale(main.state) || verdictFor(fence.body)?.ok === false) {
-    sayAt(main, anchor, "stale");
-    return null;
-  }
-  return fence;
 }
 
 async function runOp(
   main: EditorView,
   anchor: number,
-  hold: ArrowHold | null,
+  hold: LineHold | null,
   op: FlowOp | ((edge: EdgeKey) => FlowOp),
 ): Promise<void> {
   try {
@@ -147,11 +132,20 @@ async function runOp(
         if (typeof op !== "function") {
           return op;
         }
-        if (hold === null) {
+        if (hold === null || !("key" in hold)) {
           return { refused: "gone" };
         }
-        const edge = resolveArrow(main, hold, model, bodyFrom);
-        return typeof edge === "string" ? { refused: edge } : op(edge);
+        const edge = resolveHeldTarget(
+          main,
+          { kind: "edge", key: hold.key },
+          hold,
+          model,
+          bodyFrom,
+        );
+        if (typeof edge === "string") {
+          return { refused: edge };
+        }
+        return edge.kind === "edge" ? op(edge.key) : { refused: "gone" };
       },
     );
     if ("refused" in outcome) {
@@ -159,7 +153,7 @@ async function runOp(
     }
   } finally {
     if (hold !== null) {
-      letGoOfArrow(main, hold);
+      letGoOfLine(main, hold);
     }
   }
 }
@@ -283,7 +277,7 @@ function boxMenu(
 function blockedBy(model: FlowModel, op: FlowOp): Partial<MenuItem> {
   const result = compileFlowOp(model, op);
   return "refused" in result
-    ? { disabled: true, description: NOTICES[result.refused] }
+    ? { disabled: true, description: reasonFor(result.refused) }
     : {};
 }
 
@@ -304,7 +298,7 @@ function arrowMenu(
   key: EdgeKey,
   model: FlowModel,
 ): MenuItem[] {
-  const hold = holdFor(main, anchor, key, model);
+  const hold = holdFor(main, anchor, { kind: "edge", key }, model);
   const op = (flowOp: (edge: EdgeKey) => FlowOp) => () => {
     holds.delete(main);
     void runOp(main, anchor, hold, flowOp);
@@ -320,7 +314,7 @@ function arrowMenu(
       label: "Edit label",
       run: () => {
         holds.delete(main);
-        editLabel(main, anchor, hold);
+        editLabel(main, anchor, hold, key);
       },
     },
     {
@@ -365,25 +359,31 @@ function arrowMenu(
 }
 
 /** The field opens on the arrow the menu was opened on, wherever it is now. */
-function editLabel(main: EditorView, anchor: number, hold: ArrowHold): void {
+function editLabel(
+  main: EditorView,
+  anchor: number,
+  hold: LineHold,
+  key: EdgeKey,
+): void {
   const place = placeNow(main, anchor);
   const fence = fenceNow(main, place);
   const model = fence && modelNow(fence);
   const edge =
     fence === null || model === null
       ? "gone"
-      : resolveArrow(main, hold, model, fence.bodyFrom);
-  letGoOfArrow(main, hold);
+      : resolveHeldTarget(
+          main,
+          { kind: "edge", key },
+          hold,
+          model,
+          fence.bodyFrom,
+        );
+  letGoOfLine(main, hold);
   if (typeof edge === "string") {
     sayAt(main, place, edge);
     return;
   }
-  openLabelEditor(
-    main,
-    place,
-    { kind: "edge", key: edge },
-    { selectAll: true },
-  );
+  openLabelEditor(main, place, edge, { selectAll: true });
 }
 
 function diagramMenu(
@@ -430,6 +430,30 @@ export function flowMenu(
   target: FlowTarget,
   model: FlowModel,
 ): { name: string; items: MenuItem[] } {
+  return menuOf(main, anchor, target, model);
+}
+
+/** The menu of `target` on a diagram of either kind. */
+function menuOf(
+  main: EditorView,
+  anchor: number,
+  target: TargetKey,
+  model: DiagramModel,
+): { name: string; items: MenuItem[] } {
+  if (model.kind === "sequence") {
+    return seqMenu(main, anchor, target, model, {
+      connect: (at, name) => {
+        startConnect(main, at, name);
+      },
+      deleteDiagram: (at) => {
+        deleteFenceOf(main, at);
+      },
+      hold: (message) => holdFor(main, anchor, message, model),
+      release: () => {
+        holds.delete(main);
+      },
+    });
+  }
   switch (target.kind) {
     case "node":
       return {
@@ -441,7 +465,7 @@ export function flowMenu(
         name: "Arrow actions",
         items: arrowMenu(main, anchor, target.key, model),
       };
-    case "canvas":
+    default:
       return {
         name: "Diagram actions",
         items: diagramMenu(main, anchor, model),
@@ -513,7 +537,7 @@ function menuClosed(open: OpenMenu, reason: MenuClose): void {
     const fence = fenceAt(main.state, anchor);
     const model = fence && modelNow(fence);
     if (fence !== null && model !== null) {
-      const held = resolveTarget(
+      const held = resolveHeldTarget(
         main,
         open.target,
         hold ?? null,
@@ -521,7 +545,7 @@ function menuClosed(open: OpenMenu, reason: MenuClose): void {
         fence.bodyFrom,
       );
       // Not another arrow of the pair: the ring would stand on what a key deletes.
-      if (typeof held !== "string" && flowLabelOf(model, held) !== null) {
+      if (typeof held !== "string" && labelOfTarget(model, held) !== null) {
         target = held;
       }
     }
@@ -529,7 +553,7 @@ function menuClosed(open: OpenMenu, reason: MenuClose): void {
   // An item's own run still needs its arrow, and lets go when it is done.
   if (hold !== undefined && reason !== "item") {
     holds.delete(main);
-    letGoOfArrow(main, hold);
+    letGoOfLine(main, hold);
   }
   if (!main.dom.isConnected) {
     return;
@@ -568,7 +592,7 @@ function menuPlace(
     return { x: CANVAS_INSET, y: CANVAS_INSET };
   }
   const box = el.getBoundingClientRect();
-  return target.kind === "edge"
+  return target.kind === "edge" || target.kind === "message"
     ? {
         x: box.left - frame.left + box.width / 2,
         y: box.top - frame.top + box.height / 2,
@@ -598,11 +622,11 @@ function openFlowMenu(
     sayAt(main, anchor, "stale");
     return;
   }
-  if (target.kind !== "canvas" && flowLabelOf(model, target) === null) {
+  if (target.kind !== "canvas" && labelOfTarget(model, target) === null) {
     sayAt(main, anchor, "gone");
     return;
   }
-  const { name, items } = flowMenu(main, fence.from, target, model);
+  const { name, items } = menuOf(main, fence.from, target, model);
   main.dispatch({
     effects: [
       setDiagramIntent.of({ anchor: fence.from, target, mode: "menu" }),
@@ -660,7 +684,7 @@ function reconcileMenu(main: EditorView, open: OpenMenu): void {
     return;
   }
   open.body = fence.body;
-  const held = resolveTarget(
+  const held = resolveHeldTarget(
     main,
     open.target,
     holds.get(main) ?? null,
@@ -673,7 +697,7 @@ function reconcileMenu(main: EditorView, open: OpenMenu): void {
   }
   if (
     held === "gone" ||
-    (held.kind !== "canvas" && flowLabelOf(model, held) === null)
+    (held.kind !== "canvas" && labelOfTarget(model, held) === null)
   ) {
     open.gone = true;
     handle.close();
@@ -686,13 +710,15 @@ function reconcileMenu(main: EditorView, open: OpenMenu): void {
       effects: setDiagramIntent.of({ ...intent, target: held }),
     });
   }
-  handle.refresh(flowMenu(main, open.anchor, held, model).items);
+  handle.refresh(menuOf(main, open.anchor, held, model).items);
 }
 
 interface Connecting {
   main: EditorView;
   source: string;
   anchor: number;
+  /** What the mode asks for, by the kind of diagram. */
+  prompt: string;
   /** The prompt and its Cancel button. */
   bar: HTMLElement;
   /** A choice is being verified. */
@@ -710,12 +736,12 @@ function placeBar(open: Connecting, host: DiagramHost): void {
   host.container.classList.add(CONNECTING_CLASS);
 }
 
-function makeBar(main: EditorView): HTMLElement {
+function makeBar(main: EditorView, text: string): HTMLElement {
   const bar = document.createElement("div");
   bar.className = CONNECT_CLASS;
   const prompt = document.createElement("span");
   prompt.setAttribute("role", "status");
-  prompt.textContent = PROMPT;
+  prompt.textContent = text;
   const cancel = document.createElement("button");
   cancel.type = "button";
   cancel.tabIndex = -1;
@@ -750,25 +776,29 @@ function startConnect(main: EditorView, anchor: number, id: string): void {
   if (fence === null) {
     return;
   }
-  if (modelNow(fence)?.nodes.has(id) !== true) {
+  const model = modelNow(fence);
+  const stop = model && connectStopOf(model, id);
+  if (model === null || stop === null) {
     sayAt(main, anchor, "gone");
     return;
   }
+  const prompt = model.kind === "sequence" ? SEQ_CONNECT_PROMPT : PROMPT;
   const open: Connecting = {
     main,
     source: id,
     anchor: fence.from,
-    bar: makeBar(main),
+    prompt,
+    bar: makeBar(main, prompt),
     running: false,
     cancelled: false,
   };
   connects.set(main, open);
-  focusTarget(main, fence.from, { kind: "node", id }, "connect");
+  focusTarget(main, fence.from, stop, "connect");
   main.dispatch({
     effects: [
       keepFenceDrawn.of(fence.from),
       // A live region that arrives with its text is commonly not read (R92).
-      EditorView.announce.of(PROMPT),
+      EditorView.announce.of(prompt),
     ],
   });
   const host = hostOf(main, fence.from);
@@ -781,7 +811,7 @@ function startConnect(main: EditorView, anchor: number, id: string): void {
 function backFromConnect(open: Connecting, to: string): TargetKey {
   const fence = fenceNow(open.main, open.anchor);
   const model = fence && modelNow(fence);
-  return model?.nodes.has(to) === true ? { kind: "node", id: to } : CANVAS;
+  return (model && connectStopOf(model, to)) ?? CANVAS;
 }
 
 function cancelConnect(main: EditorView): void {
@@ -802,25 +832,34 @@ async function chooseBox(main: EditorView, to: string): Promise<void> {
     return;
   }
   const place = placeNow(main, open.anchor);
-  if (fenceToAct(main, place) === null) {
+  const fence = fenceToAct(main, place);
+  if (fence === null) {
     return;
   }
+  const sequence = modelNow(fence)?.kind === "sequence";
   open.running = true;
-  const outcome = await runDiagramOp(
-    main,
-    place,
-    {
-      ...flowKind,
-      // Whoever left during the check meant no arrow.
-      verify: async (body, dark): Promise<Verdict> => {
-        const verdict = await flowKind.verify(body, dark);
-        return open.cancelled
-          ? { ok: false, reason: "the person left connect mode" }
-          : verdict;
-      },
-    },
-    { op: "connect", from: open.source, to },
-  );
+  // Whoever left during the check meant no arrow. Each kind's own check runs.
+  const verify = async (body: string, dark: boolean): Promise<Verdict> => {
+    const verdict = sequence
+      ? await seqKind.verify(body, dark)
+      : await flowKind.verify(body, dark);
+    return open.cancelled
+      ? { ok: false, reason: "the person left connect mode" }
+      : verdict;
+  };
+  const outcome: ApplyOutcome<TargetKey> = sequence
+    ? await runDiagramOp(
+        main,
+        place,
+        { ...seqKind, verify },
+        { op: "addMessage", from: open.source, to },
+      )
+    : await runDiagramOp(
+        main,
+        place,
+        { ...flowKind, verify },
+        { op: "connect", from: open.source, to },
+      );
   open.running = false;
   if (open.cancelled || connects.get(main) !== open) {
     return;
@@ -837,6 +876,12 @@ async function chooseBox(main: EditorView, to: string): Promise<void> {
   focusTarget(main, anchor, stop);
   if (refused !== null) {
     sayAt(main, anchor, refused);
+  } else if (sequence && outcome.applied && outcome.created !== undefined) {
+    // A new message is named at once: its text is the second undo step.
+    openLabelEditor(main, anchor, outcome.created, {
+      selectAll: true,
+      added: true,
+    });
   }
 }
 
@@ -846,7 +891,8 @@ registerConnectHooks({
   },
   cancel: cancelConnect,
   remind: (main) => {
-    main.dispatch({ effects: EditorView.announce.of(PROMPT) });
+    const prompt = connects.get(main)?.prompt ?? PROMPT;
+    main.dispatch({ effects: EditorView.announce.of(prompt) });
   },
 });
 
@@ -872,20 +918,21 @@ function reconcileConnect(main: EditorView, open: Connecting): void {
   if (model === null) {
     return;
   }
-  if (!model.nodes.has(open.source)) {
+  const source = connectStopOf(model, open.source);
+  if (source === null) {
     endConnect(open);
     focusTarget(main, open.anchor, CANVAS);
     sayAt(main, open.anchor, "gone");
     return;
   }
   // The box it stood on went: back to the one it began from.
-  if (intent.target.kind !== "node" || !model.nodes.has(intent.target.id)) {
-    focusTarget(
-      main,
-      open.anchor,
-      { kind: "node", id: open.source },
-      "connect",
-    );
+  const standing = connectIdOf(intent.target);
+  if (
+    !connectable(intent.target) ||
+    standing === null ||
+    connectStopOf(model, standing) === null
+  ) {
+    focusTarget(main, open.anchor, source, "connect");
   }
 }
 

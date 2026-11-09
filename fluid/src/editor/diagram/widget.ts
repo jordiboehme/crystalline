@@ -50,6 +50,7 @@ import {
   offerPreviewDrawing,
   takePreviewDrawing,
 } from "../fencePreviews";
+import { diagramKindOf } from "./draws";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
 import { diagramField } from "./field";
@@ -160,6 +161,10 @@ function estimateHeight(body: string): number {
     1,
     body.split("\n").filter((line) => line.trim() !== "").length - 1,
   );
+  if (diagramKindOf(body) === "sequenceDiagram") {
+    // Measured on the starter: the boxes above and below, 46 px a statement.
+    return Math.min(TALLEST_ESTIMATE, 120 + 46 * statements);
+  }
   const sideways = /^\s*(?:flowchart|graph)\s+(?:LR|RL|>|<)/m.test(body);
   return Math.min(
     TALLEST_ESTIMATE,
@@ -260,6 +265,15 @@ export const ScrollRequest = (View.scrollIntoView(0).value as object)
  */
 const ANCHOR_REACH_PX = 12;
 
+/** Whether an update asks CodeMirror to scroll to a target. */
+function asksScroll(update: ViewUpdate): boolean {
+  return update.transactions.some(
+    (tr) =>
+      tr.scrollIntoView ||
+      tr.effects.some((effect) => effect.value instanceof ScrollRequest),
+  );
+}
+
 /** Views with a scroll to a target asked for since their last measure pass. */
 const scrollAsks = new WeakSet<EditorView>();
 
@@ -269,12 +283,7 @@ const scrollAsks = new WeakSet<EditorView>();
  */
 export const scrollAskWatcher = ViewPlugin.define((view) => ({
   update(update: ViewUpdate) {
-    const asks = update.transactions.some(
-      (tr) =>
-        tr.scrollIntoView ||
-        tr.effects.some((effect) => effect.value instanceof ScrollRequest),
-    );
-    if (!asks) {
+    if (!asksScroll(update)) {
       return;
     }
     scrollAsks.add(view);
@@ -285,6 +294,116 @@ export const scrollAskWatcher = ViewPlugin.define((view) => ({
         // That pass is over once the queue gets here.
         queueMicrotask(() => {
           scrollAsks.delete(view);
+        });
+      },
+    });
+  },
+}));
+
+/** The first of the editor's elements whose top is at or below `top`. */
+function lineAtOrBelow(view: EditorView, top: number): Element | null {
+  const children = view.contentDOM.children;
+  let low = 0;
+  let high = children.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    const child = children[middle];
+    if (child !== undefined && child.getBoundingClientRect().top < top) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return children[low] ?? null;
+}
+
+/**
+ * A fence first drawn wholly above the window, in an update that asks for no
+ * scroll: its box is taller or shorter than its source lines were. CodeMirror's
+ * anchor step keeps the text in the window still through that, but not in a
+ * pass where its scroll offset moved since its last one (something above the
+ * editor grew in between): then it keeps nothing. So the line at the window's
+ * top is noted before the box replaces the source, and whatever of the change
+ * the pass left goes back. A box first drawn in the window or under it moves
+ * the text below it (R77).
+ */
+export const firstDrawHold = ViewPlugin.define((view) => ({
+  update(update: ViewUpdate) {
+    const before = update.startState.field(diagramField, false);
+    const after = update.state.field(diagramField, false);
+    if (before === undefined || after === undefined) {
+      return;
+    }
+    if (before.fences === after.fences || asksScroll(update)) {
+      return;
+    }
+    const known = new Set(before.keys.values());
+    const fresh = [...after.keys.values()].filter((key) => !known.has(key));
+    if (fresh.length === 0) {
+      return;
+    }
+    const scroller = outerScroller(view);
+    if (scroller === null) {
+      return;
+    }
+    // Before CodeMirror's DOM sync: the source lines are still on the page.
+    const line = lineAtOrBelow(view, windowTopOf(scroller));
+    if (line === null) {
+      return;
+    }
+    // Where the line is in the document: CodeMirror's sync below still has the
+    // old one, the changes take it to the new.
+    const at = update.changes.mapPos(view.posAtDOM(line, 0));
+    const offset =
+      line.getBoundingClientRect().top - view.dom.getBoundingClientRect().top;
+    view.requestMeasure({
+      read: () => {
+        const windowTop = windowTopOf(scroller);
+        const above = fresh.some((key) => {
+          const box = boxesByKey.get(view)?.get(key);
+          return (
+            box !== undefined &&
+            !box.dead &&
+            box.dom.getBoundingClientRect().bottom <=
+              windowTop + ANCHOR_REACH_PX
+          );
+        });
+        // A box shorter than its source at the document's end: the browser
+        // clamped the scroll in this layout, and that is in the editor's top.
+        const atEnd =
+          scroller.scrollTop >=
+          scroller.scrollHeight - scroller.clientHeight - 1;
+        // The editor's top before any scroll of the pass: the person's is in it.
+        return {
+          above,
+          atEnd,
+          editorTop: view.dom.getBoundingClientRect().top,
+        };
+      },
+      write: ({ above, atEnd, editorTop }) => {
+        if (!above || scrollAsks.has(view)) {
+          return;
+        }
+        // After the pass, and after a landing's own step in it: `settleScroll`
+        // is queued in a write of the same pass, so it is ahead of the first
+        // hop, and the second hop runs after it. The two depend on each other:
+        // run this first and `settleScroll` reads its scroll as CodeMirror's.
+        queueMicrotask(() => {
+          queueMicrotask(() => {
+            // CodeMirror reuses a line's element, also for another line.
+            if (
+              !view.dom.isConnected ||
+              !line.isConnected ||
+              view.posAtDOM(line, 0) !== at
+            ) {
+              return;
+            }
+            const off = line.getBoundingClientRect().top - (editorTop + offset);
+            // CodeMirror leaves a pixel or less as it is; the clamp kept a shrink.
+            if (Math.abs(off) >= 1 && !(off < 0 && atEnd)) {
+              scroller.scrollBy({ top: off, behavior: "instant" });
+            }
+          });
         });
       },
     });
@@ -309,7 +428,8 @@ const settles = new WeakMap<EditorView, Settle>();
  * to a target, a scroll of CodeMirror's is its anchor step: it kept the line at
  * the window's top still through every change above it, a box wholly above
  * among them. It keeps a box across the top still itself, so the text under
- * that box is this step's in any case.
+ * that box is this step's in any case. `firstDrawHold` waits two microtasks so
+ * that it runs after this one: keep this a single hop from the pass's write.
  */
 function settleScroll(view: EditorView, settle: Settle): void {
   settles.delete(view);
@@ -499,8 +619,16 @@ function cancelRetry(box: Box): void {
   }
 }
 
+/** The box's name for a screen reader, by the kind its body says. */
+function boxName(body: string): string {
+  return diagramKindOf(body) === "sequenceDiagram"
+    ? "Sequence diagram"
+    : "Flowchart";
+}
+
 /** Brings the box to what it should show, at once when a drawing is at hand. */
 function draw(box: Box): void {
+  box.dom.setAttribute("aria-label", boxName(box.body));
   const key = drawKey(box.body, box.dark);
   cancelRetry(box);
   if (box.shown === key) {
@@ -535,7 +663,7 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
   dom.className = "cm-diagram";
   dom.setAttribute("role", "group");
   dom.setAttribute("aria-roledescription", "diagram");
-  dom.setAttribute("aria-label", "Flowchart");
+  dom.setAttribute("aria-label", boxName(widget.body));
   dom.tabIndex = 0;
   const drawing = document.createElement("div");
   drawing.className = "cm-diagram-drawing";

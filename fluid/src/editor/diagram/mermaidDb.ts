@@ -14,7 +14,7 @@
  * mermaid is imported dynamically, so this module costs nothing until a
  * diagram asks and mermaid stays its own lazy chunk.
  *
- * Two facts of mermaid 12.2.0 the callers rely on (pinned in the test):
+ * Two facts of mermaid 12.2.0's flowchart db the callers rely on (pinned in the test):
  *
  * - `domId` is `flowchart-<id>-<n>`, where `n` counts every `addVertex` call
  *   (edge ends and `style` lines included), so it cannot be derived from the
@@ -222,4 +222,148 @@ export async function flowDbOf(
   } catch (error) {
     return isImportFailure(error) ? { error, unavailable: true } : { error };
   }
+}
+
+/** One participant, in `db.getActors()` order, which is left to right. */
+export interface SequenceActorView {
+  name: string;
+  /** The label as mermaid stores it: entities still encoded. */
+  description: string;
+  type: string;
+}
+
+/** One entry of mermaid's message list. Its index is the `i<n>` the drawing carries. */
+export interface SequenceRecordView {
+  id: string;
+  from: string | undefined;
+  to: string | undefined;
+  /** The text; empty on an `autonumber` record, whose db message is its numbers. */
+  message: string;
+  /** mermaid's `LINETYPE`. */
+  type: number | undefined;
+  /** An `autonumber` record's numbers. */
+  autonumber?: { start?: number; step?: number; visible: boolean };
+  /** A note's `PLACEMENT`. */
+  placement?: number;
+}
+
+/**
+ * What else mermaid keeps on an actor, in `actors` order. The drawing uses both: a
+ * message's width reaches a gap only through `prevActor` and `nextActor`, and the
+ * menu comes from `links` and `properties`. A second `addActor` with a label resets
+ * them, which no other field of this view shows.
+ */
+export interface SequenceActorFacts {
+  name: string;
+  prevActor: string | undefined;
+  nextActor: string | undefined;
+  links: Record<string, unknown>;
+  properties: Record<string, unknown>;
+}
+
+export interface SequenceDbView {
+  actors: SequenceActorView[];
+  facts: SequenceActorFacts[];
+  records: SequenceRecordView[];
+  /** Each box's members. Its colour and title depend on the DOM's CSS support, so they are left out. */
+  boxes: { actors: string[] }[];
+  /** A created participant and the index of the record that creates it. */
+  created: [string, number][];
+  /** A destroyed participant and the index of the record that destroys it. */
+  destroyed: [string, number][];
+}
+
+/** The part of mermaid's SequenceDB this module reads. */
+interface RawSequenceDb {
+  getActors(): Map<
+    string,
+    {
+      name: string;
+      description: string;
+      type: string;
+      prevActor?: string;
+      nextActor?: string;
+      links?: Record<string, unknown>;
+      properties?: Record<string, unknown>;
+    }
+  >;
+  getMessages(): {
+    id: string;
+    from?: string;
+    to?: string;
+    message: string | { start?: number; step?: number; visible: boolean };
+    type?: number;
+    placement?: number;
+  }[];
+  getBoxes(): { actorKeys: string[] }[];
+  getCreatedActors(): Map<string, number>;
+  getDestroyedActors(): Map<string, number>;
+}
+
+/**
+ * Mermaid's sequence db for `body`, a new `SequenceDB` per diagram. The rest
+ * is as for `flowDbOf`: `dark` is the scheme of the view that asks, a refusal or
+ * another diagram type is `{ error }`, mermaid or its diagram chunk failing to
+ * load is `{ error, unavailable: true }`, and this never throws.
+ */
+export async function sequenceDbOf(
+  body: string,
+  dark: boolean,
+): Promise<SequenceDbView | { error: unknown; unavailable?: true }> {
+  let mermaid: (typeof import("mermaid"))["default"];
+  try {
+    ({ default: mermaid } = await import("mermaid"));
+  } catch (error) {
+    return { error, unavailable: true };
+  }
+  try {
+    initializeMermaid(mermaid, dark);
+    const diagram = await mermaid.mermaidAPI.getDiagramFromText(body);
+    if (diagram.type !== "sequence") {
+      return { error: new Error(`not a sequence diagram: ${diagram.type}`) };
+    }
+    const db = diagram.db as unknown as RawSequenceDb;
+    return {
+      actors: [...db.getActors().values()].map((a) => ({
+        name: a.name,
+        description: a.description,
+        type: a.type,
+      })),
+      facts: [...db.getActors().values()].map((a) => ({
+        name: a.name,
+        prevActor: a.prevActor,
+        nextActor: a.nextActor,
+        links: { ...a.links },
+        properties: { ...a.properties },
+      })),
+      records: db.getMessages().map((m) => ({
+        id: m.id,
+        from: m.from,
+        to: m.to,
+        message: typeof m.message === "string" ? m.message : "",
+        type: m.type,
+        ...(typeof m.message === "string"
+          ? {}
+          : { autonumber: definedOnly(m.message) }),
+        ...(m.placement === undefined ? {} : { placement: m.placement }),
+      })),
+      boxes: db.getBoxes().map((b) => ({ actors: [...b.actorKeys] })),
+      created: [...db.getCreatedActors()],
+      destroyed: [...db.getDestroyedActors()],
+    };
+  } catch (error) {
+    return isImportFailure(error) ? { error, unavailable: true } : { error };
+  }
+}
+
+function definedOnly(numbers: {
+  start?: number;
+  step?: number;
+  visible: boolean;
+}): { start?: number; step?: number; visible: boolean } {
+  return {
+    ...(numbers.start === undefined ? {} : { start: numbers.start }),
+    ...(numbers.step === undefined ? {} : { step: numbers.step }),
+    visible: numbers.visible,
+  };
 }

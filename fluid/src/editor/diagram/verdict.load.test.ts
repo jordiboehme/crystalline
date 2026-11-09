@@ -112,6 +112,21 @@ describe("the diagram chunk failing to load inside mermaid", () => {
     },
   );
 
+  test("the sequence chunk failing is no verdict either", async () => {
+    load.fail = false;
+    const body = "sequenceDiagram\n  A->>B: x";
+    load.rejectOnce = new TypeError(
+      "Failed to fetch dynamically imported module: https://x/sequenceDiagram.js",
+    );
+    const first = await requestVerdict(body, false);
+    expect(first.ok).toBe(false);
+    if (!first.ok) {
+      expect(first.reason).toMatch(/could not be loaded/);
+      expect(first.unavailable).toBe(true);
+    }
+    expect(verdictFor(body)).toBe(undefined);
+  });
+
   test("a refusal from the parse is a cached verdict, even one quoting those words", async () => {
     load.fail = false;
     const body = "flowchart TD\n  B";

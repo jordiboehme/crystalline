@@ -10,6 +10,7 @@ const FIXTURES = import.meta.glob<string>(
   [
     "../fixtures/diagrams/flowchart/*.mmd",
     "../fixtures/diagrams/fallback/*.mmd",
+    "../fixtures/diagrams/sequence/*.mmd",
   ],
   { query: "?raw", import: "default", eager: true },
 );
@@ -140,5 +141,67 @@ describe("the diagram verdict", () => {
     if (!verdict.ok) {
       expect(verdict.reason).toMatch(/too long/);
     }
+  });
+
+  test.each(["s01", "s05", "s07", "s15", "c01"])(
+    "%s is a drawable sequence diagram, with its names in domIds",
+    async (prefix) => {
+      const verdict = await requestVerdict(fixture(prefix), false);
+      if (!verdict.ok) {
+        throw new Error(verdict.reason);
+      }
+      expect(verdict.kind).toBe("sequence");
+      expect(verdict.domIds.size).toBeGreaterThan(0);
+      for (const [dom, name] of verdict.domIds) {
+        expect(dom).toBe(name);
+      }
+    },
+  );
+
+  test("y01, which the parser does not understand, is not drawable", async () => {
+    const verdict = await requestVerdict(fixture("y01"), false);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/half arrow/);
+    }
+  });
+
+  test("y02, which neither reads, is not drawable", async () => {
+    const verdict = await requestVerdict(fixture("y02"), false);
+    expect(verdict.ok).toBe(false);
+  });
+
+  test("a sequence that mermaid's db refuses is a cached refusal", async () => {
+    const body = "sequenceDiagram\n  A->>B: x\n  deactivate A";
+    const verdict = await requestVerdict(body, false);
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/refuses/);
+    }
+    expect(verdictFor(body)).toBe(verdict);
+  });
+
+  test("a sequence that agrees with nothing is refused in words", async () => {
+    const verdict = await requestVerdict(
+      'sequenceDiagram\n  A->>B: <a href="x">t</a>',
+      false,
+    );
+    expect(verdict.ok).toBe(false);
+  });
+
+  test("a sequence past mermaid's text limit is not drawable", async () => {
+    const verdict = await requestVerdict(
+      `sequenceDiagram\n  A->>B: x\n  %% ${"x".repeat(50_000)}`,
+      false,
+    );
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) {
+      expect(verdict.reason).toMatch(/too long/);
+    }
+  });
+
+  test("a body that only starts like the keyword goes to neither parser", async () => {
+    const verdict = await requestVerdict("sequenceDiagrams\n  A->>B: x", false);
+    expect(verdict.ok).toBe(false);
   });
 });

@@ -36,10 +36,11 @@ import {
   showPanel,
 } from "@codemirror/view";
 
+import { isMac, isMenuKey } from "../../platform";
 import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
 import { dispatchIsolated, roomUndo } from "../roomUndo";
-import { flowKind, removeFence, runDiagramOp } from "./apply";
+import { flowKind, removeFence, runDiagramOp, seqKind } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
@@ -50,18 +51,16 @@ import {
   showFenceSource,
   verdictArrived,
 } from "./field";
-import {
-  decorateFlow,
-  flowEdgeSpanOf,
-  flowElementOf,
-  flowStops,
-  flowTargetOf,
-} from "./flowchart/hit";
-import type { ArrowHold } from "./flowchart/heldArrow";
-import { holdArrow, letGoOfArrow, resolveArrow } from "./flowchart/heldArrow";
-import type { EdgeKey, FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
-import { parseFlowchart } from "./flowchart/parse";
+import type { LineHold } from "./held";
+import {
+  followLine,
+  heldMessageOp,
+  heldTargetOf,
+  holdLine,
+  letGoOfLine,
+  resolveHeldTarget,
+} from "./held";
 import type { DiagramIntent, TargetKey } from "./intent";
 import {
   closeDiagramIntent,
@@ -69,6 +68,21 @@ import {
   registerIntentReopen,
   setDiagramIntent,
 } from "./intent";
+import type { DiagramModel } from "./kinds";
+import {
+  connectIdOf,
+  connectable,
+  decorateDrawing,
+  elementOfTarget,
+  isLine,
+  labelOfTarget,
+  parseDiagram,
+  startOf,
+  stopAtOffset,
+  stopsOf as kindStops,
+  targetOfElement,
+} from "./kinds";
+import { heldSeqOp } from "./sequence/ops";
 import type { Verdict } from "./verdict";
 import { verdictFor } from "./verdict";
 import type { DiagramHost } from "./widget";
@@ -133,13 +147,13 @@ export function registerConnectHooks(hooks: ConnectHooks): void {
   connectHooks = hooks;
 }
 
-const models = new Map<string, FlowModel>();
+const models = new Map<string, DiagramModel>();
 
-/** The model of a fence body, kept for the last few bodies. */
-export function modelOf(body: string): FlowModel {
+/** The model of a fence body, of its kind, kept for the last few bodies. */
+export function modelOf(body: string): DiagramModel {
   let model = models.get(body);
   if (model === undefined) {
-    model = parseFlowchart(body);
+    model = parseDiagram(body);
     models.set(body, model);
     if (models.size > MODELS_KEPT) {
       const oldest = models.keys().next().value;
@@ -154,7 +168,7 @@ export function modelOf(body: string): FlowModel {
 interface Reading {
   svg: SVGSVGElement;
   svgId: string;
-  model: FlowModel;
+  model: DiagramModel;
   verdict: Verdict;
 }
 
@@ -175,13 +189,13 @@ function stopsOf(reading: Reading | null): TargetKey[] {
   if (reading === null) {
     return [CANVAS];
   }
-  return flowStops(reading.model).filter(
+  return kindStops(reading.model).filter(
     (stop) => stop.kind === "canvas" || elementOf(reading, stop) !== null,
   );
 }
 
 function elementOf(reading: Reading, target: TargetKey) {
-  return flowElementOf(
+  return elementOfTarget(
     reading.svg,
     reading.svgId,
     target,
@@ -304,9 +318,9 @@ export function prepareStop(
   return el;
 }
 
-/** The stops connect mode walks: only its boxes. */
+/** The stops connect mode walks: only its boxes, or its participants. */
 function boxStops(stops: TargetKey[]): TargetKey[] {
-  return stops.filter((stop) => stop.kind === "node");
+  return stops.filter(connectable);
 }
 
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
@@ -355,6 +369,15 @@ export function backOnStop(
 registerIntentReopen("focus", (main, intent, host) => {
   backOnStop(main, host, intent.target);
 });
+
+/** Whether the drawing on screen is of another body than the fence's text now. */
+function drawingBehind(
+  main: EditorView,
+  host: DiagramHost,
+  from: number,
+): boolean {
+  return fenceAt(main.state, from)?.body !== host.renderedBody();
+}
 
 /** The drawn fence whose box is `container`, by the line the box stands for. */
 function fenceFromOf(main: EditorView, container: HTMLElement): number | null {
@@ -409,29 +432,46 @@ async function deleteStop(
     return;
   }
   const fence = fenceAt(main.state, from);
+  const read = fence === null ? null : modelOf(fence.body);
   // A peer's duplicate landing during the verify must not move the delete (R94).
   const hold =
-    target.kind === "edge" && fence !== null
-      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+    fence !== null && read !== null && isLine(target)
+      ? holdLine(main, read, target, fence.bodyFrom)
       : null;
   try {
-    const outcome = await runDiagramOp(
-      main,
-      from,
-      flowKind,
-      (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
-        if (target.kind === "node") {
-          return { op: "deleteNode", id: target.id };
-        }
-        if (hold === null) {
-          return { refused: "gone" };
-        }
-        const edge = resolveArrow(main, hold, model, bodyFrom);
-        return typeof edge === "string"
-          ? { refused: edge }
-          : { op: "deleteEdge", edge };
-      },
-    );
+    const outcome =
+      read?.kind === "sequence"
+        ? await runDiagramOp(
+            main,
+            from,
+            seqKind,
+            seqDelete(main, target, hold, read),
+          )
+        : await runDiagramOp(
+            main,
+            from,
+            flowKind,
+            (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
+              if (target.kind === "node") {
+                return { op: "deleteNode", id: target.id };
+              }
+              if (hold === null) {
+                return { refused: "gone" };
+              }
+              const edge = resolveHeldTarget(
+                main,
+                target,
+                hold,
+                model,
+                bodyFrom,
+              );
+              return typeof edge === "string"
+                ? { refused: edge }
+                : edge.kind === "edge"
+                  ? { op: "deleteEdge", edge: edge.key }
+                  : { refused: "gone" };
+            },
+          );
     if ("refused" in outcome) {
       sayAt(
         main,
@@ -441,9 +481,32 @@ async function deleteStop(
     }
   } finally {
     if (hold !== null) {
-      letGoOfArrow(main, hold);
+      letGoOfLine(main, hold);
     }
   }
+}
+
+/** A sequence delete by key: a participant by name, a message by its held place. */
+function seqDelete(
+  main: EditorView,
+  target: TargetKey,
+  hold: LineHold | null,
+  read: DiagramModel,
+) {
+  if (target.kind === "message" && read.kind === "sequence") {
+    return heldMessageOp(
+      main,
+      hold,
+      target,
+      (message) => ({ op: "deleteMessage", target: message }),
+      read,
+    );
+  }
+  if (target.kind === "participant") {
+    return heldSeqOp({ op: "deleteParticipant", name: target.name });
+  }
+  // A box or an arrow has no place in a sequence diagram.
+  return () => ({ refused: "gone" as const });
 }
 
 /**
@@ -526,6 +589,42 @@ const WALK_KEYS = new Set([
   "End",
 ]);
 
+/**
+ * A Mac's own key for a stop key, read as that key: Cmd+Up and Cmd+Down for Home
+ * and End, which need fn on a MacBook, and Cmd+Backspace for Backspace, the
+ * Finder's delete (R111). Null off a Mac and for any other key. Cmd+Left and
+ * Cmd+Right stay the browser's, as Safari's Back and Forward.
+ */
+function macStopKey(event: KeyboardEvent): string | null {
+  if (
+    !isMac() ||
+    !event.metaKey ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.shiftKey
+  ) {
+    return null;
+  }
+  switch (event.key) {
+    case "ArrowUp":
+      return "Home";
+    case "ArrowDown":
+      return "End";
+    case "Backspace":
+      return "Backspace";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Whether the browser sends a `contextmenu` event after this menu key. Shift+F10
+ * and the menu key do; a Mac's Ctrl+Return is ours alone and sends none.
+ */
+function sendsContextMenu(event: KeyboardEvent): boolean {
+  return event.key === "ContextMenu" || event.key === "F10";
+}
+
 function isUndoKey(event: KeyboardEvent): boolean {
   return (event.metaKey || event.ctrlKey) && /^[zy]$/i.test(event.key);
 }
@@ -549,6 +648,194 @@ function leave(
   closeDiagramIntent(main, "user");
 }
 
+/** Alt+ArrowUp or Alt+ArrowDown, and no other modifier: a message's move. */
+function moveKey(event: KeyboardEvent): boolean {
+  return (
+    event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.shiftKey &&
+    (event.key === "ArrowUp" || event.key === "ArrowDown")
+  );
+}
+
+/**
+ * Moves the message the stop stands on one step, and the stop goes with it. Only on
+ * a message: on any other stop the key is not the diagram's. A held key moves once
+ * (R81), and a stop a peer moved takes the first press as a reminder (R102).
+ */
+function onMoveKey(
+  main: EditorView,
+  host: DiagramHost,
+  from: number,
+  event: KeyboardEvent,
+): boolean {
+  const intent = main.state.field(diagramIntent);
+  const target = currentTarget(main, from);
+  if (intent?.mode === "connect" && intent.anchor === from) {
+    return true;
+  }
+  if (target.kind !== "message") {
+    return false;
+  }
+  if (event.repeat || !host.writable()) {
+    return true;
+  }
+  const direction = event.key === "ArrowUp" ? "up" : "down";
+  const turn = moveTurns.get(main) ?? 0;
+  const queued = (moveQueues.get(main) ?? Promise.resolve())
+    .then(() => queuedMove(main, direction, turn))
+    .catch(() => {
+      // A press that threw says so, and the queue goes on for the next one (M3).
+      moveFailed(main, from);
+    });
+  moveQueues.set(main, queued);
+  return true;
+}
+
+/** A move that threw: the presses still waiting go, and one sentence says so. */
+export function moveFailed(main: EditorView, from: number): void {
+  dropQueuedMoves(main);
+  if (main.dom.isConnected) {
+    sayAt(
+      main,
+      main.state.field(diagramIntent, false)?.anchor ?? from,
+      "failed",
+    );
+  }
+}
+
+/** The fence body the person's own last move wrote, per view. */
+const ownMoves = new WeakMap<EditorView, string>();
+/** Each view's presses, one after another: a press waits for the one before. */
+const moveQueues = new WeakMap<EditorView, Promise<void>>();
+/**
+ * Raised when a press is answered with a sentence, and when the person chooses
+ * something else (Escape, a walk, a click, a closed intent): the presses after it
+ * are dropped, and a move in its check does not take the stop back (I4).
+ */
+const moveTurns = new WeakMap<EditorView, number>();
+
+function dropQueuedMoves(main: EditorView): void {
+  moveTurns.set(main, (moveTurns.get(main) ?? 0) + 1);
+}
+
+/**
+ * Whether the drawing is behind the text for any reason but the person's own last
+ * move. A move writes the text at once and the drawing follows a little later, so a
+ * quick next press acts on the text; a peer's change since is still "Try again".
+ */
+function behindForMove(main: EditorView, from: number): boolean {
+  const host = hostOf(main, from);
+  const drawn = main.state
+    .field(diagramField)
+    .fences.find((f) => f.from === from);
+  const behind = fenceIsBehind(main.state, from);
+  if (behind || (drawn && syntaxTree(main.state).length < drawn.to)) {
+    forceParsing(main, drawn?.to ?? from, PARSE_MS);
+  }
+  const body = fenceAt(main.state, from)?.body;
+  if (behind || body === undefined) {
+    return true;
+  }
+  return (
+    host !== null && body !== host.renderedBody() && body !== ownMoves.get(main)
+  );
+}
+
+/**
+ * One press's move, run after the presses before it, on the stop as it stands then:
+ * the last move put the stop on the message where it landed. A stop a peer moved
+ * (R102) or a peer's change since says so, and drops the presses still waiting.
+ */
+async function queuedMove(
+  main: EditorView,
+  direction: "up" | "down",
+  turn: number,
+): Promise<void> {
+  if ((moveTurns.get(main) ?? 0) !== turn || !main.dom.isConnected) {
+    return;
+  }
+  const intent = main.state.field(diagramIntent, false);
+  if (intent === null || intent === undefined) {
+    return;
+  }
+  const { anchor, target } = intent;
+  if (movedStops.delete(main)) {
+    dropQueuedMoves(main);
+    sayAt(main, anchor, "stale");
+    return;
+  }
+  if (target.kind !== "message" || intent.mode !== "focus") {
+    return;
+  }
+  if (behindForMove(main, anchor)) {
+    dropQueuedMoves(main);
+    sayAt(main, anchor, "stale");
+    return;
+  }
+  if (!(await moveMessageAt(main, anchor, target, direction))) {
+    dropQueuedMoves(main);
+  }
+}
+
+/**
+ * Moves a message one step, through its hold, and puts the stop on it where it
+ * lands, so the next press moves it on. `hold` is let go when done; with none, one
+ * is taken here.
+ */
+export async function moveMessageAt(
+  main: EditorView,
+  from: number,
+  target: Extract<TargetKey, { kind: "message" }>,
+  direction: "up" | "down",
+  given: LineHold | null = null,
+): Promise<boolean> {
+  const turn = moveTurns.get(main) ?? 0;
+  const fence = fenceAt(main.state, from);
+  const read = fence === null ? null : modelOf(fence.body);
+  const hold =
+    given ??
+    (fence !== null && read !== null
+      ? holdLine(main, read, target, fence.bodyFrom)
+      : null);
+  try {
+    const outcome = await runDiagramOp(
+      main,
+      from,
+      seqKind,
+      heldMessageOp(
+        main,
+        hold,
+        target,
+        (message) => ({ op: "moveMessage", target: message, direction }),
+        read?.kind === "sequence" ? read : undefined,
+      ),
+    );
+    const anchor = main.state.field(diagramIntent)?.anchor ?? from;
+    if ("refused" in outcome) {
+      sayAt(main, anchor, outcome.refused);
+      return false;
+    }
+    if (outcome.applied && outcome.created !== undefined) {
+      // The text is what the next press reads, before the drawing catches up.
+      const body = fenceAt(main.state, anchor)?.body;
+      if (body !== undefined) {
+        ownMoves.set(main, body);
+      }
+      // Only when the person chose nothing else while it was checked (I4).
+      if ((moveTurns.get(main) ?? 0) === turn) {
+        focusTarget(main, anchor, outcome.created);
+      }
+    }
+    return outcome.applied;
+  } finally {
+    if (hold !== null) {
+      letGoOfLine(main, hold);
+    }
+  }
+}
+
 /** Answers a key on the box; false when it is not one of the diagram's. */
 function onKey(
   main: EditorView,
@@ -560,11 +847,21 @@ function onKey(
     // The drawing holds the focus, and the undo stack is the page's.
     return runScopeHandlers(main, event, "editor");
   }
-  if (event.ctrlKey || event.metaKey || event.altKey) {
+  if (moveKey(event)) {
+    return onMoveKey(main, host, from, event);
+  }
+  // Before the modifier test: Ctrl+Return is a Mac's menu key, and Cmd+Up,
+  // Cmd+Down and Cmd+Backspace are its first, last and delete (R111).
+  const menu = isMenuKey(event);
+  const macKey = macStopKey(event);
+  if (
+    !menu &&
+    macKey === null &&
+    (event.ctrlKey || event.metaKey || event.altKey)
+  ) {
     return false;
   }
-  const { key } = event;
-  const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+  const key = macKey ?? event.key;
   if (event.shiftKey && !menu) {
     return false;
   }
@@ -575,6 +872,7 @@ function onKey(
   const intent = main.state.field(diagramIntent);
   const connecting = intent?.mode === "connect" && intent.anchor === from;
   if (key === "Escape") {
+    dropQueuedMoves(main);
     if (!event.repeat) {
       movedStops.delete(main);
       if (connecting) {
@@ -591,6 +889,8 @@ function onKey(
   if (!menu && !rename && !remove && !WALK_KEYS.has(key)) {
     return false;
   }
+  // Another key on the drawing is another choice: no waiting move goes on (I4).
+  dropQueuedMoves(main);
   // Held, the walk may run on within the drawing; nothing else repeats (R81).
   if (event.repeat && !WALK_KEYS.has(key)) {
     return true;
@@ -598,7 +898,10 @@ function onKey(
   // Waiting for its box: a walk or a choice, and no other key takes anything.
   if (connecting && (menu || remove || key === "F2")) {
     // By reading only: on Windows that key's `contextmenu` comes after its keyup.
-    keyMenuOwed.add(main);
+    // A Mac's Ctrl+Return sends none, so nothing is owed for it.
+    if (menu && sendsContextMenu(event)) {
+      keyMenuOwed.add(main);
+    }
     return true;
   }
   // A peer's edit moved the stop here, and this key was meant for the arrow (R102).
@@ -613,8 +916,9 @@ function onKey(
   if (WALK_KEYS.has(key)) {
     walk(main, host, from, key, connecting);
   } else if (connecting) {
-    if (target.kind === "node") {
-      connectHooks?.choose(main, target.id);
+    const id = connectIdOf(target);
+    if (id !== null) {
+      connectHooks?.choose(main, id);
     } else {
       connectHooks?.remind(main);
     }
@@ -672,12 +976,12 @@ function throughGate(
   const at = where();
   const fence = at === null ? null : fenceAt(main.state, at);
   const hold =
-    target.kind === "edge" && fence !== null
-      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+    isLine(target) && fence !== null
+      ? holdLine(main, modelOf(fence.body), target, fence.bodyFrom)
       : null;
   const letGo = () => {
     if (hold !== null) {
-      letGoOfArrow(main, hold);
+      letGoOfLine(main, hold);
     }
   };
   const go = () => {
@@ -689,16 +993,22 @@ function throughGate(
     let now = target;
     if (hold !== null) {
       const stands = fenceAt(main.state, anchor);
-      const edge =
+      const line =
         stands === null
           ? "gone"
-          : resolveArrow(main, hold, modelOf(stands.body), stands.bodyFrom);
+          : resolveHeldTarget(
+              main,
+              target,
+              hold,
+              modelOf(stands.body),
+              stands.bodyFrom,
+            );
       letGo();
-      if (typeof edge === "string") {
-        sayAt(main, anchor, edge);
+      if (typeof line === "string") {
+        sayAt(main, anchor, line);
         return;
       }
-      now = { kind: "edge", key: edge };
+      now = line;
     }
     act(anchor, now);
   };
@@ -723,7 +1033,7 @@ function settle(main: EditorView, host: DiagramHost): void {
   const reading = readingOf(host);
   if (reading !== null && !decorated.has(reading.svg)) {
     decorated.add(reading.svg);
-    decorateFlow(reading.svg, reading.svgId, reading.model, reading.verdict);
+    decorateDrawing(reading.svg, reading.svgId, reading.model, reading.verdict);
   }
   // Only a page that takes writes has a menu to offer (R87).
   if (reading !== null) {
@@ -752,8 +1062,9 @@ function settle(main: EditorView, host: DiagramHost): void {
     intent.mode === "connect" ? boxStops(stopsOf(reading)) : stopsOf(reading);
   if (!stops.some((stop) => sameTarget(stop, target))) {
     // The stop went, by a delete or a peer: the one now in its place, never the
-    // body, and only a drawing that can be read says it went.
-    if (reading === null) {
+    // body, and only a drawing of the text as it stands says it went. A message
+    // renamed a moment ago is not in the old drawing yet.
+    if (reading === null || drawingBehind(main, host, intent.anchor)) {
       return;
     }
     const place = lastPlace.get(host.container) ?? 0;
@@ -779,26 +1090,7 @@ const decorated = new WeakSet<SVGSVGElement>();
 /** The stop whose source spans hold `pos`; the canvas otherwise. */
 function stopAtPos(host: DiagramHost, offset: number): TargetKey {
   const reading = readingOf(host);
-  if (reading === null) {
-    return CANVAS;
-  }
-  const { model } = reading;
-  for (const id of model.nodeOrder) {
-    const refs = model.nodes.get(id)?.refs ?? [];
-    if (refs.some((r) => r.span.from <= offset && offset <= r.span.to)) {
-      return { kind: "node", id };
-    }
-  }
-  for (const edge of model.edges) {
-    const gap = model.chains[edge.chain]?.links[edge.link]?.gap;
-    if (gap !== undefined && gap.from <= offset && offset <= gap.to) {
-      return {
-        kind: "edge",
-        key: { start: edge.start, end: edge.end, occurrence: edge.occurrence },
-      };
-    }
-  }
-  return CANVAS;
+  return reading === null ? CANVAS : stopAtOffset(reading.model, offset);
 }
 
 /** Whether a sentence in this box's status line stands inside the window. */
@@ -849,9 +1141,6 @@ export function sayAt(
     main.dispatch({ effects: EditorView.announce.of(NOTICES[code]) });
   }
 }
-
-const sameEdgeKey = (a: EdgeKey, b: EdgeKey) =>
-  a.start === b.start && a.end === b.end && a.occurrence === b.occurrence;
 
 /** The views this layer runs in: a filter has only a state to go by. */
 const liveViews = new Set<EditorView>();
@@ -906,8 +1195,8 @@ const focusPlugin = ViewPlugin.fromClass(
     lookOn: DiagramHost | null = null;
     /** Takes a refusal's panel away again. */
     panelTimer: ReturnType<typeof setTimeout> | null = null;
-    /** The arrow the keyboard stands on, by its place (R94). */
-    stopHold: ArrowHold | null = null;
+    /** The arrow or message the keyboard stands on, by its place. */
+    stopHold: LineHold | null = null;
     /** The person's own edit came: it may rewrite the token, and it means no harm. */
     ownEdit = false;
     /** This plugin ended, as Raw ends it. A view that comes back gets a new one. */
@@ -933,20 +1222,22 @@ const focusPlugin = ViewPlugin.fromClass(
     readonly awayKey = (event: KeyboardEvent): void => {
       const { view } = this;
       const active = view.root.activeElement;
+      const move = moveKey(event);
+      // Read before the modifier test, as `onKey` reads them (R111).
+      const menu = isMenuKey(event);
+      const macKey = macStopKey(event);
       if (
         (active !== null && active !== view.dom.ownerDocument.body) ||
-        event.ctrlKey ||
-        event.metaKey ||
-        event.altKey ||
+        ((event.ctrlKey || event.metaKey) && !menu && macKey === null) ||
+        (event.altKey && !move) ||
         event.isComposing
       ) {
         return;
       }
-      const { key } = event;
-      const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+      const key = macKey ?? event.key;
       if (
         (event.shiftKey && !menu) ||
-        !(menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))
+        !(move || menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))
       ) {
         return;
       }
@@ -962,6 +1253,7 @@ const focusPlugin = ViewPlugin.fromClass(
       }
       event.preventDefault();
       event.stopPropagation();
+      dropQueuedMoves(view);
       if (event.repeat) {
         return;
       }
@@ -1033,6 +1325,7 @@ const focusPlugin = ViewPlugin.fromClass(
       if (place === null) {
         return;
       }
+      dropQueuedMoves(this.view);
       if (this.connectClick(event, place)) {
         return;
       }
@@ -1044,7 +1337,7 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null
           ? CANVAS
-          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
+          : targetOfElement(el, reading.svgId, reading.model, reading.verdict);
       const { view } = this;
       // Found again from the box, as a rename field's draft may move it. The intent's
       // own anchor would be the other fence's when the click came from there.
@@ -1067,6 +1360,9 @@ const focusPlugin = ViewPlugin.fromClass(
     readonly contextmenu = (event: Event): void => {
       movedStops.delete(this.view);
       const place = this.place(event);
+      if (place !== null) {
+        dropQueuedMoves(this.view);
+      }
       // A page that takes no writes has no menu of ours, and keeps the browser's.
       if (place === null || !place.host.writable()) {
         return;
@@ -1094,7 +1390,7 @@ const focusPlugin = ViewPlugin.fromClass(
         () => (box.isConnected ? fenceFromOf(this.view, box) : null),
         reading === null
           ? CANVAS
-          : flowTargetOf(
+          : targetOfElement(
               event.target as Element,
               reading.svgId,
               reading.model,
@@ -1206,18 +1502,19 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null
           ? CANVAS
-          : flowTargetOf(
+          : targetOfElement(
               event.target as Element,
               reading.svgId,
               reading.model,
               reading.verdict,
             );
+      const id = connectIdOf(target);
       if (target.kind === "canvas") {
         connectHooks?.cancel(view);
-      } else if (target.kind === "edge") {
+      } else if (id === null) {
         connectHooks?.remind(view);
       } else if (!staleNow(view, place.host, place.from)) {
-        connectHooks?.choose(view, target.id);
+        connectHooks?.choose(view, id);
       }
       return true;
     }
@@ -1247,19 +1544,28 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null || el === box
           ? CANVAS
-          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
+          : targetOfElement(el, reading.svgId, reading.model, reading.verdict);
       const intent = view.state.field(diagramIntent);
+      // The box stands in for a stop the drawing has not caught up with, as a
+      // message just renamed: the stop stays, and the next drawing takes it.
+      if (
+        el === box &&
+        intent !== null &&
+        intent.anchor === from &&
+        intent.target.kind !== "canvas" &&
+        drawingBehind(view, host, from)
+      ) {
+        paint(host, box);
+        return;
+      }
       // Connect mode keeps its mode, and stands only on a box.
       if (intent?.mode === "connect" && intent.anchor === from) {
-        if (target.kind === "node" && !sameTarget(intent.target, target)) {
+        if (connectable(target) && !sameTarget(intent.target, target)) {
           view.dispatch({
             effects: setDiagramIntent.of({ ...intent, target }),
           });
         }
-        paint(
-          host,
-          rove(host, target.kind === "node" ? target : intent.target),
-        );
+        paint(host, rove(host, connectable(target) ? target : intent.target));
         return;
       }
       if (
@@ -1302,24 +1608,24 @@ const focusPlugin = ViewPlugin.fromClass(
     /** Stop holding the stop's arrow. */
     dropStopHold(): void {
       if (this.stopHold !== null) {
-        letGoOfArrow(this.view, this.stopHold);
+        letGoOfLine(this.view, this.stopHold);
         this.stopHold = null;
       }
     }
 
     /**
-     * A stop on an arrow is a choice too: it follows that arrow when a duplicate
-     * moves its occurrence, and leaves when it cannot tell, so the ring never comes
-     * to stand on another arrow that the next key would take.
+     * A stop on an arrow or a message is a choice too: it follows that line when a
+     * duplicate moves its occurrence, and leaves when it cannot tell, so the ring
+     * never comes to stand on another line that the next key would take.
      */
     followStop(): void {
       const { view } = this;
       const intent = view.state.field(diagramIntent, false);
-      const key =
-        intent?.mode === "focus" && intent.target.kind === "edge"
-          ? intent.target.key
+      const target =
+        intent?.mode === "focus" && isLine(intent.target)
+          ? intent.target
           : null;
-      if (intent === null || intent === undefined || key === null) {
+      if (intent === null || intent === undefined || target === null) {
         this.ownEdit = false;
         this.dropStopHold();
         return;
@@ -1336,15 +1642,15 @@ const focusPlugin = ViewPlugin.fromClass(
       this.ownEdit = false;
       const hold = this.stopHold;
       const now =
-        hold === null || !sameEdgeKey(hold.key, key)
+        hold === null || !sameTarget(heldTargetOf(hold), target)
           ? null
-          : resolveArrow(view, hold, model, fence.bodyFrom);
+          : resolveHeldTarget(view, target, hold, model, fence.bodyFrom);
       // A new stop, or the person's own edit took the token, as a Line and its undo
-      // do. That is the same arrow, so the ticket goes back in it.
+      // do. That is the same line, so the ticket goes back in it.
       if (hold === null || now === null || (own && typeof now === "string")) {
         this.dropStopHold();
-        if (flowEdgeSpanOf(model, key) !== null) {
-          this.stopHold = holdArrow(view, model, key, fence.bodyFrom);
+        if (labelOfTarget(model, target) !== null) {
+          this.stopHold = holdLine(view, model, target, fence.bodyFrom);
         }
         return;
       }
@@ -1356,24 +1662,28 @@ const focusPlugin = ViewPlugin.fromClass(
         view.dispatch({
           effects: setDiagramIntent.of({
             ...intent,
-            target: { kind: "node", id: key.start },
+            target: startOf(target) ?? CANVAS,
           }),
         });
         movedStops.add(view);
         sayAt(view, intent.anchor, "stale");
-      } else if (!sameEdgeKey(now, key)) {
-        hold.key = now;
+      } else if (!sameTarget(now, target)) {
+        followLine(hold, now);
         view.dispatch({
-          effects: setDiagramIntent.of({
-            ...intent,
-            target: { kind: "edge", key: now },
-          }),
+          effects: setDiagramIntent.of({ ...intent, target: now }),
         });
       }
     }
 
     update(update: ViewUpdate): void {
       const { view } = this;
+      if (
+        update.startState.field(diagramIntent) !== null &&
+        update.state.field(diagramIntent) === null
+      ) {
+        // The intent closed: a waiting move has no stop to go on from (I4).
+        dropQueuedMoves(view);
+      }
       if (
         update.docChanged ||
         update.startState.field(diagramIntent) !==

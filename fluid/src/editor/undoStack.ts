@@ -29,6 +29,8 @@ import type { EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
+import { isMac } from "../platform";
+
 /** Whether `view` carries an undo stack: CodeMirror's history or a room's. */
 export function hasUndoStack(view: EditorView): boolean {
   return (
@@ -69,10 +71,7 @@ export function stackUndo(view: EditorView, which: "undo" | "redo"): boolean {
  */
 export function isShiftedZ(event: KeyboardEvent): boolean {
   if (event.isComposing || event.keyCode === 229) return false;
-  const mac =
-    typeof navigator !== "undefined" &&
-    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-  const mod = mac
+  const mod = isMac()
     ? event.metaKey && !event.ctrlKey
     : event.ctrlKey && !event.metaKey;
   if (!mod || !event.shiftKey || event.altKey) return false;

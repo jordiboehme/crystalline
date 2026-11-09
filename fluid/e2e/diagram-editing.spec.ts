@@ -175,6 +175,10 @@ const docText = (page: Page) =>
     return content.cmTile.view.state.doc.toString();
   });
 
+/** The id of the drawing on screen: each new render gets a new one. */
+const drawingIdOf = (page: Page) =>
+  page.locator(".cm-diagram svg").first().getAttribute("id");
+
 /** The text of the line the caret stands on. */
 const caretLine = (page: Page) =>
   page.evaluate(() => {
@@ -352,6 +356,7 @@ test("two browsers: a comment typed under Raw and a rename by the box both end e
     await nodeOf(pageB, "C").click();
     await expect(field(pageB)).toHaveValue("End");
     await pageB.keyboard.type("Finish");
+    const drawnB = await drawingIdOf(pageB);
 
     await pageA.getByRole("button", { name: "Raw", exact: true }).click();
     const comment = pageA.locator(".cm-line", {
@@ -361,9 +366,12 @@ test("two browsers: a comment typed under Raw and a rename by the box both end e
     await pageA.keyboard.press("End");
     await pageA.keyboard.press("Enter");
     await pageA.keyboard.type("%% from raw");
-    // The redraw this brings on must leave B's field and its draft alone.
+    // The redraw this brings on must leave B's field and its draft alone: wait for
+    // B's new drawing first, so the field is checked after it landed.
     await expect.poll(() => docText(pageB)).toContain("%% from raw");
+    await expect.poll(() => drawingIdOf(pageB)).not.toBe(drawnB);
     await expect(field(pageB)).toHaveValue("Finish");
+    await expect(field(pageB)).toBeFocused();
     await pageB.keyboard.press("Enter");
     await expect(field(pageB)).toHaveCount(0);
 
@@ -830,5 +838,252 @@ for (const theme of ["light", "dark"] as const) {
     await page.getByRole("link", { name: "Edit", exact: true }).click();
     await expect(page.locator(".cm-diagram svg")).toBeVisible();
     await shot("reflection-edit");
+  });
+}
+
+/**
+ * A sequence diagram with a comment, an undeclared participant (`service`) and a
+ * loop. It stands here and not in the flowchart fixture, so the flowchart
+ * journeys keep their counts. `diagram-sequence.spec.ts` holds the declared-alias
+ * rename and the keys-only Add message.
+ */
+const SEQ =
+  "Text above the sequence.\n\n```mermaid\nsequenceDiagram\n  %% keep this comment\n  participant caller as Caller\n  caller->>service:   Request\n  loop every minute\n    service-->>caller: Ping\n  end\n  service->>caller: Reply\n```\n\nText at the end.\n";
+
+const seqParticipant = (page: Page, name: string) =>
+  page
+    .locator(`.cm-diagram [data-et="participant"][data-id="${name}"]`)
+    .first();
+const seqText = (page: Page, text: string) =>
+  page.locator(".cm-diagram .messageText", { hasText: text }).first();
+
+test("sequence: renaming the undeclared participant adds one declaration line and keeps the rest", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  expect(before.startsWith("---\n")).toBe(true);
+  await seqParticipant(page, "service").click();
+  await expect(field(page)).toHaveValue("service");
+  await expect(field(page)).toHaveAccessibleName("Participant name");
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("Server");
+  await page.keyboard.press("Enter");
+  await expect(field(page)).toHaveCount(0);
+  await savedIs(
+    page,
+    permalink,
+    swap(
+      before,
+      "  participant caller as Caller\n",
+      "  participant caller as Caller\n  participant service as Server\n",
+    ),
+  );
+});
+
+test("sequence: a click on a message text, a new text and Enter change only that text", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  await seqText(page, "Request").click();
+  await expect(field(page)).toHaveAccessibleName("Message text");
+  await expect(field(page)).toHaveValue("Request");
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("Ask");
+  await page.keyboard.press("Enter");
+  await expect(field(page)).toHaveCount(0);
+  await savedIs(page, permalink, swap(before, ":   Request", ":   Ask"));
+});
+
+test("sequence: right click a message, Line, Dotted changes only the arrow token", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  await seqText(page, "Reply").click({ button: "right" });
+  await expect(
+    page.getByRole("menu", { name: "Message actions" }),
+  ).toBeVisible();
+  await page.getByRole("menuitem", { name: "Line" }).click();
+  await page.getByRole("menuitemradio", { name: "Dotted" }).click();
+  await savedIs(
+    page,
+    permalink,
+    swap(before, "service->>caller: Reply", "service-->>caller: Reply"),
+  );
+});
+
+test("sequence: the Arrowhead submenu changes only the head", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  await seqText(page, "Reply").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Arrowhead" }).click();
+  await page.getByRole("menuitemradio", { name: "Cross" }).click();
+  await savedIs(
+    page,
+    permalink,
+    swap(before, "service->>caller: Reply", "service-xcaller: Reply"),
+  );
+});
+
+test("sequence: Delete on a message removes its line and nothing else", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  await seqText(page, "Reply").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
+  await savedIs(
+    page,
+    permalink,
+    swap(before, "  service->>caller: Reply\n", ""),
+  );
+  await expect(page.locator(".cm-diagram .messageText")).toHaveCount(2);
+});
+
+test("sequence, two browsers: a comment typed under Raw and a message edit both end everywhere", async ({
+  page,
+  browser,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  const before = await saved(page, permalink);
+  const contextA = await browser.newContext();
+  const contextB = await browser.newContext();
+  try {
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+    await signIn(pageA);
+    await signIn(pageB, PEER, PEER_PASSWORD);
+    await edit(pageA, permalink);
+    await edit(pageB, permalink);
+
+    await seqText(pageB, "Request").click();
+    await expect(field(pageB)).toHaveValue("Request");
+    await pageB.keyboard.press("ControlOrMeta+A");
+    await pageB.keyboard.type("Ask twice");
+    const drawnB = await drawingIdOf(pageB);
+
+    await pageA.getByRole("button", { name: "Raw", exact: true }).click();
+    await pageA
+      .locator(".cm-line", { hasText: "%% keep this comment" })
+      .click();
+    await pageA.keyboard.press("End");
+    await pageA.keyboard.press("Enter");
+    await pageA.keyboard.type("%% from raw");
+    // The redraw this brings on must leave B's field and its draft alone: wait for
+    // B's new drawing first, so the field is checked after it landed.
+    await expect.poll(() => docText(pageB)).toContain("%% from raw");
+    await expect.poll(() => drawingIdOf(pageB)).not.toBe(drawnB);
+    await expect(field(pageB)).toHaveValue("Ask twice");
+    await expect(field(pageB)).toBeFocused();
+    await pageB.keyboard.press("Enter");
+    await expect(field(pageB)).toHaveCount(0);
+
+    const expected = swap(
+      swap(before, ":   Request", ":   Ask twice"),
+      "  %% keep this comment\n",
+      "  %% keep this comment\n  %% from raw\n",
+    );
+    await savedIs(page, permalink, expected);
+    await expect.poll(() => docText(pageA)).toContain(":   Ask twice");
+    expect(await docText(pageA)).toBe(await docText(pageB));
+    expect(await docText(pageA)).toContain(
+      expected.slice(expected.indexOf("Text above")),
+    );
+  } finally {
+    await contextA.close();
+    await contextB.close();
+  }
+});
+
+test("sequence: every participant and every message in a drawing is mapped", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, SEQ);
+  await edit(page, permalink);
+  await expect(seqParticipant(page, "service")).toBeVisible();
+  const counts = await page.evaluate(() => {
+    const diagram = document.querySelector(".cm-diagram");
+    const all = Array.from(
+      diagram?.querySelectorAll('[data-et="participant"]') ?? [],
+    );
+    const lines = Array.from(
+      diagram?.querySelectorAll('[data-et="message"]') ?? [],
+    );
+    return {
+      participants: all.length,
+      participantButtons: all.filter(
+        (el) => el.getAttribute("role") === "button",
+      ).length,
+      names: Array.from(new Set(all.map((el) => el.getAttribute("data-id")))),
+      messages: lines.length,
+      messageButtons: lines.filter((el) => el.getAttribute("role") === "button")
+        .length,
+      messagesWithHit: lines.filter((el) =>
+        el.parentElement?.querySelector(
+          `:scope > [data-hit-for="${el.getAttribute("data-id") ?? ""}"]`,
+        ),
+      ).length,
+    };
+  });
+  expect(counts.names.sort()).toEqual(["caller", "service"]);
+  expect(counts.participants).toBeGreaterThanOrEqual(2);
+  expect(counts.participantButtons).toBe(counts.participants);
+  expect(counts.messages).toBe(3);
+  expect(counts.messageButtons).toBe(3);
+  expect(counts.messagesWithHit).toBe(3);
+});
+
+for (const theme of ["light", "dark"] as const) {
+  test(`the sequence checkpoint's pictures in ${theme}`, async ({ page }) => {
+    test.skip(SHOTS === undefined, "only with FLUID_E2E_SHOTS");
+    await page.addInitScript((value) => {
+      window.localStorage.setItem("fluid-theme", value);
+    }, theme);
+    const shot = async (name: string) => {
+      await expect(page.locator(".ready-flash")).toHaveCount(0);
+      await page.screenshot({
+        path: `${SHOTS ?? ""}/${name}-${theme}.png`,
+      });
+    };
+
+    const permalink = await scratch(page, SEQ);
+    await edit(page, permalink);
+    await shot("sequence");
+
+    await seqText(page, "Reply").click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Arrowhead" }).click();
+    await expect(page.getByRole("menu", { name: "Arrowhead" })).toBeVisible();
+    await shot("message-menu-arrowhead");
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await expect(menus(page)).toHaveCount(0);
+
+    await seqParticipant(page, "caller").click({ button: "right" });
+    await expect(
+      page.getByRole("menu", { name: "Participant actions" }),
+    ).toBeVisible();
+    await shot("participant-menu");
+    await page.getByRole("menuitem", { name: "Add message to..." }).click();
+    await expect(
+      page.locator(".cm-diagram [role=status]", {
+        hasText: "Choose the participant",
+      }),
+    ).toBeVisible();
+    await shot("add-message-prompt");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("Enter");
+    await expect(field(page)).toHaveValue("New message");
+    await shot("add-message-field");
+    await page.keyboard.press("Escape");
+    await expect(field(page)).toHaveCount(0);
   });
 }

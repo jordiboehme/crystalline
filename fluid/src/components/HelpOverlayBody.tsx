@@ -11,18 +11,38 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
 import { HANDBOOK_URL } from "../handbook";
+import { isMac, keyLabel } from "../platform";
 import type { HelpOverlayProps } from "./HelpOverlay";
+
+/**
+ * A key as this keyboard names it. On a Mac the sign and the words, "⌃↩
+ * (Ctrl+Return)": not everybody reads ⌃ and ↩ (M4). Elsewhere words only.
+ */
+function named(cmKey: string): string {
+  const sign = keyLabel(cmKey);
+  const words = keyLabel(cmKey, { words: true });
+  return sign === words ? sign : `${sign} (${words})`;
+}
 
 /** The map itself: what to press, and what it does. */
 const SHORTCUTS: { keys: string; does: string }[] = [
-  { keys: "Cmd/Ctrl K", does: "Command palette" },
+  { keys: named("Mod-k"), does: "Command palette" },
   { keys: "?", does: "This help" },
   { keys: "\\", does: "Full width for the content" },
-  { keys: "Cmd/Ctrl S", does: "Save (in the editor)" },
-  { keys: "Cmd/Ctrl F", does: "Find in the document (in the editor)" },
-  { keys: "Cmd/Ctrl B", does: "Bold (in the editor)" },
-  { keys: "Cmd/Ctrl I", does: "Italic (in the editor)" },
-  { keys: "Esc", does: "Close dialogs and menus" },
+  { keys: named("Mod-s"), does: "Save (in the editor)" },
+  { keys: named("Mod-f"), does: "Find in the document (in the editor)" },
+  { keys: named("Mod-b"), does: "Bold (in the editor)" },
+  { keys: named("Mod-i"), does: "Italic (in the editor)" },
+  // A Mac has no menu key, and F10 needs fn there (R111).
+  {
+    keys: named(isMac() ? "Ctrl-Enter" : "Shift-F10"),
+    does: "Menu for the item you are on (in the editor)",
+  },
+  {
+    keys: named("Alt-F10"),
+    does: "Toolbar for the selection (in the editor and on a Reflection page)",
+  },
+  { keys: named("Escape"), does: "Close dialogs and menus" },
 ];
 
 export default function HelpOverlayBody({
@@ -59,7 +79,7 @@ export default function HelpOverlayBody({
           <dl className="mt-3 flex flex-col gap-2 text-sm">
             {SHORTCUTS.map((shortcut) => (
               <div key={shortcut.keys} className="flex items-baseline gap-3">
-                <dt className="w-32 shrink-0">
+                <dt className="w-40 shrink-0">
                   <kbd className="rounded border border-slate-300 px-1.5 py-0.5 font-mono text-xs dark:border-slate-700">
                     {shortcut.keys}
                   </kbd>

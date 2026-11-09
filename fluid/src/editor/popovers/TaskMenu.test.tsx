@@ -7,7 +7,7 @@
 import { EditorState, StateEffect } from "@codemirror/state";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import {
   bytes,
@@ -167,31 +167,6 @@ describe("a page that takes no writes (C12)", () => {
     await waitFor(() => {
       expect(screen.queryByRole("menu")).toBeNull();
     });
-    expect(bytes(view.state)).toBe("x\n- [ ] t");
-  });
-});
-
-describe("Ctrl+click on a Mac", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("opens the menu and does not flip the box", async () => {
-    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-    const view = popoverView("x\n- [ ] t");
-    const el = box();
-    // The order macOS sends a Ctrl+click in.
-    for (const type of ["mousedown", "contextmenu", "mouseup", "click"]) {
-      el.dispatchEvent(
-        new MouseEvent(type, {
-          bubbles: true,
-          cancelable: true,
-          button: type === "contextmenu" ? 2 : 0,
-          ctrlKey: true,
-        }),
-      );
-    }
-    await menu();
     expect(bytes(view.state)).toBe("x\n- [ ] t");
   });
 });

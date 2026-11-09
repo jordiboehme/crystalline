@@ -1,0 +1,6 @@
+sequenceDiagram
+    %% nobody is declared, the order comes from the first mention
+    browser->>proxy: GET /api
+    proxy->>daemon: forward
+    daemon-->>proxy: 200
+    proxy-->>browser: 200

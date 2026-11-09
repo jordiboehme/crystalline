@@ -519,6 +519,8 @@ describe("what each item writes", () => {
       expect(active()).toBe(fieldOf(view));
       press("Escape");
       await flush();
+      // The box stays, and the sentence under the drawing says how it goes.
+      expect(noticeOf(view)).toBe(NOTICES.keptBox);
       undoOnce(view);
       expect(text(view)).toBe(page(SKELETON));
     },

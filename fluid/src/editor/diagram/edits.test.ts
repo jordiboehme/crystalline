@@ -3,7 +3,15 @@ import { describe, expect, test } from "vitest";
 
 import { onlyEditedBytes, untouchedLinesEqual } from "../../test/fidelity";
 import { docText, lineSeparatorFor } from "../setup";
-import { NOTICES, type TextEdit, applyEdits, toChanges } from "./edits";
+import {
+  NOTICES,
+  REASONS,
+  type RefusalCode,
+  type TextEdit,
+  applyEdits,
+  reasonFor,
+  toChanges,
+} from "./edits";
 
 describe("applyEdits", () => {
   test("a line break in an insert is a new line", () => {
@@ -158,7 +166,87 @@ describe("NOTICES", () => {
         "A diagram at the end of a page needs a line below it, so nothing was changed.",
       arrowChanged:
         "This arrow changed, so the label was not written. Press Escape and open it again.",
+      messageChanged:
+        "This message changed, so what you typed was not written. Press Escape and open it again.",
+      emptiesBlock:
+        "That would leave a block with nothing in it, so nothing was changed.",
+      leavesActive:
+        "That would leave an activation open, so nothing was changed.",
+      participantEnded:
+        "A participant that has ended can take no more messages, so nothing was changed.",
+      keptBox:
+        "The new box stays. Press Delete, or undo once, to take it back.",
+      keptParticipant:
+        "The new participant stays. Press Delete, or undo once, to take it back.",
+      keptMessage:
+        "The new message stays. Press Delete, or undo once, to take it back.",
+      atTop: "This message is already at the top, so nothing was changed.",
+      atBottom:
+        "This message is already at the bottom, so nothing was changed.",
+      sharedLine:
+        "This message shares its line with another statement, so nothing was changed.",
+      breaksActivation:
+        "That would end an activation before it starts, so nothing was changed.",
+      passesEnd:
+        "A message cannot move across the end of a participant, so nothing was changed.",
+      passesStart:
+        "A message cannot move across the start of a participant, so nothing was changed.",
+      passesDeclaration:
+        "A message cannot move across the line that declares its participant, so nothing was changed.",
+      mixedLine:
+        "The next line holds a block's own line (such as loop, else or end) and another statement, so nothing was changed.",
+      changesOrder:
+        "That would change the order of the participants, so nothing was changed.",
+      failed:
+        "Something went wrong with that move. Look at the diagram before you try again.",
     });
+  });
+
+  test("a disabled item's reasons say what would happen, not what was done", () => {
+    expect(REASONS).toEqual({
+      invalid: "That change would break the diagram.",
+      unsupported: "This diagram uses something the editor does not know yet.",
+      emptiesBlock: "That would leave a block with nothing in it.",
+      leavesActive: "That would leave an activation open.",
+      participantEnded:
+        "A participant that has ended can take no more messages.",
+      atTop: "This message is already at the top.",
+      atBottom: "This message is already at the bottom.",
+      sharedLine: "This message shares its line with another statement.",
+      breaksActivation: "That would end an activation before it starts.",
+      passesEnd: "A message cannot move across the end of a participant.",
+      passesStart: "A message cannot move across the start of a participant.",
+      passesDeclaration:
+        "A message cannot move across the line that declares its participant.",
+      mixedLine:
+        "The next line holds a block's own line (such as loop, else or end) and another statement.",
+      changesOrder: "That would change the order of the participants.",
+    });
+    // Every code an op's compile can answer, which is what a menu shows ahead.
+    const compiled: RefusalCode[] = [
+      "gone",
+      "invalid",
+      "group",
+      "chain",
+      "unsupported",
+      "emptiesBlock",
+      "leavesActive",
+      "participantEnded",
+      "atTop",
+      "atBottom",
+      "sharedLine",
+      "breaksActivation",
+      "passesEnd",
+      "passesStart",
+      "passesDeclaration",
+      "mixedLine",
+      "changesOrder",
+    ];
+    for (const code of compiled) {
+      const reason = reasonFor(code);
+      expect(reason, code).not.toMatch(/nothing was changed/);
+      expect(reason, code).not.toMatch(/\b(raw|text)\b/i);
+    }
   });
 
   test("none mentions Raw or text", () => {

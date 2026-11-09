@@ -1,0 +1,18 @@
+sequenceDiagram
+    %% one sync run: scan first, then apply in slabs
+    participant watcher as File watcher
+    participant sync as Sync engine
+    participant fs as Disk
+    participant store as Index store
+    participant embed as Embedder
+    watcher->>sync: paths changed
+    sync->>fs: read the changed files
+    fs-->>sync: contents
+    sync->>sync: classify new, modified, moved, deleted
+    loop each slab
+        sync->>store: write the rows
+        sync->>embed: embed the new chunks
+        embed-->>sync: vectors
+        sync->>store: write the vectors
+    end
+    sync-->>watcher: done

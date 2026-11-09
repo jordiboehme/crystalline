@@ -52,8 +52,9 @@ import { backGates } from "../../backGates";
 import { fieldSettlers, LOST_FIELD_TEXT } from "./draws";
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { writable } from "../elementEdit";
-import { flowKind, nextAnchorTicket, runDiagramOp } from "./apply";
-import type { OpResolver } from "./apply";
+import { roomUndo } from "../roomUndo";
+import { flowKind, nextAnchorTicket, runDiagramOp, seqKind } from "./apply";
+import type { ApplyOutcome } from "./apply";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
 import type { MermaidFence } from "./fence";
@@ -65,13 +66,23 @@ import {
   verdictArrived,
   showFenceSource,
 } from "./field";
-import { flowLabelOf } from "./flowchart/hit";
-import type { ArrowHold } from "./flowchart/heldArrow";
-import { holdArrow, holdEffect, resolveTarget } from "./flowchart/heldArrow";
 import { tidyLabel } from "./flowchart/labels";
-import type { FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
 import { compileFlowOp } from "./flowchart/ops";
+import type { LineHold } from "./held";
+import {
+  followLine,
+  heldMessageOp,
+  holdLine,
+  lineHoldEffect,
+  resolveHeldTarget,
+} from "./held";
+import type { DiagramModel } from "./kinds";
+import { labelOfTarget } from "./kinds";
+import { seqMessageTexts } from "./sequence/hit";
+import { tidySeqText } from "./sequence/labels";
+import type { SeqOp } from "./sequence/ops";
+import { compileSeqOp, heldSeqOp } from "./sequence/ops";
 import {
   clearStopLook,
   focusTarget,
@@ -97,6 +108,14 @@ import { hostOf, onDiagramDrawn } from "./widget";
 
 const CANVAS: TargetKey = { kind: "canvas" };
 const FIELD_CLASS = "cm-diagram-label-field";
+/** The field's accessible name, by what it renames. */
+const FIELD_NAMES: Record<TargetKey["kind"], string> = {
+  canvas: "Box name",
+  node: "Box name",
+  edge: "Arrow label",
+  participant: "Participant name",
+  message: "Message text",
+};
 /** Room to type in, over a small box or an arrow's midpoint. */
 const MIN_WIDTH = 128;
 const MIN_HEIGHT = 28;
@@ -122,14 +141,16 @@ interface OpenField {
   goneWaits: boolean;
   /** The commit running now. */
   checking: Promise<void> | null;
-  /** The arrow's place in the text (R94); null for a box. */
-  hold: ArrowHold | null;
+  /** The arrow's or the message's place in the text; null for a box. */
+  hold: LineHold | null;
   /** What a refusal said, while the text it refused still stands. */
   refused: RefusalCode | null;
   /** Letters typed while the box was away: they go in when it is back (R98). */
   queued: string;
   /** Where the field stood when a composition began, to hold the page there. */
   lockTop: number | null;
+  /** It names a part an add just made, which Escape leaves in place. */
+  added: boolean;
 }
 
 const fields = new WeakMap<EditorView, OpenField>();
@@ -150,7 +171,7 @@ export function fenceNow(
 }
 
 /** The model of the fence as it stands, when it is one the verdict can read. */
-export function modelNow(fence: MermaidFence): FlowModel | null {
+export function modelNow(fence: MermaidFence): DiagramModel | null {
   const model = modelOf(fence.body);
   return model.understood ? model : null;
 }
@@ -176,6 +197,24 @@ function placeOf(
     width: rect.width,
     height: rect.height,
   });
+  if (target.kind === "message") {
+    // A message's text where it has one, its line otherwise.
+    const texts = seqMessageTexts(el).map((text) =>
+      text.getBoundingClientRect(),
+    );
+    const drawn = texts.filter((rect) => rect.width > 0);
+    if (drawn.length === 0) {
+      return from(el.getBoundingClientRect());
+    }
+    const left = Math.min(...drawn.map((rect) => rect.left));
+    const top = Math.min(...drawn.map((rect) => rect.top));
+    return from({
+      left,
+      top,
+      width: Math.max(...drawn.map((rect) => rect.right)) - left,
+      height: Math.max(...drawn.map((rect) => rect.bottom)) - top,
+    });
+  }
   if (target.kind !== "edge") {
     return from(el.getBoundingClientRect());
   }
@@ -297,12 +336,12 @@ function backToStop(open: OpenField): void {
   const model = fence && modelOf(fence.body);
   const held =
     fence && model?.understood
-      ? resolveTarget(main, target, hold, model, fence.bodyFrom)
+      ? resolveHeldTarget(main, target, hold, model, fence.bodyFrom)
       : "gone";
   const stands =
     typeof held !== "string" &&
     model !== null &&
-    flowLabelOf(model, held) !== null;
+    labelOfTarget(model, held) !== null;
   focusTarget(main, anchor, stands ? held : CANVAS);
 }
 
@@ -379,7 +418,7 @@ function finish(open: OpenField, way: Way): void {
 /** What a refused field says as long as it stands, with the way out. */
 function refusalSentence(code: RefusalCode): string {
   // It says for itself what to do, and no fix of the text helps it.
-  if (code === "arrowChanged") {
+  if (code === "arrowChanged" || code === "messageChanged") {
     return NOTICES[code];
   }
   return `${NOTICES[code]} Fix it, or press Escape in the field to drop it.`;
@@ -443,34 +482,77 @@ function refuse(open: OpenField, code: RefusalCode, way: Way): void {
   }
 }
 
-/** The op for what is typed, worked out on each read of the fence (R94). */
-function opFor(
+/** What is typed as the source compares it: each kind tidies its own way. */
+function tidyText(target: TargetKey, text: string): string {
+  return target.kind === "participant" || target.kind === "message"
+    ? tidySeqText(text)
+    : tidyLabel(text);
+}
+
+/** Whether `typed` is no name at all: a box or a participant must have one. */
+function emptyName(target: TargetKey, typed: string): boolean {
+  return (
+    (target.kind === "node" || target.kind === "participant") && typed === ""
+  );
+}
+
+/**
+ * Writes what is typed as one op, worked out on each read of the fence; null
+ * for the canvas, which has no text. A line whose place changed answers its own
+ * refusal, which says to open it again.
+ */
+function runFieldOp(
   main: EditorView,
   open: OpenField,
   text: string,
-): OpResolver<FlowModel, FlowOp> | null {
-  const { target, hold } = open;
+): Promise<ApplyOutcome> | null {
+  const { target, hold, anchor } = open;
   if (target.kind === "canvas") {
     return null;
   }
-  return (model, bodyFrom) => {
-    const held = resolveTarget(main, target, hold, model, bodyFrom);
-    if (typeof held === "string") {
-      return { refused: held === "stale" ? "arrowChanged" : held };
-    }
-    return held.kind === "edge"
-      ? { op: "edgeLabel", edge: held.key, text }
-      : { op: "rename", id: target.kind === "node" ? target.id : "", text };
-  };
+  if (target.kind === "participant") {
+    return runDiagramOp(
+      main,
+      anchor,
+      seqKind,
+      heldSeqOp({ op: "renameParticipant", name: target.name, text }),
+    );
+  }
+  if (target.kind === "message") {
+    const resolve = heldMessageOp(main, hold, target, (message) => ({
+      op: "renameMessage",
+      target: message,
+      text,
+    }));
+    return runDiagramOp(main, anchor, seqKind, (model, bodyFrom) => {
+      const op = resolve(model, bodyFrom);
+      return "refused" in op && op.refused === "stale"
+        ? { refused: "messageChanged" }
+        : op;
+    });
+  }
+  return runDiagramOp(
+    main,
+    anchor,
+    flowKind,
+    (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
+      const held = resolveHeldTarget(main, target, hold, model, bodyFrom);
+      if (typeof held === "string") {
+        return { refused: held === "stale" ? "arrowChanged" : held };
+      }
+      return held.kind === "edge"
+        ? { op: "edgeLabel", edge: held.key, text }
+        : { op: "rename", id: target.kind === "node" ? target.id : "", text };
+    },
+  );
 }
 
 async function commitNow(open: OpenField, way: Way): Promise<void> {
   const { main, el, target } = open;
-  const typed = tidyLabel(el.value);
-  const op = opFor(main, open, typed);
+  const typed = tidyText(target, el.value);
   // What was typed counts against the label as it stands now, so the old name
   // typed back over a peer's rename is written. The op answers no-op on the same.
-  if (op === null || !open.typed || (target.kind === "node" && typed === "")) {
+  if (target.kind === "canvas" || !open.typed || emptyName(target, typed)) {
     finish(open, way);
     return;
   }
@@ -485,12 +567,23 @@ async function commitNow(open: OpenField, way: Way): Promise<void> {
     return;
   }
   el.readOnly = true;
-  const outcome = await runDiagramOp(main, open.anchor, flowKind, op);
+  const outcome = (await runFieldOp(main, open, typed)) ?? {
+    applied: false,
+    noop: true,
+  };
   el.readOnly = false;
   if (fields.get(main) !== open) {
     return;
   }
   if (!("refused" in outcome)) {
+    if (target.kind === "message") {
+      // A message is known by its text too: the stop comes back on it as it reads now.
+      const now = { ...target, text: typed };
+      open.target = now;
+      if (open.hold !== null) {
+        followLine(open.hold, now);
+      }
+    }
     finish(open, way);
   } else if (outcome.refused === "gone") {
     goneNow(open);
@@ -571,7 +664,7 @@ function reconcile(main: EditorView): void {
   const held =
     fence === null
       ? target
-      : resolveTarget(main, target, open.hold, model, fence.bodyFrom);
+      : resolveHeldTarget(main, target, open.hold, model, fence.bodyFrom);
   if (held === "stale") {
     // Not said until it matters: at the commit, with a sentence.
     return;
@@ -583,7 +676,7 @@ function reconcile(main: EditorView): void {
       effects: setDiagramIntent.of({ ...intent, target: now }),
     });
   }
-  const label = now === null ? null : flowLabelOf(model, now);
+  const label = now === null ? null : labelOfTarget(model, now);
   if (label === null) {
     if (open.composing) {
       open.goneWaits = true;
@@ -624,10 +717,7 @@ function makeField(
   el.rows = 1;
   el.value = text;
   el.dir = "auto";
-  el.setAttribute(
-    "aria-label",
-    target.kind === "edge" ? "Arrow label" : "Box name",
-  );
+  el.setAttribute("aria-label", FIELD_NAMES[target.kind]);
   const open: OpenField = {
     main,
     el,
@@ -642,6 +732,7 @@ function makeField(
     refused: null,
     queued: "",
     lockTop: null,
+    added: false,
   };
   el.addEventListener("input", () => {
     open.typed = true;
@@ -752,7 +843,7 @@ export function openLabelEditor(
   main: EditorView,
   anchor: number,
   target: TargetKey,
-  options: { selectAll: boolean; initial?: string },
+  options: { selectAll: boolean; initial?: string; added?: true },
 ): void {
   if (!writable(main.state) || target.kind === "canvas") {
     return;
@@ -788,13 +879,25 @@ export function openLabelEditor(
     return;
   }
   const model = modelNow(fence);
-  const label = model && flowLabelOf(model, target);
+  const label = model && labelOfTarget(model, target);
   if (model === null || label === null || label === undefined) {
     sayAt(main, anchor, "gone");
     return;
   }
+  // No use typing a name the source cannot take, as one with a space.
+  if (model.kind === "sequence" && target.kind === "participant") {
+    const tried = compileSeqOp(model, {
+      op: "renameParticipant",
+      name: target.name,
+      text: label === "x" ? "y" : "x",
+    });
+    if ("refused" in tried && tried.refused === "unsupported") {
+      sayAt(main, anchor, "unsupported");
+      return;
+    }
+  }
   // No use typing a label the arrow cannot take on its own.
-  if (target.kind === "edge") {
+  if (target.kind === "edge" && model.kind !== "sequence") {
     const tried = compileFlowOp(model, {
       op: "edgeLabel",
       edge: target.key,
@@ -807,12 +910,13 @@ export function openLabelEditor(
   }
   const text = options.initial ?? label;
   const created = makeField(main, fence.from, target, label, text);
+  created.added = options.added === true;
   const arrowEffect: StateEffect<unknown>[] = [];
-  if (target.kind === "edge") {
-    const { hold, effect } = holdEffect(model, target.key, fence.bodyFrom);
-    created.hold = hold;
-    if (effect !== null) {
-      arrowEffect.push(effect);
+  const line = lineHoldEffect(model, target, fence.bodyFrom);
+  if (line !== null) {
+    created.hold = line.hold;
+    if (line.effect !== null) {
+      arrowEffect.push(line.effect);
     }
   }
   fields.set(main, created);
@@ -841,11 +945,29 @@ function intentStaleAt(main: EditorView, fence: MermaidFence): boolean {
   return main.state.field(diagramField).behind.includes(fence.from);
 }
 
-/** Closes the field, writes nothing, and puts the focus on its stop. */
+/** What Escape on a field an add opened says: the part stays, and how it goes. */
+const KEPT: Partial<Record<TargetKey["kind"], RefusalCode>> = {
+  node: "keptBox",
+  participant: "keptParticipant",
+  message: "keptMessage",
+};
+
+/**
+ * Closes the field, writes nothing, and puts the focus on its stop. A field an add
+ * opened leaves what was added in place, and says so once, with the way back, when
+ * the stop stands on it.
+ */
 export function cancelLabelEditor(main: EditorView): void {
   const open = fields.get(main);
   if (open !== undefined && open.checking === null) {
     finish(open, "enter");
+    // Only when the stop came back on what was added: after a peer's change it is
+    // the canvas, where Delete would take the whole diagram.
+    const stop = main.state.field(diagramIntent, false)?.target;
+    const kept = open.added ? KEPT[open.target.kind] : undefined;
+    if (kept !== undefined && stop?.kind === open.target.kind) {
+      sayAt(main, open.anchor, kept);
+    }
   }
 }
 
@@ -856,7 +978,9 @@ export function cancelLabelEditor(main: EditorView): void {
 export async function addWithName(
   main: EditorView,
   anchor: number,
-  op: Extract<FlowOp, { op: "addChild" | "addSibling" | "addBox" }>,
+  op:
+    | Extract<FlowOp, { op: "addChild" | "addSibling" | "addBox" }>
+    | Extract<SeqOp, { op: "addParticipant" | "addMessage" }>,
 ): Promise<void> {
   // The intent follows the fence through what a peer writes during the check.
   const before = main.state.field(diagramIntent);
@@ -865,13 +989,35 @@ export async function addWithName(
       effects: setDiagramIntent.of({ anchor, target: CANVAS, mode: "focus" }),
     });
   }
-  const outcome = await runDiagramOp(main, anchor, flowKind, op);
+  const outcome: ApplyOutcome<TargetKey> =
+    op.op === "addParticipant" || op.op === "addMessage"
+      ? await runDiagramOp(main, anchor, seqKind, inThisRoom(main, op))
+      : await runDiagramOp(main, anchor, flowKind, op);
   const place = main.state.field(diagramIntent, false)?.anchor ?? anchor;
   if ("refused" in outcome) {
     sayAt(main, place, outcome.refused);
   } else if (outcome.applied && outcome.created !== undefined) {
-    openLabelEditor(main, place, outcome.created, { selectAll: true });
+    openLabelEditor(main, place, outcome.created, {
+      selectAll: true,
+      added: true,
+    });
   }
+}
+
+/**
+ * In a room, a new participant's id starts from a number of this person's own: two
+ * people adding at the same moment would otherwise both write `p1`, and the merged
+ * text would hold one participant declared twice, a line nobody can rename away.
+ * Alone, ids count from 1.
+ */
+function inThisRoom(
+  main: EditorView,
+  op: Extract<SeqOp, { op: "addParticipant" | "addMessage" }>,
+): SeqOp {
+  const room = main.state.facet(roomUndo);
+  return op.op === "addParticipant" && room !== null
+    ? { ...op, first: 1 + (room.doc.clientID % 1000) }
+    : op;
 }
 
 /** A close that did not come from the field. */
@@ -915,7 +1061,7 @@ function onClosing(
 /** A refused draft waiting for Raw to go off (R97). */
 interface RawDraft {
   target: TargetKey;
-  hold: ArrowHold | null;
+  hold: LineHold | null;
   /** The ticket holding the fence's place. */
   place: number;
   baseline: string;
@@ -976,14 +1122,13 @@ async function commitForRaw(open: OpenField): Promise<void> {
   const { main, el, target, anchor, hold } = open;
   const arrow = hold?.ticket ?? null;
   fields.delete(main);
-  const typed = tidyLabel(el.value);
+  const typed = tidyText(target, el.value);
   el.remove();
   syncGuards(main);
-  const op = opFor(main, open, typed);
   const refused =
-    op === null || !open.typed || (target.kind === "node" && typed === "")
+    !open.typed || emptyName(target, typed)
       ? null
-      : await runDiagramOp(main, anchor, flowKind, op);
+      : await runFieldOp(main, open, typed);
   if (refused === null || !("refused" in refused) || !main.dom.isConnected) {
     if (arrow !== null && main.state.field(diagramAnchors, false)?.has(arrow)) {
       main.dispatch({ effects: untrackAnchor.of(arrow) });
@@ -1029,7 +1174,7 @@ function restoreRawDraft(main: EditorView): void {
   const held =
     fence === null || model === null
       ? "gone"
-      : resolveTarget(main, raw.target, raw.hold, model, fence.bodyFrom);
+      : resolveHeldTarget(main, raw.target, raw.hold, model, fence.bodyFrom);
   if (fence === null || model === null || typeof held === "string") {
     end();
     showLostDraft(main, raw.draft);
@@ -1072,20 +1217,20 @@ function labelNow(open: OpenField): string {
   if (fence === null || model === null) {
     return open.baseline;
   }
-  const held = resolveTarget(main, target, hold, model, fence.bodyFrom);
+  const held = resolveHeldTarget(main, target, hold, model, fence.bodyFrom);
   return (
-    (typeof held === "string" ? null : flowLabelOf(model, held)) ??
+    (typeof held === "string" ? null : labelOfTarget(model, held)) ??
     open.baseline
   );
 }
 
 /** Whether leaving now would lose what the field holds. */
 function hasDraft(open: OpenField): boolean {
-  const typed = tidyLabel(open.el.value);
+  const typed = tidyText(open.target, open.el.value);
   return (
     open.typed &&
-    typed !== tidyLabel(labelNow(open)) &&
-    !(open.target.kind === "node" && typed === "")
+    typed !== tidyText(open.target, labelNow(open)) &&
+    !emptyName(open.target, typed)
   );
 }
 
@@ -1418,7 +1563,7 @@ registerIntentReopen("rename", (main, intent, host) => {
     }
     const fence = fenceAt(main.state, intent.anchor);
     const model = fence && modelNow(fence);
-    const label = (model && flowLabelOf(model, intent.target)) ?? "";
+    const label = (model && labelOfTarget(model, intent.target)) ?? "";
     open = makeField(
       main,
       intent.anchor,
@@ -1427,18 +1572,18 @@ registerIntentReopen("rename", (main, intent, host) => {
       intent.draft ?? label,
     );
     // With no reading of its fence no ticket can be asked for: `resolveArrow`'s case.
-    if (intent.target.kind === "edge" && model !== null && fence !== null) {
-      open.hold = holdArrow(main, model, intent.target.key, fence.bodyFrom);
+    if (model !== null && fence !== null) {
+      open.hold = holdLine(main, model, intent.target, fence.bodyFrom);
     }
     fields.set(main, open);
   }
   mount(open, host, "back");
 });
 
-/** Whether the selection is one box's label in the fence it stands in. */
+/** Whether the selection is one box's or participant's label in its fence. */
 function selectedLabel(main: EditorView): {
   fence: MermaidFence;
-  id: string;
+  target: TargetKey;
 } | null {
   const { state } = main;
   const { selection } = state;
@@ -1456,10 +1601,22 @@ function selectedLabel(main: EditorView): {
   }
   const from = range.from - fence.bodyFrom;
   const to = range.to - fence.bodyFrom;
+  if (model.kind === "sequence") {
+    for (const [name, participant] of model.participants) {
+      if (
+        participant.declarations.some(
+          (d) => d.alias?.from === from && d.alias.to === to,
+        )
+      ) {
+        return { fence, target: { kind: "participant", name } };
+      }
+    }
+    return null;
+  }
   for (const id of model.nodeOrder) {
     const label = model.nodes.get(id)?.defining?.shape?.label;
     if (label?.from === from && label.to === to) {
-      return { fence, id };
+      return { fence, target: { kind: "node", id } };
     }
   }
   return null;
@@ -1490,14 +1647,7 @@ function openOnStarter(main: EditorView): boolean {
   }
   // The field takes the focus before main could: with its caret in a drawn fence
   // the next key is refused, and main focused would show the fence as text.
-  openLabelEditor(
-    main,
-    from,
-    { kind: "node", id: found.id },
-    {
-      selectAll: true,
-    },
-  );
+  openLabelEditor(main, from, found.target, { selectAll: true });
   return fields.has(main);
 }
 

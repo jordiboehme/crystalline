@@ -1,0 +1,22 @@
+[
+  {
+    "name": "the receiver of the first message",
+    "body": "sequenceDiagram\n    Alice->>Bob: Could you please send me the signed contract today",
+    "after": "sequenceDiagram\n    participant Alice\n    participant Bob as Robert\n    Alice->>Bob: Could you please send me the signed contract today"
+  },
+  {
+    "name": "a participant between two long messages",
+    "body": "sequenceDiagram\n    a->>b: Could you please send me the signed contract today\n    b->>c: and the second copy of the same contract to the other office",
+    "after": "sequenceDiagram\n    participant a\n    participant b as Robert\n    a->>b: Could you please send me the signed contract today\n    b->>c: and the second copy of the same contract to the other office"
+  },
+  {
+    "name": "a late bare declaration",
+    "body": "sequenceDiagram\n    a->>b: Could you please send me the signed contract today\n    participant b\n    b->>a: y",
+    "after": "sequenceDiagram\n    participant a\n    participant b as Robert\n    a->>b: Could you please send me the signed contract today\n    participant b\n    b->>a: y"
+  },
+  {
+    "name": "first mentioned inside a block",
+    "body": "sequenceDiagram\n    loop l\n        x->>y: Could you please send me the signed contract today\n        y->>z: and the second copy of the same contract to the other office\n    end",
+    "after": "sequenceDiagram\n    participant x\n    participant y\n    participant z as Robert\n    loop l\n        x->>y: Could you please send me the signed contract today\n        y->>z: and the second copy of the same contract to the other office\n    end"
+  }
+]

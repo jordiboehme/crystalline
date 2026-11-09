@@ -1,0 +1,23 @@
+sequenceDiagram
+    %% starting a GitHub link for a domain
+    actor owner as Owner
+    participant fluid as Fluid
+    participant rest as REST API
+    participant gh as GitHub
+    participant state as Origin state
+    owner->>fluid: Link to GitHub
+    fluid->>rest: POST link start
+    rest->>gh: device code
+    gh-->>rest: user code
+    rest-->>fluid: user code
+    fluid-->>owner: Show the code
+    par the person confirms
+        owner->>gh: enter the code
+    and the server polls
+        loop until confirmed or expired
+            rest->>gh: poll
+            gh-->>rest: pending
+        end
+    end
+    gh-->>rest: token
+    rest->>state: remember the origin

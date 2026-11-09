@@ -551,16 +551,29 @@ function key(forward: boolean): Command {
     guardShownHeading(view, forward);
 }
 
+/**
+ * What a CodeMirror delete command reads from its target here: a bare state,
+ * and, for the line deletes, where the line wraps.
+ */
+type DeleteTarget = Parameters<StateCommand>[0] &
+  Pick<EditorView, "moveToLineBoundary">;
+
 /** The range a CodeMirror delete command would take from `pos`, no atoms. */
 function reach(
-  state: EditorState,
-  command: StateCommand,
+  view: EditorView,
+  command: (target: DeleteTarget) => boolean,
   pos: number,
 ): Range | null {
+  const { state } = view;
   let found: Range | null = null;
   // A bare state on the same text: the command's own transaction would
   // otherwise pass this buffer's filters, which keep the marks it reaches.
+  // The line deletes (a Mac's Cmd+Backspace and Cmd+Delete) also ask where
+  // the line wraps, which only the view knows; the text is the same, so its
+  // answer holds for the bare state.
   command({
+    moveToLineBoundary: (range, forward) =>
+      view.moveToLineBoundary(range, forward),
     state: State.create({
       doc: state.doc,
       selection: EditorSelection.cursor(pos),
@@ -593,7 +606,7 @@ function reach(
  * command runs as today.
  */
 function overHidden(command: Command, forward: boolean): Command {
-  const plain = command as unknown as StateCommand;
+  const plain = command as unknown as (target: DeleteTarget) => boolean;
   return (view) => {
     if (
       view.state.readOnly ||
@@ -611,7 +624,7 @@ function overHidden(command: Command, forward: boolean): Command {
       return false;
     }
     const marks = marksOnLine(state, line.number);
-    const first = reach(state, plain, head);
+    const first = reach(view, plain, head);
     if (!first || visibleBetween(first.from, first.to, [], marks)) {
       return false;
     }
@@ -619,7 +632,7 @@ function overHidden(command: Command, forward: boolean): Command {
     // A line holds few marks; the bound only guards a command that stops.
     const range = { from: first.from, to: first.to };
     for (let step = 0; step < 64; step += 1) {
-      const again = reach(state, plain, forward ? range.to : range.from);
+      const again = reach(view, plain, forward ? range.to : range.from);
       if (!again) {
         break;
       }
