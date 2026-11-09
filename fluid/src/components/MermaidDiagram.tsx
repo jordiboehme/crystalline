@@ -18,6 +18,7 @@ import { useTheme } from "../theme/context";
 import { mermaidConfig } from "../theme/mermaid";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
+import { queuePaper } from "./paperQueue";
 import { unclampDiagram } from "./wideDiagram";
 
 /**
@@ -48,20 +49,6 @@ const SCROLLER =
  */
 const SCROLLABLE =
   "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
-
-/** Run `work` once the browser is idle (soon, where it cannot say); returns the cancel. */
-function whenIdle(work: () => void): () => void {
-  if (typeof window.requestIdleCallback === "function") {
-    const handle = window.requestIdleCallback(work, { timeout: 2000 });
-    return () => {
-      window.cancelIdleCallback(handle);
-    };
-  }
-  const timer = setTimeout(work, 200);
-  return () => {
-    clearTimeout(timer);
-  };
-}
 
 export default function MermaidDiagram({
   source,
@@ -121,8 +108,9 @@ export default function MermaidDiagram({
   // into its markup, so a light copy is drawn beside it for the printer. Its
   // theme rides in the source as a directive: the one config a render reads
   // whatever another diagram initialised the library with meanwhile. It is
-  // drawn when the browser is idle, so a dark page does not pay for it while
-  // it opens.
+  // drawn through the page's one paper queue, one copy at a time and after
+  // the screen drawings, so a dark page does not pay for it while it opens
+  // and a page full of diagrams still answers a click.
   const [paperDrawn, setPaperDrawn] = useState<{
     source: string;
     svg: string;
@@ -146,7 +134,7 @@ export default function MermaidDiagram({
         themeCSS: light.themeCSS,
         themeVariables,
       })}}%%`;
-      mermaid
+      return mermaid
         .render(`${id}-paper`, `${source}\n${directive}\n`)
         .then((result) => {
           if (live) {
@@ -159,7 +147,7 @@ export default function MermaidDiagram({
           }
         });
     };
-    const cancel = whenIdle(drawPaper);
+    const cancel = queuePaper(drawPaper);
     return () => {
       live = false;
       cancel();
