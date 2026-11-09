@@ -154,6 +154,8 @@ describe("NOTICES", () => {
       unchecked:
         "The diagram could not be checked, so nothing was changed. Try again.",
       breaksFence: "That would break a diagram here, so nothing was changed.",
+      needsLineBelow:
+        "A diagram at the end of a page needs a line below it, so nothing was changed.",
       arrowChanged:
         "This arrow changed, so the label was not written. Press Escape and open it again.",
     });

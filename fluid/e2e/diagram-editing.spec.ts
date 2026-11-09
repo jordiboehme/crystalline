@@ -532,7 +532,11 @@ test("in a room the line below a last fence cannot be selected away (R104)", asy
   await page.keyboard.press("Shift+ArrowLeft");
   await page.keyboard.press("Delete");
   await expect(
-    page.getByText("That would break a diagram here", { exact: false }).first(),
+    page
+      .getByText("A diagram at the end of a page needs a line below it", {
+        exact: false,
+      })
+      .first(),
   ).toBeVisible();
   expect(await docText(page)).toBe(before);
 });
@@ -587,6 +591,54 @@ test("connect mode with its box away: a key brings it back, still waiting (R105)
   await page.keyboard.press("Escape");
   await expect(prompt).toHaveCount(0);
   expect(await docText(page)).toBe(before);
+});
+
+test("after a click elsewhere, the page's own keys stay the page's (R105, N1)", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, FAR);
+  await edit(page, permalink);
+  await nodeOf(page, "A").click();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => focusedLabel(page)).toBe("Box: First");
+  await page.mouse.click(2, 300);
+  await wheelAway(page);
+  const scrollOf = () =>
+    page.evaluate(() => {
+      const scrollers = [
+        document.scrollingElement,
+        ...document.querySelectorAll("main, [class*=overflow], .cm-scroller"),
+      ];
+      return Math.max(...scrollers.map((el) => el?.scrollTop ?? 0));
+    });
+  const before = await scrollOf();
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("ArrowUp");
+  // The page moves a little, as a key moves it, and the drawing stays away.
+  await expect(page.locator(".cm-diagram")).toHaveCount(0);
+  expect(before - (await scrollOf())).toBeLessThan(1_000);
+  expect(
+    await page.evaluate(() => document.activeElement === document.body),
+  ).toBe(true);
+});
+
+test("connect mode, then a click elsewhere: Space scrolls the page, Escape still ends it (R105, N1)", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, FAR);
+  await edit(page, permalink);
+  await nodeOf(page, "A").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Connect to..." }).click();
+  const prompt = page.locator(".cm-diagram-connect [role=status]");
+  await expect(prompt).toBeVisible();
+  await page.mouse.click(2, 300);
+  await page.keyboard.press("Space");
+  expect(
+    await page.evaluate(() => document.activeElement === document.body),
+  ).toBe(true);
+  await expect(prompt).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(prompt).toHaveCount(0);
 });
 
 /** A flowchart with a group, a loop, a twin arrow and shapes: each must map. */

@@ -763,7 +763,10 @@ describe("the way below a fence that is last (R104)", () => {
     const said =
       noticeOf(view) ||
       (view.dom.querySelector(".cm-diagram-refusal")?.textContent ?? "");
-    expect(said).toBe(NOTICES.breaksFence);
+    expect(said).toBe(NOTICES.needsLineBelow);
+    expect(said).toBe(
+      "A diagram at the end of a page needs a line below it, so nothing was changed.",
+    );
   });
 
   it("a cut over that line is refused too, and text below can still go", async () => {
@@ -848,6 +851,45 @@ describe("a key with the box away (R105)", () => {
     await flush();
     expect(intentOf(view)?.mode).toBe("focus");
     expect(text(view)).toBe(LONG);
+  });
+
+  it("leaves the page's keys alone after a press elsewhere took the person away", async () => {
+    const view = await drawn(LONG);
+    focusTarget(view, fromOf(view), NODE_B);
+    document.body.dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true }),
+    );
+    await awayNow(view);
+    for (const key of ["ArrowUp", " ", "ArrowDown", "Home", "End"]) {
+      expect(press(key, {}, document.body).defaultPrevented).toBe(false);
+    }
+    expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+  });
+
+  it("connect mode with its box there takes Escape on the body, and nothing else", async () => {
+    const view = await drawn(LONG);
+    openMenuOn(view, NODE_A);
+    choose("Connect to...");
+    await flush();
+    document.body.dispatchEvent(
+      new PointerEvent("pointerdown", { bubbles: true }),
+    );
+    active().blur();
+    for (const key of [" ", "ArrowDown", "Enter", "Delete"]) {
+      expect(press(key, {}, document.body).defaultPrevented).toBe(false);
+    }
+    expect(intentOf(view)?.mode).toBe("connect");
+    expect(press("Escape", {}, document.body).defaultPrevented).toBe(true);
+    await flush();
+    expect(promptOf(view)).toBeNull();
+  });
+
+  it("connect mode whose box went while it held the focus brings it back on a key", async () => {
+    const view = await drawn(LONG);
+    openMenuOn(view, NODE_A);
+    choose("Connect to...");
+    await awayNow(view);
+    expect(press("ArrowDown", {}, document.body).defaultPrevented).toBe(true);
   });
 
   it("leaves keys alone on a page with nothing open, and while the box is there", async () => {

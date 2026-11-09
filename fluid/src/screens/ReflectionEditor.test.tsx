@@ -1085,6 +1085,28 @@ describe("the reflection editor with a diagram's field open when the room ends (
     expect(readDraft("ann", "eng", KEY)?.content).toBe(`Named. ${PAGE}`);
   });
 
+  it.each([
+    ["deleted", null],
+    ["moved", null],
+  ] as const)(
+    "promises no draft when the page was %s, out of reach",
+    async (closedReason, movedTo) => {
+      serve("edit");
+      const session = live(room(PAGE));
+      await openEditor();
+      fieldKit.settle = () => {
+        (session.get().ytext as Y.Text).insert(0, "Named. ");
+        return Promise.resolve(null);
+      };
+      session.set({ closed: true, closedReason, movedTo });
+      expect(
+        await screen.findByText(/Copy your text if you want to keep it/),
+      ).toBeVisible();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(screen.queryByText(/kept as a draft on this device/)).toBeNull();
+    },
+  );
+
   it("shows the text it could not keep", async () => {
     serve("edit");
     const session = live(room(PAGE));

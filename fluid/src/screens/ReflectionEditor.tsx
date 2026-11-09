@@ -1006,12 +1006,17 @@ function Surface({
             {endedSentence(collab.closedReason, collab.saveState)}
           </p>
         )}
-        {ended && fieldEnd !== null && "kept" in fieldEnd && (
-          <p className={AMBER_BANNER}>
-            The text you were typing in the diagram is kept as a draft on this
-            device.
-          </p>
-        )}
+        {ended &&
+          fieldEnd !== null &&
+          "kept" in fieldEnd &&
+          // A page gone out of reach keeps no draft: the banner asks for a copy.
+          collab.closedReason !== "deleted" &&
+          !(collab.closedReason === "moved" && collab.movedTo === null) && (
+            <p className={AMBER_BANNER}>
+              The text you were typing in the diagram is kept as a draft on this
+              device.
+            </p>
+          )}
       </div>
       {ended && fieldEnd !== null && "lost" in fieldEnd && (
         <p role="alert" className={AMBER_BANNER}>

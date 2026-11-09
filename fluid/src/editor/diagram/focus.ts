@@ -914,6 +914,15 @@ const focusPlugin = ViewPlugin.fromClass(
     ended = false;
     /** Whether `awayKey` listens: a stop or a mode is open and its box is not there. */
     awayArmed = false;
+    /**
+     * A stop has had the focus since the person last pressed anywhere. Only then is
+     * a key on the body theirs for the diagram: after a press elsewhere it is the
+     * page's own, a scroll key above all (R105, N1).
+     */
+    stopFocused = false;
+    readonly pointerAway = (): void => {
+      this.stopFocused = false;
+    };
 
     /**
      * A key with the focus on the body while a stop's box is away (scrolled out of
@@ -945,6 +954,12 @@ const focusPlugin = ViewPlugin.fromClass(
       if (intent === null || intent === undefined || intent.mode === "rename") {
         return;
       }
+      const host = hostOf(view, intent.anchor);
+      // Connect mode with its box there, or after the person went elsewhere, takes
+      // only its way out.
+      if (key !== "Escape" && (host !== null || !this.stopFocused)) {
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       if (event.repeat) {
@@ -958,7 +973,6 @@ const focusPlugin = ViewPlugin.fromClass(
         }
         return;
       }
-      const host = hostOf(view, intent.anchor);
       if (host === null) {
         wanted.add(view);
         view.dispatch({
@@ -977,7 +991,8 @@ const focusPlugin = ViewPlugin.fromClass(
         intent !== null &&
         intent !== undefined &&
         intent.mode !== "rename" &&
-        (intent.mode === "connect" || hostOf(view, intent.anchor) === null);
+        (intent.mode === "connect" ||
+          (this.stopFocused && hostOf(view, intent.anchor) === null));
       if (want !== this.awayArmed) {
         this.awayArmed = want;
         if (want) {
@@ -1127,6 +1142,7 @@ const focusPlugin = ViewPlugin.fromClass(
       if (box === null) {
         return;
       }
+      this.stopFocused = true;
       const el = event.target as Element;
       queueMicrotask(() => {
         this.focused(box, el);
@@ -1140,6 +1156,7 @@ const focusPlugin = ViewPlugin.fromClass(
         return;
       }
       if (!box.contains(event.relatedTarget as Node)) {
+        this.stopFocused = false;
         queueMicrotask(() => {
           this.left(box);
         });
@@ -1159,6 +1176,8 @@ const focusPlugin = ViewPlugin.fromClass(
       dom.addEventListener("keydown", this.keydown);
       dom.addEventListener("focus", this.focusIn, true);
       dom.addEventListener("blur", this.focusOut, true);
+      // Anywhere: a press outside the editor is a person going elsewhere too.
+      window.addEventListener("pointerdown", this.pointerAway, true);
       this.stop = [
         onDiagramDrawn(view, (host) => {
           settle(view, host);
@@ -1492,7 +1511,7 @@ const focusPlugin = ViewPlugin.fromClass(
     }
 
     /** What a person hears about an edit `fenceMarksGuard` stopped. */
-    refused({ at, handOff, say }: FenceEditRefusal): void {
+    refused({ at, handOff, say, code }: FenceEditRefusal): void {
       const { view } = this;
       if (handOff) {
         focusTarget(view, at, CANVAS);
@@ -1500,9 +1519,9 @@ const focusPlugin = ViewPlugin.fromClass(
       if (say) {
         const host = hostOf(view, at);
         if (host !== null && noticeInWindow(host)) {
-          host.notice("breaksFence");
+          host.notice(code);
         } else {
-          this.sayInPanel("breaksFence");
+          this.sayInPanel(code);
         }
       }
     }
@@ -1587,6 +1606,7 @@ const focusPlugin = ViewPlugin.fromClass(
       dom.removeEventListener("keydown", this.keydown);
       dom.removeEventListener("focus", this.focusIn, true);
       dom.removeEventListener("blur", this.focusOut, true);
+      window.removeEventListener("pointerdown", this.pointerAway, true);
       for (const stop of this.stop) {
         stop();
       }
@@ -1669,6 +1689,8 @@ interface FenceEditRefusal {
   /** The edit came from a selection inside the fence: the box takes the keyboard. */
   handOff: boolean;
   say: boolean;
+  /** What is said. */
+  code: RefusalCode;
 }
 
 const fenceEditRefused = StateEffect.define<FenceEditRefusal>();
@@ -1725,6 +1747,7 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
             at: fence.to,
             handOff: true,
             say: false,
+            code: "breaksFence",
           }),
         };
       }
@@ -1762,6 +1785,10 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
             at: fence.to,
             handOff: false,
             say: !loneKey,
+            code:
+              endsDocument && !closes && first.from === from && last.to === to
+                ? "needsLineBelow"
+                : "breaksFence",
           }),
         };
       }
