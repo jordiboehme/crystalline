@@ -1540,7 +1540,9 @@ pub async fn sync_now(
                    `nothing_to_share`, `conflicts_pending`, \
                    `proposal_diverged`, `commit` with the branch a direct \
                    domain would commit onto, `proposal_open` with the number, \
-                   url and title of the proposal that blocks a direct share), \
+                   url and title of the proposal that blocks a direct share, \
+                   or, on a domain that reviews changes, of another member's \
+                   open proposal, with `own: false` and `guidance`), \
                    the effective title and the changed \
                    files. The plan also carries `sharing` (`proposal` or \
                    `direct`, the domain's MANIFEST policy) and `repo`, so a \
@@ -1822,7 +1824,14 @@ pub struct ShareBody {
                            domain that reviews changes, the sharer's own \
                            drafts that do not fit the team's text, each \
                            with `draft: true`), or \
-                           `proposal_diverged` with guidance.\n\nA domain \
+                           `proposal_diverged` with guidance. On a domain \
+                           that reviews changes, while another member's \
+                           proposal is open, on every forge, the answer is \
+                           `proposal_open` with its number, url and title, \
+                           `own: false` and `guidance`, a sentence to show \
+                           as given that names whose proposal it is: share \
+                           again once it is merged or closed. Nothing was \
+                           written.\n\nA domain \
                            that shares directly answers one of four outcomes \
                            instead: `committed` with the commit's sha, url \
                            and branch beside the three file lists (on a \

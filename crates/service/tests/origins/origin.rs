@@ -4856,7 +4856,7 @@ async fn the_owner_cli_shares_the_owner_overlay() {
     let mock = Arc::new(MockProvider::new());
     let eng = reviewing_domain(
         tmp.path(),
-        mock,
+        mock.clone(),
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
@@ -4875,7 +4875,24 @@ async fn the_owner_cli_shares_the_owner_overlay() {
         "alice's draft is hers to share: {result}"
     );
 
-    // And the same engine, asked as alice, carries hers and not the owner's.
+    // Alice waits while the owner's proposal is open, and once it is closed
+    // the same engine, asked as alice, carries hers and not the owner's.
+    let waits = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(waits["outcome"], "proposal_open", "{waits}");
+    mock.set_proposal_state(
+        result["number"].as_u64().unwrap(),
+        crystalline_remote::provider::ProposalState::Declined,
+    );
     let hers = eng
         .origin_share(
             "team",
@@ -4887,8 +4904,9 @@ async fn the_owner_cli_shares_the_owner_overlay() {
         )
         .await
         .unwrap();
+    assert_eq!(hers["outcome"], "proposed", "{hers}");
     assert!(
-        hers.to_string().contains("notes/alice.md"),
+        hers.to_string().contains("notes/alice.md") && !hers.to_string().contains("fresh"),
         "alice shares her own draft: {hers}"
     );
 }
@@ -6560,7 +6578,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     // thing he is doing.
     drafted(&eng, tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE).await;
     mirror(tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE);
-    let err = eng
+    let his = eng
         .origin_share(
             "team",
             None,
@@ -6570,11 +6588,13 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
             ShareActor::Account("bo".to_string()),
         )
         .await
-        .expect_err("somebody else's proposal is open");
-    let text = err.to_string();
+        .unwrap();
+    assert_eq!(his["outcome"], "proposal_open", "{his}");
+    assert_eq!(his["own"], false, "{his}");
+    let text = his["guidance"].as_str().unwrap().to_string();
     assert!(
-        text.contains("ada") && text.contains("one proposal at a time"),
-        "the refusal names whose it is and what to wait for: {text}"
+        text.starts_with("ada's proposal #") && text.contains("merged or closed"),
+        "the answer names whose it is and what to wait for: {text}"
     );
     assert!(
         !text.contains("share a fresh proposal instead"),

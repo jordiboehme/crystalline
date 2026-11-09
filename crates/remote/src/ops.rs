@@ -671,6 +671,15 @@ pub async fn pull_with(
     // refresh: `status` can flip a record to Merged between pulls, and such a
     // record is un-consumed work this pull has to finish.
     let (transitions, _) = refresh_proposals(provider, spec, &mut state).await?;
+    let transitions = hold_back_late_merges(
+        provider,
+        spec,
+        &mut state,
+        transitions,
+        new_etag.as_deref(),
+        &head,
+    )
+    .await;
     let merged_to_consume: Vec<Proposal> = state
         .proposals
         .iter()
@@ -907,6 +916,57 @@ pub async fn pull_with(
         skipped_large,
         re_baselined: false,
     })
+}
+
+/// Keep a proposal this refresh found merged in the chain, as open, when
+/// `main` may have taken the merge after this pull read it at `head`.
+///
+/// The head is read before the proposal states, so a merge that lands between
+/// the two reads is a Merged record over a base that does not hold it, and
+/// every reader of history takes a merged record's files to be in the base:
+/// the convergence pass would settle a draft against the team's text from
+/// before the merge. So `main` is read once more, only when this refresh found
+/// a merge. Still at `head`, the merge is in it. Moved, or unreadable, the
+/// record stays open and out of the transitions, and the next pull finds it
+/// merged again with a head read after the merge.
+async fn hold_back_late_merges(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    transitions: Vec<(u64, ProposalStatus)>,
+    etag: Option<&str>,
+    head: &str,
+) -> Vec<(u64, ProposalStatus)> {
+    let merged: Vec<u64> = transitions
+        .iter()
+        .filter(|(_, status)| *status == ProposalStatus::Merged)
+        .map(|(number, _)| *number)
+        .collect();
+    if merged.is_empty() {
+        return transitions;
+    }
+    let still = match provider.branch_head(spec, etag).await {
+        Ok(HeadProbe::Unchanged) => true,
+        Ok(HeadProbe::Changed { head: now, .. }) => now == head,
+        Err(e) => {
+            tracing::debug!("reading the head again after a merge failed: {e}");
+            false
+        }
+    };
+    if still {
+        return transitions;
+    }
+    for prop in state
+        .proposals
+        .iter_mut()
+        .filter(|prop| merged.contains(&prop.number))
+    {
+        prop.status = ProposalStatus::Open;
+    }
+    transitions
+        .into_iter()
+        .filter(|(number, _)| !merged.contains(number))
+        .collect()
 }
 
 /// Moves every Merged record out of the chain and into history, queues its
@@ -5927,6 +5987,20 @@ async fn settle_up_to_date(
     cleanup: BranchCleanup,
 ) -> Result<PullReport, RemoteError> {
     let (transitions, _touched) = refresh_proposals(provider, spec, &mut state).await?;
+    let etag = match &new_etag {
+        Some(etag) => etag.clone(),
+        None => state.ref_etag.clone(),
+    };
+    let base = state.base_commit.clone();
+    let transitions = hold_back_late_merges(
+        provider,
+        spec,
+        &mut state,
+        transitions,
+        etag.as_deref(),
+        &base,
+    )
+    .await;
     consume_merged(&mut state);
     if let Some(etag) = new_etag {
         state.ref_etag = etag;

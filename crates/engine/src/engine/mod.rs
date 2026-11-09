@@ -1860,14 +1860,24 @@ pub fn joined_draft_is_gone(owner: &str, draft: &str) -> String {
 pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on an open layer is not supported while it does - withdraw it and share again";
 
 /// What a share hears when SOMEBODY ELSE's proposal is open in a domain that
-/// reviews changes: a `{actor}` slot and the wait.
+/// reviews changes: whose it is and what to do.
 ///
-/// A separate string from [`REVIEW_NO_STACKING`] because the way forward is
+/// A separate answer from [`REVIEW_NO_STACKING`] because the way forward is
 /// different in kind. This actor cannot withdraw a proposal that is not theirs,
-/// so telling them to would be telling them to do something they may not do -
-/// and telling them to "share a fresh proposal instead" would be telling them
-/// to do the very thing being refused.
-const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and this domain takes one proposal at a time while it reviews changes - wait for theirs to merge, or ask them to withdraw it, then share again";
+/// so telling them to would be telling them to do something they may not do,
+/// and telling them to share a fresh proposal would be telling them to do the
+/// very thing being refused. A proposal with no owner on record is named as
+/// another member's.
+pub(crate) fn review_proposal_is_anothers(owner: Option<&str>, number: u64) -> String {
+    match owner {
+        Some(owner) => format!(
+            "{owner}'s proposal #{number} is still open. Share again when it is merged or closed."
+        ),
+        None => format!(
+            "Another member's proposal #{number} is still open. Share again when it is merged or closed."
+        ),
+    }
+}
 
 /// The refusal a write verb answers with in personal mode when the acting
 /// identity has connected no GitHub account of its own (spec section 6, and the
@@ -6987,7 +6997,7 @@ impl Engine {
             let Some(shared) = record.shared.clone() else {
                 continue;
             };
-            let fate = settle_shared(record, state);
+            let fate = settle_shared(record, entry.tombstone, state);
             let settled = match fate {
                 SharedFate::Open => continue,
                 SharedFate::Ended => crate::draft_start::DraftStart {
@@ -7039,6 +7049,9 @@ impl Engine {
             // Her deletion merged: a draft that started there and that the
             // proposal did not carry starts nowhere now.
             for draft in entries.iter().filter(|draft| !draft.tombstone) {
+                // A guard for a race: drafts are settled first, so a draft its
+                // own proposal carried no longer starts here unless its save was
+                // skipped this pass, and then the next pass settles it again.
                 if carried.contains(&(draft.path.clone(), shared.proposal)) {
                     continue;
                 }
@@ -7798,7 +7811,7 @@ impl Engine {
     /// one actor to withdraw a proposal that is not theirs.
     ///
     /// **Last writer wins, not first**, which matters only once more than one
-    /// actor can touch one open proposal: while `REVIEW_NO_STACKING` refuses a
+    /// actor can touch one open proposal: while a reviewing domain refuses a
     /// second actor's share against an open proposal, this is never called
     /// twice for the same number by two different actors, so the map's one
     /// entry is always the opener's. If a later design serves stacked

@@ -370,7 +370,7 @@ impl Reading<'_> {
         // step, and a share would carry her change again. It stands refused
         // until a pass settles it, as a merge whose start has not moved does.
         if let Some(record) = &self.records[i]
-            && settle_shared(record, self.base.state) == SharedFate::Merged
+            && settle_shared(record, row.tombstone, self.base.state) == SharedFate::Merged
         {
             let kind = if row.tombstone {
                 DraftConflictKind::DeleteEdit

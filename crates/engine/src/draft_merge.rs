@@ -40,7 +40,7 @@ use crystalline_core::relink::{rebase_relative_links, respell_path_wikilinks};
 use crystalline_core::to_lf;
 use crystalline_remote::merge::{ConflictKind, FileMerge};
 use crystalline_remote::ops::merge_with_manifest_rule;
-use crystalline_remote::state::{BaseStamp, OriginState, ProposalStatus};
+use crystalline_remote::state::{BaseStamp, OriginState, ProposalStatus, ProposedChange};
 use serde::Serialize;
 
 use crate::draft_start::DraftStart;
@@ -446,7 +446,7 @@ pub enum SharedFate {
 }
 
 /// What became of the proposal `record` says holds its row, read from the
-/// origin state.
+/// origin state. `tombstone` says the row is a deletion.
 ///
 /// Only history decides a merge. A status probe marks a record `Merged` in the
 /// chain before a pull has brought its text into the base, and moving the start
@@ -455,17 +455,59 @@ pub enum SharedFate {
 /// any status, is left as it is. One found in neither list is ended: history is
 /// capped, and a start that stays where it was can only refuse, never lose a
 /// word.
-pub fn settle_shared(record: &DraftStart, state: &OriginState) -> SharedFate {
+///
+/// **A merge counts only where the merged proposal still held her row.** Its
+/// history record lists the files of the last share that wrote its branch, and
+/// that may not be hers: a colleague's share can update the same proposal in
+/// place with only his drafts, and an amend carries only what it names. So the
+/// record must list her row's key (her path, or the path her case move started
+/// from, which is where a share carries it) with the digest of the shared text
+/// in either line ending, or a deletion for a tombstone. Anything else is
+/// ended: the merged branch held the team's text there, and her row keeps the
+/// start it had.
+pub fn settle_shared(record: &DraftStart, tombstone: bool, state: &OriginState) -> SharedFate {
     let Some(shared) = record.shared.as_ref() else {
         return SharedFate::Open;
     };
     if state.proposals.iter().any(|p| p.number == shared.proposal) {
         return SharedFate::Open;
     }
-    match state.history.iter().find(|p| p.number == shared.proposal) {
-        Some(p) if p.status == ProposalStatus::Merged => SharedFate::Merged,
-        _ => SharedFate::Ended,
+    let Some(merged) = state
+        .history
+        .iter()
+        .find(|p| p.number == shared.proposal && p.status == ProposalStatus::Merged)
+    else {
+        return SharedFate::Ended;
+    };
+    let folded = crystalline_core::fold_path_case(&record.path);
+    let case_move_from = record
+        .from
+        .as_deref()
+        .filter(|from| crystalline_core::fold_path_case(from) == folded);
+    let held_hers = merged.files.iter().any(|file| {
+        let at_her_key = file.path == record.path || Some(file.path.as_str()) == case_move_from;
+        let same_text = match (file.change, file.sha256.as_deref(), shared.text.as_deref()) {
+            (ProposedChange::Deleted, _, None) => tombstone,
+            (ProposedChange::Deleted, _, Some(_)) => false,
+            (_, Some(digest), Some(text)) => !tombstone && is_text_digest(text, digest),
+            _ => false,
+        };
+        at_her_key && same_text
+    });
+    if held_hers {
+        SharedFate::Merged
+    } else {
+        SharedFate::Ended
     }
+}
+
+/// Whether `digest` names `text` as stored (LF) or as a share stages it for a
+/// wholly CRLF team file.
+fn is_text_digest(text: &str, digest: &str) -> bool {
+    crate::engine::sha256_hex(text.as_bytes()) == digest
+        || crate::engine::sha256_hex(
+            crystalline_core::with_line_endings_of(text, b"\r\n").as_bytes(),
+        ) == digest
 }
 
 /// The key of the base snapshot that holds the team's text for her row at
@@ -2484,7 +2526,13 @@ mod tests {
             title: String::new(),
             created_at: chrono::Utc::now(),
             status,
-            files: Vec::new(),
+            files: vec![crystalline_remote::state::ProposedFile {
+                path: "plan.md".to_string(),
+                change: ProposedChange::Modified,
+                sha256: Some(crate::engine::sha256_hex(HERS.as_bytes())),
+                blob_sha: None,
+                size: None,
+            }],
             head_commit: None,
             pending_head_commit: None,
             base_commit: None,
@@ -2523,13 +2571,13 @@ mod tests {
         };
         let record = sharing(Some(7));
         assert_eq!(
-            settle_shared(&sharing(None), &state(vec![], vec![(7, Merged)])),
+            settle_shared(&sharing(None), false, &state(vec![], vec![(7, Merged)])),
             SharedFate::Open,
             "a record that names no proposal"
         );
         for status in [Open, Merged, Declined, Withdrawn] {
             assert_eq!(
-                settle_shared(&record, &state(vec![(7, status)], vec![(7, Merged)])),
+                settle_shared(&record, false, &state(vec![(7, status)], vec![(7, Merged)])),
                 SharedFate::Open,
                 "{status:?} in the chain"
             );
@@ -2537,21 +2585,114 @@ mod tests {
         assert_eq!(
             settle_shared(
                 &record,
+                false,
                 &state(vec![(8, Open)], vec![(6, Withdrawn), (7, Merged)])
             ),
             SharedFate::Merged
         );
         for status in [Open, Declined, Withdrawn] {
             assert_eq!(
-                settle_shared(&record, &state(vec![], vec![(7, status)])),
+                settle_shared(&record, false, &state(vec![], vec![(7, status)])),
                 SharedFate::Ended,
                 "{status:?} in history"
             );
         }
         assert_eq!(
-            settle_shared(&record, &state(vec![], vec![(8, Merged)])),
+            settle_shared(&record, false, &state(vec![], vec![(8, Merged)])),
             SharedFate::Ended,
             "in neither list"
+        );
+    }
+
+    /// A merge settles her row only where the merged proposal's own record still
+    /// lists it with her text, or as a deletion for a tombstone.
+    #[test]
+    fn settle_shared_reads_a_merge_only_where_the_proposal_held_her_row() {
+        let file =
+            |path: &str, change, text: Option<&str>| crystalline_remote::state::ProposedFile {
+                path: path.to_string(),
+                change,
+                sha256: text.map(|text| crate::engine::sha256_hex(text.as_bytes())),
+                blob_sha: None,
+                size: None,
+            };
+        let merged = |files| {
+            let mut state = OriginState::new("acme/team", "main");
+            let mut held = proposal(7, ProposalStatus::Merged);
+            held.files = files;
+            state.history = vec![held];
+            state
+        };
+        let at = |path: &str, from: &str, text: Option<&str>| DraftStart {
+            path: path.to_string(),
+            from: Some(from.to_string()),
+            shared: Some(crate::draft_start::SharedText {
+                proposal: 7,
+                text: text.map(str::to_string),
+            }),
+            ..sharing(None)
+        };
+        use ProposedChange::{Added, Deleted, Modified};
+        let draft = at("plan.md", "plan.md", Some(HERS));
+        let fate = |record: &DraftStart, tombstone, files| {
+            settle_shared(record, tombstone, &merged(files))
+        };
+        assert_eq!(
+            fate(&draft, false, vec![file("plan.md", Modified, Some(HERS))]),
+            SharedFate::Merged
+        );
+        let crlf = String::from_utf8(crlf(HERS)).unwrap();
+        assert_eq!(
+            fate(&draft, false, vec![file("plan.md", Modified, Some(&crlf))]),
+            SharedFate::Merged,
+            "CRLF"
+        );
+        assert_eq!(
+            fate(&draft, false, vec![]),
+            SharedFate::Ended,
+            "rewritten without her row"
+        );
+        assert_eq!(
+            fate(&draft, false, vec![file("other.md", Added, Some(HERS))]),
+            SharedFate::Ended
+        );
+        assert_eq!(
+            fate(&draft, false, vec![file("plan.md", Modified, Some(HIS))]),
+            SharedFate::Ended,
+            "another text"
+        );
+        assert_eq!(
+            fate(&draft, false, vec![file("plan.md", Deleted, None)]),
+            SharedFate::Ended
+        );
+        let case_move = at("Plan.md", "plan.md", Some(HERS));
+        assert_eq!(
+            fate(
+                &case_move,
+                false,
+                vec![file("plan.md", Modified, Some(HERS))]
+            ),
+            SharedFate::Merged
+        );
+        let moved = at("renamed.md", "plan.md", Some(HERS));
+        assert_eq!(
+            fate(&moved, false, vec![file("plan.md", Modified, Some(HERS))]),
+            SharedFate::Ended,
+            "a move is not her key"
+        );
+        let deletion = at("plan.md", "plan.md", None);
+        assert_eq!(
+            fate(&deletion, true, vec![file("plan.md", Deleted, None)]),
+            SharedFate::Merged
+        );
+        assert_eq!(
+            fate(&deletion, true, vec![file("plan.md", Modified, Some(HERS))]),
+            SharedFate::Ended
+        );
+        assert_eq!(
+            fate(&deletion, false, vec![file("plan.md", Deleted, None)]),
+            SharedFate::Ended,
+            "a draft is no deletion"
         );
     }
 

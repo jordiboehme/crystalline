@@ -907,8 +907,14 @@ impl<'a> DomainView<'a> {
                 self.engine
                     .start_from_read(self.domain.as_str(), path, read)?
             }
+            // A row that moves to another path leaves what an open proposal
+            // holds behind: the proposal holds her text at the old path, which
+            // her row no longer stands for, and a start moved there on its merge
+            // would read a key the snapshot does not hold as the team deleting
+            // her page. The row merges against the start it carries.
             StartRule::Carried(start) => start.map(|start| DraftStart {
                 path: path.to_string(),
+                shared: start.shared.filter(|_| start.path == path),
                 ..start
             }),
         };

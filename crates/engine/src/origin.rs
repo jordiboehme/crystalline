@@ -991,6 +991,22 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
     v
 }
 
+/// A share of a reviewing domain that waits for somebody else's open proposal:
+/// `{ outcome: "proposal_open", proposal, own: false, guidance }`, the shape a
+/// direct domain's share answers with when another person's proposal is open,
+/// with `guidance` the sentence to show as given.
+pub(crate) fn another_members_proposal_json(
+    open: &crystalline_remote::state::Proposal,
+    guidance: &str,
+) -> Value {
+    json!({
+        "outcome": "proposal_open",
+        "proposal": { "number": open.number, "url": open.url, "title": open.title },
+        "own": false,
+        "guidance": guidance,
+    })
+}
+
 /// A share refused because drafts it would carry do not fit the team's text:
 /// `{ outcome: "conflicts_pending", count, conflicts }`, the shape the
 /// non-review refusal has, with each conflict as [`draft_conflicts_json`] gives
