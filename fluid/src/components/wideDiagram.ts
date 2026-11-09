@@ -39,6 +39,33 @@ export function unclampDiagram(svg: string): string {
 }
 
 /**
+ * The drawing's own size in pixels, from the root's viewBox, or null when it
+ * has none that reads as two positive numbers.
+ *
+ * Paper needs both numbers, the screen only the width. The print sheet sizes a
+ * printed diagram from them (`index.css`): its own width, less when the column
+ * or one page is too small for it, and never more. Mermaid's inline
+ * `max-width` cannot do that on paper, because the sheet must also override
+ * the width a widened diagram took on screen.
+ */
+export function naturalSize(
+  svg: string,
+): { width: number; height: number } | null {
+  const root = findRootTag(svg);
+  if (root === null) {
+    return null;
+  }
+  const viewBox = attribute(svg.slice(root.start, root.end), "viewBox");
+  const parts = viewBox?.trim().split(/[\s,]+/) ?? [];
+  if (parts.length !== 4) {
+    return null;
+  }
+  const width = pixels(parts[2] ?? "");
+  const height = pixels(parts[3] ?? "");
+  return width === null || height === null ? null : { width, height };
+}
+
+/**
  * The span of the opening `<svg>` tag, quotes respected so an attribute value
  * holding a `>` does not end the tag early. Only the root is ever rewritten:
  * mermaid nests `<svg>` elements for images and icons, and a `<style>` block

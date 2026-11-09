@@ -198,6 +198,43 @@ describe("MermaidDiagram", () => {
     ).not.toBeNull();
   });
 
+  it("tells the print sheet each drawing's own size, the paper copy's too", async () => {
+    // Paper prints a diagram at its viewBox width, less to fit the column or
+    // a page, never more (`index.css`); the wrapper carries the numbers.
+    localStorage.setItem("fluid-theme", "dark");
+    renderDiagram.mockImplementation((id: string) =>
+      Promise.resolve({
+        svg: id.endsWith("-paper")
+          ? '<svg data-paper viewBox="0 0 230 410"><g/></svg>'
+          : '<svg data-diagram viewBox="0 0 228 400"><g/></svg>',
+        diagramType: "er",
+      }),
+    );
+    const { container } = draw("erDiagram\n A ||--o{ B : has");
+    await waitFor(() => {
+      expect(container.querySelector("svg[data-paper]")).not.toBeNull();
+    });
+    const screenBox = container.querySelector("svg[data-diagram]")
+      ?.parentElement as HTMLElement;
+    expect(screenBox).toHaveAttribute("data-drawing");
+    expect(screenBox.style.getPropertyValue("--diagram-width")).toBe("228");
+    expect(screenBox.style.getPropertyValue("--diagram-height")).toBe("400");
+    const paperBox = container.querySelector("svg[data-paper]")
+      ?.parentElement as HTMLElement;
+    expect(paperBox).toHaveAttribute("data-drawing");
+    expect(paperBox.style.getPropertyValue("--diagram-width")).toBe("230");
+    expect(paperBox.style.getPropertyValue("--diagram-height")).toBe("410");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show at full width" }),
+    );
+    const wideBox = container.querySelector("svg[data-diagram]")
+      ?.parentElement as HTMLElement;
+    expect(wideBox.className).toContain("overflow-x-auto");
+    expect(wideBox).toHaveAttribute("data-drawing");
+    expect(wideBox.style.getPropertyValue("--diagram-width")).toBe("228");
+  });
+
   it("draws no printer copy on a light screen", async () => {
     const { container } = draw("graph TD; A-->B;");
     await waitFor(() => {
