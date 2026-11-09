@@ -1866,15 +1866,17 @@ pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on a
 /// different in kind. This actor cannot withdraw a proposal that is not theirs,
 /// so telling them to would be telling them to do something they may not do,
 /// and telling them to share a fresh proposal would be telling them to do the
-/// very thing being refused. A proposal with no owner on record is named as
-/// another member's.
+/// very thing being refused. A proposal with no owner on record may be the
+/// asker's own, so its sentence is true for everyone and names withdrawing it
+/// as the way out for its opener.
 pub(crate) fn review_proposal_is_anothers(owner: Option<&str>, number: u64) -> String {
     match owner {
         Some(owner) => format!(
             "{owner}'s proposal #{number} is still open. Share again when it is merged or closed."
         ),
         None => format!(
-            "Another member's proposal #{number} is still open. Share again when it is merged or closed."
+            "Proposal #{number} is still open, and Crystalline does not know who opened it. Share \
+             again when it is merged or closed, or withdraw it if it is yours."
         ),
     }
 }

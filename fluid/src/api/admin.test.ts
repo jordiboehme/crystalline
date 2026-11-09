@@ -1132,6 +1132,8 @@ describe("the admin client layer", () => {
       title: null,
       // A plan that names no owner reads as the caller's own, as from an older server.
       own: true,
+      // No sentence from the server about whose proposal is in the way.
+      guidance: null,
       // No note: the plain share needs no sentence about how it will go.
       note: null,
       spellingNote: null,

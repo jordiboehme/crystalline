@@ -974,6 +974,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 lines.push(format!("  {line}"));
             }
             lines.extend(skipped_large_lines(&prop["skipped_large"]));
+            if let Some(note) = data["note"].as_str() {
+                lines.push(format!("  {note}"));
+            }
         }
         "committed" => {
             let sha = data["sha"].as_str().unwrap_or("");

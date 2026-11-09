@@ -3696,3 +3696,41 @@ async fn a_share_goes_through_once_another_members_proposal_is_closed() {
     assert_eq!(his["outcome"], "proposed", "{his}");
     assert_ne!(his["number"].as_u64(), Some(number), "{his}");
 }
+
+// --- A share that races the merge --------------------------------------------
+
+/// The team merges her proposal while her share of a newer edit is between its
+/// pull and its push. The forge keeps the merged branch, so the push lands on a
+/// proposal that already merged without it: her newer text never reached the
+/// team, the receipt says so, and her draft keeps it to share again.
+#[tokio::test]
+async fn a_share_that_updates_a_proposal_merged_meanwhile_keeps_her_newer_text() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, _) = proposed(&t, "alice").await;
+    let merged = t.merged_commit(&answer, &[]);
+    same_line(&t).await;
+    let newer = t.row("alice", "plan.md").await;
+
+    // The share reads the head twice: in the pull it opens with, and in the
+    // pinned pull inside the proposal step. The merge lands after the second.
+    t.mock
+        .merge_after_head_probes(t.mock.branch_head_calls() + 2, number, "main", &merged);
+    let again = t.share("alice", None).await;
+    assert_eq!(again["outcome"], "updated", "{again}");
+    assert_eq!(
+        again["note"],
+        format!(
+            "The team merged proposal #{number} before this change reached it, so the change \
+             was not shared. It stays in your drafts. Share it again."
+        ),
+        "{again}"
+    );
+    assert_eq!(t.shared("alice", "plan.md"), None);
+
+    t.pull().await;
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, newer);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert!(t.forge_file("plan.md").unwrap().contains(HER_WORD));
+}

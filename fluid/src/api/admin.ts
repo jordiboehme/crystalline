@@ -1437,6 +1437,12 @@ export interface SharePlan {
    */
   own: boolean;
   /**
+   * On a `proposal_open` plan of a domain that reviews changes: the server's
+   * sentence that says whose proposal is open and what to do, shown as given.
+   * Absent elsewhere, and from an older server.
+   */
+  guidance?: string | null;
+  /**
    * How a direct domain's share will go when it is not the plain commit:
    * the server's own sentences, shown as given, for example that it opens a
    * proposal if the branch refuses it again. Null otherwise, and from an
@@ -1545,6 +1551,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     branch: asString(record?.branch),
     title: asString(record?.title),
     own: record?.own !== false,
+    guidance: asString(record?.guidance),
     note: asString(record?.note),
     spellingNote: asString(record?.spelling_note),
     teamMarker: readTeamMarker(record?.team_marker),

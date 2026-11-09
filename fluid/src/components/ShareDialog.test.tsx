@@ -1728,6 +1728,69 @@ describe("the share dialog", () => {
     ).toBeDisabled();
   });
 
+  it("shows the server's sentence when another member's proposal blocks a reviewing domain", async () => {
+    const UNOWNED =
+      "Proposal #6 is still open, and Crystalline does not know who opened it. Share again when it is merged or closed, or withdraw it if it is yours.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "proposal_open",
+        number: 6,
+        url: "https://github.com/acme/knowledge/pull/6",
+        title: "Somebody's",
+        own: false,
+        guidance: UNOWNED,
+        effective_title: "",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(await within(dialog).findByText(UNOWNED)).toBeVisible();
+    expect(
+      within(dialog).getByRole("button", { name: "Share" }),
+    ).toBeDisabled();
+  });
+
+  it("says when an update reached a proposal the team had already merged", async () => {
+    const NOTE =
+      "The team merged proposal #4 before this change reached it, so the change was not shared. It stays in your drafts. Share it again.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "update",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "updated",
+              proposal: {
+                number: 4,
+                url: "https://github.com/acme/knowledge/pull/4",
+              },
+              note: NOTE,
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(await within(dialog).findByText(NOTE)).toBeVisible();
+  });
+
   const PROTECTED_GUIDANCE =
     "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).";
   // What a person reads beside the button: no tool syntax.

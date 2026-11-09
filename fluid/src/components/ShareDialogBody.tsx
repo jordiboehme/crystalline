@@ -960,6 +960,7 @@ function actionLine(plan: SharePlan | null): string {
     branch = null,
     title = null,
     own = true,
+    guidance = null,
   } = plan ?? {};
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
@@ -994,9 +995,14 @@ function actionLine(plan: SharePlan | null): string {
     case "commit":
       return `Sharing commits straight to ${branch ?? "the branch"}, with no review.`;
     case "proposal_open":
-      // The one state a direct domain adds: the branch this share would
-      // commit onto is the one a proposal is still waiting to land on.
+      // A direct domain: the branch this share would commit onto is the one a
+      // proposal is still waiting to land on. A domain that reviews changes:
+      // another member's proposal is open, and the server's own sentence says
+      // whose and what to do.
       if (!own) {
+        if (guidance != null && guidance !== "") {
+          return guidance;
+        }
         return number === null
           ? "Another person's proposal is still open; share again once it is merged or closed."
           : `Proposal #${String(number)} (${title ?? "untitled"}) is another person's and is still open; share again once it is merged or closed.`;
@@ -1161,12 +1167,15 @@ function describeShareOutcome(result: unknown): OutcomeSentence {
   const number = asNumber(record?.number) ?? asNumber(proposal?.number);
   switch (outcome) {
     case "updated":
-      return numberSentence(
-        "Updated ",
-        number,
-        `${placementLine(proposal ?? record)}.`,
-        asString(proposal?.url),
-      );
+      return {
+        ...numberSentence(
+          "Updated ",
+          number,
+          `${placementLine(proposal ?? record)}.`,
+          asString(proposal?.url),
+        ),
+        note: asString(record?.note),
+      };
     case "proposed":
       return {
         ...numberSentence(

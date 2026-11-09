@@ -2524,8 +2524,40 @@ impl Engine {
                     && let Some(number) = proposal_number_of(&receipt)
                 {
                     self.record_proposal_actor(domain, number, Some(who));
-                    self.record_what_the_proposal_holds(domain, who, &state_dir, number)
-                        .await;
+                    // An update can land on a proposal the team merged after
+                    // this share's pull: a forge keeps a merged branch, so the
+                    // push goes through and the merge never held it. Asked once,
+                    // after the push: a merge from here on holds what was pushed.
+                    let merged_meanwhile = match &outcome {
+                        ops::ProposeOutcome::Updated(_) => {
+                            match provider.proposal_state(&spec, number).await {
+                                Ok(crystalline_remote::provider::ProposalState::Open) => None,
+                                Ok(state) => Some(
+                                    state == crystalline_remote::provider::ProposalState::Merged,
+                                ),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "asking whether proposal #{number} of '{domain}' is still \
+                                         open after its update failed, so what it holds is not \
+                                         recorded: {e}"
+                                    );
+                                    Some(false)
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    self.record_what_the_proposal_holds(
+                        domain,
+                        who,
+                        &state_dir,
+                        number,
+                        merged_meanwhile.is_none(),
+                    )
+                    .await;
+                    if merged_meanwhile == Some(true) {
+                        receipt["note"] = json!(merged_before_the_update(number));
+                    }
                 }
                 Ok(receipt)
             }
@@ -2590,12 +2622,18 @@ impl Engine {
     /// go on. A record that still names the proposal after a failure is
     /// settled only where the merged proposal's own record lists its text
     /// (`draft_merge::settle_shared`), so it can refuse but loses nothing.
+    ///
+    /// With `holds` false the proposal holds nothing of anybody's any more
+    /// (an update that landed after the team merged or closed it): every
+    /// record that names it forgets it, and each row merges against the start
+    /// it had.
     async fn record_what_the_proposal_holds(
         &self,
         domain: &str,
         actor: &str,
         state_dir: &Path,
         number: u64,
+        holds: bool,
     ) {
         self.take_proposal_record_hold().await;
         let warn = |path: &str, e: &dyn std::fmt::Display| {
@@ -2644,7 +2682,12 @@ impl Engine {
         };
         let fold = crystalline_core::fold_path_case;
         let mut carried_rows: HashSet<String> = HashSet::new();
-        for file in &proposal.files {
+        let carried_files = if holds {
+            proposal.files.as_slice()
+        } else {
+            &[]
+        };
+        for file in carried_files {
             let deletes = file.change == crystalline_remote::state::ProposedChange::Deleted;
             let carried = rows
                 .iter()
@@ -5279,4 +5322,13 @@ pub(super) enum SharePass {
 fn is_draft_digest(content: &str, digest: &str) -> bool {
     sha256_hex(content.as_bytes()) == digest
         || sha256_hex(crystalline_core::with_line_endings_of(content, b"\r\n").as_bytes()) == digest
+}
+
+/// What an update that reached a proposal only after the team merged it says:
+/// the change was not shared and stays a draft.
+fn merged_before_the_update(number: u64) -> String {
+    format!(
+        "The team merged proposal #{number} before this change reached it, so the change was \
+         not shared. It stays in your drafts. Share it again."
+    )
 }
