@@ -1832,10 +1832,10 @@ pub struct ShareBody {
                            as given that names whose proposal it is: share \
                            again once it is merged or closed. Nothing was \
                            written. An `updated` outcome on such a domain \
-                           may carry `note`, a sentence to show as given, \
-                           when the team merged the proposal before the \
-                           update reached it: the change was not shared and \
-                           stays a draft.\n\nA domain \
+                           may carry `note`, a sentence to show in place of \
+                           the headline, when the team merged the proposal \
+                           while the update was on its way: a change the \
+                           merge did not hold stays a draft.\n\nA domain \
                            that shares directly answers one of four outcomes \
                            instead: `committed` with the commit's sha, url \
                            and branch beside the three file lists (on a \

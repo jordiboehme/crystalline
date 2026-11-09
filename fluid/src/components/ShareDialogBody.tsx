@@ -1166,16 +1166,20 @@ function describeShareOutcome(result: unknown): OutcomeSentence {
   const proposal = asObject(record?.proposal);
   const number = asNumber(record?.number) ?? asNumber(proposal?.number);
   switch (outcome) {
-    case "updated":
-      return {
-        ...numberSentence(
-          "Updated ",
-          number,
-          `${placementLine(proposal ?? record)}.`,
-          asString(proposal?.url),
-        ),
-        note: asString(record?.note),
-      };
+    case "updated": {
+      // A note on an update says the team merged the proposal while the
+      // change was on its way, so it is the headline rather than "Updated".
+      const note = asString(record?.note);
+      if (note !== null && note !== "") {
+        return plainSentence(note);
+      }
+      return numberSentence(
+        "Updated ",
+        number,
+        `${placementLine(proposal ?? record)}.`,
+        asString(proposal?.url),
+      );
+    }
     case "proposed":
       return {
         ...numberSentence(

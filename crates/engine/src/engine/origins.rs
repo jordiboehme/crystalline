@@ -5324,11 +5324,12 @@ fn is_draft_digest(content: &str, digest: &str) -> bool {
         || sha256_hex(crystalline_core::with_line_endings_of(content, b"\r\n").as_bytes()) == digest
 }
 
-/// What an update that reached a proposal only after the team merged it says:
-/// the change was not shared and stays a draft.
+/// What an update says when the team merged its proposal while the change was
+/// on its way. The merge may have come before the push, which the merge then
+/// did not hold, or just after it, which it did; the sentence is true for both.
 fn merged_before_the_update(number: u64) -> String {
     format!(
-        "The team merged proposal #{number} before this change reached it, so the change was \
-         not shared. It stays in your drafts. Share it again."
+        "The team merged proposal #{number} while this change was on its way. If your change \
+         is not in it, it stays in your drafts and you can share it again."
     )
 }

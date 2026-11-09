@@ -3721,8 +3721,8 @@ async fn a_share_that_updates_a_proposal_merged_meanwhile_keeps_her_newer_text()
     assert_eq!(
         again["note"],
         format!(
-            "The team merged proposal #{number} before this change reached it, so the change \
-             was not shared. It stays in your drafts. Share it again."
+            "The team merged proposal #{number} while this change was on its way. If your \
+             change is not in it, it stays in your drafts and you can share it again."
         ),
         "{again}"
     );

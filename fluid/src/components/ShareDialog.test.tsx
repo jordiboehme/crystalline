@@ -1755,7 +1755,7 @@ describe("the share dialog", () => {
 
   it("says when an update reached a proposal the team had already merged", async () => {
     const NOTE =
-      "The team merged proposal #4 before this change reached it, so the change was not shared. It stays in your drafts. Share it again.";
+      "The team merged proposal #4 while this change was on its way. If your change is not in it, it stays in your drafts and you can share it again.";
     serve({
       "/domains/eng/sync/changes": () => ({
         action: "update",
@@ -1789,6 +1789,8 @@ describe("the share dialog", () => {
     );
 
     expect(await within(dialog).findByText(NOTE)).toBeVisible();
+    // No headline says it was updated above a sentence that it may not be.
+    expect(within(dialog).queryByText(/^Updated/)).toBeNull();
   });
 
   const PROTECTED_GUIDANCE =

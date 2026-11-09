@@ -961,11 +961,23 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "updated" => {
             let prop = &data["proposal"];
-            lines.push(format!(
-                "Updated proposal #{}: {}",
-                prop["number"].as_u64().unwrap_or(0),
-                prop["url"].as_str().unwrap_or("")
-            ));
+            // A note on an update says the team merged the proposal while the
+            // change was on its way: that is the headline, not "Updated".
+            match data["note"].as_str() {
+                Some(note) => {
+                    lines.push(note.to_string());
+                    lines.push(format!(
+                        "  Proposal #{}: {}",
+                        prop["number"].as_u64().unwrap_or(0),
+                        prop["url"].as_str().unwrap_or("")
+                    ));
+                }
+                None => lines.push(format!(
+                    "Updated proposal #{}: {}",
+                    prop["number"].as_u64().unwrap_or(0),
+                    prop["url"].as_str().unwrap_or("")
+                )),
+            }
             if let Some(summary) = prop["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -974,9 +986,6 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 lines.push(format!("  {line}"));
             }
             lines.extend(skipped_large_lines(&prop["skipped_large"]));
-            if let Some(note) = data["note"].as_str() {
-                lines.push(format!("  {note}"));
-            }
         }
         "committed" => {
             let sha = data["sha"].as_str().unwrap_or("");
@@ -1001,7 +1010,13 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
             let url = prop["url"].as_str().unwrap_or("");
             // An older daemon sends no `own`; its proposal_open was always
             // the sharer's own.
-            if data["own"].as_bool() == Some(false) {
+            // The server's own sentence when it sends one: it says whose the
+            // proposal is, which this side cannot know.
+            if data["own"].as_bool() == Some(false)
+                && let Some(guidance) = data["guidance"].as_str()
+            {
+                lines.push(format!("Cannot share '{domain}': {guidance}"));
+            } else if data["own"].as_bool() == Some(false) {
                 lines.push(format!(
                     "Cannot share '{domain}': proposal #{number} ({url}) is another person's and is still open. Share again once it is merged or closed."
                 ));
@@ -4727,13 +4742,36 @@ mod origin_share_tests {
             open[0],
             "Cannot share 'kb': proposal #4 (https://github.com/acme/knowledge/pull/4) is still open; merge or withdraw it first."
         );
+        // An older daemon sends no guidance, and the line says what it can.
         let foreign = origin_share_lines(
             "kb",
-            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 5, "url": "https://github.com/acme/knowledge/pull/5", "title": "Theirs" }, "guidance": "g" }),
+            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 5, "url": "https://github.com/acme/knowledge/pull/5", "title": "Theirs" } }),
         );
         assert_eq!(
             foreign[0],
             "Cannot share 'kb': proposal #5 (https://github.com/acme/knowledge/pull/5) is another person's and is still open. Share again once it is merged or closed."
+        );
+        // The server's sentence says whose it is, which may be the sharer's own.
+        let unowned = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 6, "url": "https://github.com/acme/knowledge/pull/6", "title": "Somebody's" }, "guidance": "Proposal #6 is still open, and Crystalline does not know who opened it. Share again when it is merged or closed, or withdraw it if it is yours." }),
+        );
+        assert_eq!(
+            unowned[0],
+            "Cannot share 'kb': Proposal #6 is still open, and Crystalline does not know who opened it. Share again when it is merged or closed, or withdraw it if it is yours."
+        );
+        // An update that met the team's merge leads with what happened.
+        let raced = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "updated", "proposal": { "number": 4, "url": "https://github.com/acme/knowledge/pull/4" }, "note": "The team merged proposal #4 while this change was on its way. If your change is not in it, it stays in your drafts and you can share it again." }),
+        );
+        assert_eq!(
+            raced[0],
+            "The team merged proposal #4 while this change was on its way. If your change is not in it, it stays in your drafts and you can share it again."
+        );
+        assert!(
+            raced.iter().all(|line| !line.starts_with("Updated")),
+            "{raced:?}"
         );
         let protected = origin_share_lines(
             "kb",
