@@ -81,6 +81,7 @@ import {
   reflectionAfter,
   reflectionWords,
 } from "./reflectionLevels";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /**
  * Every knowledge level a member can be invited at, or moved to, least to
@@ -128,11 +129,11 @@ export function MembersCard({ domain }: { domain: string }) {
   });
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: membersKey(domain) });
+    refreshAfterWrite(queryClient, { queryKey: membersKey(domain) });
 
   /** Leaving, or being transferred away from owning it: this account's own reach into the domain just ended. */
   function leftTheDomain() {
-    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
     void navigate("/");
   }
 

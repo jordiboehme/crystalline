@@ -1,0 +1,14 @@
+flowchart TD
+    %% write_reflection with sources
+    call[write_reflection section plus sources] --> each[Each named source]
+    each --> readable{Caller may read it?}
+    readable -- no --> hidden[Refuse: unavailable source]
+    readable -- yes --> wide{Source domain narrower than the page domain?}
+    wide -- no --> ok[Accept the source]
+    wide -- yes --> ask{Client can ask the person?}
+    ask -- no --> drop[Refuse: leave the text out]
+    ask -- yes --> person{Person shares it on purpose?}
+    person -- yes --> ok
+    person -- no --> drop
+    ok --> write[Write the section with provenance]
+    write --> page[/reflections page/]

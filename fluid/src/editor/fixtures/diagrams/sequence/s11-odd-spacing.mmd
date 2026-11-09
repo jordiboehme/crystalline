@@ -1,0 +1,14 @@
+sequenceDiagram
+%% odd spacing: tabs, runs of spaces, no spaces
+
+	participant   a   as   First one  
+  participant b
+
+	a->>b:no space
+    a  ->>  b  :   many spaces   
+	b-->>a : tab before
+      Note  over  a , b :  spread out
+  loop   twice  
+  a->>b:x;b-->>a:y
+    end
+

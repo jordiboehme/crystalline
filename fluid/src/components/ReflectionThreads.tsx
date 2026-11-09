@@ -51,6 +51,7 @@ import { Dialog } from "radix-ui";
 import { useLocation } from "react-router";
 
 import { problemDetail } from "../api/client";
+import { keyLabel } from "../platform";
 import type {
   AnchorState,
   ReflectionDoc,
@@ -106,6 +107,7 @@ import {
   IconButton,
   RAIL_LABEL,
 } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const ALERT = "text-red-800 dark:text-red-200";
 
@@ -672,7 +674,7 @@ export function ReflectionThreads({
   const { user, capabilities } = useAuth();
   const { hash } = useLocation();
   const refresh = () =>
-    queryClient.invalidateQueries({ queryKey: reflectionKey(domain) });
+    refreshAfterWrite(queryClient, { queryKey: reflectionKey(domain) });
   // Reading and commenting are one level; the anonymous viewer of a public
   // domain is the one reader who never comments (spec B5). A server that
   // serves read-only refuses every thread write, so it gets no controls.
@@ -1225,10 +1227,12 @@ export function ReflectionThreads({
     if (barShown && !announced.current) {
       announced.current = true;
       // Below `xl` the column's button is in the sheet.
+      // Words, not signs: a screen reader says this (Option+F10 on a Mac).
+      const barKey = keyLabel("Alt-F10", { words: true });
       say(
         column
-          ? "Comment on the selection with Alt+F10"
-          : "Comment on the selection with Alt+F10 or from the threads",
+          ? `Comment on the selection with ${barKey}`
+          : `Comment on the selection with ${barKey} or from the threads`,
       );
     }
   }, [barShown, captured, column, say]);

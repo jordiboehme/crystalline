@@ -1,0 +1,8 @@
+flowchart TD
+    %% device.rs: one device pick per model load
+    load[Load a model] --> target{aarch64-apple-darwin?}
+    target -- yes --> metal{Metal device available?}
+    metal -- yes --> gpu[Run on Metal]
+    metal -- no --> cpu[Run on the CPU]
+    target -- no --> cpu
+    gpu & cpu --> model[Embedding model or NLI model]

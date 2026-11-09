@@ -10,6 +10,7 @@
  */
 
 import { usePageTitle } from "../usePageTitle";
+import { LOST_FIELD_TEXT, settleFieldDraft } from "../editor/diagram/draws";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -111,6 +112,7 @@ import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "Engram source";
@@ -786,7 +788,7 @@ function Surface({
       // fresh for a minute (`TREE_STALE_TIME`), and the sidebar stays mounted
       // for as long as a reader is inside a domain, so without this a renamed
       // engram leaves a row in the frame that 404s when it is clicked.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(saved.domain),
       });
       /*
@@ -882,6 +884,12 @@ function Surface({
       : (domains.data.domains.find((entry) => entry.name === engram.domain)
           ?.review ?? null) !== null;
   const walkedOut = useRef(false);
+  // Whether a rename field was open at the close, and its answer when it comes.
+  const fieldWait = useRef(false);
+  const fieldSnapped = useRef(false);
+  const [fieldSettled, setFieldSettled] = useState<{
+    lost: string | null;
+  } | null>(null);
   useEffect(() => {
     if (!closed || walkedOut.current) {
       return;
@@ -889,8 +897,28 @@ function Surface({
     // Once: this effect re-runs whenever the session object is rebuilt, and a
     // second snapshot would only restamp the same text.
     walkedOut.current = true;
-    session.snapshotDraft();
+    // An open rename field's text goes into the draft the banner promises, or the
+    // banner names it (R100). The walk out below waits for this answer.
+    const view = session.viewRef.current;
+    const settling = view === null ? null : settleFieldDraft(view);
+    if (settling === null) {
+      session.snapshotDraft();
+    } else {
+      fieldWait.current = true;
+      void settling
+        .catch(() => null)
+        .then((lost) => {
+          setFieldSettled({ lost });
+        });
+    }
   }, [closed, session]);
+  // The next render's session, whose buffer holds what the field just wrote.
+  useEffect(() => {
+    if (fieldSettled !== null && !fieldSnapped.current) {
+      fieldSnapped.current = true;
+      session.snapshotDraft();
+    }
+  }, [fieldSettled, session]);
   /**
    * The room closed because the engram moved: nothing is gone, so the author
    * is not walked away. The banner offers the new address instead, and the
@@ -903,7 +931,14 @@ function Surface({
   // Moved somewhere this person cannot open: the notice says so and stays.
   const movedAway = inRoom && collab.closedReason === "moved";
   useEffect(() => {
-    if (!closed || movedTo !== null || movedAway) {
+    // Not before the field's answer, and not with a text the person has to see.
+    if (
+      !closed ||
+      movedTo !== null ||
+      movedAway ||
+      (fieldWait.current && fieldSettled === null) ||
+      fieldSettled?.lost != null
+    ) {
       return;
     }
     const timer = setTimeout(() => {
@@ -914,7 +949,7 @@ function Surface({
     return () => {
       clearTimeout(timer);
     };
-  }, [closed, movedTo, movedAway, engram.domain, navigate]);
+  }, [closed, movedTo, movedAway, fieldSettled, engram.domain, navigate]);
 
   /**
    * The unload prompt in a room, keyed on the SESSION's verdict.
@@ -951,7 +986,7 @@ function Surface({
   // drawn from changed: one refetch per rename rather than one per save.
   useEffect(() => {
     if (inRoom && collab.permalink !== engram.permalink) {
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(engram.domain),
       });
       void navigate(editRoute(engram.domain, collab.permalink), {
@@ -1205,6 +1240,7 @@ function Surface({
                   <button
                     type="button"
                     onClick={closing.close}
+                    data-leaves-editor=""
                     className={BUTTON.primary}
                   >
                     Done
@@ -1333,6 +1369,14 @@ function Surface({
                 : collab.closedReason === "moved"
                   ? "This engram was moved to a place you cannot open. Your text is kept as a draft."
                   : "The session ended; your text is kept as a draft"}
+            </p>
+          )}
+          {closed && fieldSettled?.lost != null && (
+            <p role="alert" className={AMBER_BANNER}>
+              <span>{LOST_FIELD_TEXT}</span>
+              <q className="block max-h-40 w-full overflow-auto wrap-anywhere whitespace-pre-wrap select-all">
+                {fieldSettled.lost}
+              </q>
             </p>
           )}
           {/*

@@ -1368,7 +1368,8 @@ test("a domain is registered, filled from an archive and unregistered", async ({
       async () =>
         (
           await page.request.get(
-            `${BASE_PATH}/api/v1/domains/${RESTORE_DOMAIN}/engrams`,
+            // Past the listing's default page of 10: the archive holds more.
+            `${BASE_PATH}/api/v1/domains/${RESTORE_DOMAIN}/engrams?limit=100`,
           )
         ).text(),
       { timeout: 30_000 },

@@ -1,0 +1,15 @@
+flowchart LR
+    %% how one path is classified
+    path[Path in the scan] --> known{In the index?}
+    known -- no --> sameSum{Checksum of a vanished path?}
+    sameSum -- yes --> moved[Moved: rename in place, no reparse]
+    sameSum -- no --> new[New: parse and insert]
+    known -- yes --> changed{Checksum changed?}
+    changed -- no --> same[Unchanged]
+    changed -- yes --> modified[Modified: reparse]
+    gone[Indexed path not on disk] --> claimed{Claimed by a new file?}
+    claimed -->|yes| moved
+    claimed -->|no| deleted[Deleted]
+
+    style moved fill:#e8f5e9
+    style deleted fill:#fdecea

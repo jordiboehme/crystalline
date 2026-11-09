@@ -1,0 +1,7 @@
+flowchart LR
+    %% where the documentation lives, with links
+    readme["`**README**: one line per scenario`"] --> deploy["`docs/deployment.md`"]
+    deploy --> charts[One chart per scenario]
+    readme --> notes[Release notes]
+    click readme href "https://github.com/jordiboehme/crystalline" "Repository"
+    click deploy href "https://github.com/jordiboehme/crystalline/blob/main/docs/deployment.md"

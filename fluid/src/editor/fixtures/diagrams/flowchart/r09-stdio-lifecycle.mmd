@@ -1,0 +1,10 @@
+flowchart TD
+    %% what the rmcp start-up loop does with the first messages
+    first[First client message] --> kind{What is it?}
+    kind -->|initialize| legacy[Legacy session]
+    kind -->|server/discover| discover[Answer from the start-up loop]
+    discover --> first
+    kind -->|"complete modern request"| modern[Modern lifecycle, latch armed]
+    kind -->|notification| fail[ExpectedInitializeRequest: session ends]
+    kind -->|"ping"| pong["Answer {}"]
+    pong --> first

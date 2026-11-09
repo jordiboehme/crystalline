@@ -108,6 +108,7 @@ import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { preselect, substantive } from "./changes";
 import { BUTTON, Field } from "./primitives";
 import { useShareIdentity } from "./useShareIdentity";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -397,21 +398,21 @@ export default function ShareDialogBody({
     if (outcome === null) {
       return;
     }
-    void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
-    void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: SYNC_SUMMARY_KEY });
     // The plan too, which nothing refetches while this dialog is up - the
     // query above is switched off by the outcome - and which is exactly why
     // it is invalidated here: the next opening reads a fresh plan rather than
     // the one describing the share that just landed.
-    void queryClient.invalidateQueries({ queryKey: sharePlanKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: sharePlanKey(domain) });
     // A direct commit in a reviewing domain folds the caller's own drafts
     // into the branch on its way out, which moves files under every list on
     // the screen. The same pair a withdraw's revert invalidates, for the
     // same reason: this is the working tree moving, not a count.
     if (outcome.folded) {
-      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, { queryKey: domainTreeKey(domain) });
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(domain),
       });
     }
@@ -428,11 +429,11 @@ export default function ShareDialogBody({
     if (receipt === null) {
       return;
     }
-    void queryClient.invalidateQueries({ queryKey: sharePlanKey(domain) });
-    void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
-    void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
-    void queryClient.invalidateQueries({ queryKey: localChangesKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: sharePlanKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: SYNC_SUMMARY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: localChangesKey(domain) });
   }, [receipt, domain, queryClient]);
 
   const action = plan.data?.action ?? null;

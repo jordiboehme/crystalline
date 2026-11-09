@@ -30,6 +30,7 @@ import { Prec } from "@codemirror/state";
 import type { Command, EditorView } from "@codemirror/view";
 import { keymap } from "@codemirror/view";
 
+import { isMac } from "../../platform";
 import { stepVisible, viewAtoms } from "../marks/caret";
 import { roomUndo } from "../roomUndo";
 import { tableAddRowBelow } from "../tableVerbs";
@@ -305,10 +306,6 @@ export const cellKeymap: Extension = Prec.high(
   ]),
 );
 
-const mac =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-
 /**
  * A key that types one character: no Cmd chord and no Ctrl chord, except
  * Ctrl together with Alt, which counts as printable (R18): that is AltGr on
@@ -364,7 +361,15 @@ function navigate(
   const [row, column] = placeOf(el);
   const cell = cellIn(table, row, column);
   if (!cell) return false;
-  const mod = mac ? event.metaKey : event.ctrlKey;
+  const mod = isMac() ? event.metaKey : event.ctrlKey;
+  // Cmd+Up and Cmd+Down go to the column's first and last row, as in Numbers
+  // and Excel on a Mac (R111). Home and End stay the row's ends.
+  const columnEnd =
+    isMac() &&
+    event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.shiftKey;
   const last = table.rows.length - 1;
   // The main view never sees a key inside the grid (the widget ignores
   // events), so its undo keys are bound here too.
@@ -385,10 +390,12 @@ function navigate(
       focusAt(root, table, row, column + 1);
       return true;
     case "ArrowUp":
-      focusAt(root, table, row - 1, column);
+      if (columnEnd) focusAt(root, table, 0, column);
+      else focusAt(root, table, row - 1, column);
       return true;
     case "ArrowDown":
-      focusAt(root, table, row + 1, column);
+      if (columnEnd) focusAt(root, table, last, column);
+      else focusAt(root, table, row + 1, column);
       return true;
     case "Home":
       if (mod) focusAt(root, table, 0, 0);

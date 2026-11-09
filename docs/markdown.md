@@ -145,6 +145,8 @@ sequenceDiagram
 
 A `mermaid` fence draws a diagram in light, dark and print. Keep it small, about a dozen nodes, put a sentence before it that says what it shows, and quote a label that holds special characters: `A["Retry (3x)"]`. Do not set colours; the page does.
 
+In Fluid's editor a flowchart (`flowchart` or `graph`) is drawn and edited in the page. Click a box or an arrow to rename it. Right click it, or press Shift+F10 on it (Ctrl+Return on a Mac), for its menu: add a child or a sibling, connect it to another box, change its shape, colour, line or arrowhead, reverse an arrow or delete it. A right click on the empty drawing adds a box, changes its direction or deletes it. Tab moves onto the diagram, the arrow keys walk its boxes and arrows, Home and End (Cmd+Up Arrow and Cmd+Down Arrow on a Mac) go to the first and the last, Delete or Backspace deletes the one you are on (on a Mac Cmd+Delete too) and Escape goes back to the text. When the diagram ends the page, Enter on the drawing opens a line below it. A sequence diagram (`sequenceDiagram`) is edited the same way. Click a participant or a message to rename it. Its menu adds a participant or a message (Add message to... and then the participant it goes to), moves a message up or down, changes its line or arrowhead, removes the block around it, or deletes it; Alt+Up Arrow and Alt+Down Arrow (Option+Up Arrow and Option+Down Arrow on a Mac) move the message you are on, one step each, and the focus goes with it. A message passes a whole block and never goes into one, and at the first or last place in a block it moves out of it. Each change writes only the lines it means, and one undo takes it back. Other diagram types, and a diagram the editor cannot read, show their text with the drawing below it.
+
 On GitHub: renders as a diagram.
 
 ## Code blocks
@@ -161,7 +163,9 @@ On GitHub: GitHub builds its own outline from the headings.
 
 ## Writing it in Fluid
 
-The editor has one **Insert** menu with Callout (five kinds), Expand block, Status label, Diagram, Code block, Math and Footnote; Table and Task list have their own buttons. Type `/` at the start of an empty line to open every element at the caret, the table and the task list included, and filter it as you type. It does not open inside a quote or an HTML comment. Escape closes it, and so does a space right after the `/`; a query with no match closes it too. The `/` stays in the text.
+A flowchart is edited in the page, by its boxes and arrows, and a sequence diagram by its participants and messages, as **Diagrams** above says. The editor has one **Insert** menu with Callout (five kinds), Expand block, Status label, Diagram, Code block, Math and Footnote; Table and Task list have their own buttons. Type `/` at the start of an empty line to open every element at the caret, the table and the task list included, and filter it as you type. It does not open inside a quote or an HTML comment. Escape closes it, and so does a space right after the `/`; a query with no match closes it too. The `/` stays in the text.
+
+In a table the arrow keys move between cells. Home and End go to the start and the end of the row, and Ctrl+Home and Ctrl+End (Cmd+Home and Cmd+End on a Mac) to the first and the last cell. On a Mac, Cmd+Up Arrow and Cmd+Down Arrow go to the first and the last row of the column. Enter or F2 opens a cell, and Shift+F10 (Ctrl+Return on a Mac) opens Cell actions.
 
 While the caret is inside a callout, the toolbar offers the kind and "Starts open", "Starts closed" or "Does not fold". An expand block always folds, so it has no "Does not fold", and when it becomes another kind it keeps its `-` so it stays closed. Inside a status label it offers the six colours. Away from the active line, callouts, labels, swatches and math show as they do on the reading page.
 

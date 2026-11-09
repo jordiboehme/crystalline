@@ -69,6 +69,7 @@ import {
   RENAMING_REASON,
 } from "./DestructiveAction";
 import { BUTTON, FIELD } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The refusal face, the same one every other screen announces a problem in. */
 const ALERT_CLASSES =
@@ -205,30 +206,32 @@ export function DomainPoliciesCard({
       });
       // The editor's own copy carries a checksum this write moved, and the
       // status says which way a share goes - which `sharing` just decided.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: manifestDetailKey(domain),
       });
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
       if (key === "reflection") {
         // Switching the Reflection on or off moves the mode switch on the
         // page above and the Reflection listing every screen reads.
-        void queryClient.invalidateQueries({
+        void refreshAfterWrite(queryClient, {
           queryKey: reflectionStatusKey(domain),
         });
-        void queryClient.invalidateQueries({
+        void refreshAfterWrite(queryClient, {
           queryKey: REFLECTION_DOMAINS_KEY,
         });
       }
       if (key === "read_only") {
         // Every row's `read_only` and every write gate move with the chip,
         // which the manifest write above already moved.
-        void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+        void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
       }
       if (written.draft) {
         // A draft of the MANIFEST is a file in the caller's own overlay, so
         // the lists that draw the domain's files have moved.
-        void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
-        void queryClient.invalidateQueries({
+        void refreshAfterWrite(queryClient, {
+          queryKey: domainTreeKey(domain),
+        });
+        void refreshAfterWrite(queryClient, {
           queryKey: domainEngramsRoot(domain),
         });
       }

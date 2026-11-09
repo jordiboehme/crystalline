@@ -1,0 +1,25 @@
+sequenceDiagram
+  %% a remote ctl call, two spaces of indent as some people write
+  participant cli as crystalline CLI
+  participant rest as POST /api/v1/ctl
+  participant auth as resolve_bearer
+  participant allow as REMOTE_COMMANDS
+  participant ctl as Control handler
+  cli->>rest: command with a bearer token
+  rest->>auth: who is this
+  alt unknown token
+    auth-->>rest: nobody
+    rest-->>cli: 401
+  else known account
+    auth-->>rest: account
+    rest->>allow: is the command allowed
+    alt not on the list
+      allow-->>rest: no
+      rest-->>cli: 403
+    else on the list
+      allow-->>rest: yes
+      rest->>ctl: run
+      ctl-->>rest: output
+      rest-->>cli: 200 with the output
+    end
+  end

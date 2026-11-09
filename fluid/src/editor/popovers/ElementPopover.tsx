@@ -33,6 +33,7 @@ import type {
 } from "react";
 import { useEffect, useLayoutEffect, useRef } from "react";
 
+import { isMenuKey } from "../../platform";
 import type { ElementEdit, ElementRequest } from "../elementEdit";
 import {
   closeElementEdit,
@@ -281,6 +282,18 @@ function Open({
   });
 
   const menu = isMenu(edit);
+  /**
+   * The menu key that opened it opens nothing more and runs nothing inside it: on
+   * a Mac a second or held Ctrl+Return reaches the focused item as Enter (R111).
+   */
+  const onKeyDownCapture = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    // In a text field Shift+F10 and the menu key keep the field's own menu (paste).
+    const fieldMenu = takesText(event.target) && event.key !== "Enter";
+    if (isMenuKey(event.nativeEvent) && !fieldMenu) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
   const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.defaultPrevented) return;
     // In a filter field Home and End move its own caret.
@@ -335,6 +348,7 @@ function Open({
       role={menu ? "menu" : "dialog"}
       aria-label={nameOf(edit)}
       {...{ [POPOVER_MARK]: "" }}
+      onKeyDownCapture={onKeyDownCapture}
       onKeyDown={onKeyDown}
       onFocus={onFocus}
       onBlur={onBlur}

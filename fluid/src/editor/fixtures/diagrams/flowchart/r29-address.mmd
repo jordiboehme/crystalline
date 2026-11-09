@@ -1,0 +1,10 @@
+flowchart LR
+    %% resolving crystalline://domain/permalink
+    url["crystalline://jordi/projects/x"] --> split[Split scheme, domain, permalink]
+    split --> dom{Domain registered?}
+    dom -- no --> miss[Not found: name the bare permalink]
+    dom -- yes --> alias{Alias for an older permalink?}
+    alias -- yes --> follow[Follow alias.rs]
+    alias -- no --> lookup[Look up the permalink]
+    follow --> lookup
+    lookup --> engram[(Engram row)]

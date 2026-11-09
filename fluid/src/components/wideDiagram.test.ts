@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { unclampDiagram } from "./wideDiagram";
+import { naturalSize, unclampDiagram } from "./wideDiagram";
 
 function rootTag(markup: string): string {
   return /<svg[^>]*>/.exec(markup)?.[0] ?? "";
@@ -105,5 +105,22 @@ describe("unclampDiagram", () => {
     const svg = unclampDiagram(source);
     expect(svg).toContain(".node { max-width: 40px; }");
     expect(svg).toContain('<svg width="100%" viewBox="0 0 20 20">');
+  });
+});
+
+describe("naturalSize", () => {
+  it("reads the drawing's own width and height from the root's viewBox", () => {
+    expect(
+      naturalSize(
+        '<svg viewBox="-8 -8 228.5 400" width="100%" style="max-width: 228.5px;"><svg viewBox="0 0 24 24"/></svg>',
+      ),
+    ).toEqual({ width: 228.5, height: 400 });
+  });
+
+  it("is null without a viewBox or with one that does not read", () => {
+    expect(naturalSize('<svg width="300" height="200"><g/></svg>')).toBeNull();
+    expect(naturalSize('<svg viewBox="0 0 0 200"><g/></svg>')).toBeNull();
+    expect(naturalSize('<svg viewBox="0 0 300"><g/></svg>')).toBeNull();
+    expect(naturalSize("<p>no drawing</p>")).toBeNull();
   });
 });

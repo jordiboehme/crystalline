@@ -6,26 +6,25 @@
  * Solo, `isolateHistory` keeps CodeMirror's history from joining it to the
  * events around it. In a room the `Y.UndoManager` joins whatever lands in
  * its capture window, so its window is closed on both sides of the dispatch
- * (`roomUndo` hands the screen's manager in).
+ * (`roomUndo` hands the screen's manager in). `dispatchIsolated` does both.
  *
  * A composition still waiting to be judged is judged first (D60, P13): a
  * gesture comes from outside the editor's DOM, so the capture listeners
  * that judge one before a press never saw it.
  */
 
-import { isolateHistory } from "@codemirror/commands";
 import type { TransactionSpec } from "@codemirror/state";
-import { Annotation } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 
 import { judgeBeforeCommand } from "./marks/commandJudge";
-import { roomUndo } from "./roomUndo";
+import { dispatchIsolated } from "./roomUndo";
 
 /**
  * Dispatches `spec` as one undo step of its own, and says whether it did.
  * A caller reads the text after its own `judgeBeforeCommand` call; if the
  * judge here still changed the text, the spec's positions are stale and
- * nothing is dispatched (false).
+ * nothing is dispatched (false). Nothing is dispatched while an IME composes
+ * either (false).
  */
 export function dispatchGesture(
   view: EditorView,
@@ -36,15 +35,11 @@ export function dispatchGesture(
   if (view.state.doc !== before) {
     return false;
   }
-  const given = spec.annotations;
-  const annotations: readonly Annotation<unknown>[] =
-    given === undefined ? [] : given instanceof Annotation ? [given] : given;
-  const room = view.state.facet(roomUndo);
-  room?.stopCapturing();
-  view.dispatch({
-    ...spec,
-    annotations: [...annotations, isolateHistory.of("full")],
-  });
-  room?.stopCapturing();
+  // The judge stands back while an IME composes, and a write would end the
+  // composition's log unjudged: the person's Bold would be lost.
+  if (view.composing || view.compositionStarted) {
+    return false;
+  }
+  dispatchIsolated(view, spec);
   return true;
 }

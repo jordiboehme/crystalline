@@ -37,6 +37,7 @@ import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
 import type { ConflictDialogProps } from "./ConflictDialog";
 import { BUTTON } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The refusal face, the same one every other screen announces a problem in. */
 const ALERT_CLASSES =
@@ -90,12 +91,12 @@ export default function ConflictDialogBody({
       // everything drawn from what is in the domain: the engine re-syncs after
       // every resolve, so what is in it has moved even when this side of the
       // choice wrote nothing.
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: domainTreeKey(domain) });
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(domain),
       });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));

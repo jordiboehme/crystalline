@@ -1,0 +1,15 @@
+sequenceDiagram
+    %% boxes with a colour, a title and neither
+    box Aqua Local machine
+        participant bridge
+        actor person
+    end
+    box rgb(255, 240, 200) Server
+        participant daemon as The daemon
+    end
+    box Remote
+        participant github
+    end
+    person->>bridge: start
+    bridge->>daemon: relay
+    daemon->>github: fetch

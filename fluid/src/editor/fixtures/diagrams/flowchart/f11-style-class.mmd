@@ -1,0 +1,8 @@
+flowchart TD
+    %% style, classDef, class and the ::: shorthand
+    A[Draft] --> B[Review]
+    B --> C:::done
+    classDef hot fill:#fdd,stroke:#c33
+    classDef done fill:#dfd
+    class A,B hot
+    style C stroke-width:3px

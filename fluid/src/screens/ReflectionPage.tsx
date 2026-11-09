@@ -110,6 +110,7 @@ import {
   sectionTexts,
   stripProvenance,
 } from "../reflectionText";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** What a tick on a page that moved underneath says. */
 const PAGE_CHANGED = "The page changed. Try again.";
@@ -360,7 +361,7 @@ function PageBody({
       setTickProblem(null);
     },
     onSuccess: () =>
-      queryClient.invalidateQueries({
+      refreshAfterWrite(queryClient, {
         queryKey: reflectionDocKey(domain, path),
       }),
     onError: (error: Error) => {
@@ -725,7 +726,7 @@ function PageBody({
             onMove={curate ? onMoveFile : undefined}
             onRemoved={() => {
               invalidateReflection(queryClient, domain);
-              void queryClient.invalidateQueries({
+              void refreshAfterWrite(queryClient, {
                 queryKey: reflectionAssetsKey(domain),
               });
             }}

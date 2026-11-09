@@ -1,0 +1,31 @@
+sequenceDiagram
+    %% every block keyword, nested
+    participant A
+    participant B
+    loop every minute
+        A->>B: ping
+        alt healthy
+            B-->>A: pong
+        else slow
+            opt retry
+                A->>B: ping again
+            end
+        else
+            B--xA: gone
+        end
+    end
+    par first branch
+        A->>B: one
+    and second branch
+        A->>B: two
+        critical take the lock
+            B->>B: lock
+        option timed out
+            break no lock
+                B-->>A: busy
+            end
+        end
+    end
+    rect rgb(240, 240, 255)
+        A->>B: tinted
+    end

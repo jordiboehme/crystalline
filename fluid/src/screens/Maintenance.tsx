@@ -99,6 +99,7 @@ import {
 import type { ChipVariant } from "../components/primitives";
 import { plural, relativeTime } from "../format";
 import { engramRoute } from "../paths";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** Every domain, as the filter writes it. */
 const EVERY_DOMAIN = "";
@@ -179,7 +180,7 @@ export default function Maintenance() {
 
   /** What a write does afterwards: ask the queue again, both ways of asking. */
   const resweep = async () => {
-    await queryClient.invalidateQueries({ queryKey: EVOLVE_KEY_ROOT });
+    await refreshAfterWrite(queryClient, { queryKey: EVOLVE_KEY_ROOT });
   };
 
   // The answer on screen is the previous scope's while a new one is on its

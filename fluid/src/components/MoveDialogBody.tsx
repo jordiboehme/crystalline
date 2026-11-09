@@ -46,6 +46,7 @@ import {
   permalinkFolder,
 } from "../permalink";
 import type { MoveDialogProps, MovedState } from "./MoveDialog";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -102,24 +103,24 @@ export default function MoveDialogBody({
   /** Leave the dialog, refresh what the move changed and follow the engram. */
   const settle = (receipt: MoveReceipt): void => {
     onClose();
-    void queryClient.invalidateQueries({
+    void refreshAfterWrite(queryClient, {
       queryKey: engramDetailKey(engram.domain, engram.permalink),
     });
     // A move is the write that changes the shape of a domain, so the tree
     // the sidebar walks is read again rather than left pointing at where
     // the engram used to be. Both domains when it crossed one: the row left
     // one tree and arrived in the other.
-    void queryClient.invalidateQueries({
+    void refreshAfterWrite(queryClient, {
       queryKey: domainTreeKey(engram.domain),
     });
     if (receipt.domain !== engram.domain) {
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(receipt.domain),
       });
     }
     // A detail read cached under the NEW address could predate the move when
     // the move only renamed the permalink in place; read it fresh.
-    void queryClient.invalidateQueries({
+    void refreshAfterWrite(queryClient, {
       queryKey: engramDetailKey(receipt.domain, receipt.permalink),
     });
     const state: MovedState | undefined =

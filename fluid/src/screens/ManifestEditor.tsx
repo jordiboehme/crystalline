@@ -63,6 +63,7 @@ import { domainNameOf, withDomainName } from "../manifest/domainName";
 import { WHOLE_MANIFEST, engramsRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /**
  * The MANIFEST's stand-in permalink in the draft store. A domain's MANIFEST
@@ -350,8 +351,8 @@ function EditorSurface({
       setRenameProblem(null);
       // The plain read and the detail read are two cache entries over one
       // file: both are stale the moment this lands.
-      void queryClient.invalidateQueries({ queryKey: manifestKey(domain) });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, { queryKey: manifestKey(domain) });
+      void refreshAfterWrite(queryClient, {
         queryKey: manifestDetailKey(domain),
       });
       savedName.current = domainNameOf(saved.markdown) ?? domain;
@@ -520,6 +521,7 @@ function EditorSurface({
             <button
               type="button"
               onClick={closing.close}
+              data-leaves-editor=""
               className={BUTTON.primary}
             >
               Done

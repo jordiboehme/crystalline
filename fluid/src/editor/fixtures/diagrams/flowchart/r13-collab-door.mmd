@@ -1,0 +1,15 @@
+flowchart TD
+    %% ws::join decides who may open a room over whose document
+    join[ws::join] --> mine{Your own draft or the shared document?}
+    mine -->|yes| open[Open the room]
+    mine -->|no| link{Share link from the author?}
+    link -->|no| deny[Refuse]
+    link -->|yes| joined{Joined on that link?}
+    joined -->|yes| open
+    joined -->|no| deny
+    open --> cap{Room full?}
+    cap -->|16 connections| busy[Refuse: room is full]
+    cap -->|room left| enter([Enter])
+
+    style deny fill:#fdecea
+    style busy fill:#fdecea

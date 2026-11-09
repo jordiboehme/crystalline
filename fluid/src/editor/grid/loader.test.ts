@@ -3,10 +3,11 @@
  * shows up, once for every view, and what it brings survives the Raw flip.
  */
 
-import { Compartment, EditorState } from "@codemirror/state";
+import { forceParsing, syntaxTree } from "@codemirror/language";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../../test/parse";
 import { reflectionAdapter } from "../adapter";
@@ -44,6 +45,42 @@ const flush = async () => {
 };
 
 describe("tableGridWith", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("asks for the grid when a parse that was cut short reaches the table later", async () => {
+    // The first parse gets a few milliseconds of wall-clock time. On a busy
+    // machine it stops before the table, and the rest of the tree arrives in a
+    // transaction that changes neither the text nor the viewport.
+    const doc = `## Crew\n\n${"Words before the table.\n\n".repeat(40)}${TABLE}\n`;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      now += 50;
+      return now;
+    });
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const grid = tableGridWith(load);
+    const state = EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(0),
+      extensions: [...baseExtensions(false), grid.extension()],
+    });
+    vi.restoreAllMocks();
+    expect(syntaxTree(state).length).toBeLessThan(doc.indexOf("| a"));
+    const view = new EditorView({ state, parent: document.body });
+    await Promise.resolve();
+    expect(load).not.toHaveBeenCalled();
+    forceParsing(view, view.state.doc.length, 1000);
+    await vi.waitFor(() => {
+      expect(load).toHaveBeenCalledTimes(1);
+    });
+    await vi.waitFor(() => {
+      expect(view.contentDOM.getAttribute("data-grid")).toBe("on");
+    });
+    view.destroy();
+  });
+
   it("never calls the import for a state without a table", async () => {
     const load = vi.fn(() => Promise.resolve(chunk()));
     const grid = tableGridWith(load);

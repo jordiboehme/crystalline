@@ -1,0 +1,15 @@
+sequenceDiagram
+    %% + and - on the arrow, and activate lines
+    participant client
+    participant router
+    participant engine
+    client->>+router: call
+    router->>+engine: dispatch
+    engine-->>-router: result
+    activate router
+    router->>engine: log
+    deactivate router
+    router-->>-client: answer
+    activate engine
+    Note over engine: flush
+    deactivate engine

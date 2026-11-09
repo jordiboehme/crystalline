@@ -1,0 +1,15 @@
+sequenceDiagram
+    %% crystalline install on one machine
+    actor user as User
+    box rgb(235, 245, 255) This machine
+        participant cli as crystalline install
+        participant config as Harness config
+        participant receipt as Install receipt
+    end
+    user->>cli: run
+    loop each harness found
+        cli->>config: add the MCP registration
+        config-->>cli: written
+        cli->>receipt: note this harness
+    end
+    cli-->>user: restart your harness

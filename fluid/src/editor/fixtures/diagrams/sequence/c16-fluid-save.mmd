@@ -1,0 +1,17 @@
+sequenceDiagram
+    %% saving an engram from the Fluid editor; the edit never touches a %% comment
+    actor person as Person
+    participant editor as Editor
+    participant rest as REST API
+    participant engine as Engine
+    person->>editor: stops typing
+    editor->>editor: debounce
+    editor->>rest: PUT engram, if the revision is still 7
+    alt revision matches
+        rest->>engine: write
+        engine-->>rest: revision 8
+        rest-->>editor: 200
+    else someone else saved
+        rest-->>editor: 409 with their text
+        editor->>person: Show the two versions
+    end

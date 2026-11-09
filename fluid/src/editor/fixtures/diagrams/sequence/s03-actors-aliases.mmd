@@ -1,0 +1,10 @@
+sequenceDiagram
+    %% actors and participants, with and without an alias
+    actor person as Jordi
+    actor Reader
+    participant ui as Fluid editor
+    participant Daemon
+    person->>ui: types
+    Reader->>ui: reads
+    ui->>Daemon: save
+    Daemon-->>ui: saved

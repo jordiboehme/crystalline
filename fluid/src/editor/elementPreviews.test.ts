@@ -265,6 +265,28 @@ describe("math", () => {
     expect(v.dom.querySelector(".cm-math-block")).toBeNull();
   });
 
+  it("draws an unclosed math fence as text plus a formula, as the page does (D43)", async () => {
+    const doc = "Intro\n\n```math\na^2 + b^2";
+    const v = editor(doc, 0, { mode: "hidden" });
+    // The source stays, whatever the caret does, and the formula follows it.
+    expect(lineText(v, 3)).toBe("```math");
+    expect(lineText(v, 4)).toBe("a^2 + b^2");
+    expect(v.dom.querySelectorAll(".cm-math-block")).toHaveLength(1);
+    await waitFor(() => {
+      expect(
+        v.dom.querySelector(".cm-math-block .katex-display"),
+      ).not.toBeNull();
+    });
+    v.dispatch({ selection: EditorSelection.cursor(doc.indexOf("a^2")) });
+    expect(v.dom.querySelectorAll(".cm-math-block")).toHaveLength(1);
+    expect(v.state.doc.toString()).toBe(doc);
+  });
+
+  it("draws no formula for an unclosed math fence with nothing in it", () => {
+    const v = editor("Intro\n\n```math", 0, { mode: "hidden" });
+    expect(v.dom.querySelector(".cm-math-block")).toBeNull();
+  });
+
   it("leaves a single dollar pair alone", () => {
     const doc = "It costs $5 and $6 today\n\nEnd\n";
     const v = editor(doc, doc.length);

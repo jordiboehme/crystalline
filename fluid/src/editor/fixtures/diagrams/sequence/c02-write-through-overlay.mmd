@@ -1,0 +1,20 @@
+sequenceDiagram
+    %% a write in review mode lands in the overlay, not on disk
+    actor agent as Agent
+    participant mcp as MCP server
+    participant engine as Engine
+    participant overlay as Review overlay
+    participant disk as Domain folder
+    agent->>mcp: write_engram
+    mcp->>engine: write
+    alt the domain is in review mode
+        engine->>overlay: store the draft
+        overlay-->>engine: draft id
+        engine-->>mcp: awaiting review
+    else direct write
+        engine->>disk: emit the markdown file
+        disk-->>engine: written
+        engine-->>mcp: committed
+    end
+    mcp-->>agent: result
+    Note over overlay,disk: an approval moves the draft to disk later

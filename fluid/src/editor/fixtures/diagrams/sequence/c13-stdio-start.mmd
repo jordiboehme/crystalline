@@ -1,0 +1,20 @@
+sequenceDiagram
+    %% what the stdio bridge does when it starts
+    participant harness as Harness
+    participant bridge as Bridge
+    participant socket as Control socket
+    participant daemon as Daemon
+    harness->>bridge: start the process
+    bridge->>socket: connect
+    alt no daemon is running
+        socket--xbridge: refused
+        create participant fresh as New daemon
+        bridge->>fresh: spawn
+        fresh-->>bridge: ready
+    else a daemon answers
+        socket-->>bridge: connected
+    end
+    harness->>bridge: server/discover
+    bridge->>daemon: forward
+    daemon-->>bridge: instructions
+    bridge-->>harness: instructions

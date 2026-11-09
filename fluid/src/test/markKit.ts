@@ -6,7 +6,7 @@
  * `Y.UndoManager` in a room).
  */
 
-import { undo, undoDepth } from "@codemirror/commands";
+import { redo, undo, undoDepth } from "@codemirror/commands";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, runScopeHandlers } from "@codemirror/view";
@@ -175,6 +175,17 @@ export function remoteInsert(view: EditorView, at: number, text: string): void {
   }
   ytext.doc?.transact(() => {
     ytext.insert(at, text);
+  }, "peer");
+}
+
+/** A peer's delete in a room view built by `markView`, as `remoteInsert`'s. */
+export function roomDelete(view: EditorView, at: number, length: number): void {
+  const ytext = roomTexts.get(view);
+  if (!ytext) {
+    throw new Error("roomDelete takes a room view built by markView");
+  }
+  ytext.doc?.transact(() => {
+    ytext.delete(at, length);
   }, "peer");
 }
 
@@ -364,5 +375,15 @@ export function undoOnce(view: EditorView): void {
     manager.undo();
   } else {
     undo(view);
+  }
+}
+
+/** One redo step: CodeMirror's solo, the room's manager in a room. */
+export function redoOnce(view: EditorView): void {
+  const manager = undoManagers.get(view);
+  if (manager) {
+    manager.redo();
+  } else {
+    redo(view);
   }
 }

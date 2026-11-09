@@ -17,6 +17,7 @@ import {
 } from "../api/reflection";
 import { invalidateReflection } from "../api/reflectionDomains";
 import { BUTTON } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export function DiscloseDialog({
   domain,
@@ -37,7 +38,7 @@ export function DiscloseDialog({
   const share = useMutation({
     mutationFn: () => discloseReflectionSection(domain, path, section, basis),
     onSuccess: () => {
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: reflectionReviewKey(domain),
       });
       invalidateReflection(queryClient, domain);

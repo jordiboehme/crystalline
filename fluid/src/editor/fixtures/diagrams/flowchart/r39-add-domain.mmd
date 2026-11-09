@@ -1,0 +1,12 @@
+flowchart TD
+    %% add_domain
+    add[add_domain path] --> exists{Folder exists?}
+    exists -->|no| err[Refuse]
+    exists -->|yes| manifest{MANIFEST.md at the root?}
+    manifest -->|no| err
+    manifest -->|yes| keys[Read configuration keys]
+    keys --> registry{Every key in policy_registry?}
+    registry -->|no| warn[Report the unknown key]
+    registry -->|yes| register[Register the domain]
+    warn --> register
+    register --> first[First full sync]

@@ -1,0 +1,17 @@
+sequenceDiagram
+    %% crystalline connect from a user's view
+    actor user as User
+    participant cli as CLI
+    participant browser as Browser
+    participant server as Server
+    autonumber
+    user->>cli: crystalline connect https server
+    cli->>server: start the sign-in
+    server-->>cli: sign-in address
+    cli->>browser: open the address
+    user->>browser: sign in
+    browser->>server: credentials
+    server-->>browser: done page
+    server-->>cli: token
+    cli->>cli: keep it in the keychain
+    cli-->>user: connected

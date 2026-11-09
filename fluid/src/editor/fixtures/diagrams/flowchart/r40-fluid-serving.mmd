@@ -1,0 +1,14 @@
+flowchart LR
+    %% where a browser request goes
+    browser[Browser: Fluid] -->|static files| web[nginx or vite preview]
+    browser -->|"/api"| web
+    web -->|proxy| daemon[Daemon]
+    daemon --> rest[rest crate: JSON API]
+    daemon --> socket[Co-editing socket]
+    rest --> engine[Engine]
+    socket --> rooms[CollabSessions]
+    rooms --> engine
+    engine --> disk[(Domains on disk)]
+
+    linkStyle default stroke:#666
+    linkStyle 4 stroke:#7b1fa2,stroke-width:2px

@@ -6,16 +6,22 @@
  * missing element.
  */
 
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The platform is read once, when the modules load (`isMac`, as CodeMirror
+// reads it), so it is set before any import.
+vi.hoisted(() => {
+  Object.defineProperty(navigator, "platform", {
+    value: "MacIntel",
+    configurable: true,
+  });
+});
+
 import type { EditorView } from "@codemirror/view";
 import { cleanup, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { bytes, cleanupMarkViews, markView } from "../../test/markKit";
 import type { ElementEdit } from "../elementEdit";
-
-beforeEach(() => {
-  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-});
 
 afterEach(() => {
   cleanup();

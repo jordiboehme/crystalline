@@ -1,0 +1,19 @@
+sequenceDiagram
+    %% two people in one co-editing room
+    actor ana as Ana
+    actor ben as Ben
+    participant room as Room
+    participant engine as Engine
+    ana->>room: join with a session cookie
+    room-->>ana: full state
+    ben->>room: join
+    room-->>ben: full state
+    loop while typing
+        ana-)room: yjs update
+        room-)ben: yjs update
+    end
+    ben-)room: awareness
+    room-)ana: awareness
+    room->>+engine: save live text
+    engine->>engine: merge with the last saved state
+    engine-->>-room: saved

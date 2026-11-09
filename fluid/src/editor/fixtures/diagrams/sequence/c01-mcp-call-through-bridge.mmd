@@ -1,0 +1,15 @@
+sequenceDiagram
+    %% one MCP tool call from the harness to the engine and back
+    participant harness as AI harness
+    participant bridge as crystalline mcp bridge
+    participant daemon as Daemon
+    participant router as MCP router
+    participant engine as Engine
+    harness->>bridge: tools/call search_engrams
+    bridge->>daemon: forward the line
+    daemon->>+router: dispatch
+    router->>+engine: search
+    engine-->>-router: hits
+    router-->>-daemon: result
+    daemon-->>bridge: answer line
+    bridge-->>harness: result

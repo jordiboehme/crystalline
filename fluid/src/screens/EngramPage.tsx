@@ -135,6 +135,7 @@ import { engramFacts } from "../printSheet";
 import { tickAt } from "../taskTick";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver, innerOf, referenceState } from "../wikilinks";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** Where the neighborhood section writes down whether it was left open. */
 const GRAPH_SECTION_KEY = "fluid.section.graph";
@@ -495,12 +496,12 @@ export default function EngramPage() {
         receipt.cleared.some(
           (entry) => entry.path === changePath && entry.kind === "added",
         );
-      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: domainTreeKey(domain) });
       if (gone) {
         queryClient.removeQueries({
           queryKey: engramDetailKey(domain, permalink),
         });
-        void queryClient.invalidateQueries({
+        void refreshAfterWrite(queryClient, {
           queryKey: domainEngramsRoot(domain),
         });
         // The engram view, not the domain's address: that may open on the
@@ -511,7 +512,7 @@ export default function EngramPage() {
         });
         return;
       }
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: engramDetailKey(domain, permalink),
       });
     },

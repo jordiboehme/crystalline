@@ -35,6 +35,7 @@ import type { FoldChoice, PlannedActor, ReviewPlan } from "../api/review";
 import { enableReview, fetchReviewPlan, leaveReview } from "../api/review";
 import { useAuth } from "../auth/AuthContext";
 import { BUTTON } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** Why a control is disabled on an instance that serves reads only. */
 const READ_ONLY_REASON =
@@ -81,7 +82,7 @@ export function ReviewModeCard({
     setPlan(null);
     setChoices({});
     setProblem(null);
-    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+    void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
   }
 
   const enable = useMutation({

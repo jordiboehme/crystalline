@@ -1,0 +1,17 @@
+sequenceDiagram
+    %% entity forms and line breaks in every text
+    participant a as Alice #35;1
+    participant b as Bob#59; the second
+    a->>b: say #quot;hi#quot;
+    b-->>a: fish #38; chips
+    a->>b: first line<br>second line
+    b-->>a: one<br/>two
+    Note over a: a heart #9829; here
+    Note over b: 100%% of #lt;input#gt;
+    a->>b: wrap: long text that wraps
+    loop until #35;3
+        a->>b: again
+    end
+    alt fine #59; go
+        b-->>a: ok
+    end

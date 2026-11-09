@@ -1,0 +1,9 @@
+flowchart TD
+    %% a room is one document: domain, permalink and overlay owner
+    ws[Socket join from Fluid] --> key[RoomKey]
+    key --> d[domain]
+    key --> p[permalink]
+    key --> o{Domain reviews changes?}
+    o -- no --> shared[owner None: the folder's own document]
+    o -- yes --> draft[owner: the author whose draft it is]
+    shared & draft --> room[(Room: yrs Doc plus awareness)]

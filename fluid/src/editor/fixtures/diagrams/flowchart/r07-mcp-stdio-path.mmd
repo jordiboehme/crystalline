@@ -1,0 +1,11 @@
+flowchart LR
+    %% an MCP call from a harness over stdio
+    harness[Agent harness] -- stdin line --> bridge[crystalline mcp bridge]
+    bridge --> limit[BoundedLines: 16 MiB per line]
+    limit --> daemon[Daemon socket]
+    daemon --> router[MCP router]
+    router --> tool[Tool handler]
+    tool --> engine[Engine]
+    engine --> store[(Store)]
+    engine --> files[/Engram files/]
+    tool -. answer .-> harness

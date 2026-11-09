@@ -40,6 +40,7 @@ import { domainEngramsRoot } from "../api/engrams";
 import type { ImportArchiveDialogProps } from "./ImportArchiveDialog";
 import { BUTTON, Chip, FIELD } from "./primitives";
 import type { ChipVariant } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** What happens to an entry whose path or permalink is already taken. */
 type Policy = "skip" | "overwrite";
@@ -151,11 +152,11 @@ export default function ImportArchiveDialogBody({
       // middle one is the screen this dialog was opened from, so leaving it
       // out would put the reader back in front of the domain as it was before
       // the archive landed in it.
-      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, { queryKey: domainTreeKey(domain) });
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(domain),
       });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));
