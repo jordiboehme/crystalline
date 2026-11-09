@@ -2245,6 +2245,277 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/drafts/conflicts": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "List your own draft conflicts in a domain that reviews changes.",
+        "description": "Any signed-in account that may read the domain. Lists the caller's own drafts that do not fit the team's text, and the drafts an update merged team changes into. Never anybody else's. A domain that does not review changes lists nothing. Entirely local, so a read-only instance serves it.",
+        "operationId": "list_draft_conflicts",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Your conflicts and merged drafts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftConflictsResponse"
+                },
+                "example": {
+                  "conflicts": [
+                    {
+                      "draft": true,
+                      "file": false,
+                      "id": "d3f9a1c2",
+                      "kind": "EditEdit",
+                      "moved_from": null,
+                      "other": null,
+                      "path": "notes/plan.md"
+                    }
+                  ],
+                  "merged": []
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer, which holds no draft.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or one the caller may not see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Your conflicts cannot be read, so none are listed; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/drafts/conflicts/{id}": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "One of your draft conflicts, with every side.",
+        "description": "Any signed-in account that may read the domain, for its own conflict only. `base` is the text the draft started from, `local` the draft and `upstream` the team's text. A side with no text is null and `note` says why. Entirely local, so a read-only instance serves it.",
+        "operationId": "get_draft_conflict",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The conflict id from the list.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The conflict and its sides.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftConflictSides"
+                },
+                "example": {
+                  "base": "---\ntitle: Plan\n---\n\nthe shared start\n",
+                  "detected_at": null,
+                  "draft": true,
+                  "id": "d3f9a1c2",
+                  "kind": "EditEdit",
+                  "local": "---\ntitle: Plan\n---\n\nmy version\n",
+                  "moved_from": null,
+                  "note": null,
+                  "other": null,
+                  "path": "notes/plan.md",
+                  "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Your conflicts cannot be read; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Settle one of your draft conflicts.",
+        "description": "Any account that may write the domain, for its own conflict only. Keep your draft (`mine`), take the team's text and end the draft (`theirs`), or write `merged` content into the draft. A file is never merged. Entirely local, but it writes, so a read-only instance refuses it.",
+        "operationId": "resolve_draft_conflict",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The conflict id from the list.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Where the resolution landed and how many of your conflicts are left.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftResolveReceipt"
+                },
+                "example": {
+                  "draft": true,
+                  "kept": "mine",
+                  "kept_copy": false,
+                  "remaining": 0,
+                  "resolved": "notes/plan.md"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived (except for `theirs`), or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An unknown `resolution`, `merged` with no `content`, a merge of a file, or a resolution the draft refuses; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/engrams": {
       "get": {
         "tags": [
@@ -7946,7 +8217,7 @@
           "domains"
         ],
         "summary": "Resolve one recorded conflict by id.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. A conflict the pull recorded in the folder only: a draft's conflict is settled through `resolve_draft_conflict`. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
         "operationId": "resolve_domain_conflict",
         "parameters": [
           {
@@ -13194,6 +13465,237 @@
           "reflection": {
             "$ref": "#/components/schemas/ReflectionLevel",
             "description": "The Reflection level on this domain."
+          }
+        }
+      },
+      "DraftConflictEntry": {
+        "type": "object",
+        "description": "One of your drafts that does not fit the team's text.",
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "draft",
+          "file"
+        ],
+        "properties": {
+          "draft": {
+            "type": "boolean",
+            "description": "Always true: the entry is a draft's, never the folder's."
+          },
+          "file": {
+            "type": "boolean",
+            "description": "A file beside the pages rather than a page."
+          },
+          "id": {
+            "type": "string",
+            "description": "`d` and seven hex digits, stable while the draft stands.",
+            "example": "d3f9a1c2"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DraftConflictKind"
+          },
+          "moved_from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The path a moved draft left."
+          },
+          "other": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `AddressTaken`: the team's path that holds the address."
+          },
+          "path": {
+            "type": "string",
+            "description": "The draft's path, or the deletion's when it stands alone.",
+            "example": "notes/plan.md"
+          }
+        }
+      },
+      "DraftConflictKind": {
+        "type": "string",
+        "description": "Why a draft does not fit the team's text: `EditEdit` both changed the same lines, `EditDelete` the team deleted a page you drafted, `DeleteEdit` you deleted a page the team changed, `AddAdd` the team has a file where you did not start from one, `UnknownStart` a draft from before 0.32.0 with no record of its start, `AddressTaken` another team page holds your draft's address.",
+        "enum": [
+          "EditEdit",
+          "EditDelete",
+          "DeleteEdit",
+          "AddAdd",
+          "UnknownStart",
+          "AddressTaken"
+        ]
+      },
+      "DraftConflictSides": {
+        "type": "object",
+        "description": "One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.",
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "draft"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detected_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Always null: a draft conflict is read from what stands, never stored."
+          },
+          "draft": {
+            "type": "boolean",
+            "description": "Always true."
+          },
+          "file": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and true, only for a file."
+          },
+          "id": {
+            "type": "string",
+            "example": "d3f9a1c2"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DraftConflictKind"
+          },
+          "local": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moved_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "other": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string",
+            "example": "notes/plan.md"
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DraftConflictsResponse": {
+        "type": "object",
+        "description": "Your own draft conflicts in this domain, and the drafts an update merged team changes into since they last settled.",
+        "required": [
+          "conflicts",
+          "merged"
+        ],
+        "properties": {
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DraftConflictEntry"
+            },
+            "description": "Ordered by path."
+          },
+          "merged": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths of your drafts a merge changed, sorted.",
+            "example": [
+              "notes/plan.md"
+            ]
+          }
+        }
+      },
+      "DraftResolveReceipt": {
+        "type": "object",
+        "description": "Where the resolution landed: in your draft.",
+        "required": [
+          "resolved",
+          "draft",
+          "kept",
+          "kept_copy"
+        ],
+        "properties": {
+          "draft": {
+            "type": "boolean",
+            "description": "Always true."
+          },
+          "draft_warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when the draft landed but its copy on this server's disk did\nnot."
+          },
+          "file": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and true, only for a file."
+          },
+          "kept": {
+            "type": "string",
+            "description": "`mine`, `theirs` or `merged`.",
+            "example": "mine"
+          },
+          "kept_copy": {
+            "type": "boolean",
+            "description": "Whether a copy of your text or file was kept before taking the\nteam's."
+          },
+          "kept_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Always null over this API: a place on the server's disk is named only\nto the machine owner."
+          },
+          "kept_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a file that was kept: where to find it."
+          },
+          "remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many of your conflicts in this domain are left, or null when they\ncould not be counted.",
+            "minimum": 0
+          },
+          "resolved": {
+            "type": "string",
+            "description": "The draft's path. A move is settled whole, at its draft.",
+            "example": "notes/plan.md"
           }
         }
       },

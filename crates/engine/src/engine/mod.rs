@@ -5833,8 +5833,10 @@ impl Engine {
     /// a fold of it began and did not finish
     /// ([`crate::overlay_journal::fold_unfinished`]). The pass and resolve ask
     /// this, so a fold that stopped part way still has a way to settle each
-    /// draft before it is repeated.
-    pub(crate) fn drafts_stay_open(&self, name: &str) -> bool {
+    /// draft before it is repeated. The draft conflict routes ask it too, and
+    /// list nothing where it is false.
+    #[doc(hidden)]
+    pub fn drafts_stay_open(&self, name: &str) -> bool {
         self.reviews_changes(name)
             || self
                 .journal_state_dir()

@@ -11,5 +11,6 @@ mod support;
 
 mod github_app;
 mod rest_admin_api;
+mod rest_draft_conflicts;
 mod rest_draft_links;
 mod rest_write_api;

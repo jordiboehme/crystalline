@@ -386,6 +386,118 @@ pub struct ReflectionChanged {
     pub actor: Option<String>,
 }
 
+/// The kind of a draft conflict: a copy of the engine's `DraftConflictKind`,
+/// which carries no `utoipa`. The draft conflict routes answer the engine's
+/// JSON as it is; these copies only describe it.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Why a draft does not fit the team's text: `EditEdit` \
+                        both changed the same lines, `EditDelete` the team \
+                        deleted a page you drafted, `DeleteEdit` you deleted a \
+                        page the team changed, `AddAdd` the team has a file \
+                        where you did not start from one, `UnknownStart` a \
+                        draft from before 0.32.0 with no record of its start, \
+                        `AddressTaken` another team page holds your draft's \
+                        address.")]
+pub enum DraftConflictKind {
+    EditEdit,
+    EditDelete,
+    DeleteEdit,
+    AddAdd,
+    UnknownStart,
+    AddressTaken,
+}
+
+/// One of the caller's draft conflicts, as `GET .../drafts/conflicts` lists it.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "One of your drafts that does not fit the team's text.")]
+pub struct DraftConflictEntry {
+    /// `d` and seven hex digits, stable while the draft stands.
+    #[schema(example = "d3f9a1c2")]
+    pub id: String,
+    /// The draft's path, or the deletion's when it stands alone.
+    #[schema(example = "notes/plan.md")]
+    pub path: String,
+    pub kind: DraftConflictKind,
+    /// Always true: the entry is a draft's, never the folder's.
+    pub draft: bool,
+    /// The path a moved draft left.
+    pub moved_from: Option<String>,
+    /// A file beside the pages rather than a page.
+    pub file: bool,
+    /// For `AddressTaken`: the team's path that holds the address.
+    pub other: Option<String>,
+}
+
+/// What `GET /domains/{domain}/drafts/conflicts` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Your own draft conflicts in this domain, and the \
+                        drafts an update merged team changes into since they \
+                        last settled.")]
+pub struct DraftConflictsResponse {
+    /// Ordered by path.
+    pub conflicts: Vec<DraftConflictEntry>,
+    /// Paths of your drafts a merge changed, sorted.
+    #[schema(example = json!(["notes/plan.md"]))]
+    pub merged: Vec<String>,
+}
+
+/// What `GET /domains/{domain}/drafts/conflicts/{id}` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "One of your draft conflicts with its three sides: \
+                        `base` is the text your draft started from, `local` \
+                        your draft and `upstream` the team's text. A side \
+                        with no text is null and `note` says why. A file has \
+                        no text sides, and carries `file: true`.")]
+pub struct DraftConflictSides {
+    #[schema(example = "d3f9a1c2")]
+    pub id: String,
+    #[schema(example = "notes/plan.md")]
+    pub path: String,
+    pub kind: DraftConflictKind,
+    /// Always true.
+    pub draft: bool,
+    /// Always null: a draft conflict is read from what stands, never stored.
+    pub detected_at: Option<String>,
+    pub base: Option<String>,
+    pub local: Option<String>,
+    pub upstream: Option<String>,
+    pub moved_from: Option<String>,
+    pub other: Option<String>,
+    pub note: Option<String>,
+    /// Present, and true, only for a file.
+    pub file: Option<bool>,
+}
+
+/// What `POST /domains/{domain}/drafts/conflicts/{id}/resolve` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Where the resolution landed: in your draft.")]
+pub struct DraftResolveReceipt {
+    /// The draft's path. A move is settled whole, at its draft.
+    #[schema(example = "notes/plan.md")]
+    pub resolved: String,
+    /// How many of your conflicts in this domain are left, or null when they
+    /// could not be counted.
+    pub remaining: Option<u64>,
+    /// Always true.
+    pub draft: bool,
+    /// Present, and true, only for a file.
+    pub file: Option<bool>,
+    /// `mine`, `theirs` or `merged`.
+    #[schema(example = "mine")]
+    pub kept: String,
+    /// Whether a copy of your text or file was kept before taking the
+    /// team's.
+    pub kept_copy: bool,
+    /// For a file that was kept: where to find it.
+    pub kept_note: Option<String>,
+    /// Always null over this API: a place on the server's disk is named only
+    /// to the machine owner.
+    pub kept_file: Option<String>,
+    /// Present when the draft landed but its copy on this server's disk did
+    /// not.
+    pub draft_warning: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -543,6 +655,30 @@ mod tests {
             }]),
             published::<super::ClosedDomain>()
         );
+        use crystalline_engine::engine::{DraftConflict, DraftConflictKind as Kind};
+        assert_eq!(
+            keys([
+                Kind::EditEdit,
+                Kind::EditDelete,
+                Kind::DeleteEdit,
+                Kind::AddAdd,
+                Kind::UnknownStart,
+                Kind::AddressTaken
+            ]),
+            published::<super::DraftConflictKind>()
+        );
+        // The list adds `draft` to each conflict, as the status does.
+        let mut listed = keys([DraftConflict {
+            id: s(),
+            path: s(),
+            kind: Kind::EditEdit,
+            moved_from: None,
+            file: false,
+            other: None,
+        }]);
+        listed.push("draft".to_string());
+        listed.sort();
+        assert_eq!(listed, published::<super::DraftConflictEntry>());
         use crystalline_engine::changes as bus;
         assert_eq!(
             keys([

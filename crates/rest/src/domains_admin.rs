@@ -2247,7 +2247,10 @@ pub struct ResolveBody {
 /// naming a conflict at the CLI has. A browser has the id the status listed,
 /// which is the stabler handle: this route looks the path up through
 /// [`crate::engine::Engine::origin_conflict_detail`] first, so a resolve can
-/// never land on some other conflict that happens to share a path.
+/// never land on some other conflict that happens to share a path. It settles
+/// the folder's conflict only, through
+/// [`crate::engine::Engine::origin_resolve_folder`]: a draft of the caller's
+/// at that path is settled on [`resolve_draft_conflict`], by its own id.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/sync/conflicts/{id}/resolve",
@@ -2259,7 +2262,9 @@ pub struct ResolveBody {
                    `personal`, the default with a GitHub App). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
-                   re-indexes the domain. Entirely local - no GitHub \
+                   re-indexes the domain. A conflict the pull recorded in \
+                   the folder only: a draft's conflict is settled through \
+                   `resolve_draft_conflict`. Entirely local - no GitHub \
                    connection is needed - but it writes, so a read-only \
                    instance refuses it.",
     params(
@@ -2349,27 +2354,13 @@ pub async fn resolve_conflict(
         .as_str()
         .ok_or_else(|| ApiError::not_found(format!("no open conflict {id}")))?
         .to_string();
-    let (keep, content): (Option<&str>, Option<Vec<u8>>) = match body.resolution.as_str() {
-        "mine" => (Some("mine"), None),
-        "theirs" => (Some("theirs"), None),
-        "merged" => match &body.content {
-            Some(text) => (None, Some(text.clone().into_bytes())),
-            None => {
-                return Err(ApiError::unprocessable(
-                    "resolution merged requires content",
-                ));
-            }
-        },
-        other => {
-            return Err(ApiError::unprocessable(format!(
-                "resolution must be mine, theirs or merged, got '{other}'"
-            )));
-        }
-    };
+    let (keep, content) = resolution_of(&body)?;
+    // The folder's conflict and nothing else: a draft of the caller's at the
+    // same path is settled on the draft routes, by its own id.
     Ok(Json(
         state
             .engine
-            .origin_resolve(
+            .origin_resolve_folder(
                 &domain,
                 &path,
                 keep,
@@ -2378,6 +2369,312 @@ pub async fn resolve_conflict(
             )
             .await?,
     ))
+}
+
+/// An engine error on a draft conflict route, as the caller is told it. A
+/// failure to read or write is logged with its cause and answered in one
+/// sentence that names no place on this server's disk; every other refusal
+/// is answered as the engine words it.
+fn draft_conflict_error(domain: &str, e: EngineError) -> ApiError {
+    match e {
+        EngineError::Io { .. } | EngineError::Internal(_) => {
+            tracing::warn!(domain, "a draft conflict route failed: {e}");
+            ApiError::internal(
+                "Your conflicts in this domain could not be read or settled here. Try again, \
+                 and if it stays, ask whoever runs this server.",
+            )
+        }
+        e => e.into(),
+    }
+}
+
+/// `GET /domains/{domain}/drafts/conflicts` - the caller's own draft conflicts.
+///
+/// Any account that may read the domain: a draft is its author's, so nobody
+/// needs the share role to see their own. Never pulls, so it is served on a
+/// read-only instance and with no connection. A domain whose drafts do not
+/// stay open lists nothing here, whatever rows are left.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/drafts/conflicts",
+    tag = "domains",
+    operation_id = "list_draft_conflicts",
+    summary = "List your own draft conflicts in a domain that reviews changes.",
+    description = "Any signed-in account that may read the domain. Lists \
+                   the caller's own drafts that do not fit the team's text, \
+                   and the drafts an update merged team changes into. Never \
+                   anybody else's. A domain that does not review changes \
+                   lists nothing. Entirely local, so a read-only instance \
+                   serves it.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    responses(
+        (
+            status = 200,
+            description = "Your conflicts and merged drafts.",
+            body = super::schemas::DraftConflictsResponse,
+            example = json!({
+                "conflicts": [{
+                    "id": "d3f9a1c2",
+                    "path": "notes/plan.md",
+                    "kind": "EditEdit",
+                    "draft": true,
+                    "moved_from": null,
+                    "file": false,
+                    "other": null
+                }],
+                "merged": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer, which holds no draft.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or one the caller may not see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "Your conflicts cannot be read, so none are listed; \
+                           the detail says why and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn list_draft_conflicts(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    if !state.engine.drafts_stay_open(&domain) {
+        return Ok(Json(serde_json::json!({ "conflicts": [], "merged": [] })));
+    }
+    Ok(Json(
+        state
+            .engine
+            .own_draft_conflicts(&domain, user.name.as_str())
+            .await
+            .map_err(|e| draft_conflict_error(&domain, e))?,
+    ))
+}
+
+/// `GET /domains/{domain}/drafts/conflicts/{id}` - one of the caller's own
+/// draft conflicts with its three sides.
+///
+/// Gated as the list beside it. An id that is not the caller's is not found,
+/// in the words an id nobody holds is, so it says nothing about somebody
+/// else's draft.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/drafts/conflicts/{id}",
+    tag = "domains",
+    operation_id = "get_draft_conflict",
+    summary = "One of your draft conflicts, with every side.",
+    description = "Any signed-in account that may read the domain, for its \
+                   own conflict only. `base` is the text the draft started \
+                   from, `local` the draft and `upstream` the team's text. \
+                   A side with no text is null and `note` says why. \
+                   Entirely local, so a read-only instance serves it.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("id" = String, Path, description = "The conflict id from the list."),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The conflict and its sides.",
+            body = super::schemas::DraftConflictSides,
+            example = json!({
+                "id": "d3f9a1c2",
+                "path": "notes/plan.md",
+                "kind": "EditEdit",
+                "draft": true,
+                "detected_at": null,
+                "base": "---\ntitle: Plan\n---\n\nthe shared start\n",
+                "local": "---\ntitle: Plan\n---\n\nmy version\n",
+                "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n",
+                "moved_from": null,
+                "other": null,
+                "note": null
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, one the caller may not see, a \
+                           domain that does not review changes, or no \
+                           conflict with that id among the caller's drafts.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "Your conflicts cannot be read; the detail says why \
+                           and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_draft_conflict(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    if !state.engine.drafts_stay_open(&domain) {
+        return Err(ApiError::not_found(format!(
+            "no conflict {id} among your drafts in '{domain}'"
+        )));
+    }
+    Ok(Json(
+        state
+            .engine
+            .draft_conflict_sides(&domain, user.name.as_str(), &id)
+            .await
+            .map_err(|e| draft_conflict_error(&domain, e))?,
+    ))
+}
+
+/// `POST /domains/{domain}/drafts/conflicts/{id}/resolve` - settle one of the
+/// caller's own draft conflicts.
+///
+/// Gated as every write: the domain write right, a refusal on a read-only
+/// instance, the CSRF token the router asks of every write, and on an
+/// archived repository a refusal for anything but taking the team's text.
+/// The share role is not asked: settling a draft writes only the author's
+/// draft. The id is looked up among the caller's own conflicts by the engine
+/// under the origin lock, so somebody else's id, or the folder's, is not
+/// found.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve",
+    tag = "domains",
+    operation_id = "resolve_draft_conflict",
+    summary = "Settle one of your draft conflicts.",
+    description = "Any account that may write the domain, for its own \
+                   conflict only. Keep your draft (`mine`), take the team's \
+                   text and end the draft (`theirs`), or write `merged` \
+                   content into the draft. A file is never merged. Entirely \
+                   local, but it writes, so a read-only instance refuses it.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("id" = String, Path, description = "The conflict id from the list."),
+    ),
+    request_body = ResolveBody,
+    responses(
+        (
+            status = 200,
+            description = "Where the resolution landed and how many of your \
+                           conflicts are left.",
+            body = super::schemas::DraftResolveReceipt,
+            example = json!({
+                "resolved": "notes/plan.md",
+                "remaining": 0,
+                "draft": true,
+                "kept": "mine",
+                "kept_copy": false
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may not write this domain, the request \
+                           did not echo its CSRF token, this instance is \
+                           read-only, the domain's repository is archived \
+                           (except for `theirs`), or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, one the caller may not see, a \
+                           domain that does not review changes, or no \
+                           conflict with that id among the caller's drafts.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An unknown `resolution`, `merged` with no \
+                           `content`, a merge of a file, or a resolution the \
+                           draft refuses; the detail says why and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn resolve_draft_conflict(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<ResolveBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_write(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    refuse_read_only(&state)?;
+    // Taking the team's text is what a pull does, and a pull still applies on
+    // an archived domain, as on the share surface.
+    if body.resolution != "theirs" {
+        refuse_archived_share(&state, &identity, &domain).await?;
+    }
+    let (keep, content) = resolution_of(&body)?;
+    Ok(Json(
+        state
+            .engine
+            .resolve_own_draft_conflict(
+                &domain,
+                &id,
+                keep,
+                content.as_deref(),
+                ShareActor::Account(user.name.clone()),
+            )
+            .await
+            .map_err(|e| draft_conflict_error(&domain, e))?,
+    ))
+}
+
+/// A [`ResolveBody`] as the engine's resolve verbs take it: `keep` for
+/// `mine` or `theirs`, `content` for `merged`.
+fn resolution_of(body: &ResolveBody) -> Result<(Option<&'static str>, Option<Vec<u8>>), ApiError> {
+    match body.resolution.as_str() {
+        "mine" => Ok((Some("mine"), None)),
+        "theirs" => Ok((Some("theirs"), None)),
+        "merged" => match &body.content {
+            Some(text) => Ok((None, Some(text.clone().into_bytes()))),
+            None => Err(ApiError::unprocessable(
+                "resolution merged requires content",
+            )),
+        },
+        other => Err(ApiError::unprocessable(format!(
+            "resolution must be mine, theirs or merged, got '{other}'"
+        ))),
+    }
 }
 
 /// `GET /domains/{domain}/changes` - every unshared change, offline.

@@ -1725,6 +1725,20 @@ impl Engine {
         }
     }
 
+    /// `actor`'s own conflicts and merged drafts in `domain`, for a surface
+    /// that lists them alone: `{ conflicts, merged }`, each conflict in the
+    /// shape `origin_status` lists it. A list that cannot be read is an error
+    /// carrying the sentence `origin_status` gives it, never an empty list (C1),
+    /// and that sentence names no place on this server's disk to anybody but
+    /// the machine owner.
+    pub async fn own_draft_conflicts(&self, domain: &str, actor: &str) -> Result<Value> {
+        let own = self.own_drafts(domain, Some(actor), false).await;
+        if let Some(reason) = own.unreadable {
+            return Err(EngineError::Conflict(reason));
+        }
+        Ok(json!({ "conflicts": own.conflicts, "merged": own.merged }))
+    }
+
     /// Reports one domain's status, under its origin lock. The per-domain
     /// body behind `origin_status`'s aggregate loop.
     ///
@@ -4346,10 +4360,64 @@ impl Engine {
         content: Option<&[u8]>,
         actor: ShareActor,
     ) -> Result<Value> {
+        self.resolve_reaching(domain, Reach::Path(path), keep, content, actor)
+            .await
+    }
+
+    /// [`Engine::origin_resolve`] for the folder's own conflict at `path` and
+    /// nothing else: a draft of the caller's at that path is left as it is.
+    /// The share surface resolves a conflict the pull recorded by its id, and
+    /// that id names the folder's conflict, never a draft that shares its path.
+    pub async fn origin_resolve_folder(
+        &self,
+        domain: &str,
+        path: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.resolve_reaching(domain, Reach::Folder(path), keep, content, actor)
+            .await
+    }
+
+    /// Settles the caller's own draft conflict with this `id`, as listed by
+    /// [`Engine::draft_conflicts`], and nothing else. The id is looked up among
+    /// the caller's conflicts under the origin lock, so a draft that ended in
+    /// the meantime is not found rather than settled as the folder's conflict
+    /// at its path. An id that is not the caller's, or a domain whose drafts do
+    /// not stay open, is not found.
+    pub async fn resolve_own_draft_conflict(
+        &self,
+        domain: &str,
+        id: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.resolve_reaching(domain, Reach::OwnDraft(id), keep, content, actor)
+            .await
+    }
+
+    /// The body of the three resolve verbs. See [`Reach`] for what each may
+    /// settle.
+    async fn resolve_reaching(
+        &self,
+        domain: &str,
+        reach: Reach<'_>,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        let drafts_open = self.drafts_stay_open(domain);
+        if let Reach::OwnDraft(id) = reach
+            && !drafts_open
+        {
+            return Err(not_among_drafts(domain, id));
+        }
         // A draft settles with collaboration off, so only a domain that takes
         // changes directly is refused here. Its folder conflict is refused
         // again below, for a reviewing domain too.
-        if !self.config.read().unwrap().github_enabled() && !self.drafts_stay_open(domain) {
+        if !self.config.read().unwrap().github_enabled() && !drafts_open {
             return Err(RemoteError::NotEnabled.into());
         }
         if self.read_only {
@@ -4361,10 +4429,19 @@ impl Engine {
             self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
                 .await?;
         }
+        let (path, folder_only) = match reach {
+            Reach::OwnDraft(id) => {
+                return self
+                    .resolve_own_draft(domain, id, keep, content, actor)
+                    .await;
+            }
+            Reach::Path(path) => (path, false),
+            Reach::Folder(path) => (path, true),
+        };
         // A draft file is settled here as a page is, from its own record. It
         // is never merged. Under the origin lock, as a page is, so a resolve
         // waits out a fold's locked window.
-        if is_assets_reserved(path) && self.drafts_stay_open(domain) {
+        if is_assets_reserved(path) && drafts_open && !folder_only {
             let who = share_staging::overlay_share_actor(&actor)?;
             let resolution = origin::resolution_from(keep, content)?;
             let lock = self.origin_lock_registered(domain)?;
@@ -4396,28 +4473,14 @@ impl Engine {
         // asked about the same one or a missing suffix would turn a resolution
         // into a refusal.
         let path = &normalize_md(path);
-        // Keeping your own MANIFEST text or a merge may switch read_only on,
-        // which is the owner's (decision D10). The machine owner may; this
-        // verb carries no scope for anybody else, so for them an off-to-on
-        // result is refused and the owner switches it in the domain policies
-        // once the conflict is settled. Taking the team's side is a pull and
-        // is never checked.
-        if is_manifest_path(path) && keep != Some("theirs") && !matches!(&actor, ShareActor::Owner)
-        {
-            let after = match content {
-                Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-                None => std::fs::read_to_string(root.join(path)).unwrap_or_default(),
-            };
-            if self.switches_read_only_on(domain, &after).await {
-                return Err(EngineError::Forbidden(
-                    "resolving a conflict does not switch read_only on; the owner switches it in the domain policies"
-                        .to_string(),
-                ));
-            }
-        }
+        self.refuse_resolve_switching_read_only(domain, &root, path, keep, content, &actor)
+            .await?;
         // A fold that stopped part way leaves the drafts settling as in review
-        // mode, so the fold can be repeated once each one is settled.
-        let drafting = match self.drafts_stay_open(domain) {
+        // mode, so the fold can be repeated once each one is settled. The
+        // folder's own conflict is settled on the folder, whoever drafts there.
+        // Read again under the lock, as before: a fold may have finished, or
+        // review mode changed, while this resolve waited for it.
+        let drafting = match self.drafts_stay_open(domain) && !folder_only {
             true => Some(share_staging::overlay_share_actor(&actor)?),
             false => None,
         };
@@ -4473,6 +4536,89 @@ impl Engine {
             "resolved": report.resolved,
             "remaining": report.remaining,
         }))
+    }
+
+    /// [`Engine::resolve_own_draft_conflict`] past the gates every resolve
+    /// shares: under the origin lock, the id is looked up among the caller's
+    /// own conflicts and its draft is settled, a page or a file. Nothing here
+    /// falls back to the folder's conflict at the same path.
+    async fn resolve_own_draft(
+        &self,
+        domain: &str,
+        id: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        let who = share_staging::overlay_share_actor(&actor)?;
+        let resolution = origin::resolution_from(keep, content)?;
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        let conflict = self
+            .draft_conflicts(domain, &who)
+            .await?
+            .into_iter()
+            .find(|conflict| conflict.id == id)
+            .ok_or_else(|| not_among_drafts(domain, id))?;
+        if conflict.file {
+            return self
+                .resolve_file_in_overlay(domain, &who, &conflict.path, resolution)
+                .await;
+        }
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        self.refuse_resolve_switching_read_only(
+            domain,
+            &root,
+            &conflict.path,
+            keep,
+            content,
+            &actor,
+        )
+        .await?;
+        let domain_id = {
+            let store = self.store.lock().await;
+            store.domain_id(domain).await?
+        }
+        .ok_or_else(|| not_among_drafts(domain, id))?;
+        self.resolve_in_overlay(
+            domain,
+            domain_id,
+            &who,
+            &conflict.path,
+            resolution,
+            &state_dir,
+        )
+        .await
+    }
+
+    /// Keeping your own MANIFEST text or a merge may switch read_only on,
+    /// which is the owner's (decision D10). The machine owner may; a resolve
+    /// carries no scope for anybody else, so for them an off-to-on result is
+    /// refused and the owner switches it in the domain policies once the
+    /// conflict is settled. Taking the team's side is a pull and is never
+    /// checked.
+    async fn refuse_resolve_switching_read_only(
+        &self,
+        domain: &str,
+        root: &Path,
+        path: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        actor: &ShareActor,
+    ) -> Result<()> {
+        if is_manifest_path(path) && keep != Some("theirs") && !matches!(actor, ShareActor::Owner) {
+            let after = match content {
+                Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                None => std::fs::read_to_string(root.join(path)).unwrap_or_default(),
+            };
+            if self.switches_read_only_on(domain, &after).await {
+                return Err(EngineError::Forbidden(
+                    "resolving a conflict does not switch read_only on; the owner switches it in the domain policies"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Settles one actor's draft file beside the pages. A file never merges.
@@ -6119,6 +6265,27 @@ impl Engine {
             }
         }
     }
+}
+
+/// Which conflict a resolve may settle. The share surface and the draft
+/// surface each name exactly one kind, so neither can settle the other's: a
+/// folder conflict needs the share role, a draft only its author.
+#[derive(Clone, Copy)]
+enum Reach<'a> {
+    /// The caller's draft at this path when there is one, else the folder's
+    /// conflict there: what an agent or the CLI names by path.
+    Path(&'a str),
+    /// Only the folder's conflict at this path.
+    Folder(&'a str),
+    /// Only the caller's own draft conflict with this id.
+    OwnDraft(&'a str),
+}
+
+/// The refusal for a draft conflict id the caller does not hold, in one
+/// wording for the sides and the resolve, so a reader cannot tell somebody
+/// else's id from one that never was.
+pub(super) fn not_among_drafts(domain: &str, id: &str) -> EngineError {
+    EngineError::NotFound(format!("no conflict {id} among your drafts in '{domain}'"))
 }
 
 /// What a connect finds holding the name it would register under, once every

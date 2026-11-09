@@ -917,9 +917,7 @@ impl Engine {
             .await?
             .into_iter()
             .find(|found| found.conflict.id == id)
-            .ok_or_else(|| {
-                EngineError::NotFound(format!("no conflict {id} among your drafts in '{domain}'"))
-            })?;
+            .ok_or_else(|| super::origins::not_among_drafts(domain, id))?;
         Ok(sides_json(found))
     }
 

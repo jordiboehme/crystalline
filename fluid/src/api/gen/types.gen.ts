@@ -562,6 +562,129 @@ export type DomainMember = {
 };
 
 /**
+ * One of your drafts that does not fit the team's text.
+ */
+export type DraftConflictEntry = {
+    /**
+     * Always true: the entry is a draft's, never the folder's.
+     */
+    draft: boolean;
+    /**
+     * A file beside the pages rather than a page.
+     */
+    file: boolean;
+    /**
+     * `d` and seven hex digits, stable while the draft stands.
+     */
+    id: string;
+    kind: DraftConflictKind;
+    /**
+     * The path a moved draft left.
+     */
+    moved_from?: string | null;
+    /**
+     * For `AddressTaken`: the team's path that holds the address.
+     */
+    other?: string | null;
+    /**
+     * The draft's path, or the deletion's when it stands alone.
+     */
+    path: string;
+};
+
+/**
+ * Why a draft does not fit the team's text: `EditEdit` both changed the same lines, `EditDelete` the team deleted a page you drafted, `DeleteEdit` you deleted a page the team changed, `AddAdd` the team has a file where you did not start from one, `UnknownStart` a draft from before 0.32.0 with no record of its start, `AddressTaken` another team page holds your draft's address.
+ */
+export type DraftConflictKind = 'EditEdit' | 'EditDelete' | 'DeleteEdit' | 'AddAdd' | 'UnknownStart' | 'AddressTaken';
+
+/**
+ * One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.
+ */
+export type DraftConflictSides = {
+    base?: string | null;
+    /**
+     * Always null: a draft conflict is read from what stands, never stored.
+     */
+    detected_at?: string | null;
+    /**
+     * Always true.
+     */
+    draft: boolean;
+    /**
+     * Present, and true, only for a file.
+     */
+    file?: boolean | null;
+    id: string;
+    kind: DraftConflictKind;
+    local?: string | null;
+    moved_from?: string | null;
+    note?: string | null;
+    other?: string | null;
+    path: string;
+    upstream?: string | null;
+};
+
+/**
+ * Your own draft conflicts in this domain, and the drafts an update merged team changes into since they last settled.
+ */
+export type DraftConflictsResponse = {
+    /**
+     * Ordered by path.
+     */
+    conflicts: Array<DraftConflictEntry>;
+    /**
+     * Paths of your drafts a merge changed, sorted.
+     */
+    merged: Array<string>;
+};
+
+/**
+ * Where the resolution landed: in your draft.
+ */
+export type DraftResolveReceipt = {
+    /**
+     * Always true.
+     */
+    draft: boolean;
+    /**
+     * Present when the draft landed but its copy on this server's disk did
+     * not.
+     */
+    draft_warning?: string | null;
+    /**
+     * Present, and true, only for a file.
+     */
+    file?: boolean | null;
+    /**
+     * `mine`, `theirs` or `merged`.
+     */
+    kept: string;
+    /**
+     * Whether a copy of your text or file was kept before taking the
+     * team's.
+     */
+    kept_copy: boolean;
+    /**
+     * Always null over this API: a place on the server's disk is named only
+     * to the machine owner.
+     */
+    kept_file?: string | null;
+    /**
+     * For a file that was kept: where to find it.
+     */
+    kept_note?: string | null;
+    /**
+     * How many of your conflicts in this domain are left, or null when they
+     * could not be counted.
+     */
+    remaining?: number | null;
+    /**
+     * The draft's path. A move is settled whole, at its draft.
+     */
+    resolved: string;
+};
+
+/**
  * One engram changed, as every subscriber hears it.
  */
 export type EngramChanged = {
@@ -3840,6 +3963,136 @@ export type GetDomainDraftsResponses = {
 };
 
 export type GetDomainDraftsResponse = GetDomainDraftsResponses[keyof GetDomainDraftsResponses];
+
+export type ListDraftConflictsData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts';
+};
+
+export type ListDraftConflictsErrors = {
+    /**
+     * No identity, or the anonymous viewer, which holds no draft.
+     */
+    401: ProblemDetail;
+    /**
+     * No such domain, or one the caller may not see.
+     */
+    404: ProblemDetail;
+    /**
+     * Your conflicts cannot be read, so none are listed; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+};
+
+export type ListDraftConflictsError = ListDraftConflictsErrors[keyof ListDraftConflictsErrors];
+
+export type ListDraftConflictsResponses = {
+    /**
+     * Your conflicts and merged drafts.
+     */
+    200: DraftConflictsResponse;
+};
+
+export type ListDraftConflictsResponse = ListDraftConflictsResponses[keyof ListDraftConflictsResponses];
+
+export type GetDraftConflictData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The conflict id from the list.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts/{id}';
+};
+
+export type GetDraftConflictErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.
+     */
+    404: ProblemDetail;
+    /**
+     * Your conflicts cannot be read; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+};
+
+export type GetDraftConflictError = GetDraftConflictErrors[keyof GetDraftConflictErrors];
+
+export type GetDraftConflictResponses = {
+    /**
+     * The conflict and its sides.
+     */
+    200: DraftConflictSides;
+};
+
+export type GetDraftConflictResponse = GetDraftConflictResponses[keyof GetDraftConflictResponses];
+
+export type ResolveDraftConflictData = {
+    body: ResolveBody;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The conflict id from the list.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve';
+};
+
+export type ResolveDraftConflictErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived (except for `theirs`), or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.
+     */
+    404: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * An unknown `resolution`, `merged` with no `content`, a merge of a file, or a resolution the draft refuses; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+};
+
+export type ResolveDraftConflictError = ResolveDraftConflictErrors[keyof ResolveDraftConflictErrors];
+
+export type ResolveDraftConflictResponses = {
+    /**
+     * Where the resolution landed and how many of your conflicts are left.
+     */
+    200: DraftResolveReceipt;
+};
+
+export type ResolveDraftConflictResponse = ResolveDraftConflictResponses[keyof ResolveDraftConflictResponses];
 
 export type ListEngramsData = {
     body?: never;
