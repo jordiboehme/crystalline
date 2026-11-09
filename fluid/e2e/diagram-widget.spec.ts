@@ -299,6 +299,7 @@ interface ScrollReport {
   deepest: number;
   worst: number;
   shifted: number;
+  own: number;
   jumps: string[];
 }
 
@@ -330,7 +331,10 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
   // change above the line changes the sum. That is a jump, unless the layer's own
   // `scrollBy` took it back in that frame, so that is counted and subtracted.
   // `shifted` is the largest such scroll, by either party, in a frame where a box
-  // above the window changed its height: the correction of a landing ran.
+  // above the window changed its height: the correction of a landing ran. `own`
+  // is the widget's part alone. Which party corrects depends on whether the
+  // wheel step was less than 100 ms before, so `own` is reported, not asserted;
+  // widget.test.ts pins the widget's correction when CodeMirror scrolls nothing.
   await page.evaluate(() => {
     const log = {
       frames: 0,
@@ -338,6 +342,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
       deepest: 0,
       worst: 0,
       shifted: 0,
+      own: 0,
       jumps: [] as string[],
     };
     (window as unknown as { __jumps: typeof log }).__jumps = log;
@@ -445,6 +450,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
       boxHeights = heightsNow;
       if (landedAbove) {
         log.shifted = Math.max(log.shifted, Math.abs(taken + compensated));
+        log.own = Math.max(log.own, Math.abs(taken));
       }
       taken = 0;
       compensated = 0;
@@ -473,6 +479,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
               deepest: number;
               worst: number;
               shifted: number;
+              own: number;
               jumps: string[];
             };
           }
@@ -541,8 +548,98 @@ test("scrolling a long document with several diagrams does not jump", async ({
   expect(report.boxes).toBeGreaterThan(0);
   expect(report.deepest).toBeGreaterThan(5000);
   expect(report.worst).toBeLessThanOrEqual(control.worst + SCROLL_JUMP_PX);
-  // The walk did reach a diagram landing above the window, and the correction ran.
+  // The walk did reach a diagram landing above the window, and a correction ran:
+  // the widget's or CodeMirror's anchor step, one of them.
   expect(report.shifted).toBeGreaterThan(0);
+});
+
+test("solo: an undo or a redo with the box above the window scrolls to its change", async ({
+  page,
+}) => {
+  // No room to join: the solo surface, whose undo scrolls to the change it undid.
+  await page.routeWebSocket(/\/collab\//, (socket) => {
+    void socket.close();
+  });
+  const filler = Array.from(
+    { length: 60 },
+    (_, i) => `Filler line ${String(i)}`,
+  ).join("\n\n");
+  await openEditor(
+    page,
+    `Top line\n\n\`\`\`mermaid\nflowchart TD\n  A[One] --> B[Two]\n\`\`\`\n\n${filler}\n`,
+  );
+  const drawn = page.locator(".cm-diagram");
+  await expect(drawn.locator("svg")).toBeVisible();
+  await settle(page);
+  const short = (await drawn.boundingBox())?.height ?? 0;
+  await page
+    .locator('.cm-diagram g.node[id*="flowchart-B-"]')
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Add child" }).click();
+  await expect(page.locator(".cm-diagram-label-field")).toBeVisible();
+  await page.keyboard.type("Kid");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await drawn.boundingBox())?.height ?? 0)
+    .toBeGreaterThan(short + 40);
+  await settle(page);
+
+  const height = async () => (await drawn.boundingBox())?.height ?? 0;
+  /**
+   * Each step from the box above the window, still in CodeMirror's reach, with
+   * the caret in a line in the window; the name and the new node may be two
+   * steps. Ends at the step that changes the drawing's height.
+   */
+  const fromAbove = async (key: string, done: (h: number) => boolean) => {
+    for (let step = 0; step < 3; step++) {
+      const bottom = await drawn.evaluate(
+        (el) => el.getBoundingClientRect().bottom,
+      );
+      await page.evaluate((by) => {
+        window.scrollBy(0, by);
+      }, bottom + 150);
+      await settle(page, 500);
+      expect(
+        await drawn.evaluate((el) => el.getBoundingClientRect().bottom),
+      ).toBeLessThan(0);
+      const inWindow = await page.evaluate(() => {
+        const found = [
+          ...document.querySelectorAll(".cm-content > .cm-line"),
+        ].find((el) => {
+          const rect = el.getBoundingClientRect();
+          return (
+            /^Filler line \d+$/.test(el.textContent ?? "") &&
+            rect.top > 100 &&
+            rect.bottom < window.innerHeight - 100
+          );
+        });
+        return found?.textContent ?? "";
+      });
+      await line(page, inWindow).click();
+      await page.keyboard.press(key);
+      await settle(page);
+      if (done(await height())) {
+        break;
+      }
+    }
+  };
+  /** The step's own scroll stands: the change it made is in the window. */
+  const inView = async () => {
+    const box = await drawn.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, window: window.innerHeight };
+    });
+    expect(box.bottom).toBeGreaterThan(0);
+    expect(box.top).toBeLessThan(box.window);
+  };
+
+  await fromAbove("ControlOrMeta+z", (h) => h < short + 2);
+  expect(await height()).toBeLessThan(short + 2);
+  await inView();
+  // CodeMirror matches Ctrl-z (undo) before Mod-Shift-z (redo).
+  await fromAbove("ControlOrMeta+Shift+Z", (h) => h > short + 40);
+  expect(await height()).toBeGreaterThan(short + 40);
+  await inView();
 });
 
 test("a new drawing landing after an edit does not collapse the box, and moves the text once", async ({

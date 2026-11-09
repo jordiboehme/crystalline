@@ -817,19 +817,22 @@ describe("off screen", () => {
   describe("a drawing landing above the window, the page scrolling outside the editor", () => {
     /** How far the page has scrolled since the box was first drawn. */
     let scrolled = 0;
+    /** Drawn heights by SVG id; any other drawing is 374 px tall. */
+    const drawnHeights = new Map<string, number>();
 
     /**
      * The box at `top` less the scroll; the editor's lines after it 600 px below
-     * its bottom, those before it 20 px above it. 300 px tall before its drawing,
-     * 374 px after.
+     * its bottom, those before it 20 px above it. 300 px tall before its drawing.
      */
     function rects(top: number, bodyTop = 0) {
       scrolled = 0;
+      drawnHeights.clear();
       return vi
         .spyOn(HTMLElement.prototype, "getBoundingClientRect")
         .mockImplementation(function rect(this: HTMLElement) {
+          const svg = document.querySelector(".cm-diagram svg");
           const boxHeight =
-            document.querySelector(".cm-diagram svg") === null ? 300 : 374;
+            svg === null ? 300 : (drawnHeights.get(svg.id) ?? 374);
           let place: number | null = null;
           let height = 0;
           if (this.classList.contains("cm-diagram")) {
@@ -866,13 +869,21 @@ describe("off screen", () => {
         });
     }
 
-    /**
-     * Lands the drawing. `person` is a scroll between the paste and the measure
-     * pass; `pass` is one that something later in the same pass makes, the way
-     * CodeMirror keeps its first line still.
-     */
-    async function land(top: number, { person = 0, pass = 0 } = {}) {
-      const scrollBy = vi.fn();
+    interface Pass {
+      /** A scroll between the paste and the measure pass. */
+      person?: number;
+      /** A scroll later in the same pass, after its writes, by CodeMirror. */
+      pass?: number;
+      /** Runs right after the paste. */
+      then?: (view: EditorView) => void;
+    }
+
+    /** The page's scroller, with a `scrollBy` that notes where the page was. */
+    function pageScroller() {
+      const at: number[] = [];
+      const scrollBy = vi.fn(() => {
+        at.push(scrolled);
+      });
       // jsdom has neither.
       const scroller = document.documentElement;
       scroller.scrollBy = scrollBy;
@@ -880,27 +891,43 @@ describe("off screen", () => {
         configurable: true,
         value: scroller,
       });
+      return { scrollBy, at };
+    }
+
+    /** Applies `pass` to the next landing's measure request. */
+    function arm(view: EditorView, { person = 0, pass = 0, then }: Pass) {
+      const ask = view.requestMeasure.bind(view);
+      let armed = true;
+      return vi.spyOn(view, "requestMeasure").mockImplementation((request) => {
+        ask(request);
+        if (armed && request?.write !== undefined) {
+          // The landing's own request, asked right after the paste.
+          armed = false;
+          scrolled += person;
+          then?.(view);
+          ask({
+            read: () => null,
+            write: () => {
+              // In the loop's next round: after every write of this one.
+              ask({
+                read: () => null,
+                write: () => {
+                  scrolled += pass;
+                },
+              });
+            },
+          });
+        }
+      });
+    }
+
+    /** Lands the drawing with the box's top at `top`. */
+    async function land(top: number, pass: Pass = {}) {
+      const { scrollBy, at } = pageScroller();
       kit.hold.value = true;
       const view = await drawn();
       const spy = rects(top);
-      const ask = view.requestMeasure.bind(view);
-      let armed = true;
-      const asked = vi
-        .spyOn(view, "requestMeasure")
-        .mockImplementation((request) => {
-          ask(request);
-          if (armed && request?.write !== undefined) {
-            // The landing's own request, asked right after the paste.
-            armed = false;
-            scrolled += person;
-            ask({
-              read: () => null,
-              write: () => {
-                scrolled += pass;
-              },
-            });
-          }
-        });
+      const asked = arm(view, pass);
       try {
         const render = renders().at(-1);
         render?.resolve(recordedAs(render.id));
@@ -913,7 +940,7 @@ describe("off screen", () => {
         spy.mockRestore();
         asked.mockRestore();
       }
-      return scrollBy;
+      return Object.assign(scrollBy, { at });
     }
 
     it("takes the difference on the scroller when the box starts above the window", async () => {
@@ -973,16 +1000,90 @@ describe("off screen", () => {
       expect(scrollBy).not.toHaveBeenCalled();
     });
 
-    it("takes only what the pass left over", async () => {
-      const scrollBy = await land(-500, { pass: 30 });
+    it("leaves the text to the pass when it kept a box wholly above still", async () => {
+      // CodeMirror's step was 30 px more than the box: other lines above changed too.
+      const scrollBy = await land(-500, { pass: 104 });
+      expect(scrollBy).not.toHaveBeenCalled();
+    });
+
+    it("takes a box that holds the window's top whatever the pass scrolled", async () => {
+      // Its old bottom is below the top: CodeMirror keeps the box itself still.
+      const scrollBy = await land(-100, { pass: 30 });
       expect(scrollBy).toHaveBeenCalledTimes(1);
-      expect(scrollBy).toHaveBeenCalledWith({ top: 44, behavior: "instant" });
+      expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+    });
+
+    it("leaves the text to the pass when the box ended just under the window's top", async () => {
+      // Its old bottom 5 px down: CodeMirror's anchor is the line below it.
+      const scrollBy = await land(-295, { pass: 74 });
+      expect(scrollBy).not.toHaveBeenCalled();
     });
 
     it("keeps the person's own scroll between the paste and the pass", async () => {
       const scrollBy = await land(-500, { person: 200 });
       expect(scrollBy).toHaveBeenCalledTimes(1);
       expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+    });
+
+    it("takes a box the person's scroll carried across the window's top", async () => {
+      const scrollBy = await land(100, { person: 200 });
+      expect(scrollBy).toHaveBeenCalledTimes(1);
+      expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+    });
+
+    it("keeps a key's scroll to the caret in the same pass, and takes the growth before it", async () => {
+      // Enter or PageDown at the window's end, in the frame the drawing lands.
+      const scrollBy = await land(-500, {
+        pass: 600,
+        then: (view) => {
+          view.dispatch({
+            selection: { anchor: view.state.doc.length },
+            scrollIntoView: true,
+          });
+        },
+      });
+      expect(scrollBy).toHaveBeenCalledTimes(1);
+      expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+      // Before CodeMirror's scroll to the caret, which then reads the new layout.
+      expect(scrollBy.at).toEqual([0]);
+    });
+
+    it("keeps an undo's scroll to its change, and takes the growth before it", async () => {
+      const { scrollBy, at } = pageScroller();
+      const view = await drawn();
+      const spy = rects(-500);
+      try {
+        const first = box(view).querySelector("svg")?.id ?? "";
+        const where = view.state.doc.toString().indexOf("Next");
+        view.dispatch({ changes: { from: where, insert: "X" } });
+        await vi.waitFor(() => {
+          expect(box(view).querySelector("svg")?.id).not.toBe(first);
+        });
+        // The edited drawing is a rank taller.
+        drawnHeights.set(box(view).querySelector("svg")?.id ?? "", 468);
+        measured(view);
+        await flush();
+        scrollBy.mockClear();
+        at.length = 0;
+        // The undone body's drawing is in the cache: pasted in the undo's own update.
+        const asked = arm(view, { pass: -600 });
+        try {
+          undoOnce(view);
+          expect(box(view).querySelector("svg")?.id).toBe(first);
+          measured(view);
+          await flush();
+        } finally {
+          asked.mockRestore();
+        }
+        expect(scrollBy).toHaveBeenCalledTimes(1);
+        expect(scrollBy).toHaveBeenCalledWith({
+          top: -94,
+          behavior: "instant",
+        });
+        expect(at).toEqual([0]);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 
