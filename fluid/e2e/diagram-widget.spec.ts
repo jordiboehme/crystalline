@@ -352,6 +352,46 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
         taken += options.top ?? 0;
         scrollBy.call(this, options);
       };
+    // CodeMirror keeps the text still after a height correction with a window
+    // scroll in the same frame (the page scrolls the document), so those scrolls
+    // are taken back too. They stay out of `shifted`, which counts the widget's
+    // own correction only.
+    let compensated = 0;
+    // The global object holds its own scroll methods (they are not on
+    // Window.prototype), so the hooks go on `window` itself.
+    const win = window as unknown as Record<
+      string,
+      (this: Window, ...args: unknown[]) => void
+    >;
+    const delta = (win: Window, args: unknown[]) => {
+      const first = args[0];
+      if (typeof first === "object" && first !== null) {
+        const opts = first as ScrollToOptions;
+        return opts.top === undefined ? 0 : opts.top - win.scrollY;
+      }
+      return typeof args[1] === "number" ? args[1] - win.scrollY : 0;
+    };
+    for (const name of ["scrollTo", "scroll"]) {
+      const original = win[name] as (this: Window, ...a: unknown[]) => void;
+      win[name] = function counted(this: Window, ...args: unknown[]) {
+        compensated += delta(this, args);
+        original.apply(this, args);
+      };
+    }
+    const windowScrollBy = win.scrollBy as (
+      this: Window,
+      ...a: unknown[]
+    ) => void;
+    win.scrollBy = function counted(this: Window, ...args: unknown[]) {
+      const first = args[0];
+      compensated +=
+        typeof first === "object" && first !== null
+          ? ((first as ScrollToOptions).top ?? 0)
+          : typeof args[1] === "number"
+            ? args[1]
+            : 0;
+      windowScrollBy.apply(this, args);
+    };
     const tick = () => {
       const now = new Map<string, number>();
       const at = scroller.scrollTop;
@@ -372,7 +412,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
           now.set(text, place);
           const before = was.get(text);
           if (before !== undefined) {
-            const moved = Math.abs(place - before - taken);
+            const moved = Math.abs(place - before - taken - compensated);
             log.worst = Math.max(log.worst, moved);
             log.shifted = Math.max(log.shifted, Math.abs(taken));
             if (moved > 2 && log.jumps.length < 8) {
@@ -384,6 +424,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
         }
       }
       taken = 0;
+      compensated = 0;
       lastAt = at;
       log.frames += 1;
       was = now;
@@ -570,28 +611,34 @@ test("a new drawing landing after an edit does not collapse the box, and moves t
   ).toBeLessThanOrEqual(STILL_PX);
 });
 
-/** Logs each painted frame: where a line stands, and the box. */
+/**
+ * Logs each painted frame: where a line stands, and the box. Resolves once the
+ * first frame is recorded, so a key pressed right after it is seen by a sample.
+ */
 async function sampleFrames(page: Page, text: string): Promise<void> {
   await page.evaluate((wanted) => {
     const frames: { top: number; box: number; svg: boolean }[] = [];
     (window as unknown as { __frames: typeof frames }).__frames = frames;
-    const channel = new MessageChannel();
-    const after = () => {
-      channel.port2.postMessage(null);
-    };
-    channel.port1.onmessage = () => {
-      const below = [
-        ...document.querySelectorAll(".cm-content > .cm-line"),
-      ].find((el) => el.textContent === wanted);
-      const box = document.querySelector(".cm-diagram");
-      frames.push({
-        top: below?.getBoundingClientRect().top ?? -1,
-        box: box?.getBoundingClientRect().height ?? 0,
-        svg: box?.querySelector("svg") != null,
-      });
+    return new Promise<void>((resolve) => {
+      const channel = new MessageChannel();
+      const after = () => {
+        channel.port2.postMessage(null);
+      };
+      channel.port1.onmessage = () => {
+        const below = [
+          ...document.querySelectorAll(".cm-content > .cm-line"),
+        ].find((el) => el.textContent === wanted);
+        const box = document.querySelector(".cm-diagram");
+        frames.push({
+          top: below?.getBoundingClientRect().top ?? -1,
+          box: box?.getBoundingClientRect().height ?? 0,
+          svg: box?.querySelector("svg") != null,
+        });
+        resolve();
+        requestAnimationFrame(after);
+      };
       requestAnimationFrame(after);
-    };
-    requestAnimationFrame(after);
+    });
   }, text);
 }
 
@@ -783,6 +830,10 @@ test("the flip back with its body unchanged moves the page by the source lines, 
   const panel =
     (await page.locator(".cm-panels-top").boundingBox())?.height ?? 0;
   await sampleFrames(page, "Below marker");
+  // The first sample was taken before Escape and still shows the drawing.
+  const first = (await framesOf(page))[0];
+  expect(first?.box ?? 0).toBeGreaterThan(0);
+  expect(first?.svg).toBe(true);
   await page.keyboard.press("Escape");
   await expect(page.locator(".cm-diagram")).toHaveCount(0);
   await expect(page.locator(".cm-mermaid-preview svg")).toBeVisible();
