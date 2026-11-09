@@ -16,6 +16,7 @@
 use serde::Serialize;
 use serde_yaml_ng::Value;
 
+use crate::line_endings::to_lf;
 use crate::parse::{locate, parse_engram};
 
 /// A caller's line-based three-way merge, `(base, local, upstream)` to the
@@ -764,6 +765,50 @@ pub fn merge_text_with(
 
 fn breaks_parse(local: &str, upstream: &str, merged: &str) -> bool {
     parse_engram(local).is_ok() && parse_engram(upstream).is_ok() && parse_engram(merged).is_err()
+}
+
+/// Whether two sources are one text but for the top-level `generated` key,
+/// which is the provenance of the last write and no one's words, compared as
+/// LF. One side holding the key and the other not counts as the same, wherever
+/// it stands. Everything else counts exactly, as text: another key's quoting,
+/// the order of two other keys, a comment of hers at column 0 behind the stamp
+/// and the body. A source with no frontmatter, or one that cannot be cut into
+/// keys, is compared whole.
+pub fn same_but_generated(a: &str, b: &str) -> bool {
+    let (a, b) = (to_lf(a), to_lf(b));
+    if a == b {
+        return true;
+    }
+    let (Some(x), Some(y)) = (split_frontmatter(&a), split_frontmatter(&b)) else {
+        return false;
+    };
+    if x.close != y.close || x.body != y.body {
+        return false;
+    }
+    let (Some(left), Some(right)) = (key_blocks(x.yaml), key_blocks(y.yaml)) else {
+        return false;
+    };
+    left.preamble == right.preamble && without_generated(&left) == without_generated(&right)
+}
+
+/// The text of every key block but `generated`. Of that block only what is its
+/// own goes: the key line and its indented lines, not a comment or a blank line
+/// at column 0 that a cut into blocks merely hangs on it.
+fn without_generated(blocks: &KeyBlocks) -> String {
+    let mut text = String::new();
+    for block in &blocks.blocks {
+        if is_generated(block) {
+            block
+                .text
+                .split_inclusive('\n')
+                .skip(1)
+                .filter(|line| !line.starts_with([' ', '\t']))
+                .for_each(|line| text.push_str(line));
+        } else {
+            text.push_str(&block.text);
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1660,5 +1705,81 @@ mod tests {
             merge_text(Some(HARBOR), &local, &upstream, &trivial),
             MergedText::Clean(upstream.clone())
         );
+    }
+}
+
+#[cfg(test)]
+mod same_but_generated_tests {
+    use super::same_but_generated;
+
+    const WITH_LINE: &str = "---\ntitle: Plan\ngenerated:\n  at: 2026-11-06T10:00:00Z\n  by: human:alice\nstatus: draft\n---\nbody\n";
+
+    #[test]
+    fn same_but_generated_ignores_only_that_key() {
+        // Another stamp, the stamp gone, the stamp in another place, a second copy.
+        for same in [
+            "---\ntitle: Plan\ngenerated:\n  at: 2026-11-07T10:00:00Z\n  by: human:bob\nstatus: draft\n---\nbody\n",
+            "---\ntitle: Plan\nstatus: draft\n---\nbody\n",
+            "---\ngenerated:\n  at: 2026-11-07T10:00:00Z\ntitle: Plan\nstatus: draft\n---\nbody\n",
+            "---\ntitle: Plan\ngenerated: a\nstatus: draft\ngenerated: b\n---\nbody\n",
+            "---\ntitle: Plan\n\"generated\": quoted\nstatus: draft\n---\nbody\n",
+        ] {
+            assert!(same_but_generated(WITH_LINE, same), "{same}");
+            assert!(same_but_generated(same, WITH_LINE), "{same}");
+        }
+        // Every other change counts: a value, quoting, the order of two other
+        // keys, the body, a comment of hers at column 0 behind the stamp, the
+        // key spelled another way, a key of that name inside another key, and
+        // a body line that only looks like the key.
+        for differs in [
+            "---\ntitle: Other\ngenerated: x\nstatus: draft\n---\nbody\n",
+            "---\ntitle: \"Plan\"\ngenerated: x\nstatus: draft\n---\nbody\n",
+            "---\nstatus: draft\ngenerated: x\ntitle: Plan\n---\nbody\n",
+            "---\ntitle: Plan\ngenerated: x\nstatus: draft\n---\nbody two\n",
+            "---\ntitle: Plan\ngenerated: x\n# her note\nstatus: draft\n---\nbody\n",
+            "---\ntitle: Plan\nGenerated: x\nstatus: draft\n---\nbody\n",
+            "---\ntitle: Plan\nstatus: draft\nother:\n  generated: x\n---\nbody\n",
+            "---\n# her note\ntitle: Plan\nstatus: draft\n---\nbody\n",
+        ] {
+            assert!(!same_but_generated(WITH_LINE, differs), "{differs}");
+            assert!(!same_but_generated(differs, WITH_LINE), "{differs}");
+        }
+        assert!(!same_but_generated(
+            "---\ntitle: Plan\n---\ngenerated: a\n",
+            "---\ntitle: Plan\n---\ngenerated: b\n",
+        ));
+    }
+
+    #[test]
+    fn same_but_generated_reads_as_lf() {
+        assert!(same_but_generated(
+            "---\r\ntitle: Plan\r\ngenerated: a\r\n---\r\nbody\r\n",
+            "---\ntitle: Plan\ngenerated: b\n---\nbody\n",
+        ));
+    }
+
+    #[test]
+    fn same_but_generated_asks_for_the_whole_text_where_it_cannot_cut_keys() {
+        // No frontmatter at all.
+        assert!(same_but_generated("plain\n", "plain\n"));
+        assert!(same_but_generated("plain\n", "plain\r\n"));
+        assert!(!same_but_generated("plain\n", "other\n"));
+        // The closing line counts as text too.
+        assert!(!same_but_generated(
+            "---\ntitle: Plan\ngenerated: a\n---",
+            "---\ntitle: Plan\ngenerated: b\n---\n",
+        ));
+        // A stamp is no reason to call a file with frontmatter the same as one with none.
+        assert!(!same_but_generated(
+            "---\ngenerated: a\n---\nplain\n",
+            "plain\n",
+        ));
+        // Frontmatter that cannot be cut into keys.
+        let broken = "---\n{title: Plan}\n---\nbody\n";
+        assert!(same_but_generated(broken, broken));
+        assert!(!same_but_generated(
+            broken,
+            "---\n{title: Plan, generated: a}\n---\nbody\n",
+        ));
     }
 }

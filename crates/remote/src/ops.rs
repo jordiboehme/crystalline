@@ -7029,6 +7029,135 @@ fn settled_manifest(
     crystalline_core::settle_evolve_home_claim(base, local, upstream).map(String::into_bytes)
 }
 
+/// [`merge_file`] with the one thing a pull does around it for the MANIFEST at a
+/// domain's root: the evolve home is the engine's line, so when the team's copy
+/// names a home and `local` holds an unshared claim of its own, the team's wins
+/// without a conflict (`settled_manifest`). Any other path is plain
+/// [`merge_file`]. The answer says what to do with `local`, so a settled text
+/// that equals the team's is an `Apply` and not "nothing to do": the file still
+/// holds the claim.
+///
+/// For a merge with no folder behind it, as a review draft has. The pull's own
+/// loop keeps its branches, since it also has to record what it applied.
+pub fn merge_with_manifest_rule(
+    rel: &str,
+    base: Option<&[u8]>,
+    local: Option<&[u8]>,
+    upstream: Option<&[u8]>,
+) -> FileMerge {
+    let settled = if rel == "MANIFEST.md" {
+        settled_manifest(base, local, upstream)
+    } else {
+        None
+    };
+    match merge_file(base, settled.as_deref().or(local), upstream) {
+        FileMerge::Converged => match settled {
+            Some(bytes) if Some(bytes.as_slice()) != local => FileMerge::Apply(bytes),
+            _ => FileMerge::Converged,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod manifest_rule_tests {
+    use super::*;
+    use crate::merge::ConflictKind;
+
+    const BASE: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\n---\nAbout the team.\n";
+    const HERS: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://hers.example\n---\nAbout the team.\n";
+    const HERS_EDITED: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://hers.example\n---\nAbout the team, by her.\n";
+    const TEAM: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://team.example\n---\nAbout the team.\n";
+    const TEAM_SETTLED_HERS: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://team.example\n---\nAbout the team, by her.\n";
+
+    fn rule(rel: &str, base: &str, local: &str, upstream: &str) -> FileMerge {
+        merge_with_manifest_rule(
+            rel,
+            Some(base.as_bytes()),
+            Some(local.as_bytes()),
+            Some(upstream.as_bytes()),
+        )
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_lets_the_teams_evolve_home_win() {
+        // The claim is all she changed: the team's MANIFEST as it is.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, HERS, TEAM),
+            FileMerge::Apply(TEAM.as_bytes().to_vec())
+        );
+        // She also changed the words: those stay, the home is the team's.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, HERS_EDITED, TEAM),
+            FileMerge::Apply(TEAM_SETTLED_HERS.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_applies_a_settled_text_that_equals_the_teams() {
+        // With no base the settled text is hers with the team's home, which is
+        // the team's text. Her file still holds the claim, so "nothing to do"
+        // would be wrong: the answer says to write it.
+        let answer = merge_with_manifest_rule(
+            "MANIFEST.md",
+            None,
+            Some(HERS.as_bytes()),
+            Some(TEAM.as_bytes()),
+        );
+        assert_eq!(answer, FileMerge::Apply(TEAM.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_answers_as_merge_file_for_any_other_path() {
+        for rel in ["notes/MANIFEST.md", "manifest.md", "plan.md"] {
+            assert_eq!(
+                rule(rel, BASE, HERS, TEAM),
+                merge_file(
+                    Some(BASE.as_bytes()),
+                    Some(HERS.as_bytes()),
+                    Some(TEAM.as_bytes())
+                ),
+                "{rel}"
+            );
+            assert_eq!(
+                rule(rel, BASE, HERS, TEAM),
+                FileMerge::Conflict(ConflictKind::EditEdit),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_keeps_a_deliberate_move_and_the_ordinary_answers() {
+        // A base that names a home: her line is a move on purpose, not a race.
+        // The team moved it too, so it is an ordinary conflict.
+        assert_eq!(
+            rule(
+                "MANIFEST.md",
+                TEAM,
+                HERS,
+                "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://third.example\n---\nAbout the team.\n"
+            ),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+        // No claim at all: the merge as it is.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, BASE, TEAM),
+            FileMerge::Apply(TEAM.as_bytes().to_vec())
+        );
+        // Not text: left to the merge, and never decoded with a loss.
+        assert_eq!(
+            merge_with_manifest_rule(
+                "MANIFEST.md",
+                Some(BASE.as_bytes()),
+                Some(HERS.as_bytes()),
+                Some(&[0xff, 0xfe])
+            ),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+}
+
 #[cfg(test)]
 mod share_route_tests {
     use super::*;

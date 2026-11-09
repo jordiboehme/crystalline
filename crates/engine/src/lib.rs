@@ -7,6 +7,7 @@ pub mod changes;
 pub mod collab;
 #[doc(hidden)]
 pub mod domain_view;
+pub mod draft_merge;
 pub mod draft_start;
 pub mod engine;
 pub mod harness_cli;
