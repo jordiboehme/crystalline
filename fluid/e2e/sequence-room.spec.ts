@@ -99,9 +99,11 @@ test("a rename keeps each message's room", async ({ page }) => {
       expect(message.text, name).toBe(was?.text);
       expect(message.from, name).toBeCloseTo(was?.from ?? 0, 0);
       expect(message.to, name).toBeCloseTo(was?.to ?? 0, 0);
-      // The label stands inside its arrow, as in the body before.
-      expect(message.left, name).toBeGreaterThanOrEqual(message.from - 1);
-      expect(message.right, name).toBeLessThanOrEqual(message.to + 1);
+      // The label stands where it stood in the body before. Whether it fits
+      // inside its arrow depends on the fonts of the machine, so the check is
+      // against the first drawing, not against the arrow.
+      expect(message.left, name).toBeCloseTo(was?.left ?? 0, 0);
+      expect(message.right, name).toBeCloseTo(was?.right ?? 0, 0);
     }
   }
 });
