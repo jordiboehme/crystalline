@@ -2101,7 +2101,7 @@ async fn a_case_move_whose_start_could_not_move_stays_on_either_disk() {
     let f = fixture(&[("plan.md", LONG)]).await;
     eprintln!("the temp folder folds case: {}", folds_case(&f.root));
     f.moved("plan", "Plan.md").await;
-    f.engine.fail_next_start_restore();
+    f.engine.fail_next_merge_start();
     f.push(&[("plan.md", Some(bobs(LONG)))]).await;
     let both = vec![
         ("Plan.md".to_string(), false),
@@ -2122,4 +2122,55 @@ async fn a_case_move_whose_start_could_not_move_stays_on_either_disk() {
     assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()));
     assert!(f.row("Plan.md").await.contains(BOB_LINE));
     assert_eq!(f.conflicts().await, vec![]);
+}
+
+/// Her share of an edited case move lands, and the pass ends the move: the
+/// tombstone first, then the draft. The draft changes between the two, so it
+/// stays; the tombstone is put back, so the move stands whole and her own old
+/// path is never read as a team file holding her address.
+///
+/// The edit verbs cannot write the draft in that window: with the tombstone gone
+/// the team's `plan.md` holds her address, and the address check refuses them.
+/// So the row is written straight, as any writer that skips that check would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_between_the_two_drops_of_a_landed_move_keeps_the_move_whole() {
+    let f = Arc::new(fixture_direct(&[("plan.md", LONG)]).await);
+    let folds = folds_case(&f.root);
+    eprintln!("the temp folder folds case: {folds}");
+    f.append("plan", HER_LINE).await;
+    f.moved("plan", "Plan.md").await;
+
+    // Hold the second drop, the draft's, and edit the draft in that window.
+    f.engine.hold_convergence_drop(1, 1500);
+    let share = {
+        let f = f.clone();
+        tokio::spawn(async move { f.share().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let edited = format!(
+        "{}- [idea] a word after her share #team\n",
+        f.row("Plan.md").await
+    );
+    f.old_draft("Plan.md", &edited).await;
+    let answer = share.await.unwrap();
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("Plan.md".to_string(), false),
+            ("plan.md".to_string(), true)
+        ],
+        "{answer}"
+    );
+    assert!(f.row("Plan.md").await.contains("a word after her share"));
+    assert!(
+        f.start("plan.md").is_some(),
+        "the half's record came back too"
+    );
+    let kinds: Vec<DraftConflictKind> = f.conflicts().await.into_iter().map(|c| c.kind).collect();
+    assert!(
+        !kinds.contains(&DraftConflictKind::AddressTaken),
+        "{kinds:?}"
+    );
 }

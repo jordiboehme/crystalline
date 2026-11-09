@@ -1063,6 +1063,13 @@ pub struct Engine {
     // `Engine::hold_next_convergence_drop`.
     #[cfg(any(test, feature = "testing"))]
     hold_next_convergence_drop: std::sync::atomic::AtomicU64,
+    // How many drops the hold above lets pass before the one it holds.
+    #[cfg(any(test, feature = "testing"))]
+    hold_convergence_drop_skip: std::sync::atomic::AtomicU64,
+    // When armed, the pass's next save of a moved start after a merge fails
+    // once. See `Engine::fail_next_merge_start`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_merge_start: std::sync::atomic::AtomicBool,
     // When armed, the next rename-question scan fails once. See
     // `Engine::fail_next_rename_scan`.
     #[cfg(any(test, feature = "testing"))]
@@ -2521,6 +2528,10 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             hold_next_convergence_drop: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
+            hold_convergence_drop_skip: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_merge_start: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             lose_next_relink_swap: std::sync::atomic::AtomicBool::new(false),
@@ -2664,10 +2675,8 @@ impl Engine {
 
     /// Make the next put-back of a draft start record fail, once, as a full disk
     /// would, leaving the clear that follows it to work. The other way to get
-    /// there, a folder that refuses writes, fails the clear as well. The
-    /// convergence pass consumes it too, at the start it moves after writing a
-    /// merge, which is the same kind of write. Nothing in the daemon, the CLI or
-    /// the MCP surface calls this.
+    /// there, a folder that refuses writes, fails the clear as well. Nothing in
+    /// the daemon, the CLI or the MCP surface calls this.
     #[cfg(any(test, feature = "testing"))]
     pub fn fail_next_start_restore(&self) {
         self.fail_next_start_restore
@@ -2711,26 +2720,60 @@ impl Engine {
         }
     }
 
-    /// Hold the convergence pass's next drop of a draft for `millis` before it
-    /// takes the draft's lock, once, so a test can write the draft in that
-    /// window: the drop must then see the new text and leave the row. Nothing in
-    /// the daemon, the CLI or the MCP surface calls this.
+    /// Hold one of the convergence pass's drops of a draft for `millis` before it
+    /// takes the draft's lock, once: the drop after the next `skip` ones. A test
+    /// writes the draft in that window, and the drop must then see the new text
+    /// and leave the row. Nothing in the daemon, the CLI or the MCP surface calls
+    /// this.
     #[cfg(any(test, feature = "testing"))]
-    pub fn hold_next_convergence_drop(&self, millis: u64) {
+    pub fn hold_convergence_drop(&self, skip: u64, millis: u64) {
+        self.hold_convergence_drop_skip
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
         self.hold_next_convergence_drop
             .store(millis, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The hold above, consuming the arming. Does nothing outside a test build.
+    /// The hold above, consuming the arming when its drop comes. Does nothing
+    /// outside a test build.
     async fn take_convergence_drop_hold(&self) {
         #[cfg(any(test, feature = "testing"))]
         {
-            let millis = self
-                .hold_next_convergence_drop
-                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.hold_next_convergence_drop.load(Relaxed) == 0 {
+                return;
+            }
+            let skip = self.hold_convergence_drop_skip.load(Relaxed);
+            if skip > 0 {
+                self.hold_convergence_drop_skip.store(skip - 1, Relaxed);
+                return;
+            }
+            let millis = self.hold_next_convergence_drop.swap(0, Relaxed);
             if millis > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
             }
+        }
+    }
+
+    /// Make the convergence pass's next save of a moved start, after it wrote a
+    /// merge, fail once, as a full disk would. Nothing in the daemon, the CLI or
+    /// the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_merge_start(&self) {
+        self.fail_next_merge_start
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::fail_next_merge_start`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    fn take_failed_merge_start(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_merge_start
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
         }
     }
 
@@ -6797,21 +6840,104 @@ impl Engine {
         {
             return Ok(0);
         }
-        let mut ended = 0;
-        if let Some(t) = half
-            && self
+        let half_dropped = match half {
+            Some(t) => self
                 .drop_as_read(view, domain, domain_id, actor, reading, t)
                 .await?
-        {
-            ended += 1;
-        }
+                .then_some(t),
+            None => None,
+        };
         if self
             .drop_as_read(view, domain, domain_id, actor, reading, i)
             .await?
         {
-            ended += 1;
+            return Ok(1 + u64::from(half_dropped.is_some()));
         }
-        Ok(ended)
+        // The draft changed after its half went, so the move stands: the half
+        // comes back as it was read. Left gone, her old path would read as a
+        // team file holding her address on a disk that folds case.
+        if let Some(t) = half_dropped {
+            self.put_half_back(domain, domain_id, actor, reading, t)
+                .await;
+        }
+        Ok(0)
+    }
+
+    /// Write tombstone `t` of a reading back, row, mirror and record, under its
+    /// draft lock, when nothing of hers stands at its path. A failure is warned
+    /// about and leaves the draft standing alone, which the next pass decides
+    /// again with nothing lost.
+    async fn put_half_back(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        t: usize,
+    ) {
+        let row = &reading.rows[t];
+        let put = async {
+            let lock = self.draft_lock(domain, actor, &row.path)?;
+            let _guard = lock.lock().await;
+            let held = {
+                let store = self.store.lock().await;
+                store.overlay_entry(domain_id, actor, &row.path).await?
+            };
+            if held.is_some() {
+                return Ok(());
+            }
+            let engram = parse_engram(&row.content)
+                .map_err(|e| EngineError::Invalid(format!("the deleted text: {e}")))?;
+            let mut record =
+                EngramRecord::from_engram(&engram, &row.path, virtual_stamp(&row.content));
+            record.permalink = row.path.clone();
+            record.content = row.content.clone();
+            record.tags = Vec::new();
+            record.observations = Vec::new();
+            record.relations = Vec::new();
+            record.links = Vec::new();
+            record.tombstone = true;
+            if let Some(start) = &reading.records[t] {
+                self.save_start(domain, actor, start)?;
+            }
+            self.commit_overlay_row(domain_id, actor, &record).await?;
+            let state_dir = self.journal_state_dir()?;
+            let mirrored = if self
+                .deletion_shares_a_mirror(domain_id, actor, &row.path)
+                .await?
+            {
+                crate::overlay_journal::journal_tombstone_beside_a_draft(
+                    &state_dir, domain, actor, &row.path,
+                )
+            } else {
+                crate::overlay_journal::journal_tombstone(&state_dir, domain, actor, &row.path)
+            };
+            if let Err(e) = mirrored {
+                let text = unmirrored(domain, actor, &row.path, &e, true);
+                tracing::warn!(domain, actor, path = row.path.as_str(), "{text}");
+            }
+            self.announce(Change::Engram(EngramChanged {
+                domain: domain.to_string(),
+                permalink: row.path.clone(),
+                path: row.path.clone(),
+                kind: ChangeKind::Deleted,
+                from: None,
+                checksum: None,
+                actor: Some(actor.to_string()),
+                draft_of: Some(actor.to_string()),
+                audience: None,
+            }));
+            Ok::<(), EngineError>(())
+        };
+        if let Err(e) = put.await {
+            tracing::warn!(
+                domain,
+                actor,
+                path = row.path.as_str(),
+                "the deletion half of a move that did not end could not be put back; the \
+                 draft stands alone until the next pass: {e}"
+            );
+        }
     }
 
     /// Drop row `i` of a reading under its draft lock, and only when the row and
@@ -7002,7 +7128,7 @@ impl Engine {
                 merging: None,
                 ..record
             };
-            let saved = if self.take_failed_start_restore() {
+            let saved = if self.take_failed_merge_start() {
                 Err(EngineError::Internal(
                     "the armed failure of a test".to_string(),
                 ))

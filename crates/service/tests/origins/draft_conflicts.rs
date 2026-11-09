@@ -1987,7 +1987,7 @@ async fn a_landing_after_a_merge_leaves_an_edit_that_came_in_meanwhile() {
     .unwrap();
     t.snapshot_has("plan.md", Some(&plan_later()));
 
-    t.eng.hold_next_convergence_drop(1500);
+    t.eng.hold_convergence_drop(0, 1500);
     let pass = {
         let t = t.clone();
         tokio::spawn(async move { t.eng.converge_overlays("team").await })
@@ -2051,7 +2051,7 @@ async fn a_merge_whose_start_could_not_move_merges_again_and_tells_her() {
     t.append("alice", "plan", HER_WORD).await;
     t.snapshot_has("plan.md", Some(&plan_later()));
 
-    t.eng.fail_next_start_restore();
+    t.eng.fail_next_merge_start();
     let first = t.eng.converge_overlays("team").await.unwrap();
     assert_eq!(first.merged, 1, "{first:?}");
     let merged = t.row("alice", "plan.md").await;
