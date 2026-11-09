@@ -90,9 +90,22 @@ export function useHud(): HudBindings {
     };
     let shownAt = 0;
     let hideTimer: ReturnType<typeof setTimeout> | null = null;
+    // Set when the screen goes away. The game loop can still report a
+    // connector change after that, and a timer started then would set state
+    // on a component that no longer exists.
+    let gone = false;
     const cancelHide = () => {
       if (hideTimer !== null) clearTimeout(hideTimer);
       hideTimer = null;
+    };
+    // React may run the effect's cleanup and then the effect again on the
+    // same screen (StrictMode), so the effect clears the flag each time.
+    const arrive = () => {
+      gone = false;
+      return () => {
+        gone = true;
+        cancelHide();
+      };
     };
     const sink: HudSink = {
       prompt: (text) => {
@@ -109,6 +122,7 @@ export function useHud(): HudBindings {
       },
       connector: (active, label) => {
         cancelHide();
+        if (gone) return;
         if (active) {
           shownAt = performance.now();
           setConnector({ active: true, label });
@@ -132,10 +146,10 @@ export function useHud(): HudBindings {
       frame: bind("frame"),
       notice: bind("notice"),
     };
-    return { sink, view, cancelHide };
+    return { sink, view, arrive };
   });
 
-  useEffect(() => made.cancelHide, [made]);
+  useEffect(() => made.arrive(), [made]);
 
   return { sink: made.sink, view: made.view, connector, reader };
 }

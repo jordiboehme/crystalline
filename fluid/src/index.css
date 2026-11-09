@@ -767,24 +767,54 @@
    * What belongs together stays together. `break-after: avoid` on a heading
    * is honoured by Chrome alone, so a heading and the block after it share
    * one wrapper (`keepWithNext`), a plain block that may not break, which
-   * WebKit honours too; a block taller than about half a page is left out of
-   * it. A whole section is never kept together: a long one would leave half
-   * empty pages. For the same reason only a short list item and a short
-   * table (`data-short`, set by `keepWithNext`) are kept whole; a longer one
-   * breaks between its lines or rows. `page-break-inside` is the older
-   * spelling WebKit still reads.
+   * WebKit honours too. A whole section is never kept together: a long one
+   * would leave half empty pages. For the same reason only a short list item
+   * and a short table (`data-short`, set by `keepWithNext`) are kept whole;
+   * a longer one breaks between its lines or rows. `page-break-inside` is
+   * the older spelling WebKit still reads.
    */
   [data-keep] {
     display: block;
   }
   /*
-   * A heading and its diagram are one inline block on paper, a box no
-   * browser breaks: WebKit still left a kept heading at the foot of a page
-   * now and then and moved only its diagram on. Safe because a diagram
-   * prints no taller than a page less its heading (below), so the pair
-   * always fits on one page.
+   * A heading before a block too tall to keep with it (a long paragraph, a
+   * long list, a long table, or the next heading) is kept with the first
+   * lines of that block only. Its wrapper holds the heading alone and
+   * reserves room under it for those lines, `--keep-lines` of them plus
+   * the block's top margin, and a negative margin of the same size pulls the
+   * block back up into that room. The wrapper may not break, so a heading
+   * with less room than that under it moves to the next page, and the block
+   * follows it there. The reserve is only space: nothing is split in the
+   * document, and a wrong guess costs a heading at the foot of a page or a
+   * few empty lines there, never text. The heading's own bottom margin goes,
+   * so the block sits as far under it as it does on screen: the larger of
+   * the two margins, which is the block's. The notes at the end of a page
+   * keep their label the same way.
    */
-  .measured > [data-keep]:has(> figure) {
+  .measured > [data-keep="lead"],
+  .measured > section[data-footnotes] > [data-keep="lead"] {
+    --keep-room: calc(var(--keep-lines, 3) * 1.55rem + 1rem);
+    padding-bottom: var(--keep-room);
+    margin-bottom: calc(-1 * var(--keep-room));
+  }
+  .measured > [data-keep="lead"] > *,
+  .measured > section[data-footnotes] > [data-keep="lead"] > * {
+    margin-bottom: 0 !important;
+  }
+  /*
+   * A heading and its diagram or picture are one inline block on paper, a
+   * box a browser moves whole to the next page: WebKit still left a kept heading at the foot of a
+   * page now and then and moved only its diagram on. Safe because a diagram
+   * and a picture print no taller than a page less its heading (below), so
+   * the pair always fits on one page. `keepWithNext` marks these pairs
+   * `data-keep="unit"`. An inline block holds together only when it fits
+   * on a page (WebKit broke one that did not inside, its heading on one page
+   * and its picture on the next), and only a capped height makes sure it
+   * does. A pair with text has no such cap, its height is an estimate from
+   * the text, so it stays a block that may not break: one taller than a page
+   * breaks like any other block.
+   */
+  .measured > [data-keep="unit"] {
     display: inline-block;
     width: 100%;
     vertical-align: top;
@@ -864,12 +894,6 @@
     overflow-wrap: anywhere;
   }
 
-  /* Pictures fit the width. */
-  .measured img {
-    max-width: 100% !important;
-    height: auto;
-  }
-
   /*
    * A diagram prints at its own size: the width of its viewBox in CSS pixels,
    * the size it has on screen in a column wide enough for it. It is scaled
@@ -880,11 +904,20 @@
    * as well. The numbers come from the wrapper (`MermaidDiagram`); without
    * them a diagram fills the column.
    *
-   * One page is 215mm here: the page height of US Letter (279.4mm less the
-   * 40mm of top and bottom margin above), the shorter of Letter and A4, less
-   * room for the heading kept with the diagram and for the figure's frame.
+   * One page is `--print-page-room` here, 190mm. US Letter, the shorter of
+   * Letter and A4, has 239.4mm of height inside the margins above, but WebKit
+   * prints a page at 1.25 CSS pixels to the point, not at 96 to the inch: a
+   * Letter page holds about 840 CSS pixels there, 222mm of CSS length
+   * (measured with a web view's print operation, WebKit's own print path on
+   * a Mac). Less about 120 pixels (32mm) for the heading kept with the
+   * diagram, its margins and the figure's frame, 190mm is left. At 215mm a
+   * tall diagram or picture and its heading did not fit on such a page, and
+   * WebKit printed the heading alone at the foot of a page.
    * The scroller of a widened diagram would clip it and fade its edge.
    */
+  .measured {
+    --print-page-room: 190mm;
+  }
   [data-drawing] {
     overflow: visible !important;
     mask-image: none !important;
@@ -895,14 +928,38 @@
     width: min(
       100%,
       calc(var(--diagram-width, 100000) * 1px),
-      calc(215mm * var(--diagram-width, 1) / var(--diagram-height, 1))
+      calc(
+        var(--print-page-room, 190mm) * var(--diagram-width, 1) /
+          var(--diagram-height, 1)
+      )
     ) !important;
     min-width: 0 !important;
     max-width: none !important;
     height: auto !important;
   }
+
+  /*
+   * A picture prints the same way: at its own size in CSS pixels, scaled
+   * down to fit the column and one page (the same `--print-page-room`, from
+   * the picture's own proportion), never up, so it is never cut at a page
+   * edge. A width
+   * the author gave still applies, under the same caps. The size comes from
+   * the picture once it has loaded (`MarkdownImage`); before that only the
+   * column and the height cap hold, and the height cap keeps it whole.
+   */
   .measured img {
-    max-height: 190mm;
+    display: block;
+    margin-inline: auto;
+    max-width: min(
+      100%,
+      calc(var(--picture-width, 100000) * 1px),
+      calc(
+        var(--print-page-room, 190mm) * var(--picture-width, 1) /
+          var(--picture-height, 1)
+      )
+    ) !important;
+    height: auto !important;
+    max-height: var(--print-page-room, 190mm);
     object-fit: contain;
   }
 

@@ -245,24 +245,31 @@ function QrStamp({ text }: { text: string }): ReactElement {
     [text],
   );
   const size = data.length;
+  // One link around the code and its caption: a PDF made from the print keeps
+  // it, so a reader can click the stamp instead of scanning it.
   return (
-    <figure className="print-qr flex w-[22mm] flex-col items-center gap-1">
-      <svg
-        role="img"
-        aria-label={`QR code: ${text}`}
-        data-qr-text={text}
-        data-qr-size={size}
-        viewBox={`0 0 ${String(size)} ${String(size)}`}
-        width="22mm"
-        height="22mm"
-        shapeRendering="crispEdges"
+    <figure className="print-qr w-[22mm]">
+      <a
+        href={text}
+        className="flex flex-col items-center gap-1 text-inherit no-underline"
       >
-        <rect width={size} height={size} fill="#ffffff" />
-        <path d={qrPath(data)} fill="#000000" />
-      </svg>
-      <figcaption className="text-[7pt] leading-none text-muted">
-        Open in Fluid
-      </figcaption>
+        <svg
+          role="img"
+          aria-label={`QR code: ${text}`}
+          data-qr-text={text}
+          data-qr-size={size}
+          viewBox={`0 0 ${String(size)} ${String(size)}`}
+          width="22mm"
+          height="22mm"
+          shapeRendering="crispEdges"
+        >
+          <rect width={size} height={size} fill="#ffffff" />
+          <path d={qrPath(data)} fill="#000000" />
+        </svg>
+        <span className="text-[7pt] leading-none text-muted">
+          Open in Fluid
+        </span>
+      </a>
     </figure>
   );
 }
