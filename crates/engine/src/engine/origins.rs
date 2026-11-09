@@ -2147,7 +2147,12 @@ impl Engine {
         {
             tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
         }
+        // The pass belongs to the pull: one that applied something runs it for
+        // every person, whatever the caller may write, since its renames and
+        // divergences are read from this pull's own paths once and never again.
+        // Only an up-to-date pull narrows the pass to what the caller asked.
         let only = match pass {
+            _ if !report.up_to_date => Some(None),
             SharePass::Everyone => Some(None),
             SharePass::Own => Some(Some(who)),
             SharePass::Nobody => None,
@@ -2791,11 +2796,13 @@ impl Engine {
     /// embed tail (see `Engine::index_what_the_share_pull_applied`).
     ///
     /// On a domain that reviews changes it also runs the convergence pass, as
-    /// the share does, but for the caller's own drafts only: a clean merge of
-    /// hers is written into her rows, so the plan shows what her share would
-    /// carry. A caller on the instance's credential (`ReadScopeFallback` taken)
-    /// writes no draft at all, and the plan names a stale draft of hers as a
-    /// conflict until a pass has merged it.
+    /// the share does. When its pull applied team changes, that pass is the
+    /// pull's and converges every person's drafts, as an update would. When
+    /// the pull applied nothing, it runs for the caller's own drafts only: a
+    /// clean merge of hers is written into her rows, so the plan shows what her
+    /// share would carry. A caller on the instance's credential
+    /// (`ReadScopeFallback` taken) then writes no draft at all, and the plan
+    /// names a stale draft of hers as a conflict until a pass has merged it.
     ///
     /// It carries the share's own credential resolution too, `actor` and all:
     /// a preview that resolved a different identity than the share would could
@@ -4958,7 +4965,8 @@ fn subscribed_reflection_mode(root: &Path) -> crystalline_core::ReflectionMode {
 }
 
 /// Whose drafts the convergence pass in front of a share or a preview may
-/// write.
+/// write when its pull applied nothing. A pull that applied something always
+/// converges every person's drafts (see `Engine::overlay_share_tree`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SharePass {
     /// Every person's, as an update does: a share writes to the team.

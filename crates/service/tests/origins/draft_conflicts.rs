@@ -2816,3 +2816,45 @@ async fn a_refused_share_marks_each_conflict_as_a_draft() {
     let plan = t.preview("alice", Some(&["plan.md"])).await;
     assert_eq!(plan["conflicts"][0]["draft"], true, "{plan}");
 }
+
+fn old_page() -> Vec<u8> {
+    engram("Old", "old", "the old page")
+}
+
+/// A preview whose own pull brings in a team rename converges every person's
+/// drafts, as any pull does: the rename is applied once, and a pass that missed
+/// it could never follow it later.
+#[tokio::test]
+async fn a_preview_whose_pull_applied_a_rename_takes_a_colleagues_draft_along() {
+    let t = team(&[("old.md", old_page())]).await;
+    t.append("bob", "old", "bob's word").await;
+    t.commit(&[("old.md", None), ("new.md", Some(old_page()))]);
+
+    t.preview("alice", None).await;
+    assert_eq!(t.rows("bob").await, vec![("new.md".to_string(), false)]);
+    assert_eq!(t.conflicts("bob").await, vec![]);
+}
+
+/// The same on read scope: the pass belongs to the pull, so her own draft
+/// follows the rename too.
+#[tokio::test]
+async fn a_read_scope_preview_whose_pull_applied_a_rename_takes_her_draft_along() {
+    let t = team(&[("old.md", old_page())]).await;
+    t.append("alice", "old", "her word").await;
+    t.commit(&[("old.md", None), ("new.md", Some(old_page()))]);
+    t.eng.refuse_next_personal_credential();
+
+    t.eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+            PreviewCredential::ReadScopeFallback,
+        )
+        .await
+        .unwrap();
+    assert_eq!(t.rows("alice").await, vec![("new.md".to_string(), false)]);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
