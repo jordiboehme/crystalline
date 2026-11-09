@@ -548,6 +548,20 @@ describe("what stays text", () => {
   });
 });
 
+/** The arrows a message can carry, as the sequence grammar names them. */
+const MESSAGE_ARROWS = [
+  "->",
+  "-->",
+  "->>",
+  "-->>",
+  "<<->>",
+  "<<-->>",
+  "-x",
+  "--x",
+  "-)",
+  "--)",
+];
+
 describe("the spans of every corpus file", () => {
   test.each(corpus)("%s", (_name, body) => {
     const model = understood(body);
@@ -555,7 +569,7 @@ describe("the spans of every corpus file", () => {
       expect(reads(body, message.fromSpan)).toBe(message.from);
       expect(reads(body, message.toSpan)).toBe(message.to);
       const token = defined(reads(body, message.arrow.span));
-      expect(token).toMatch(/^(?:<<)?--?(?:>>?|x|\))$/i);
+      expect(MESSAGE_ARROWS).toContain(token.toLowerCase());
       expect(message.span.from).toBe(message.fromSpan.from);
       if (message.arrow.activation) {
         expect(["+", "-"]).toContain(reads(body, message.arrow.activation));
