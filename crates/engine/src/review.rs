@@ -17,14 +17,14 @@
 //! one `DomainView::address_map` rather than by two call sites agreeing to
 //! agree.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crystalline_core::config::DomainEntry;
 use crystalline_index::EngramDescriptor;
 use serde_json::{Value, json};
 
 use crate::domain_view::DomainView;
-use crate::engine::EngineError;
+use crate::engine::{DraftConflict, EngineError};
 
 /// What one actor's drafts become when their domain stops reviewing changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,8 @@ pub enum FoldChoice {
 /// for anybody to decide about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewModeConfirm {
-    /// Answer what this would do, and write nothing.
+    /// Answer what this would do, and fold nothing. The convergence pass runs
+    /// first, so a draft the team's change merges into is merged.
     Preview,
     /// Make the change, with one [`FoldChoice`] per actor holding drafts.
     Confirmed {
@@ -108,11 +109,22 @@ pub(crate) fn left_json(
     })
 }
 
+/// What each actor's drafts in a fold plan stand against: the conflicts read
+/// for each of them, the actors whose conflicts could not be read, and who is
+/// asking, so a row of their own is said to them as theirs.
+pub(crate) struct PlanConflicts<'a> {
+    pub(crate) conflicts: &'a HashMap<String, Vec<DraftConflict>>,
+    pub(crate) unreadable: &'a HashSet<String>,
+    pub(crate) viewer: Option<&'a str>,
+}
+
 /// The plan a preview answers with, and the shape Task 8's removal gate
 /// reads the same rows through.
 ///
-/// `conflict` on a draft is the choice-independent half: an address another
-/// path already answers to, which no fold of that draft alone can avoid.
+/// `conflict` on a draft is the choice-independent half: a draft that does
+/// not fit the team's text, which only its author can settle, or an address
+/// another path already answers to, which no fold of that draft alone can
+/// avoid. A move's deletion half carries its draft's sentence too.
 /// `contested_paths` is the other half, which depends on the answers: a path
 /// two actors are drafting refuses only if both of them fold.
 pub(crate) fn plan_json(
@@ -120,6 +132,7 @@ pub(crate) fn plan_json(
     entry: &DomainEntry,
     drafts: &[ActorDrafts],
     base: &[EngramDescriptor],
+    standing: &PlanConflicts<'_>,
 ) -> Value {
     let mut by_path: HashMap<&str, Vec<&str>> = HashMap::new();
     for held in drafts {
@@ -142,13 +155,32 @@ pub(crate) fn plan_json(
             // else did, which is the only address question a plan can
             // answer before the answers are in.
             let surviving = DomainView::address_map(&[held], base);
+            let unsettled: HashSet<&str> = standing
+                .conflicts
+                .get(&held.actor)
+                .into_iter()
+                .flatten()
+                .flat_map(|c| std::iter::once(c.path.as_str()).chain(c.moved_from.as_deref()))
+                .collect();
+            let sentence = if standing.viewer == Some(held.actor.as_str()) {
+                "You have a conflict here. Settle it first.".to_string()
+            } else {
+                format!(
+                    "{} has a conflict here. Ask them to settle it, or choose discard.",
+                    held.actor
+                )
+            };
             let mut rows: Vec<Value> = held
                 .entries
                 .iter()
                 .map(|draft| {
-                    let conflict = (!draft.tombstone)
-                        .then(|| address_held_elsewhere(draft, &surviving))
-                        .flatten();
+                    let conflict = if unsettled.contains(draft.path.as_str()) {
+                        Some(sentence.clone())
+                    } else {
+                        (!draft.tombstone)
+                            .then(|| address_held_elsewhere(draft, &surviving))
+                            .flatten()
+                    };
                     json!({
                         "path": draft.path,
                         "permalink": draft.permalink,
@@ -168,7 +200,9 @@ pub(crate) fn plan_json(
                     "path": file.path,
                     "kind": "file",
                     "tombstone": file.tombstone,
-                    "conflict": Value::Null,
+                    "conflict": unsettled
+                        .contains(file.path.as_str())
+                        .then(|| sentence.clone()),
                 })
             }));
             let mut actor = json!({
@@ -187,6 +221,13 @@ pub(crate) fn plan_json(
                 && let Some(object) = actor.as_object_mut()
             {
                 object.insert("files_unreadable".to_string(), json!(true));
+            }
+            // The same for an actor whose conflicts could not be read: a fold
+            // of them refuses, and the plan says why before anyone answers.
+            if standing.unreadable.contains(&held.actor)
+                && let Some(object) = actor.as_object_mut()
+            {
+                object.insert("conflicts_unreadable".to_string(), json!(true));
             }
             actor
         })
@@ -262,6 +303,43 @@ pub(crate) fn contested_addresses(drafts: &[ActorDrafts]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// The refusal of a fold while drafts that do not fit the team's text stand,
+/// or `None` when every folding actor's drafts are settled.
+///
+/// Only the actors in `folding` are asked: discard ends a draft whatever it
+/// holds, so a colleague's conflict never blocks the others once discard is
+/// chosen for them. A name in `removed` has no account, so nobody can settle
+/// its conflicts and the sentence names the two ways out that are left.
+pub(crate) fn unsettled(
+    domain: &str,
+    folding: &[&ActorDrafts],
+    conflicts: &HashMap<String, Vec<DraftConflict>>,
+    removed: &HashSet<String>,
+) -> Option<String> {
+    let mut sentences = Vec::new();
+    for held in folding {
+        let Some(standing) = conflicts.get(&held.actor).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let actor = &held.actor;
+        let paths: Vec<&str> = standing.iter().map(|c| c.path.as_str()).collect();
+        let paths = paths.join(", ");
+        sentences.push(if removed.contains(actor) {
+            format!(
+                "'{actor}' has conflicts in {paths}. '{actor}' has no account any more, so \
+                 nobody can settle these. Choose discard, or end the drafts on the users screen."
+            )
+        } else {
+            format!(
+                "'{actor}' has conflicts in {paths}. They can settle them, or you can choose \
+                 discard, which ends their text."
+            )
+        });
+    }
+    (!sentences.is_empty())
+        .then(|| format!("Nothing in '{domain}' was folded. {}", sentences.join(" ")))
 }
 
 /// One choice per actor holding drafts, refusing an actor left out and an

@@ -604,7 +604,11 @@ impl Engine {
     /// **Taking it off** ends every actor's private drafts, so it is never
     /// decided by omission. [`ReviewModeConfirm::Preview`] answers the plan -
     /// who holds what, which drafts are deletions, which paths more than one
-    /// actor is drafting and which drafts could not land - and writes nothing.
+    /// actor is drafting, which drafts could not land and which do not fit the
+    /// team's text - and folds nothing. Both ways first run the convergence
+    /// pass, so a draft the team's change merges into is merged before anyone
+    /// reads the plan or folds; a draft that still does not fit refuses its
+    /// actor's fold, which discard does not need.
     /// [`ReviewModeConfirm::Confirmed`] carries one [`FoldChoice`] per actor
     /// holding drafts: an actor left out refuses naming them, and an actor named
     /// who holds nothing refuses too, because both are somebody meaning a
@@ -796,6 +800,15 @@ impl Engine {
                 )
                 .await?
         };
+        // The pass first, for the plan and the fold alike, while the domain
+        // still reviews: a stale draft that merges is merged now, so the fold
+        // lands the team's line beside hers rather than over it. A failed pass
+        // stays a warning, as it does before a share: the check below reads
+        // what stands, so a stale draft still refuses. With the key already off
+        // (the mid-fold recovery) the pass does nothing.
+        if let Err(e) = self.converge_overlays(domain).await {
+            tracing::warn!("converging the drafts in '{domain}' before leaving review failed: {e}");
+        }
         let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
         let base = {
             let store = self.store.lock().await;
@@ -804,7 +817,38 @@ impl Engine {
 
         let choices = match &confirm {
             ReviewModeConfirm::Preview => {
-                return Ok(review::plan_json(domain, entry, &drafts, &base));
+                // A list that cannot be read is reported on its actor, never
+                // read as clean (C1): the fold of that actor refuses.
+                let mut conflicts = HashMap::new();
+                let mut unreadable = HashSet::new();
+                for held in &drafts {
+                    match self.draft_conflicts(domain, &held.actor).await {
+                        Ok(found) => {
+                            conflicts.insert(held.actor.clone(), found);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                domain,
+                                actor = held.actor.as_str(),
+                                "the conflicts of '{}' could not be read: {e}",
+                                held.actor
+                            );
+                            unreadable.insert(held.actor.clone());
+                        }
+                    }
+                }
+                let viewer = crate::scope::overlay_actor(scope);
+                return Ok(review::plan_json(
+                    domain,
+                    entry,
+                    &drafts,
+                    &base,
+                    &review::PlanConflicts {
+                        conflicts: &conflicts,
+                        unreadable: &unreadable,
+                        viewer: viewer.as_deref(),
+                    },
+                ));
             }
             ReviewModeConfirm::Confirmed { folds } => folds,
         };
@@ -824,6 +868,9 @@ impl Engine {
             .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
             .collect();
         if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
+            return Err(EngineError::Conflict(refusal));
+        }
+        if let Some(refusal) = self.unsettled_folds(domain, &folding).await? {
             return Err(EngineError::Conflict(refusal));
         }
 
@@ -909,6 +956,7 @@ impl Engine {
         // their sockets and nothing else: the key goes back on, no file is
         // written and no row is dropped, so the same call works once one of the
         // two engrams has an address of its own.
+        self.run_fold_recheck_hook();
         let base = {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
@@ -924,6 +972,23 @@ impl Engine {
                  closed, so nothing was folded and the domain reviews changes again; what those \
                  rooms saved is in the folder now, which `origin status` lists as out-of-band work"
             )));
+        }
+        // And her drafts asked again, of the snapshot as it stands now: a pull
+        // in that window can make a draft stale, and with the key off no pass
+        // merges it. This list does not ask the key. Its refusal, or a list
+        // that cannot be read, puts the key back as the address check does.
+        let unsettled = match self.unsettled_folds(domain, &folding).await {
+            Ok(None) => None,
+            Ok(Some(refusal)) => Some(EngineError::Conflict(format!(
+                "{refusal} This changed while the co-editing rooms were being closed, and the \
+                 domain reviews changes again. What those rooms saved is in the folder now, \
+                 which `origin status` lists as out-of-band work."
+            ))),
+            Err(e) => Some(e),
+        };
+        if let Some(refusal) = unsettled {
+            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+            return Err(refusal);
         }
 
         // A folded MANIFEST draft may move the switch.
@@ -1051,6 +1116,40 @@ impl Engine {
         synced?;
 
         Ok(review::left_json(domain, folded, discarded, rooms_closed))
+    }
+
+    /// The fold's refusal while a folding actor holds drafts that do not fit
+    /// the team's text, read fresh from what stands. A list that cannot be read
+    /// is an error, never a clean answer (C1).
+    ///
+    /// A name is removed when the accounts store holds no account under it and
+    /// it is not the machine owner's. With no accounts store, as on the CLI or
+    /// a test engine, no name is removed.
+    async fn unsettled_folds(
+        &self,
+        domain: &str,
+        folding: &[&ActorDrafts],
+    ) -> Result<Option<String>> {
+        let mut conflicts = HashMap::new();
+        let mut removed = HashSet::new();
+        for held in folding {
+            let found = self.draft_conflicts(domain, &held.actor).await?;
+            if found.is_empty() {
+                continue;
+            }
+            if held.actor != OWNER_IDENTITY_NAME
+                && let Some(access) = self.domain_access.get()
+                && access
+                    .account_born(&held.actor)
+                    .await
+                    .map_err(|e| EngineError::Internal(e.to_string()))?
+                    .is_none()
+            {
+                removed.insert(held.actor.clone());
+            }
+            conflicts.insert(held.actor.clone(), found);
+        }
+        Ok(review::unsettled(domain, folding, &conflicts, &removed))
     }
 
     /// Land one folding actor's files in the folder the team shares, answering

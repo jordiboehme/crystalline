@@ -2391,3 +2391,509 @@ async fn a_merged_resolve_tells_the_caller_when_its_mirror_failed() {
     assert!(receipt["draft_warning"].is_string(), "{receipt}");
     assert_eq!(f.row("renamed.md").await, merged);
 }
+
+// --- leaving review refuses a draft that cannot be merged --------------------
+
+/// The fold's sentence for a person whose conflicts stand.
+fn unsettled_of(actor: &str, paths: &str) -> String {
+    format!(
+        "'{actor}' has conflicts in {paths}. They can settle them, or you can choose discard, \
+         which ends their text."
+    )
+}
+
+/// The fold's sentence for a name with no account any more.
+fn unsettled_of_removed(actor: &str) -> String {
+    format!(
+        "'{actor}' has no account any more, so nobody can settle these. Choose discard, or end \
+         the drafts on the users screen."
+    )
+}
+
+fn bob() -> Scope {
+    Scope::User {
+        account: "bob".to_string(),
+        admin: false,
+    }
+}
+
+impl Fixture {
+    /// Leave review with these answers, as the domain's owner.
+    async fn fold(
+        &self,
+        answers: &[(&str, FoldChoice)],
+    ) -> Result<serde_json::Value, crystalline_service::engine::EngineError> {
+        self.engine
+            .set_review_mode(
+                "team",
+                None,
+                ReviewModeConfirm::Confirmed {
+                    folds: answers
+                        .iter()
+                        .map(|(actor, choice)| ((*actor).to_string(), *choice))
+                        .collect(),
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+    }
+
+    /// The plan of leaving review, as `scope` asks for it.
+    async fn plan(&self, scope: &Scope) -> serde_json::Value {
+        self.engine
+            .set_review_mode("team", None, ReviewModeConfirm::Preview, scope)
+            .await
+            .unwrap()
+    }
+
+    /// Whether the config file still says the domain reviews changes.
+    fn reviews(&self) -> bool {
+        let text = std::fs::read_to_string(self.root.join("config.yaml")).unwrap();
+        let cfg: GlobalConfig = serde_yaml_ng::from_str(&text).unwrap();
+        cfg.domains["team"].review.is_some()
+    }
+
+    /// What the folder the team shares holds at `path`.
+    fn folder(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(self.root.join("team").join(path)).ok()
+    }
+
+    /// The names the folder lists, spelled as the disk keeps them.
+    fn listed(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.root.join("team"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.ends_with(".md") && !["MANIFEST.md", "index.md"].contains(&name.as_str())
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Alice changes the plan's first line, and the team changes the same line
+    /// with no pull and no pass: a conflict nothing has looked at yet.
+    async fn a_stale_conflict(&self) {
+        self.replace("plan", "the first line", "alice's first line")
+            .await;
+        self.team_has("plan.md", bobs(LONG).as_bytes());
+    }
+
+    /// An accounts store with no account in it, so every name but the
+    /// machine owner's is a removed one.
+    async fn no_accounts(&self) -> Arc<crystalline_service::rest::AuthStore> {
+        let auth = Arc::new(
+            crystalline_service::rest::AuthStore::open(&self.root.join("web-auth.db"))
+                .await
+                .unwrap(),
+        );
+        self.engine
+            .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(
+                auth.clone(),
+            )));
+        auth
+    }
+}
+
+/// The fold runs the pass first, so a stale edit that merges lands with the
+/// team's line beside hers.
+#[tokio::test]
+async fn a_fold_of_a_stale_edit_that_merges_lands_both_lines() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+
+    let plan = f.plan(&Scope::Unrestricted).await;
+    assert_eq!(
+        plan["actors"][0]["drafts"][0]["conflict"],
+        serde_json::Value::Null,
+        "{plan}"
+    );
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    let landed = f.folder("plan.md").unwrap();
+    assert!(
+        landed.contains(BOB_LINE) && landed.contains(HER_LINE),
+        "{landed}"
+    );
+    assert!(!f.reviews());
+}
+
+#[tokio::test]
+async fn a_fold_of_a_conflict_refuses_and_changes_nothing() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_stale_conflict().await;
+    let hers = f.row("plan.md").await;
+    let start = f.start("plan.md");
+
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Nothing in 'team' was folded. {}",
+            unsettled_of("alice", "plan.md")
+        ),
+        "refused before the key came off"
+    );
+    assert!(f.reviews(), "the key is still on");
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.row("plan.md").await, hers);
+    assert_eq!(f.start("plan.md"), start);
+    assert_eq!(
+        f.folder("plan.md"),
+        Some(bobs(LONG)),
+        "the folder is unchanged"
+    );
+}
+
+/// The plan names the conflict on her row: to the owner as hers, and to her as
+/// her own.
+#[tokio::test]
+async fn a_fold_plan_names_the_conflict_on_the_row() {
+    let f = fixture(&[("plan.md", LONG), ("note.md", NOTE)]).await;
+    f.a_stale_conflict().await;
+    f.delete("note").await;
+    f.team_has(
+        "note.md",
+        NOTE.replace("team body", "bob's body").as_bytes(),
+    );
+
+    let plan = f.plan(&Scope::Unrestricted).await;
+    let rows = &plan["actors"][0]["drafts"];
+    assert_eq!(rows[0]["path"], "note.md", "{plan}");
+    assert_eq!(
+        rows[0]["conflict"], "alice has a conflict here. Ask them to settle it, or choose discard.",
+        "a deletion stands too: {plan}"
+    );
+    assert_eq!(rows[1]["path"], "plan.md", "{plan}");
+    assert_eq!(
+        rows[1]["conflict"], "alice has a conflict here. Ask them to settle it, or choose discard.",
+        "{plan}"
+    );
+
+    let own = Scope::User {
+        account: "alice".to_string(),
+        admin: true,
+    };
+    let plan = f.plan(&own).await;
+    assert_eq!(
+        plan["actors"][0]["drafts"][1]["conflict"], "You have a conflict here. Settle it first.",
+        "{plan}"
+    );
+
+    // A move lists once, at its draft, and both its rows carry the sentence.
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_move_in_conflict("renamed.md").await;
+    let plan = f.plan(&Scope::Unrestricted).await;
+    let rows = &plan["actors"][0]["drafts"];
+    for row in [0, 1] {
+        assert_eq!(
+            rows[row]["conflict"],
+            "alice has a conflict here. Ask them to settle it, or choose discard.",
+            "{plan}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fold_of_an_unedited_move_lands_the_peers_line_on_either_disk() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.moved("plan", "renamed.md").await;
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    assert_eq!(f.listed(), vec!["renamed.md".to_string()]);
+    assert_eq!(f.folder("renamed.md"), Some(bobs(LONG)));
+}
+
+/// Asserted per disk: a disk that does not fold case lands her spelling with
+/// the team's line, and one that folds keeps one file with the team's line.
+#[tokio::test]
+async fn a_fold_of_an_unedited_case_move_lands_her_spelling_on_a_case_sensitive_disk() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    let folds = folds_case(&f.root);
+    eprintln!("the temp folder folds case: {folds}");
+    f.moved("plan", "Plan.md").await;
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    let listed = f.listed();
+    if folds {
+        assert_eq!(listed.len(), 1, "{listed:?}");
+    } else {
+        assert_eq!(listed, vec!["Plan.md".to_string()]);
+    }
+    assert_eq!(f.folder(&listed[0]), Some(bobs(LONG)));
+}
+
+#[tokio::test]
+async fn a_fold_of_a_stale_delete_refuses_and_the_file_stays() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.delete("plan").await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&unsettled_of("alice", "plan.md")),
+        "{refused}"
+    );
+    assert!(f.reviews());
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(f.folder("plan.md").as_deref(), Some(PLAN_LATER));
+}
+
+#[tokio::test]
+async fn discard_still_works_on_a_conflict() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_stale_conflict().await;
+
+    f.fold(&[("alice", FoldChoice::Discard)]).await.unwrap();
+    assert!(!f.reviews());
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+}
+
+/// The second check, after the rooms have closed with the key off. A room's own
+/// save lands in the folder there and is no draft, so what makes her draft
+/// stale in that window is the team's change arriving with it, which the seam
+/// stands in for. The refusal puts the key back, as the address check does.
+#[tokio::test]
+async fn a_room_that_saves_into_a_conflict_during_the_fold_puts_the_key_back() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    let hers = f.row("plan.md").await;
+    let (folder, snapshot) = (f.root.join("team"), f.snapshot_dir());
+    f.engine.before_next_fold_recheck(Box::new(move || {
+        let bytes = bobs(LONG).into_bytes();
+        std::fs::write(folder.join("plan.md"), &bytes).unwrap();
+        let mut state = OriginState::load(&snapshot).unwrap().unwrap();
+        state.files.insert(
+            "plan.md".to_string(),
+            BaseStamp {
+                sha256: crate::support::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+            },
+        );
+        write_base_file(&snapshot, "plan.md", &bytes).unwrap();
+        state.save(&snapshot).unwrap();
+    }));
+
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let words = refused.to_string();
+    assert!(words.contains(&unsettled_of("alice", "plan.md")), "{words}");
+    assert!(
+        words.contains("the domain reviews changes again"),
+        "{words}"
+    );
+    assert!(words.contains("out-of-band work"), "{words}");
+    assert!(f.reviews(), "the key is back on");
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.row("plan.md").await, hers);
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+}
+
+/// A fold that failed part way leaves the key off and her rows standing. The
+/// repeat still asks for conflicts, though no pass runs with the key off.
+#[tokio::test]
+async fn a_mid_fold_recovery_still_refuses_a_conflict() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("sub".to_string()),
+                ..write_params("Fresh", "her new page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    // A file where the folder `sub` has to go, so the fold fails after the plan.
+    std::fs::write(f.root.join("team").join("sub"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(!f.reviews(), "the half-state: the key is off");
+    assert_eq!(f.rows().await.len(), 2);
+
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+    std::fs::remove_file(f.root.join("team").join("sub")).unwrap();
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&unsettled_of("alice", "plan.md")),
+        "{refused}"
+    );
+    assert_eq!(f.rows().await.len(), 2);
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+}
+
+#[tokio::test]
+async fn a_removed_names_conflict_refuses_the_fold_with_its_two_ways_out() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_stale_conflict().await;
+    let _auth = f.no_accounts().await;
+
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let words = refused.to_string();
+    assert!(words.contains(&unsettled_of_removed("alice")), "{words}");
+    assert!(f.reviews());
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+
+    f.fold(&[("alice", FoldChoice::Discard)]).await.unwrap();
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+    assert_eq!(f.rows().await, vec![]);
+}
+
+#[tokio::test]
+async fn ending_a_removed_names_drafts_takes_the_records_and_a_new_account_inherits_nothing() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_stale_conflict().await;
+    let auth = f.no_accounts().await;
+    assert!(f.start("plan.md").is_some());
+
+    f.engine
+        .discard_account_drafts("alice", "root")
+        .await
+        .unwrap();
+    assert_eq!(f.start("plan.md"), None);
+    assert!(
+        draft_start::all(&f.state, "team", "alice")
+            .unwrap()
+            .is_empty()
+    );
+
+    auth.add_user(
+        "alice",
+        "alice",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.conflicts().await, vec![]);
+    let plan = f.plan(&Scope::Unrestricted).await;
+    assert_eq!(plan["actors"], serde_json::json!([]), "{plan}");
+    f.fold(&[]).await.unwrap();
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+}
+
+/// A text kept from a removed name's draft is no draft: it never blocks a fold.
+#[tokio::test]
+async fn a_kept_text_of_a_removed_name_takes_no_part_in_a_conflict() {
+    let f = fixture(&[("plan.md", PLAN)]).await;
+    f.old_draft(
+        "plan.md",
+        &PLAN.replace("as the team has it", "her old words"),
+    )
+    .await;
+    f.team_has("plan.md", PLAN_LATER.as_bytes());
+    let receipt = f.resolve("plan.md", "theirs").await;
+    assert_eq!(receipt["kept_copy"], true, "{receipt}");
+    let _auth = f.no_accounts().await;
+    f.engine
+        .write_engram_as(&write_params("Bobs", "bob's page"), None, &bob())
+        .await
+        .unwrap();
+
+    assert_eq!(f.conflicts().await, vec![]);
+    f.fold(&[("bob", FoldChoice::Fold)]).await.unwrap();
+    assert_eq!(f.folder("plan.md").as_deref(), Some(PLAN_LATER));
+    assert!(f.folder("bobs.md").unwrap().contains("bob's page"));
+}
+
+/// Only the people who fold are asked: a colleague's conflict refuses the fold
+/// while he folds, and with discard chosen for him the others land.
+#[tokio::test]
+async fn a_colleagues_conflict_with_her_choice_discard_lets_the_others_fold() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_stale_conflict().await;
+    f.engine
+        .write_engram_as(&write_params("Bobs", "bob's page"), None, &bob())
+        .await
+        .unwrap();
+
+    let refused = f
+        .fold(&[("alice", FoldChoice::Fold), ("bob", FoldChoice::Fold)])
+        .await
+        .unwrap_err();
+    let words = refused.to_string();
+    assert!(words.contains(&unsettled_of("alice", "plan.md")), "{words}");
+    assert!(!words.contains("'bob'"), "{words}");
+    assert_eq!(f.folder("bobs.md"), None);
+
+    f.fold(&[("alice", FoldChoice::Discard), ("bob", FoldChoice::Fold)])
+        .await
+        .unwrap();
+    assert!(f.folder("bobs.md").unwrap().contains("bob's page"));
+    assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
+}
+
+/// C1: a record that cannot be read refuses the fold and changes nothing. The
+/// plan still answers, and says her conflicts could not be read.
+#[tokio::test]
+async fn a_fold_with_a_broken_record_refuses_and_changes_nothing() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
+    std::fs::write(&file, "not a record").unwrap();
+
+    let plan = f.plan(&Scope::Unrestricted).await;
+    assert_eq!(plan["actors"][0]["conflicts_unreadable"], true, "{plan}");
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(f.reviews());
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.folder("plan.md").as_deref(), Some(LONG));
+
+    f.fold(&[("alice", FoldChoice::Discard)]).await.unwrap();
+    assert_eq!(f.folder("plan.md").as_deref(), Some(LONG));
+}
+
+/// The machine owner has no account and is never a removed name: their
+/// conflict refuses with the way out a person has.
+#[tokio::test]
+async fn the_machine_owners_conflict_is_never_a_removed_names() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.engine
+        .edit_engram_as(
+            &EditParams {
+                operation: "find_replace".to_string(),
+                find_text: Some("the first line".to_string()),
+                ..edit_append("plan", "the owner's first line")
+            },
+            None,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+    let _auth = f.no_accounts().await;
+
+    let refused = f.fold(&[("owner", FoldChoice::Fold)]).await.unwrap_err();
+    let words = refused.to_string();
+    assert!(words.contains(&unsettled_of("owner", "plan.md")), "{words}");
+    assert!(!words.contains("no account"), "{words}");
+}
+
+/// C1 at the second check: a record that breaks while the rooms close refuses
+/// the fold, and the key goes back on with nothing folded.
+#[tokio::test]
+async fn a_record_broken_during_the_fold_puts_the_key_back() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
+    f.engine.before_next_fold_recheck(Box::new(move || {
+        std::fs::write(&file, "not a record").unwrap();
+    }));
+
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(f.reviews(), "the key is back on");
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.folder("plan.md").as_deref(), Some(LONG));
+}

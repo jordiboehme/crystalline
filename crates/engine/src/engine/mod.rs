@@ -1075,6 +1075,10 @@ pub struct Engine {
     // fails once. See `Engine::fail_next_half_settle`.
     #[cfg(any(test, feature = "testing"))]
     fail_next_half_settle: std::sync::atomic::AtomicBool,
+    // When armed, a fold runs this once after its rooms closed and before it
+    // asks again for conflicts. See `Engine::before_next_fold_recheck`.
+    #[cfg(any(test, feature = "testing"))]
+    before_next_fold_recheck: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     // When armed, the next resolution of a share's credential answers that the
     // caller connected no personal identity, once. See
     // `Engine::refuse_next_personal_credential`.
@@ -2562,6 +2566,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_half_settle: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            before_next_fold_recheck: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
             refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
@@ -2804,6 +2810,34 @@ impl Engine {
     pub fn fail_next_half_settle(&self) {
         self.fail_next_half_settle
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run `change` once in the next fold, after its rooms closed with the key
+    /// off and before it asks again for conflicts: the moment a pull can land
+    /// unseen by the first check. Nothing in the daemon, the CLI or the MCP
+    /// surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn before_next_fold_recheck(&self, change: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_next_fold_recheck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(change);
+    }
+
+    /// Run what [`Engine::before_next_fold_recheck`] armed, once. Does nothing
+    /// outside a test build.
+    pub(super) fn run_fold_recheck_hook(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let change = self
+                .before_next_fold_recheck
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(change) = change {
+                change();
+            }
+        }
     }
 
     /// Whether [`Engine::fail_next_half_settle`] is armed, consuming the arming.

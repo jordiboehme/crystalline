@@ -2737,9 +2737,11 @@ pub struct ReviewBody {
                    unshared in it already - each refused 409 naming what is in \
                    the way.\n\nmode `direct` takes review mode off and ends \
                    every private draft in the domain. WITHOUT a `folds` key \
-                   this answers the plan and writes nothing: each actor, their \
+                   this answers the plan and folds nothing: each actor, their \
                    drafts, which are deletions, which paths more than one of \
-                   them is drafting and which drafts have nowhere to land. \
+                   them is drafting, which drafts have nowhere to land and \
+                   which do not fit the team's text. Both ways first merge \
+                   each draft the team's change merges into, as a pull does. \
                    WITH a `folds` map it makes the change, and the map has to \
                    name every actor the plan named and nobody else - `fold` \
                    writes that actor's drafts into the folder, `discard` ends \
@@ -2748,7 +2750,8 @@ pub struct ReviewBody {
                    saying it has none, which is the question. Two \
                    folded actors at one path, or a folded draft whose address \
                    another engram already holds, refuse before anything is \
-                   written.\n\nAsking for a mode the domain already has changes \
+                   written, and so does a folded draft that does not fit the \
+                   team's text: its author settles it, or discard ends it.\n\nAsking for a mode the domain already has changes \
                    nothing and answers the same way.",
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = ReviewBody,
