@@ -73,17 +73,24 @@ async function openFigure(page: Page, index: number): Promise<void> {
   const figure = page.locator('figure[aria-label="Diagram"]').nth(index);
   await figure.scrollIntoViewIfNeeded();
   await expect(figure.locator('svg[id^="mermaid-"]').first()).toBeVisible();
+  const dialog = page.getByRole("dialog");
   // Twice if need be: figures above this one are still drawing, and when one
   // arrives this one moves out from under the pointer and its toolbar hides.
+  // A busy page can also report a click late that did open the window, so a
+  // try that finds the window open is done: hovering the figure under the
+  // modal would only fail until the test timed out. Bounded, so a click that
+  // never works fails here with its own reason.
   await expect(async () => {
-    await figure.hover();
+    if (await dialog.isVisible()) {
+      return;
+    }
+    await figure.hover({ timeout: 2000 });
     await figure
       .getByRole("button", { name: "Open in full window" })
       .click({ timeout: 2000 });
-  }).toPass();
-  await expect(
-    page.getByRole("dialog").locator('svg[id^="mermaid-"]'),
-  ).toBeVisible();
+  }).toPass({ timeout: 15_000 });
+  await expect(dialog.locator('svg[id^="mermaid-"]')).toBeVisible();
+  // The full window fits the drawing once its library has arrived.
   await expect(
     page.getByRole("button", { name: "Download PNG" }),
   ).toBeVisible();

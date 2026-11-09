@@ -18,6 +18,7 @@ import { tags } from "@lezer/highlight";
 
 import { codeLanguageFor } from "./codeLanguage";
 import { dialectGrammar } from "./dialectHighlight";
+import { mainShiftedZRedo } from "./undoStack";
 
 /**
  * Round-trip the document's own line endings. CodeMirror splits an incoming
@@ -274,6 +275,9 @@ export function baseExtensions(
   const ownHistory = options.history ?? true;
   return [
     ...(ownHistory ? [history()] : []),
+    // Mod+Shift+Z redoes on whichever stack the buffer has, also when the
+    // key arrives as a lower-case "z" (see `undoStack.ts`).
+    mainShiftedZRedo,
     search({ top: true }),
     keymap.of([
       ...defaultKeymap,
