@@ -203,7 +203,7 @@ pub async fn list(
         (
             status = 422,
             description = "The kept copy is a file, not text. The detail says \
-                           where it is.",
+                           so in a sentence to show.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

@@ -1,6 +1,6 @@
 /**
- * A kept copy that is a file, not text: the dialog says so and where it is,
- * in the server's own sentence, and offers no text to copy.
+ * A kept copy that is a file, not text: the dialog says so in the server's
+ * own sentence, and offers no text to copy.
  */
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -18,7 +18,7 @@ vi.mock("../api/client", async (importOriginal) => {
 const apiMock = vi.mocked(api);
 
 const SENTENCE =
-  "This kept copy is a file, not text. It is at /state/kept/team/draft/alice/engram/assets/deck.png.20261109T080000Z.md.";
+  "This kept copy is a file, not text. Download it from the kept list.";
 
 function entry(): KeptTextEntry {
   return {

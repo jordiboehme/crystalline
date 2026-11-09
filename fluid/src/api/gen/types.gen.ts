@@ -4651,7 +4651,7 @@ export type ReadKeptTextErrors = {
      */
     404: ProblemDetail;
     /**
-     * The kept copy is a file, not text. The detail says where it is.
+     * The kept copy is a file, not text. The detail says so in a sentence to show.
      */
     422: ProblemDetail;
 };

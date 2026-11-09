@@ -4881,10 +4881,7 @@ async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
     assert!(matches!(err, EngineError::Invalid(_)), "{err}");
     assert_eq!(
         err.to_string(),
-        format!(
-            "This kept copy is a file, not text. It is at {}.",
-            listed[0].file.display()
-        )
+        "This kept copy is a file, not text. Download it from the kept list."
     );
 }
 

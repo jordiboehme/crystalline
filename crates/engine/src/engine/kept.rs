@@ -56,6 +56,11 @@ impl KeptRights {
     }
 }
 
+/// What a reader of the kept texts over the API is told of a kept copy that is
+/// a file, not text. The CLI names the file's place on disk instead.
+pub const KEPT_FILE_NOT_TEXT: &str =
+    "This kept copy is a file, not text. Download it from the kept list.";
+
 impl Engine {
     /// The kept texts of `domain` that `scope` may handle, oldest first.
     /// [`EngineError::Forbidden`] when it may handle neither kind, and the
@@ -76,9 +81,10 @@ impl Engine {
     ) -> Result<(KeptText, String)> {
         let found = self.kept_entry(domain, id, scope).await?;
         let text = kept::read(&found).map_err(|source| {
-            // A draft file kept as its bytes: say so and where it is.
+            // A draft file kept as its bytes: say so, without the server's own
+            // path, which a caller over the API cannot open.
             if source.kind() == std::io::ErrorKind::InvalidData {
-                EngineError::Invalid(kept::not_text(&found))
+                EngineError::Invalid(KEPT_FILE_NOT_TEXT.to_string())
             } else {
                 EngineError::Io {
                     path: found.file.display().to_string(),
