@@ -228,6 +228,26 @@ describe("moving through the stops", () => {
     expect(active()?.getAttribute("aria-label")).toBe("Box: First step");
   });
 
+  it("off a Mac, leaves Meta with Up, Down and Backspace alone (R111)", async () => {
+    const view = await onCanvas();
+    press("ArrowRight");
+    const event = (key: string) => {
+      const sent = new KeyboardEvent("keydown", {
+        key,
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      active()?.dispatchEvent(sent);
+      return sent.defaultPrevented;
+    };
+    expect(event("ArrowDown")).toBe(false);
+    expect(event("ArrowUp")).toBe(false);
+    expect(event("Backspace")).toBe(false);
+    expect(active()?.getAttribute("aria-label")).toBe("Box: First step");
+    expect(text(view)).toBe(DOC);
+  });
+
   it("stays at the ends", async () => {
     const view = await onCanvas();
     press("ArrowLeft");

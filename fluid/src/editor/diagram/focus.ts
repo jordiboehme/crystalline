@@ -36,6 +36,7 @@ import {
   showPanel,
 } from "@codemirror/view";
 
+import { isMac, isMenuKey } from "../../platform";
 import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
 import { dispatchIsolated, roomUndo } from "../roomUndo";
@@ -588,6 +589,42 @@ const WALK_KEYS = new Set([
   "End",
 ]);
 
+/**
+ * A Mac's own key for a stop key, read as that key: Cmd+Up and Cmd+Down for Home
+ * and End, which need fn on a MacBook, and Cmd+Backspace for Backspace, the
+ * Finder's delete (R111). Null off a Mac and for any other key. Cmd+Left and
+ * Cmd+Right stay the browser's, as Safari's Back and Forward.
+ */
+function macStopKey(event: KeyboardEvent): string | null {
+  if (
+    !isMac() ||
+    !event.metaKey ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.shiftKey
+  ) {
+    return null;
+  }
+  switch (event.key) {
+    case "ArrowUp":
+      return "Home";
+    case "ArrowDown":
+      return "End";
+    case "Backspace":
+      return "Backspace";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Whether the browser sends a `contextmenu` event after this menu key. Shift+F10
+ * and the menu key do; a Mac's Ctrl+Return is ours alone and sends none.
+ */
+function sendsContextMenu(event: KeyboardEvent): boolean {
+  return event.key === "ContextMenu" || event.key === "F10";
+}
+
 function isUndoKey(event: KeyboardEvent): boolean {
   return (event.metaKey || event.ctrlKey) && /^[zy]$/i.test(event.key);
 }
@@ -790,11 +827,18 @@ function onKey(
   if (moveKey(event)) {
     return onMoveKey(main, host, from, event);
   }
-  if (event.ctrlKey || event.metaKey || event.altKey) {
+  // Before the modifier test: Ctrl+Return is a Mac's menu key, and Cmd+Up,
+  // Cmd+Down and Cmd+Backspace are its first, last and delete (R111).
+  const menu = isMenuKey(event);
+  const macKey = macStopKey(event);
+  if (
+    !menu &&
+    macKey === null &&
+    (event.ctrlKey || event.metaKey || event.altKey)
+  ) {
     return false;
   }
-  const { key } = event;
-  const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+  const key = macKey ?? event.key;
   if (event.shiftKey && !menu) {
     return false;
   }
@@ -828,7 +872,10 @@ function onKey(
   // Waiting for its box: a walk or a choice, and no other key takes anything.
   if (connecting && (menu || remove || key === "F2")) {
     // By reading only: on Windows that key's `contextmenu` comes after its keyup.
-    keyMenuOwed.add(main);
+    // A Mac's Ctrl+Return sends none, so nothing is owed for it.
+    if (menu && sendsContextMenu(event)) {
+      keyMenuOwed.add(main);
+    }
     return true;
   }
   // A peer's edit moved the stop here, and this key was meant for the arrow (R102).
@@ -1150,17 +1197,18 @@ const focusPlugin = ViewPlugin.fromClass(
       const { view } = this;
       const active = view.root.activeElement;
       const move = moveKey(event);
+      // Read before the modifier test, as `onKey` reads them (R111).
+      const menu = isMenuKey(event);
+      const macKey = macStopKey(event);
       if (
         (active !== null && active !== view.dom.ownerDocument.body) ||
-        event.ctrlKey ||
-        event.metaKey ||
+        ((event.ctrlKey || event.metaKey) && !menu && macKey === null) ||
         (event.altKey && !move) ||
         event.isComposing
       ) {
         return;
       }
-      const { key } = event;
-      const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+      const key = macKey ?? event.key;
       if (
         (event.shiftKey && !menu) ||
         !(move || menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))

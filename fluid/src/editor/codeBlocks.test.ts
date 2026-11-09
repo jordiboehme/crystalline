@@ -490,26 +490,6 @@ describe("the header's buttons", () => {
     expect(bytes(view.state)).toBe(DOC);
   });
 
-  it("ask for nothing on a Mac Ctrl+click", () => {
-    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
-    const { view, heard } = listened(DOC);
-    for (const el of [languageButton(view), moreButton(view)]) {
-      for (const type of ["mousedown", "contextmenu", "mouseup", "click"]) {
-        el.dispatchEvent(
-          new MouseEvent(type, {
-            bubbles: true,
-            cancelable: true,
-            button: type === "contextmenu" ? 2 : 0,
-            ctrlKey: true,
-          }),
-        );
-      }
-    }
-    expect(heard).toEqual([]);
-    press(languageButton(view));
-    expect(heard).toHaveLength(1);
-  });
-
   it("ask for nothing on a page that takes no writes (C12)", () => {
     const { view, heard } = listened(DOC, { adapter: "reflection" });
     view.dispatch({

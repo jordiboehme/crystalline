@@ -36,6 +36,7 @@ import {
   tableMoveColumn,
   tableMoveRow,
 } from "../tableVerbs";
+import { isMenuKey } from "../../platform";
 import { activeCell, noteUndoLanding } from "./cellEditor";
 import { closeUndoGroup } from "./gridKeys";
 import {
@@ -721,9 +722,8 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
 
   root.addEventListener("keydown", (event) => {
     if (event.defaultPrevented || event.isComposing) return;
-    const menuKey =
-      event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey);
-    if (!menuKey || !gridWritable(main.state)) return;
+    // Shift+F10, the menu key, and on a Mac Ctrl+Return (R111).
+    if (!isMenuKey(event) || !gridWritable(main.state)) return;
     const el = cellOf(event.target);
     if (!el) return;
     event.preventDefault();

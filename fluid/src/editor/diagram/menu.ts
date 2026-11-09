@@ -15,6 +15,8 @@
  * elsewhere leaves it there.
  */
 
+import { isMenuKey } from "../../platform";
+
 export interface MenuItem {
   label: string;
   run?: () => void;
@@ -299,15 +301,19 @@ export function openMenu(
     if (event.isComposing || event.keyCode === 229) {
       return;
     }
-    if (event.ctrlKey || event.metaKey || event.altKey) {
+    const { key } = event;
+    // A menu key on an open menu opens no second one. Read before the modifier
+    // test: a Mac's menu key is Ctrl+Return (R111).
+    const opener =
+      isMenuKey(event) ||
+      (key === "F10" && !event.ctrlKey && !event.metaKey && !event.altKey);
+    if (!opener && (event.ctrlKey || event.metaKey || event.altKey)) {
       return;
     }
     const row = doc.activeElement;
     if (!(row instanceof HTMLElement) || !inside(row)) {
       return;
     }
-    const { key } = event;
-    const opener = key === "F10" || key === "ContextMenu";
     if (
       !opener &&
       key !== "Tab" &&

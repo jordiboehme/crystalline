@@ -55,6 +55,7 @@ import {
   markModeChanged,
   marksHiddenOnLine,
 } from "./marks/mode";
+import { isMac, isMenuKey } from "../platform";
 import { judgeBeforeCommand } from "./marks/commandJudge";
 import { roomUndo } from "./roomUndo";
 import { insertMarkdownLink } from "./toolbar";
@@ -88,7 +89,7 @@ export type ElementEdit =
  * drawn element acts on the press (no write, no popover, no new tab).
  */
 export function macMenuClick(event: MouseEvent): boolean {
-  return event.ctrlKey && /Mac/.test(navigator.platform);
+  return event.ctrlKey && isMac();
 }
 
 /** Where the element a request names starts. */
@@ -602,15 +603,13 @@ function openAtCaret(view: EditorView): boolean {
 }
 
 /**
- * Shift+F10 and the context-menu key: the popover of the element at the
- * caret. With none there the key goes on (in a table cell, to Part 1's Cell
- * actions; in prose, to the browser).
+ * Shift+F10, the context-menu key, and on a Mac Ctrl+Return (`isMenuKey`, R111):
+ * the popover of the element at the caret. With none there the key goes on (in
+ * a table cell, to Part 1's Cell actions; in prose, to the browser). On a Mac
+ * Ctrl+Return is no task flip, as that is Cmd+Return there.
  */
 export const elementMenuKey: Extension = Prec.highest(
-  keymap.of([
-    { key: "Shift-F10", run: openAtCaret },
-    { key: "ContextMenu", run: openAtCaret },
-  ]),
+  keymap.of([{ any: (view, event) => isMenuKey(event) && openAtCaret(view) }]),
 );
 
 /** Said when no link can go where Mod-k or the Link button asked for one. */

@@ -11,18 +11,19 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
 import { HANDBOOK_URL } from "../handbook";
+import { keyLabel } from "../platform";
 import type { HelpOverlayProps } from "./HelpOverlay";
 
-/** The map itself: what to press, and what it does. */
+/** The map itself: what to press, and what it does, named as this keyboard names it. */
 const SHORTCUTS: { keys: string; does: string }[] = [
-  { keys: "Cmd/Ctrl K", does: "Command palette" },
+  { keys: keyLabel("Mod-k"), does: "Command palette" },
   { keys: "?", does: "This help" },
   { keys: "\\", does: "Full width for the content" },
-  { keys: "Cmd/Ctrl S", does: "Save (in the editor)" },
-  { keys: "Cmd/Ctrl F", does: "Find in the document (in the editor)" },
-  { keys: "Cmd/Ctrl B", does: "Bold (in the editor)" },
-  { keys: "Cmd/Ctrl I", does: "Italic (in the editor)" },
-  { keys: "Esc", does: "Close dialogs and menus" },
+  { keys: keyLabel("Mod-s"), does: "Save (in the editor)" },
+  { keys: keyLabel("Mod-f"), does: "Find in the document (in the editor)" },
+  { keys: keyLabel("Mod-b"), does: "Bold (in the editor)" },
+  { keys: keyLabel("Mod-i"), does: "Italic (in the editor)" },
+  { keys: keyLabel("Escape"), does: "Close dialogs and menus" },
 ];
 
 export default function HelpOverlayBody({

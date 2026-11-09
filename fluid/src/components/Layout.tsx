@@ -123,6 +123,7 @@ import { ShatterGem } from "./ShatterGem";
 import { ownedPhrase, shareBadgeCount } from "./changes";
 import { Loading, ReadyFlash } from "./Loading";
 import { Chip, FOCUS_RING, IconButton, SIDE, Tooltip } from "./primitives";
+import { keyLabel } from "../platform";
 import { SidebarStateContext, useSidebarState } from "./sidebarState";
 import type { SidebarCreate, SidebarState } from "./sidebarState";
 
@@ -134,14 +135,10 @@ const NewReflectionDialog = lazyChunk(() =>
 );
 
 /**
- * What the command palette's shortcut is called on this keyboard.
- *
- * The palette answers to both modifiers, so this only decides which one to
- * name, and it names the one this keyboard has.
+ * What the command palette's shortcut is called on this keyboard: "⌘K" on a
+ * Mac, "Ctrl+K" elsewhere.
  */
-const PALETTE_HINT = /Mac|iPhone|iPad/.test(navigator.userAgent)
-  ? "⌘K"
-  : "Ctrl K";
+const PALETTE_HINT = keyLabel("Mod-k");
 
 /**
  * Where the sidebar's width is remembered. Its two values are "rail" and

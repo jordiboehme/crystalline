@@ -38,6 +38,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactElement } from "react";
 
+import { isMac } from "../platform";
 import { Loading } from "./Loading";
 import { lazyPart } from "./lazyPart";
 
@@ -83,12 +84,13 @@ export function CommandPalette(): ReactElement | null {
       // Mod-k opens its Link popover and prevents the default, and the
       // palette opening over it would take the focus and close it again.
       //
-      // Either modifier: one keyboard has a Cmd key and the other does not,
-      // and a reader should not have to know which one this app was built on.
+      // Either modifier off a Mac, so a reader need not know which one this
+      // app was built on. On a Mac Cmd+K only: Ctrl+K there deletes to the
+      // end of the line in a text field (R111).
       if (
         event.defaultPrevented ||
         event.key.toLowerCase() !== "k" ||
-        !(event.metaKey || event.ctrlKey)
+        !(event.metaKey || (event.ctrlKey && !isMac()))
       ) {
         return;
       }
