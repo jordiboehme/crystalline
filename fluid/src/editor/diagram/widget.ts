@@ -351,7 +351,9 @@ export const firstDrawHold = ViewPlugin.define((view) => ({
     if (line === null) {
       return;
     }
-    const text = line.textContent;
+    // Where the line is in the document: CodeMirror's sync below still has the
+    // old one, the changes take it to the new.
+    const at = update.changes.mapPos(view.posAtDOM(line, 0));
     const offset =
       line.getBoundingClientRect().top - view.dom.getBoundingClientRect().top;
     view.requestMeasure({
@@ -366,27 +368,39 @@ export const firstDrawHold = ViewPlugin.define((view) => ({
               windowTop + ANCHOR_REACH_PX
           );
         });
+        // A box shorter than its source at the document's end: the browser
+        // clamped the scroll in this layout, and that is in the editor's top.
+        const atEnd =
+          scroller.scrollTop >=
+          scroller.scrollHeight - scroller.clientHeight - 1;
         // The editor's top before any scroll of the pass: the person's is in it.
-        return { above, editorTop: view.dom.getBoundingClientRect().top };
+        return {
+          above,
+          atEnd,
+          editorTop: view.dom.getBoundingClientRect().top,
+        };
       },
-      write: ({ above, editorTop }) => {
+      write: ({ above, atEnd, editorTop }) => {
         if (!above || scrollAsks.has(view)) {
           return;
         }
-        // After the pass, and after a landing's own step in it.
+        // After the pass, and after a landing's own step in it: `settleScroll`
+        // is queued in a write of the same pass, so it is ahead of the first
+        // hop, and the second hop runs after it. The two depend on each other:
+        // run this first and `settleScroll` reads its scroll as CodeMirror's.
         queueMicrotask(() => {
           queueMicrotask(() => {
-            // CodeMirror reuses a line's element: the same text, or nothing.
+            // CodeMirror reuses a line's element, also for another line.
             if (
               !view.dom.isConnected ||
               !line.isConnected ||
-              line.textContent !== text
+              view.posAtDOM(line, 0) !== at
             ) {
               return;
             }
             const off = line.getBoundingClientRect().top - (editorTop + offset);
-            // CodeMirror leaves a pixel or less as it is.
-            if (Math.abs(off) >= 1) {
+            // CodeMirror leaves a pixel or less as it is; the clamp kept a shrink.
+            if (Math.abs(off) >= 1 && !(off < 0 && atEnd)) {
               scroller.scrollBy({ top: off, behavior: "instant" });
             }
           });
@@ -414,7 +428,8 @@ const settles = new WeakMap<EditorView, Settle>();
  * to a target, a scroll of CodeMirror's is its anchor step: it kept the line at
  * the window's top still through every change above it, a box wholly above
  * among them. It keeps a box across the top still itself, so the text under
- * that box is this step's in any case.
+ * that box is this step's in any case. `firstDrawHold` waits two microtasks so
+ * that it runs after this one: keep this a single hop from the pass's write.
  */
 function settleScroll(view: EditorView, settle: Settle): void {
   settles.delete(view);

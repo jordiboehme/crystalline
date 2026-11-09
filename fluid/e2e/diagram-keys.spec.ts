@@ -448,7 +448,18 @@ test("Ctrl+End racing the first draw of a fence above: the end stays in the wind
         requestAnimationFrame(() => requestAnimationFrame(resolve));
       }),
   );
-  const was = (await here.boundingBox())?.y ?? Number.NaN;
+  // The line's place in the editor less the page's scroll: what a person sees
+  // of the text, whatever moves the editor itself (the findings line above it
+  // comes in at no fixed time). The box growing above the line adds to the
+  // first part; only a scroll by the same amount keeps the sum.
+  const seen = () =>
+    here.evaluate(
+      (el) =>
+        el.getBoundingClientRect().top -
+        (el.closest(".cm-editor")?.getBoundingClientRect().top ?? Number.NaN) -
+        (document.scrollingElement?.scrollTop ?? Number.NaN),
+    );
+  const was = await seen();
   // Something above the editor grows after CodeMirror's last pass and before
   // the pass that measures the new box (as the findings line can, coming in),
   // so that pass keeps no anchor of its own.
@@ -470,8 +481,7 @@ test("Ctrl+End racing the first draw of a fence above: the end stays in the wind
   await page.waitForTimeout(500);
   // The box replaced its source above the window; the text in the window stays.
   await expect(here).toBeInViewport();
-  const now = (await here.boundingBox())?.y ?? Number.NaN;
-  expect(Math.abs(now - (was + ABOVE_PX))).toBeLessThanOrEqual(2);
+  expect(Math.abs((await seen()) - was)).toBeLessThanOrEqual(2);
 });
 
 /** A hit taken with main focused: the box stays drawn, the selection in its body. */

@@ -1570,6 +1570,8 @@ describe("a box first drawn above the window", () => {
   /** How far the page has scrolled since the fence was text. */
   let scrolled = 0;
   const LINE_PX = 20;
+  /** The box's height before its drawing, when not its estimate. */
+  let boxPx: number | null = null;
 
   function heightOf(el: Element): number {
     if (el.classList.contains("cm-mermaid-preview")) {
@@ -1579,9 +1581,12 @@ describe("a box first drawn above the window", () => {
     if (!el.classList.contains("cm-diagram")) {
       return LINE_PX;
     }
-    return el.querySelector("svg") === null
-      ? Number.parseFloat((el as HTMLElement).style.minHeight) || 0
-      : 374;
+    if (el.querySelector("svg") !== null) {
+      return 374;
+    }
+    return (
+      boxPx ?? (Number.parseFloat((el as HTMLElement).style.minHeight) || 0)
+    );
   }
 
   /**
@@ -1629,6 +1634,12 @@ describe("a box first drawn above the window", () => {
     person?: number;
     /** A scroll later in the same pass, after its writes, by CodeMirror. */
     pass?: number;
+    /** The page at its last scroll position. */
+    atEnd?: boolean;
+    /** Runs once the drawing update is over, before the measure pass. */
+    then?: (view: EditorView) => void;
+    /** The drawing lands right after the update, before the measure pass. */
+    land?: boolean;
   }
 
   /**
@@ -1638,19 +1649,21 @@ describe("a box first drawn above the window", () => {
    */
   async function create(
     editorTop: number,
-    { person = 0, pass = 0 }: Pass = {},
+    { person = 0, pass = 0, atEnd = false, then, land = false }: Pass = {},
   ) {
-    const scrollBy = vi.fn();
+    const scrollBy = vi.fn((options?: ScrollToOptions) => {
+      scrolled += options?.top ?? 0;
+    });
     // jsdom lays nothing out: a long page, not at its end.
     const page = document.documentElement;
-    page.scrollBy = scrollBy;
+    page.scrollBy = scrollBy as Element["scrollBy"];
     Object.defineProperty(document, "scrollingElement", {
       configurable: true,
       value: page,
     });
     Object.defineProperty(page, "scrollTop", {
       configurable: true,
-      value: 500,
+      value: atEnd ? 1_000 : 500,
     });
     Object.defineProperty(page, "scrollHeight", {
       configurable: true,
@@ -1684,6 +1697,7 @@ describe("a box first drawn above the window", () => {
           // Once the update is over: between it and the measure pass.
           queueMicrotask(() => {
             scrolled += person;
+            then?.(view);
           });
           ask({
             read: () => null,
@@ -1699,10 +1713,11 @@ describe("a box first drawn above the window", () => {
           });
         }
       });
+    kit.hold.value = !land;
     try {
       await settle(BODY);
-      expect(view.dom.querySelector(".cm-diagram svg")).toBeNull();
-      const growth = heightOf(box(view)) - 4 * LINE_PX;
+      expect(view.dom.querySelector(".cm-diagram svg") !== null).toBe(land);
+      const growth = land ? 0 : heightOf(box(view)) - 4 * LINE_PX;
       measured(view);
       await flush();
       return { scrollBy, growth };
@@ -1730,6 +1745,40 @@ describe("a box first drawn above the window", () => {
     const box = await create(-200, { pass: 106 });
     expect(box.growth).toBe(106);
     expect(box.scrollBy).not.toHaveBeenCalled();
+  });
+
+  it("leaves a box shorter than its source to the clamp at the document's end", async () => {
+    boxPx = 40;
+    try {
+      const { scrollBy, growth } = await create(-200, { atEnd: true });
+      expect(growth).toBe(-40);
+      expect(scrollBy).not.toHaveBeenCalled();
+    } finally {
+      boxPx = null;
+    }
+  });
+
+  it("leaves the text to a scroll target a later transaction asks for", async () => {
+    // A room's undo: its changes first, its scroll in a second transaction.
+    const { scrollBy } = await create(-200, {
+      then: (view) => {
+        // A line near the box, so the box stays in CodeMirror's viewport.
+        view.dispatch({
+          selection: { anchor: view.state.doc.line(8).from },
+          scrollIntoView: true,
+        });
+      },
+    });
+    expect(scrollBy).not.toHaveBeenCalled();
+  });
+
+  it("comes after a landing's own step in the same pass", async () => {
+    // The drawing lands before the pass: its step first (374 less the 186 px
+    // estimate), this one after it (the estimate less the source's 80 px).
+    const { scrollBy } = await create(-500, { land: true });
+    expect(scrollBy.mock.calls.map(([options]) => options?.top)).toEqual([
+      188, 106,
+    ]);
   });
 
   it("leaves a box first drawn in the window as it is", async () => {
