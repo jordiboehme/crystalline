@@ -675,6 +675,32 @@ describe("a message held by its place with a peer", () => {
     );
   });
 
+  it("Escape on a new message a peer changed meanwhile says nothing, and the stop is the canvas", async () => {
+    const { local, peer, sync } = await room(STARTER);
+    openMenuOn(local, CALLER);
+    choose("Add message to...");
+    await flush();
+    press("ArrowRight");
+    press("Enter");
+    await vi.waitFor(() => {
+      expect(fieldOf(local)).not.toBeNull();
+    });
+    sync();
+    await settle();
+    const doc = text(peer);
+    const arrow =
+      doc.indexOf("caller->>service: New message") + "caller".length;
+    peer.dispatch({
+      changes: { from: arrow, to: arrow + 3, insert: "-->>" },
+    });
+    sync();
+    await settle();
+    press("Escape");
+    await settle();
+    expect(local.state.field(diagramIntent)?.target).toEqual(CANVAS);
+    expect(noticeOf(local)).not.toBe(NOTICES.keptMessage);
+  });
+
   it("two people adding a participant at once each get their own, not one declared twice", async () => {
     const { local, peer, sync } = await room(STARTER);
     await vi.waitFor(() => {

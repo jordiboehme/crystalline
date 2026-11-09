@@ -954,14 +954,18 @@ const KEPT: Partial<Record<TargetKey["kind"], RefusalCode>> = {
 
 /**
  * Closes the field, writes nothing, and puts the focus on its stop. A field an add
- * opened leaves what was added in place, and says so once, with the way back.
+ * opened leaves what was added in place, and says so once, with the way back, when
+ * the stop stands on it.
  */
 export function cancelLabelEditor(main: EditorView): void {
   const open = fields.get(main);
   if (open !== undefined && open.checking === null) {
     finish(open, "enter");
+    // Only when the stop came back on what was added: after a peer's change it is
+    // the canvas, where Delete would take the whole diagram.
+    const stop = main.state.field(diagramIntent, false)?.target;
     const kept = open.added ? KEPT[open.target.kind] : undefined;
-    if (kept !== undefined) {
+    if (kept !== undefined && stop?.kind === open.target.kind) {
       sayAt(main, open.anchor, kept);
     }
   }
