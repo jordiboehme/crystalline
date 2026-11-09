@@ -23,7 +23,7 @@ use crystalline_service::params::{EditParams, MoveParams, WriteParams};
 use crystalline_service::{Engine, Scope};
 use tokio::sync::Mutex;
 
-use DraftConflictKind::{AddressTaken, DeleteEdit, EditDelete, EditEdit, UnknownStart};
+use DraftConflictKind::{AddAdd, AddressTaken, DeleteEdit, EditDelete, EditEdit, UnknownStart};
 
 fn plan() -> Vec<u8> {
     engram(
@@ -184,6 +184,41 @@ impl Team {
     /// directory, which says the team has a file there and not what it holds.
     fn copy_lost(&self, path: &str) {
         remove_base_file(&self.snapshot_dir(), path).unwrap();
+    }
+
+    /// The base snapshot holds `bytes` at `path` and the folder is not touched:
+    /// what a pull or commit leaves when its folder write failed.
+    fn snapshot_only(&self, path: &str, bytes: &[u8]) {
+        let dir = self.snapshot_dir();
+        let mut state = OriginState::load(&dir).unwrap().unwrap();
+        state.files.insert(
+            path.to_string(),
+            BaseStamp {
+                sha256: sha256_hex(bytes),
+                size: bytes.len() as u64,
+            },
+        );
+        write_base_file(&dir, path, bytes).unwrap();
+        state.save(&dir).unwrap();
+    }
+
+    /// The pass took `actor`'s row at `path`, and its record with it.
+    async fn row_taken(&self, actor: &str, path: &str) {
+        {
+            let store = self.eng.store();
+            let store = store.lock().await;
+            let id = store.domain_id("team").await.unwrap().unwrap();
+            assert!(store.clear_overlay_entry(id, actor, path).await.unwrap());
+        }
+        overlay_journal::journal_clear_tombstone(&self.state(), "team", actor, path).unwrap();
+        draft_start::clear(&self.state(), "team", actor, path).unwrap();
+    }
+
+    async fn sides(&self, actor: &str, path: &str) -> serde_json::Value {
+        self.eng
+            .draft_conflict_sides("team", actor, &id(actor, path))
+            .await
+            .unwrap()
     }
 
     /// `actor` rewrites the page titled `title` through the engine's write verb,
@@ -987,4 +1022,246 @@ async fn an_old_move_lists_once_at_the_draft() {
     t.snapshot_has("plan.md", None);
     t.snapshot_has("renamed.md", Some(&plan()));
     assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+// --- Review round ------------------------------------------------------------
+
+/// C11: a landing folder that cannot say whether it folds case is not read as
+/// folding. Her edited case move whose text the team holds at the old spelling
+/// is then not landed, on either disk: from Task 6 on a landed move drops both
+/// halves, and on a disk that keeps the two apart that drops her rename.
+#[tokio::test]
+async fn a_case_move_into_a_folder_that_cannot_say_has_not_landed() {
+    let t = team(&[(
+        "notes/plan.md",
+        engram("Plan", "plan", "the plan in its folder"),
+    )])
+    .await;
+    eprintln!("the temp folder folds case: {}", folds_case(t.tmp.path()));
+    t.moved("alice", "plan", "notes/Plan.md").await;
+    t.append("alice", "plan", "alice's own last word").await;
+    let hers = t.row("alice", "notes/Plan.md").await;
+    // The team holds her text at the old spelling, and the landing folder holds
+    // no name to ask: the folder file is gone, the snapshot keeps it.
+    t.snapshot_only("notes/plan.md", hers.as_bytes());
+    // The folder's generated listing goes too, as a folder of one page has none
+    // before its first sync.
+    for name in ["plan.md", "index.md"] {
+        let _ = std::fs::remove_file(t.root().join("notes").join(name));
+    }
+    let left: Vec<_> = std::fs::read_dir(t.root().join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    let listed = vec![DraftConflict {
+        moved_from: Some("notes/plan.md".to_string()),
+        ..conflict("alice", "notes/Plan.md", EditEdit)
+    }];
+    assert_eq!(t.conflicts("alice").await, listed, "an empty folder");
+
+    // A folder that cannot be listed, with the file back in it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let notes = t.root().join("notes");
+        std::fs::write(notes.join("plan.md"), &hers).unwrap();
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unlistable = std::fs::read_dir(&notes).is_err();
+        let found = t.conflicts("alice").await;
+        std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unlistable {
+            assert_eq!(found, listed, "a folder that cannot be listed");
+        } else {
+            eprintln!("skipped the unreadable half: this user lists any folder");
+        }
+    }
+}
+
+/// I2: a file a direct commit deleted, whose sync failed, holds no address,
+/// though the index still has its row.
+#[tokio::test]
+async fn a_deleted_team_file_the_index_still_lists_holds_no_address() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    t.append("alice", "plan", "alice's own last word").await;
+    // The commit deleted plan.md and no sync ran; the pass took her tombstone.
+    t.snapshot_has("plan.md", None);
+    t.row_taken("alice", "plan.md").await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", EditDelete)
+        }],
+        "not AddressTaken by a file that is gone"
+    );
+}
+
+/// I2: a team file in the snapshot that no sync has indexed yet holds its
+/// address. Nothing on the share path checks addresses.
+#[tokio::test]
+async fn a_team_file_the_index_does_not_list_yet_holds_its_address() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Idea", "alice's idea").await;
+    t.snapshot_has(
+        "other/thought.md",
+        Some(&engram("Thought", "idea", "bob's")),
+    );
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            other: Some("other/thought.md".to_string()),
+            ..conflict("alice", "idea.md", AddressTaken)
+        }]
+    );
+    // A page the index lists with older bytes answers to what the snapshot
+    // holds now.
+    let t = team(&[
+        ("plan.md", plan()),
+        ("other.md", engram("Other", "other", "x")),
+    ])
+    .await;
+    t.write("alice", "Idea", "alice's idea").await;
+    t.snapshot_has("other.md", Some(&engram("Other", "idea", "bob took it")));
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            other: Some("other.md".to_string()),
+            ..conflict("alice", "idea.md", AddressTaken)
+        }]
+    );
+    // A page with no permalink line answers to its path's slug.
+    let t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Loose", "alice's loose page").await;
+    t.snapshot_has("other/loose.md", Some(&loose()));
+    let found = t.conflicts("alice").await;
+    assert!(
+        found.iter().all(|c| c.kind != AddressTaken),
+        "other/loose answers to other/loose, not loose: {found:?}"
+    );
+}
+
+/// I3: an old move whose draft lands on a team file shows that file, which Keep
+/// mine would overwrite, and not the source.
+#[tokio::test]
+async fn an_old_move_onto_a_team_file_shows_that_file() {
+    let bobs = engram("Renamed", "renamed", "bob's own page");
+    let t = team(&[("plan.md", plan()), ("renamed.md", bobs.clone())]).await;
+    t.old_tombstone("alice", "plan.md", &plan()).await;
+    t.old_draft(
+        "alice",
+        "renamed.md",
+        &text(&plan()).replace("the last line", "alice's last line"),
+    )
+    .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", UnknownStart)
+        }]
+    );
+    assert_eq!(
+        t.sides("alice", "renamed.md").await["upstream"],
+        text(&bobs)
+    );
+}
+
+/// I3, with a record: the start cannot be read, the team holds a file where she
+/// moved to, and that file is what the conflict shows.
+#[tokio::test]
+async fn a_move_with_an_unreadable_start_onto_a_team_file_shows_that_file() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let bobs = engram("Renamed", "renamed", "bob's own page");
+    t.snapshot_has("renamed.md", Some(&bobs));
+    t.copy_lost("plan.md");
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", UnknownStart)
+        }]
+    );
+    assert_eq!(
+        t.sides("alice", "renamed.md").await["upstream"],
+        text(&bobs)
+    );
+}
+
+/// M1: an old move whose source the team deleted is a deletion she has to see,
+/// not a page that comes back under her new name.
+#[tokio::test]
+async fn an_old_move_whose_source_the_team_deleted_is_edit_delete() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.old_tombstone("alice", "plan.md", &plan()).await;
+    t.old_draft(
+        "alice",
+        "renamed.md",
+        &text(&plan()).replace("the last line", "alice's last line"),
+    )
+    .await;
+    t.snapshot_has("plan.md", None);
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", EditDelete)
+        }]
+    );
+}
+
+/// M5: two sides that need a note keep both.
+#[tokio::test]
+async fn two_sides_with_no_text_keep_both_notes() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Plan", "alice rewrote the plan").await;
+    let mut record = t.record("alice", "plan.md").unwrap();
+    record.start = None;
+    record.start_sha256 = Some(sha256_hex(b"bytes that were not text"));
+    draft_start::save(&t.state(), "team", "alice", &record).unwrap();
+    t.snapshot_has("plan.md", Some(b"\xff\xfe not text"));
+    let sides = t.sides("alice", "plan.md").await;
+    let note = sides["note"].as_str().unwrap();
+    assert!(note.contains("base"), "{note}");
+    assert!(note.contains("upstream"), "{note}");
+}
+
+/// M6: a row with a record reads `AddAdd` when the team adds a file where she
+/// holds a new one, and the sides show the team's file.
+#[tokio::test]
+async fn a_team_file_at_her_new_files_path_is_add_add() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Idea", "alice's idea").await;
+    let bobs = engram("Idea", "idea", "bob's idea");
+    t.push(&[("idea.md", Some(bobs.clone()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "idea.md", AddAdd)]
+    );
+    let sides = t.sides("alice", "idea.md").await;
+    assert_eq!(sides["upstream"], text(&bobs), "{sides}");
+    assert_eq!(sides["base"], serde_json::Value::Null, "{sides}");
+}
+
+/// M6: the same where she moved to, which reads the team's file there, not the
+/// text where she started.
+#[tokio::test]
+async fn a_team_file_at_the_path_she_moved_to_is_add_add_with_its_text() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let bobs = engram("Renamed", "renamed", "bob's own page");
+    t.snapshot_has("renamed.md", Some(&bobs));
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", AddAdd)
+        }]
+    );
+    assert_eq!(
+        t.sides("alice", "renamed.md").await["upstream"],
+        text(&bobs)
+    );
 }

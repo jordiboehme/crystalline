@@ -1819,36 +1819,40 @@ impl Engine {
     }
 }
 
-/// Whether folding `folding` (in fold order, the last MANIFEST draft wins)
-/// switches the Reflection of the domain at `root` off: the MANIFEST in the
-/// folder says `reflection: on` and the one the fold leaves does not (a
-/// deleted MANIFEST says nothing, so it is off too).
 /// Whether the folder a file at `rel` would land in may treat two spellings as
-/// one name: the nearest folder that exists, since a symlink or a mount inside a
-/// domain can stand on another disk from its root.
+/// one name. **A folder that cannot say counts as folding**: for a fold and a
+/// share a wrong "folds" costs a refusal with a way out, and a wrong "keeps
+/// apart" costs somebody's text with no warning. See [`folder_folds_case`].
+pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+    folder_folds_case(root, rel) != Some(false)
+}
+
+/// Whether the folder a file at `rel` would land in treats two spellings as one
+/// name: `Some(true)` it folds, `Some(false)` it keeps them apart, `None` it
+/// cannot say. The folder asked is the nearest one that exists, since a symlink
+/// or a mount inside a domain can stand on another disk from its root.
 ///
 /// Nothing is written. A name the folder lists is looked up in the other case:
 /// not there means it keeps them apart, and there without being listed means it
-/// folds. **A folder that cannot say counts as folding**, an empty one included:
-/// a wrong "folds" costs a refusal with a way out, and a wrong "keeps apart"
-/// costs somebody's text with no warning.
-pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+/// folds. A folder outside `root`, one that cannot be listed, an empty one or
+/// one whose names hold no letter cannot say.
+///
+/// The caller picks the safe side of `None` for what it decides. A fold reads
+/// it as folding ([`folder_may_fold_case`]). Whether a draft has landed, in the
+/// conflict list and in the pass alike, reads it as keeping apart: a case move
+/// read as landed would end with its rename dropped, and one read as not landed
+/// stays a draft she can settle (ruling C11).
+pub(crate) fn folder_folds_case(root: &Path, rel: &str) -> Option<bool> {
     let landing = join_rel(root, rel);
-    let Some(dir) = landing.ancestors().skip(1).find(|dir| dir.is_dir()) else {
-        return true;
-    };
+    let dir = landing.ancestors().skip(1).find(|dir| dir.is_dir())?;
     if !dir.starts_with(root) {
-        return true;
+        return None;
     }
-    let Ok(listing) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    let Ok(names) = listing
+    let names = std::fs::read_dir(dir)
+        .ok()?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<Vec<_>>>()
-    else {
-        return true;
-    };
+        .ok()?;
     let other_case = |name: &str| -> String {
         name.chars()
             .map(|c| {
@@ -1860,22 +1864,24 @@ pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
             })
             .collect()
     };
-    let Some(swapped) = names
+    let swapped = names
         .iter()
         .filter_map(|name| name.to_str())
-        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))
-    else {
-        return true;
-    };
+        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))?;
     if names.iter().any(|listed| listed.to_str() == Some(&swapped)) {
-        return false;
+        return Some(false);
     }
     match dir.join(&swapped).symlink_metadata() {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
+/// Whether folding `folding` (in fold order, the last MANIFEST draft wins)
+/// switches the Reflection of the domain at `root` off: the MANIFEST in the
+/// folder says `reflection: on` and the one the fold leaves does not (a
+/// deleted MANIFEST says nothing, so it is off too).
 fn folds_switch_off(root: &Path, folding: &[&ActorDrafts]) -> bool {
     let landing = folding
         .iter()
@@ -1908,7 +1914,44 @@ fn folds_switch_on(root: &Path, folding: &[&ActorDrafts]) -> bool {
 
 #[cfg(test)]
 mod folder_case_tests {
-    use super::folder_may_fold_case;
+    use super::{folder_folds_case, folder_may_fold_case};
+
+    /// The three answers: a folder that lists a name says, and one with nothing
+    /// to ask, or that cannot be listed, cannot.
+    #[test]
+    fn a_folder_that_cannot_say_answers_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        assert_eq!(folder_folds_case(root, "empty/Zed.md"), None);
+        assert_eq!(folder_folds_case(&root.join("gone"), "Zed.md"), None);
+        std::fs::create_dir(root.join("digits")).unwrap();
+        std::fs::write(root.join("digits").join("123"), "x").unwrap();
+        assert_eq!(
+            folder_folds_case(root, "digits/Zed.md"),
+            None,
+            "no letter to swap"
+        );
+
+        std::fs::write(root.join("Probe.md"), "x").unwrap();
+        let folds = root.join("probe.md").exists();
+        assert_eq!(folder_folds_case(root, "Zed.md"), Some(folds));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shut = root.join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("Name.md"), "x").unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listable = std::fs::read_dir(&shut).is_ok();
+            let answer = folder_folds_case(root, "shut/Zed.md");
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if !listable {
+                assert_eq!(answer, None, "a folder that cannot be listed");
+            }
+        }
+    }
 
     /// A folder that lists a name answers for itself. Nothing to compare with is
     /// no answer, and no answer counts as folding, since a refusal beats a lost

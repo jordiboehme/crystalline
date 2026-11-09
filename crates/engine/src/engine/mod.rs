@@ -7898,7 +7898,7 @@ pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
 mod review_mode;
-pub(crate) use review_mode::folder_may_fold_case;
+pub(crate) use review_mode::{folder_folds_case, folder_may_fold_case};
 mod schemas;
 mod search;
 mod sources;
