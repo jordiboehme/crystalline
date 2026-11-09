@@ -979,6 +979,118 @@ test.describe("hidden marks", () => {
     }
   });
 
+  test("on Linux with Caps Lock, Ctrl+Shift+Z redoes in the room, in prose and in a table cell", async ({
+    browser,
+  }) => {
+    const context = await newContext(browser);
+    // CodeMirror reads the platform once, when the bundle loads: on Linux
+    // Mod is Ctrl, whatever machine runs the browser.
+    await context.addInitScript(() => {
+      Object.defineProperty(Navigator.prototype, "platform", {
+        get: () => "Linux x86_64",
+        configurable: true,
+      });
+    });
+    try {
+      const page = await context.newPage();
+      await signIn(page);
+      const permalink = await createEngram(
+        page,
+        titled("Marks Redo"),
+        [
+          "# Buoy Marks",
+          "",
+          "Watch list: one two",
+          "",
+          "| Buoy | Colour |",
+          "| --- | --- |",
+          "| North | green |",
+          "",
+        ].join("\n"),
+      );
+      const source = await edit(page, permalink);
+      expect(await page.evaluate(() => navigator.platform)).toBe(
+        "Linux x86_64",
+      );
+      // Every keydown the page sees, so the test shows it sent the shape
+      // Caps Lock gives: key "z" with Shift held.
+      await page.evaluate(() => {
+        const seen: { key: string; shift: boolean; ctrl: boolean }[] = [];
+        (window as unknown as { seenKeys: typeof seen }).seenKeys = seen;
+        window.addEventListener(
+          "keydown",
+          (e) => seen.push({ key: e.key, shift: e.shiftKey, ctrl: e.ctrlKey }),
+          true,
+        );
+      });
+      const cdp: CDPSession = await context.newCDPSession(page);
+      /** Ctrl+Shift+Z with Caps Lock on: the key arrives as "z". */
+      const capsRedo = async () => {
+        const key = {
+          key: "z",
+          code: "KeyZ",
+          windowsVirtualKeyCode: 90,
+          // Ctrl (2) and Shift (8).
+          modifiers: 10,
+        };
+        await cdp.send("Input.dispatchKeyEvent", {
+          type: "rawKeyDown",
+          ...key,
+        });
+        await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+        const seen = await page.evaluate(
+          () =>
+            (
+              window as unknown as {
+                seenKeys: { key: string; shift: boolean; ctrl: boolean }[];
+              }
+            ).seenKeys,
+        );
+        expect(seen.at(-1)).toEqual({ key: "z", shift: true, ctrl: true });
+      };
+      /** "A", then "B" as a separate undo step (the room merges within 500 ms). */
+      const twoSteps = async () => {
+        await page.keyboard.type("A");
+        await page.waitForTimeout(700);
+        await page.keyboard.type("B");
+        await page.waitForTimeout(700);
+      };
+
+      // In prose.
+      const watch = async () =>
+        (await held(page)).doc.split("\n").find((l) => l.startsWith("Watch"));
+      await clickBeside(line(source, "Watch list"), "two", "after");
+      await twoSteps();
+      await expect.poll(watch).toBe("Watch list: one twoAB");
+      await page.keyboard.press("Control+z");
+      await expect.poll(watch).toBe("Watch list: one twoA");
+      await capsRedo();
+      await expect.poll(watch).toBe("Watch list: one twoAB");
+
+      // In an open table cell.
+      await page
+        .locator('.cm-grid [aria-rowindex="2"][aria-colindex="1"]')
+        .click();
+      const open = page.locator(".cm-grid .cm-content[contenteditable=true]");
+      await expect(open).toBeFocused();
+      await page.keyboard.press("End");
+      await twoSteps();
+      await expect(open).toHaveText("NorthAB");
+      await page.keyboard.press("Control+z");
+      await expect(open).toHaveText("NorthA");
+      await capsRedo();
+      await expect(open).toHaveText("NorthAB");
+
+      await bodySatisfies(
+        page,
+        permalink,
+        (b) => b.includes("Watch list: one twoAB") && b.includes("| NorthAB |"),
+      );
+    } finally {
+      await context.close();
+    }
+  });
+
   test("an open table cell draws its bold word bold with the marks hidden", async ({
     page,
   }) => {

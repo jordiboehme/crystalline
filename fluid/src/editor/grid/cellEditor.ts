@@ -25,13 +25,7 @@
  * peers' carets in the cell and publishes the local one while it has focus.
  */
 
-import {
-  defaultKeymap,
-  historyField,
-  redo as historyRedo,
-  isolateHistory,
-  undo as historyUndo,
-} from "@codemirror/commands";
+import { defaultKeymap, isolateHistory } from "@codemirror/commands";
 import { ensureSyntaxTree, syntaxHighlighting } from "@codemirror/language";
 import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
@@ -55,7 +49,6 @@ import {
   WidgetType,
   keymap,
 } from "@codemirror/view";
-import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 
 import { copyAsHtml } from "../copyHtml";
 import { hidesIdLines, pageHidesComments } from "../hiddenIdLines";
@@ -67,6 +60,7 @@ import { formatGate, formatKeymap, pendingFormat } from "../marks/formatting";
 import { marksOnEditLine } from "../marks/mode";
 import { budgetOf, isReadTo, parsedTo, pressDeadline } from "../marks/parse";
 import { roomUndo } from "../roomUndo";
+import { shiftedZRedo, stackUndo } from "../undoStack";
 import { cellPreviewLayers } from "./draws";
 import { cellPresence } from "./presence";
 import type { MountedCell, OpenCell } from "./openCell";
@@ -658,21 +652,6 @@ export function noteUndoLanding(main: EditorView, landing: UndoLanding): void {
   landings.set(main, landing);
 }
 
-function stackUndo(main: EditorView, which: "undo" | "redo"): boolean {
-  if (main.state.field(historyField, false) !== undefined) {
-    return (which === "undo" ? historyUndo : historyRedo)(main);
-  }
-  if (main.state.facet(ySyncFacet) === undefined) return false;
-  const key = which === "undo" ? "Mod-z" : "Mod-Shift-z";
-  const binding = yUndoManagerKeymap.find((b) => b.key === key);
-  try {
-    return binding?.run?.(main) ?? false;
-  } catch {
-    // A room built without an undo manager has no stack to run.
-    return false;
-  }
-}
-
 /**
  * The undo stack of `main`: CodeMirror's history solo, Y.UndoManager in a
  * room. An undo that takes the document from a recorded landing's `after`
@@ -1136,6 +1115,13 @@ export function mountCellEditor(
       keptWhole.of(keepsEscape),
       composeEdges,
       forward,
+      // Mod+Shift+Z redoes on main's stack also when the key arrives as a
+      // lower-case "z", which the runner offers to Mod-z first (see
+      // `undoStack.ts`). Taken always, as the bindings below are.
+      shiftedZRedo(() => {
+        runMainUndo(main, "redo");
+        return true;
+      }),
       Prec.high([
         keymap.of([
           {

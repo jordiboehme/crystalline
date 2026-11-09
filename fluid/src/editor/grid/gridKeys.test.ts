@@ -681,6 +681,12 @@ describe("grid navigation", () => {
     keyOn(cellEl(main, 1, 1), "Z", { ...modKey, shiftKey: true, keyCode: 90 });
     expect(bytes(main.state)).toBe(WIDE.replace("| 2 |", "|  |"));
     expect(focused(main)).toEqual([1, 1]);
+    // With Caps Lock on Linux and Windows the shifted key arrives as "z":
+    // Shift still makes it the redo.
+    keyOn(cellEl(main, 1, 1), "z", { ...modKey, keyCode: 90 });
+    expect(bytes(main.state)).toBe(WIDE);
+    keyOn(cellEl(main, 1, 1), "z", { ...modKey, shiftKey: true, keyCode: 90 });
+    expect(bytes(main.state)).toBe(WIDE.replace("| 2 |", "|  |"));
   });
 
   test("Backspace clears the content too, and an empty cell is left alone", () => {
