@@ -26,7 +26,7 @@ import {
 import { fenceToAct, placeNow } from "../act";
 import { nextAnchorTicket, runDiagramOp, seqKind } from "../apply";
 import type { RefusalCode } from "../edits";
-import { NOTICES } from "../edits";
+import { reasonFor } from "../edits";
 import { sayAt } from "../focus";
 import type { LineHold } from "../held";
 import {
@@ -97,12 +97,24 @@ async function runSeqOp(
   }
 }
 
-/** Why `op` could not be made, for an item that says so before it is chosen. */
+/**
+ * Why `op` could not be made, for an item that says so before it is chosen. A block
+ * left with nothing in it names its way out: Remove block, on the message's own menu
+ * or, for a participant, on the message in that block.
+ */
 function blockedBy(model: SeqModel, op: SeqOp): Partial<MenuItem> {
   const result = compileSeqOp(model, op);
-  return "refused" in result
-    ? { disabled: true, description: NOTICES[result.refused] }
-    : {};
+  if (!("refused" in result)) {
+    return {};
+  }
+  const reason = reasonFor(result.refused);
+  const way =
+    result.refused !== "emptiesBlock"
+      ? ""
+      : op.op === "deleteParticipant"
+        ? " Use Remove block on the message in that block first."
+        : " Use Remove block first.";
+  return { disabled: true, description: `${reason}${way}` };
 }
 
 function participantMenu(

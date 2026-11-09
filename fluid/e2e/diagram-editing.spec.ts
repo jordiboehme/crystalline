@@ -175,6 +175,10 @@ const docText = (page: Page) =>
     return content.cmTile.view.state.doc.toString();
   });
 
+/** The id of the drawing on screen: each new render gets a new one. */
+const drawingIdOf = (page: Page) =>
+  page.locator(".cm-diagram svg").first().getAttribute("id");
+
 /** The text of the line the caret stands on. */
 const caretLine = (page: Page) =>
   page.evaluate(() => {
@@ -352,6 +356,7 @@ test("two browsers: a comment typed under Raw and a rename by the box both end e
     await nodeOf(pageB, "C").click();
     await expect(field(pageB)).toHaveValue("End");
     await pageB.keyboard.type("Finish");
+    const drawnB = await drawingIdOf(pageB);
 
     await pageA.getByRole("button", { name: "Raw", exact: true }).click();
     const comment = pageA.locator(".cm-line", {
@@ -361,9 +366,12 @@ test("two browsers: a comment typed under Raw and a rename by the box both end e
     await pageA.keyboard.press("End");
     await pageA.keyboard.press("Enter");
     await pageA.keyboard.type("%% from raw");
-    // The redraw this brings on must leave B's field and its draft alone.
+    // The redraw this brings on must leave B's field and its draft alone: wait for
+    // B's new drawing first, so the field is checked after it landed.
     await expect.poll(() => docText(pageB)).toContain("%% from raw");
+    await expect.poll(() => drawingIdOf(pageB)).not.toBe(drawnB);
     await expect(field(pageB)).toHaveValue("Finish");
+    await expect(field(pageB)).toBeFocused();
     await pageB.keyboard.press("Enter");
     await expect(field(pageB)).toHaveCount(0);
 
@@ -961,6 +969,7 @@ test("sequence, two browsers: a comment typed under Raw and a message edit both 
     await expect(field(pageB)).toHaveValue("Request");
     await pageB.keyboard.press("ControlOrMeta+A");
     await pageB.keyboard.type("Ask twice");
+    const drawnB = await drawingIdOf(pageB);
 
     await pageA.getByRole("button", { name: "Raw", exact: true }).click();
     await pageA
@@ -969,9 +978,12 @@ test("sequence, two browsers: a comment typed under Raw and a message edit both 
     await pageA.keyboard.press("End");
     await pageA.keyboard.press("Enter");
     await pageA.keyboard.type("%% from raw");
-    // The redraw this brings on must leave B's field and its draft alone.
+    // The redraw this brings on must leave B's field and its draft alone: wait for
+    // B's new drawing first, so the field is checked after it landed.
     await expect.poll(() => docText(pageB)).toContain("%% from raw");
+    await expect.poll(() => drawingIdOf(pageB)).not.toBe(drawnB);
     await expect(field(pageB)).toHaveValue("Ask twice");
+    await expect(field(pageB)).toBeFocused();
     await pageB.keyboard.press("Enter");
     await expect(field(pageB)).toHaveCount(0);
 

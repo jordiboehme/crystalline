@@ -890,7 +890,7 @@ describe("addMessage", () => {
   ])("a message with a destroyed participant refuses: %s to %s", (from, to) => {
     const body =
       "sequenceDiagram\n  participant host\n  participant worker\n  destroy worker\n  host-xworker: stop";
-    expect(code(body, { op: "addMessage", from, to })).toBe("invalid");
+    expect(code(body, { op: "addMessage", from, to })).toBe("participantEnded");
   });
 
   test("a keyword-like name that the message form reads otherwise refuses", () => {
@@ -1138,18 +1138,9 @@ describe("deleteMessage", () => {
     ).toBe("sequenceDiagram\n  a->>b: 2");
   });
 
-  // R69, finding 3: the source would keep its `+` and the bar would go from the drawing.
+  // The source would keep its `+` and the bar would go from the drawing. A `-` whose
+  // `+` is on a message goes with that `+` instead (below).
   test.each<[string, string, MessageTarget]>([
-    [
-      "the - of a +",
-      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: ask\n  b-->>-a: reply\n  a->>b: later\n  b->>a: much later",
-      message("b", "a", "reply"),
-    ],
-    [
-      "one of two stacked",
-      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>+b: 2\n  b-->>-a: 3\n  b-->>-a: 4",
-      message("b", "a", "3"),
-    ],
     [
       "the - of an activate line",
       "sequenceDiagram\n  participant a\n  participant b\n  activate b\n  b-->>-a: x\n  a->>b: y",
@@ -1159,6 +1150,76 @@ describe("deleteMessage", () => {
     "a delete that leaves more open activations refuses: %s",
     (_, body, target) => {
       expect(code(body, { op: "deleteMessage", target })).toBe("leavesActive");
+    },
+  );
+
+  // A message whose + or - has its other end on a message takes that marker along,
+  // paired as mermaid pairs them: a close ends the latest open activation of its
+  // participant.
+  const ASK =
+    "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: ask\n  b-->>-a: reply\n  a->>b: later";
+  const STACKED =
+    "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>+b: 2\n  b-->>-a: 3\n  b-->>-a: 4";
+  const BETWEEN =
+    "sequenceDiagram\n  participant a\n  participant b\n  participant c\n  a->>+b: ask\n  b->>c: work\n  c-->>b: done\n  b-->>-a: reply";
+  const AGAIN =
+    "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: one\n  b-->>-a: back\n  a->>+b: two\n  b-->>-a: back again";
+  test.each<[string, string, MessageTarget, string]>([
+    [
+      "the + drops the - of its reply",
+      ASK,
+      message("a", "b", "ask"),
+      "sequenceDiagram\n  participant a\n  participant b\n  b-->>a: reply\n  a->>b: later",
+    ],
+    [
+      "the - drops the + of its opener",
+      ASK,
+      message("b", "a", "reply"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: ask\n  a->>b: later",
+    ],
+    [
+      "nested: the outer + pairs with the last -",
+      STACKED,
+      message("a", "b", "1"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 2\n  b-->>-a: 3\n  b-->>a: 4",
+    ],
+    [
+      "nested: the inner - pairs with the inner +",
+      STACKED,
+      message("b", "a", "3"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: 1\n  a->>b: 2\n  b-->>-a: 4",
+    ],
+    [
+      "nested: the outer - pairs with the outer +",
+      STACKED,
+      message("b", "a", "4"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: 1\n  a->>+b: 2\n  b-->>-a: 3",
+    ],
+    [
+      "other messages between the + and the -",
+      BETWEEN,
+      message("a", "b", "ask"),
+      "sequenceDiagram\n  participant a\n  participant b\n  participant c\n  b->>c: work\n  c-->>b: done\n  b-->>a: reply",
+    ],
+    [
+      "repeated: the second + pairs with the second -",
+      AGAIN,
+      message("a", "b", "two"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: one\n  b-->>-a: back\n  b-->>a: back again",
+    ],
+    [
+      "repeated: the first - pairs with the first +",
+      AGAIN,
+      message("b", "a", "back"),
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: one\n  a->>+b: two\n  b-->>-a: back again",
+    ],
+  ])(
+    "an activation pair: %s, and mermaid reads the result",
+    async (_, body, target, want) => {
+      const after = run(body, { op: "deleteMessage", target });
+      expect(after).toBe(want);
+      // Throws on mermaid's refusal, as for an inactive participant.
+      await expect(seqDbFor(after)).resolves.toBeDefined();
     },
   );
 

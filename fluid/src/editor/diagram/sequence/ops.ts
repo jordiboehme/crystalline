@@ -48,7 +48,11 @@ type MessageTarget = SeqTarget & { kind: "message" };
 export type SeqOp =
   | { op: "renameParticipant"; name: string; text: string }
   | { op: "renameMessage"; target: MessageTarget; text: string }
-  | { op: "addParticipant" }
+  /**
+   * `first`: the lowest number the new `p<k>` id may take. Two people adding at once
+   * in a room each start from their own, so their two lines name two participants.
+   */
+  | { op: "addParticipant"; first?: number }
   | { op: "addMessage"; from: string; to: string }
   | {
       op: "arrowStyle";
@@ -490,8 +494,8 @@ function menuBefore(
   );
 }
 
-function freeParticipantId(model: SeqModel): string {
-  let k = 1;
+function freeParticipantId(model: SeqModel, first = 1): string {
+  let k = Math.max(1, Math.floor(first));
   while (model.participants.has(`p${String(k)}`)) {
     k++;
   }
@@ -542,8 +546,8 @@ function newParticipantPlace(model: SeqModel): {
   return { line: anchor.line, indent: indentOf(model, anchor.line) };
 }
 
-function addParticipant(model: SeqModel): OpResult<SeqCreated> {
-  const name = freeParticipantId(model);
+function addParticipant(model: SeqModel, first?: number): OpResult<SeqCreated> {
+  const name = freeParticipantId(model, first);
   const place = newParticipantPlace(model);
   const edit = newLineAfter(
     model,
@@ -568,7 +572,7 @@ function addMessage(
   }
   // It would draw without a throw, with an arrow to a life line that has stopped.
   if (model.destroyed.has(from) || model.destroyed.has(to)) {
-    return refused("invalid");
+    return refused("participantEnded");
   }
   const edit = newLineAfter(
     model,
@@ -842,6 +846,65 @@ function checkedRemoval(
   return edit ? checkedSeq(model, [edit, ...edits], wanted) : plain;
 }
 
+const ACTIVE_START = 17;
+const ACTIVE_END = 18;
+
+/**
+ * Each activation's opening and closing record, paired as mermaid pairs them: a
+ * close ends the latest activation still open for its participant (the drawing's
+ * `endActivation` takes the last one by `lastIndexOf`). Keyed both ways by record.
+ */
+function activationPairs(model: SeqModel): Map<number, number> {
+  const pairs = new Map<number, number>();
+  const open = new Map<string, number[]>();
+  model.records.forEach((record, index) => {
+    const name = record.from;
+    if (name === undefined) {
+      return;
+    }
+    if (record.type === ACTIVE_START) {
+      open.set(name, [...(open.get(name) ?? []), index]);
+    } else if (record.type === ACTIVE_END) {
+      const stack = open.get(name) ?? [];
+      const opener = stack.pop();
+      if (opener !== undefined) {
+        pairs.set(opener, index);
+        pairs.set(index, opener);
+      }
+    }
+  });
+  return pairs;
+}
+
+/**
+ * The other end of the activation a message's `+` opens or its `-` closes, when that
+ * end is a message's marker too: its marker's span and the record the marker adds.
+ * Null when the message carries no marker, its activation has no other end, or the
+ * other end is an `activate` or `deactivate` line.
+ */
+function partnerMarker(
+  model: SeqModel,
+  message: SeqMessage,
+): { span: Span; record: number } | null {
+  if (message.arrow.activation === null) {
+    return null;
+  }
+  const own = message.record + 1;
+  const other = activationPairs(model).get(own);
+  if (other === undefined) {
+    return null;
+  }
+  const partner = model.messages.find((m) => m.record + 1 === other);
+  return partner?.arrow.activation
+    ? { span: partner.arrow.activation, record: other }
+    : null;
+}
+
+/**
+ * A message goes with what it alone adds. When its `+` or `-` has its other end on
+ * another message, that marker goes too, so the activation leaves the drawing whole
+ * and nothing is left open or closed twice; both are one undo step.
+ */
 function deleteMessage(
   model: SeqModel,
   target: MessageTarget,
@@ -850,19 +913,35 @@ function deleteMessage(
   const statement = message
     ? model.statements[model.records[message.record]?.statement ?? -1]
     : undefined;
-  if (statement === undefined) {
+  if (message === undefined || statement === undefined) {
     return refused("gone");
   }
   const gone = new Set([statement]);
   if (emptiesSection(model, gone)) {
     return refused("emptiesBlock");
   }
-  if (raisesActivations(model, gone)) {
+  const partner = partnerMarker(model, message);
+  if (partner === null && raisesActivations(model, gone)) {
     return refused("leavesActive");
   }
   const wanted = readingOf(model);
-  withoutRecords(wanted, new Set(statement.records));
-  return checkedRemoval(model, gone, statementRemovals(model, gone), wanted);
+  withoutRecords(
+    wanted,
+    new Set(
+      partner === null
+        ? statement.records
+        : [...statement.records, partner.record],
+    ),
+  );
+  return checkedRemoval(
+    model,
+    gone,
+    [
+      ...statementRemovals(model, gone),
+      ...(partner === null ? [] : [partner.span]),
+    ],
+    wanted,
+  );
 }
 
 /**
@@ -979,7 +1058,7 @@ export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult<SeqCreated> {
     case "renameMessage":
       return renameMessage(model, op.target, op.text);
     case "addParticipant":
-      return addParticipant(model);
+      return addParticipant(model, op.first);
     case "addMessage":
       return addMessage(model, op.from, op.to);
     case "arrowStyle":

@@ -28,6 +28,8 @@ import { sequenceDrawing } from "../../../test/sequenceDrawing";
 import { seqKind } from "../apply";
 import { applyEdits, NOTICES } from "../edits";
 import { focusTarget } from "../focus";
+import { addWithName } from "../labelEditor";
+import { roomUndo } from "../../roomUndo";
 import type { TargetKey } from "../intent";
 import { diagramIntent } from "../intent";
 import { prefetchDiagrams } from "../loader";
@@ -360,6 +362,7 @@ describe("each item is the op's text and one undo step", () => {
       expect(active()).toBe(fieldOf(view));
       press("Escape");
       await flush();
+      expect(noticeOf(view)).toBe(NOTICES.keptParticipant);
       undoOnce(view);
       expect(text(view)).toBe(page(STARTER));
     },
@@ -456,6 +459,53 @@ describe("Add message to...", () => {
     }
   });
 
+  it("Escape on the new message's text keeps the message, and says so once", async () => {
+    const view = await drawn();
+    openMenuOn(view, CALLER);
+    choose("Add message to...");
+    await flush();
+    press("ArrowRight");
+    press("Enter");
+    await vi.waitFor(() => {
+      expect(fieldOf(view)).not.toBeNull();
+    });
+    press("Escape");
+    await flush();
+    expect(fieldOf(view)).toBeNull();
+    expect(noticeOf(view)).toBe(NOTICES.keptMessage);
+    expect(text(view)).toBe(
+      page(`${STARTER}\n    caller->>service: New message`),
+    );
+    expect(view.state.field(diagramIntent)?.target).toEqual(
+      message("caller", "service", "New message"),
+    );
+  });
+
+  it("Escape on a field that only renames says nothing", async () => {
+    const view = await drawn();
+    openMenuOn(view, CALLER);
+    choose("Rename");
+    await flush();
+    press("Escape");
+    await flush();
+    expect(noticeOf(view)).toBe("");
+  });
+
+  it("to a participant that has ended says so and writes nothing", async () => {
+    const body =
+      "sequenceDiagram\n    participant host\n    participant worker\n    destroy worker\n    host-xworker: stop";
+    const view = await drawn(page(body));
+    openMenuOn(view, { kind: "participant", name: "host" });
+    choose("Add message to...");
+    await flush();
+    press("ArrowRight");
+    press("Enter");
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toBe(NOTICES.participantEnded);
+    });
+    expect(text(view)).toBe(page(body));
+  });
+
   it("Escape ends it and writes nothing", async () => {
     const view = await drawn();
     openMenuOn(view, CALLER);
@@ -510,20 +560,50 @@ describe("a delete the source cannot take", () => {
     openMenuOn(view, message("a", "b", "ping"));
     expect(row("Delete").getAttribute("aria-disabled")).toBe("true");
     expect(row("Delete").getAttribute("aria-description")).toBe(
-      NOTICES.emptiesBlock,
+      "That would leave a block with nothing in it. Use Remove block first.",
     );
     expect(row("Remove block").getAttribute("aria-disabled")).toBeNull();
   });
 
-  it("a message whose deactivation would be left open is offered disabled, with the sentence", async () => {
+  it("a message whose - closes an activate line is offered disabled, with the sentence", async () => {
     const body =
-      "sequenceDiagram\n    participant a\n    participant b\n    a->>+b: call\n    b-->>-a: done";
+      "sequenceDiagram\n    participant a\n    participant b\n    activate b\n    b-->>-a: done\n    a->>b: more";
     const view = await drawn(page(body));
     openMenuOn(view, message("b", "a", "done"));
     expect(row("Delete").getAttribute("aria-disabled")).toBe("true");
     expect(row("Delete").getAttribute("aria-description")).toBe(
-      NOTICES.leavesActive,
+      "That would leave an activation open.",
     );
+  });
+
+  it("a participant whose only message there fills a block names Remove block on that message", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>b: hi\n    loop every minute\n        b->>a: ping\n    end";
+    const view = await drawn(page(body));
+    openMenuOn(view, { kind: "participant", name: "b" });
+    expect(row("Delete").getAttribute("aria-disabled")).toBe("true");
+    expect(row("Delete").getAttribute("aria-description")).toBe(
+      "That would leave a block with nothing in it. Use Remove block on the message in that block first.",
+    );
+  });
+
+  it("a + and its - go together, as one undo step", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>+b: call\n    b->>b: work\n    b-->>-a: done";
+    const view = await drawn(page(body));
+    const steps = undoSteps(view);
+    openMenuOn(view, message("b", "a", "done"));
+    expect(row("Delete").getAttribute("aria-disabled")).toBeNull();
+    choose("Delete");
+    await changed(view, page(body));
+    expect(text(view)).toBe(
+      page(
+        "sequenceDiagram\n    participant a\n    participant b\n    a->>b: call\n    b->>b: work",
+      ),
+    );
+    expect(undoSteps(view)).toBe(steps + 1);
+    undoOnce(view);
+    expect(text(view)).toBe(page(body));
   });
 
   it("Remove block takes the block's own lines, and then Delete takes the message", async () => {
@@ -593,6 +673,39 @@ describe("a message held by its place with a peer", () => {
         "sequenceDiagram\n    participant a\n    participant b\n    a->>b: hi\n    a->>b: hi\n    a-->>b: hi",
       ),
     );
+  });
+
+  it("two people adding a participant at once each get their own, not one declared twice", async () => {
+    const { local, peer, sync } = await room(STARTER);
+    await vi.waitFor(() => {
+      expect(peer.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+    });
+    await settle();
+    await Promise.all([
+      addWithName(local, fromOf(local), { op: "addParticipant" }),
+      addWithName(peer, fromOf(peer), { op: "addParticipant" }),
+    ]);
+    sync();
+    await settle();
+    expect(text(peer)).toBe(text(local));
+    const ids = [
+      ...text(local).matchAll(/participant (p\d+) as New participant/g),
+    ].map((m) => m[1]);
+    // Each starts from its own room client: the two ids differ unless those two
+    // numbers happen to meet, one time in a thousand, which this does not count on.
+    const own = (view: EditorView) =>
+      `p${String(1 + ((view.state.facet(roomUndo)?.doc.clientID ?? 0) % 1000))}`;
+    expect(ids.sort()).toEqual([own(local), own(peer)].sort());
+    if (own(local) !== own(peer)) {
+      expect(new Set(ids).size).toBe(2);
+      const model = parseSequence(
+        text(local).slice(
+          text(local).indexOf("sequenceDiagram"),
+          text(local).lastIndexOf("\n```"),
+        ),
+      );
+      expect(model.order).toHaveLength(4);
+    }
   });
 
   it("the Delete key on a stop holds its message through the verify", async () => {

@@ -28,7 +28,7 @@ import { fenceToAct, placeNow } from "../act";
 import type { ApplyOutcome } from "../apply";
 import { flowKind, runDiagramOp, seqKind } from "../apply";
 import type { RefusalCode } from "../edits";
-import { NOTICES } from "../edits";
+import { reasonFor } from "../edits";
 import { fenceAt } from "../fence";
 import { diagramField, keepFenceDrawn } from "../field";
 import {
@@ -277,7 +277,7 @@ function boxMenu(
 function blockedBy(model: FlowModel, op: FlowOp): Partial<MenuItem> {
   const result = compileFlowOp(model, op);
   return "refused" in result
-    ? { disabled: true, description: NOTICES[result.refused] }
+    ? { disabled: true, description: reasonFor(result.refused) }
     : {};
 }
 
@@ -878,7 +878,10 @@ async function chooseBox(main: EditorView, to: string): Promise<void> {
     sayAt(main, anchor, refused);
   } else if (sequence && outcome.applied && outcome.created !== undefined) {
     // A new message is named at once: its text is the second undo step.
-    openLabelEditor(main, anchor, outcome.created, { selectAll: true });
+    openLabelEditor(main, anchor, outcome.created, {
+      selectAll: true,
+      added: true,
+    });
   }
 }
 

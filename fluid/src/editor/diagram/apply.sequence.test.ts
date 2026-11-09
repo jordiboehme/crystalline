@@ -112,14 +112,34 @@ describe("seqKind", () => {
     );
   });
 
-  // seqKind keeps verify: the op's own check cannot see a `-` with no `+`.
-  test("s05: deleting a + message refuses invalid and writes nothing", async () => {
+  // A + message goes with the - of its own activation, and real mermaid agrees.
+  test("s05: deleting a + message drops the - that closes it", async () => {
     const body = S05.replace(/\n$/, "");
     const view = markView(fenced(body), { raw: true });
     await expect(
       runDiagramOp(view, 0, seqKind, {
         op: "deleteMessage",
         target: message("client", "router", "call"),
+      }),
+    ).resolves.toEqual({ applied: true });
+    expect(bytes(view.state)).toBe(
+      fenced(
+        body
+          .replace("    client->>+router: call\n", "")
+          .replace("router-->>-client: answer", "router-->>client: answer"),
+      ),
+    );
+  });
+
+  // seqKind keeps verify: the op's own check cannot see a `-` with no `+`.
+  test("a + closed by a deactivate line refuses invalid and writes nothing", async () => {
+    const body =
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: x\n  b->>a: y\n  deactivate b";
+    const view = markView(fenced(body), { raw: true });
+    await expect(
+      runDiagramOp(view, 0, seqKind, {
+        op: "deleteMessage",
+        target: message("a", "b", "x"),
       }),
     ).resolves.toEqual({ applied: false, refused: "invalid" });
     expect(bytes(view.state)).toBe(fenced(body));

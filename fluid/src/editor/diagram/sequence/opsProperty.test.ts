@@ -403,6 +403,44 @@ async function broken(
   return wanted.holds?.(db) ?? null;
 }
 
+/**
+ * The record of the other end of the activation the message at `record` opens or
+ * closes, when that end is another message's `+` or `-`: paired over mermaid's own
+ * records, a close ending the latest open activation of its participant.
+ */
+function pairedMarker(
+  model: SeqModel,
+  db: SequenceDbView,
+  record: number,
+): number[] {
+  const own = record + 1;
+  const type = db.records[own]?.type;
+  if (type !== 17 && type !== 18) {
+    return [];
+  }
+  const open = new Map<string, number[]>();
+  let partner: number | undefined;
+  db.records.forEach((r, i) => {
+    if (r.from === undefined) {
+      return;
+    }
+    if (r.type === 17) {
+      open.set(r.from, [...(open.get(r.from) ?? []), i]);
+    } else if (r.type === 18) {
+      const opener = open.get(r.from)?.pop();
+      if (opener === own) {
+        partner = i;
+      } else if (i === own) {
+        partner = opener;
+      }
+    }
+  });
+  const onMessage = model.messages.some(
+    (m) => m.record + 1 === partner && m.arrow.activation !== null,
+  );
+  return partner !== undefined && onMessage ? [partner] : [];
+}
+
 /** Runs one op on `body` and files the result. */
 async function runOp(
   tally: Tally,
@@ -524,7 +562,15 @@ async function checkBody(body: string): Promise<Tally> {
       `delete message ${String(i)}`,
       "deleteMessage",
       { op: "deleteMessage", target },
-      { db: withoutRecords(db, new Set(recordsOfLine(model, record))) },
+      {
+        db: withoutRecords(
+          db,
+          new Set([
+            ...recordsOfLine(model, record),
+            ...pairedMarker(model, db, record),
+          ]),
+        ),
+      },
       ["invalid", "emptiesBlock", "leavesActive"],
     );
   }
@@ -609,7 +655,7 @@ async function checkBody(body: string): Promise<Tally> {
               : "the new message is not the last record";
           },
         },
-        ["invalid"],
+        ["invalid", "participantEnded"],
       );
     }
   }
@@ -953,28 +999,31 @@ test.skipIf(folder === undefined)(
 
 /**
  * addMessage: s10's two destroyed participants, in eight of its nine pairs.
- * emptiesBlock: R56. leavesActive: the `-` of a `+` that would stay open. invalid: a
+ * emptiesBlock: R56. No leavesActive: every `-` in the corpus has its `+` on a message,
+ * and the delete takes that marker along. invalid: a
  * message a `create` or `destroy` waits for, on the delete of a message and of s10's
  * host and worker.
  */
 const CORPUS_REFUSALS: Record<string, number> = {
-  "addMessage invalid": 8,
+  "addMessage participantEnded": 8,
   "deleteMessage emptiesBlock": 13,
   "deleteMessage invalid": 7,
-  "deleteMessage leavesActive": 9,
   "deleteParticipant emptiesBlock": 29,
   "deleteParticipant invalid": 2,
 };
-/** An activation left unbalanced, which only mermaid's db sees. */
+/**
+ * An activation left unbalanced, which only mermaid's db sees: a `+` whose close is a
+ * `deactivate` line, which the delete does not take along.
+ */
 const CORPUS_VERIFY_REFUSALS: Record<string, number> = {
-  deleteMessage: 11,
+  deleteMessage: 2,
   deleteParticipant: 1,
 };
 const EXTRA_REFUSALS: Record<string, number> = {
-  "addMessage invalid": 15,
+  "addMessage invalid": 5,
+  "addMessage participantEnded": 10,
   "deleteMessage emptiesBlock": 4,
   "deleteMessage invalid": 7,
-  "deleteMessage leavesActive": 2,
   "deleteParticipant emptiesBlock": 10,
   "deleteParticipant invalid": 9,
   // `x@y`, which the declaration form reads otherwise; a `create`'s undeclared sender,
@@ -983,4 +1032,4 @@ const EXTRA_REFUSALS: Record<string, number> = {
   // R61: `Web App`, `User One` and the `Web App` of the body with an alias beside it.
   "renameParticipant unsupported": 3,
 };
-const EXTRA_VERIFY_REFUSALS: Record<string, number> = { deleteMessage: 2 };
+const EXTRA_VERIFY_REFUSALS: Record<string, number> = {};

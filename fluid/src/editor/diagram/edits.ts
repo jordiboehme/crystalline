@@ -41,7 +41,11 @@ export type RefusalCode =
   | "arrowChanged"
   | "messageChanged"
   | "emptiesBlock"
-  | "leavesActive";
+  | "leavesActive"
+  | "participantEnded"
+  | "keptBox"
+  | "keptParticipant"
+  | "keptMessage";
 
 /**
  * What an op compiler returns: the edits (and what they create, of a type each
@@ -72,7 +76,32 @@ export const NOTICES: Record<RefusalCode, string> = {
   emptiesBlock:
     "That would leave a block with nothing in it, so nothing was changed.",
   leavesActive: "That would leave an activation open, so nothing was changed.",
+  participantEnded:
+    "A participant that has ended can take no more messages, so nothing was changed.",
+  keptBox: "The new box stays. Press Delete, or undo once, to take it back.",
+  keptParticipant:
+    "The new participant stays. Press Delete, or undo once, to take it back.",
+  keptMessage:
+    "The new message stays. Press Delete, or undo once, to take it back.",
 };
+
+/**
+ * What a disabled menu item says before anything was tried: what would happen. A
+ * notice's "so nothing was changed" is for after a try. Codes not here read as their
+ * notice, which already says no more than that.
+ */
+export const REASONS: Partial<Record<RefusalCode, string>> = {
+  invalid: "That change would break the diagram.",
+  unsupported: "This diagram uses something the editor does not know yet.",
+  emptiesBlock: "That would leave a block with nothing in it.",
+  leavesActive: "That would leave an activation open.",
+  participantEnded: "A participant that has ended can take no more messages.",
+};
+
+/** The reason a disabled item gives for `code`. */
+export function reasonFor(code: RefusalCode): string {
+  return REASONS[code] ?? NOTICES[code];
+}
 
 /**
  * `edits` in source order, checked: each range lies in `0..length` and runs

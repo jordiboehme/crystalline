@@ -52,6 +52,7 @@ import { backGates } from "../../backGates";
 import { fieldSettlers, LOST_FIELD_TEXT } from "./draws";
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { writable } from "../elementEdit";
+import { roomUndo } from "../roomUndo";
 import { flowKind, nextAnchorTicket, runDiagramOp, seqKind } from "./apply";
 import type { ApplyOutcome } from "./apply";
 import type { RefusalCode } from "./edits";
@@ -148,6 +149,8 @@ interface OpenField {
   queued: string;
   /** Where the field stood when a composition began, to hold the page there. */
   lockTop: number | null;
+  /** It names a part an add just made, which Escape leaves in place. */
+  added: boolean;
 }
 
 const fields = new WeakMap<EditorView, OpenField>();
@@ -729,6 +732,7 @@ function makeField(
     refused: null,
     queued: "",
     lockTop: null,
+    added: false,
   };
   el.addEventListener("input", () => {
     open.typed = true;
@@ -839,7 +843,7 @@ export function openLabelEditor(
   main: EditorView,
   anchor: number,
   target: TargetKey,
-  options: { selectAll: boolean; initial?: string },
+  options: { selectAll: boolean; initial?: string; added?: true },
 ): void {
   if (!writable(main.state) || target.kind === "canvas") {
     return;
@@ -906,6 +910,7 @@ export function openLabelEditor(
   }
   const text = options.initial ?? label;
   const created = makeField(main, fence.from, target, label, text);
+  created.added = options.added === true;
   const arrowEffect: StateEffect<unknown>[] = [];
   const line = lineHoldEffect(model, target, fence.bodyFrom);
   if (line !== null) {
@@ -940,11 +945,25 @@ function intentStaleAt(main: EditorView, fence: MermaidFence): boolean {
   return main.state.field(diagramField).behind.includes(fence.from);
 }
 
-/** Closes the field, writes nothing, and puts the focus on its stop. */
+/** What Escape on a field an add opened says: the part stays, and how it goes. */
+const KEPT: Partial<Record<TargetKey["kind"], RefusalCode>> = {
+  node: "keptBox",
+  participant: "keptParticipant",
+  message: "keptMessage",
+};
+
+/**
+ * Closes the field, writes nothing, and puts the focus on its stop. A field an add
+ * opened leaves what was added in place, and says so once, with the way back.
+ */
 export function cancelLabelEditor(main: EditorView): void {
   const open = fields.get(main);
   if (open !== undefined && open.checking === null) {
     finish(open, "enter");
+    const kept = open.added ? KEPT[open.target.kind] : undefined;
+    if (kept !== undefined) {
+      sayAt(main, open.anchor, kept);
+    }
   }
 }
 
@@ -968,14 +987,33 @@ export async function addWithName(
   }
   const outcome: ApplyOutcome<TargetKey> =
     op.op === "addParticipant" || op.op === "addMessage"
-      ? await runDiagramOp(main, anchor, seqKind, op)
+      ? await runDiagramOp(main, anchor, seqKind, inThisRoom(main, op))
       : await runDiagramOp(main, anchor, flowKind, op);
   const place = main.state.field(diagramIntent, false)?.anchor ?? anchor;
   if ("refused" in outcome) {
     sayAt(main, place, outcome.refused);
   } else if (outcome.applied && outcome.created !== undefined) {
-    openLabelEditor(main, place, outcome.created, { selectAll: true });
+    openLabelEditor(main, place, outcome.created, {
+      selectAll: true,
+      added: true,
+    });
   }
+}
+
+/**
+ * In a room, a new participant's id starts from a number of this person's own: two
+ * people adding at the same moment would otherwise both write `p1`, and the merged
+ * text would hold one participant declared twice, a line nobody can rename away.
+ * Alone, ids count from 1.
+ */
+function inThisRoom(
+  main: EditorView,
+  op: Extract<SeqOp, { op: "addParticipant" | "addMessage" }>,
+): SeqOp {
+  const room = main.state.facet(roomUndo);
+  return op.op === "addParticipant" && room !== null
+    ? { ...op, first: 1 + (room.doc.clientID % 1000) }
+    : op;
 }
 
 /** A close that did not come from the field. */

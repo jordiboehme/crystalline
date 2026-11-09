@@ -15,7 +15,6 @@ import {
   untrackAnchor,
 } from "../../diagramAnchors";
 import { nextAnchorTicket } from "../apply";
-import type { TargetKey } from "../intent";
 import { flowEdgeAt, flowEdgeSpanOf, flowPairCount } from "./hit";
 import type { EdgeKey, FlowModel } from "./model";
 
@@ -58,26 +57,6 @@ export function resolveArrow(
     pos === undefined ? null : pos - bodyFrom,
     false,
   );
-}
-
-/** `target` now: a box stands as it is, and `flowLabelOf` says whether it is there. */
-export function resolveTarget(
-  main: EditorView,
-  target: TargetKey,
-  hold: ArrowHold | null,
-  model: FlowModel,
-  bodyFrom: number,
-): TargetKey | "stale" | "gone" {
-  if (target.kind !== "edge") {
-    return target;
-  }
-  const edge = resolveArrow(
-    main,
-    hold ?? { ticket: null, key: target.key, sole: true },
-    model,
-    bodyFrom,
-  );
-  return typeof edge === "string" ? edge : { kind: "edge", key: edge };
 }
 
 /** Where a ticket for `key` of `model` goes: inside the token, clear of its edges. */
