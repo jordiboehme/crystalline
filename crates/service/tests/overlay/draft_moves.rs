@@ -16,6 +16,7 @@ use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
 use crystalline_remote::ops::DiscardTarget;
 use crystalline_remote::state::{BaseStamp, OriginState, remove_base_file, write_base_file};
 use crystalline_service::draft_start::{self, DraftStart};
+use crystalline_service::engine::{DraftConflict, DraftConflictKind};
 use crystalline_service::overlay_journal;
 use crystalline_service::params::{
     DeleteParams, EditParams, MoveParams, ReadParams, SaveParams, SplitParams, WriteParams,
@@ -28,6 +29,12 @@ const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - 
 /// What the team's plan says after a colleague's change.
 const PLAN_LATER: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan after bob's change #team\n";
 /// A team file with no `permalink:` line, whose address is its path's slug.
+/// The team's MANIFEST when a share commits straight to the branch.
+const MANIFEST_DIRECT: &str = "---\ntype: manifest\ntitle: team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
+/// A page with three lines far apart, so a change at each end merges.
+const LONG: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the first line #team\n\n- [decision] the middle line, see [other](other.md) #team\n\n- [decision] the last line #team\n";
+const BOB_LINE: &str = "bob's first line";
+const HER_LINE: &str = "- [idea] alice's own line #team";
 const LOOSE: &str = "---\ntype: engram\ntitle: Loose\ntags:\n  - team\nstatus: stable\n---\n\n# Loose\n\n- [fact] no permalink line here #team\n";
 const NOTE: &str =
     "---\ntitle: Note\ntype: note\nstatus: draft\npermalink: note\n---\n\nteam body\n";
@@ -53,22 +60,29 @@ struct Fixture {
 /// A reviewing team domain with an origin, whose base snapshot says what the
 /// folder says: the MANIFEST and `files`.
 async fn fixture(files: &[(&str, &str)]) -> Fixture {
-    build(files, true).await
+    build(files, true, MANIFEST).await
+}
+
+/// [`fixture`] with `sharing: direct`, so a share is a commit.
+async fn fixture_direct(files: &[(&str, &str)]) -> Fixture {
+    build(files, true, MANIFEST_DIRECT).await
 }
 
 /// The same domain with no origin and so no base snapshot at all.
 async fn fixture_with_no_snapshot(files: &[(&str, &str)]) -> Fixture {
-    build(files, false).await
+    build(files, false, MANIFEST).await
 }
 
-async fn build(files: &[(&str, &str)], origin: bool) -> Fixture {
+async fn build(files: &[(&str, &str)], origin: bool, manifest: &str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), manifest).unwrap();
     for (name, text) in files {
-        std::fs::write(dir.join(name), text).unwrap();
+        let file = dir.join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
     }
     let mut cfg = GlobalConfig {
         domains_root: Some(root.join("domains-root")),
@@ -102,7 +116,7 @@ async fn build(files: &[(&str, &str)], origin: bool) -> Fixture {
     let mut mock = None;
     if origin {
         let provider = Arc::new(crate::support::MockProvider::new());
-        let mut held = BTreeMap::from([("MANIFEST.md".to_string(), MANIFEST.as_bytes().to_vec())]);
+        let mut held = BTreeMap::from([("MANIFEST.md".to_string(), manifest.as_bytes().to_vec())]);
         for (name, text) in files {
             held.insert((*name).to_string(), text.as_bytes().to_vec());
         }
@@ -128,7 +142,7 @@ async fn build(files: &[(&str, &str)], origin: bool) -> Fixture {
         mock,
     };
     if origin {
-        f.team_has("MANIFEST.md", MANIFEST.as_bytes());
+        f.team_has("MANIFEST.md", manifest.as_bytes());
         for (name, text) in files {
             f.team_has(name, text.as_bytes());
         }
@@ -280,6 +294,94 @@ impl Fixture {
         mock.set_branch("main", &commit);
         self.engine
             .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+
+    /// The forge's `main` as it stands.
+    fn tree(&self) -> BTreeMap<String, Vec<u8>> {
+        let mock = self.mock.as_ref().unwrap();
+        let head = mock.branch_commit("main").unwrap();
+        mock.commit_paths(&head)
+            .into_iter()
+            .map(|path| {
+                let bytes = mock.commit_file(&head, &path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    /// What the forge's `main` holds at `path`.
+    fn forge_file(&self, path: &str) -> Option<String> {
+        self.tree()
+            .remove(path)
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    /// A colleague commits these changes and this machine pulls them.
+    async fn push(&self, changes: &[(&str, Option<String>)]) {
+        let mut files = self.tree();
+        for (path, text) in changes {
+            match text {
+                Some(text) => files.insert((*path).to_string(), text.clone().into_bytes()),
+                None => files.remove(*path),
+            };
+        }
+        let mock = self.mock.as_ref().unwrap();
+        let commit = mock.add_commit(files);
+        mock.set_branch("main", &commit);
+        self.engine
+            .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+
+    /// Alice shares everything she holds.
+    async fn share(&self) -> serde_json::Value {
+        self.engine
+            .origin_share(
+                "team",
+                None,
+                None,
+                None,
+                None,
+                ShareActor::Account("alice".to_string()),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn conflicts(&self) -> Vec<DraftConflict> {
+        self.engine.draft_conflicts("team", "alice").await.unwrap()
+    }
+
+    /// The text of alice's row at `path`.
+    async fn row(&self, path: &str) -> String {
+        let store = self.store.lock().await;
+        let id = self.domain_id(&*store).await;
+        store
+            .overlay_entries(id, "alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.path == path)
+            .unwrap_or_else(|| panic!("alice holds no row at {path}"))
+            .content
+    }
+
+    async fn append(&self, identifier: &str, line: &str) {
+        self.engine
+            .edit_engram_as(&edit_append(identifier, line), None, &alice())
+            .await
+            .unwrap();
+    }
+
+    async fn replace(&self, identifier: &str, find: &str, with: &str) {
+        let mut p = edit_append(identifier, with);
+        p.operation = "find_replace".to_string();
+        p.find_text = Some(find.to_string());
+        self.engine
+            .edit_engram_as(&p, None, &alice())
             .await
             .unwrap();
     }
@@ -949,8 +1051,8 @@ async fn a_second_move_hands_the_record_on_and_leaves_none_behind() {
     assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN)));
 }
 
-/// A move back is reachable only for another spelling of the file: onto a path a
-/// different team file stands at, `refuse_taken_draft_destination` refuses it.
+/// A move back by case keeps the start; the plain move back is
+/// `a_plain_move_back_lands_on_her_own_deletion_and_survives_a_rebuild`.
 #[tokio::test]
 async fn a_move_back_keeps_the_start() {
     let f = fixture(&[("note.md", NOTE)]).await;
@@ -962,17 +1064,31 @@ async fn a_move_back_keeps_the_start() {
     assert_eq!(f.start("Note.md"), None, "nothing stays at the other end");
 }
 
-/// The other move back is refused as it was, and costs no record.
+/// A move onto a team path that is not where the draft started is refused, even
+/// over a deletion of hers there, and the refusal costs no record. Only the way
+/// back is free (`a_plain_move_back_lands_on_her_own_deletion_and_survives_a_rebuild`).
 #[tokio::test]
-async fn a_refused_move_back_to_a_team_path_changes_no_record() {
-    let f = fixture(&[("plan.md", PLAN)]).await;
+async fn a_refused_move_onto_another_deleted_team_file_changes_no_record() {
+    let f = fixture(&[("plan.md", PLAN), ("loose.md", LOOSE)]).await;
     f.moved("plan", "renamed.md").await;
-    let before = (f.start("plan.md"), f.start("renamed.md"));
+    f.delete("loose").await;
+    let before = (
+        f.start("plan.md"),
+        f.start("renamed.md"),
+        f.start("loose.md"),
+    );
     f.engine
-        .move_engram(&draft_move("plan", "plan.md"), &alice())
+        .move_engram(&draft_move("plan", "loose.md"), &alice())
         .await
         .unwrap_err();
-    assert_eq!((f.start("plan.md"), f.start("renamed.md")), before);
+    assert_eq!(
+        (
+            f.start("plan.md"),
+            f.start("renamed.md"),
+            f.start("loose.md")
+        ),
+        before
+    );
 }
 
 #[tokio::test]
@@ -1610,4 +1726,363 @@ async fn a_followed_team_rename_points_the_record_at_the_new_path() {
     f.team_renames_plan_and_pull("plan-v2.md").await;
     assert_eq!(f.rows().await, vec![("plan-v2.md".to_string(), false)]);
     assert_eq!(f.start("plan-v2.md"), None);
+}
+
+// --- The pass merges a moved draft ---------------------------------------------
+
+fn bobs(text: &str) -> String {
+    text.replace("the first line", BOB_LINE)
+}
+
+/// What a moved draft's conflict is, at its new path.
+fn moved_conflict(path: &str, from: &str, kind: DraftConflictKind) -> DraftConflict {
+    DraftConflict {
+        id: format!(
+            "d{}",
+            &crate::support::sha256_hex(format!("alice\0{path}").as_bytes())[..7]
+        ),
+        path: path.to_string(),
+        kind,
+        moved_from: Some(from.to_string()),
+        file: false,
+        other: None,
+    }
+}
+
+#[tokio::test]
+async fn an_unedited_rename_carries_only_the_move_and_the_peers_line() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.moved("plan", "renamed.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("plan.md".to_string(), true),
+            ("renamed.md".to_string(), false)
+        ]
+    );
+    assert_eq!(
+        f.row("renamed.md").await,
+        bobs(LONG),
+        "his line and her move"
+    );
+    assert!(f.reads("plan").await.contains(BOB_LINE));
+    let record = f.start("renamed.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()));
+    assert_eq!(record.merged_at, None, "none of her words changed");
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", &bobs(LONG))));
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn an_unedited_folder_move_carries_the_peers_line_with_links_rebased() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.moved("plan", "sub/plan.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    let row = f.row("sub/plan.md").await;
+    assert!(row.contains(BOB_LINE), "{row}");
+    assert!(row.contains("[other](../other.md)"), "{row}");
+    assert!(!row.contains("(other.md)"), "{row}");
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn an_unedited_case_move_keeps_the_peers_line_on_either_disk() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.moved("plan", "Plan.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("Plan.md".to_string(), false),
+            ("plan.md".to_string(), true)
+        ]
+    );
+    assert!(f.row("Plan.md").await.contains(BOB_LINE));
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn an_unedited_case_move_shares_no_delete_on_either_disk() {
+    let f = fixture_direct(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.moved("plan", "Plan.md").await;
+    let answer = f.share().await;
+    assert!(
+        answer["deleted"].as_array().is_none_or(Vec::is_empty),
+        "{answer}"
+    );
+    assert_eq!(f.forge_file("plan.md").as_deref(), Some(LONG), "{answer}");
+    assert_eq!(f.share().await["outcome"], "nothing_to_share");
+
+    // A colleague's edit first, then her share: his line is what the forge holds.
+    let f = fixture_direct(&[("plan.md", LONG)]).await;
+    f.moved("plan", "Plan.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+    let answer = f.share().await;
+    assert!(
+        answer["deleted"].as_array().is_none_or(Vec::is_empty),
+        "{answer}"
+    );
+    let held = f.tree();
+    assert!(
+        held.values()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(BOB_LINE)),
+        "{answer}"
+    );
+}
+
+/// Asserted per disk: on a disk that folds case her share lands her move, and on
+/// one that does not, only her text travels and the spelling stays hers.
+#[tokio::test]
+async fn an_edited_case_move_ends_when_it_lands_on_either_disk() {
+    let f = fixture_direct(&[("plan.md", LONG)]).await;
+    let folds = folds_case(&f.root);
+    eprintln!("the temp folder folds case: {folds}");
+    f.append("plan", HER_LINE).await;
+    f.moved("plan", "Plan.md").await;
+    let answer = f.share().await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+
+    if folds {
+        // Her text stands at the spelling the team has, which on this disk is
+        // her file: both halves end.
+        assert_eq!(f.rows().await, vec![], "{answer}");
+    } else {
+        // A share does not carry the spelling, and on this disk the team's
+        // `plan.md` is not her `Plan.md`: what stays is an unedited case move,
+        // in step with the text she shared.
+        assert_eq!(
+            f.rows().await,
+            vec![
+                ("Plan.md".to_string(), false),
+                ("plan.md".to_string(), true)
+            ],
+            "{answer}"
+        );
+        assert_eq!(
+            f.start("Plan.md").unwrap().start,
+            f.forge_file("plan.md"),
+            "{answer}"
+        );
+    }
+    assert_eq!(f.conflicts().await, vec![]);
+    let held = f.tree();
+    assert!(
+        held.values()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains("alice's own line")),
+        "{held:?}"
+    );
+    assert_eq!(f.share().await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn an_edited_move_merges_both_lines() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    f.moved("plan", "renamed.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    let row = f.row("renamed.md").await;
+    assert!(row.contains(BOB_LINE) && row.contains(HER_LINE), "{row}");
+    let record = f.start("renamed.md").unwrap();
+    assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()));
+    assert!(record.merged_at.is_some());
+    assert_eq!(
+        f.start("plan.md").unwrap().start.as_deref(),
+        Some(bobs(LONG).as_str()),
+        "the deletion half starts there too"
+    );
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn an_edited_move_on_the_same_line_is_a_conflict_at_the_new_path() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    f.moved("plan", "renamed.md").await;
+    let hers = f.row("renamed.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    assert_eq!(f.row("renamed.md").await, hers);
+    assert_eq!(
+        f.conflicts().await,
+        vec![moved_conflict(
+            "renamed.md",
+            "plan.md",
+            DraftConflictKind::EditEdit
+        )]
+    );
+}
+
+/// N1, direct: her own share of an edited move ends both halves, and a later
+/// colleague's edit of the new path is his, with nothing of hers to share.
+#[tokio::test]
+async fn an_edited_move_ends_when_it_lands_and_a_later_peer_edit_stays() {
+    let f = fixture_direct(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    f.moved("plan", "renamed.md").await;
+    let answer = f.share().await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.conflicts().await, vec![]);
+    assert_eq!(answer["drafts_folded"], 2, "{answer}");
+
+    let landed = f.forge_file("renamed.md").unwrap();
+    f.push(&[("renamed.md", Some(bobs(&landed)))]).await;
+    assert!(f.reads("plan").await.contains(BOB_LINE));
+    assert_eq!(f.share().await["outcome"], "nothing_to_share");
+    assert!(f.forge_file("renamed.md").unwrap().contains(BOB_LINE));
+}
+
+#[tokio::test]
+async fn a_move_with_a_new_permalink_keeps_the_peers_edit() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    let mut asked = draft_move("plan", "renamed.md");
+    asked.permalink = Some("renamed".to_string());
+    f.engine.move_engram(&asked, &alice()).await.unwrap();
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+
+    let row = f.row("renamed.md").await;
+    assert!(row.contains(BOB_LINE), "{row}");
+    assert!(row.contains("permalink: renamed"), "{row}");
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_move_of_a_file_with_no_permalink_line_keeps_the_peers_edit() {
+    let f = fixture(&[("loose.md", LOOSE)]).await;
+    f.moved("loose", "elsewhere.md").await;
+    let later = LOOSE.replace("no permalink line here", "bob's line about it");
+    f.push(&[("loose.md", Some(later))]).await;
+
+    let row = f.row("elsewhere.md").await;
+    assert!(row.contains("bob's line about it"), "{row}");
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+#[tokio::test]
+async fn a_move_back_with_no_edit_after_a_peer_edit_ends_and_shows_the_peer() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.moved("plan", "renamed.md").await;
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+    f.moved("plan", "plan.md").await;
+
+    assert_eq!(f.conflicts().await, vec![]);
+    assert!(f.reads("plan").await.contains(BOB_LINE));
+    f.engine.converge_overlays("team").await.unwrap();
+    assert_eq!(f.rows().await, vec![]);
+    assert!(f.reads("plan").await.contains(BOB_LINE));
+}
+
+#[tokio::test]
+async fn a_peer_delete_of_a_file_she_moved_stands_as_a_conflict() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.moved("plan", "renamed.md").await;
+    f.push(&[("plan.md", None)]).await;
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("plan.md".to_string(), true),
+            ("renamed.md".to_string(), false)
+        ],
+        "neither half is dropped"
+    );
+    assert_eq!(
+        f.conflicts().await,
+        vec![moved_conflict(
+            "renamed.md",
+            "plan.md",
+            DraftConflictKind::EditDelete
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_crlf_team_file_clears_her_landed_draft() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    let hers = f.row("plan.md").await;
+    f.push(&[("plan.md", Some(hers.replace('\n', "\r\n")))])
+        .await;
+
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+}
+
+/// A plain move back onto the path she moved from: her own deletion there is no
+/// obstacle (C3).
+#[tokio::test]
+async fn a_plain_move_back_lands_on_her_own_deletion_and_survives_a_rebuild() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    f.moved("plan", "renamed.md").await;
+    f.moved("plan", "plan.md").await;
+
+    assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
+    assert_eq!(f.start("renamed.md"), None);
+    let record = f.start("plan.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(LONG));
+
+    // The mirror holds the draft and no tombstone, so a rebuild brings the draft.
+    let journal = overlay_journal::journal_entries(&f.state, "team");
+    assert!(!journal.unreadable);
+    let mine: Vec<_> = journal
+        .entries
+        .iter()
+        .filter(|entry| entry.actor == "alice")
+        .map(|entry| (entry.path.clone(), entry.content.is_some()))
+        .collect();
+    assert_eq!(mine, vec![("plan.md".to_string(), true)]);
+}
+
+/// A merge whose text is the team's own ends the draft: the team took her line
+/// and added one of his.
+#[tokio::test]
+async fn a_merge_equal_to_the_teams_text_ends_the_draft() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.append("plan", HER_LINE).await;
+    // Her text with his line in it, her `generated` stamp and all.
+    let theirs = bobs(&f.row("plan.md").await);
+    f.push(&[("plan.md", Some(theirs))]).await;
+
+    assert_eq!(f.rows().await, vec![]);
+    assert_eq!(f.start("plan.md"), None);
+    assert!(f.reads("plan").await.contains(BOB_LINE));
+}
+
+/// An edited case move whose edit the team took, with a line of his own: her
+/// draft takes his text and is an unedited case move from there, which stays in
+/// step on either disk, as C10 has it. Nobody's change ends her case move.
+#[tokio::test]
+async fn an_edited_case_move_whose_edit_the_team_took_stays_on_either_disk() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.append("plan", HER_LINE).await;
+    let theirs = bobs(&f.row("plan.md").await);
+    f.moved("plan", "Plan.md").await;
+    f.push(&[("plan.md", Some(theirs.clone()))]).await;
+
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("Plan.md".to_string(), false),
+            ("plan.md".to_string(), true)
+        ]
+    );
+    let row = f.row("Plan.md").await;
+    assert!(row.contains(BOB_LINE) && row.contains(HER_LINE), "{row}");
+    assert_eq!(
+        f.start("Plan.md").unwrap().start.as_deref(),
+        Some(theirs.as_str())
+    );
+    assert_eq!(f.conflicts().await, vec![]);
 }

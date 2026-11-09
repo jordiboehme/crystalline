@@ -4469,6 +4469,48 @@ pub(super) async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
         .unwrap();
 }
 
+/// [`draft`] for a draft written since drafts keep a record of where they
+/// started: the row, and the record a write verb leaves, read from the base
+/// snapshot as it stands now. Call it before the team moves on. `tmp` is the
+/// fixture's state directory, as [`mirror`] takes it.
+pub(super) async fn drafted(eng: &Engine, tmp: &Path, actor: &str, path: &str, text: &str) {
+    // A second write of a row keeps the record the first one left.
+    if crystalline_service::draft_start::load(tmp, "team", actor, path)
+        .unwrap()
+        .is_some()
+    {
+        draft(eng, actor, path, text).await;
+        return;
+    }
+    let snapshot = tmp.join("origins").join("team");
+    let state = crystalline_remote::state::OriginState::load(&snapshot)
+        .unwrap()
+        .expect("the domain has a base snapshot");
+    let start = if state.files.contains_key(path) {
+        crystalline_remote::state::read_base_file(&snapshot, path)
+            .unwrap()
+            .map(|bytes| crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned())
+    } else {
+        None
+    };
+    let from = start.is_some().then(|| path.to_string());
+    crystalline_service::draft_start::save(
+        tmp,
+        "team",
+        actor,
+        &crystalline_service::draft_start::DraftStart {
+            path: path.to_string(),
+            from,
+            start,
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+        },
+    )
+    .unwrap();
+    draft(eng, actor, path, text).await;
+}
+
 /// Write one actor's deletion of a base path: a tombstone row standing at that
 /// path, whose permalink is the path, exactly as `write_overlay_tombstone`
 /// records one.
@@ -4484,6 +4526,30 @@ async fn tombstone(eng: &Engine, actor: &str, path: &str) {
     record.tombstone = true;
     record.permalink = path.to_string();
     store.upsert_overlay(id, actor, &record).await.unwrap();
+}
+
+/// [`tombstone`] for a deletion made since drafts keep a record: the record the
+/// delete verb leaves, starting from the team's text at that path.
+async fn tombstoned(eng: &Engine, tmp: &Path, actor: &str, path: &str) {
+    tombstone(eng, actor, path).await;
+    let snapshot = tmp.join("origins").join("team");
+    let start = crystalline_remote::state::read_base_file(&snapshot, path)
+        .unwrap()
+        .map(|bytes| String::from_utf8(bytes).unwrap());
+    crystalline_service::draft_start::save(
+        tmp,
+        "team",
+        actor,
+        &crystalline_service::draft_start::DraftStart {
+            path: path.to_string(),
+            from: Some(path.to_string()),
+            start,
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+        },
+    )
+    .unwrap();
 }
 
 /// The scope one actor name means, as an authenticated surface resolves it.
@@ -4547,7 +4613,7 @@ async fn a_review_mode_share_carries_the_marker_through_the_proposal() {
     )
     .await;
     let root = tmp.path().join("team-knowledge");
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     let preview = eng
         .origin_share_preview(
             "team",
@@ -4611,7 +4677,7 @@ async fn an_overlay_share_stages_the_actors_files_and_the_proposal_carries_the_b
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     file(&eng, "owner", "assets/deck.png", DECK_PNG).await;
     delete_file(&eng, "owner", "assets/old.png").await;
 
@@ -4703,9 +4769,9 @@ async fn an_overlay_share_proposes_exactly_the_actors_entries() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    tombstone(&eng, "owner", "notes/old.md").await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    tombstoned(&eng, tmp.path(), "owner", "notes/old.md").await;
     // A stray direct edit of the reviewed folder. Nobody reviewed it, so no
     // share carries it: a walk of the tree would, and this is how the test
     // says the plan is not a walk.
@@ -4747,8 +4813,8 @@ async fn files_naming_another_actors_path_refuses() {
     )
     .await;
 
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let err = eng
         .origin_share(
@@ -4793,8 +4859,8 @@ async fn the_owner_cli_shares_the_owner_overlay() {
     )
     .await;
 
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4838,7 +4904,7 @@ async fn an_http_agent_without_identity_cannot_share_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let err = eng
         .origin_share("team", None, None, None, None, ShareActor::HttpAgent)
@@ -4885,8 +4951,8 @@ async fn an_overlay_share_respects_the_domains_generated_index_policy_on_both_si
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/index.md", DRAFT_INDEX).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4912,8 +4978,8 @@ async fn an_overlay_share_respects_the_domains_generated_index_policy_on_both_si
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/index.md", DRAFT_INDEX).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4946,7 +5012,7 @@ async fn a_review_mode_share_pulls_the_teams_folder_not_the_staged_tree() {
     )
     .await;
     let root = tmp.path().join("team-knowledge");
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     // The team merged somebody else's work while this draft was being written.
     let moved = mock.add_commit(commit_files(&[
@@ -5011,7 +5077,7 @@ async fn an_upstream_move_after_the_share_pulled_refuses_instead_of_merging_into
     .await;
     let root = tmp.path().join("team-knowledge");
     let state_dir = tmp.path().join("origins").join("team");
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let settled = crystalline_remote::state::OriginState::load(&state_dir)
         .unwrap()
@@ -5078,7 +5144,7 @@ async fn an_actor_with_no_drafts_has_nothing_to_share() {
     )
     .await;
     // Somebody else is drafting; this actor is not.
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -5104,8 +5170,8 @@ async fn a_shared_draft_is_still_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let before = {
         let store = eng.store();
@@ -5171,9 +5237,9 @@ async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/authored.md", AUTHORED).await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/authored.md", AUTHORED).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let plan = eng
         .origin_share_preview(
@@ -5268,7 +5334,7 @@ async fn a_base_path_with_no_recorded_copy_asks_for_a_resync() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     // The recorded copy goes missing while the path stays in the snapshot.
     let copy = tmp
@@ -5320,7 +5386,7 @@ async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan: v2.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan: v2.md", DRAFT_FRESH).await;
 
     let drafted = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -5437,9 +5503,9 @@ async fn a_merged_and_pulled_draft_converges_out_of_the_overlay() {
     )
     .await;
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     // The team reviewed the rewrite and merged it.
@@ -5669,10 +5735,10 @@ async fn a_diverged_draft_is_its_authors_conflict_only() {
     )
     .await;
 
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     // A draft at a path this pull never touches: not merged, not in conflict.
-    draft(&eng, "alice", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "alice", "notes/fresh.md", DRAFT_FRESH);
 
     // Somebody else's change to the same page landed instead.
@@ -5775,7 +5841,7 @@ async fn a_renamed_base_path_takes_the_draft_with_it() {
     )
     .await;
 
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
 
     // The team filed the same page under a new name.
@@ -5817,7 +5883,7 @@ async fn a_pulled_address_collision_is_the_drafters_divergence() {
     let root = tmp.path().join("team-knowledge");
 
     // A page only this actor has, answering to `plan`.
-    draft(&eng, "owner", "notes/mine.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/mine.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/mine.md", DRAFT_PLAN);
 
     // The team adds a page of its own at that address, under another name.
@@ -5866,9 +5932,9 @@ async fn withdraw_revert_lands_in_the_overlay_while_the_tree_stays() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     let shared = eng
@@ -5917,7 +5983,7 @@ async fn a_resolution_in_a_reviewing_domain_is_a_draft() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
 
     let merged = eng
@@ -5968,7 +6034,7 @@ async fn an_http_agent_without_identity_cannot_resolve_or_withdraw_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
 
     let err = eng
         .origin_resolve(
@@ -6063,11 +6129,11 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
 
     // A draft the folder already says, a draft it does not, and a deletion of
     // a page the folder still has.
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
-    tombstone(&eng, "owner", "notes/old.md").await;
+    tombstoned(&eng, tmp.path(), "owner", "notes/old.md").await;
 
     let report = eng.converge_overlays("team").await.unwrap();
     assert_eq!(report.cleared, 1, "the draft the folder caught up with");
@@ -6086,7 +6152,8 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
 /// A convergence pass that stops on an error still announces the drafts it
 /// already ended: the batch guard is pushed each drop right after it lands, so
 /// a later entry failing does not swallow the event for an earlier one. The
-/// second draft's base copy is a directory, which no read turns into bytes.
+/// second draft's base copy is a directory, which no read turns into bytes, at
+/// a key of the snapshot.
 #[tokio::test]
 async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6100,13 +6167,27 @@ async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/zz.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH);
     let base = base_copy_of(&tmp.path().join("origins"), "notes/plan.md")
         .expect("the first pull wrote the base snapshot");
     std::fs::create_dir_all(base.join("notes/zz.md")).unwrap();
+    // A key of the snapshot, so the pass reads its copy: a path that is no key
+    // is absent without a read.
+    let state_dir = base.parent().unwrap();
+    let mut state = crystalline_remote::state::OriginState::load(state_dir)
+        .unwrap()
+        .unwrap();
+    state.files.insert(
+        "notes/zz.md".to_string(),
+        crystalline_remote::state::BaseStamp {
+            sha256: crate::support::sha256_hex(DRAFT_FRESH.as_bytes()),
+            size: DRAFT_FRESH.len() as u64,
+        },
+    );
+    state.save(state_dir).unwrap();
 
     let mut rx = eng.changes().subscribe();
     eng.converge_overlays("team")
@@ -6163,7 +6244,7 @@ async fn an_out_of_band_conflict_is_still_settled_against_the_folder() {
     let root = tmp.path().join("team-knowledge");
 
     // Somebody's draft, which takes no part in this at all.
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     // A direct edit of the reviewed folder, and an upstream change to the same
@@ -6257,7 +6338,7 @@ async fn an_unrelated_pull_leaves_a_standing_conflict_alone() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
 
     // Pull A moves the page ada is drafting: her draft is a conflict.
@@ -6331,7 +6412,7 @@ async fn the_clear_only_pass_leaves_the_conflicts_it_did_not_settle() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
 
     let moved = mock.add_commit(commit_files(&[
@@ -6395,7 +6476,7 @@ async fn a_restart_still_names_the_conflicts_the_last_pull_found() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
     let moved = mock.add_commit(commit_files(&[
         ("MANIFEST.md", manifest()),
@@ -6458,7 +6539,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/ada.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "ada", "notes/ada.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "ada", "notes/ada.md", DRAFT_FRESH);
     let first = eng
         .origin_share(
@@ -6475,7 +6556,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
 
     // Bo has never shared anything. The refusal must not tell him to do the
     // thing he is doing.
-    draft(&eng, "bo", "notes/bo.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE).await;
     mirror(tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE);
     let err = eng
         .origin_share(
@@ -6499,7 +6580,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     );
 
     // Ada's own second share is the one that may withdraw and share again.
-    draft(&eng, "ada", "notes/more.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/more.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/more.md", DRAFT_PLAN);
     let err = eng
         .origin_share(
@@ -6584,7 +6665,7 @@ async fn a_pulled_convergence_ends_the_links_on_the_draft_it_cleared() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
     assert_eq!(
@@ -6612,7 +6693,7 @@ async fn a_pulled_convergence_ends_the_links_on_the_draft_it_cleared() {
     );
 
     // And a later draft at the same path revives nothing.
-    draft(&eng, "alice", "notes/plan.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_FRESH).await;
     assert!(
         auth.overlay_grants_held("bob", "team")
             .await
@@ -6638,7 +6719,7 @@ async fn convergences_rename_ends_the_links_on_the_path_it_left() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
 
@@ -6690,7 +6771,7 @@ async fn a_convergence_that_makes_the_draft_the_folder_ends_its_links() {
     // Her draft says exactly what the team's page says, which is what makes the
     // rename below land rather than move.
     let agreed = String::from_utf8(team_plan()).unwrap();
-    draft(&eng, "alice", "notes/plan.md", &agreed).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", &agreed).await;
     mirror(tmp.path(), "alice", "notes/plan.md", &agreed);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
 

@@ -1566,10 +1566,9 @@ impl Engine {
                         actor.clone(),
                         everyone,
                     ),
-                    // Read here for the reason the counts are: a plain
-                    // in-memory read of what the last pull recorded, which
-                    // orders nothing and cannot fail.
-                    self.converged_json(&name, actor.as_deref(), everyone),
+                    // Read here for the reason the counts are: outside the
+                    // per-domain lock, from what stands, and it fails no report.
+                    self.converged_json(&name, actor.as_deref(), everyone).await,
                 )
             } else {
                 // Never read: the per-domain body reports the draft keys only

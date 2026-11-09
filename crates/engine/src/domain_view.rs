@@ -1465,6 +1465,18 @@ impl<'a> DomainView<'a> {
         let store = store.lock().await;
         let drafts = store.overlay_entries(src.domain_id, actor).await?;
         let team = store.list_engrams(&p.domain, None, None).await?;
+        // Where the draft being moved started, from its record: a move back onto
+        // that path lands on her own deletion of it, which is no obstacle. Only
+        // a draft she holds has a record to ask, and one that cannot be read
+        // refuses here, as the move would.
+        let started_at = if drafts
+            .iter()
+            .any(|entry| !entry.tombstone && entry.path == src.path)
+        {
+            self.start_of(&src.path)?.and_then(|start| start.from)
+        } else {
+            None
+        };
         // The team's file this very draft was moved from is not in the way: a
         // draft with no team file of its own, and this actor's deletion on another
         // spelling of it, are one case-only move. It can move to a third spelling
@@ -1483,7 +1495,15 @@ impl<'a> DomainView<'a> {
             .iter()
             .any(|entry| !entry.tombstone && entry.path == dest_rel)
             || team.iter().any(|found| found.path == dest_rel);
-        if exact && !moved_from(dest_rel) {
+        // The plain way back: the team's file at the destination is the one this
+        // draft was moved from, and her tombstone stands over it. Only that
+        // tombstone: another deletion of hers is a different team file, which a
+        // move must not replace.
+        let way_back = started_at.as_deref() == Some(dest_rel)
+            && drafts
+                .iter()
+                .any(|entry| entry.tombstone && entry.path == dest_rel);
+        if exact && !moved_from(dest_rel) && !way_back {
             return Err(EngineError::Conflict(format!(
                 "'{dest_rel}' already holds an engram in domain '{}'",
                 p.domain
