@@ -1,0 +1,11 @@
+graph LR
+    %% Outcome::of: what a failed lookup means
+    fail[Lookup failed] --> what{What did GitHub say?}
+    what -- App not installed --> closed[Domain closed]
+    what -- repository not shown --> closed
+    what -- anything else --> learn[Failure to learn]
+    learn --> window[Stale snapshot inside the window]
+    closed --> owner[Only machine owner and instance admins]
+    closed --> retry[Ask again every 5 min]
+    retry -.-> what
+    learn --> degraded[degraded_since is set]

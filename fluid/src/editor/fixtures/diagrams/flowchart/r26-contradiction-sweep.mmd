@@ -1,0 +1,10 @@
+flowchart LR
+    %% the contradiction check in the sweep
+    pairs[Candidate engram pairs] --> near{Similar enough?}
+    near -->|no| skip[Skip]
+    near -->|yes| nli[NLI model]
+    nli --> label{Verdict}
+    label -->|entailment| fine[No finding]
+    label -->|neutral| fine
+    label -->|contradiction| finding[Contradiction finding]
+    finding --> evolve[Shown in evolve]

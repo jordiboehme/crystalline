@@ -19,7 +19,7 @@ import type { StatusColour } from "../markdown/directives";
 import { isIdLine } from "../reflectionText";
 import { STATUS_OPEN } from "./dialectHighlight";
 import { calloutAt, statusAround, statusColourChanges } from "./elementContext";
-import { fenceBody, fenceInfo } from "./fenceInfo";
+import { fenceInfo } from "./fenceInfo";
 import { frontmatterRegion } from "./frontmatterRegion";
 import {
   SECTION_HEADING,
@@ -27,6 +27,7 @@ import {
   mathBlocks,
   mathFence,
   mathSections,
+  quoteDepth,
   quotePrefix,
   unpadded,
   unquoted,
@@ -1073,19 +1074,61 @@ export interface CodeFence extends Span {
 
 /**
  * The source of a mermaid fence the editor draws as a diagram
- * (`fencePreviews.ts`), or null: a closed fence whose info word is
- * `mermaid` (read as the page reads it, `fenceInfo`), with something in it.
- * The reading page draws exactly these. The one test for both layers.
+ * (`fencePreviews.ts`), or null: a fence whose info word is `mermaid` (read
+ * as the page reads it, `fenceInfo`), with something in it. The reading page
+ * draws exactly these, an unclosed fence too (D43): its body runs to where
+ * the fence's container ends. The one test for both layers; whether the
+ * fence is closed, and so may be an editable diagram, is `mermaidFences`'.
  */
 export function mermaidFence(
   state: EditorState,
   node: SyntaxNode,
 ): string | null {
-  const info = fenceInfo(state.doc, node);
-  if (info?.name !== "mermaid" || info.close === null) {
+  const doc = state.doc;
+  const info = fenceInfo(doc, node);
+  if (info?.name !== "mermaid") {
     return null;
   }
-  const body = fenceBody(state.doc, info);
+  // A fence in the frontmatter is YAML text, as `codeFenceOf` has it.
+  const region = frontmatterRegion(doc);
+  if (region !== null && node.from <= region.to) {
+    return null;
+  }
+  const last =
+    info.close !== null ? info.close - 1 : doc.lineAt(node.to).number;
+  if (last <= info.open) {
+    return null;
+  }
+  // The container marks in front of the fence (quote marks, list markers'
+  // indentation) are not part of the diagram: the page hands mermaid the
+  // text without them. They run as far as the opening mark's column and are
+  // made of spaces, tabs and `>`, which also covers a quote on a list item's
+  // line (`- > ```mermaid`) and a list item's own indentation.
+  const openLine = doc.line(info.open);
+  const column = info.marks.from - openLine.from;
+  const lines: string[] = [];
+  for (let number = info.open + 1; number <= last; number += 1) {
+    const text = doc.line(number).text;
+    let at = 0;
+    while (at < column && at < text.length && " \t>".includes(text[at] ?? "")) {
+      at += 1;
+    }
+    lines.push(text.slice(at));
+  }
+  // An unclosed fence on a page read section by section ends at the next
+  // section heading (the page does not draw it, as for math).
+  if (
+    info.close === null &&
+    state.facet(mathSections) &&
+    lines.some(
+      (text, index) =>
+        quoteDepth(doc.line(info.open + 1 + index).text) === 0 &&
+        SECTION_HEADING.test(text),
+    )
+  ) {
+    return null;
+  }
+  const body = lines.join("\n");
   return body.trim() === "" ? null : body;
 }
 

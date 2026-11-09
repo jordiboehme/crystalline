@@ -16,7 +16,8 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
 import { useTheme } from "../theme/context";
-import { mermaidConfig } from "../theme/mermaid";
+import { initializeMermaid, mermaidConfig } from "../theme/mermaid";
+import { drawnLabels } from "../theme/mermaidText";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { queuePaper } from "./paperQueue";
@@ -110,12 +111,12 @@ export default function MermaidDiagram({
     // React's tree, where nothing here could ever take it down again. The
     // fallback below - the source the author wrote - is this component's
     // answer to a diagram that will not parse.
-    mermaid.initialize(mermaidConfig(resolved === "dark"));
+    initializeMermaid(mermaid, resolved === "dark");
     mermaid
       .render(id, source)
       .then((result) => {
         if (live) {
-          setDrawn({ svg: result.svg });
+          setDrawn({ svg: drawnLabels(result.svg) });
         }
       })
       .catch(() => {
@@ -162,7 +163,7 @@ export default function MermaidDiagram({
         .render(`${id}-paper`, `${source}\n${directive}\n`)
         .then((result) => {
           if (live) {
-            setPaperDrawn({ source, svg: result.svg });
+            setPaperDrawn({ source, svg: drawnLabels(result.svg) });
           }
         })
         .catch(() => {

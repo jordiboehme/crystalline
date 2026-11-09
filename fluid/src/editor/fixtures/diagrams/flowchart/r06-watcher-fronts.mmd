@@ -1,0 +1,12 @@
+flowchart LR
+    %% two fronts, one apply
+    watcher[File watcher event] --> targeted[scan_paths: given paths only]
+    startup[Startup sync] --> full[scan_domain: full walk]
+    manual[Manual sync] --> full
+    fallback[Watcher full fallback] --> full
+    targeted --> apply[apply_scan]
+    full --> apply
+    apply --> index[(Index)]
+
+    %% the targeted front only needs to converge
+    targeted -.->|gap| fallback

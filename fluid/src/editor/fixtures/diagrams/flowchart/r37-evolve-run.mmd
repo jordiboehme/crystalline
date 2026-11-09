@@ -1,0 +1,10 @@
+flowchart LR
+    %% crystalline evolve run, unattended
+    sched[Schedule] --> run[evolve run]
+    run --> queue[evolve_engrams queue]
+    queue --> agent[Agent works the items]
+    agent --> writes[Engram writes]
+    writes --> noted[note_run_writes]
+    noted --> branch[Run branch through the GitHub API]
+    branch --> pr[Pull request]
+    agent -.->|nothing to do| quiet([No pull request])

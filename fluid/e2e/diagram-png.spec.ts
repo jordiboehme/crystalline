@@ -90,10 +90,14 @@ async function openFigure(page: Page, index: number): Promise<void> {
       .click({ timeout: 2000 });
   }).toPass({ timeout: 15_000 });
   await expect(dialog.locator('svg[id^="mermaid-"]')).toBeVisible();
-  // The full window fits the drawing once its library has arrived.
   await expect(
     page.getByRole("button", { name: "Download PNG" }),
   ).toBeVisible();
+  // The full window fits the drawing once its library has arrived, and the
+  // button above does not wait for that: the fit puts the pixel size on the svg.
+  await expect(
+    page.getByRole("dialog").locator('svg[id^="mermaid-"]'),
+  ).not.toHaveAttribute("width", "100%");
 }
 
 async function closeFigure(page: Page): Promise<void> {

@@ -1,0 +1,13 @@
+flowchart LR
+    %% reflect: the work queue, recomputed on every call
+    queue[(reflect queue)] --> feedback[Feedback items]
+    feedback --> update[Update items]
+    update --> review[Review threads]
+
+    feedback -->|take into engrams| engrams[Change engrams, then write_reflection]
+    feedback -->|keep| settle[settle outcome=kept]
+    feedback -->|answer| discuss[discuss with answers_feedback]
+    update --> wide[source_too_wide: rewrite without it]
+    review --> blocking[Blocking threads first]
+
+    linkStyle 0,1 stroke:#888,stroke-dasharray:4 3

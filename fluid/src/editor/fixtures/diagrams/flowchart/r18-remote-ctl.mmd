@@ -1,0 +1,11 @@
+flowchart LR
+    %% a remote ctl call from a connected local Crystalline
+    local[Local crystalline] -->|"POST /api/v1/ctl"| route[remote_ctl route]
+    route --> bearer[mcp_gate::resolve_bearer]
+    bearer -->|no token| refuse[Refused: no anonymous ctl]
+    bearer -->|token| scope[Scope::User of the token]
+    scope --> allow{In REMOTE_COMMANDS?}
+    allow -->|no| notRemote[NOT_REMOTE]
+    allow -->|tool| remoteTool[McpServer::remote_tool]
+    allow -->|other| dispatch[Remote dispatcher]
+    remoteTool & dispatch --> reply["Envelope: v, ok, data or error"]

@@ -1,0 +1,8 @@
+flowchart LR
+    %% a write inside a headless run
+    run([crystalline evolve run]) --> agent[Agent session]
+    agent --> write[write_engram]
+    write --> commit[Engine commits the change]
+    commit --> note[note_run_writes]
+    note --> pr[Pull request for the run]
+    commit --> sync[Sync updates the index]

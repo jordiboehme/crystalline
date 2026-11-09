@@ -198,6 +198,22 @@ describe("MermaidDiagram", () => {
     ).not.toBeNull();
   });
 
+  it("draws a label's entity forms on the printer's copy too", async () => {
+    localStorage.setItem("fluid-theme", "dark");
+    renderDiagram.mockImplementation(() =>
+      Promise.resolve({
+        svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+        diagramType: "flowchart-v2",
+      }),
+    );
+    const { container } = draw("graph TD; A-->B;");
+    await waitFor(() => {
+      expect(container.querySelector("[data-print] tspan")?.textContent).toBe(
+        'say "hi"',
+      );
+    });
+  });
+
   it("tells the print sheet each drawing's own size, the paper copy's too", async () => {
     // Paper prints a diagram at its viewBox width, less to fit the column or
     // a page, never more (`index.css`); the wrapper carries the numbers.
@@ -618,6 +634,20 @@ describe("MermaidDiagram", () => {
       expect(document.activeElement).toBe(
         screen.getByRole("button", { name: "Open in full window" }),
       );
+    });
+  });
+
+  it("draws a label's entity forms as the characters they stand for", async () => {
+    vi.mocked(mermaid.render).mockResolvedValueOnce({
+      svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+    } as Awaited<ReturnType<typeof mermaid.render>>);
+    const { container } = render(
+      <ThemeProvider>
+        <MermaidDiagram source="flowchart TD" />
+      </ThemeProvider>,
+    );
+    await waitFor(() => {
+      expect(container.querySelector("tspan")?.textContent).toBe('say "hi"');
     });
   });
 });

@@ -1,0 +1,8 @@
+flowchart TB
+    %% factory.rs picks the Store backend
+    cfg@{ shape: doc, label: "store settings" } --> pick@{ shape: diam, label: "Which backend?" }
+    pick -->|embedded| turso@{ shape: cyl, label: "turso: one file per instance" }
+    pick -->|shared| pg@{ shape: cyl, label: "postgres: shared database" }
+    turso --> trait[Store trait]
+    pg --> trait
+    trait --> sync[Sync engine and search]

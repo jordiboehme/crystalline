@@ -1,0 +1,14 @@
+flowchart TD
+    %% streamable HTTP, with auth.mcp on
+    req[POST to the MCP endpoint] --> on{auth.mcp on?}
+    on -- no --> transport[Streamable HTTP transport]
+    on -- yes --> bearer{Bearer token valid?}
+    bearer -- no --> refuse[401 with WWW-Authenticate: Bearer]
+    bearer -- yes --> who[Resolve the account]
+    who --> transport
+    transport --> cap{Body over 15 MiB?}
+    cap -- yes --> big[413]
+    cap -- no --> handler[Tool handler]
+
+    classDef no fill:#fdecea,stroke:#b3261e
+    class refuse,big no

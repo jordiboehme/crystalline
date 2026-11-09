@@ -1,0 +1,8 @@
+flowchart LR
+    %% line_limit.rs on stdin
+    stdin[stdin] --> read[BoundedLines]
+    read --> size{Line over STDIO_LINE_LIMIT?}
+    size -->|no| relay[Relay to the daemon]
+    size -->|yes| reject["Answer -32600"]
+    read --> replay[replay: hand the session opener back]
+    replay --> relay
