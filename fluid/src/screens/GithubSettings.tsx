@@ -38,6 +38,7 @@ import {
   FOCUS_RING,
 } from "../components/primitives";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** How often the status is asked again while a device flow is running. */
 const POLL_MS = 3000;
@@ -98,7 +99,7 @@ function GithubPanel() {
   });
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: GITHUB_STATUS_KEY });
+    refreshAfterWrite(queryClient, { queryKey: GITHUB_STATUS_KEY });
 
   const connect = useMutation({
     mutationFn: startGithubConnect,

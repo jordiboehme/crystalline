@@ -23,6 +23,7 @@ import { membersKey, setVisibility } from "../api/members";
 import type { DomainMember, GithubPerson } from "../api/model";
 import { formatDay } from "../format";
 import { reflectionWords } from "./reflectionLevels";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const CAPTION = "text-caption font-semibold text-slate-500 dark:text-slate-400";
 const MUTED = "text-sm text-slate-500 dark:text-slate-400";
@@ -117,7 +118,7 @@ function WhoMayRead({
     mutationFn: (makePrivate: boolean) => setVisibility(domain, makePrivate),
     onSuccess: () => {
       setProblem(null);
-      void queryClient.invalidateQueries({ queryKey: membersKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: membersKey(domain) });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));

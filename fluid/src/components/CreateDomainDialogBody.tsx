@@ -66,6 +66,7 @@ import { useAuth } from "../auth/AuthContext";
 import { domainRoute, githubSettingsRoute } from "../paths";
 import type { CreateDomainDialogProps } from "./CreateDomainDialog";
 import { BUTTON, FIELD, FOCUS_RING, Field } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** How long a repository, branch or folder edit waits before it is peeked. */
 const PEEK_DEBOUNCE_MS = 400;
@@ -228,7 +229,7 @@ export default function CreateDomainDialogBody({
       // three, and a domain that was just registered is not in the copy any of
       // them are holding. Invalidated and closed either way, so an admin
       // reading the sidebar update never mistakes this for a failed create.
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
       onClose();
       // An empty name means the server named nothing and neither did the
       // request (the reader in api/admin.ts falls back to "" for exactly

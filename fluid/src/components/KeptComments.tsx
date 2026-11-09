@@ -22,6 +22,7 @@ import { formatInstant } from "../format";
 import { DestructiveAction } from "./DestructiveAction";
 import { KeptTextDialog } from "./KeptTextDialog";
 import { FOCUS_RING } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const ACTION = `rounded text-link underline decoration-(--link-line) underline-offset-[3px] hover:no-underline ${FOCUS_RING}`;
 
@@ -48,7 +49,7 @@ export function KeptComments({
       setProblem(problemDetail(error));
     },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keptKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: keptKey(domain) });
     },
   });
   if (user === null) {

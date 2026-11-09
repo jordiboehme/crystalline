@@ -109,6 +109,7 @@ import {
 import { movePageDrafts } from "../reflectionPageDrafts";
 import { firstTitle, stripIdLines, stripProvenance } from "../reflectionText";
 import { useTheme } from "../theme/context";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const LINK =
   "text-link underline decoration-(--link-line) decoration-1 underline-offset-[3px] hover:no-underline";
@@ -608,7 +609,7 @@ function Surface({
     view: () => uploadView.current,
     onError: setAttachError,
     onSettled: () => {
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: reflectionAssetsKey(domain),
       });
     },
@@ -940,7 +941,7 @@ function Surface({
                 carried.current = true;
               }
               roomExit.onDone(event);
-              void queryClient.invalidateQueries({
+              void refreshAfterWrite(queryClient, {
                 queryKey: reflectionKey(domain),
               });
             }}

@@ -24,6 +24,7 @@ import type { ReflectionGrant } from "../api/model";
 import { formatDay } from "../format";
 import { DestructiveAction } from "./DestructiveAction";
 import { BUTTON, FIELD, Field } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 type GrantLevel = "reader" | "contributor";
 
@@ -42,7 +43,7 @@ export function ReflectionCollaborators({
   const headingId = useId();
   const [problem, setProblem] = useState<string | null>(null);
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: membersKey(domain) });
+    refreshAfterWrite(queryClient, { queryKey: membersKey(domain) });
 
   const grant = useMutation({
     mutationFn: ({ account, level }: { account: string; level: GrantLevel }) =>
