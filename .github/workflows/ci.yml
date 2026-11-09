@@ -773,7 +773,8 @@ jobs:
       # real embedded bundle (the Rust matrix compiles against the empty
       # placeholder and covers the serving rules with fixture assets), and
       # run-smoke.sh asserts it against the daemon's own port. Only the binary
-      # travels to the shards: run-smoke.sh builds the bundle again for `vite
+      # and its staged bundle travel to the shards (see "Keep only what the
+      # shards get" below): run-smoke.sh builds fluid/dist again for `vite
       # preview` on purpose, and the build is the same inputs and costs a few
       # seconds.
       - name: Build the bundle
@@ -785,16 +786,110 @@ jobs:
       - name: Build crystalline
         run: cargo build -p crystalline --locked
 
+      # A debug build does not put the bundle inside the binary. rust-embed
+      # reads the files at run time from the folder the derive names, and in a
+      # debug build that is the absolute path of the build script's staging
+      # folder, target/debug/build/crystalline-service-<hash>/out/fluid-dist.
+      # A release build embeds the files; this job builds debug on purpose (see
+      # above). So the shards get that folder as well as the binary, at the
+      # same path: the checkout path is the same on every runner, and the
+      # artifact is unpacked into target/debug again.
+      #
+      # The rest of target/ moves aside, so the check below runs against
+      # exactly the files the upload carries and nothing the build left beside
+      # them. The last step of this job puts the full tree back.
+      - name: Keep only what the shards get
+        run: |
+          set -euo pipefail
+          mv target "$RUNNER_TEMP/target-built"
+          mkdir -p target/debug
+          cp "$RUNNER_TEMP/target-built/debug/crystalline" target/debug/
+          found=0
+          for staged in "$RUNNER_TEMP"/target-built/debug/build/crystalline-service-*/out/fluid-dist; do
+            [ -f "$staged/index.html" ] || continue
+            rel="${staged#"$RUNNER_TEMP"/target-built/debug/}"
+            mkdir -p "target/debug/$rel"
+            cp -R "$staged/." "target/debug/$rel/"
+            echo "staged bundle: target/debug/$rel"
+            found=1
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "::error::no staged bundle with an index.html under target/debug/build/crystalline-service-*/out/fluid-dist; the build script ran without fluid/dist"
+            exit 1
+          fi
+
+      # The binary as a shard will run it: started on a free port with a
+      # scratch state directory, it must answer GET / with the app shell (200)
+      # and not with the 503 a binary without a bundle gives. This catches a
+      # build that ran before the bundle existed as well as a bundle folder the
+      # upload would leave behind, before ten legs fail on it one by one.
+      - name: The binary serves the bundle
+        run: |
+          set -euo pipefail
+          bin=target/debug/crystalline
+          state="$(mktemp -d)"
+          port=""
+          for candidate in $(seq 7411 7431); do
+            if ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then
+              port="$candidate"
+              break
+            fi
+          done
+          if [ -z "$port" ]; then
+            echo "::error::no free port from 7411 to 7431 for the bundle check"
+            exit 1
+          fi
+          env XDG_CONFIG_HOME="$state/config" XDG_STATE_HOME="$state/state" \
+            XDG_CACHE_HOME="$state/cache" XDG_DATA_HOME="$state/data" \
+            CRYSTALLINE_DOMAINS_ROOT="$state/domains" \
+            "$bin" serve --http "127.0.0.1:$port" >"$state/daemon.log" 2>&1 &
+          daemon=$!
+          trap 'kill "$daemon" 2>/dev/null || true' EXIT
+          status=""
+          for _ in $(seq 1 60); do
+            status=$(curl --silent --output "$state/body" --write-out '%{http_code}' \
+              --max-time 5 --header 'Accept: text/html' "http://127.0.0.1:$port/" || true)
+            if [ "$status" != "000" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$status" != "200" ]; then
+            echo "::error::the binary answered GET / with $status rather than 200, so it carries no web bundle the shards could use"
+            tail -n 20 "$state/daemon.log" || true
+            exit 1
+          fi
+          echo "the binary serves the bundle on its own (GET / answered 200)"
+
       # One day is enough: the shards of this run are the only readers. A
       # re-run of this job uploads the same name again, hence overwrite.
+      # The whole of target/debug is the binary and its staged bundle now.
       - name: Upload the binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fluid-smoke-binary
-          path: target/debug/crystalline
+          path: target/debug
+          include-hidden-files: true
           retention-days: 1
           overwrite: true
           if-no-files-found: error
+
+      # The full target/ back in place, whatever happened above. rust-cache
+      # here only restores (save-if: false, the ubuntu test leg is the one that
+      # saves the shared `test` key on main), so today its post step saves
+      # nothing. This step keeps it that way if that ever changes: a save of
+      # the cut-down tree would leave the next build with nothing to reuse.
+      - name: Put the full target back
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d "$RUNNER_TEMP/target-built" ]; then
+            rm -rf target
+            mv "$RUNNER_TEMP/target-built" target
+            echo "target/ is the full build tree again"
+          else
+            echo "target/ was never moved aside"
+          fi
 
   # One shard of the browser smoke: `run` says at the root or under a path
   # prefix, `shard` which part of the spec files. Every leg has its own
@@ -849,6 +944,8 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: fluid
 
+      # The binary and its staged bundle, back at the paths the build job had
+      # them (see "Keep only what the shards get" there).
       - name: Download the binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
