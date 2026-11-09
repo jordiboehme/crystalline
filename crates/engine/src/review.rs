@@ -397,17 +397,21 @@ pub(crate) fn unreadable(
         false => format!("Nothing in '{domain}' was folded."),
         true => format!("Nothing more in '{domain}' was folded."),
     };
+    // Only an admin can read the daemon log the cause went to, or repair the
+    // records under the state folder.
+    let repair = match reader.admin {
+        true => "repair the records the daemon log names and fold again",
+        false => "ask an admin to repair the records and fold again",
+    };
     if reader.viewer == Some(actor) {
         format!(
-            "{lead} Your conflicts could not be read, so your drafts cannot be folded safely. \
-             Choose discard, which ends your text, or fold again once the problem in the log \
-             is fixed."
+            "{lead} Your draft records could not be read, so your drafts cannot be folded \
+             safely. Choose discard, which ends your text, or {repair}."
         )
     } else {
         format!(
-            "{lead} The conflicts of '{actor}' could not be read, so their drafts cannot be \
-             folded safely. Choose discard for '{actor}', which ends their text, or fold again \
-             once the problem in the log is fixed."
+            "{lead} The draft records of '{actor}' could not be read, so their drafts cannot be \
+             folded safely. Choose discard for '{actor}', which ends their text, or {repair}."
         )
     }
 }
@@ -731,6 +735,25 @@ mod tests {
             file: false,
             other: None,
         }
+    }
+
+    /// A person who cannot read the daemon log is pointed at an admin, never
+    /// at the log.
+    #[test]
+    fn an_unreadable_list_points_a_non_admin_at_an_admin() {
+        let reader = Reader {
+            viewer: Some("jo"),
+            admin: false,
+        };
+        assert_eq!(
+            unreadable("eng", "ada", reader, false),
+            "Nothing in 'eng' was folded. The draft records of 'ada' could not be read, so \
+             their drafts cannot be folded safely. Choose discard for 'ada', which ends their \
+             text, or ask an admin to repair the records and fold again."
+        );
+        let own = unreadable("eng", "jo", reader, false);
+        assert!(!own.contains("log"), "{own}");
+        assert!(own.contains("ask an admin"), "{own}");
     }
 
     /// A domain owner who is not an admin cannot end a removed name's drafts,

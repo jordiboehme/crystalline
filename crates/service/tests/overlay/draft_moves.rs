@@ -2881,9 +2881,9 @@ async fn a_fold_with_a_broken_record_refuses_and_changes_nothing() {
     );
     assert_eq!(
         refused.to_string(),
-        "Nothing in 'team' was folded. The conflicts of 'alice' could not be read, so their \
-         drafts cannot be folded safely. Choose discard for 'alice', which ends their text, or \
-         fold again once the problem in the log is fixed."
+        "Nothing in 'team' was folded. The draft records of 'alice' could not be read, so \
+         their drafts cannot be folded safely. Choose discard for 'alice', which ends their \
+         text, or repair the records the daemon log names and fold again."
     );
     assert!(f.reviews());
     assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
@@ -3133,6 +3133,109 @@ async fn a_pull_during_a_repeated_fold_leaves_the_key_off() {
         words.ends_with("This changed while the fold was under way."),
         "{words}"
     );
+    assert!(!f.reviews(), "the key stays off");
+    assert!(f.state.join("overlays/team/.fold-unfinished").is_file());
+    assert_eq!(f.rows().await.len(), 2);
+}
+
+/// N-1: a mark left with no drafts (a crash after the last drop, or an admin
+/// who ended the drafts) is taken away by the next `direct`, which has nothing
+/// else to do.
+#[tokio::test]
+async fn a_fold_with_nothing_left_takes_a_stale_mark_away() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.fold(&[]).await.unwrap();
+    assert!(!f.reviews());
+    let mark = f.state.join("overlays/team/.fold-unfinished");
+    std::fs::create_dir_all(mark.parent().unwrap()).unwrap();
+    std::fs::write(&mark, "").unwrap();
+
+    f.fold(&[]).await.unwrap();
+    assert!(!mark.exists(), "the mark is gone");
+}
+
+/// N-2: in a fold that stopped part way, status still tells her which of
+/// her drafts stand, so she knows what to settle.
+#[tokio::test]
+async fn status_names_her_conflicts_while_a_fold_is_unfinished() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("sub".to_string()),
+                ..write_params("Fresh", "her new page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(f.root.join("team").join("sub"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+    // The pass a pull would run, which the mark keeps running.
+    f.engine.converge_overlays("team").await.unwrap();
+
+    let status = f
+        .engine
+        .origin_status(Some("team"), false, false, &alice())
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["converged"]["mine"],
+        serde_json::json!(["plan.md"]),
+        "{status}"
+    );
+}
+
+/// N-3 (C22): in a repeated fold, the second address check leaves the domain as
+/// it found it, as the conflict check does: the key stays off, the mark stays.
+#[tokio::test]
+async fn a_repeated_folds_address_refusal_leaves_the_key_off() {
+    let f = Arc::new(fixture(&[("plan.md", PLAN)]).await);
+    // A page whose write fails, ahead of the new page in path order.
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("a".to_string()),
+                ..write_params("First", "her first page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    f.engine
+        .write_engram_as(&write_params("Fresh", "her new page"), None, &alice())
+        .await
+        .unwrap();
+    std::fs::write(f.root.join("team").join("a"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(!f.reviews());
+    assert_eq!(f.folder("fresh.md"), None, "the fold stopped before it");
+    std::fs::remove_file(f.root.join("team").join("a")).unwrap();
+
+    // While the rooms close, the team's plan takes the new page's address.
+    let g = f.clone();
+    f.engine.at_next_fold_step(
+        FoldStep::RoomsClosed,
+        Box::new(move || {
+            Box::pin(async move {
+                std::fs::write(
+                    g.root.join("team/plan.md"),
+                    PLAN.replace("permalink: plan", "permalink: fresh"),
+                )
+                .unwrap();
+                g.engine.sync(Some("team")).await.unwrap();
+            })
+        }),
+    );
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let words = refused.to_string();
+    assert!(words.contains("fresh"), "{words}");
+    assert!(!words.contains("reviews changes again"), "{words}");
     assert!(!f.reviews(), "the key stays off");
     assert!(f.state.join("overlays/team/.fold-unfinished").is_file());
     assert_eq!(f.rows().await.len(), 2);

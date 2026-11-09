@@ -1535,8 +1535,10 @@ impl Engine {
             // reports these keys for no other kind: a domain taking changes
             // directly would pay a store lock and two queries per status call
             // for an answer nothing reads, and the instance-wide `/sync`
-            // overview asks this of every team domain at once.
-            let (view, converged) = if entry.is_overlay() {
+            // overview asks this of every team domain at once. A fold that
+            // stopped part way counts too: its drafts can still be settled,
+            // so their authors are told which ones stand.
+            let (view, converged) = if self.drafts_stay_open(&name) {
                 // Whoever owns the domain sees who else is drafting in it. One
                 // comparison covers the whole rule: an instance admin owns
                 // every domain, a private domain's owner owns theirs, and
@@ -1729,16 +1731,19 @@ impl Engine {
                 if let Some(everyone) = drafts.everyone() {
                     object.insert("drafts".to_string(), everyone);
                 }
-                // What the last pull's convergence did here, absent until a
-                // pull has converged something or flagged a conflict for this
-                // domain - read off the durable record beside the journal, so
-                // a restart does not turn "nothing has looked yet" into
-                // "nothing converged". Absent rather than zeroed, for the
-                // reason `behind` is null when nothing probed it: the two are
-                // different answers.
-                if let Some(converged) = converged {
-                    object.insert("converged".to_string(), converged.clone());
-                }
+            }
+            // What the last pull's convergence did here, absent until a
+            // pull has converged something or flagged a conflict for this
+            // domain - read off the durable record beside the journal, so
+            // a restart does not turn "nothing has looked yet" into
+            // "nothing converged". Absent rather than zeroed, for the
+            // reason `behind` is null when nothing probed it: the two are
+            // different answers. Read for a reviewing domain and for one
+            // whose fold stopped part way, whose drafts still settle.
+            if let Some(converged) = converged
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("converged".to_string(), converged.clone());
             }
             value
         };

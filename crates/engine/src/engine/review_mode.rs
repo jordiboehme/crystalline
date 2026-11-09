@@ -913,7 +913,17 @@ impl Engine {
         // already come off but whose overlay is not empty is the mid-fold
         // recovery [`Engine::set_review_mode`] documents, and that one has to
         // run.
+        //
+        // A fold mark left with no drafts behind it (a crash after the last
+        // drop, or an admin who ended the drafts) goes here, since nothing
+        // else is left to clear it. Only a mark that is there is cleared, and a
+        // failure is a warning: the statement still holds without it.
         if !entry.is_overlay() && drafts.is_empty() {
+            if self.drafts_stay_open(domain)
+                && let Err(e) = self.mark_fold(domain, false)
+            {
+                tracing::warn!("the fold mark of '{domain}' could not be taken away: {e}");
+            }
             return Ok(review::left_json(domain, Vec::new(), Vec::new(), 0));
         }
 
@@ -1052,13 +1062,22 @@ impl Engine {
             // with `switched_off` already, and nothing was folded. That is
             // harmless: each of those rooms saved its text first, and its
             // editors can open the page again.
-            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
-            self.mark_fold(domain, false)?;
-            return Err(EngineError::Conflict(format!(
-                "{refusal}. The folder changed while this domain's co-editing rooms were being \
-                 closed, so nothing was folded and the domain reviews changes again; what those \
-                 rooms saved is in the folder now, which `origin status` lists as out-of-band work"
-            )));
+            //
+            // A repeated fold is left as it was found, as the conflict check
+            // below leaves it: the key stays off and the mark stays.
+            put_back(self)?;
+            return Err(EngineError::Conflict(match recovering {
+                false => format!(
+                    "{refusal}. The folder changed while this domain's co-editing rooms were \
+                     being closed, so nothing was folded and the domain reviews changes again; \
+                     what those rooms saved is in the folder now, which `origin status` lists as \
+                     out-of-band work"
+                ),
+                true => format!(
+                    "{refusal}. The folder changed while the fold was under way, so nothing more \
+                     was folded.{rooms_saved}"
+                ),
+            }));
         }
         // And her drafts asked again, of the snapshot as it stands now. This
         // list does not ask the key. Its refusal, or a list that cannot be
