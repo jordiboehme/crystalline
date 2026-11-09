@@ -27,7 +27,7 @@ use super::{
     sha256_hex, utf8_side,
 };
 use crate::draft_merge::{
-    DraftConflictKind, DraftSides, DraftStep, TeamText, has_landed, next_step,
+    DraftConflictKind, DraftSides, DraftStep, TeamText, answers_at_path, has_landed, next_step,
 };
 use crate::draft_start::{self, DraftStart};
 use crate::origin::takes_part_in_local_change;
@@ -347,8 +347,10 @@ impl Engine {
     }
 
     /// The team's addresses in her view, permalink to path: the base snapshot's
-    /// pages less the paths she deletes, which is what the pass and the share
-    /// read. The index is asked only for a page whose row matches the snapshot's
+    /// pages less every path she holds a row at, which is what the pass reads.
+    /// Only a page that takes part in a share counts: a log, a listing or a
+    /// dotfile is never indexed, so it holds no address whatever its
+    /// frontmatter says. The index is asked only for a page whose row matches the snapshot's
     /// stamp; a page it does not list, or lists with other bytes, is read from
     /// its base copy. So a page a direct commit deleted holds no address while
     /// its row lingers, and a page no sync has indexed yet holds its own. A key
@@ -372,18 +374,19 @@ impl Engine {
             .iter()
             .map(|row| (row.path.as_str(), row.permalink.as_str()))
             .collect();
-        let deleted: HashSet<&str> = held
-            .entries
-            .iter()
-            .filter(|row| row.tombstone)
-            .map(|row| row.path.as_str())
-            .collect();
+        // Every path she holds a row at, as the pass reads it: a tombstone takes
+        // the page away, and a draft says in her view what that path answers to,
+        // so the base copy's address there is not the team's to hold.
+        let own: HashSet<&str> = held.entries.iter().map(|row| row.path.as_str()).collect();
         let keys: Vec<(String, String)> = base
             .state
             .files
             .iter()
             .filter(|(key, _)| {
-                key.ends_with(".md") && is_within_domain(key) && !deleted.contains(key.as_str())
+                key.ends_with(".md")
+                    && is_within_domain(key)
+                    && takes_part_in_local_change(key)
+                    && !own.contains(key.as_str())
             })
             .map(|(key, stamp)| (key.clone(), stamp.sha256.clone()))
             .collect();
@@ -547,10 +550,10 @@ impl Engine {
                 });
                 continue;
             }
-            // Where the kind came from: a team file at her path she did not start
-            // from is what `next_step` answers on first, and what Keep mine would
-            // overwrite; otherwise the text where she started.
-            let upstream_at = if !matches!(team_at_path, Held::Absent) && from != Some(&row.path) {
+            // Where the kind came from, by the decision's own rule: what Keep
+            // mine would overwrite when a file of the team's stands at her path,
+            // otherwise the text where she started.
+            let upstream_at = if answers_at_path(&sides) {
                 row.path.clone()
             } else {
                 from.unwrap_or(&row.path).to_string()

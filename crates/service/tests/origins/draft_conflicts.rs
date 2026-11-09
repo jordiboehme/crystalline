@@ -1265,3 +1265,135 @@ async fn a_team_file_at_the_path_she_moved_to_is_add_add_with_its_text() {
         text(&bobs)
     );
 }
+
+// --- Fix round 2 ---------------------------------------------------------------
+
+/// N1: her share of the new path landed and the old one stands, and bob changed
+/// the old one. The conflict is about bob's text where she started, not about her
+/// own text at her new path.
+#[tokio::test]
+async fn a_moved_draft_whose_new_path_landed_shows_the_teams_text_where_she_started() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    t.append("alice", "plan", "alice's own last word").await;
+    let hers = t.row("alice", "renamed.md").await;
+    // A share that named only renamed.md landed, then bob edited plan.md.
+    t.snapshot_has("renamed.md", Some(hers.as_bytes()));
+    t.snapshot_has("plan.md", Some(&plan_later()));
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", EditEdit)
+        }]
+    );
+    let sides = t.sides("alice", "renamed.md").await;
+    assert_eq!(sides["upstream"], text(&plan_later()), "{sides}");
+    assert_eq!(sides["local"], hers, "{sides}");
+}
+
+/// N1, where she started cannot be read: `UnknownStart`, and the side says so
+/// rather than showing her own text as the team's.
+#[tokio::test]
+async fn a_moved_draft_whose_new_path_landed_with_an_unreadable_start_says_so() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    t.append("alice", "plan", "alice's own last word").await;
+    let hers = t.row("alice", "renamed.md").await;
+    t.snapshot_has("renamed.md", Some(hers.as_bytes()));
+    t.copy_lost("plan.md");
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", UnknownStart)
+        }]
+    );
+    let sides = t.sides("alice", "renamed.md").await;
+    assert_eq!(sides["upstream"], serde_json::Value::Null, "{sides}");
+    assert!(
+        sides["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("upstream") && note.contains("readable")),
+        "{sides}"
+    );
+}
+
+/// I2: a file the index never holds as a page (a log, a listing, a dotfile) holds
+/// no address, whatever its frontmatter says.
+#[tokio::test]
+async fn a_file_that_takes_no_part_holds_no_address() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Idea", "alice's idea").await;
+    t.snapshot_has(
+        "notes/log.md",
+        Some(&engram("Log", "idea", "the team's log")),
+    );
+    t.snapshot_has(
+        "notes/.idea.md",
+        Some(&engram("Hidden", "idea", "a dotfile")),
+    );
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    // A generated listing answers to its path's slug, which an ordinary page of
+    // another spelling can share: still no clash, as the listing is no page.
+    let t = team(&[("plan.md", plan())]).await;
+    t.snapshot_has(
+        "notes/index.md",
+        Some(b"# Contents\n\n- [Plan](../plan.md)\n"),
+    );
+    t.old_draft(
+        "alice",
+        "notes/Index.md",
+        "---\ntype: engram\ntitle: Index\nstatus: current\n---\n\nher page\n",
+    )
+    .await;
+    let found = t.conflicts("alice").await;
+    assert!(found.iter().all(|c| c.kind != AddressTaken), "{found:?}");
+}
+
+/// Her own other drafts say what their paths answer to in her view, as the pass
+/// reads them: a draft that gives plan.md a new address frees the old one for her
+/// new page.
+#[tokio::test]
+async fn an_address_her_own_draft_gave_up_is_free_for_her_other_draft() {
+    let t = team(&[("plan.md", plan())]).await;
+    let renamed = text(&plan()).replace("permalink: plan\n", "permalink: plan-two\n");
+    draft(&t.eng, "alice", "plan.md", &renamed).await;
+    draft_start::save(
+        &t.state(),
+        "team",
+        "alice",
+        &DraftStart {
+            path: "plan.md".to_string(),
+            from: Some("plan.md".to_string()),
+            start: Some(text(&plan())),
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+        },
+    )
+    .unwrap();
+    draft(
+        &t.eng,
+        "alice",
+        "idea.md",
+        &text(&engram("Idea", "plan", "her new page")),
+    )
+    .await;
+    draft_start::save(
+        &t.state(),
+        "team",
+        "alice",
+        &DraftStart {
+            path: "idea.md".to_string(),
+            from: None,
+            start: None,
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}

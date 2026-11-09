@@ -287,6 +287,30 @@ fn case_move_landed_at_the_old_spelling(sides: &DraftSides<'_>, local: &str) -> 
     !team.is_start(sides) && same_but_generated(text, local)
 }
 
+/// Rule 3's question: the team holds a file at her path that she did not start
+/// from, and its text is not hers. Asked of sides already read after her share.
+fn holds_a_file_of_theirs_at_path(sides: &DraftSides<'_>) -> bool {
+    if sides.team_at_path == TeamText::Absent || sides.from == Some(sides.path) {
+        return false;
+    }
+    let at_path = Team::read(sides.team_at_path);
+    let hers = sides
+        .local
+        .zip(at_path.text())
+        .is_some_and(|(local, team)| same_but_generated(team, local));
+    !hers
+}
+
+/// Whether [`next_step`] answers from the team's text at the row's own path
+/// rather than at `from`: when rule 3 meets a file of the team's there, when
+/// she started there (or from nothing), and when her own share at the path is
+/// her start. A caller that shows the team's side of a conflict reads it where
+/// this says, so the text it shows is the one the answer came from.
+pub fn answers_at_path(sides: &DraftSides<'_>) -> bool {
+    let sides = after_her_share(sides);
+    sides.from.is_none_or(|from| from == sides.path) || holds_a_file_of_theirs_at_path(&sides)
+}
+
 /// What should happen to this row. First match wins:
 ///
 /// 1. A shape no writer leaves: [`DraftConflictKind::UnknownStart`].
@@ -327,21 +351,14 @@ pub fn next_step(sides: &DraftSides<'_>) -> DraftStep {
     if has_landed(sides) {
         return DraftStep::Landed;
     }
-    if sides.team_at_path != TeamText::Absent && sides.from != Some(sides.path) {
-        let at_path = Team::read(sides.team_at_path);
-        let hers = sides
-            .local
-            .zip(at_path.text())
-            .is_some_and(|(local, team)| same_but_generated(team, local));
-        if !hers {
-            let unreadable = matches!(at_path, Team::Unreadable(_))
-                || matches!(sides.team_at_from, TeamText::Unreadable { .. });
-            return DraftStep::Conflict(match sides.local {
-                _ if unreadable => UnknownStart,
-                Some(_) => AddAdd,
-                None => DeleteEdit,
-            });
-        }
+    if holds_a_file_of_theirs_at_path(sides) {
+        let unreadable = matches!(sides.team_at_path, TeamText::Unreadable { .. })
+            || matches!(sides.team_at_from, TeamText::Unreadable { .. });
+        return DraftStep::Conflict(match sides.local {
+            _ if unreadable => UnknownStart,
+            Some(_) => AddAdd,
+            None => DeleteEdit,
+        });
     }
     let team = Team::read(sides.team_at_from);
     if team.is_start(sides) {
@@ -522,6 +539,66 @@ mod tests {
                 team_at_from: self.at_from,
                 folds_case,
             }
+        }
+    }
+
+    /// The path a conflict's team side is read at follows the decision: rule 3's
+    /// file of theirs, a start at the path itself or at nothing, and her own share
+    /// at the path read as her start.
+    #[test]
+    fn answers_at_path_reads_the_sides_as_next_step_does() {
+        let side = |from, local, shared, at_path, at_from| DraftSides {
+            path: "renamed.md",
+            from,
+            start: Some("start\n"),
+            start_sha256: None,
+            shared,
+            folds_case: false,
+            local,
+            team_at_path: at_path,
+            team_at_from: at_from,
+        };
+        let held = |text: &'static str| TeamText::Held(text.as_bytes());
+        let mine = Some("mine\n");
+        let cases = [
+            // A file of the team's at her path: there.
+            (
+                side(Some("plan.md"), mine, None, held("bob\n"), held("start\n")),
+                true,
+            ),
+            // Her own text at her path, the start elsewhere: where she started.
+            (
+                side(Some("plan.md"), mine, None, held("mine\n"), held("bob\n")),
+                false,
+            ),
+            (
+                side(Some("plan.md"), mine, None, TeamText::Absent, held("bob\n")),
+                false,
+            ),
+            // A new file, and a start at the path itself: there.
+            (
+                side(None, mine, None, TeamText::Absent, TeamText::Absent),
+                true,
+            ),
+            (
+                side(Some("renamed.md"), mine, None, held("bob\n"), held("bob\n")),
+                true,
+            ),
+            // Her share stands at her path and the team let go of where she
+            // started: her share is her start, at the path.
+            (
+                side(
+                    Some("plan.md"),
+                    mine,
+                    mine,
+                    held("mine\n"),
+                    TeamText::Absent,
+                ),
+                true,
+            ),
+        ];
+        for (i, (sides, want)) in cases.iter().enumerate() {
+            assert_eq!(answers_at_path(sides), *want, "case {i}");
         }
     }
 
