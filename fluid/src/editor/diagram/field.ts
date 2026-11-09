@@ -51,7 +51,7 @@ export const verdictArrived = StateEffect.define<string>();
 
 /**
  * The hook for a fence that may be drawn although the main selection is in
- * it (R52): Task 11's starter insert puts the caret inside the fence it just
+ * it (R52): a starter inserted from the toolbar puts the caret inside the fence it just
  * wrote and still wants it drawn. The value is the fence's `from` in the
  * document the transaction produces. The exemption follows the fence through
  * changes and ends once the fence is drawn or is no fence any more.
@@ -106,7 +106,7 @@ interface DiagramFieldValue {
 let nextKey = 0;
 
 /** The fences of `state` the layer could draw, whatever their verdict. */
-export function candidateFences(state: EditorState): DrawnFence[] {
+function candidateFences(state: EditorState): DrawnFence[] {
   const found: DrawnFence[] = [];
   for (const fence of mermaidFences(state)) {
     if (!fence.topLevel) {

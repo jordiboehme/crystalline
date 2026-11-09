@@ -30,6 +30,21 @@ vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
+const fieldKit = vi.hoisted(() => ({
+  settle: null as null | (() => Promise<string | null>),
+}));
+
+vi.mock("../editor/diagram/draws", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../editor/diagram/draws")>();
+  return {
+    ...real,
+    settleFieldDraft: (view: Parameters<typeof real.settleFieldDraft>[0]) =>
+      fieldKit.settle === null
+        ? real.settleFieldDraft(view)
+        : fieldKit.settle(),
+  };
+});
+
 vi.mock("../collab/useCollabSession", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../collab/useCollabSession")>();
@@ -1041,6 +1056,59 @@ describe("the reflection editor once the room has ended", () => {
     const editor = await openEditor();
     expect(editor).toHaveAttribute("contenteditable", "false");
     expect(screen.queryByRole("button", { name: "Put it back" })).toBeNull();
+  });
+});
+
+describe("the reflection editor with a diagram's field open when the room ends (R100)", () => {
+  afterEach(() => {
+    fieldKit.settle = null;
+  });
+
+  it("writes the field's text first, keeps it as a draft and says so", async () => {
+    serve("edit");
+    const session = live(room(PAGE));
+    const editor = await openEditor();
+    let writable: string | null = null;
+    fieldKit.settle = () => {
+      writable = editor.getAttribute("contenteditable");
+      (session.get().ytext as Y.Text).insert(0, "Named. ");
+      return Promise.resolve(null);
+    };
+    session.set({ closed: true, closedReason: "internal" });
+    expect(
+      await screen.findByText(
+        "The text you were typing in the diagram is kept as a draft on this device.",
+      ),
+    ).toBeVisible();
+    expect(writable).toBe("true");
+    expect(editor).toHaveAttribute("contenteditable", "false");
+    expect(readDraft("ann", "eng", KEY)?.content).toBe(`Named. ${PAGE}`);
+  });
+
+  it("shows the text it could not keep", async () => {
+    serve("edit");
+    const session = live(room(PAGE));
+    const editor = await openEditor();
+    fieldKit.settle = () => Promise.resolve("a %%{ b");
+    session.set({ closed: true, closedReason: "internal" });
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The text you were typing in a diagram was not saved. Copy it if you need it:",
+    );
+    expect(alert).toHaveTextContent("a %%{ b");
+    expect(editor).toHaveAttribute("contenteditable", "false");
+  });
+
+  it("still stops taking writes when the settle fails", async () => {
+    serve("edit");
+    const session = live(room(PAGE));
+    const editor = await openEditor();
+    fieldKit.settle = () => Promise.reject(new Error("gone"));
+    session.set({ closed: true, closedReason: "internal" });
+    await waitFor(() => {
+      expect(editor).toHaveAttribute("contenteditable", "false");
+    });
+    expect(screen.queryByText(/typing in/)).toBeNull();
   });
 });
 

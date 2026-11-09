@@ -50,14 +50,14 @@ export type OpResult<Created = unknown> =
 export const NOTICES: Record<RefusalCode, string> = {
   stale: "The diagram just changed. Try again.",
   gone: "That part of the diagram is no longer there.",
-  invalid: "That change would break the diagram, so it was not made.",
+  invalid: "That change would break the diagram, so nothing was changed.",
   group:
     "This arrow is drawn together with others, so it cannot be changed on its own.",
   chain: "This arrow is part of a chain, so it cannot be reversed on its own.",
   unsupported:
-    "This diagram uses something the editor does not know yet, so it was not changed.",
+    "This diagram uses something the editor does not know yet, so nothing was changed.",
   unchecked:
-    "The diagram could not be checked, so it was not changed. Try again.",
+    "The diagram could not be checked, so nothing was changed. Try again.",
   breaksFence: "That would break a diagram here, so nothing was changed.",
   arrowChanged:
     "This arrow changed, so the label was not written. Press Escape and open it again.",

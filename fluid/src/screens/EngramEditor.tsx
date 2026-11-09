@@ -10,7 +10,7 @@
  */
 
 import { usePageTitle } from "../usePageTitle";
-import { settleFieldDraft } from "../editor/diagram/draws";
+import { LOST_FIELD_TEXT, settleFieldDraft } from "../editor/diagram/draws";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -904,9 +904,11 @@ function Surface({
       session.snapshotDraft();
     } else {
       fieldWait.current = true;
-      void settling.then((lost) => {
-        setFieldSettled({ lost });
-      });
+      void settling
+        .catch(() => null)
+        .then((lost) => {
+          setFieldSettled({ lost });
+        });
     }
   }, [closed, session]);
   // The next render's session, whose buffer holds what the field just wrote.
@@ -1370,10 +1372,7 @@ function Surface({
           )}
           {closed && fieldSettled?.lost != null && (
             <p role="alert" className={AMBER_BANNER}>
-              <span>
-                The name you were typing in the diagram could not be kept. Copy
-                it if you need it:
-              </span>
+              <span>{LOST_FIELD_TEXT}</span>
               <q className="block max-h-40 w-full overflow-auto wrap-anywhere whitespace-pre-wrap select-all">
                 {fieldSettled.lost}
               </q>

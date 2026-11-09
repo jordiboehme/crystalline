@@ -14,8 +14,8 @@
  *
  * The record kept beside the field is what makes this work: Raw takes the field
  * away with the preview compartment and `setState` replaces it, so what was open
- * and its draft live in a map keyed by view (pre-flight proposal 14). Task 11
- * keeps the draft current with `noteIntentDraft`.
+ * and its draft live in a map keyed by view. The rename field keeps the draft
+ * current by putting it on the intent (`setDiagramIntent`).
  */
 
 import { forceParsing, syntaxTree } from "@codemirror/language";
@@ -42,7 +42,7 @@ export type FlowTarget =
   | { kind: "node"; id: string }
   | { kind: "edge"; key: EdgeKey };
 
-/** 4b widens this with the sequence diagram's targets. */
+/** What a stop can stand on; a flowchart's parts are the only kind today. */
 export type TargetKey = FlowTarget;
 
 export type IntentMode = "focus" | "menu" | "rename" | "connect";
@@ -165,19 +165,11 @@ export function onIntentClosed(
 
 /**
  * Runs before a close, with the intent as it stood and its latest draft. On
- * "raw" the field is already gone: Task 11 commits a rename draft from here, and
+ * "raw" the field is already gone: the rename field commits its draft from here, and
  * the apply layer it calls reads the document and `diagramAnchors`, not the field.
  */
 export function beforeClose(main: EditorView, hook: BeforeClose): () => void {
   return add(beforeCloseHooks, main, hook);
-}
-
-/** Keeps the draft for `beforeClose` current, on every input of the open field. */
-export function noteIntentDraft(main: EditorView, draft: string): void {
-  const open = opens.get(main);
-  if (open !== undefined) {
-    open.draft = draft;
-  }
 }
 
 /** How a mode comes back when its fence is mounted again. */

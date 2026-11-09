@@ -30,7 +30,6 @@ import {
   closeDiagramIntent,
   diagramIntent,
   intentStale,
-  noteIntentDraft,
   onIntentClosed,
   registerIntentReopen,
   setDiagramIntent,
@@ -121,6 +120,13 @@ function closes(view: EditorView): IntentCloseReason[] {
 }
 
 const intentOf = (view: EditorView) => view.state.field(diagramIntent);
+
+/** What the open field does on each input: its draft rides on the intent. */
+function noteDraft(view: EditorView, draft: string): void {
+  const intent = intentOf(view);
+  if (intent === null) throw new Error("no intent");
+  view.dispatch({ effects: setDiagramIntent.of({ ...intent, draft }) });
+}
 
 beforeEach(() => {
   kit.settled.clear();
@@ -281,7 +287,7 @@ describe("closing by hand", () => {
   it("gives beforeClose the newest draft, not an older note (i23)", async () => {
     const view = await drawn();
     open(view, "rename");
-    noteIntentDraft(view, "old");
+    noteDraft(view, "old");
     view.dispatch({
       effects: setDiagramIntent.of({
         anchor: FROM,
@@ -360,7 +366,7 @@ describe("Raw", () => {
   it("hands beforeClose the last draft, read from beside the field", async () => {
     const view = await drawn();
     open(view, "rename");
-    noteIntentDraft(view, "New");
+    noteDraft(view, "New");
     const seen: [IntentCloseReason, DiagramIntent][] = [];
     beforeClose(view, (reason, intent) => {
       // The apply layer writes from here: the update has ended, and the document
@@ -415,7 +421,7 @@ describe("a draft", () => {
   it("does not follow the intent into another mode on the same target", async () => {
     const view = await drawn();
     open(view, "rename");
-    noteIntentDraft(view, "Old");
+    noteDraft(view, "Old");
     open(view, "menu");
     const seen: (string | undefined)[] = [];
     beforeClose(view, (_reason, intent) => {
@@ -428,7 +434,7 @@ describe("a draft", () => {
   it("does not follow the intent to another target", async () => {
     const view = await drawn();
     open(view, "rename");
-    noteIntentDraft(view, "Old");
+    noteDraft(view, "Old");
     view.dispatch({
       effects: setDiagramIntent.of({
         anchor: FROM,
@@ -886,7 +892,7 @@ describe("an intent opened on another fence", () => {
   it("closes the first as gone, with its draft, when its fence went in the same tick", async () => {
     const view = await drawn(TWO, {}, [BODY, OTHER]);
     open(view, "rename");
-    noteIntentDraft(view, "New");
+    noteDraft(view, "New");
     const reasons = closes(view);
     const seen: [IntentCloseReason, string | undefined, string][] = [];
     beforeClose(view, (reason, intent) => {
@@ -909,7 +915,7 @@ describe("an intent opened on another fence", () => {
   it("closes the first as user when its fence is still there", async () => {
     const view = await drawn(TWO, {}, [BODY, OTHER]);
     open(view, "rename");
-    noteIntentDraft(view, "New");
+    noteDraft(view, "New");
     const reasons = closes(view);
     const drafts: (string | undefined)[] = [];
     beforeClose(view, (_reason, intent) => {

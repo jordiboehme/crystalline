@@ -4,7 +4,9 @@
  * The shape of the grid's loader (`grid/loader.ts`). Nothing here imports
  * `./index` statically: the chunk is asked for with a dynamic import, the
  * first time a view holds a top-level, closed mermaid fence of an editable
- * kind (or a screen calls `prefetchDiagrams`). One compartment and one load
+ * kind (or a test calls `prefetchDiagrams`). After the first look a view looks
+ * again only where an edit or a parse step touched a fenced block, so a page
+ * with no diagram does not walk its whole tree on each key. One compartment and one load
  * for the whole app - `previewConfig` runs again on every Raw flip, and a
  * compartment made per call would forget what the chunk brought.
  *
@@ -18,6 +20,7 @@
  * prefetch) tries again from the start.
  */
 
+import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension } from "@codemirror/state";
 import { Compartment } from "@codemirror/state";
 import type { EditorView, ViewUpdate } from "@codemirror/view";
@@ -47,6 +50,34 @@ function hasEditableFence(state: EditorState): boolean {
   return mermaidFences(state).some((fence) => {
     const kind = diagramKindOf(fence.body);
     return fence.topLevel && kind !== null && EDITABLE_KINDS.includes(kind);
+  });
+}
+
+/**
+ * Whether an update reached a fenced block: one an edit is in, or one a parse step
+ * read for the first time. Only there can an editable fence have come to be.
+ */
+function touchesFence(update: ViewUpdate): boolean {
+  const tree = syntaxTree(update.state);
+  const ranges: [number, number][] = [];
+  update.changes.iterChangedRanges((_fromA, _toA, fromB, toB) => {
+    ranges.push([fromB, toB]);
+  });
+  const before = syntaxTree(update.startState).length;
+  if (tree.length > before) {
+    ranges.push([update.changes.mapPos(before, -1), tree.length]);
+  }
+  return ranges.some(([from, to]) => {
+    let found = false;
+    tree.iterate({
+      from,
+      to,
+      enter: (node) => {
+        found ||= node.name === "FencedCode";
+        return !found;
+      },
+    });
+    return found;
   });
 }
 
@@ -103,7 +134,11 @@ export function diagramLayerWith(
       }
 
       update(update: ViewUpdate): void {
-        if (update.docChanged || parseAdvanced(update)) {
+        if (
+          !this.asked &&
+          (update.docChanged || parseAdvanced(update)) &&
+          touchesFence(update)
+        ) {
           this.check();
         }
       }
@@ -151,7 +186,7 @@ export function diagramLayer(): Extension {
   return shared.extension();
 }
 
-/** Warms the chunk; screens call it on mount. Never rejects. */
+/** Warms the chunk, which the tests use. Never rejects. */
 export function prefetchDiagrams(): Promise<void> {
   return shared.prefetch();
 }

@@ -105,6 +105,58 @@ describe("diagramLayerWith", () => {
     view.destroy();
   });
 
+  it("picks it up when a fence is typed one key at a time, last line first", async () => {
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const layer = diagramLayerWith(load);
+    const view = mount("Intro\n\n", layer.extension());
+    // The body first, then the marks around it: the closing mark is what makes it.
+    const steps = ["flowchart TD\n  A --> B\n", "```\n"];
+    for (const text of steps) {
+      for (const letter of text) {
+        view.dispatch({
+          changes: { from: view.state.doc.length, insert: letter },
+        });
+      }
+    }
+    view.dispatch({ changes: { from: 7, insert: "```mermaid\n" } });
+    await flush();
+    expect(load).toHaveBeenCalledTimes(1);
+    view.destroy();
+  });
+
+  it("picks it up from a parse step that reaches a fence below the first parse", async () => {
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const layer = diagramLayerWith(load);
+    const filler = "A paragraph of filler text.\n\n".repeat(4000);
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: `${filler}${FLOW}\n`,
+        extensions: [...baseExtensions(false), layer.extension()],
+      }),
+      parent: document.body,
+    });
+    expect(load).not.toHaveBeenCalled();
+    const { forceParsing } = await import("@codemirror/language");
+    forceParsing(view, view.state.doc.length, 5_000);
+    await flush();
+    expect(load).toHaveBeenCalledTimes(1);
+    view.destroy();
+  });
+
+  it("asks nothing for typing in a page with no fence", async () => {
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const layer = diagramLayerWith(load);
+    const view = mount("Intro\n\nA line", layer.extension());
+    for (const letter of "more words") {
+      view.dispatch({
+        changes: { from: view.state.doc.length, insert: letter },
+      });
+    }
+    await flush();
+    expect(load).not.toHaveBeenCalled();
+    view.destroy();
+  });
+
   it("keeps the layer when Raw is flipped on and off again", async () => {
     const layer = diagramLayerWith(() => Promise.resolve(chunk()));
     const preview = new Compartment();

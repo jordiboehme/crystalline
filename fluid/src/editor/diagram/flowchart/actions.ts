@@ -699,7 +699,6 @@ interface Connecting {
   running: boolean;
   /** Left, by any route, while a choice was being verified: it is not written. */
   cancelled: boolean;
-  stopGuard: () => void;
 }
 
 const connects = new WeakMap<EditorView, Connecting>();
@@ -741,30 +740,9 @@ function endConnect(open: Connecting): void {
   connects.delete(main);
   bar.closest(`.${CONNECTING_CLASS}`)?.classList.remove(CONNECTING_CLASS);
   bar.remove();
-  open.stopGuard();
   if (main.dom.isConnected) {
     releaseFence(main, open.anchor);
   }
-}
-
-/** Escape with the box away: the focus has nowhere to take the key to the mode. */
-function armConnectGuard(main: EditorView): () => void {
-  const onKey = (event: KeyboardEvent) => {
-    const active = main.root.activeElement;
-    if (
-      event.key === "Escape" &&
-      !event.repeat &&
-      (active === null || active === main.dom.ownerDocument.body)
-    ) {
-      event.preventDefault();
-      event.stopPropagation();
-      cancelConnect(main);
-    }
-  };
-  window.addEventListener("keydown", onKey, true);
-  return () => {
-    window.removeEventListener("keydown", onKey, true);
-  };
 }
 
 function startConnect(main: EditorView, anchor: number, id: string): void {
@@ -783,7 +761,6 @@ function startConnect(main: EditorView, anchor: number, id: string): void {
     bar: makeBar(main),
     running: false,
     cancelled: false,
-    stopGuard: armConnectGuard(main),
   };
   connects.set(main, open);
   focusTarget(main, fence.from, { kind: "node", id }, "connect");

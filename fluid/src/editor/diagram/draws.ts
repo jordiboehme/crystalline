@@ -10,7 +10,15 @@ import { Facet } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 
 /**
- * The diagram kinds the layer draws and edits. 4b adds `sequenceDiagram`.
+ * What a person is told when the text of a diagram's field could not be kept: the
+ * field holds a box's name and an arrow's label alike.
+ */
+export const LOST_FIELD_TEXT =
+  "The text you were typing in a diagram was not saved. Copy it if you need it:";
+
+/**
+ * The diagram kinds the layer draws and edits. Sequence diagrams draw on the page
+ * as pictures, and are not edited yet.
  * `flowchart-elk` stays out: no layout loader is registered for it and no
  * recorded SVG pins its element ids, so nothing proves they map.
  */
@@ -108,7 +116,7 @@ export const enterDrawnFence = Facet.define<
  * The drawn fence right across the line edge `pos`: on the next line going
  * `forward` from a line's end, on the line before going back from its start.
  */
-export function drawnFenceBeside(
+function drawnFenceBeside(
   state: EditorState,
   pos: number,
   forward: boolean,

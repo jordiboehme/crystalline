@@ -20,6 +20,7 @@
 import { forceParsing, syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import {
+  EditorSelection,
   EditorState,
   Prec,
   StateEffect,
@@ -37,7 +38,7 @@ import {
 
 import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
-import { roomUndo } from "../roomUndo";
+import { dispatchIsolated, roomUndo } from "../roomUndo";
 import { flowKind, removeFence, runDiagramOp } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
@@ -445,6 +446,29 @@ async function deleteStop(
   }
 }
 
+/**
+ * A fence that ends the document has no line to go on below it, and in a Reflection
+ * there is no Raw to make one. Enter on its canvas opens that line, as one undo step,
+ * and puts the caret on it (R104). Only Enter: a key that only moves writes nothing.
+ */
+function openLineBelow(main: EditorView, from: number): void {
+  const fence = fenceAt(main.state, from);
+  if (fence === null || fence.to !== main.state.doc.length) {
+    return;
+  }
+  const at = fence.to;
+  dispatchIsolated(main, {
+    changes: { from: at, insert: main.state.lineBreak },
+    // A position counts a line break as one, whatever the separator.
+    selection: EditorSelection.cursor(at + 1),
+    userEvent: "input.diagram",
+  });
+  // A key still held goes no further than the line it opened.
+  spentHold.add(main);
+  closeDiagramIntent(main, "user", "none");
+  main.focus();
+}
+
 /** The stop a key walks from: the one the intent holds, when it is this fence's. */
 function currentTarget(main: EditorView, from: number): TargetKey {
   const intent = main.state.field(diagramIntent);
@@ -482,6 +506,16 @@ function walk(
   }
   focusTarget(main, from, target ?? CANVAS);
 }
+
+/** The keys besides the walk that act on a stop, and Escape. */
+const AWAY_KEYS = new Set([
+  "Enter",
+  "F2",
+  " ",
+  "Delete",
+  "Backspace",
+  "Escape",
+]);
 
 const WALK_KEYS = new Set([
   "ArrowRight",
@@ -596,7 +630,11 @@ function onKey(
         target,
       );
     }
-  } else if (target.kind !== "canvas") {
+  } else if (target.kind === "canvas") {
+    if (key === "Enter" && host.writable()) {
+      openLineBelow(main, from);
+    }
+  } else {
     stopActions.get("rename")?.(main, from, target, host);
   }
   return true;
@@ -874,6 +912,81 @@ const focusPlugin = ViewPlugin.fromClass(
     ownEdit = false;
     /** This plugin ended, as Raw ends it. A view that comes back gets a new one. */
     ended = false;
+    /** Whether `awayKey` listens: a stop or a mode is open and its box is not there. */
+    awayArmed = false;
+
+    /**
+     * A key with the focus on the body while a stop's box is away (scrolled out of
+     * the window) or connect mode waits: a diagram key brings the box back and puts
+     * the focus on the stop, and does nothing else, as the drawing was not in view
+     * (R105, as R102). Escape keeps its meaning: it ends what is open.
+     */
+    readonly awayKey = (event: KeyboardEvent): void => {
+      const { view } = this;
+      const active = view.root.activeElement;
+      if (
+        (active !== null && active !== view.dom.ownerDocument.body) ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        event.isComposing
+      ) {
+        return;
+      }
+      const { key } = event;
+      const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+      if (
+        (event.shiftKey && !menu) ||
+        !(menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))
+      ) {
+        return;
+      }
+      const intent = view.state.field(diagramIntent, false);
+      if (intent === null || intent === undefined || intent.mode === "rename") {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.repeat) {
+        return;
+      }
+      if (key === "Escape") {
+        if (intent.mode === "connect") {
+          connectHooks?.cancel(view);
+        } else {
+          closeDiagramIntent(view, "user");
+        }
+        return;
+      }
+      const host = hostOf(view, intent.anchor);
+      if (host === null) {
+        wanted.add(view);
+        view.dispatch({
+          effects: EditorView.scrollIntoView(intent.anchor, { y: "center" }),
+        });
+      } else {
+        prepareStop(host, intent.target).focus({ preventScroll: true });
+      }
+    };
+
+    /** Listens only while it can matter, so a page with no diagram pays nothing. */
+    syncAway(): void {
+      const { view } = this;
+      const intent = this.ended ? null : view.state.field(diagramIntent, false);
+      const want =
+        intent !== null &&
+        intent !== undefined &&
+        intent.mode !== "rename" &&
+        (intent.mode === "connect" || hostOf(view, intent.anchor) === null);
+      if (want !== this.awayArmed) {
+        this.awayArmed = want;
+        if (want) {
+          window.addEventListener("keydown", this.awayKey, true);
+        } else {
+          window.removeEventListener("keydown", this.awayKey, true);
+        }
+      }
+    }
 
     readonly mousedown = (event: Event): void => {
       // The click decides; a press alone moves neither focus nor selection.
@@ -1052,6 +1165,7 @@ const focusPlugin = ViewPlugin.fromClass(
         }),
         onBoxMounted(view, (host) => {
           settle(view, host);
+          this.syncAway();
         }),
       ];
     }
@@ -1263,6 +1377,15 @@ const focusPlugin = ViewPlugin.fromClass(
         });
       }
       if (
+        this.awayArmed ||
+        update.viewportChanged ||
+        update.state.field(diagramIntent) !== null
+      ) {
+        queueMicrotask(() => {
+          this.syncAway();
+        });
+      }
+      if (
         update.transactions.some((tr) =>
           tr.effects.some((e) => e.is(verdictArrived)),
         )
@@ -1448,6 +1571,7 @@ const focusPlugin = ViewPlugin.fromClass(
 
     destroy(): void {
       this.ended = true;
+      this.syncAway();
       // Not during the reconfigure that ends this: Raw keeps the anchors, and the view.
       queueMicrotask(() => {
         this.dropStopHold();
@@ -1623,7 +1747,10 @@ export const fenceMarksGuard: Extension = EditorState.transactionFilter.of(
       const to = tr.changes.mapPos(fence.to, -1);
       const first = tr.newDoc.lineAt(from);
       const last = tr.newDoc.lineAt(to);
+      // A fence with a line below must keep one: last, it has no way below (R104).
+      const endsDocument = fence.to < doc.length && to >= tr.newDoc.length;
       if (
+        endsDocument ||
         closes ||
         first.from !== from ||
         last.to !== to ||

@@ -117,7 +117,7 @@ export function mathFence(
  * the editor keeps the text as written and draws the formula after it. Its
  * `close` is the last line of the fence, which is no closing mark.
  */
-export function openMathFence(
+function openMathFence(
   state: EditorState,
   node: SyntaxNode,
   sections = state.facet(mathSections),
@@ -196,6 +196,11 @@ export function openMathFences(
   sections = state.facet(mathSections),
 ): MathBlock[] {
   const found: MathBlock[] = [];
+  // A plain text scan first: a page with no `math` word has no such fence, and the
+  // tree walk is the dearer of the two on every edit.
+  if (!holds(state.doc, "math")) {
+    return found;
+  }
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name !== "FencedCode") {
@@ -225,15 +230,15 @@ export interface MathRegion {
   to: number;
 }
 
-/** Whether `doc` holds `$$` anywhere, read chunk by chunk. */
-function holdsDollars(doc: Text): boolean {
+/** Whether `doc` holds `needle` anywhere, read chunk by chunk. */
+function holds(doc: Text, needle: string): boolean {
   let last = "";
   for (const iter = doc.iter(); !iter.next().done;) {
     const chunk = iter.value;
-    if ((last + chunk).includes("$$")) {
+    if ((last + chunk).includes(needle)) {
       return true;
     }
-    last = chunk.slice(-1);
+    last = chunk.slice(1 - needle.length);
   }
   return false;
 }
@@ -258,7 +263,7 @@ export function mathRegions(
   if (hit) {
     return hit;
   }
-  const regions = holdsDollars(state.doc)
+  const regions = holds(state.doc, "$$")
     ? readMath(state, sections).regions
     : [];
   if (!cached) {

@@ -3364,6 +3364,26 @@ describe("the engram editor resolving a session conflict", () => {
     }
   });
 
+  it("a field's settle that fails still snapshots and walks out", async () => {
+    fieldKit.settle = () => Promise.reject(new Error("the room went"));
+    try {
+      joinedSession({ closed: true, closedReason: "deleted" });
+      serveEditor({
+        "/domains/eng/manifest": () => ({ content: "# eng\n" }),
+        "/domains/eng/tree": () => ({ folders: [], engrams: [] }),
+        "/domains/eng/tags": () => ({ tags: [] }),
+        "/domains/eng/engrams": () => ({ engrams: [], total: 0 }),
+      });
+      renderApp("/d/eng/edit/alpha");
+      expect(
+        await screen.findByRole("heading", { name: "eng" }, { timeout: 3000 }),
+      ).toBeInTheDocument();
+      expect(readDraft("ada", "eng", "alpha")?.content).toContain("A rule.");
+    } finally {
+      fieldKit.settle = null;
+    }
+  });
+
   it("waits for a good draft's write before the snapshot and the walk out (R100)", async () => {
     let answer: (lost: string | null) => void = () => undefined;
     fieldKit.settle = () =>

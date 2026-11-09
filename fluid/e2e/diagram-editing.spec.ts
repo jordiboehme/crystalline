@@ -483,6 +483,112 @@ test("in a Reflection the flowchart draws and Add child writes one line", async 
     .toBe(unstamped(expected));
 });
 
+test("in a Reflection a fence that ends the page takes a line below by Enter (R104)", async ({
+  page,
+}) => {
+  const markdown =
+    "# Flow\n\nThe way through.\n\n```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```";
+  const path = await newPage(page, markdown);
+  expect((await pageSource(page, path)).endsWith("```")).toBe(true);
+  await page.goto(`d/${PAGES}/reflection/${path}`);
+  await page.getByRole("link", { name: "Edit", exact: true }).click();
+  await expect(page.locator(".cm-diagram svg")).toBeVisible();
+  await nodeOf(page, "A").click();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => focusedLabel(page)).toBe("Box: Start");
+  // The last stop: ArrowDown there writes nothing.
+  await page.keyboard.press("End");
+  await page.keyboard.press("ArrowDown");
+  expect(await docText(page)).toBe(markdown);
+  await page.keyboard.press("Home");
+  await page.keyboard.press("ArrowLeft");
+  await expect.poll(() => focusedLabel(page)).toBe("Flowchart");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => focusIsOnEditor(page)).toBe(true);
+  expect(await caretLine(page)).toBe("");
+  await page.keyboard.type("Below it");
+  await expect.poll(() => docText(page)).toBe(`${markdown}\nBelow it`);
+  await expect
+    .poll(
+      async () => (await pageSource(page, path)).endsWith("```\nBelow it"),
+      {
+        timeout: 20_000,
+      },
+    )
+    .toBe(true);
+});
+
+test("in a room the line below a last fence cannot be selected away (R104)", async ({
+  page,
+}) => {
+  const content =
+    "Top\n\n```mermaid\nflowchart TD\n  A[Start] --> B[End]\n```\n";
+  const permalink = await scratch(page, content);
+  await edit(page, permalink);
+  const before = await docText(page);
+  expect(before.endsWith("```\n")).toBe(true);
+  await page.locator(".cm-content").focus();
+  await page.keyboard.press("ControlOrMeta+End");
+  await page.keyboard.press("Shift+ArrowLeft");
+  await page.keyboard.press("Delete");
+  await expect(
+    page.getByText("That would break a diagram here", { exact: false }).first(),
+  ).toBeVisible();
+  expect(await docText(page)).toBe(before);
+});
+
+/** A page long enough that its drawing leaves the window. */
+const FAR =
+  "Top\n\n```mermaid\nflowchart TD\n  A[First] --> B[Second]\n```\n\n" +
+  Array.from({ length: 160 }, (_, i) => `Filler ${String(i)}.`).join("\n\n") +
+  "\n";
+
+async function wheelAway(page: Page): Promise<void> {
+  await page.mouse.move(400, 400);
+  await page.mouse.wheel(0, 12_000);
+  await expect(page.locator(".cm-diagram")).toHaveCount(0);
+  await expect
+    .poll(() => page.evaluate(() => document.activeElement === document.body))
+    .toBe(true);
+}
+
+test("a key on a stop whose box left the window brings it back and does nothing else (R105)", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, FAR);
+  await edit(page, permalink);
+  const before = await docText(page);
+  await nodeOf(page, "A").click();
+  await page.keyboard.press("Escape");
+  await expect.poll(() => focusedLabel(page)).toBe("Box: First");
+  await wheelAway(page);
+  await page.keyboard.press("Delete");
+  await expect(page.locator(".cm-diagram")).toHaveCount(1);
+  await expect.poll(() => focusedLabel(page)).toBe("Box: First");
+  expect(await docText(page)).toBe(before);
+});
+
+test("connect mode with its box away: a key brings it back, still waiting (R105)", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, FAR);
+  await edit(page, permalink);
+  const before = await docText(page);
+  await nodeOf(page, "A").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Connect to..." }).click();
+  const prompt = page.locator(".cm-diagram-connect [role=status]");
+  await expect(prompt).toBeVisible();
+  await wheelAway(page);
+  await page.keyboard.press("ArrowRight");
+  await expect(prompt).toBeVisible();
+  await expect.poll(() => focusedLabel(page)).toBe("Box: First");
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(() => focusedLabel(page)).toBe("Box: Second");
+  await page.keyboard.press("Escape");
+  await expect(prompt).toHaveCount(0);
+  expect(await docText(page)).toBe(before);
+});
+
 /** A flowchart with a group, a loop, a twin arrow and shapes: each must map. */
 const RICH =
   "```mermaid\nflowchart LR\n  subgraph S [Group]\n    P[One] --> Q((Two))\n  end\n  Q --> Q\n  P --> R{Three}\n  P --> R\n  R -. dotted .-> T & U\n  T --> S\n```\n";

@@ -6,14 +6,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { EditorState, StateEffect } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 
 import { cellMarksMode } from "../../../test/cellMarksMode";
 import type { MarkViewOptions } from "../../../test/markKit";
 import {
   bytes,
   cleanupMarkViews,
+  keys,
   markView,
   setRaw,
   undoOnce,
@@ -677,6 +678,185 @@ describe("what cannot be done", () => {
     });
     expect(timers.mock.calls.some(([, ms]) => ms === NOTICE_MS)).toBe(true);
     timers.mockRestore();
+  });
+});
+
+describe("the way below a fence that is last (R104)", () => {
+  const LAST = `Above\n${fence(SKELETON)}`;
+  const canvasOf = (view: EditorView) =>
+    view.dom.querySelector(".cm-diagram") as HTMLElement;
+
+  it("Enter on the canvas opens one line below, one undo step, caret on it", async () => {
+    const view = await drawn(LAST);
+    const steps = undoSteps(view);
+    focusTarget(view, fromOf(view), CANVAS);
+    expect(active()).toBe(canvasOf(view));
+    const event = press("Enter");
+    expect(event.defaultPrevented).toBe(true);
+    await flush();
+    expect(text(view)).toBe(`${LAST}\n`);
+    expect(view.state.selection.main.head).toBe(view.state.doc.length);
+    expect(active()).toBe(view.contentDOM);
+    expect(undoSteps(view)).toBe(steps + 1);
+    undoOnce(view);
+    expect(text(view)).toBe(LAST);
+  });
+
+  it("writes the document's own line break", async () => {
+    const doc = LAST.replaceAll("\n", "\r\n");
+    const view = await drawn(doc, { lineSeparator: "\r\n" });
+    focusTarget(view, fromOf(view), CANVAS);
+    press("Enter");
+    await flush();
+    expect(text(view)).toBe(`${doc}\r\n`);
+  });
+
+  it("ArrowDown and ArrowRight at the last stop write nothing", async () => {
+    const view = await drawn(LAST);
+    focusTarget(view, fromOf(view), EDGE_AB);
+    press("ArrowDown");
+    press("ArrowRight");
+    press("End");
+    press("ArrowDown");
+    await flush();
+    expect(text(view)).toBe(LAST);
+  });
+
+  it("a held Enter opens one line and no more", async () => {
+    const view = await drawn(LAST);
+    focusTarget(view, fromOf(view), CANVAS);
+    press("Enter");
+    // The repeat goes where the focus is now: the text.
+    press("Enter", { repeat: true });
+    await flush();
+    expect(text(view)).toBe(`${LAST}\n`);
+  });
+
+  it("does nothing with a line below already there, or on a page that takes no writes", async () => {
+    const view = await drawn();
+    focusTarget(view, fromOf(view), CANVAS);
+    press("Enter");
+    await flush();
+    expect(text(view)).toBe(page(SKELETON));
+    cleanupMarkViews();
+    const shut = await drawn(LAST);
+    shut.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    await flush();
+    focusTarget(shut, fromOf(shut), CANVAS);
+    press("Enter");
+    await flush();
+    expect(text(shut)).toBe(LAST);
+  });
+
+  it("a selection over the last empty line and Delete keeps that line, and says why", async () => {
+    const doc = `${LAST}\n`;
+    const view = await drawn(doc);
+    view.contentDOM.focus();
+    view.dispatch({
+      selection: EditorSelection.range(doc.length - 1, doc.length),
+    });
+    keys(view, "Delete");
+    await flush();
+    expect(text(view)).toBe(doc);
+    const said =
+      noticeOf(view) ||
+      (view.dom.querySelector(".cm-diagram-refusal")?.textContent ?? "");
+    expect(said).toBe(NOTICES.breaksFence);
+  });
+
+  it("a cut over that line is refused too, and text below can still go", async () => {
+    const doc = `${LAST}\nTail`;
+    const view = await drawn(doc);
+    view.contentDOM.focus();
+    view.dispatch({
+      selection: EditorSelection.range(doc.length - 5, doc.length),
+    });
+    keys(view, "Delete");
+    await flush();
+    expect(text(view)).toBe(doc);
+    view.dispatch({
+      selection: EditorSelection.range(doc.length - 4, doc.length),
+    });
+    keys(view, "Delete");
+    await flush();
+    expect(text(view)).toBe(`${LAST}\n`);
+  });
+});
+
+describe("a key with the box away (R105)", () => {
+  const LONG = `${page(SKELETON)}${"Line of text\n\n".repeat(8000)}`;
+  const away = (view: EditorView) => {
+    view.dispatch({
+      effects: EditorView.scrollIntoView(view.state.doc.length),
+    });
+    (view as unknown as { measure(): void }).measure();
+    expect(view.dom.querySelector(".cm-diagram")).toBeNull();
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(active()).toBe(document.body);
+  };
+  /** The guard is armed after the update that took the box, as a person's key comes. */
+  const awayNow = async (view: EditorView) => {
+    away(view);
+    await flush();
+  };
+
+  it.each(["Delete", "Enter", "ArrowRight", "Backspace"])(
+    "%s brings the stop back and does not act",
+    async (key) => {
+      const view = await drawn(LONG);
+      focusTarget(view, fromOf(view), NODE_B);
+      await awayNow(view);
+      const event = press(key, {}, document.body);
+      expect(event.defaultPrevented).toBe(true);
+      (view as unknown as { measure(): void }).measure();
+      await vi.waitFor(() => {
+        expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
+      });
+      await flush();
+      expect(active()).toBe(nodeOf(view, "B"));
+      expect(text(view)).toBe(LONG);
+      expect(fieldOf(view)).toBeNull();
+      expect(intentOf(view)?.target).toEqual(NODE_B);
+    },
+  );
+
+  it("connect mode: ArrowRight brings it back on the box it stood on, still waiting", async () => {
+    const view = await drawn(LONG);
+    openMenuOn(view, NODE_A);
+    choose("Connect to...");
+    await awayNow(view);
+    press("ArrowRight", {}, document.body);
+    (view as unknown as { measure(): void }).measure();
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-diagram")).not.toBeNull();
+    });
+    await flush();
+    expect(intentOf(view)?.mode).toBe("connect");
+    expect(active()).toBe(nodeOf(view, "A"));
+    expect(promptOf(view)).not.toBeNull();
+    expect(text(view)).toBe(LONG);
+  });
+
+  it("Escape in connect mode still ends it", async () => {
+    const view = await drawn(LONG);
+    openMenuOn(view, NODE_A);
+    choose("Connect to...");
+    await awayNow(view);
+    press("Escape", {}, document.body);
+    await flush();
+    expect(intentOf(view)?.mode).toBe("focus");
+    expect(text(view)).toBe(LONG);
+  });
+
+  it("leaves keys alone on a page with nothing open, and while the box is there", async () => {
+    const view = await drawn(LONG);
+    focusTarget(view, fromOf(view), NODE_B);
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(press("Delete", {}, document.body).defaultPrevented).toBe(false);
+    cleanupMarkViews();
+    expect(press("Delete", {}, document.body).defaultPrevented).toBe(false);
   });
 });
 
@@ -1458,6 +1638,7 @@ describe("connect mode", () => {
   it("Escape with the focus on the body still gets out", async () => {
     const view = await drawn();
     startOn(view);
+    await flush();
     active().blur();
     expect(active()).toBe(document.body);
     press("Escape", {}, document.body);

@@ -372,7 +372,7 @@ function direction(model: FlowModel, value: "TD" | "LR"): OpResult<never> {
   return checked(model, [{ from: at, to: at, insert: ` ${value}` }], changes);
 }
 
-/** The label of a box an op makes. Task 10 opens the rename field on it. */
+/** The label of a box an op makes; the rename field then opens on it. */
 const NEW_BOX_LABEL = "New box";
 
 /**

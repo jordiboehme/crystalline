@@ -30,12 +30,7 @@ import { parseFlowchart } from "./flowchart/parse";
 import { focusTarget } from "./focus";
 import { diagramField, pointerDown, showFenceSource } from "./field";
 import { diagramIntent } from "./intent";
-import {
-  addWithName,
-  cancelLabelEditor,
-  commitLabelEditor,
-  openLabelEditor,
-} from "./labelEditor";
+import { addWithName, cancelLabelEditor, openLabelEditor } from "./labelEditor";
 import { prefetchDiagrams } from "./loader";
 import { requestVerdict } from "./verdict";
 import { forgetDrawings, NOTICE_MS } from "./widget";
@@ -611,14 +606,15 @@ describe.each<[string, MarkViewOptions]>([
     const field = fieldOf(view);
     expect(field.value).toBe("Mine");
     expect(field.selectionStart).toBe(4);
-    await commitLabelEditor(view);
-    expect(text(view)).toBe(withB("Mine"));
-    expect(noField(view)).toBe(true);
+    press(field, "Enter");
+    await vi.waitFor(() => {
+      expect(text(view)).toBe(withB("Mine"));
+    });
+    await closed(view);
   });
 
-  it("does nothing for a commit or a cancel with no field", async () => {
+  it("does nothing for a cancel with no field", async () => {
     const view = await open();
-    await commitLabelEditor(view);
     cancelLabelEditor(view);
     expect(text(view)).toBe(DOC);
   });
@@ -1104,7 +1100,8 @@ describe("a box the person scrolled away (I3, R98)", () => {
   it("says a refusal in the panel while the box is away, and keeps the draft", async () => {
     const { view, field } = await scrolledAway();
     type(field, "a %%{ b");
-    await commitLabelEditor(view);
+    // Enter, as the guard that queues keys for a field away hands it on.
+    keyOnBody("Enter");
     await vi.waitFor(() => {
       expect(panelOf(view)).toContain(NOTICES.invalid);
     });
@@ -1299,8 +1296,8 @@ describe("a refused draft under Raw has an end (N3)", () => {
 
   it("says how to leave, and a second try leaves, naming the text", async () => {
     const view = await under();
-    expect(note(view)).toContain("again");
-    expect(note(view)).toContain("stopped once");
+    expect(note(view)).toContain("A second try leaves");
+    expect(note(view)).toContain("The first try to leave this page is stopped");
     expect(note(view)).not.toContain("asks");
     const went = vi.fn();
     const link = document.createElement("a");

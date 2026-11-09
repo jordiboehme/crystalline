@@ -49,7 +49,7 @@ import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, showPanel } from "@codemirror/view";
 
 import { backGates } from "../../backGates";
-import { fieldSettlers } from "./draws";
+import { fieldSettlers, LOST_FIELD_TEXT } from "./draws";
 import { diagramAnchors, trackAnchor, untrackAnchor } from "../diagramAnchors";
 import { writable } from "../elementEdit";
 import { flowKind, nextAnchorTicket, runDiagramOp } from "./apply";
@@ -841,15 +841,6 @@ function intentStaleAt(main: EditorView, fence: MermaidFence): boolean {
   return main.state.field(diagramField).behind.includes(fence.from);
 }
 
-/**
- * Writes the field's text as Enter does, and closes it unless it is refused. Waits
- * for a commit already running.
- */
-export function commitLabelEditor(main: EditorView): Promise<void> {
-  const open = fields.get(main);
-  return open === undefined ? Promise.resolve() : commit(open, "enter");
-}
-
 /** Closes the field, writes nothing, and puts the focus on its stop. */
 export function cancelLabelEditor(main: EditorView): void {
   const open = fields.get(main);
@@ -1000,7 +991,7 @@ async function commitForRaw(open: OpenField): Promise<void> {
     return;
   }
   const place = nextAnchorTicket();
-  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. Leaving is stopped once. Leaving again goes without it.`;
+  const sentence = `${NOTICES[refused.refused]} "${el.value}" comes back in its field when Raw is off, to fix or drop it. The first try to leave this page is stopped. A second try leaves, and this text is lost.`;
   rawDrafts.set(main, {
     target,
     hold,
@@ -1048,7 +1039,7 @@ function restoreRawDraft(main: EditorView): void {
     !main.state.field(diagramField).fences.some((f) => f.from === fence.from)
   ) {
     // Text under the caret, or a verdict to come: the next change of those tries.
-    const waiting = `"${raw.draft}" comes back in its field when this diagram draws: move the caret out of it. Leaving is stopped once. Leaving again goes without it.`;
+    const waiting = `"${raw.draft}" comes back in its field when this diagram draws: move the caret out of it. The first try to leave this page is stopped. A second try leaves, and this text is lost.`;
     if (main.state.field(rawNote, false) !== waiting) {
       main.dispatch({ effects: rawNoteShown.of(waiting) });
     }
@@ -1112,8 +1103,7 @@ function showLostDraft(main: EditorView, text: string): void {
     "cm-diagram-lost-draft fixed bottom-4 left-1/2 z-50 flex w-[min(36rem,calc(100vw-2rem))] -translate-x-1/2 flex-wrap items-baseline gap-3 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 shadow-xl dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100";
   note.setAttribute("role", "alert");
   const sentence = doc.createElement("span");
-  sentence.textContent =
-    "The name you were typing in a diagram was not saved. Copy it if you need it:";
+  sentence.textContent = LOST_FIELD_TEXT;
   const kept = doc.createElement("q");
   // Its own scroller, so a long text leaves the sentence and Dismiss in the window.
   kept.className = LOST_TEXT;
