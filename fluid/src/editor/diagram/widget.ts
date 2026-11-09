@@ -251,7 +251,7 @@ function windowTopOf(scroller: Element): number {
  * The kind of value CodeMirror's scroll requests carry (`scrollIntoView`, a
  * snapshot): their effect type is not exported, its value's class is.
  */
-const ScrollRequest = (View.scrollIntoView(0).value as object)
+export const ScrollRequest = (View.scrollIntoView(0).value as object)
   .constructor as abstract new (...args: never[]) => object;
 
 /**
@@ -353,9 +353,14 @@ function landed(
         return { height: rect.height, scroller: null, across: false, top: 0 };
       }
       const windowTop = windowTopOf(scroller);
+      // A box that shrank with the page at its last position: the browser's
+      // clamp of the scroll has already kept the text still.
+      const clamped =
+        rect.height < before &&
+        scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 1;
       return {
         height: rect.height,
-        scroller: rect.top < windowTop ? scroller : null,
+        scroller: rect.top < windowTop && !clamped ? scroller : null,
         // Its bottom as CodeMirror's height map still has it.
         across: rect.top + before > windowTop + ANCHOR_REACH_PX,
         top: view.dom.getBoundingClientRect().top,

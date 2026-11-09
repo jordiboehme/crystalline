@@ -817,8 +817,12 @@ describe("off screen", () => {
   describe("a drawing landing above the window, the page scrolling outside the editor", () => {
     /** How far the page has scrolled since the box was first drawn. */
     let scrolled = 0;
+    /** The page scroller's position; 1,000 is its last. */
+    let pageTop = 500;
     /** Drawn heights by SVG id; any other drawing is 374 px tall. */
     const drawnHeights = new Map<string, number>();
+    /** The height of any other drawing. */
+    let drawnDefault = 374;
 
     /**
      * The box at `top` less the scroll; the editor's lines after it 600 px below
@@ -827,12 +831,13 @@ describe("off screen", () => {
     function rects(top: number, bodyTop = 0) {
       scrolled = 0;
       drawnHeights.clear();
+      drawnDefault = 374;
       return vi
         .spyOn(HTMLElement.prototype, "getBoundingClientRect")
         .mockImplementation(function rect(this: HTMLElement) {
           const svg = document.querySelector(".cm-diagram svg");
           const boxHeight =
-            svg === null ? 300 : (drawnHeights.get(svg.id) ?? 374);
+            svg === null ? 300 : (drawnHeights.get(svg.id) ?? drawnDefault);
           let place: number | null = null;
           let height = 0;
           if (this.classList.contains("cm-diagram")) {
@@ -890,6 +895,19 @@ describe("off screen", () => {
       Object.defineProperty(document, "scrollingElement", {
         configurable: true,
         value: scroller,
+      });
+      // jsdom lays nothing out: a long page, scrolled to `pageTop`.
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => pageTop,
+      });
+      Object.defineProperty(scroller, "scrollHeight", {
+        configurable: true,
+        value: 1_800,
+      });
+      Object.defineProperty(scroller, "clientHeight", {
+        configurable: true,
+        value: 800,
       });
       return { scrollBy, at };
     }
@@ -1029,6 +1047,30 @@ describe("off screen", () => {
       const scrollBy = await land(100, { person: 200 });
       expect(scrollBy).toHaveBeenCalledTimes(1);
       expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
+    });
+
+    it("leaves a shrink at the document's end to the browser, which clamps the scroll", async () => {
+      // The page at its last position: the clamp already kept the text still.
+      pageTop = 1_000;
+      try {
+        const shrunk = await land(-100, {
+          then: () => {
+            drawnDefault = 250;
+          },
+        });
+        expect(shrunk).not.toHaveBeenCalled();
+      } finally {
+        pageTop = 500;
+      }
+    });
+
+    it("takes back a shrink when the page is not at its end", async () => {
+      const kept = await land(-100, {
+        then: () => {
+          drawnDefault = 250;
+        },
+      });
+      expect(kept).toHaveBeenCalledWith({ top: -50, behavior: "instant" });
     });
 
     it("keeps a key's scroll to the caret in the same pass, and takes the growth before it", async () => {

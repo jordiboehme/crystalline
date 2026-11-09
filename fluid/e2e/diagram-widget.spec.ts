@@ -553,13 +553,13 @@ test("scrolling a long document with several diagrams does not jump", async ({
   expect(report.shifted).toBeGreaterThan(0);
 });
 
-test("solo: an undo or a redo with the box above the window scrolls to its change", async ({
-  page,
-}) => {
-  // No room to join: the solo surface, whose undo scrolls to the change it undid.
-  await page.routeWebSocket(/\/collab\//, (socket) => {
-    void socket.close();
-  });
+/**
+ * Adds a child to a drawing, then undoes and redoes it from below: each step
+ * with the box scrolled above the window and the caret on a line in the window.
+ * Says, for each, whether the box came into the window and how far that line
+ * moved.
+ */
+async function undoRedoFromAbove(page: Page) {
   const filler = Array.from(
     { length: 60 },
     (_, i) => `Filler line ${String(i)}`,
@@ -616,30 +616,65 @@ test("solo: an undo or a redo with the box above the window scrolls to its chang
         return found?.textContent ?? "";
       });
       await line(page, inWindow).click();
+      const was = await top(line(page, inWindow));
       await page.keyboard.press(key);
       await settle(page);
       if (done(await height())) {
-        break;
+        return {
+          text: inWindow,
+          moved: (await top(line(page, inWindow))) - was,
+        };
       }
     }
+    return { text: "", moved: Number.NaN };
   };
-  /** The step's own scroll stands: the change it made is in the window. */
   const inView = async () => {
     const box = await drawn.evaluate((el) => {
       const rect = el.getBoundingClientRect();
       return { top: rect.top, bottom: rect.bottom, window: window.innerHeight };
     });
-    expect(box.bottom).toBeGreaterThan(0);
-    expect(box.top).toBeLessThan(box.window);
+    return box.bottom > 0 && box.top < box.window;
   };
 
-  await fromAbove("ControlOrMeta+z", (h) => h < short + 2);
+  const undone = await fromAbove("ControlOrMeta+z", (h) => h < short + 2);
   expect(await height()).toBeLessThan(short + 2);
-  await inView();
+  const undoShows = await inView();
   // CodeMirror matches Ctrl-z (undo) before Mod-Shift-z (redo).
-  await fromAbove("ControlOrMeta+Shift+Z", (h) => h > short + 40);
+  const redone = await fromAbove(
+    "ControlOrMeta+Shift+Z",
+    (h) => h > short + 40,
+  );
   expect(await height()).toBeGreaterThan(short + 40);
-  await inView();
+  const redoShows = await inView();
+  return { undone, undoShows, redone, redoShows };
+}
+
+test("solo: an undo or a redo with the box above the window scrolls to its change", async ({
+  page,
+}) => {
+  // No room to join: the solo surface, whose undo scrolls to the selection it
+  // restores, here at the drawing.
+  await page.routeWebSocket(/\/collab\//, (socket) => {
+    void socket.close();
+  });
+  const steps = await undoRedoFromAbove(page);
+  // The step's own scroll stands: the change it made is in the window.
+  expect(steps.undoShows).toBe(true);
+  expect(steps.redoShows).toBe(true);
+});
+
+test("in a room: an undo or a redo with the box above the window keeps the text still", async ({
+  page,
+}, info) => {
+  // The room's undo scrolls too, in a second transaction after its change, to
+  // the selection it stored: here the caret's line in the window, so that scroll
+  // has nothing to do and the drawing's change must not move the text.
+  const steps = await undoRedoFromAbove(page);
+  info.annotations.push({ type: "steps", description: JSON.stringify(steps) });
+  expect(steps.undoShows).toBe(false);
+  expect(Math.abs(steps.undone.moved)).toBeLessThanOrEqual(STILL_PX);
+  expect(steps.redoShows).toBe(false);
+  expect(Math.abs(steps.redone.moved)).toBeLessThanOrEqual(STILL_PX);
 });
 
 test("a new drawing landing after an edit does not collapse the box, and moves the text once", async ({
