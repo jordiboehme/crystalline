@@ -2640,6 +2640,9 @@ impl<'a> DomainView<'a> {
         let _guard = lock.lock().await;
         let before = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
+        if before == crate::overlay_files::Held::Nothing {
+            self.refuse_case_twin(path)?;
+        }
         let shown = self.shows_file(path).await?;
         let mut shown_sha = None;
         if shown {
@@ -2757,6 +2760,9 @@ impl<'a> DomainView<'a> {
                 path,
             )));
         }
+        if held == crate::overlay_files::Held::Nothing {
+            self.refuse_case_twin(path)?;
+        }
         let base_holds = match self.engine.attachment_delete_size(&self.domain, path).await {
             Ok(_) => true,
             Err(EngineError::NotFound(_)) => false,
@@ -2789,6 +2795,20 @@ impl<'a> DomainView<'a> {
             return Err(self.files_io(path, e));
         }
         Ok(())
+    }
+
+    /// Refuse a new draft file whose spelling differs from the team's file only
+    /// by case, where the disk keeps one file for the two: a share would write
+    /// her bytes over the team's without a word. Her own draft at a spelling is
+    /// never refused, so she can still change or delete it.
+    fn refuse_case_twin(&self, path: &str) -> Result<()> {
+        match self.engine.team_case_twin(&self.domain, path)? {
+            Some(team) => Err(EngineError::Conflict(format!(
+                "'{path}' is the team's file '{team}' on this disk, which does not tell the two \
+                 spellings apart. Use the name '{team}'."
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Write the record of a new draft file at `path`, from the folder's bytes

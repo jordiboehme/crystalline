@@ -4274,6 +4274,7 @@ impl Engine {
                  reviews changes, so what a resolution settles is your own draft"
             )));
         }
+        let mut kept_file: Option<String> = None;
         let kept = match resolution {
             ops::Resolution::Mine => {
                 // With no snapshot nothing can say where a file starts, and no
@@ -4291,6 +4292,34 @@ impl Engine {
                 "mine"
             }
             _ => {
+                // A file from before the record did not cause its conflict, and
+                // its bytes exist nowhere else: they are kept first, as an old
+                // page's text is, and a copy that cannot be kept refuses.
+                if held == crate::overlay_files::Held::Bytes
+                    && self.file_step_of(domain, &journal_dir, actor, path)?
+                        == super::draft_conflicts::FileStep::Conflict(
+                            DraftConflictKind::UnknownStart,
+                        )
+                {
+                    let bytes = crate::overlay_files::read(&journal_dir, domain, actor, path)
+                        .map_err(io)?
+                        .unwrap_or_default();
+                    let what = format!("a kept copy of your draft file '{path}'");
+                    let root = self
+                        .kept_dir()
+                        .ok_or_else(|| EngineError::Internal(format!("{what}: no state folder")))?;
+                    let file = crystalline_core::kept::write_bytes(
+                        &root,
+                        domain,
+                        Some(actor),
+                        crystalline_core::kept::KeptKind::Engram,
+                        path,
+                        chrono::Utc::now(),
+                        &bytes,
+                    )
+                    .map_err(|source| EngineError::Io { path: what, source })?;
+                    kept_file = Some(file.display().to_string());
+                }
                 crate::overlay_files::clear(&journal_dir, domain, actor, path).map_err(io)?;
                 crate::maintenance::record_pending(domain);
                 "theirs"
@@ -4315,8 +4344,57 @@ impl Engine {
             "draft": true,
             "file": true,
             "kept": kept,
-            "kept_copy": false,
+            "kept_copy": kept_file.is_some(),
+            "kept_file": kept_file,
         }))
+    }
+
+    /// What `actor`'s draft file at `path` is now, by the table the gate reads.
+    fn file_step_of(
+        &self,
+        domain: &str,
+        journal_dir: &Path,
+        actor: &str,
+        path: &str,
+    ) -> Result<super::draft_conflicts::FileStep> {
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&state_dir)? else {
+            return Ok(super::draft_conflicts::FileStep::InStep);
+        };
+        let tombstone =
+            crate::overlay_files::held(journal_dir, domain, actor, path).map_err(|source| {
+                EngineError::Io {
+                    path: format!("your draft file '{path}' in '{domain}'"),
+                    source,
+                }
+            })? == crate::overlay_files::Held::Tombstone;
+        let entry = crate::overlay_files::FileEntry {
+            actor: actor.to_string(),
+            path: path.to_string(),
+            tombstone,
+        };
+        let folds = super::folder_may_fold_case(&root, path);
+        let draft = super::draft_conflicts::FileDraft::read(
+            journal_dir,
+            domain,
+            actor,
+            &entry,
+            &state,
+            folds,
+        )?;
+        let journal = journal_dir.to_path_buf();
+        super::draft_conflicts::file_step(&draft, || {
+            Ok(
+                crate::overlay_journal::journal_record_strict(&journal, domain)
+                    .map_err(|source| EngineError::Io {
+                        path: format!("the convergence record of '{domain}'"),
+                        source,
+                    })?
+                    .conflicts
+                    .get(actor)
+                    .is_some_and(|paths| paths.iter().any(|held| held == path)),
+            )
+        })
     }
 
     /// Whether the domain's own origin state records a conflict at `path`: one

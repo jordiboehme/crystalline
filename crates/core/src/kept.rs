@@ -197,7 +197,7 @@ pub fn record_sender(file: &Path, sender: &Sender) -> std::io::Result<()> {
     ));
     let temp = PathBuf::from(temp);
     let json = serde_json::to_string(sender).map_err(std::io::Error::other)?;
-    let written = write_new(&temp, &json).and_then(|()| std::fs::rename(&temp, &target));
+    let written = write_new(&temp, json.as_bytes()).and_then(|()| std::fs::rename(&temp, &target));
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -228,6 +228,22 @@ pub fn write(
     path: &str,
     at: DateTime<Utc>,
     text: &str,
+) -> std::io::Result<PathBuf> {
+    write_bytes(root, domain, owner, kind, path, at, text.as_bytes())
+}
+
+/// [`write`](fn@write) for bytes that need not be text: a draft file beside
+/// the pages, kept when it is the last copy. The layout and the name are a
+/// text's, so a listing finds it under its path; [`read`] of it fails when the
+/// bytes are not UTF-8, and the file itself holds them as they were.
+pub fn write_bytes(
+    root: &Path,
+    domain: &str,
+    owner: Option<&str>,
+    kind: KeptKind,
+    path: &str,
+    at: DateTime<Utc>,
+    text: &[u8],
 ) -> std::io::Result<PathBuf> {
     let mut base = root.join(domain);
     if let Some(owner) = owner {
@@ -297,12 +313,12 @@ pub const UNFINISHED_AFTER: std::time::Duration = std::time::Duration::from_secs
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Write `text` to a new file at `file`; fails when something is there.
-fn write_new(file: &Path, text: &str) -> std::io::Result<()> {
+fn write_new(file: &Path, text: &[u8]) -> std::io::Result<()> {
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(file)?;
-    out.write_all(text.as_bytes())?;
+    out.write_all(text)?;
     out.sync_all()
 }
 
@@ -315,7 +331,7 @@ fn place(
     base: &Path,
     name: &str,
     stamp: &str,
-    text: &str,
+    text: &[u8],
 ) -> std::io::Result<PathBuf> {
     for n in 1u32.. {
         let file = base.with_file_name(match n {

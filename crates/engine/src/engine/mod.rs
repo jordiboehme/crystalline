@@ -1079,6 +1079,10 @@ pub struct Engine {
     // `Engine::at_next_fold_step`.
     #[cfg(any(test, feature = "testing"))]
     fold_hooks: std::sync::Mutex<Vec<(FoldStep, FoldHook)>>,
+    // When armed, the pass runs this once between deciding that a draft file
+    // has landed and taking its lock. See `Engine::before_next_file_settle`.
+    #[cfg(any(test, feature = "testing"))]
+    file_settle_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     // When armed, the next resolution of a share's credential answers that the
     // caller connected no personal identity, once. See
     // `Engine::refuse_next_personal_credential`.
@@ -2568,6 +2572,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fold_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "testing"))]
+            file_settle_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
             refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
@@ -2821,6 +2827,34 @@ impl Engine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((step, hook));
+    }
+
+    /// Run `hook` once in the pass, after it decided that a draft file has
+    /// landed and before it takes the file's lock: the moment an upload can
+    /// land in between. Nothing in the daemon, the CLI or the MCP surface calls
+    /// this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn before_next_file_settle(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .file_settle_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Run what [`Engine::before_next_file_settle`] armed, once. Does nothing
+    /// outside a test build.
+    fn run_file_settle_hook(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let hook = self
+                .file_settle_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// Run what [`Engine::at_next_fold_step`] armed for `step`, once. Does
@@ -6494,6 +6528,12 @@ impl Engine {
     /// The shown bytes and not the snapshot's digest: a pull or a commit can move
     /// the snapshot ahead of the folder, and a start taken from the snapshot then
     /// reads as in step over a file she never saw.
+    ///
+    /// An accepted cost: in the moment a pull has taken a deleted file out of the
+    /// snapshot while the folder still shows it, an upload there reads as a new
+    /// file, and its share puts the deleted file back. The snapshot alone cannot
+    /// tell that from a file in the folder nobody shared. Nothing of a
+    /// colleague's is overwritten.
     pub(crate) fn fresh_file_start(
         &self,
         domain: &str,
@@ -6511,6 +6551,41 @@ impl Engine {
             path: path.to_string(),
             start_sha,
         }))
+    }
+
+    /// The team's spelling of the file `path` when it differs from `path` only
+    /// by case, on a disk that may fold case: a key of the base snapshot, or a
+    /// file in the folder beside it. There the two spellings are one file, and a
+    /// share would write her bytes into the team's. `None` on a disk that keeps
+    /// them apart, which [`folder_may_fold_case`] answers, and for a domain
+    /// with no folder.
+    pub(crate) fn team_case_twin(&self, domain: &str, path: &str) -> Result<Option<String>> {
+        let Ok(ContentSource::File { root }) = self.content_source(domain) else {
+            return Ok(None);
+        };
+        if !folder_may_fold_case(&root, path) {
+            return Ok(None);
+        }
+        let folded = crystalline_core::fold_path_case(path);
+        let twin = |name: &str| name != path && crystalline_core::fold_path_case(name) == folded;
+        if let Some(state) =
+            crystalline_remote::state::OriginState::load(&self.origin_state_dir(domain)?)?
+            && let Some(key) = state.files.keys().find(|key| twin(key))
+        {
+            return Ok(Some(key.clone()));
+        }
+        let (parent, _) = path.rsplit_once('/').unwrap_or(("", path));
+        let Ok(listed) = std::fs::read_dir(join_rel(&root, parent)) else {
+            return Ok(None);
+        };
+        Ok(listed
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .map(|name| match parent {
+                "" => name,
+                parent => format!("{parent}/{name}"),
+            })
+            .find(|name| twin(name)))
     }
 
     /// The record of a new tombstone at `path`, whose `from` is always its path.
@@ -6908,7 +6983,7 @@ impl Engine {
             // stands, in step or a conflict the gates read; a file never merges.
             for file in files {
                 if self
-                    .settle_overlay_file(&journal_dir, domain, actor, file, &state)
+                    .settle_overlay_file(&journal_dir, &root, domain, actor, file, &state)
                     .await?
                 {
                     cleared += 1;
@@ -7781,8 +7856,8 @@ impl Engine {
         if files.unreadable {
             tracing::warn!(
                 domain,
-                "the draft files could not be listed, so the status says nothing about their \
-                 conflicts"
+                "the draft files could not be listed, so the status says nothing about the \
+                 conflicts of pages or files"
             );
             return None;
         }
@@ -7843,6 +7918,7 @@ impl Engine {
     async fn settle_overlay_file(
         &self,
         journal_dir: &Path,
+        root: &Path,
         domain: &str,
         actor: &str,
         file: &crate::overlay_files::FileEntry,
@@ -7853,20 +7929,17 @@ impl Engine {
             source,
         };
         let landed = |file: &crate::overlay_files::FileEntry| -> Result<bool> {
-            let draft = draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state)?;
+            let folds = folder_may_fold_case(root, &file.path);
+            let draft =
+                draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state, folds)?;
             // The frozen list decides nothing about a file that has landed.
-            let step = draft_conflicts::file_step(
-                draft.tombstone,
-                draft.mine_is_team,
-                draft.record.as_ref(),
-                draft.team.as_deref(),
-                || Ok(false),
-            )?;
+            let step = draft_conflicts::file_step(&draft, || Ok(false))?;
             Ok(step == draft_conflicts::FileStep::Landed)
         };
         if !landed(file)? {
             return Ok(false);
         }
+        self.run_file_settle_hook();
         let abs = crate::overlay_files::file(journal_dir, domain, actor, &file.path).map_err(io)?;
         let lock = self.write_lock(&abs);
         let _guard = lock.lock().await;

@@ -268,34 +268,48 @@ pub(super) enum FileStep {
     Conflict(DraftConflictKind),
 }
 
-/// The table for a file, first match wins. `mine_is_team` says her bytes are
-/// the team's bytes at the path, `team` is the team's digest there (a real key
-/// of the snapshot) and `record` where she started.
+/// The table for a file, first match wins. `landed` says her version reached
+/// the team: her bytes are the team's at the path now, or a merged proposal
+/// held exactly her bytes (or her deletion) there. `team` is the team's digest
+/// at the path, `record` where she started, and `start_elsewhere` that the
+/// bytes her deletion started from stand at another key of the snapshot.
 ///
-/// 1. Landed: her bytes are the team's, or her deletion stands where the team
-///    holds nothing.
+/// 1. Landed: `landed`, or her deletion stands where the team holds nothing
+///    and the bytes she deleted are nowhere else in the snapshot. Bytes that
+///    moved to another path are the team's rename, which a file cannot follow
+///    since it answers to no address: `DeleteEdit`, so her deletion does not
+///    end in silence.
 /// 2. No record (a file from before the record): the team holds a file there,
 ///    so `UnknownStart`. A file over nothing is a new file, unless the frozen
 ///    convergence record lists it, which means a pull from before saw the team
-///    delete it: `EditDelete`. A deletion over nothing has landed (rule 1).
+///    delete it: `EditDelete`.
 /// 3. The team's digest is the one she started from: in step.
 /// 4. Otherwise a conflict, by what changed: the team deleted what she edited
 ///    (`EditDelete`), added a file where she started from none (`AddAdd`), or
 ///    changed what she edited (`EditEdit`) or deleted (`DeleteEdit`).
 ///
+/// A merged proposal that held her bytes ends the draft even when the team
+/// changed the file since: what she proposed reached the team, and a later
+/// change is the team's own, as a merged page's is (C19). One whose bytes a
+/// reviewer changed is not hers and is asked about as rule 4 says.
+///
 /// `listed_in_record` is asked only for rule 2's last case, so a broken record
 /// file refuses only where it decides something.
 pub(super) fn file_step(
-    tombstone: bool,
-    mine_is_team: bool,
-    record: Option<&DraftFileStart>,
-    team: Option<&str>,
+    draft: &FileDraft,
     listed_in_record: impl FnOnce() -> Result<bool>,
 ) -> Result<FileStep> {
-    if (tombstone && team.is_none()) || (!tombstone && mine_is_team) {
+    if draft.landed {
         return Ok(FileStep::Landed);
     }
-    let Some(record) = record else {
+    let team = draft.team.as_deref();
+    if draft.tombstone && team.is_none() {
+        return Ok(match draft.start_elsewhere {
+            true => FileStep::Conflict(DraftConflictKind::DeleteEdit),
+            false => FileStep::Landed,
+        });
+    }
+    let Some(record) = draft.record.as_ref() else {
         return Ok(match team {
             Some(_) => FileStep::Conflict(DraftConflictKind::UnknownStart),
             None if listed_in_record()? => FileStep::Conflict(DraftConflictKind::EditDelete),
@@ -305,7 +319,7 @@ pub(super) fn file_step(
     if record.start_sha.as_deref() == team {
         return Ok(FileStep::InStep);
     }
-    Ok(FileStep::Conflict(match (tombstone, team) {
+    Ok(FileStep::Conflict(match (draft.tombstone, team) {
         (true, _) => DraftConflictKind::DeleteEdit,
         (false, None) => DraftConflictKind::EditDelete,
         (false, Some(_)) if record.start_sha.is_none() => DraftConflictKind::AddAdd,
@@ -318,40 +332,105 @@ pub(super) struct FileDraft {
     pub(super) path: String,
     pub(super) tombstone: bool,
     pub(super) record: Option<DraftFileStart>,
-    /// The team's digest at the path, from a real key of the snapshot.
+    /// The team's digest at the path (see [`team_key`]).
     pub(super) team: Option<String>,
-    /// Whether her bytes are the team's bytes there.
-    pub(super) mine_is_team: bool,
+    /// Her version reached the team: see [`file_step`].
+    pub(super) landed: bool,
+    /// For a deletion: the bytes it started from stand at another key.
+    pub(super) start_elsewhere: bool,
+}
+
+/// The key of the snapshot that holds the team's file at `path`: the exact key,
+/// or on a disk that may fold case (`folds`) the one key spelled the same but
+/// for case, since the folder holds one file for the two and a share writes
+/// her bytes into it. Several such keys answer with no key and `true`: the
+/// team holds a file there whose digest cannot be named.
+fn team_key<'s>(state: &'s OriginState, path: &str, folds: bool) -> (Option<&'s str>, bool) {
+    if let Some((key, _)) = state.files.get_key_value(path) {
+        return (Some(key.as_str()), true);
+    }
+    if !folds {
+        return (None, false);
+    }
+    let folded = crystalline_core::fold_path_case(path);
+    let mut twins = state
+        .files
+        .keys()
+        .filter(|key| crystalline_core::fold_path_case(key) == folded);
+    match (twins.next(), twins.next()) {
+        (Some(key), None) => (Some(key.as_str()), true),
+        (Some(_), Some(_)) => (None, true),
+        (None, _) => (None, false),
+    }
 }
 
 impl FileDraft {
-    /// Read one of `actor`'s draft files against `state`. A record that cannot
-    /// be read is an error (C1).
+    /// Read one of `actor`'s draft files against `state`. `folds` says the
+    /// domain's folder may fold case at its path. A record that cannot be read
+    /// is an error (C1).
     pub(super) fn read(
         journal_dir: &Path,
         domain: &str,
         actor: &str,
         entry: &crate::overlay_files::FileEntry,
         state: &OriginState,
+        folds: bool,
     ) -> Result<FileDraft> {
         let io = |source| EngineError::Io {
             path: format!("the draft file '{}' in '{domain}'", entry.path),
             source,
         };
         let record = draft_start::load_file(journal_dir, domain, actor, &entry.path).map_err(io)?;
-        let stamp = state.files.get(&entry.path);
-        let mine_is_team = match stamp {
-            Some(stamp) if !entry.tombstone => {
-                same_bytes_as(journal_dir, domain, actor, &entry.path, stamp).map_err(io)?
-            }
-            _ => false,
+        let (key, held) = team_key(state, &entry.path, folds);
+        let stamp = key.and_then(|key| state.files.get(key));
+        // A file held under several spellings has no digest to name; an empty
+        // one equals no start, so it reads as a conflict.
+        let team = held.then(|| stamp.map_or_else(String::new, |stamp| stamp.sha256.clone()));
+        let at_her_key = |file: &crystalline_remote::state::ProposedFile| {
+            file.path == entry.path || Some(file.path.as_str()) == key
         };
+        let merged: Vec<&crystalline_remote::state::ProposedFile> = state
+            .history
+            .iter()
+            .filter(|proposal| proposal.status == crystalline_remote::state::ProposalStatus::Merged)
+            .flat_map(|proposal| proposal.files.iter())
+            .filter(|file| at_her_key(file))
+            .collect();
+        let landed = if entry.tombstone {
+            merged
+                .iter()
+                .any(|file| file.change == crystalline_remote::state::ProposedChange::Deleted)
+        } else {
+            let now = match stamp {
+                Some(stamp) => {
+                    same_bytes_as(journal_dir, domain, actor, &entry.path, stamp).map_err(io)?
+                }
+                None => false,
+            };
+            now || (merged.iter().any(|file| file.sha256.is_some())
+                && crate::overlay_files::read(journal_dir, domain, actor, &entry.path)
+                    .map_err(io)?
+                    .is_some_and(|bytes| {
+                        let hers = sha256_hex(&bytes);
+                        merged.iter().any(|file| {
+                            file.change != crystalline_remote::state::ProposedChange::Deleted
+                                && file.sha256.as_deref() == Some(hers.as_str())
+                        })
+                    }))
+        };
+        let start_elsewhere = entry.tombstone
+            && team.is_none()
+            && record
+                .as_ref()
+                .and_then(|record| record.start_sha.as_deref())
+                .is_some_and(|start| state.files.values().any(|stamp| stamp.sha256 == start));
         Ok(FileDraft {
             path: entry.path.clone(),
             tombstone: entry.tombstone,
             record,
-            team: stamp.map(|stamp| stamp.sha256.clone()),
-            mine_is_team,
+            team,
+            landed,
+            start_elsewhere,
         })
     }
 }
@@ -864,7 +943,7 @@ impl Engine {
         if self.domain_entry(domain)?.origin.is_none() {
             return Ok(Vec::new());
         }
-        let (_, _, state_dir) = self.origin_spec_for_domain(domain)?;
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let Some(state) = OriginState::load(&state_dir)? else {
             return Ok(Vec::new());
         };
@@ -881,20 +960,15 @@ impl Engine {
         let mut frozen: Option<HashSet<String>> = None;
         let mut found = Vec::new();
         for entry in &read.entries {
-            let draft = FileDraft::read(&journal_dir, domain, actor, entry, &state)?;
-            let step = file_step(
-                draft.tombstone,
-                draft.mine_is_team,
-                draft.record.as_ref(),
-                draft.team.as_deref(),
-                || {
-                    let listed = match &frozen {
-                        Some(listed) => listed,
-                        None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
-                    };
-                    Ok(listed.contains(&draft.path))
-                },
-            )?;
+            let folds = folder_may_fold_case(&root, &entry.path);
+            let draft = FileDraft::read(&journal_dir, domain, actor, entry, &state, folds)?;
+            let step = file_step(&draft, || {
+                let listed = match &frozen {
+                    Some(listed) => listed,
+                    None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
+                };
+                Ok(listed.contains(&draft.path))
+            })?;
             if let FileStep::Conflict(kind) = step {
                 found.push(Found {
                     conflict: DraftConflict {

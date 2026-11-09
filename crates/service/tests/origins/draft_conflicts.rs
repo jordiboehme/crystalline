@@ -4777,3 +4777,193 @@ async fn a_broken_file_record_refuses_the_list_and_the_share() {
         .unwrap_err();
     assert_eq!(t.branch_file("main", DECK).unwrap(), TEAM_DECK);
 }
+
+// --- Fix round 1: case twins, kept copies, merged proposals, renames ---------
+
+const DECK_TWIN: &str = "assets/Deck.png";
+
+/// I-1: a spelling that differs from a team file only by case is one file on
+/// a disk that folds case, so it is refused there and names the team's
+/// spelling. A case-sensitive disk keeps the two apart, and both land.
+#[tokio::test]
+async fn a_case_twin_of_a_team_file_is_refused_where_the_disk_folds_case() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    let attempt = t
+        .eng
+        .attachment_write_as("team", DECK_TWIN, HER_DECK.to_vec(), &scope("alice"))
+        .await;
+    if folds_case(&t.root()) {
+        let err = attempt.unwrap_err();
+        assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "'assets/Deck.png' is the team's file 'assets/deck.png' on this disk, which does \
+             not tell the two spellings apart. Use the name 'assets/deck.png'."
+        );
+        assert_eq!(t.held_file("alice", DECK_TWIN), None);
+        let err = t
+            .eng
+            .attachment_delete_as("team", DECK_TWIN, &scope("alice"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+        assert_eq!(t.held_file("alice", DECK_TWIN), None);
+    } else {
+        attempt.unwrap();
+        t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+        assert_eq!(t.conflicts("alice").await, vec![]);
+        let answer = t.share("alice", None).await;
+        assert_eq!(answer["outcome"], "committed", "{answer}");
+        assert_eq!(t.branch_file("main", DECK).unwrap(), BOBS_DECK);
+        assert_eq!(t.branch_file("main", DECK_TWIN).unwrap(), HER_DECK);
+    }
+}
+
+/// I-1: the team renames her file by case and changes it. On a folding disk the
+/// team's file is the one her share would overwrite, so it is EditEdit; on a
+/// case-sensitive disk her path is gone, EditDelete.
+#[tokio::test]
+async fn a_team_case_rename_under_her_file_reads_per_disk() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    t.push(&[(DECK, None), (DECK_TWIN, Some(BOBS_DECK.to_vec()))])
+        .await;
+    let kind = if folds_case(&t.root()) {
+        EditEdit
+    } else {
+        EditDelete
+    };
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, kind)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.branch_file("main", DECK_TWIN).unwrap(), BOBS_DECK);
+}
+
+/// I-2: Take theirs on a file from before the record keeps her bytes as a
+/// copy, since they exist nowhere else.
+#[tokio::test]
+async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    draft_start::clear_file(&t.state(), "team", "alice", DECK).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, UnknownStart)]
+    );
+
+    let receipt = t
+        .resolve("alice", DECK, Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, DECK, "theirs", true);
+    let kept = receipt["kept_file"].as_str().unwrap();
+    assert_eq!(std::fs::read(kept).unwrap(), HER_DECK);
+    assert_eq!(t.held_file("alice", DECK), None);
+    let root = t.state().join(crystalline_core::kept::KEPT_DIR);
+    let listed = crystalline_core::kept::held_by(&root, "alice").unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].path, DECK);
+    assert_eq!(std::fs::read(&listed[0].file).unwrap(), HER_DECK);
+}
+
+/// I-2: a new conflict is not the last copy, so Take theirs keeps none.
+#[tokio::test]
+async fn take_theirs_on_a_new_file_conflict_keeps_no_copy() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+    let receipt = t
+        .resolve("alice", DECK, Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, DECK, "theirs", false);
+    let root = t.state().join(crystalline_core::kept::KEPT_DIR);
+    assert!(
+        crystalline_core::kept::held_by(&root, "alice")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// M-1: her proposal merged her bytes and the team changed the file after.
+/// Her file has landed, so it ends and the team's newer file stands.
+#[tokio::test]
+async fn a_merged_proposal_that_held_her_file_ends_it_when_the_team_changes_it_after() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let (answer, _, _) = proposed(&t, "alice").await;
+    t.merge(&answer, &[]);
+    t.commit(&[(DECK, Some(BOBS_DECK.to_vec()))]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.held_file("alice", DECK), None);
+    assert_eq!(t.reads_file("alice", DECK).await.unwrap(), BOBS_DECK);
+}
+
+/// M-1: bytes she uploaded after sharing were not in the merged proposal, so
+/// a team change after the merge is asked about, as a page's newer edit is.
+#[tokio::test]
+async fn a_newer_upload_than_her_merged_proposal_is_asked_about() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let (answer, _, _) = proposed(&t, "alice").await;
+    let newer = b"\x89PNG\r\n\x1a\n\x00alice's newer deck";
+    t.upload("alice", DECK, newer).await;
+    t.merge(&answer, &[]);
+    t.commit(&[(DECK, Some(BOBS_DECK.to_vec()))]);
+    t.pull().await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditEdit)]
+    );
+    assert_eq!(t.held_file("alice", DECK), Some(Some(newer.to_vec())));
+}
+
+/// M-3: the team moved the file she deleted. Her deletion does not end in
+/// silence: it is DeleteEdit, and her deletion stands.
+#[tokio::test]
+async fn a_deletion_of_a_file_the_team_moved_is_delete_edit() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.delete_file("alice", DECK).await;
+    t.push(&[(DECK, None), ("assets/moved.png", Some(TEAM_DECK.to_vec()))])
+        .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, DeleteEdit)]
+    );
+    assert_eq!(t.held_file("alice", DECK), Some(None));
+
+    // The team deleting it outright still ends her deletion.
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.delete_file("alice", DECK).await;
+    t.push(&[(DECK, None)]).await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.held_file("alice", DECK), None);
+}
+
+/// M-4: a name that cannot address a folder holds no files, so its list is
+/// empty and not an error.
+#[tokio::test]
+async fn a_name_that_cannot_hold_files_has_no_conflicts() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    assert_eq!(t.eng.draft_conflicts("team", "..").await.unwrap(), vec![]);
+}
+
+/// M-4: the pass decides a file has landed, and her new upload lands before it
+/// takes the file's lock. The second look under the lock sees the new bytes,
+/// so they stay.
+#[tokio::test]
+async fn an_upload_between_the_pass_deciding_and_clearing_stays() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let file = t.state().join("overlays/team/alice/files").join(DECK);
+    let later = b"\x89PNG\r\n\x1a\n\x00alice's later deck".to_vec();
+    let written = later.clone();
+    t.eng.before_next_file_settle(Box::new(move || {
+        std::fs::write(&file, &written).unwrap();
+    }));
+    // The team takes her first bytes: her file would land.
+    t.push(&[(DECK, Some(HER_DECK.to_vec()))]).await;
+    assert_eq!(t.held_file("alice", DECK), Some(Some(later)));
+}
