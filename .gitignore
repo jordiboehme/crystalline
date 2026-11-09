@@ -21,6 +21,9 @@ __pycache__/
 
 # Source material
 
+# A lock test's temp folder, left behind only by a killed run
+.lock-key-probe*
+
 # OS noise
 .DS_Store
 

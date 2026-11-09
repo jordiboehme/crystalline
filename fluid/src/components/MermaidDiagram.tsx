@@ -15,7 +15,7 @@ import mermaid from "mermaid";
 import { useEffect, useId, useRef, useState } from "react";
 
 import { useTheme } from "../theme/context";
-import { mermaidConfig } from "../theme/mermaid";
+import { initializeMermaid, mermaidConfig } from "../theme/mermaid";
 import { drawnLabels } from "../theme/mermaidText";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
@@ -100,7 +100,7 @@ export default function MermaidDiagram({
     // React's tree, where nothing here could ever take it down again. The
     // fallback below - the source the author wrote - is this component's
     // answer to a diagram that will not parse.
-    mermaid.initialize(mermaidConfig(resolved === "dark"));
+    initializeMermaid(mermaid, resolved === "dark");
     mermaid
       .render(id, source)
       .then((result) => {

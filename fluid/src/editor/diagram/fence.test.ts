@@ -30,6 +30,12 @@ const LF = [
 ].join("\n");
 
 describe("mermaidFences", () => {
+  test("refuses a fence inside the frontmatter", () => {
+    const text =
+      "---\nnote: |\n  ```mermaid\n  flowchart TD\n    A --> B\n  ```\n---\n\nbody";
+    expect(mermaidFences(stateOf(text))).toEqual([]);
+  });
+
   test("reads a closed fence's positions and body", () => {
     const state = stateOf(LF);
     const fences = mermaidFences(state);

@@ -48,9 +48,9 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   // Chromium runs every journey. WebKit runs the questions only it can
-  // answer - mermaid labels under Safari's page zoom, and a page printed from
-  // a wide window - and nothing else, so the suite does not double its run
-  // time for answers chromium already gives.
+  // answer - mermaid labels under Safari's page zoom, a page printed from a
+  // wide window, a diagram turned into a PNG, and where Tab lands at a diagram - and nothing else, so the
+  // suite does not double its run time for answers chromium already gives.
   projects: [
     {
       name: "chromium",
@@ -60,7 +60,7 @@ export default defineConfig({
     {
       name: "webkit",
       use: { ...devices["Desktop Safari"] },
-      testMatch: /(mermaid-zoom|print)\.spec\.ts/,
+      testMatch: /(mermaid-zoom|print|diagram-png|diagram-tab)\.spec\.ts/,
     },
   ],
   // No preview server for the run against the embedded UI. Spread rather
@@ -76,7 +76,9 @@ export default defineConfig({
       // it to the address the tests use makes the two the same one.
       command: `pnpm exec vite preview --host 127.0.0.1 --port ${String(PORT)} --strictPort`,
       url: BASE_URL,
-      reuseExistingServer: !process.env.CI,
+      // Never reused: a server already on this port belongs to another run, and
+      // the journeys would test its bundle against its daemon without saying so.
+      reuseExistingServer: false,
       timeout: 60_000,
       stdout: "pipe",
       stderr: "pipe",

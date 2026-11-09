@@ -769,6 +769,11 @@ export type GithubLinkResponse = {
     login?: string | null;
     pending?: GithubPendingView | null;
     /**
+     * Whose identity shares on this instance run on, the mode in effect:
+     * `instance` or `personal`. What the profile card says follows it.
+     */
+    share_identity: string;
+    /**
      * False once the user token is known to be gone (revoked, or its
      * refresh token expired). The link stays; linking again restores it.
      */
@@ -839,6 +844,16 @@ export type GithubStatusResponse = {
      */
     error?: string | null;
     pending?: GithubPendingView | null;
+    /**
+     * Whose identity shares on this instance run on, the mode in effect:
+     * `instance` or `personal`. Admin only, like this whole route.
+     */
+    share_identity: string;
+    /**
+     * Whether that mode is the default rather than the
+     * `github.share_identity` key.
+     */
+    share_identity_default: boolean;
     /**
      * keyring | file | environment; null when disconnected.
      */
@@ -6318,7 +6333,7 @@ export type GetDomainSyncStatusErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6335,7 +6350,7 @@ export type GetDomainSyncStatusError = GetDomainSyncStatusErrors[keyof GetDomain
 
 export type GetDomainSyncStatusResponses = {
     /**
-     * The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.
+     * The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and is never the reason for a share, riding along with one where the domain's MANIFEST declares `generated_indexes: shared` and staying on this machine where it does not. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `may_share` says whether this caller may share here: on a domain GitHub governs, an account that may read the domain gets this report with `may_share` false when it may not share, so a client can say what is missing (often only a GitHub link). In `connection`, `share_identity_reason`, `owner_identity` and `agent_identity` are for an instance admin only; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not. `sharing` names the domain's policy and `direct_shares` the commits this machine put straight on the branch. `direct_refused` is null, or names the `branch`, the forge's `message`, `refused_at` and the `line` to show when the branch refused a direct commit made under the GitHub login this session's shares go out on; another login's refusal never shows, nor any on a domain that opens proposals. Show that line as given.
      *
      * Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
      *
@@ -6412,7 +6427,7 @@ export type GetDomainShareChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6460,7 +6475,7 @@ export type GetDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6508,7 +6523,7 @@ export type ResolveDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6564,7 +6579,7 @@ export type WithdrawDomainProposalErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6612,7 +6627,7 @@ export type ShareDomainErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -8432,7 +8447,7 @@ export type GetSyncSummaryErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`, the default with a GitHub App), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -8629,6 +8644,46 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
+
+export type DiscardUserDraftsData = {
+    body?: never;
+    path: {
+        /**
+         * The name, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/drafts';
+};
+
+export type DiscardUserDraftsErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin.
+     */
+    403: ProblemDetail;
+    /**
+     * The name has an account, or is the machine owner's.
+     */
+    409: ProblemDetail;
+};
+
+export type DiscardUserDraftsError = DiscardUserDraftsErrors[keyof DiscardUserDraftsErrors];
+
+export type DiscardUserDraftsResponses = {
+    /**
+     * What went, per domain.
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type DiscardUserDraftsResponse = DiscardUserDraftsResponses[keyof DiscardUserDraftsResponses];
 
 export type UnlinkUserGithubLinkData = {
     body?: never;

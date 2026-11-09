@@ -11,6 +11,7 @@
  * date at all.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link } from "react-router";
@@ -37,6 +38,7 @@ import { ENGRAM_PREFETCH, PREFETCH } from "../prefetch";
 import { useWide } from "../useWide";
 
 export default function Home() {
+  usePageTitle("Home");
   const wide = useWide();
   const { capabilities } = useAuth();
   // Its own, rather than the frame's: the dialog carries everything it needs,

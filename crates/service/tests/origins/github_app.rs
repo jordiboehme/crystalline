@@ -83,7 +83,7 @@ pub(crate) type Refreshed = (String, String, (u64, String));
 /// A GitHub stand-in: repositories, which installation covers each one, the
 /// token each installation mints, and the log.
 pub(crate) struct Forge {
-    repos: HashMap<String, Arc<MockProvider>>,
+    pub(crate) repos: HashMap<String, Arc<MockProvider>>,
     /// Repository -> installation id, for the repositories the App is
     /// installed on.
     installed: StdMutex<HashMap<String, u64>>,
@@ -112,6 +112,8 @@ pub(crate) struct Forge {
     pub(crate) revokes: StdMutex<Vec<(Option<String>, String)>>,
     /// When set, every revoke answers 503.
     pub(crate) revoke_fails: std::sync::atomic::AtomicBool,
+    /// When set, a revoke answers only once the test adds a permit here.
+    pub(crate) revoke_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// When set, a refresh answers only once the test adds a permit here,
     /// instead of after 200 ms.
     pub(crate) refresh_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -312,6 +314,7 @@ pub(crate) async fn spawn_forge(
         refreshes: StdMutex::new(Vec::new()),
         revokes: StdMutex::new(Vec::new()),
         revoke_fails: std::sync::atomic::AtomicBool::new(false),
+        revoke_gate: StdMutex::new(None),
         refresh_gate: StdMutex::new(None),
         collaborators: StdMutex::new(HashMap::new()),
         public: StdMutex::new(std::collections::HashSet::new()),
@@ -425,6 +428,10 @@ async fn handle(
             .unwrap_or_default()
             .to_string();
         forge.revokes.lock().unwrap().push((auth, token.clone()));
+        let gate = forge.revoke_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            drop(gate.acquire().await.unwrap());
+        }
         if forge.revoke_fails.load(Ordering::SeqCst) {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -812,6 +819,31 @@ async fn repo_route(
             Err(e) => failed(e),
         };
     }
+    if tail == "/stacks" && get {
+        return match mock.list_stacks(origin, None).await {
+            Ok(stacks) => ok(Value::Array(stacks.iter().map(stack_json).collect())),
+            Err(e) => failed(e),
+        };
+    }
+    if tail == "/stacks" && post {
+        let numbers = stack_numbers(&body);
+        return match mock.create_stack(origin, &numbers).await {
+            Ok(stack) => created(stack_json(&stack)),
+            Err(e) => failed(e),
+        };
+    }
+    if let Some(number) = tail
+        .strip_prefix("/stacks/")
+        .and_then(|rest| rest.strip_suffix("/add"))
+        && let Ok(number) = number.parse::<u64>()
+        && post
+    {
+        let numbers = stack_numbers(&body);
+        return match mock.extend_stack(origin, number, &numbers).await {
+            Ok(stack) => ok(stack_json(&stack)),
+            Err(e) => failed(e),
+        };
+    }
     if tail == "/pulls" && get {
         if query_param(uri, "page").as_deref() != Some("1") {
             return ok(json!([]));
@@ -909,6 +941,25 @@ pub(crate) fn files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
 
 /// A repository holding only its MANIFEST (plus `extra` MANIFEST lines) on
 /// `main`.
+fn stack_numbers(body: &Value) -> Vec<u64> {
+    body["pull_requests"]
+        .as_array()
+        .map(|numbers| numbers.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+fn stack_json(stack: &crystalline_remote::StackInfo) -> Value {
+    json!({
+        "number": stack.number,
+        "open": stack.open,
+        "pull_requests": stack.members.iter().map(|m| json!({
+            "number": m.number,
+            "state": m.state,
+            "head": {"sha": m.head_sha},
+        })).collect::<Vec<_>>(),
+    })
+}
+
 pub(crate) fn repo_with_manifest(extra: &str) -> Arc<MockProvider> {
     let mock = Arc::new(MockProvider::new());
     let head = mock.add_commit(files(&[("MANIFEST.md", manifest(extra))]));
@@ -1168,7 +1219,7 @@ async fn a_401_mid_share_renews_the_installation_token_once() {
         &[(1, "ghs_test")],
     )
     .await;
-    let eng = engine(tmp.path(), &url, &app_env()).await;
+    let eng = engine(tmp.path(), &url, &instance_share_env()).await;
     let root = tmp.path().join("kb");
     connect(&eng, "acme/kb", "kb", &root).await;
     std::fs::create_dir_all(root.join("notes")).unwrap();
@@ -1205,8 +1256,16 @@ async fn a_401_mid_share_renews_the_installation_token_once() {
     );
 }
 
+/// [`app_env`] on an instance whose admin chose that the App opens proposals:
+/// without the key an App means every person shares on their own identity.
+fn instance_share_env() -> Vec<(&'static str, &'static str)> {
+    let mut env = app_env();
+    env.push(("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "instance"));
+    env
+}
+
 /// A connected `kb` domain on an App instance with one new engram waiting
-/// to be shared.
+/// to be shared, the App opening the proposals.
 async fn app_share_setup(tmp: &Path) -> (Arc<Forge>, Engine) {
     let mock = repo_with_manifest("");
     let (forge, url) = spawn_forge(
@@ -1215,7 +1274,7 @@ async fn app_share_setup(tmp: &Path) -> (Arc<Forge>, Engine) {
         &[(1, "ghs_test")],
     )
     .await;
-    let eng = engine(tmp, &url, &app_env()).await;
+    let eng = engine(tmp, &url, &instance_share_env()).await;
     let root = tmp.join("kb");
     connect(&eng, "acme/kb", "kb", &root).await;
     std::fs::create_dir_all(root.join("notes")).unwrap();

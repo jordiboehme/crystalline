@@ -10,7 +10,7 @@ import { afterEach, expect, test, vi } from "vitest";
 
 import { cellForwarding } from "../editor/grid/cellEditor";
 import { gridTables } from "../editor/grid/structure";
-import { cleanupCells, openAt, soloMain } from "./cellKit";
+import { cleanupCells, openAt, roomMain, soloMain } from "./cellKit";
 import { parsedState } from "./parse";
 
 afterEach(() => {
@@ -43,4 +43,20 @@ test("opens a cell after an edit whose parse ran out of time", () => {
   expect(syntaxTree(main.state).length).toBeLessThan(TEXT.indexOf("|"));
   const editor = openAt(main, cell.content.to + 1, false);
   expect(editor.view.state.doc.toString()).toBe(main.state.doc.toString());
+});
+
+test("roomMain's held relay keeps both peers' writes back until release", () => {
+  const { main, rtext, hold, release } = roomMain("ab", []);
+  rtext.insert(0, "r");
+  expect(main.state.doc.toString()).toBe("rab");
+  hold();
+  rtext.insert(3, "z");
+  main.dispatch({ changes: { from: 0, insert: "m" } });
+  expect(main.state.doc.toString()).toBe("mrab");
+  expect(rtext.toJSON()).toBe("rabz");
+  release();
+  expect(main.state.doc.toString()).toBe("mrabz");
+  expect(rtext.toJSON()).toBe("mrabz");
+  rtext.insert(0, "s");
+  expect(main.state.doc.toString()).toBe("smrabz");
 });

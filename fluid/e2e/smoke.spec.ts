@@ -609,6 +609,117 @@ test("an admin creates the GitHub App with a real form post to GitHub", async ({
   await expect(page).toHaveURL((url) => !url.search.includes("app="));
 });
 
+test("an unlinked editor opens the share dialog on an App instance and sees the link fix", async ({
+  page,
+}) => {
+  // The daemon here has no App, so the answers an App instance gives this
+  // person are canned, each in the shape the routes send: the report with
+  // `may_share` false and no admin keys, the plan refused with the link
+  // sentence, and no identity on file.
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  expect(me.ok()).toBe(true);
+  const body = (await me.json()) as {
+    user?: { role: string } | null;
+    can_share?: boolean;
+  };
+  body.user!.role = "editor";
+  body.can_share = true;
+  await page.route("**/api/v1/auth/me", (route) =>
+    route.fulfill({ json: body }),
+  );
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync`, (route) =>
+    route.fulfill({
+      json: {
+        domain: DOMAIN,
+        mode: "github",
+        repo: "acme/knowledge",
+        branch: "main",
+        base_commit: "9f3c1a2",
+        behind: false,
+        local_changes: 1,
+        last_checked: "2026-10-09T08:00:00Z",
+        probe_error: null,
+        may_share: false,
+        connection: {
+          connected: true,
+          user: null,
+          token_store: "keyring",
+          share_identity: "personal",
+          share_identity_default: true,
+        },
+        open_proposals: [],
+        declined_proposals: [],
+        conflicts: [],
+      },
+    }),
+  );
+  const refusal =
+    "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync/changes`, (route) =>
+    route.fulfill({
+      status: 403,
+      contentType: "application/problem+json",
+      body: JSON.stringify({
+        type: "about:blank",
+        title: "forbidden",
+        status: 403,
+        detail: refusal,
+      }),
+    }),
+  );
+  await page.route("**/api/v1/me/github-identity", (route) =>
+    route.fulfill({
+      json: {
+        account: "smoke",
+        connected: false,
+        login: null,
+        connected_at: null,
+        token_store: null,
+        pending: null,
+        error: null,
+        warning: null,
+      },
+    }),
+  );
+  await page.route("**/api/v1/me/github-link", (route) =>
+    route.fulfill({
+      json: {
+        linked: false,
+        login: null,
+        github_id: null,
+        host: null,
+        linked_at: null,
+        token_live: false,
+        pending: null,
+        error: null,
+        app_configured: true,
+        share_identity: "personal",
+      },
+    }),
+  );
+
+  await page.goto(`d/${DOMAIN}`);
+  await page.getByRole("button", { name: "Share changes" }).first().click();
+  const dialog = page.getByRole("dialog", { name: /share/i });
+  await expect(dialog.getByText(refusal)).toBeVisible();
+  const fix = dialog.getByRole("link", { name: "Connect GitHub to share" });
+  await expect(fix).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Share" })).toHaveCount(0);
+  await expect(dialog).not.toContainText("crystalline ");
+  await expect(dialog).not.toContainText("share_identity");
+
+  await fix.click();
+  await expect(page).toHaveURL(/\/profile/);
+  await expect(
+    page.getByText(
+      "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Connect GitHub" }),
+  ).toBeVisible();
+});
+
 test("a refused direct share offers to share as a proposal", async ({
   page,
 }) => {
@@ -1257,7 +1368,8 @@ test("a domain is registered, filled from an archive and unregistered", async ({
       async () =>
         (
           await page.request.get(
-            `${BASE_PATH}/api/v1/domains/${RESTORE_DOMAIN}/engrams`,
+            // Past the listing's default page of 10: the archive holds more.
+            `${BASE_PATH}/api/v1/domains/${RESTORE_DOMAIN}/engrams?limit=100`,
           )
         ).text(),
       { timeout: 30_000 },
@@ -1289,6 +1401,11 @@ test("a domain is registered, filled from an archive and unregistered", async ({
   expect(await domains.text()).not.toContain(RESTORE_DOMAIN);
 });
 
+/** What the station journey leaves on the page: the screens it saw, in order. */
+interface StationScreens {
+  stationScreens: string[];
+}
+
 test("the station launches from the C64 screen and returns to the same page", async ({
   page,
 }) => {
@@ -1313,6 +1430,20 @@ test("the station launches from the C64 screen and returns to the same page", as
   await expect(
     page.getByRole("dialog", { name: "About Crystalline" }),
   ).toBeVisible();
+  await page.evaluate(() => {
+    const seen: string[] = [];
+    (window as unknown as StationScreens).stationScreens = seen;
+    new MutationObserver(() => {
+      for (const label of ["Opening", "Connecting"]) {
+        if (
+          !seen.includes(label) &&
+          document.querySelector(`[role="dialog"][aria-label="${label}"]`)
+        ) {
+          seen.push(label);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  });
   await page.getByRole("link", { name: 'LOAD"GAME",8,1' }).click();
   await expect(page).toHaveURL(new RegExp(`/%CF%80${route}$`), LAUNCH);
   await expect(page.locator("canvas")).toBeVisible(LAUNCH);
@@ -1327,16 +1458,23 @@ test("the station launches from the C64 screen and returns to the same page", as
   });
   console.log(`renderer: ${renderer}`);
   // The opening question shows first, since the launch's click primed the
-  // sound, and skips on any key; the connecting screen follows and skips
-  // the same way.
-  const opening = page.getByRole("dialog", { name: "Opening" });
-  await expect(opening).toBeVisible(LAUNCH);
+  // sound; the connecting screen follows. Both end on their own within
+  // seconds, and on a loaded machine the room can land before a polled look
+  // at either one, so the page records them and the keys skip what is up.
+  // That a key skips each screen is pinned in ExploreRoute.test.tsx.
+  await expect
+    .poll(async () => {
+      await page.keyboard.press("Shift");
+      return page.evaluate(
+        () => (window as unknown as StationScreens).stationScreens,
+      );
+    }, LAUNCH)
+    .toEqual(["Opening", "Connecting"]);
   await page.keyboard.press("Shift");
-  await expect(opening).toHaveCount(0);
-  const connecting = page.getByRole("dialog", { name: "Connecting" });
-  await expect(connecting).toBeVisible();
-  await page.keyboard.press("Shift");
-  await expect(connecting).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Connecting" })).toHaveCount(
+    0,
+    LAUNCH,
+  );
   // Wait for the room to land before pausing: the HUD's status line leads
   // with the room's title once the room is entered (before that it holds
   // only the mouse hint).

@@ -26,7 +26,7 @@
  *   `data-id`. Match it exactly, never by splitting on `_`.
  */
 
-import { mermaidConfig } from "../../theme/mermaid";
+import { initializeMermaid } from "../../theme/mermaid";
 
 /** One vertex, in `db.getVertices()` order. */
 export interface FlowVertexView {
@@ -173,7 +173,7 @@ export async function flowDbOf(
     return { error, unavailable: true };
   }
   try {
-    mermaid.initialize(mermaidConfig(dark));
+    initializeMermaid(mermaid, dark);
     const diagram = await mermaid.mermaidAPI.getDiagramFromText(body);
     const type = diagram.type;
     if (!FLOW_TYPES.has(type)) {
@@ -317,7 +317,7 @@ export async function sequenceDbOf(
     return { error, unavailable: true };
   }
   try {
-    mermaid.initialize(mermaidConfig(dark));
+    initializeMermaid(mermaid, dark);
     const diagram = await mermaid.mermaidAPI.getDiagramFromText(body);
     if (diagram.type !== "sequence") {
       return { error: new Error(`not a sequence diagram: ${diagram.type}`) };

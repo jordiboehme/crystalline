@@ -968,7 +968,7 @@ async fn a_personal_share_by_an_authenticated_agent_resolves_that_accounts_crede
         .call_tool("share_changes", serde_json::json!({ "domain": "kb" }))
         .await;
     assert!(
-        answer.contains("Connect yours in Fluid"),
+        answer.contains("Connect yours in your profile"),
         "the share runs as ada, so it is ada's missing connection that refuses it:\n{answer}"
     );
     assert!(

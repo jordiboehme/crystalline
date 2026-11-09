@@ -569,6 +569,29 @@ async fn a_team_update_on_an_instance_that_does_not_host_is_refused_on_postgres(
     assert_eq!(listing(), before, "no file landed");
 }
 
+/// A discard carries on past a domain this instance does not host and says where
+/// to run it. The rows on the shared store still count, so the name stays refused.
+#[tokio::test]
+async fn a_discard_reports_a_domain_it_does_not_host_on_postgres() {
+    let Some(p) = pair().await else { return };
+    let actor = "ada";
+    // A draft this instance's journal holds, in a domain the other one hosts.
+    let state = p._tmp.path().join("inst-b/state");
+    crystalline_service::overlay_journal::journal_write(&state, "eng", actor, "plan.md", "# Plan")
+        .unwrap();
+    let report = p.beta.discard_account_drafts(actor, "root").await.unwrap();
+    let row = &report["domains"][0];
+    assert_eq!(row["not_hosted"], true, "{report}");
+    assert!(
+        row["where"].as_str().unwrap().contains("Run this there"),
+        "{report}"
+    );
+    assert!(
+        !p.beta.account_drafts(actor).await.unwrap().is_empty(),
+        "the name stays refused"
+    );
+}
+
 /// When nobody holds the lock any more by the time the rows commit (its
 /// holder released it), the write says so in its own sentence.
 #[tokio::test]

@@ -2,6 +2,11 @@
 //! Claude Desktop's package, as `doctor` and `status` report it. The scan
 //! reads `LOCALAPPDATA`, which the isolated environment points at
 //! `<home>/local` on every platform.
+//!
+//! Debug builds only (see `main.rs`): the package folder planted here makes
+//! `doctor` check the daemon task on Windows, and a release binary reads
+//! neither the task seam nor the package seam, so it would ask the real Task
+//! Scheduler and the real package check.
 
 use std::path::{Path, PathBuf};
 

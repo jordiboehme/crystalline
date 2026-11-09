@@ -2,6 +2,8 @@ import { describe, expect, test } from "vitest";
 
 import { defined } from "../../../test/assert";
 import type { Span } from "../edits";
+import { flowDbOf } from "../mermaidDb";
+import { agreesFlow } from "../verdict";
 import type { FlowModel, NodeRef } from "./model";
 import { MAX_TEXT_SIZE, edgeByKey, parseFlowchart } from "./parse";
 
@@ -565,5 +567,56 @@ describe("span invariants over the corpus", () => {
         expect(ref.id).toBe(id);
       }
     }
+  });
+});
+
+describe("a @{ } box before an arrow id", () => {
+  test("a space between them is not understood, as mermaid refuses it", async () => {
+    const spaced = 'flowchart TD\n  A@{ shape: diam, label: "x" } e1@--> B';
+    expect(parseFlowchart(spaced).understood).toBe(false);
+    expect(await flowDbOf(spaced, false)).toHaveProperty("error");
+    const group = 'flowchart TD\n  B & A@{ shape: diam, label: "x" } e1@--> C';
+    expect(parseFlowchart(group).understood).toBe(false);
+    expect(await flowDbOf(group, false)).toHaveProperty("error");
+  });
+
+  test("the tight form stays understood, and mermaid reads it the same", async () => {
+    const tight = 'flowchart TD\n  A@{ shape: diam, label: "x" }e1@--> B';
+    const model = parseFlowchart(tight);
+    expect(model.understood).toBe(true);
+    expect(model.edges[0]?.mermaidId).toBe("e1");
+    const db = await flowDbOf(tight, false);
+    if ("error" in db) {
+      throw new Error(String(db.error));
+    }
+    expect(agreesFlow(model, db)).toBeNull();
+  });
+
+  test.each([
+    "A{d}",
+    "A{{h}}",
+    "A((x))",
+    "A([x])",
+    "A[x]",
+    "A:::c",
+    'A["`m`"]',
+  ])(
+    "%s with a space before the id stays understood, and mermaid reads it",
+    async (ref) => {
+      const body = `flowchart TD\n  ${ref} e1@--> B`;
+      const model = parseFlowchart(body);
+      expect(model.understood).toBe(true);
+      const db = await flowDbOf(body, false);
+      if ("error" in db) {
+        throw new Error(String(db.error));
+      }
+      expect(agreesFlow(model, db)).toBeNull();
+    },
+  );
+
+  test("a @{ } box with a space before a plain arrow stays understood", async () => {
+    const body = 'flowchart TD\n  A@{ shape: diam, label: "x" } --> B';
+    expect(parseFlowchart(body).understood).toBe(true);
+    expect(await flowDbOf(body, false)).not.toHaveProperty("error");
   });
 });

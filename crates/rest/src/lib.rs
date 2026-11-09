@@ -238,6 +238,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::update,
         users_api::reset_password,
         users_api::remove,
+        users_api::discard_drafts,
         github_settings::status,
         github_settings::access,
         github_settings::connect,
@@ -1108,6 +1109,7 @@ fn routes(state: RestState) -> Router {
             "/users/{name}",
             patch(users_api::update).delete(users_api::remove),
         )
+        .route("/users/{name}/drafts", delete(users_api::discard_drafts))
         .route("/users/{name}/password", post(users_api::reset_password))
         // Admin only, inside the handler: frees a GitHub account linked to
         // the wrong Crystalline account. See [`github_link`].
@@ -1427,6 +1429,10 @@ pub(crate) async fn refuse_off_write_list(
     Ok(())
 }
 
+/// Why an account with no GitHub link may not change a domain GitHub governs: a
+/// person reads this, so it names the fix without a command line or a setting.
+pub(crate) const LINK_GITHUB_TO_WRITE: &str = "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+
 /// The caller, when the request may mutate content in `domain`.
 ///
 /// Three refusals in the order they have to happen:
@@ -1495,6 +1501,19 @@ pub(crate) async fn require_domain_write(
         })?;
     if right < DomainRight::Write {
         refuse_off_write_list(state, identity, domain, None).await?;
+        if let Caller::Account(user) = &caller
+            && state.access.governs(domain)
+            && matches!(state.access.github_link_of(&user.name).await, Ok(None))
+        {
+            // A link cannot help while the App itself cannot be used, so the
+            // person is told that, in words that fit who reads them.
+            if let Err(refusal) = state.engine.github_link_app_explained()
+                && let Some(reason) = refusal.reason
+            {
+                return Err(ApiError::forbidden(reason.plain_sentence()));
+            }
+            return Err(ApiError::forbidden(LINK_GITHUB_TO_WRITE));
+        }
         return Err(ApiError::forbidden(format!(
             "your membership on this domain is {}, and editor access is required",
             member_level_word(right)

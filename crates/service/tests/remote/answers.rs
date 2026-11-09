@@ -235,7 +235,8 @@ async fn origin_status_reaches_the_engine_under_the_account() {
         !error.contains("not available over a remote connection"),
         "{error}"
     );
-    assert!(error.contains("github.enabled"), "{error}");
+    assert!(error.contains("not on for this instance"), "{error}");
+    assert!(!error.contains("github.enabled"), "{error}");
 }
 
 /// A connected machine's Stop hook never asks for a sweep of a domain that

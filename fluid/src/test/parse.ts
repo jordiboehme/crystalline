@@ -33,6 +33,7 @@
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
+import type { Tree } from "@lezer/common";
 import type { EditorView } from "@codemirror/view";
 
 /**
@@ -53,34 +54,38 @@ import type { EditorView } from "@codemirror/view";
  */
 const PARSE_DEADLINE_MS = 30_000;
 
-/**
- * How far the tree reaches, which is the only thing the callers depend on.
- *
- * Deliberately not `syntaxTreeAvailable`: that also demands a fragment set
- * spanning the document, and a fence whose nested language is still being
- * imported leaves the parse covering every character with no such fragment.
- * The decorations read node positions, so covering every character is the bar.
- */
-function covered(state: EditorState): boolean {
-  return syntaxTree(state).length >= state.doc.length;
-}
-
 function refuse(state: EditorState): never {
   throw new Error(
     `the parse stopped at ${syntaxTree(state).length} of ${state.doc.length} characters`,
   );
 }
 
+/**
+ * The trees asked for already: with a fence whose language is still loading the
+ * parse context never calls itself done, and each ask would parse the page again.
+ */
+const finished = new WeakSet<Tree>();
+
+/**
+ * Asks the parse and never `tree.length`, which overstates a cut parse: a tree
+ * cut inside a quote or a list is as long as the blocks it closed, with the
+ * lines past the cut unread. Deliberately not `syntaxTreeAvailable`: that also
+ * demands a fragment set spanning the document, and a fence whose nested
+ * language is still being imported leaves the parse covering every character
+ * with no such fragment.
+ */
 export function parsedState(state: EditorState): EditorState {
-  if (covered(state)) {
-    return state;
-  }
-  ensureSyntaxTree(state, state.doc.length, PARSE_DEADLINE_MS);
+  if (finished.has(syntaxTree(state))) return state;
+  const tree = ensureSyntaxTree(state, state.doc.length, PARSE_DEADLINE_MS);
+  if (!tree) refuse(state);
+  finished.add(tree);
   // The empty update is what publishes the advanced parse into the state
   // field: `ensureSyntaxTree` moves the parse context on, but `syntaxTree`
   // reads the snapshot the field is holding, which only a transaction renews.
+  if (tree === syntaxTree(state)) return state;
   const settled = state.update({}).state;
-  return covered(settled) ? settled : refuse(settled);
+  finished.add(syntaxTree(settled));
+  return settled;
 }
 
 /**
@@ -91,10 +96,17 @@ export function parsedState(state: EditorState): EditorState {
  * is for.
  */
 export function parsedView<V extends EditorView>(view: V): V {
-  if (covered(view.state)) {
-    return view;
+  if (finished.has(syntaxTree(view.state))) return view;
+  const tree = ensureSyntaxTree(
+    view.state,
+    view.state.doc.length,
+    PARSE_DEADLINE_MS,
+  );
+  if (!tree) refuse(view.state);
+  finished.add(tree);
+  if (tree !== syntaxTree(view.state)) {
+    view.dispatch({});
+    finished.add(syntaxTree(view.state));
   }
-  ensureSyntaxTree(view.state, view.state.doc.length, PARSE_DEADLINE_MS);
-  view.dispatch({});
-  return covered(view.state) ? view : refuse(view.state);
+  return view;
 }

@@ -35,26 +35,40 @@ export type RefusalCode =
   | "group"
   | "chain"
   | "unsupported"
+  | "unchecked"
+  | "breaksFence"
+  | "needsLineBelow"
+  | "arrowChanged"
   | "emptiesBlock"
   | "leavesActive";
 
-/** What an op compiler returns: the edits (and what they create) or a refusal. */
-export type OpResult =
-  { edits: TextEdit[]; created?: unknown } | { refused: RefusalCode };
+/**
+ * What an op compiler returns: the edits (and what they create, of a type each
+ * kind of diagram names) or a refusal.
+ */
+export type OpResult<Created = unknown> =
+  { edits: TextEdit[]; created?: Created } | { refused: RefusalCode };
 
 /** The notice shown for each refusal. None mentions Raw or text. */
 export const NOTICES: Record<RefusalCode, string> = {
   stale: "The diagram just changed. Try again.",
   gone: "That part of the diagram is no longer there.",
-  invalid: "That change would break the diagram, so it was not made.",
+  invalid: "That change would break the diagram, so nothing was changed.",
   group:
     "This arrow is drawn together with others, so it cannot be changed on its own.",
   chain: "This arrow is part of a chain, so it cannot be reversed on its own.",
   unsupported:
-    "This diagram uses something the editor does not know yet, so it was not changed.",
+    "This diagram uses something the editor does not know yet, so nothing was changed.",
+  unchecked:
+    "The diagram could not be checked, so nothing was changed. Try again.",
+  breaksFence: "That would break a diagram here, so nothing was changed.",
+  needsLineBelow:
+    "A diagram at the end of a page needs a line below it, so nothing was changed.",
+  arrowChanged:
+    "This arrow changed, so the label was not written. Press Escape and open it again.",
   emptiesBlock:
-    "That would leave a block with nothing in it, so it was not deleted.",
-  leavesActive: "That would leave an activation open, so it was not deleted.",
+    "That would leave a block with nothing in it, so nothing was changed.",
+  leavesActive: "That would leave an activation open, so nothing was changed.",
 };
 
 /**
@@ -111,18 +125,36 @@ export function applyEdits(body: string, edits: readonly TextEdit[]): string {
  * becomes that break, the CRLF rule `mermaidStarters.ts` follows. The ranges
  * are checked as `applyEdits` checks them, except against the body's end,
  * which a caller holding only `bodyFrom` does not know.
+ *
+ * `body`, for a fence, whose body always has a line break after it: an edit can
+ * only name the body, so deleting the last line takes the break before it, and
+ * the line before would end in the last line's break, which in a mixed document
+ * is another one (R68). Such a deletion moves on by one position, to take the
+ * last line's own break. The LF text is the same, so what was verified is what
+ * is written.
  */
 export function toChanges(
   bodyFrom: number,
   edits: readonly TextEdit[],
   lineBreak: string,
+  body?: string,
 ): ChangeSpec[] {
-  return sortedEdits(edits, Number.MAX_SAFE_INTEGER).map((edit) => ({
-    from: bodyFrom + edit.from,
-    to: bodyFrom + edit.to,
-    insert:
-      lineBreak === "\n"
-        ? edit.insert
-        : edit.insert.replaceAll("\n", lineBreak),
-  }));
+  return sortedEdits(edits, Number.MAX_SAFE_INTEGER).map((edit) => {
+    const shift =
+      body !== undefined &&
+      edit.insert === "" &&
+      edit.to === body.length &&
+      edit.from < edit.to &&
+      body[edit.from] === "\n"
+        ? 1
+        : 0;
+    return {
+      from: bodyFrom + edit.from + shift,
+      to: bodyFrom + edit.to + shift,
+      insert:
+        lineBreak === "\n"
+          ? edit.insert
+          : edit.insert.replaceAll("\n", lineBreak),
+    };
+  });
 }

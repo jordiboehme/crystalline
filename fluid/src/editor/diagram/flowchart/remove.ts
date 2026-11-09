@@ -96,8 +96,10 @@ function assembled(
 }
 
 /** The first of the tries whose result the self-check accepts, else the last refusal. */
-function firstAccepted(tries: readonly (() => OpResult)[]): OpResult {
-  let result: OpResult = refused("invalid");
+function firstAccepted(
+  tries: readonly (() => OpResult<never>)[],
+): OpResult<never> {
+  let result: OpResult<never> = refused("invalid");
   for (const attempt of tries) {
     result = attempt();
     if ("edits" in result) {
@@ -146,7 +148,7 @@ function ruledRemoval(
   return cut;
 }
 
-export function deleteEdge(model: FlowModel, key: EdgeKey): OpResult {
+export function deleteEdge(model: FlowModel, key: EdgeKey): OpResult<never> {
   const edge = edgeByKey(model, key);
   const chain = model.chains[edge?.chain ?? -1];
   if (edge === null || chain === undefined) {
@@ -175,7 +177,7 @@ export function deleteEdge(model: FlowModel, key: EdgeKey): OpResult {
     span: link.gap,
     insert: `\n${indentOf(model, chain)}`,
   };
-  const attempt = (removal: LinkRemoval) => (): OpResult => {
+  const attempt = (removal: LinkRemoval) => (): OpResult<never> => {
     const gone: GoneStatements = new Map();
     const edits: TextEdit[] = [];
     if ("statement" in removal) {
@@ -343,7 +345,7 @@ function directiveChanges(
   }
 }
 
-export function deleteNode(model: FlowModel, node: FlowNode): OpResult {
+export function deleteNode(model: FlowModel, node: FlowNode): OpResult<never> {
   const id = node.id;
   const removed = new Set(
     model.edges
@@ -364,7 +366,7 @@ export function deleteNode(model: FlowModel, node: FlowNode): OpResult {
   const chains = model.chains.filter((chain) =>
     chain.groups.some((group) => group.refs.some((ref) => ref.id === id)),
   );
-  const attempt = (dropParts: boolean) => (): OpResult => {
+  const attempt = (dropParts: boolean) => (): OpResult<never> => {
     const count = dropParts ? refsLeft(model) : null;
     const edits: TextEdit[] = [];
     const gone: GoneStatements = new Map();

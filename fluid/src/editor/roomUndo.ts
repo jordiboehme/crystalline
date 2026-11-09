@@ -7,7 +7,10 @@
  * outside a room.
  */
 
-import { Facet } from "@codemirror/state";
+import { isolateHistory } from "@codemirror/commands";
+import type { TransactionSpec } from "@codemirror/state";
+import { Annotation, Facet } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 import type * as Y from "yjs";
 
 export const roomUndo = Facet.define<
@@ -16,3 +19,26 @@ export const roomUndo = Facet.define<
 >({
   combine: (values) => values[0] ?? null,
 });
+
+/**
+ * Dispatches `spec` as one undo step of its own: `isolateHistory` keeps
+ * CodeMirror's history from joining it to the events around it, and in a room
+ * the manager's capture window closes on both sides. Inside a room's stack the
+ * annotation does nothing, and the screens' room buffers have no history for
+ * it to act on.
+ */
+export function dispatchIsolated(
+  view: EditorView,
+  spec: TransactionSpec,
+): void {
+  const given = spec.annotations;
+  const annotations: readonly Annotation<unknown>[] =
+    given === undefined ? [] : given instanceof Annotation ? [given] : given;
+  const room = view.state.facet(roomUndo);
+  room?.stopCapturing();
+  view.dispatch({
+    ...spec,
+    annotations: [...annotations, isolateHistory.of("full")],
+  });
+  room?.stopCapturing();
+}

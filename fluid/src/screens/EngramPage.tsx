@@ -39,6 +39,7 @@
  * which is nearly every page.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Archive, Download, FolderInput, Link2 } from "lucide-react";
 import { DropdownMenu } from "radix-ui";
@@ -538,6 +539,7 @@ export default function EngramPage() {
   const inRail = wide && large && !fullWidth;
   const inDisclosure = wide && !inRail && outlineNode !== null;
 
+  usePageTitle(detail.error ? null : detail.data?.title);
   if (isMissing(detail.error)) {
     return <EngramNotFound domain={domain} permalink={permalink} />;
   }

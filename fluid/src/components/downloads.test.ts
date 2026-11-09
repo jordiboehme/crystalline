@@ -28,6 +28,9 @@ describe("the download names", () => {
     expect(diagramFileName("alpha", "graph TD; A-->B;", "svg")).toBe(
       `alpha-diagram-${hash}.svg`,
     );
+    expect(diagramFileName("alpha", "graph TD; A-->B;", "png")).toBe(
+      `alpha-diagram-${hash}.png`,
+    );
     // Two diagrams in one document never collide; the same one is stable.
     expect(diagramFileName("alpha", "graph TD; A-->C;", "mmd")).not.toBe(
       diagramFileName("alpha", "graph TD; A-->B;", "mmd"),

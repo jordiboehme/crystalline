@@ -20,7 +20,9 @@ import { decodeLabel } from "./labels";
 import type { FlowEdge, FlowModel, FlowNode, Shape } from "./model";
 import { parseFlowchart } from "./parse";
 
-export const refused = (code: RefusalCode): OpResult => ({ refused: code });
+export const refused = (code: RefusalCode): OpResult<never> => ({
+  refused: code,
+});
 
 export const COLOUR_KEYS = ["fill", "stroke", "color"] as const;
 
@@ -307,7 +309,7 @@ export function checked(
   edits: TextEdit[],
   changes: Readonly<Record<string, Wanted>>,
   goneBox: string | null = null,
-): OpResult {
+): OpResult<never> {
   if (edits.length === 0) {
     return { edits };
   }

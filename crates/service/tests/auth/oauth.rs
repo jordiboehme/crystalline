@@ -2058,6 +2058,26 @@ async fn authorizing_is_gone_while_oauth_is_off() {
 /// chain, and a test per endpoint would let any pair of them agree on the wrong
 /// thing while each passed its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_code_is_not_spent_on_a_later_account_under_the_same_name() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    ctx.auth.remove_user_force("ada").await.unwrap();
+    ctx.create_user("ada", Role::Editor).await;
+    let refused = ctx
+        .token(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_verifier", VERIFIER),
+            ("client_id", client_id.as_str()),
+            ("resource", ctx.origin().as_str()),
+        ])
+        .await;
+    assert_eq!(refused.status(), 400, "the old person's code gets nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_full_flow_ends_in_an_mcp_session_as_the_consenting_account() {
     let ctx = OauthCtx::start().await;
     ctx.create_user("ada", Role::Editor).await;

@@ -20,6 +20,7 @@
  * room over a status refetch would drop text the server has not saved.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import type { Extension } from "@codemirror/state";
 import { Compartment, EditorState } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
@@ -60,6 +61,7 @@ import { Breadcrumbs, reflectionCrumbsOf } from "../components/Breadcrumbs";
 import { Loading } from "../components/Loading";
 import { BUTTON } from "../components/primitives";
 import { reflectionAdapter } from "../editor/adapter";
+import { LOST_FIELD_TEXT, settleFieldDraft } from "../editor/diagram/draws";
 import CmEditor from "../editor/CmEditor";
 import type { Draft } from "../editor/drafts";
 import { assetRefsIn } from "../editor/imageFormat";
@@ -524,6 +526,7 @@ function Surface({
   const [resolveProblem, setResolveProblem] = useState<string | null>(null);
   const [mountText] = useState(() => ytext.toJSON());
   const [title] = useState(() => titleOf(mountText, path));
+  usePageTitle(title);
   const [mountEnded] = useState(ended);
   const [view, setView] = useState<EditorView | null>(null);
   /*
@@ -705,9 +708,6 @@ function Surface({
       effects: previews.reconfigure(imagePreviews(previewHome)),
     });
   }, [view, previews, previewHome]);
-  useEffect(() => {
-    view?.dispatch({ effects: editable.reconfigure(readOnly(ended)) });
-  }, [view, editable, ended]);
 
   const keep = useMemo(
     () => () => {
@@ -720,6 +720,43 @@ function Surface({
     },
     [account, domain, key, ytext],
   );
+  // What a diagram's open field held when the room ended: kept in the draft, or
+  // shown as lost. Null with nothing to say.
+  const [fieldEnd, setFieldEnd] = useState<
+    { kept: true } | { lost: string } | null
+  >(null);
+  useEffect(() => {
+    if (view === null) {
+      return undefined;
+    }
+    // A diagram's open field writes its text while the page still takes it, as
+    // the engram editor does (R100); only then does the page stop taking writes.
+    const before = ytext.toJSON();
+    const settling = ended ? settleFieldDraft(view) : null;
+    if (settling === null) {
+      view.dispatch({ effects: editable.reconfigure(readOnly(ended)) });
+      return undefined;
+    }
+    let live = true;
+    void settling
+      .catch(() => null)
+      .then((lost) => {
+        if (!live) {
+          return;
+        }
+        view.dispatch({ effects: editable.reconfigure(readOnly(true)) });
+        if (lost !== null) {
+          setFieldEnd({ lost });
+        } else if (ytext.toJSON() !== before) {
+          // Written after the room's last save: only this tab has it now.
+          keep();
+          setFieldEnd({ kept: true });
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [view, editable, ended, ytext, keep]);
 
   /**
    * Drop the offers on screen from the offer key, and only those: text set
@@ -969,7 +1006,26 @@ function Surface({
             {endedSentence(collab.closedReason, collab.saveState)}
           </p>
         )}
+        {ended &&
+          fieldEnd !== null &&
+          "kept" in fieldEnd &&
+          // A page gone out of reach keeps no draft: the banner asks for a copy.
+          collab.closedReason !== "deleted" &&
+          !(collab.closedReason === "moved" && collab.movedTo === null) && (
+            <p className={AMBER_BANNER}>
+              The text you were typing in the diagram is kept as a draft on this
+              device.
+            </p>
+          )}
       </div>
+      {ended && fieldEnd !== null && "lost" in fieldEnd && (
+        <p role="alert" className={AMBER_BANNER}>
+          <span>{LOST_FIELD_TEXT}</span>
+          <q className="block max-h-40 w-full overflow-auto wrap-anywhere whitespace-pre-wrap select-all">
+            {fieldEnd.lost}
+          </q>
+        </p>
+      )}
       {/*
         A note, not a status: the offer is there when the screen opens and
         waits for a choice, it is not news that happened while the person

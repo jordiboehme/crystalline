@@ -22,6 +22,7 @@
  * this app before.
  */
 
+import { usePageTitle } from "../usePageTitle";
 import { useMutation } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { useCallback, useEffect, useState } from "react";
@@ -157,6 +158,8 @@ export default function GrantedDraft(): ReactElement {
     },
   });
 
+  // The name the page itself shows: the draft's path, or the placeholder.
+  usePageTitle(draft ? draft.path : "A shared draft");
   if (!draft) {
     return (
       <section className="flex flex-col gap-2">

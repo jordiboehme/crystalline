@@ -57,6 +57,29 @@ describe("applyEdits", () => {
 });
 
 describe("toChanges", () => {
+  test("with the body, a deletion of the last lines takes the last line's break instead of the first's", () => {
+    const body = "a\nb\nc";
+    expect(toChanges(10, [{ from: 3, to: 5, insert: "" }], "\n", body)).toEqual(
+      [{ from: 14, to: 16, insert: "" }],
+    );
+    expect(toChanges(10, [{ from: 1, to: 5, insert: "" }], "\n", body)).toEqual(
+      [{ from: 12, to: 16, insert: "" }],
+    );
+  });
+
+  test("with the body, any other edit stays where it is", () => {
+    const body = "a\nb\nc;d";
+    for (const edit of [
+      { from: 1, to: 3, insert: "" }, // not to the body's end
+      { from: 3, to: 7, insert: "x" }, // not a pure deletion
+      { from: 5, to: 7, insert: "" }, // does not start at a line break
+    ]) {
+      expect(toChanges(10, [edit], "\n", body)).toEqual([
+        { from: 10 + edit.from, to: 10 + edit.to, insert: edit.insert },
+      ]);
+    }
+  });
+
   test("shifts by the body start and writes the document's line break", () => {
     expect(toChanges(10, [{ from: 1, to: 1, insert: "\nx" }], "\r\n")).toEqual([
       { from: 11, to: 11, insert: "\r\nx" },
@@ -121,17 +144,24 @@ describe("NOTICES", () => {
     expect(NOTICES).toEqual({
       stale: "The diagram just changed. Try again.",
       gone: "That part of the diagram is no longer there.",
-      invalid: "That change would break the diagram, so it was not made.",
+      invalid: "That change would break the diagram, so nothing was changed.",
       group:
         "This arrow is drawn together with others, so it cannot be changed on its own.",
       chain:
         "This arrow is part of a chain, so it cannot be reversed on its own.",
       unsupported:
-        "This diagram uses something the editor does not know yet, so it was not changed.",
+        "This diagram uses something the editor does not know yet, so nothing was changed.",
+      unchecked:
+        "The diagram could not be checked, so nothing was changed. Try again.",
+      breaksFence: "That would break a diagram here, so nothing was changed.",
+      needsLineBelow:
+        "A diagram at the end of a page needs a line below it, so nothing was changed.",
+      arrowChanged:
+        "This arrow changed, so the label was not written. Press Escape and open it again.",
       emptiesBlock:
-        "That would leave a block with nothing in it, so it was not deleted.",
+        "That would leave a block with nothing in it, so nothing was changed.",
       leavesActive:
-        "That would leave an activation open, so it was not deleted.",
+        "That would leave an activation open, so nothing was changed.",
     });
   });
 

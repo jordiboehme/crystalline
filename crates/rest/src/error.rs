@@ -692,7 +692,17 @@ impl From<EngineError> for ApiError {
     /// match is exhaustive so a new variant must be classified here instead
     /// of silently defaulting.
     fn from(e: EngineError) -> ApiError {
-        let detail = e.to_string();
+        // This answer is worded before anybody knows who asked, so a sentence with
+        // a command line, a setting or a host goes to the log. An admin reads it on
+        // the GitHub settings screen too.
+        let full = e.to_string();
+        let detail = match crate::engine::neutral_refusal_text(&full) {
+            Some(plain) => {
+                tracing::warn!("a request was refused: {full}");
+                plain
+            }
+            None => full,
+        };
         match e {
             EngineError::UnknownDomain { .. } | EngineError::NotFound(_) => {
                 ApiError::not_found(detail)

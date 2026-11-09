@@ -72,7 +72,10 @@ pub fn fixtures_dir() -> PathBuf {
 /// would fetch the embedding or contradiction model (about 220 MB and 550 MB,
 /// into this test's empty cache) fails the fetch at once and goes on
 /// text-only, as it does offline. See [`NO_HUB`].
-pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 11] {
+///
+/// [`TEST_PARENT_PID_VAR`] names this test process, so a debug daemon any
+/// child starts stops once the test process is gone. See [`parent_pid`].
+pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 12] {
     [
         ("HOME", home.to_path_buf()),
         ("XDG_CONFIG_HOME", home.join("config")),
@@ -85,7 +88,23 @@ pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 11] {
         ("CRYSTALLINE_TEST_DAEMON_TASK", PathBuf::from("missing")),
         ("CRYSTALLINE_TEST_DESKTOP_OPEN", PathBuf::from("fail")),
         (HUB_ENDPOINT_VAR, PathBuf::from(NO_HUB)),
+        (TEST_PARENT_PID_VAR, PathBuf::from(parent_pid())),
     ]
+}
+
+/// The debug seam that ties a test daemon to the test process that started
+/// it (`crystalline_service::daemon::TEST_PARENT_PID_ENV`).
+pub const TEST_PARENT_PID_VAR: &str = "CRYSTALLINE_TEST_PARENT_PID";
+
+/// This test process's pid, the value of [`TEST_PARENT_PID_VAR`]. A test's
+/// drop stops the daemons its folder started, but a test process that is
+/// killed outright (a nextest timeout) runs no drop. With this set, a daemon
+/// started by a debug build notices within about a second that the test
+/// process is gone and stops as it does on `SIGTERM`. A bridge passes the
+/// variable on to the daemon it starts, since that daemon inherits its
+/// environment. A release build ignores it.
+pub fn parent_pid() -> String {
+    std::process::id().to_string()
 }
 
 /// The variable the model downloader (hf-hub) reads its hub address from.
@@ -189,4 +208,326 @@ pub fn crystalline_std() -> std::process::Command {
     // scratch cache above, and `doctor --fix` removes lock folders there.
     cmd.env_remove("CRYSTALLINE_MODELS_DIR");
     cmd
+}
+
+/// A process found by [`processes_under`]: its pid and its command line.
+pub type Process = (u32, String);
+
+/// Every live process whose environment or command line names `dir`, as
+/// `(pid, command line)`: on macOS read from `ps -E` (which shows the
+/// environment of this user's own processes), on Linux from `/proc`. A zombie
+/// is not counted, since it is already gone and only waits to be reaped, and
+/// neither is this test process.
+///
+/// A test daemon is found this way rather than by the pid in its owner record
+/// (`service.json`): the record names only the daemon that published it, and
+/// a successor a bridge spawned has not published one yet, or published it
+/// after the test read it (see [`Leftovers`]). Every child a test isolates
+/// carries `HOME` (or `XDG_STATE_HOME`) under its own folder, and so does
+/// everything those children start.
+///
+/// `None` when the scan could not run at all (on macOS `ps` could not be
+/// started, as when the per-user process limit is reached under a loaded
+/// run), so a caller never reads a failed scan as "nothing left". One retry
+/// every 100 ms for up to 5 s comes first.
+#[cfg(unix)]
+pub fn processes_under(dir: &Path) -> Option<Vec<Process>> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(found) = scan_under(dir) {
+            return Some(found);
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// One attempt of [`processes_under`].
+#[cfg(unix)]
+fn scan_under(dir: &Path) -> Option<Vec<Process>> {
+    // The folder as given and as the kernel spells it (`/tmp` is
+    // `/private/tmp` on macOS, and a daemon is handed absolute paths).
+    let mut needles = vec![dir.to_string_lossy().into_owned()];
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        let real = real.to_string_lossy().into_owned();
+        if real != needles[0] {
+            needles.push(real);
+        }
+    }
+    let names_it = |text: &str| {
+        needles.iter().any(|needle| {
+            text.match_indices(needle.as_str()).any(|(at, _)| {
+                matches!(
+                    text[at + needle.len()..].chars().next(),
+                    None | Some('/') | Some(' ') | Some('\0')
+                )
+            })
+        })
+    };
+    let me = std::process::id();
+    let mut found = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return None;
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let base = entry.path();
+            let zombie = std::fs::read_to_string(base.join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(true);
+            if zombie {
+                continue;
+            }
+            let read = |name: &str| {
+                std::fs::read(base.join(name))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default()
+            };
+            let cmdline = read("cmdline");
+            if names_it(&read("environ")) || names_it(&cmdline) {
+                found.push((pid, cmdline.replace('\0', " ").trim_end().to_string()));
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-axww", "-E", "-o", "pid=,stat=,command="])
+            .output()
+        else {
+            return None;
+        };
+        if !out.status.success() {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(stat)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if pid == me || stat.starts_with('Z') || !names_it(line) {
+                continue;
+            }
+            // `-E` appends the environment to the command line; the command
+            // ends at the first `NAME=value` word.
+            let command: Vec<&str> = fields
+                .take_while(|word| {
+                    !word.split_once('=').is_some_and(|(name, _)| {
+                        !name.is_empty()
+                            && name
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    })
+                })
+                .collect();
+            found.push((pid, command.join(" ")));
+        }
+    }
+    Some(found)
+}
+
+/// What [`stop_processes_under`] met: what the first scan found, what was
+/// still alive at the end, and whether every scan ran (`false` when one could
+/// not, see [`processes_under`]).
+#[cfg(unix)]
+pub struct Stopped {
+    pub found: Vec<Process>,
+    pub left: Vec<Process>,
+    pub scanned: bool,
+}
+
+/// Stop every process [`processes_under`] finds for `dir` with `SIGKILL`, and
+/// wait until none is left, for at most `within`. Each lap kills again what it
+/// finds, so a successor that was being spawned on the first lap is caught on
+/// a later one.
+///
+/// When a scan cannot run, the pid in the owner record under `dir` (the old
+/// way, `state/crystalline/service.json`) is killed instead, so this is never
+/// weaker than that, and the result says the scan failed.
+#[cfg(unix)]
+pub fn stop_processes_under(dir: &Path, within: std::time::Duration) -> Stopped {
+    let start = std::time::Instant::now();
+    let Some(first) = processes_under(dir) else {
+        kill_record_pid(dir);
+        return Stopped {
+            found: Vec::new(),
+            left: Vec::new(),
+            scanned: false,
+        };
+    };
+    let mut left = first.clone();
+    let mut quiet_laps = 0;
+    loop {
+        if left.is_empty() {
+            quiet_laps += 1;
+            // Two empty scans 100 ms apart: one is enough for a process that
+            // exists, the second catches one a dying parent forked just now.
+            if quiet_laps >= 2 {
+                break;
+            }
+        } else {
+            quiet_laps = 0;
+            for (pid, _) in &left {
+                kill_hard(*pid);
+            }
+        }
+        if start.elapsed() > within {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(if left.is_empty() {
+            100
+        } else {
+            50
+        }));
+        match processes_under(dir) {
+            Some(now) => left = now,
+            None => {
+                kill_record_pid(dir);
+                return Stopped {
+                    found: first,
+                    left,
+                    scanned: false,
+                };
+            }
+        }
+    }
+    Stopped {
+        found: first,
+        left,
+        scanned: true,
+    }
+}
+
+/// `SIGKILL` to `pid`, never to 0 or 1 (which `kill(2)` reads as a group or
+/// init) and never to this test process.
+#[cfg(unix)]
+fn kill_hard(pid: u32) {
+    if pid > 1 && pid != std::process::id() {
+        // SAFETY: `kill` only sends a signal. The pid was found under a
+        // test's own folder or in its owner record a moment ago, and 0, 1 and
+        // this process are refused above.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Kill the pid the owner record under `dir` names, the fallback when no scan
+/// can run. Some tests write a fake record (another process's pid, or this
+/// test's own), which [`kill_hard`] refuses for this process.
+#[cfg(unix)]
+fn kill_record_pid(dir: &Path) {
+    let record = dir.join("state/crystalline/service.json");
+    if let Some(pid) = std::fs::read_to_string(record)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("pid").and_then(serde_json::Value::as_u64))
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        kill_hard(pid);
+    }
+}
+
+/// The guard every test folder that a daemon may run in holds: dropped, it
+/// stops every process still running under the folder (a daemon a test left
+/// behind, a bridge's successor, a background command), says in the test's
+/// output which ones it had to stop, and fails the test when one is still
+/// alive afterwards, unless the test is already failing (a panic inside a
+/// drop that runs during unwinding would abort the run).
+///
+/// Hold it next to the folder and drop it before the folder is removed: a
+/// daemon whose folder is deleted under it re-creates its state directory and
+/// runs on with no test to stop it, which is how the leaked
+/// `serve --daemon --autostarted` processes of 2026-11-04 came about.
+#[cfg(unix)]
+pub struct Leftovers(pub PathBuf);
+
+#[cfg(unix)]
+impl Leftovers {
+    /// Stop now rather than at the end of the scope. Consumes the guard, so
+    /// its drop does not run the stop a second time.
+    pub fn stop_now(self) {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let dir = std::mem::take(&mut this.0);
+        stop_leftovers(&dir);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Leftovers {
+    fn drop(&mut self) {
+        stop_leftovers(&self.0);
+    }
+}
+
+/// The work of [`Leftovers`]: stop, report and fail as its doc says.
+#[cfg(unix)]
+fn stop_leftovers(dir: &Path) {
+    let Stopped {
+        found,
+        left,
+        scanned,
+    } = stop_processes_under(dir, std::time::Duration::from_secs(10));
+    for (pid, command) in &found {
+        eprintln!(
+            "note: stopped pid {pid} still running under {}: {command}",
+            dir.display()
+        );
+    }
+    if !scanned && !std::thread::panicking() {
+        panic!(
+            "could not look for processes under {} (the scan did not run), so only the \
+             owner record's pid was stopped",
+            dir.display()
+        );
+    }
+    if !left.is_empty() && !std::thread::panicking() {
+        panic!(
+            "processes still running under {} after the test: {left:?}",
+            dir.display()
+        );
+    }
+}
+
+/// A temp home whose drop first stops every process still running under it
+/// ([`Leftovers`], on unix), then removes it. For a test that starts a daemon
+/// in a `tempfile` home and stops it with `ctl shutdown` at its end: a failing
+/// assert before that line would otherwise leave the daemon running.
+pub struct GuardedHome(tempfile::TempDir);
+
+impl GuardedHome {
+    pub fn new(dir: tempfile::TempDir) -> GuardedHome {
+        GuardedHome(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for GuardedHome {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        Leftovers(self.0.path().to_path_buf()).stop_now();
+    }
 }

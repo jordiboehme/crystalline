@@ -67,7 +67,13 @@ import {
 import { calloutMarkAt, mathAt, statusAt } from "./elementVerbs";
 import { frontmatterRegion } from "./frontmatterRegion";
 import type { MathBlock } from "./mathBlocks";
-import { escapedAt, mathBlocks, mathSections, unpadded } from "./mathBlocks";
+import {
+  escapedAt,
+  mathBlocks,
+  mathSections,
+  openMathFences,
+  unpadded,
+} from "./mathBlocks";
 import {
   hiddenMarkLayerOn,
   markModeChanged,
@@ -638,36 +644,45 @@ const inlinePreviews = ViewPlugin.fromClass(
 interface Scanned extends MathBlock {
   callout: CalloutKind | null;
   edge: string;
+  /**
+   * An unclosed `math` fence (D43): its text stays on the page whatever the
+   * caret does, and the formula is drawn after it instead of over it.
+   */
+  unclosed: boolean;
 }
 
 /** Every display formula of the text: a walk of the whole tree. */
 function scanBlocks(state: EditorState, sections: boolean): Scanned[] {
   const doc = state.doc;
-  return mathBlocks(state, sections)
-    .filter((block) => block.tex.trim() !== "")
-    .map((block) => {
-      const callout = calloutAt(state, block.from + 1);
-      const edge =
-        callout === null
-          ? ""
-          : [
-              doc.lineAt(block.from).number ===
-              doc.lineAt(callout.quote.from).number
-                ? "cm-callout-first"
-                : "",
-              doc.lineAt(block.to).number ===
-              doc.lineAt(callout.quote.to).number
-                ? "cm-callout-last"
-                : "",
-            ]
-              .join(" ")
-              .trim();
-      return { ...block, callout: callout?.callout ?? null, edge };
-    });
+  const scanned = (block: MathBlock, unclosed: boolean): Scanned => {
+    const callout = calloutAt(state, block.from + 1);
+    const edge =
+      callout === null
+        ? ""
+        : [
+            doc.lineAt(block.from).number ===
+            doc.lineAt(callout.quote.from).number
+              ? "cm-callout-first"
+              : "",
+            doc.lineAt(block.to).number === doc.lineAt(callout.quote.to).number
+              ? "cm-callout-last"
+              : "",
+          ]
+            .join(" ")
+            .trim();
+    return { ...block, callout: callout?.callout ?? null, edge, unclosed };
+  };
+  return [
+    ...mathBlocks(state, sections).map((block) => scanned(block, false)),
+    ...openMathFences(state, sections).map((block) => scanned(block, true)),
+  ].filter((block) => block.tex.trim() !== "");
 }
 
 /** Whether any line of a formula shows its source. */
 function blockShowsSource(state: EditorState, block: Scanned): boolean {
+  if (block.unclosed) {
+    return false;
+  }
   const first = state.doc.lineAt(block.from).number;
   const last = state.doc.lineAt(block.to).number;
   for (let number = first; number <= last; number += 1) {
@@ -686,19 +701,30 @@ function touchedKey(state: EditorState, blocks: Scanned[]): string {
     .join(",");
 }
 
-/** The formulas drawn: every scanned one the selection does not touch. */
+/**
+ * The formulas drawn: every scanned one the selection does not touch, over
+ * its source; an unclosed fence keeps its source and gets the formula after.
+ */
 function drawBlocks(state: EditorState, blocks: Scanned[]): DecorationSet {
   const touched = new Set(touchedKey(state, blocks).split(","));
   return Decoration.set(
     blocks
       .filter((_block, index) => !touched.has(String(index)))
-      .map((block) =>
-        Decoration.replace({
-          widget: new MathWidget(block.tex, true, block.callout, block.edge),
-          block: true,
-        }).range(block.from, block.to),
-      )
-      .sort((a, b) => a.from - b.from),
+      .map((block) => {
+        const widget = new MathWidget(
+          block.tex,
+          true,
+          block.callout,
+          block.edge,
+        );
+        return block.unclosed
+          ? Decoration.widget({ widget, block: true, side: 1 }).range(block.to)
+          : Decoration.replace({ widget, block: true }).range(
+              block.from,
+              block.to,
+            );
+      }),
+    true,
   );
 }
 

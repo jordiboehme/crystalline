@@ -1253,11 +1253,17 @@ pub struct Engine {
     // a `connect` landing later - in this process or a standalone CLI writing
     // the same keychain item - is picked up on the very next call.
     github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    // Personal tokens a status read did not find, and when: see
+    // `Engine::personal_token_for_report`.
+    github_tokens_missing: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     // One lock per account whose App user token is being refreshed, so two
     // shares that find it expiring refresh it once: GitHub spends a refresh
     // token on use, and a second exchange of the same one would be refused
     // and cost the person their token. See `Engine::personal_user_token`.
     personal_refresh: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Held across a personal token's check and save, and across a sweep's
+    /// delete, so a save that passed its check ends before a sweep looks.
+    token_writes: Arc<tokio::sync::Mutex<()>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -1637,6 +1643,13 @@ pub enum ShareActor {
     /// authenticate, so the transport carries no user auth and there is nobody
     /// to be: resolved through the `github.agent_identity` setting.
     HttpAgent,
+    /// A scheduled or headless reflect or evolve run with no account: the
+    /// machine's own work, not a person's. With a usable GitHub App and no
+    /// `github.share_identity` it goes through the App, so the bot authors it.
+    /// Otherwise it is [`ShareActor::Owner`]. Only
+    /// `Engine::automation_share` takes this actor: a person at the machine (the
+    /// CLI, the control socket, stdio MCP) is a person.
+    Machine,
 }
 
 /// What a removal knows about how much knowledge is at stake.
@@ -1839,12 +1852,20 @@ const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub 
 /// `--as`; its token alone is what its shares go out on.
 const PERSONAL_LINK_MISSING: &str = "This instance shares with personal GitHub identities through its GitHub App. Link yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal --as <account>' (without --as for this machine's owner), then share again.";
 
+/// [`PERSONAL_TOKEN_MISSING`] for a person, who shares from a session and may
+/// not be an admin: plain words and the fix, no command line.
+const PERSON_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in your profile, under GitHub identity, then share again.";
+
+/// [`PERSONAL_LINK_MISSING`] for a person: plain words and the fix, no command
+/// line.
+const PERSON_LINK_MISSING: &str = "This instance shares with personal GitHub identities. Link yours in your profile, under GitHub identity, then share again.";
+
 /// The refusal an HTTP-MCP write gets when this instance shares personally and
 /// no agent identity is configured. HTTP MCP carries no user auth, so there is
 /// nobody to resolve a credential for until an admin names the account those
 /// shares run as - which is what this message teaches, rather than reporting a
 /// missing token for an identity the caller never chose.
-const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured. Ask an admin to name the account agents share as, or share from Fluid or the CLI.";
 
 /// The [`TokenIdentity`] one account's personal credential lives under, or the
 /// teaching refusal for a name that cannot address a credential at all.
@@ -1872,6 +1893,9 @@ fn personal_identity(account: &str) -> Result<TokenIdentity> {
     Ok(TokenIdentity::Personal(account.to_string()))
 }
 
+/// How long a status read remembers that a personal token was not there.
+const TOKEN_MISSING_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The [`Engine::github_tokens`] cache key for one credential on one host.
 ///
 /// A unit separator joins the parts because an identity name can never contain
@@ -1893,7 +1917,7 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 ///
 /// Matched on the frozen text rather than on a variant of its own, because that
 /// text IS the distinguishing fact - [`PERSONAL_TOKEN_MISSING`] is produced at
-/// exactly one place ([`Engine::resolve_share_credential`]), its App
+/// exactly one place ([`Engine::resolve_share_credential_in`]), its App
 /// counterpart [`PERSONAL_LINK_MISSING`] only where an App user token is
 /// missing or gone (`Engine::personal_user_token`), and every other
 /// refusal a preview can meet (an unset agent identity, a name no credential can
@@ -1901,7 +1925,13 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 /// to keep standing for both kinds of caller.
 fn is_personal_token_missing(e: &EngineError) -> bool {
     matches!(e, EngineError::Remote(RemoteError::Refused(text))
-        if text == PERSONAL_TOKEN_MISSING || text == PERSONAL_LINK_MISSING)
+        if [
+            PERSONAL_TOKEN_MISSING,
+            PERSONAL_LINK_MISSING,
+            PERSON_TOKEN_MISSING,
+            PERSON_LINK_MISSING,
+        ]
+        .contains(&text.as_str()))
 }
 
 /// Turns a write failure on a PERSONAL credential into the teaching error that
@@ -1931,7 +1961,7 @@ fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> Remote
             "your GitHub account @{login} needs write access to {repo} - ask a maintainer to add you as a collaborator."
         )),
         RemoteError::AuthExpired => RemoteError::Refused(format!(
-            "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity (Fluid profile, or 'crystalline connect github --personal')."
+            "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity in your profile, or from the command line if you share from there."
         )),
         other => other,
     }
@@ -2522,7 +2552,9 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             github_tokens: Arc::default(),
+            github_tokens_missing: std::sync::Mutex::default(),
             personal_refresh: std::sync::Mutex::default(),
+            token_writes: Arc::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
@@ -4615,9 +4647,9 @@ impl Engine {
         self.config.read().unwrap().auth_mcp()
     }
 
-    /// Whose GitHub identity a share on this instance runs as, read live from
-    /// the effective config: `instance` (the default, one credential does
-    /// everything) or `personal` (the acting identity's own).
+    /// Whose GitHub identity a share on this instance runs as, read live:
+    /// `instance` (one credential does everything) or `personal` (the acting
+    /// identity's own). [`Engine::share_identity_effective`] says why.
     ///
     /// Public because it is a fact about the instance that surfaces branch on
     /// before they ever reach a credential - the REST share routes pick their
@@ -4625,7 +4657,7 @@ impl Engine {
     /// one that carries its own accountability), and Fluid renders a different
     /// share dialog.
     pub fn share_identity_mode(&self) -> ShareIdentityMode {
-        self.config.read().unwrap().github_share_identity()
+        self.share_identity_effective().mode
     }
 
     /// The open `subscriptions/listen` streams a moved tool list is announced
@@ -5956,9 +5988,17 @@ impl Engine {
             draft_of: Some(actor.to_string()),
             audience: None,
         }));
-        let warning = match crate::overlay_journal::journal_tombstone(
-            &state_dir, domain, actor, &desc.path,
-        ) {
+        let mirrored = if self
+            .deletion_shares_a_mirror(desc.domain_id, actor, &desc.path)
+            .await?
+        {
+            crate::overlay_journal::journal_tombstone_beside_a_draft(
+                &state_dir, domain, actor, &desc.path,
+            )
+        } else {
+            crate::overlay_journal::journal_tombstone(&state_dir, domain, actor, &desc.path)
+        };
+        let warning = match mirrored {
             Ok(()) => None,
             Err(e) => Some(unmirrored(domain, actor, &desc.path, &e, true)),
         };
@@ -5966,6 +6006,37 @@ impl Engine {
             tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
         }
         Ok(warning)
+    }
+
+    /// Whether this actor's deletion at `path` stands beside a draft of theirs at
+    /// another spelling of it. That draft may be mirrored in the very file `path`
+    /// names, where a folder-only case move leaves it on a disk that folds case,
+    /// and the mirror is the one copy a rebuild can bring it back from. So writing
+    /// or ending such a deletion touches its sidecar and nothing else.
+    pub(crate) async fn deletion_shares_a_mirror(
+        &self,
+        domain_id: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<bool> {
+        let store = self.store.lock().await;
+        let is_deletion = store
+            .overlay_entry(domain_id, actor, path)
+            .await?
+            .is_some_and(|entry| entry.tombstone);
+        if !is_deletion {
+            return Ok(false);
+        }
+        let folded = crystalline_core::fold_path_case(path);
+        Ok(store
+            .overlay_entries(domain_id, actor)
+            .await?
+            .iter()
+            .any(|entry| {
+                !entry.tombstone
+                    && entry.path != path
+                    && crystalline_core::fold_path_case(&entry.path) == folded
+            }))
     }
 
     /// The row half of both overlay writers, in one transaction: the row, its
@@ -6216,6 +6287,9 @@ impl Engine {
         }
         let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
         let addresses = pulled_addresses(&state_dir, &touched)?;
+        let base_paths: HashSet<String> = crystalline_remote::state::OriginState::load(&state_dir)?
+            .map(|state| state.files.into_keys().collect())
+            .unwrap_or_default();
 
         let mut cleared = 0u64;
         // The drafts this pass ended, announced when it ends or stops, collapsed.
@@ -6234,9 +6308,15 @@ impl Engine {
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths);
             for entry in entries {
                 let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
-                match settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own) {
+                let settled = if ended.contains(entry.path.as_str()) {
+                    Settle::Clear
+                } else {
+                    settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own)
+                };
+                match settled {
                     Settle::Leave => {}
                     Settle::Clear => {
                         view.drop(domain_id, &entry.path).await?;
@@ -7546,8 +7626,8 @@ mod evolve;
 mod fence;
 mod github;
 pub use github::{
-    LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP,
-    UNATTENDED_LINK,
+    GITHUB_OFF_PLAIN, LinkAppRefusal, LinkSetupReason, NO_CLIENT_SECRET_TO_LINK,
+    OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK, neutral_refusal_text, plain_refusal_text,
 };
 mod github_access;
 pub use github_access::{
@@ -7566,7 +7646,7 @@ mod move_;
 mod name_report;
 mod names;
 mod origins;
-pub use origins::READERS_REQUIRED;
+pub use origins::{READERS_REQUIRED, leave_out_for_non_admin};
 mod read;
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};
@@ -7584,6 +7664,7 @@ pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
 mod review_mode;
+pub(crate) use review_mode::folder_may_fold_case;
 mod schemas;
 mod search;
 mod sources;
@@ -7780,6 +7861,9 @@ pub struct GithubIdentity {
 /// whether the user token is still live, and the device flow's poll.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GithubLinkView {
+    /// Whose identity shares on this instance run on: `instance` or
+    /// `personal`, the mode in effect.
+    pub share_identity: String,
     /// Whether the account is linked.
     pub linked: bool,
     /// The GitHub login last seen for the linked id.
@@ -7884,6 +7968,17 @@ struct PendingConnect {
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
 }
 
+/// A flow whose record goes is stopped with it, on every path: a task left
+/// running would save its token later, under a name that may have changed hands
+/// by then.
+impl Drop for PendingConnect {
+    fn drop(&mut self) {
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
 impl PendingConnect {
     /// How many seconds of this code's life are left, saturating at 0. The
     /// one place the countdown is computed, so the MCP view and the REST one
@@ -7930,6 +8025,44 @@ struct TokenSavePlan {
     /// The engine's token cache, refreshed after a successful write so the
     /// next `github_credential` serves the new identity with no keychain read.
     cache: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    /// The account this write belongs to, for a person's credential on an
+    /// engine that keeps accounts. [`save_off_runtime`] asks it before the save.
+    owner: Option<TokenOwner>,
+    /// Held across the check and the save. See [`Engine::token_writes`].
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Which account a personal token write began for. The name alone says nothing:
+/// a name can be freed and made again while a sign-in or a renewal is running.
+#[derive(Clone)]
+struct TokenOwner {
+    access: Arc<crate::scope::DomainAccess>,
+    name: String,
+    /// [`crate::auth_store::AuthStore::account_born`] when the write began.
+    born: Option<String>,
+    /// The machine owner and an agent identity with no account: a name with no
+    /// account is right for them, as long as it stays that way.
+    no_account_is_right: bool,
+}
+
+impl TokenOwner {
+    /// Refuses unless the name still holds the account the write began for. A
+    /// read that fails refuses too: a token never lands on a guess.
+    async fn refuse_if_changed(&self) -> std::result::Result<(), RemoteError> {
+        let name = &self.name;
+        let now = self.access.account_born(name).await.map_err(|e| {
+            tracing::warn!("the account '{name}' could not be read before a token save: {e:#}");
+            RemoteError::Refused(format!(
+                "the account '{name}' could not be read, so this sign-in saved nothing"
+            ))
+        })?;
+        if now == self.born && (now.is_some() || self.no_account_is_right) {
+            return Ok(());
+        }
+        Err(RemoteError::Refused(format!(
+            "the account '{name}' no longer exists, so this sign-in saved nothing"
+        )))
+    }
 }
 
 /// Where a [`TokenSavePlan`] writes: a fixed file under a test override, or a
@@ -7966,24 +8099,81 @@ fn identity_label(identity: &TokenIdentity) -> String {
 /// unwrapped: the caller is a background flow whose whole job is to land an
 /// outcome, and a task that disappeared without one is exactly the silence
 /// this change exists to remove.
+///
+/// **The one place a token write is checked**, so every late writer meets it: a
+/// device flow, a link, a pasted token, a renewal. The gate is held across the
+/// check and the save and travels into the blocking closure, so a caller that is
+/// aborted in the middle does not let a sweep run beside a save that has started.
+///
+/// The check runs a second time after the save, for what the gate cannot see:
+/// `crystalline users remove` in another process. A token that lost that race is
+/// taken back out.
 async fn save_off_runtime(
     plan: TokenSavePlan,
     token: StoredToken,
 ) -> std::result::Result<(), RemoteError> {
+    let held = Arc::new(plan.gate.clone().lock_owned().await);
+    let owner = plan.owner.clone();
+    if let Some(owner) = &owner {
+        owner.refuse_if_changed().await?;
+    }
     // Where the token landed is only known after the write - `save_resolving`
     // falls through to the file store on its own - so the line is emitted
     // here, back on the runtime, rather than inside the blocking closure.
     // Both connect paths save through this function, so both get the line.
     let identity = identity_label(&plan.identity);
-    match tokio::task::spawn_blocking(move || plan.save(&token)).await {
+    let cache = plan.cache.clone();
+    let key = credential_cache_key(&plan.identity, plan.host.as_deref());
+    let written = token.access_token.clone();
+    let in_save = held.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        let _held = in_save;
+        plan.save(&token)
+    })
+    .await;
+    match saved {
         Ok(Ok(store)) => {
             tracing::info!(identity = %identity, store, "github token saved");
-            Ok(())
         }
-        Ok(Err(e)) => Err(e),
-        Err(e) => Err(RemoteError::Credential {
-            detail: format!("could not save the GitHub token: {e}"),
-        }),
+        Ok(Err(e)) => return Err(e),
+        Err(e) => {
+            return Err(RemoteError::Credential {
+                detail: format!("could not save the GitHub token: {e}"),
+            });
+        }
+    }
+    if let Some(owner) = &owner
+        && let Err(refused) = owner.refuse_if_changed().await
+    {
+        take_back_saved_token(cache, key, written).await;
+        return Err(refused);
+    }
+    drop(held);
+    Ok(())
+}
+
+/// Deletes a token [`save_off_runtime`] just saved for an account that went while
+/// it did, if the store still holds that token and not a later one.
+async fn take_back_saved_token(
+    cache: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    key: String,
+    written: String,
+) {
+    let Some(entry) = cache.lock().unwrap().remove(&key) else {
+        return;
+    };
+    let undone = tokio::task::spawn_blocking(move || {
+        let held = entry.store.load()?;
+        if held.is_some_and(|token| token.access_token == written) {
+            entry.store.delete()?;
+        }
+        Ok::<(), RemoteError>(())
+    })
+    .await;
+    if !matches!(undone, Ok(Ok(()))) {
+        tracing::warn!(
+            "a GitHub token saved for an account that went at the same moment could not be taken back; it is deleted when an account is next made under that name"
+        );
     }
 }
 
@@ -8761,34 +8951,34 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
     parse_engram(&source).ok()
 }
 
-/// A registered file domain's root, canonicalized. Falls back to the expanded
-/// (non-canonical) path when it no longer resolves, so a domain whose folder
-/// moved away still compares by its last-known path instead of silently
-/// dropping out of the comparison. A virtual domain has no path, so `None`.
 /// The [`Engine::write_locks`] key for a file: its canonical path wherever the
 /// filesystem can resolve one, so two spellings of one file - a symlinked
 /// domain root, a `..` segment, a case difference the filesystem folds - share
 /// a lock instead of each getting their own.
 ///
-/// A file that does not exist yet cannot be canonicalized, and a create is
-/// exactly that case, so the parent folder is resolved instead and the filename
-/// joined back on. When even the parent is missing (a create that will also
-/// make the folder) the path as given is the key: still stable, and still the
-/// same string for two creates racing on one target, since both derive it from
-/// the same registered root. The same fallback ladder
-/// [`canonicalized_file_path`] uses for a domain root, one level deeper.
+/// **One key from before the folder exists to after the file does.** A file
+/// not created yet is spelled as its nearest existing ancestor, canonicalized,
+/// with the rest appended ([`crate::rename::canonical_path`]). The key must not
+/// change while a create runs: the first writer makes the missing folders while
+/// it holds the lock, so a second writer asks for the lock in that moment, and
+/// a different key would hand it a mutex of its own. Both would then find the
+/// path free and both would write. A relative path is made absolute first, so
+/// it does not change once it can be resolved.
+///
+/// What stays as spelled is the part that does not exist yet: on a filesystem
+/// that folds case, `assets/a.png` and `assets/A.png` have two keys until one
+/// of them is created.
 fn lock_key(abs: &Path) -> String {
-    if let Ok(canonical) = std::fs::canonicalize(abs) {
-        return canonical.to_string_lossy().into_owned();
-    }
-    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name())
-        && let Ok(canonical) = std::fs::canonicalize(parent)
-    {
-        return canonical.join(name).to_string_lossy().into_owned();
-    }
-    abs.to_string_lossy().into_owned()
+    let absolute = std::path::absolute(abs);
+    crate::rename::canonical_path(absolute.as_deref().unwrap_or(abs))
+        .to_string_lossy()
+        .into_owned()
 }
 
+/// A registered file domain's root, canonicalized. Falls back to the expanded
+/// (non-canonical) path when it no longer resolves, so a domain whose folder
+/// moved away still compares by its last-known path instead of silently
+/// dropping out of the comparison. A virtual domain has no path, so `None`.
 fn canonicalized_file_path(entry: &DomainEntry) -> Option<PathBuf> {
     crystalline_core::config::registration::canonical_root(entry)
 }
@@ -8915,7 +9105,7 @@ impl Drop for AudienceHold<'_> {
 fn share_actor_label(actor: &ShareActor) -> Option<String> {
     match actor {
         ShareActor::Account(name) => Some(name.clone()),
-        ShareActor::Owner | ShareActor::HttpAgent => None,
+        ShareActor::Owner | ShareActor::HttpAgent | ShareActor::Machine => None,
     }
 }
 
@@ -10325,6 +10515,50 @@ fn settle_overlay_entry(
     }
 }
 
+/// The tombstones that end with their draft: the deletion half of a case-only
+/// move whose text the base has caught up with.
+///
+/// On a disk that folds case the base copy of `plan.md` also answers to
+/// `Plan.md`, so a draft at `Plan.md` is found equal once a share has landed its
+/// text, and its row is cleared. The tombstone at `plan.md` was half of the same
+/// move, and left standing alone it says the opposite of what the person did:
+/// it hides the file from them and their next share proposes the deletion.
+///
+/// `base_paths` is what tells this from two real files: the draft's own spelling
+/// must not be in the snapshot, and the tombstone's must. On a disk that keeps
+/// `Note.md` and `note.md` apart this finds nothing.
+fn tombstones_of_settled_case_moves<'a>(
+    entries: &'a [StoredEngram],
+    state_dir: &Path,
+    base_paths: &HashSet<String>,
+) -> HashSet<&'a str> {
+    // A base copy that cannot be read settles nothing here. This look runs ahead
+    // of the pass, so failing here would stop it before it ended a single draft;
+    // the pass reaches that copy in its own turn and stops there, with what it
+    // already ended announced.
+    let mut settled = HashSet::new();
+    for draft in entries.iter().filter(|entry| !entry.tombstone) {
+        if !base_paths.contains(&draft.path)
+            && crystalline_remote::state::read_base_file(state_dir, &draft.path)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(draft.content.as_bytes())
+        {
+            settled.insert(crystalline_core::fold_path_case(&draft.path));
+        }
+    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.tombstone
+                && base_paths.contains(&entry.path)
+                && settled.contains(&crystalline_core::fold_path_case(&entry.path))
+        })
+        .map(|entry| entry.path.as_str())
+        .collect()
+}
+
 /// What one pull leaves one overlay FILE to be. Pure, beside
 /// [`settle_overlay_entry`] and answering the same four-way question with the
 /// two arms that cannot apply to a file left out.
@@ -10905,6 +11139,93 @@ mod lock_tests {
             Err(other) => panic!("expected a conflict, got {other}"),
             Ok(_) => panic!("a write into a name nobody registers was counted"),
         }
+    }
+
+    /// Asks for the lock of `abs` before each missing folder above it is made,
+    /// after each one and after the file itself, and wants one lock throughout.
+    /// A writer makes the folders while it holds the lock, so a second writer
+    /// asks in the middle of this, and a different answer there means two
+    /// writers each holding a lock of their own over one file.
+    async fn assert_one_lock_while_folders_appear(abs: &Path, stop: &Path) {
+        let engine = engine_with_domains(&["known"]).await;
+        let first = engine.write_lock(abs);
+        let mut missing: Vec<&Path> = abs
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| *dir != stop)
+            .collect();
+        missing.reverse();
+        assert!(missing.len() > 1, "more than one folder to make: {abs:?}");
+        for dir in missing {
+            std::fs::create_dir(dir).unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &engine.write_lock(abs)),
+                "making {dir:?} moved the lock of {abs:?}"
+            );
+        }
+        std::fs::write(abs, "x").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &engine.write_lock(abs)),
+            "writing {abs:?} moved its lock"
+        );
+        assert_eq!(engine.write_locks.lock().unwrap().len(), 1);
+    }
+
+    /// A temp folder as the system names it, on every platform: on Windows a
+    /// canonical path carries the verbatim prefix this one lacks, and on macOS
+    /// the temp folder stands behind the `/var` link. On Linux the two spellings
+    /// are usually one, so the symlinked test below is the one that bites there.
+    #[tokio::test]
+    async fn a_lock_stays_one_lock_while_its_folders_appear() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_one_lock_while_folders_appear(&tmp.path().join("assets/a/b/x.png"), tmp.path())
+            .await;
+    }
+
+    /// The same through a symlink above the missing folders, which is the shape
+    /// that makes the raw and the canonical spelling differ on every Unix.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lock_stays_one_lock_while_its_folders_appear_under_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert_one_lock_while_folders_appear(&linked.join("assets/a/b/x.png"), &linked).await;
+    }
+
+    /// A root written as a relative path resolves against the working folder
+    /// from the first ask on, so it does not move either.
+    #[tokio::test]
+    async fn a_lock_on_a_relative_path_stays_one_lock_while_its_folders_appear() {
+        let tmp = tempfile::Builder::new()
+            .prefix(".lock-key-probe")
+            .tempdir_in(".")
+            .unwrap();
+        let relative = Path::new(tmp.path().file_name().unwrap());
+        assert_one_lock_while_folders_appear(&relative.join("assets/a/b/x.png"), relative).await;
+    }
+
+    /// Where the filesystem folds case, a folder on disk spelled differently
+    /// from the path asked for still gives one lock before and after the file
+    /// exists. Says so and returns where case does not fold.
+    #[tokio::test]
+    async fn a_lock_follows_the_folder_spelling_on_a_folding_filesystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("Assets")).unwrap();
+        if !tmp.path().join("assets").exists() {
+            eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+            return;
+        }
+        let engine = engine_with_domains(&["known"]).await;
+        let lower = tmp.path().join("assets/x.png");
+        let upper = tmp.path().join("Assets/x.png");
+        let unborn = engine.write_lock(&lower);
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&upper)));
+        std::fs::write(&lower, "x").unwrap();
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&lower)));
+        assert!(Arc::ptr_eq(&unborn, &engine.write_lock(&upper)));
     }
 
     /// One lock per file, whoever asks for it.
@@ -12207,11 +12528,52 @@ mod share_actor_tests {
         let err = engine
             .resolve_share_credential(&ShareActor::HttpAgent)
             .expect_err("no agent identity is configured");
-        assert_eq!(
-            err.to_string(),
-            "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI."
-        );
-        assert!(err.to_string().contains("github.agent_identity"), "{err}");
+        assert_eq!(err.to_string(), AGENT_IDENTITY_UNSET);
+        assert!(!err.to_string().contains("github."), "{err}");
+    }
+
+    /// Every sentence that holds a command line, a setting or a host has plain
+    /// words, and none of them holds any of those.
+    #[test]
+    fn every_refusal_with_admin_detail_has_plain_words() {
+        for text in [
+            github_app::KEYCHAIN_REFUSAL.to_string(),
+            format!("{} (the keychain is locked)", github_app::KEYCHAIN_REFUSAL),
+            RemoteError::AppCredential(
+                "the saved App belongs to github.com but github.api_url points at 10.0.0.1"
+                    .to_string(),
+            )
+            .to_string(),
+            NO_CLIENT_SECRET_TO_LINK.to_string(),
+            RemoteError::NotEnabled.to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            }
+            .to_string(),
+            PERSONAL_TOKEN_MISSING.to_string(),
+            PERSONAL_LINK_MISSING.to_string(),
+            reflection::hosted_refusal("alpha").to_string(),
+        ] {
+            let plain =
+                plain_refusal_text(&text).unwrap_or_else(|| panic!("no plain words: {text}"));
+            for detail in [
+                "crystalline ",
+                "github.",
+                "service.",
+                "CRYSTALLINE_",
+                "10.0.0.1",
+            ] {
+                assert!(!plain.contains(detail), "{plain}");
+            }
+            // The neutral words are read by an admin too, so none says to ask one.
+            let neutral =
+                neutral_refusal_text(&text).unwrap_or_else(|| panic!("no neutral words: {text}"));
+            assert!(!neutral.contains("Ask an admin"), "{neutral}");
+            assert!(!neutral.contains("crystalline "), "{neutral}");
+        }
+        assert_eq!(plain_refusal_text("the domain is not there"), None);
+        assert_eq!(neutral_refusal_text("the domain is not there"), None);
     }
 
     /// With one configured, the agent writes as that account's connected
@@ -12375,7 +12737,7 @@ mod share_actor_tests {
         // and this slice stops being its body - so move the pattern with it.
         let body = &rest[..rest.find("\n    }").unwrap_or(rest.len())];
         assert!(
-            body.contains("self.resolve_share_credential(actor)?"),
+            body.contains(".resolve_share_credential_in(actor, effective.mode)"),
             "the provider resolves the same credential: {body}"
         );
         assert!(
@@ -12485,10 +12847,10 @@ mod share_actor_tests {
             err.to_string().contains("reconnect your GitHub identity"),
             "{err}"
         );
+        assert!(err.to_string().contains("in your profile"), "{err}");
         assert!(
-            err.to_string()
-                .contains("crystalline connect github --personal"),
-            "{err}"
+            !err.to_string().contains("crystalline "),
+            "a person may not be an admin: {err}"
         );
     }
 
@@ -12537,6 +12899,11 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
+        // A status remembers a missing token for a moment; the CLI tells the
+        // daemon when it writes one.
+        engine
+            .forget_cached_credential(Some(OWNER_IDENTITY_NAME))
+            .unwrap();
         let status = engine
             .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await
@@ -12594,6 +12961,7 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
+        engine.forget_cached_credential(Some("share-bot")).unwrap();
         let status = engine
             .origin_status(None, false, false, &crate::scope::Scope::Unrestricted)
             .await

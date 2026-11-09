@@ -16,6 +16,14 @@
  * an HTML `style`, `xmp` and the like, which is why nothing under a
  * `foreignObject` is touched, and an SVG `style` or `script` is left alone too.
  *
+ * Mermaid also wraps a long word with no space by its measured width, and it
+ * measures the form, so a row of an arrow's label can end inside one: `a&` and
+ * `quot;a`. `rejoinSplitForms` puts such a form back on one row before the decode
+ * (R59). The drawing cannot tell this from a person's own line break between `a&`
+ * and `quot;` on rows as long as a wrapped one, or from a wrap at a space there. It
+ * reads those as one form too, which needs a `&` and a whole known name exactly at
+ * a row's end, so it is accepted. A short row is never read so.
+ *
  * A cost, accepted (R45): by this point a double-escaped form is the same text
  * as a plain one. `&amp;quot;` and `#quot;` both arrive as `&quot;`, so both draw
  * `"`, and a label written the HTML way to show the text `&quot;` shows the
@@ -91,9 +99,97 @@ function isDrawnText(parent: Element | null): boolean {
   );
 }
 
+/** The start of a form at a row's end: `&`, `&qu`, `&#`, `&#12`. */
+const FORM_START = /&(#?\w*)$/;
+/** The rest of a form at a row's start: `quot;`, `ot;`, `#58;`, `26;`. */
+const FORM_REST = /^(#?\w*);/;
 /**
- * `svg` with the entity forms in its drawn text decoded, one pass per text
- * node (see the file header for what counts as drawn text). Styles, attributes,
+ * A row shorter than this was not wrapped, so its end is a person's own line break.
+ * Mermaid wraps at 200 px: about 22 characters here, and no glyph of the label font
+ * is wide enough to reach that in 10.
+ */
+const SHORTEST_WRAPPED_ROW = 10;
+
+/** The text nodes of `row` that are drawn text, in order. */
+function drawnTextNodes(doc: Document, row: Element): Node[] {
+  const nodes: Node[] = [];
+  const walker = doc.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    nodes.push(node);
+  }
+  return nodes;
+}
+
+/** Takes an emptied node's word out, and the row with it if nothing is left. */
+function removeEmptied(node: Node, row: Element): void {
+  let element: Element | null = node.parentElement;
+  node.parentNode?.removeChild(node);
+  while (element && element !== row && element.childNodes.length === 0) {
+    const parent = element.parentElement;
+    element.remove();
+    element = parent;
+  }
+  if (row.textContent === "") {
+    row.remove();
+  }
+}
+
+/**
+ * Puts each entity form mermaid's wrapping split across two rows of the label
+ * `text` back on the first row, where the decode finds it. Only when the two pieces
+ * make a form `entityText` knows, and only in drawn text. Whether anything changed.
+ */
+function rejoinSplitForms(doc: Document, text: Element): boolean {
+  let changed = false;
+  const rows = Array.from(text.children).filter(
+    (row) => row.namespaceURI === SVG_NAMESPACE,
+  );
+  for (let i = 0; i + 1 < rows.length; i++) {
+    const row = rows[i];
+    const next = rows[i + 1];
+    if (row === undefined || next === undefined) {
+      continue;
+    }
+    const tail = drawnTextNodes(doc, row).at(-1);
+    const head = drawnTextNodes(doc, next)[0];
+    if (
+      tail === undefined ||
+      head === undefined ||
+      !isDrawnText(tail.parentElement) ||
+      !isDrawnText(head.parentElement) ||
+      (row.textContent ?? "").length < SHORTEST_WRAPPED_ROW
+    ) {
+      continue;
+    }
+    const start = FORM_START.exec(tail.textContent ?? "");
+    const rest = FORM_REST.exec(head.textContent ?? "");
+    if (start === null || rest === null) {
+      continue;
+    }
+    const name = `${start[1] ?? ""}${rest[1] ?? ""}`;
+    if (!/^(?:#\d+|\w+)$/.test(name) || entityText(name) === null) {
+      continue;
+    }
+    tail.textContent = `${tail.textContent ?? ""}${rest[0]}`;
+    const left = (head.textContent ?? "").slice(rest[0].length);
+    changed = true;
+    if (left !== "") {
+      head.textContent = left;
+      continue;
+    }
+    removeEmptied(head, next);
+    // The word that now starts the row brought the space that stood before it.
+    const first = drawnTextNodes(doc, next)[0];
+    if (first !== undefined && isDrawnText(first.parentElement)) {
+      first.textContent = (first.textContent ?? "").trimStart();
+    }
+  }
+  return changed;
+}
+
+/**
+ * `svg` with the forms a wrap split put back together and the entity forms in its
+ * drawn text decoded, one pass per text node (see the file header for what counts as drawn text). Styles, attributes,
  * titles and foreign objects stay as they are. An svg with nothing to decode
  * comes back as the same string.
  */
@@ -112,6 +208,7 @@ export function drawnLabels(svg: string): string {
     if (text.namespaceURI !== SVG_NAMESPACE) {
       continue;
     }
+    changed = rejoinSplitForms(doc, text) || changed;
     const walker = doc.createTreeWalker(text, NodeFilter.SHOW_TEXT);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) {
       if (!isDrawnText(node.parentElement)) {

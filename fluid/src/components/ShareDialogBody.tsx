@@ -535,6 +535,11 @@ export default function ShareDialogBody({
                   {outcome.marker}
                 </p>
               )}
+              {outcome.spelling != null && (
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  {outcome.spelling}
+                </p>
+              )}
               {problem !== null && (
                 <p role="alert" className={ALERT_CLASSES}>
                   {problem}
@@ -673,6 +678,11 @@ export default function ShareDialogBody({
                     : amendLine(amending, chosenLayersAbove)
                   : "This share could not be planned."}
               </Dialog.Description>
+              {plan.data?.spellingNote != null && (
+                <p className="text-caption text-slate-500 dark:text-slate-400">
+                  {plan.data.spellingNote}
+                </p>
+              )}
               {amending !== null && (
                 // The one thing somebody amending a layer has to know, and it
                 // is general rather than a list of paths: the engine knows
@@ -868,7 +878,7 @@ export default function ShareDialogBody({
                     plan above stays exactly as it is, because reading it
                     needed nobody's credential. */}
                 {identity.mustConnect ? (
-                  <ConnectToShare />
+                  <ConnectToShare onLeave={onClose} />
                 ) : (
                   <button
                     type="submit"
@@ -969,7 +979,10 @@ function actionLine(plan: SharePlan | null): string {
         ? "Sharing amends the open proposal."
         : amendLine(number, layersAbove);
     case "nothing_to_share":
-      return "Nothing to share: the team already has all of this.";
+      // Not "has all of this" when a change of letter case will not travel.
+      return plan?.spellingNote != null
+        ? "Nothing to share."
+        : "Nothing to share: the team already has all of this.";
     case "conflicts_pending":
       // With the number when the report carried one: how much is waiting is
       // the difference between settling it now and coming back later.
@@ -1049,6 +1062,8 @@ interface OutcomeSentence {
    * in the MANIFEST) and why, when it added one.
    */
   marker?: string | null;
+  /** The server's sentence when a change of letter case did not travel. */
+  spelling?: string | null;
   /**
    * Whether the refusal offers the same share as a proposal: a direct
    * commit the branch refused, answered with `fallback: "proposal"`.
@@ -1125,12 +1140,15 @@ function numberSentence(
 function describeOutcome(result: unknown): OutcomeSentence {
   const sentence = describeShareOutcome(result);
   const marker = readTeamMarker(asObject(result)?.team_marker);
-  return marker === null
-    ? sentence
-    : {
-        ...sentence,
-        marker: `${marker.path} went with this share: it ${marker.reason}.`,
-      };
+  return {
+    ...sentence,
+    spelling: asString(asObject(result)?.spelling_note),
+    ...(marker === null
+      ? {}
+      : {
+          marker: `${marker.path} went with this share: it ${marker.reason}.`,
+        }),
+  };
 }
 
 /** {@link describeOutcome} without the team marker line. */
@@ -1161,7 +1179,9 @@ function describeShareOutcome(result: unknown): OutcomeSentence {
       };
     case "nothing_to_share":
       return plainSentence(
-        "Nothing to share: the team already has all of this.",
+        asString(record?.spelling_note) === null
+          ? "Nothing to share: the team already has all of this."
+          : "Nothing to share.",
       );
     case "conflicts_pending":
       return plainSentence(

@@ -79,7 +79,12 @@ impl Env {
             // Windows never asks the real Task Scheduler.
             .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
             // And the model hub is unreachable (`crate::common::NO_HUB`).
-            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB);
+            .env(crate::common::HUB_ENDPOINT_VAR, crate::common::NO_HUB)
+            // And a daemon started here stops once this test process is gone.
+            .env(
+                crate::common::TEST_PARENT_PID_VAR,
+                crate::common::parent_pid(),
+            );
     }
 
     fn info_path(&self) -> PathBuf {
@@ -101,6 +106,9 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
+        // A daemon spawned here dies on the lock the test holds, so nothing
+        // should be left; the guard stops and reports one that is.
+        crate::common::Leftovers(self.dir.clone()).stop_now();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

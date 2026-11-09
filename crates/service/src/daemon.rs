@@ -85,7 +85,7 @@ const COPYRIGHT_LINE: &str = concat!(
 /// does, so the two spellings cannot drift apart unnoticed.
 pub const COPYRIGHT_HOLDER: &str = "Copyright (C) 2026 Jordi Böhme";
 
-pub use crate::overlay::PARK_BLOCKING_ENV;
+pub use crate::overlay::{PARK_BLOCKING_ENV, TEST_PARENT_PID_ENV};
 
 /// How long a daemon parks one `spawn_blocking` task at startup, from
 /// [`PARK_BLOCKING_ENV`], or `None`.
@@ -109,6 +109,49 @@ fn parked_blocking_task() -> Option<Duration> {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
+}
+
+/// How often a debug daemon checks that its test parent is still there.
+#[cfg(debug_assertions)]
+const TEST_PARENT_POLL: Duration = Duration::from_secs(1);
+
+/// The reason a debug daemon gives when its test parent is gone.
+#[cfg(debug_assertions)]
+const TEST_PARENT_GONE: &str = "the test process that started it ended";
+
+/// Resolve once the process [`TEST_PARENT_PID_ENV`] names no longer exists,
+/// and never when the variable is unset, empty or not a pid.
+///
+/// A test-only seam, named `TEST` for the same reason as
+/// [`PARK_BLOCKING_ENV`]. A test stops the daemons it started in its drop,
+/// but a test process killed outright (a nextest timeout) runs no drop, and
+/// its daemon ran on for days. Every test child carries the test's own pid,
+/// a bridge passes it on to the daemon it starts through the environment it
+/// inherits, and the daemon then leaves the way it does on `SIGTERM`. Only a
+/// debug build has the read; in a release build this never resolves.
+#[cfg(debug_assertions)]
+async fn test_parent_gone() -> &'static str {
+    let parent = std::env::var(TEST_PARENT_PID_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        // 0 and 1 are never a test process, and a value above i32::MAX
+        // would wrap to a negative pid, which names a process group.
+        .filter(|pid| (2..=i32::MAX as u32).contains(pid));
+    let Some(parent) = parent else {
+        return futures::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(TEST_PARENT_POLL).await;
+        if !crate::instance::process_alive(parent) {
+            return TEST_PARENT_GONE;
+        }
+    }
+}
+
+/// The release build's twin of the seam above: it never resolves.
+#[cfg(not(debug_assertions))]
+async fn test_parent_gone() -> &'static str {
+    futures::future::pending().await
 }
 
 /// A tracked live session.
@@ -605,7 +648,8 @@ pub async fn run_serve(
     // it opens is dropped inside, so `setup_token_for`'s own open is the only
     // handle left. A refused configuration fails the start here, with a
     // sentence that never carries the password.
-    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
+    let created_admin =
+        crate::first_admin::seed_from_environment(accounts_db.as_deref(), &engine).await?;
     let setup_token = match http_addr.as_deref() {
         Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
@@ -654,7 +698,7 @@ pub async fn run_serve(
                 }
             }
         }
-        if let Some(line) = &created_admin {
+        if let Some(crate::first_admin::CreatedAdmin { line, .. }) = &created_admin {
             eprintln!("{line}");
         }
         if read_only {
@@ -666,7 +710,7 @@ pub async fn run_serve(
             );
         }
     } else {
-        if let Some(line) = &created_admin {
+        if let Some(crate::first_admin::CreatedAdmin { line, .. }) = &created_admin {
             tracing::info!("{line}");
         }
         if let (Some(addr), Some(drawn)) = (&http_addr, &setup_token) {
@@ -926,6 +970,7 @@ pub async fn run_serve(
 
     let reason = tokio::select! {
         signal = wait_signal() => signal,
+        gone = test_parent_gone() => gone,
         _ = shared.wait_shutdown() => shared.shutdown_reason(),
     };
     shared.trigger_shutdown(reason);

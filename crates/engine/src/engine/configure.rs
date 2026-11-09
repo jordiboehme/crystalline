@@ -19,8 +19,13 @@ impl Engine {
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
-                let file = self.file_config.read().unwrap();
-                Ok(json!({ "settings": settings::snapshot(&file, &self.overlay) }))
+                let views = {
+                    let file = self.file_config.read().unwrap();
+                    settings::snapshot(&file, &self.overlay)
+                };
+                let views =
+                    settings::with_effective_share_identity(views, self.share_identity_effective());
+                Ok(json!({ "settings": views }))
             }
             ConfigureAction::Set { key, value } => {
                 if self.read_only {
@@ -117,19 +122,25 @@ impl Engine {
     /// already been validated against the registry by `apply`/`unset`, so it is
     /// always found.
     fn setting_view_json(&self, file: &GlobalConfig, key: &str) -> Value {
-        settings::snapshot(file, &self.overlay)
-            .into_iter()
-            .find(|v| v.key == key)
-            .map(|v| {
-                let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
-                if let Some(note) = settings::change_note(key, &self.overlay)
-                    && let Value::Object(map) = &mut value
-                {
-                    map.insert("note".to_string(), Value::String(note));
-                }
-                value
-            })
-            .unwrap_or(Value::Null)
+        // The config moves only after this answers, so the mode is worked out
+        // from the file being saved.
+        let setting = self.overlay.apply(file).github_share_identity_setting();
+        settings::with_effective_share_identity(
+            settings::snapshot(file, &self.overlay),
+            self.share_identity_given(setting),
+        )
+        .into_iter()
+        .find(|v| v.key == key)
+        .map(|v| {
+            let mut value = serde_json::to_value(v).unwrap_or(Value::Null);
+            if let Some(note) = settings::change_note(key, &self.overlay)
+                && let Value::Object(map) = &mut value
+            {
+                map.insert("note".to_string(), Value::String(note));
+            }
+            value
+        })
+        .unwrap_or(Value::Null)
     }
 
     /// The file config a mutation starts from, read under the `file_config`

@@ -1298,6 +1298,40 @@ describe("the share dialog", () => {
     expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
   });
 
+  it("offers the link fix to an unlinked person when the mode is the default and the plan is closed", async () => {
+    const refusal =
+      "You have not linked your GitHub account yet. GitHub decides who may change this domain, so link yours in your profile, under GitHub identity.";
+    serve({
+      // No `owner_identity`: the server sends that to an admin only.
+      "/domains/eng/sync": () =>
+        syncResponse({
+          may_share: false,
+          connection: {
+            connected: true,
+            user: null,
+            token_store: "keyring",
+            share_identity: "personal",
+            share_identity_default: true,
+          },
+        }),
+      "/me/github-identity": () => identityPayload(),
+      "/domains/eng/sync/changes": () => {
+        throw new ApiProblem(403, "forbidden", refusal);
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(await within(dialog).findByText(refusal)).toBeInTheDocument();
+    const fix = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(fix).toHaveAttribute("href", "/profile");
+    expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
+    expect(dialog.textContent).not.toMatch(/crystalline |share_identity/);
+  });
+
   it("names the identity a share would go out on", async () => {
     serve({
       "/domains/eng/sync": () =>
@@ -2234,6 +2268,54 @@ describe("seeing and discarding changes from the dialog", () => {
         "Nothing to share: the team already has all of this.",
       ),
     ).toBeVisible();
+  });
+
+  it("says a change of letter case did not travel, before and after the share", async () => {
+    const note = "A share does not carry a change of letter case.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "nothing_to_share",
+        effective_title: "",
+        changes: [],
+        spelling_note: note,
+      }),
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      await within(dialog).findByText("Nothing to share."),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText(note)).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText(/the team already has all of this/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("names the spelling that did not travel in a share's outcome", async () => {
+    const note = "A share does not carry a change of letter case.";
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "Plan.md", kind: "modified" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              url: "https://github.com/acme/knowledge/pull/4",
+              number: 4,
+              spelling_note: note,
+            }
+          : null,
+    });
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await within(dialog).findByText("Plan.md");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    expect(await within(dialog).findByText(note)).toBeInTheDocument();
   });
 
   it("has no discard controls on a read-only instance", async () => {

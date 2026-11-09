@@ -26,6 +26,7 @@ import {
   Copy,
   Download,
   FileCode,
+  FileImage,
   Maximize2,
   Minimize2,
   RotateCcw,
@@ -38,7 +39,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent, ReactElement, RefObject } from "react";
 import { createPortal } from "react-dom";
 
-import { diagramFileName, saveBlob } from "./downloads";
+import { diagramFileName, PNG_FAILED, saveBlob } from "./downloads";
 import { FOCUS_RING } from "./primitives";
 
 /**
@@ -52,6 +53,9 @@ const ARROW_STEP_PX = 40;
 
 /** How long the copy confirmation stays up, matching `EngramActions`. */
 const CONFIRMED_FOR_MS = 2000;
+
+/** How long a sentence stays up that has to be read rather than glanced at. */
+const EXPLAINED_FOR_MS = 12_000;
 
 /**
  * Whether the browser is showing something fullscreen right now.
@@ -157,10 +161,13 @@ export default function DiagramOverlay({
   const instanceRef = useRef<PanzoomObject | null>(null);
   const pressedAt = useRef<{ x: number; y: number } | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
-  // What the copy control has to say for itself, and nothing else: a clipboard
-  // write is the one action in this bar with an outcome the screen does not
-  // already show.
-  const [said, setSaid] = useState<string | null>(null);
+  // What a control has to say for itself, and nothing else: a clipboard write
+  // and a PNG are the actions in this bar with an outcome the screen does not
+  // already show. No time means it stays until the work behind it is done.
+  const [said, setSaid] = useState<{ text: string; forMs?: number } | null>(
+    null,
+  );
+  const makingPng = useRef(false);
 
   // Read at render rather than remembered: a browser that has no element
   // fullscreen must not be offered a button that would do nothing, and jsdom
@@ -276,14 +283,14 @@ export default function DiagramOverlay({
   }, [fit, shown]);
 
   // The confirmation clears itself, the same two seconds the engram page's
-  // own copy gives its announcement.
+  // own copy gives its announcement, or long enough to read a whole sentence.
   useEffect(() => {
-    if (said === null) {
+    if (said?.forMs === undefined) {
       return;
     }
     const timer = setTimeout(() => {
       setSaid(null);
-    }, CONFIRMED_FOR_MS);
+    }, said.forMs);
     return () => {
       clearTimeout(timer);
     };
@@ -333,6 +340,44 @@ export default function DiagramOverlay({
       return;
     }
     void overlayRef.current?.requestFullscreen().catch(() => undefined);
+  }, []);
+
+  /**
+   * The drawing as a PNG, read from what is on screen. The code for it comes
+   * on the click, so a reader who never asks for one never downloads it. One
+   * at a time: a large diagram takes a moment, and a second press would only
+   * make a second file.
+   */
+  const downloadPng = useCallback(async (source: string, name?: string) => {
+    if (makingPng.current) {
+      return;
+    }
+    makingPng.current = true;
+    setSaid({ text: "Making the PNG" });
+    try {
+      const host = hostRef.current;
+      const drawing = host?.querySelector("svg") ?? null;
+      const natural = host === null ? null : naturalSize(host);
+      const stage = overlayRef.current;
+      if (drawing === null || natural === null || stage === null) {
+        setSaid({ text: PNG_FAILED, forMs: EXPLAINED_FOR_MS });
+        return;
+      }
+      const { exportDiagramPng } = await import("./diagramPng");
+      const { blob, note } = await exportDiagramPng({
+        drawing,
+        natural,
+        background: window.getComputedStyle(stage).backgroundColor,
+      });
+      if (blob !== null) {
+        saveBlob(blob, diagramFileName(name, source, "png"));
+      }
+      setSaid(note === null ? null : { text: note, forMs: EXPLAINED_FOR_MS });
+    } catch {
+      setSaid({ text: PNG_FAILED, forMs: EXPLAINED_FOR_MS });
+    } finally {
+      makingPng.current = false;
+    }
   }, []);
 
   const onKeyDown = useCallback(
@@ -469,18 +514,19 @@ export default function DiagramOverlay({
       className="fixed inset-0 z-50 flex flex-col bg-white dark:bg-slate-950"
       onKeyDown={onKeyDown}
     >
-      <div className="flex shrink-0 items-center justify-end gap-1 border-b border-slate-200 px-2 py-1 dark:border-slate-800">
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-1 border-b border-slate-200 px-2 py-1 dark:border-slate-800">
         {/*
           In the document from the start and empty, so the text arriving in it
           is what gets read out, and first in the bar so the buttons this bar
-          right-aligns keep their places while it says something.
+          right-aligns keep their places while it says something. On a phone a
+          sentence has no room beside them, so it takes a row of its own.
         */}
         <span
           role="status"
           aria-live="polite"
-          className="text-caption text-slate-500 dark:text-slate-400"
+          className="min-w-0 text-caption text-slate-500 max-sm:not-empty:basis-full dark:text-slate-400"
         >
-          {said ?? ""}
+          {said?.text ?? ""}
         </span>
         {content.kind === "diagram" ? (
           <>
@@ -497,9 +543,9 @@ export default function DiagramOverlay({
                   // control wraps its call.
                   try {
                     await navigator.clipboard.writeText(content.source);
-                    setSaid("Copied");
+                    setSaid({ text: "Copied", forMs: CONFIRMED_FOR_MS });
                   } catch {
-                    setSaid("Copy refused");
+                    setSaid({ text: "Copy refused", forMs: CONFIRMED_FOR_MS });
                   }
                 })();
               }}
@@ -548,6 +594,17 @@ export default function DiagramOverlay({
               }}
             >
               <Download size={16} strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="Download PNG"
+              title="Download PNG"
+              className={BAR_BUTTON}
+              onClick={() => {
+                void downloadPng(content.source, content.name);
+              }}
+            >
+              <FileImage size={16} strokeWidth={1.75} />
             </button>
           </>
         ) : (

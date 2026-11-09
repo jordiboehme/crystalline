@@ -502,6 +502,18 @@ describe("deleteNode", () => {
       "graph TD\n  A\n  C\n  class A,C x",
     ],
     [
+      "the box named twice on a shared class line",
+      "graph TD\n  A --> B\n  class A,B,B x",
+      "B",
+      "graph TD\n  A\n  class A x",
+    ],
+    [
+      "neighbouring indices of a shared linkStyle line",
+      "graph TD\n  A --> B\n  B --> C\n  C --> D\n  linkStyle 0,1,2 stroke:#f00",
+      "C",
+      "graph TD\n  A --> B\n  D\n  linkStyle 0 stroke:#f00",
+    ],
+    [
       "a shared click line keeps the rest",
       'graph TD\n  A --> B\n  click A,B "https://x.y"',
       "B",

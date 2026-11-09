@@ -1195,7 +1195,7 @@ describe("deleteMessage", () => {
 
   test("the notice for it is plain", () => {
     expect(NOTICES.leavesActive).toBe(
-      "That would leave an activation open, so it was not deleted.",
+      "That would leave an activation open, so nothing was changed.",
     );
   });
 
@@ -1240,7 +1240,7 @@ describe("deleteMessage", () => {
 
   test("the notice is plain", () => {
     expect(NOTICES.emptiesBlock).toBe(
-      "That would leave a block with nothing in it, so it was not deleted.",
+      "That would leave a block with nothing in it, so nothing was changed.",
     );
   });
 
