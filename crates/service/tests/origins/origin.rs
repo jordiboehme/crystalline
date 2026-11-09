@@ -4505,6 +4505,7 @@ pub(super) async fn drafted(eng: &Engine, tmp: &Path, actor: &str, path: &str, t
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         },
     )
     .unwrap();
@@ -4535,7 +4536,7 @@ async fn tombstoned(eng: &Engine, tmp: &Path, actor: &str, path: &str) {
     let snapshot = tmp.join("origins").join("team");
     let start = crystalline_remote::state::read_base_file(&snapshot, path)
         .unwrap()
-        .map(|bytes| String::from_utf8(bytes).unwrap());
+        .map(|bytes| crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned());
     crystalline_service::draft_start::save(
         tmp,
         "team",
@@ -4547,6 +4548,7 @@ async fn tombstoned(eng: &Engine, tmp: &Path, actor: &str, path: &str) {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         },
     )
     .unwrap();

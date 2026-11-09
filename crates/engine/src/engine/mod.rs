@@ -1058,6 +1058,11 @@ pub struct Engine {
     // `Engine::fail_next_convergence`.
     #[cfg(any(test, feature = "testing"))]
     fail_next_convergence: std::sync::atomic::AtomicBool,
+    // A stopwatch: when armed, the pass's next drop of a draft sleeps this many
+    // milliseconds before it takes the draft lock. See
+    // `Engine::hold_next_convergence_drop`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_convergence_drop: std::sync::atomic::AtomicU64,
     // When armed, the next rename-question scan fails once. See
     // `Engine::fail_next_rename_scan`.
     #[cfg(any(test, feature = "testing"))]
@@ -2514,6 +2519,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_convergence: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            hold_next_convergence_drop: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             lose_next_relink_swap: std::sync::atomic::AtomicBool::new(false),
@@ -2657,8 +2664,10 @@ impl Engine {
 
     /// Make the next put-back of a draft start record fail, once, as a full disk
     /// would, leaving the clear that follows it to work. The other way to get
-    /// there, a folder that refuses writes, fails the clear as well. Nothing in
-    /// the daemon, the CLI or the MCP surface calls this.
+    /// there, a folder that refuses writes, fails the clear as well. The
+    /// convergence pass consumes it too, at the start it moves after writing a
+    /// merge, which is the same kind of write. Nothing in the daemon, the CLI or
+    /// the MCP surface calls this.
     #[cfg(any(test, feature = "testing"))]
     pub fn fail_next_start_restore(&self) {
         self.fail_next_start_restore
@@ -2699,6 +2708,29 @@ impl Engine {
         #[cfg(not(any(test, feature = "testing")))]
         {
             false
+        }
+    }
+
+    /// Hold the convergence pass's next drop of a draft for `millis` before it
+    /// takes the draft's lock, once, so a test can write the draft in that
+    /// window: the drop must then see the new text and leave the row. Nothing in
+    /// the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_convergence_drop(&self, millis: u64) {
+        self.hold_next_convergence_drop
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming. Does nothing outside a test build.
+    async fn take_convergence_drop_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let millis = self
+                .hold_next_convergence_drop
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
         }
     }
 
@@ -6197,6 +6229,7 @@ impl Engine {
                 start_sha256: None,
                 shared: None,
                 merged_at: None,
+                merging: None,
             }))
     }
 
@@ -6234,6 +6267,7 @@ impl Engine {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         }))
     }
 
@@ -6678,6 +6712,11 @@ impl Engine {
     /// A tombstone half is never decided alone: its draft stands for both, and
     /// an old pair's tombstone the team deleted would otherwise go and leave a
     /// draft that reads as a new file.
+    ///
+    /// The decision is made on the rows as this pass read them, with no lock;
+    /// every write and every drop that acts on it re-reads its row under that
+    /// row's draft lock and leaves a row that changed in between for the next
+    /// pass, so a writer that came in meanwhile never loses its text.
     async fn settle_drafts(
         &self,
         view: &DomainView<'_>,
@@ -6695,21 +6734,28 @@ impl Engine {
             match decision {
                 draft_conflicts::Decision::Landed
                 | draft_conflicts::Decision::Step(DraftStep::Landed) => {
-                    settled.cleared += self.end_draft(view, domain_id, reading, i).await?;
+                    settled.cleared += self
+                        .end_draft(view, domain, domain_id, actor, reading, i)
+                        .await?;
                 }
                 draft_conflicts::Decision::Step(DraftStep::Take { text, edited }) => {
-                    if self
+                    let taken = self
                         .take_merge(
                             view, domain, domain_id, actor, reading, i, &team, text, edited,
                         )
-                        .await?
-                    {
+                        .await?;
+                    if taken == Taken::Left {
+                        continue;
+                    }
+                    if taken == Taken::Wrote {
                         settled.merged += 1;
-                        // A merge equal to the team's text has landed.
-                        let team = reading.team(i)?;
-                        if has_landed(&reading.sides(i, &team)) {
-                            settled.cleared += self.end_draft(view, domain_id, reading, i).await?;
-                        }
+                    }
+                    // A merge equal to the team's text has landed.
+                    let team = reading.team(i)?;
+                    if has_landed(&reading.sides(i, &team)) {
+                        settled.cleared += self
+                            .end_draft(view, domain, domain_id, actor, reading, i)
+                            .await?;
                     }
                 }
                 draft_conflicts::Decision::NotAsked
@@ -6721,51 +6767,133 @@ impl Engine {
         Ok(settled)
     }
 
-    /// End row `i` of a reading, and the tombstone half of its move first,
-    /// so a crash between the two never leaves a tombstone standing alone over
-    /// a move that landed. Answers how many rows went.
+    /// End row `i` of a reading, and the tombstone half of its move first, so
+    /// a crash between the two never leaves a tombstone standing alone over a
+    /// move that landed. Answers how many rows went. Each goes only if it is
+    /// still what the pass read ([`Engine::drop_as_read`]).
     ///
     /// A half by record ends with its draft: the decision that landed the draft
-    /// asked where it started. An old pair's tombstone was paired by a guess and
-    /// its draft landed with no word about where it started, so it ends only
-    /// when the team no longer holds its path either; otherwise her deletion
-    /// stands as her own.
+    /// asked where it started. An old pair was paired by a guess and its draft
+    /// landed with no word about where it started, so while the team still
+    /// holds the tombstone's path the pair stands together, as the one conflict
+    /// the conflict list names at the draft.
     async fn end_draft(
         &self,
         view: &DomainView<'_>,
+        domain: &str,
         domain_id: DomainId,
+        actor: &str,
         reading: &mut draft_conflicts::Reading<'_>,
         i: usize,
     ) -> Result<u64> {
-        let mut ended = 0;
-        if !reading.rows[i].tombstone
-            && let Some(t) = reading.half_of(i)
+        let half = if reading.rows[i].tombstone {
+            None
+        } else {
+            reading.half_of(i)
+        };
+        if let Some(t) = half
+            && reading.is_old_half(t)
+            && !matches!(reading.team(t)?.at_path, draft_conflicts::Held::Absent)
         {
-            let ends = !reading.is_old_half(t)
-                || matches!(reading.team(t)?.at_path, draft_conflicts::Held::Absent);
-            if ends {
-                view.drop(domain_id, &reading.rows[t].path).await?;
-                ended += 1;
-            }
+            return Ok(0);
         }
-        view.drop(domain_id, &reading.rows[i].path).await?;
-        Ok(ended + 1)
+        let mut ended = 0;
+        if let Some(t) = half
+            && self
+                .drop_as_read(view, domain, domain_id, actor, reading, t)
+                .await?
+        {
+            ended += 1;
+        }
+        if self
+            .drop_as_read(view, domain, domain_id, actor, reading, i)
+            .await?
+        {
+            ended += 1;
+        }
+        Ok(ended)
+    }
+
+    /// Drop row `i` of a reading under its draft lock, and only when the row and
+    /// its record are still what the pass decided on. A row somebody wrote in
+    /// the meantime is left, and the next pass decides it again. Answers
+    /// whether it went.
+    async fn drop_as_read(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        i: usize,
+    ) -> Result<bool> {
+        self.take_convergence_drop_hold().await;
+        let row = &reading.rows[i];
+        let lock = self.draft_lock(domain, actor, &row.path)?;
+        let _guard = lock.lock().await;
+        if !self
+            .still_as_read(view, domain_id, actor, row, reading.records[i].as_ref())
+            .await?
+        {
+            tracing::warn!(
+                domain,
+                actor,
+                path = row.path.as_str(),
+                "a draft that had landed changed while the pass ran, so it stands; the next \
+                 pass looks again"
+            );
+            return Ok(false);
+        }
+        view.drop(domain_id, &row.path).await?;
+        Ok(true)
+    }
+
+    /// Whether `actor`'s row at `row.path` and its record still say what this
+    /// pass read. Asked under the row's draft lock. A record that cannot be
+    /// read is not the record the pass read.
+    async fn still_as_read(
+        &self,
+        view: &DomainView<'_>,
+        domain_id: DomainId,
+        actor: &str,
+        row: &StoredEngram,
+        record: Option<&crate::draft_start::DraftStart>,
+    ) -> Result<bool> {
+        let now = {
+            let store = self.store.lock().await;
+            store.overlay_entry(domain_id, actor, &row.path).await?
+        };
+        let same_row = now
+            .as_ref()
+            .is_some_and(|now| now.tombstone == row.tombstone && now.content == row.content);
+        let same_record = view.start_of(&row.path).ok() == Some(record.cloned());
+        Ok(same_row && same_record)
     }
 
     /// Write a merge into row `i`, then move its start to the team's text, and
-    /// the start of the tombstone half of its move with it. Answers whether it
-    /// wrote. Every refusal leaves the row as it was, so it stands as a
-    /// conflict until a later pass merges it:
+    /// the start of the tombstone half of its move with it. Every refusal leaves
+    /// the row as it was, so it stands as a conflict until a later pass merges
+    /// it:
     ///
     /// - a merge that would change the row's address while a room is open over
     ///   it, since a room is keyed by its address. Asked before the draft lock,
     ///   never under it: a room's save holds its state while it waits for that
-    ///   lock;
+    ///   lock. A room that opens between the question and the write meets the
+    ///   change at its next save, as an external change, and keeps its text;
     /// - a row or record that changed since the decision;
     /// - a write the view refuses: text that is no page, an address held.
     ///
-    /// The row goes first and the start second, so a crash between them leaves
-    /// the old start under the merged row, which merges again to the same text.
+    /// **Three writes, in this order.** The record is marked `merging`, the row
+    /// is written, and the start moves with the mark cleared. A crash after the
+    /// first leaves the old row under a mark, which decides as before. A crash
+    /// after the second leaves the merged row over the old start, and the mark
+    /// is what keeps the next pass from reading that as her case move landed:
+    /// it merges again, to the same text, and tells her if the first merge
+    /// changed her words. The start never moves first, which would read the old
+    /// row as in step and share it over the team's change.
+    ///
+    /// A merge whose text is what the row already holds writes no row: only the
+    /// start moves on.
     #[allow(clippy::too_many_arguments)]
     async fn take_merge(
         &self,
@@ -6778,19 +6906,19 @@ impl Engine {
         team: &draft_conflicts::RowTeam,
         text: String,
         edited: bool,
-    ) -> Result<bool> {
+    ) -> Result<Taken> {
         let row = reading.rows[i].clone();
         let Some(record) = reading.records[i].clone() else {
-            return Ok(false);
+            return Ok(Taken::Left);
         };
-        let leave = |why: &str| -> Result<bool> {
+        let leave = |why: &str| -> Result<Taken> {
             tracing::warn!(
                 domain,
                 actor,
                 path = row.path.as_str(),
                 "a merge of the team's change into this draft was left: {why}"
             );
-            Ok(false)
+            Ok(Taken::Left)
         };
         let merged_address = match Engine::overlay_record(&row.path, &text) {
             Ok(merged) => merged.permalink,
@@ -6820,26 +6948,47 @@ impl Engine {
             return leave("the team's text there is not text");
         };
         let start = crystalline_core::to_lf(&start).into_owned();
-        {
+        // A merge an earlier pass wrote and could not finish counts as this one.
+        let edited = edited || record.merging == Some(true);
+        let unchanged = text == row.content;
+        let moved = {
             let lock = self.draft_lock(domain, actor, &row.path)?;
             let _guard = lock.lock().await;
-            let now = {
-                let store = self.store.lock().await;
-                store.overlay_entry(domain_id, actor, &row.path).await?
-            };
-            let same_row = now
-                .as_ref()
-                .is_some_and(|now| now.tombstone == row.tombstone && now.content == row.content);
-            let same_record = view.start_of(&row.path).ok() == Some(Some(record.clone()));
-            if !(same_row && same_record) {
+            if !self
+                .still_as_read(view, domain_id, actor, &row, Some(&record))
+                .await?
+            {
                 return leave("it changed since this pass read it; the next pass looks again");
             }
-            match view.write(domain_id, &row.path, &text).await {
-                Ok(None) => {}
-                Ok(Some(warning)) => {
-                    tracing::warn!(domain, actor, path = row.path.as_str(), "{warning}")
+            if !unchanged {
+                let marked = crate::draft_start::DraftStart {
+                    merging: Some(edited),
+                    ..record.clone()
+                };
+                if let Err(e) = self.save_start(domain, actor, &marked) {
+                    return leave(&e.to_string());
                 }
-                Err(e) => return leave(&e.to_string()),
+                match view.write(domain_id, &row.path, &text).await {
+                    Ok(None) => {}
+                    Ok(Some(warning)) => {
+                        tracing::warn!(domain, actor, path = row.path.as_str(), "{warning}")
+                    }
+                    Err(e) => {
+                        if let Err(undo) = self.save_start(domain, actor, &record) {
+                            tracing::warn!(
+                                domain,
+                                actor,
+                                path = row.path.as_str(),
+                                "the merge mark could not be taken off a draft whose merge was \
+                                 not written; the next pass merges it again: {undo}"
+                            );
+                            reading.records[i] = Some(marked);
+                        }
+                        return leave(&e.to_string());
+                    }
+                }
+                reading.rows[i].content = text;
+                reading.records[i] = Some(marked);
             }
             let moved = crate::draft_start::DraftStart {
                 from: Some(from),
@@ -6850,19 +6999,35 @@ impl Engine {
                 } else {
                     record.merged_at
                 },
+                merging: None,
                 ..record
             };
-            if let Err(e) = self.save_start(domain, actor, &moved) {
-                tracing::warn!(
-                    domain,
-                    actor,
-                    path = row.path.as_str(),
-                    "a draft took the team's change and its start could not move with it; the \
-                     next pass merges it again: {e}"
-                );
+            let saved = if self.take_failed_start_restore() {
+                Err(EngineError::Internal(
+                    "the armed failure of a test".to_string(),
+                ))
+            } else {
+                self.save_start(domain, actor, &moved)
+            };
+            match saved {
+                Ok(()) => {
+                    reading.records[i] = Some(moved);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        actor,
+                        path = row.path.as_str(),
+                        "a draft took the team's change and its start could not move with it; \
+                         the next pass merges it again: {e}"
+                    );
+                    false
+                }
             }
-            reading.rows[i].content = text;
-            reading.records[i] = Some(moved);
+        };
+        if !moved {
+            return Ok(if unchanged { Taken::Left } else { Taken::Wrote });
         }
         // The tombstone half of the same move starts from the same text, under
         // its own lock, taken after the draft's is let go.
@@ -6895,7 +7060,11 @@ impl Engine {
                 ),
             }
         }
-        Ok(true)
+        Ok(if unchanged {
+            Taken::StartOnly
+        } else {
+            Taken::Wrote
+        })
     }
 
     /// Save one of `actor`'s draft start records.
@@ -11015,6 +11184,17 @@ fn file_conflicts(record: &crate::overlay_journal::ConvergenceRecord) -> u64 {
         .flatten()
         .filter(|path| !path.ends_with(".md"))
         .count() as u64
+}
+
+/// What [`Engine::take_merge`] did with a merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// Nothing: the row stands as it was, and so does its start.
+    Left,
+    /// The row took the merge.
+    Wrote,
+    /// The row already held the merge, so only its start moved on.
+    StartOnly,
 }
 
 /// What [`Engine::settle_drafts`] did to one actor's rows.

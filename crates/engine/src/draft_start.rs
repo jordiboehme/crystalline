@@ -75,6 +75,14 @@ pub struct DraftStart {
     pub shared: Option<SharedText>,
     /// Set when a merge changed the row. Drives the notice.
     pub merged_at: Option<DateTime<Utc>>,
+    /// Stands while a merge is being written: set before the row is written
+    /// and cleared when the start moves after it. A crash between the two
+    /// leaves the merged row over the old start, and this says so, so the next
+    /// pass merges again rather than reading the row as landed. The value is
+    /// whether that merge changed her words, so the notice is not lost on the
+    /// replay. Absent from every record written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merging: Option<bool>,
 }
 
 /// What an open proposal holds of one row.
@@ -281,6 +289,7 @@ mod tests {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         }
     }
 
@@ -308,6 +317,7 @@ mod tests {
                 text: Some("what the proposal holds\n".to_string()),
             }),
             merged_at: Some("2026-11-06T10:00:00Z".parse().unwrap()),
+            merging: None,
         };
         let upper = DraftStart {
             path: "Note.md".to_string(),
@@ -319,6 +329,7 @@ mod tests {
                 text: None,
             }),
             merged_at: None,
+            merging: None,
         };
 
         save(state, "team", "alice", &lower).unwrap();
@@ -828,6 +839,7 @@ mod tests {
                 start_sha256: None,
                 shared: None,
                 merged_at: None,
+                merging: None,
             })
         );
     }

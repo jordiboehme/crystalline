@@ -464,6 +464,7 @@ fn in_step(path: &str, text: &str) -> DraftStart {
         start_sha256: None,
         shared: None,
         merged_at: None,
+        merging: None,
     }
 }
 
@@ -677,6 +678,7 @@ async fn a_tombstone_over_a_draft_from_elsewhere_does_not_read_as_in_step() {
         start_sha256: None,
         shared: None,
         merged_at: None,
+        merging: None,
     };
 
     let f = moved_onto_by_the_team().await;
@@ -837,6 +839,7 @@ async fn a_new_file_records_no_start() {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         }),
         "a record that says new, which no record at all could not"
     );
@@ -902,6 +905,7 @@ async fn a_tombstone_names_its_own_path_when_the_snapshot_does_not_hold_it() {
         start_sha256: None,
         shared: None,
         merged_at: None,
+        merging: None,
     };
 
     f.delete("stray").await;
@@ -1716,6 +1720,7 @@ async fn a_followed_team_rename_points_the_record_at_the_new_path() {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         })
     );
 
@@ -2084,5 +2089,37 @@ async fn an_edited_case_move_whose_edit_the_team_took_stays_on_either_disk() {
         f.start("Plan.md").unwrap().start.as_deref(),
         Some(theirs.as_str())
     );
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+/// A merge into an unedited case move whose start could not be saved leaves the
+/// team's text over the old start. On a disk that folds case that reads like her
+/// case move landed at the team's spelling; the merge mark keeps it in step, and
+/// the next pass moves the start. Both rows stand on either disk.
+#[tokio::test]
+async fn a_case_move_whose_start_could_not_move_stays_on_either_disk() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.moved("plan", "Plan.md").await;
+    f.engine.fail_next_start_restore();
+    f.push(&[("plan.md", Some(bobs(LONG)))]).await;
+    let both = vec![
+        ("Plan.md".to_string(), false),
+        ("plan.md".to_string(), true),
+    ];
+    assert_eq!(f.rows().await, both);
+    assert_eq!(f.start("Plan.md").unwrap().merging, Some(false));
+    assert_eq!(
+        f.start("plan.md").unwrap().start.as_deref(),
+        Some(LONG),
+        "the deletion half keeps its start until the draft's has moved"
+    );
+
+    f.engine.converge_overlays("team").await.unwrap();
+    assert_eq!(f.rows().await, both);
+    let record = f.start("Plan.md").unwrap();
+    assert_eq!(record.merging, None);
+    assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()));
+    assert!(f.row("Plan.md").await.contains(BOB_LINE));
     assert_eq!(f.conflicts().await, vec![]);
 }

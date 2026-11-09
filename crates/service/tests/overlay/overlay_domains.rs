@@ -328,7 +328,7 @@ impl Fixture {
     }
 
     /// The record of where `actor`'s row at `path` starts, as a write verb
-    /// leaves it for a new row: the team's text there when the base snapshot
+    /// leaves it for a new row: the team's text there, as LF, when the base snapshot
     /// holds the path, else a new file; a tombstone names its own path either
     /// way. Left alone when a record stands, as a second write leaves it, and
     /// when the domain has no snapshot, where no verb writes one.
@@ -346,7 +346,9 @@ impl Fixture {
         let start = if state.files.contains_key(path) {
             crystalline_remote::state::read_base_file(&snapshot, path)
                 .unwrap()
-                .map(|bytes| String::from_utf8(bytes).unwrap())
+                .map(|bytes| {
+                    crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned()
+                })
         } else {
             None
         };
@@ -361,6 +363,7 @@ impl Fixture {
                 start_sha256: None,
                 shared: None,
                 merged_at: None,
+                merging: None,
             },
         )
         .unwrap();

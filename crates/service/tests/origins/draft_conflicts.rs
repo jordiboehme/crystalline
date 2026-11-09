@@ -685,6 +685,7 @@ async fn a_generated_listing_row_is_not_a_conflict() {
                 start_sha256: None,
                 shared: None,
                 merged_at: None,
+                merging: None,
             },
         )
         .unwrap();
@@ -708,6 +709,7 @@ async fn a_generated_listing_row_is_not_a_conflict() {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         },
     )
     .unwrap();
@@ -1433,6 +1435,7 @@ async fn an_address_her_own_draft_gave_up_is_free_for_her_other_draft() {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         },
     )
     .unwrap();
@@ -1454,6 +1457,7 @@ async fn an_address_her_own_draft_gave_up_is_free_for_her_other_draft() {
             start_sha256: None,
             shared: None,
             merged_at: None,
+            merging: None,
         },
     )
     .unwrap();
@@ -1768,18 +1772,34 @@ async fn an_old_move_whose_source_the_team_deleted_stands_through_a_pull() {
 }
 
 /// An old pair is paired by a guess, so its draft landing says nothing about the
-/// path it may have left: while the team holds that path, her deletion of it
-/// stands as her own.
+/// path it may have left: while the team holds that path, the pair stands as the
+/// one conflict the list names at the draft, with the same id before and after
+/// the pass.
 #[tokio::test]
 async fn an_old_move_whose_draft_landed_keeps_her_deletion_while_the_team_holds_it() {
-    let mut t = team(&[("plan.md", plan())]).await;
+    let t = team(&[("plan.md", plan())]).await;
     let hers = text(&plan()).replace("the last line", "alice's last line");
     t.old_tombstone("alice", "plan.md", &plan()).await;
     t.old_draft("alice", "renamed.md", &hers).await;
-    t.push(&[("renamed.md", Some(hers.clone().into_bytes()))])
-        .await;
+    t.snapshot_has("renamed.md", Some(hers.as_bytes()));
+    let before = t.conflicts("alice").await;
+    assert_eq!(
+        before,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", UnknownStart)
+        }]
+    );
+    t.eng.converge_overlays("team").await.unwrap();
 
-    assert_eq!(t.rows("alice").await, vec![("plan.md".to_string(), true)]);
+    assert_eq!(
+        t.rows("alice").await,
+        vec![
+            ("plan.md".to_string(), true),
+            ("renamed.md".to_string(), false)
+        ]
+    );
+    assert_eq!(t.conflicts("alice").await, before);
 
     // Once the team lets go of it too, the next pull ends it.
     let mut t = team(&[("plan.md", plan())]).await;
@@ -1938,4 +1958,122 @@ async fn a_merge_onto_an_address_held_elsewhere_leaves_the_row_and_its_start() {
     let record = t.record("alice", "plan.md").unwrap();
     assert_eq!(record.start.as_deref(), Some(text(&plan()).as_str()));
     assert_eq!(record.merged_at, None);
+}
+
+/// The pass decides a landed row on the rows it read first. An edit that comes
+/// in after a merge was written and before the landed row is dropped is hers:
+/// the drop re-reads the row under its lock and leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landing_after_a_merge_leaves_an_edit_that_came_in_meanwhile() {
+    let t = Arc::new(team(&[("plan.md", plan())]).await);
+    // Her draft holds what she started from: unedited, so the merge is the
+    // team's text and the row has then landed.
+    draft(&t.eng, "alice", "plan.md", &text(&plan())).await;
+    mirror(&t.state(), "alice", "plan.md", &text(&plan()));
+    draft_start::save(
+        &t.state(),
+        "team",
+        "alice",
+        &DraftStart {
+            path: "plan.md".to_string(),
+            from: Some("plan.md".to_string()),
+            start: Some(text(&plan())),
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+            merging: None,
+        },
+    )
+    .unwrap();
+    t.snapshot_has("plan.md", Some(&plan_later()));
+
+    t.eng.hold_next_convergence_drop(1500);
+    let pass = {
+        let t = t.clone();
+        tokio::spawn(async move { t.eng.converge_overlays("team").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    t.append("alice", "plan", "her line while the pass ran")
+        .await;
+    pass.await.unwrap().unwrap();
+
+    assert_eq!(t.rows("alice").await, vec![("plan.md".to_string(), false)]);
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains("her line while the pass ran"), "{row}");
+    assert!(row.contains(BOB_LINE), "{row}");
+}
+
+/// While the pass waits at one draft's lock, she edits another draft the pass
+/// read as landed. The drop re-reads that row and leaves her edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_landed_draft_edited_while_the_pass_waits_at_another_lock_keeps_the_edit() {
+    let zz = engram("Zz", "zz", "the team's last page");
+    let t = Arc::new(team(&[("plan.md", plan()), ("zz.md", zz.clone())]).await);
+    t.append("alice", "plan", HER_WORD).await;
+    t.append("alice", "zz", "her word on zz").await;
+    // The team took her zz as it stands, and changed the plan under her.
+    let landed = t.row("alice", "zz.md").await;
+    t.snapshot_has("zz.md", Some(landed.as_bytes()));
+    t.snapshot_has("plan.md", Some(&plan_later()));
+
+    // An edit holds the plan's lock, so the pass waits there.
+    t.eng.hold_next_draft_edit(1500);
+    let held = {
+        let t = t.clone();
+        tokio::spawn(async move { t.append("alice", "plan", "a word on the plan").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let pass = {
+        let t = t.clone();
+        tokio::spawn(async move { t.eng.converge_overlays("team").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    t.append("alice", "zz", "her second word on zz").await;
+    held.await.unwrap();
+    pass.await.unwrap().unwrap();
+
+    assert!(
+        t.rows("alice")
+            .await
+            .contains(&("zz.md".to_string(), false))
+    );
+    let row = t.row("alice", "zz.md").await;
+    assert!(row.contains("her second word on zz"), "{row}");
+}
+
+/// The start of a written merge could not be saved. The row holds the merge
+/// over the old start, under the merge mark: the gate still lists it, the next
+/// pass merges again to the same text, writes nothing, moves the start and
+/// tells her.
+#[tokio::test]
+async fn a_merge_whose_start_could_not_move_merges_again_and_tells_her() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.snapshot_has("plan.md", Some(&plan_later()));
+
+    t.eng.fail_next_start_restore();
+    let first = t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(first.merged, 1, "{first:?}");
+    let merged = t.row("alice", "plan.md").await;
+    assert!(
+        merged.contains(BOB_LINE) && merged.contains(HER_WORD),
+        "{merged}"
+    );
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.start.as_deref(), Some(text(&plan()).as_str()));
+    assert_eq!(record.merging, Some(true));
+    assert_eq!(record.merged_at, None);
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+
+    let second = t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(second.merged, 0, "the row already held it: {second:?}");
+    assert_eq!(t.row("alice", "plan.md").await, merged);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.start.as_deref(), Some(text(&plan_later()).as_str()));
+    assert_eq!(record.merging, None);
+    assert!(record.merged_at.is_some(), "she is told: {record:?}");
+    assert_eq!(t.conflicts("alice").await, vec![]);
 }

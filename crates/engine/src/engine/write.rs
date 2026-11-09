@@ -1638,6 +1638,26 @@ impl Engine {
         .await
     }
 
+    /// The draft half of [`Engine::restore_engram_in_view`]: the write under the
+    /// draft's lock like every other writer of it, so a first edit and this
+    /// cannot both find no row and the last record win. The room that asks for
+    /// this holds its state here, as its save does, and nothing under the lock
+    /// asks about a room. A function of its own so the lock ends with it, before
+    /// the caller reaches any room.
+    async fn restore_draft_locked(
+        &self,
+        view: &DomainView<'_>,
+        domain_id: DomainId,
+        domain: &str,
+        who: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<Option<String>> {
+        let lock = self.draft_lock(domain, who, path)?;
+        let _guard = lock.lock().await;
+        view.write(domain_id, path, content).await
+    }
+
     /// [`Engine::restore_engram`] through a view somebody already built.
     ///
     /// The split exists for the co-editing room, which has a view of its own -
@@ -1687,15 +1707,9 @@ impl Engine {
         // document is this actor's draft of the path, never a file written
         // back into what the team reviewed.
         if let Some(who) = overlay {
-            // Under the draft's lock like every other writer of it, so a first
-            // edit and this cannot both find no row and the last record win. The
-            // room that asks for this holds its state here, as its save does,
-            // and nothing under the lock asks about a room.
-            let warning = {
-                let lock = self.draft_lock(domain, who, path)?;
-                let _guard = lock.lock().await;
-                view.write(domain_id, path, content).await?
-            };
+            let warning = self
+                .restore_draft_locked(view, domain_id, domain, who, path, content)
+                .await?;
             let permalink = parse_engram(content)
                 .map(|engram| {
                     EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink

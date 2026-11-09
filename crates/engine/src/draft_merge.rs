@@ -90,6 +90,11 @@ pub struct DraftSides<'a> {
     /// Whether the domain's folder folds case (`folder_may_fold_case`). Only there
     /// does a case move's share land at the spelling the team already has.
     pub folds_case: bool,
+    /// The record says a merge was being written into this row and its start
+    /// has not moved yet (`DraftStart::merging`). The row may then hold the
+    /// team's text over the old start, which the case clause would read as her
+    /// case move landed; it never does while this stands.
+    pub merging: bool,
     /// The draft's text. `None` is a tombstone.
     pub local: Option<&'a str>,
     /// What the team holds at `path`.
@@ -275,7 +280,7 @@ fn case_move_landed_at_the_old_spelling(sides: &DraftSides<'_>, local: &str) -> 
     let Some(from) = sides.from else {
         return false;
     };
-    if !sides.folds_case || from.to_lowercase() != sides.path.to_lowercase() {
+    if sides.merging || !sides.folds_case || from.to_lowercase() != sides.path.to_lowercase() {
         return false;
     }
     // A row at its own path never gets here with a text: `can_tell` holds its two
@@ -538,6 +543,7 @@ mod tests {
                 team_at_path: self.at_path,
                 team_at_from: self.at_from,
                 folds_case,
+                merging: false,
             }
         }
     }
@@ -554,6 +560,7 @@ mod tests {
             start_sha256: None,
             shared,
             folds_case: false,
+            merging: false,
             local,
             team_at_path: at_path,
             team_at_from: at_from,
@@ -637,6 +644,7 @@ mod tests {
             team_at_path,
             team_at_from,
             folds_case: false,
+            merging: false,
         }
     }
 

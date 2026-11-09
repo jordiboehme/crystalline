@@ -333,6 +333,7 @@ impl Reading<'_> {
             // is never read as landed on a guess.
             folds_case: self.root_is_there
                 && folder_folds_case(&self.root, &row.path) == Some(true),
+            merging: record.is_some_and(|record| record.merging.is_some()),
             local: (!row.tombstone).then_some(row.content.as_str()),
             team_at_path: team.at_path.team(),
             team_at_from: team.at_from.team(),
@@ -811,6 +812,7 @@ mod tests {
             start_sha256: None,
             shared: None,
             merged_at: merged.then(chrono::Utc::now),
+            merging: None,
         }
     }
 
