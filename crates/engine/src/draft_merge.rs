@@ -12,9 +12,14 @@
 //!
 //! - **`team_at_path` and `team_at_from` come from real keys of the base
 //!   snapshot.** On a disk that folds case a read of `Plan.md` also returns
-//!   `plan.md`'s bytes. A key with no readable copy is [`TeamText::Unreadable`],
-//!   never [`TeamText::Absent`], and so is a snapshot that holds two spellings
-//!   of one path on a folding disk, where it cannot hold two copies.
+//!   `plan.md`'s bytes. A key with no readable copy is [`TeamText::Unreadable`]
+//!   with the key's stamp, never [`TeamText::Absent`], and so is a snapshot that
+//!   holds two spellings of one path on a folding disk, where it cannot hold two
+//!   copies.
+//! - **`folds_case` is the domain folder's**, since the same keys mean her own
+//!   landed case move on one disk and a colleague's coincidence on the other.
+//! - **`start_sha256` and `shared` are the record's.** Keep mine over a team file
+//!   with no text writes the digest, so it settles like any other.
 //! - **A broken record is an error for the caller to refuse on.** It never
 //!   reaches this module as a record of `None`s.
 //! - **A row with no record gets [`has_landed`] only.** [`next_step`] assumes a
@@ -61,8 +66,9 @@ pub enum TeamText<'a> {
     /// The key's bytes, in the line endings the team has them.
     Held(&'a [u8]),
     /// The path is a key of the base snapshot with no readable copy. The team has
-    /// a file there and we cannot say what it holds, which is not absent.
-    Unreadable,
+    /// a file there and we cannot say what it holds, which is not absent. The
+    /// digest is the key's stamp in the snapshot.
+    Unreadable { sha256: &'a str },
 }
 
 /// One row, its record and the team's text.
@@ -72,8 +78,18 @@ pub struct DraftSides<'a> {
     pub path: &'a str,
     /// The team path it started from. `None` is a new file.
     pub from: Option<&'a str>,
-    /// The text at `from` when last in step. `None` is absent there.
+    /// The text at `from` when last in step. `None` is absent there, unless
+    /// `start_sha256` says what stood there.
     pub start: Option<&'a str>,
+    /// The record's digest of a start that has no text (Keep mine on bytes that
+    /// are not UTF-8 or have no readable copy). `start` is then `None`.
+    pub start_sha256: Option<&'a str>,
+    /// The text of hers the record says she last shared (`shared.text`), or
+    /// `None`: nothing shared, or a deletion.
+    pub shared: Option<&'a str>,
+    /// Whether the domain's folder folds case (`folder_may_fold_case`). Only there
+    /// does a case move's share land at the spelling the team already has.
+    pub folds_case: bool,
     /// The draft's text. `None` is a tombstone.
     pub local: Option<&'a str>,
     /// What the team holds at `path`.
@@ -85,7 +101,8 @@ pub struct DraftSides<'a> {
 /// What should happen to a row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DraftStep {
-    /// The team holds it. End the move, both halves.
+    /// The team holds it and has let go of where she started. End the move, both
+    /// halves.
     Landed,
     /// Nothing to do.
     InStep,
@@ -97,36 +114,104 @@ pub enum DraftStep {
 }
 
 /// A team text, read. Bytes that are not UTF-8 stay that: a lossy decode would
-/// write a replacement character into a draft, and absent would read as gone.
+/// write a replacement character into a draft. A key with no readable copy stays
+/// that too, with its stamp: there is no arm that turns it into absent, so no
+/// caller in this module can read it as gone.
 enum Team<'a> {
     Absent,
-    Text(Cow<'a, str>),
-    NotText,
+    Text { text: Cow<'a, str>, bytes: &'a [u8] },
+    NotText(&'a [u8]),
+    Unreadable(&'a str),
 }
 
 impl<'a> Team<'a> {
     fn read(team: TeamText<'a>) -> Self {
         match team {
+            TeamText::Absent => Team::Absent,
             TeamText::Held(bytes) => match std::str::from_utf8(bytes) {
-                Ok(text) => Team::Text(to_lf(text)),
-                Err(_) => Team::NotText,
+                Ok(text) => Team::Text {
+                    text: to_lf(text),
+                    bytes,
+                },
+                Err(_) => Team::NotText(bytes),
             },
-            TeamText::Absent | TeamText::Unreadable => Team::Absent,
+            TeamText::Unreadable { sha256 } => Team::Unreadable(sha256),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            Team::Text { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The sha-256 of the team's bytes as they stand, which is what a start with
+    /// no text was recorded as.
+    fn sha256(&self) -> Option<Cow<'a, str>> {
+        match self {
+            Team::Absent => None,
+            Team::Text { bytes, .. } | Team::NotText(bytes) => {
+                Some(Cow::Owned(crate::engine::sha256_hex(bytes)))
+            }
+            Team::Unreadable(sha256) => Some(Cow::Borrowed(sha256)),
+        }
+    }
+
+    /// Whether the team holds what she started from. A change of only
+    /// `generated` is no change: it is no one's words.
+    fn is_start(&self, sides: &DraftSides<'_>) -> bool {
+        match (sides.start, sides.start_sha256) {
+            (None, None) => matches!(self, Team::Absent),
+            (Some(start), None) => self
+                .text()
+                .is_some_and(|text| same_but_generated(text, start)),
+            (None, Some(sha256)) => self.sha256().as_deref() == Some(sha256),
+            // `can_tell` refuses this shape before anything asks.
+            (Some(_), Some(_)) => false,
         }
     }
 }
 
-/// Whether these sides can be decided at all. Unreadable text cannot, and neither
-/// can a shape no writer leaves: it is answered as "we cannot tell" rather than
-/// guessed at, since a guess here can be an overwrite.
+/// Whether these sides can be decided at all. A shape no writer leaves cannot: it
+/// is answered as "we cannot tell" rather than guessed at, since a guess here can
+/// be an overwrite.
 fn can_tell(sides: &DraftSides<'_>) -> bool {
-    let unreadable =
-        sides.team_at_path == TeamText::Unreadable || sides.team_at_from == TeamText::Unreadable;
-    let new_file_with_a_start =
-        sides.from.is_none() && (sides.start.is_some() || sides.team_at_from != TeamText::Absent);
+    let new_file_with_a_start = sides.from.is_none()
+        && (sides.start.is_some()
+            || sides.start_sha256.is_some()
+            || sides.team_at_from != TeamText::Absent);
     let one_path_two_texts =
         sides.from == Some(sides.path) && sides.team_at_from != sides.team_at_path;
-    !(unreadable || new_file_with_a_start || one_path_two_texts)
+    let two_starts = sides.start.is_some() && sides.start_sha256.is_some();
+    !(new_file_with_a_start || one_path_two_texts || two_starts)
+}
+
+/// The sides as they stand after her own share. When the team holds at her path
+/// what she last shared, and has let go of where she started, her share is the
+/// team's text and her start: a draft she edited again since reads that edit
+/// against what she shared. A pass that did not run after the share would
+/// otherwise leave her in conflict with herself. Only an equal text counts: a team
+/// that went on after her share, or a share that has not landed, says nothing,
+/// and the start she had answers.
+fn after_her_share<'a>(sides: &DraftSides<'a>) -> DraftSides<'a> {
+    let (Some(_), Some(shared)) = (sides.local, sides.shared) else {
+        return *sides;
+    };
+    let holds_her_share = Team::read(sides.team_at_path)
+        .text()
+        .is_some_and(|text| same_but_generated(text, shared));
+    let let_go = sides.from == Some(sides.path) || sides.team_at_from == TeamText::Absent;
+    if !(holds_her_share && let_go) {
+        return *sides;
+    }
+    DraftSides {
+        from: Some(sides.path),
+        start: Some(shared),
+        start_sha256: None,
+        team_at_from: sides.team_at_path,
+        ..*sides
+    }
 }
 
 /// `text`, written at the team path `from`, as it reads at `path`: the two steps
@@ -142,117 +227,142 @@ fn in_draft_coordinates<'t>(text: &'t str, from: Option<&str>, path: &str) -> Co
     }
 }
 
-/// Whether the team holds what this row says, so it is finished. Asked by the
-/// pass and by the conflict table alike, so that her own landed share never reads
-/// as a conflict, whether or not a pass got to it.
+/// Whether the team holds what this row says, so it is finished, both halves of a
+/// move with it. Asked by the pass and by the conflict table alike, so that her own
+/// landed share never reads as a conflict, whether or not a pass got to it.
 ///
+/// - Nothing has landed while either path is a key with no readable copy.
 /// - A tombstone has landed when the team has no file at its path.
 /// - A draft has landed when the team's text at its path is the draft, but for
-///   `generated`.
-/// - A case move can also land at the team's spelling (see below).
+///   `generated`, **and** the team has let go of where she started: no `from`,
+///   `from` is the path, or the team no longer holds `from`. A colleague who wrote
+///   her text at her new path has not deleted the old one for her, and ending the
+///   move then would drop her deletion with no word.
+/// - A case move can also land at the team's spelling, on a disk that folds case
+///   (see below).
 pub fn has_landed(sides: &DraftSides<'_>) -> bool {
-    if !can_tell(sides) {
+    // C5: a key with no readable copy on either side, and nothing has landed.
+    let unreadable = matches!(sides.team_at_path, TeamText::Unreadable { .. })
+        || matches!(sides.team_at_from, TeamText::Unreadable { .. });
+    if unreadable || !can_tell(sides) {
         return false;
     }
-    let at_path = Team::read(sides.team_at_path);
+    let sides = after_her_share(sides);
     let Some(local) = sides.local else {
-        return matches!(at_path, Team::Absent);
+        return matches!(Team::read(sides.team_at_path), Team::Absent);
     };
-    match at_path {
-        Team::Text(team) => same_but_generated(&team, local),
-        Team::NotText => false,
-        Team::Absent => case_move_landed_at_the_old_spelling(sides, local),
+    match Team::read(sides.team_at_path) {
+        Team::Text { text, .. } => {
+            let let_go = sides.from.is_none_or(|from| from == sides.path)
+                || sides.team_at_from == TeamText::Absent;
+            same_but_generated(&text, local) && let_go
+        }
+        Team::Absent => case_move_landed_at_the_old_spelling(&sides, local),
+        Team::NotText(_) | Team::Unreadable(_) => false,
     }
 }
 
 /// On a disk that folds case, a share of `plan.md` moved to `Plan.md` lands at the
 /// spelling the team already has: `Plan.md` is no key, and her text stands at
-/// `plan.md`. An unedited case move looks the same until something tells them
-/// apart, and it must not end there, on either disk: the team's text has to differ
-/// from the start.
+/// `plan.md`. On a disk that keeps the two apart the same sides are a colleague who
+/// wrote her text at the old spelling, and her move is not done, so this asks the
+/// disk.
 ///
-/// With only `generated` between the team's text and an unedited draft, the stamp
-/// is what tells. Her own landing carries her stamp, so the two are equal to the
-/// letter. Another stamp is a colleague's touch of a line that is no one's words,
-/// which must not end her move.
+/// The team's text has to be a change from her start, beyond `generated`: an
+/// unedited case move holds the start there until it lands and after, and it stays
+/// in step, on either disk, rather than end on a stamp.
 fn case_move_landed_at_the_old_spelling(sides: &DraftSides<'_>, local: &str) -> bool {
     let Some(from) = sides.from else {
         return false;
     };
-    if from.to_lowercase() != sides.path.to_lowercase() {
+    if !sides.folds_case || from.to_lowercase() != sides.path.to_lowercase() {
         return false;
     }
     // A row at its own path never gets here with a text: `can_tell` holds its two
     // team texts equal, and the one at the path is absent.
-    let Team::Text(team) = Team::read(sides.team_at_from) else {
+    let team = Team::read(sides.team_at_from);
+    let Some(text) = team.text() else {
         return false;
     };
-    let start = sides.start.map(to_lf);
-    if start.as_deref() == Some(&*team) || !same_but_generated(&team, local) {
-        return false;
-    }
-    let unedited = start.is_some_and(|start| {
-        same_but_generated(local, &in_draft_coordinates(&start, Some(from), sides.path))
-    });
-    !unedited || *team == *to_lf(local)
+    !team.is_start(sides) && same_but_generated(text, local)
 }
 
 /// What should happen to this row. First match wins:
 ///
-/// 1. What cannot be told: [`DraftConflictKind::UnknownStart`].
+/// 1. A shape no writer leaves: [`DraftConflictKind::UnknownStart`].
+///
+///    Before the rest, a draft whose own share the team holds at its path reads
+///    from that share (`after_her_share`).
 /// 2. It has landed ([`has_landed`]): [`DraftStep::Landed`].
 /// 3. The team holds the path and she did not start from it, compared to the
-///    letter: `AddAdd`, or `DeleteEdit` for a tombstone. On a disk that keeps
-///    `Note.md` and `note.md` apart those are two files, and in step at one says
-///    nothing about the other. Sides read from real keys never show a case move's
-///    own copy here, so folding the names would protect nothing and lose his file.
-/// 4. The team's text at `from` equals the start, or both are absent:
-///    [`DraftStep::InStep`].
-/// 5. A tombstone: `DeleteEdit`.
-/// 6. The team's text is gone: `EditDelete`, edit or not. A moved file going away
+///    letter: `AddAdd`, or `DeleteEdit` for a tombstone; `UnknownStart` when
+///    either path is a key with no readable copy. On a disk that keeps `Note.md` and `note.md` apart
+///    those are two files, and in step at one says nothing about the other. Sides
+///    read from real keys never show a case move's own copy here, so folding the
+///    names would protect nothing and lose his file. A team text equal to her draft
+///    is no file of his to lose, so it goes on to the rules below.
+/// 4. The team's text at `from` is her start, but for `generated`, or both are
+///    absent: [`DraftStep::InStep`]. A start with no text compares by digest.
+/// 5. No readable copy at `from`: `UnknownStart`.
+/// 6. A tombstone: `DeleteEdit`.
+/// 7. The team's text is gone: `EditDelete`, edit or not. A moved file going away
 ///    is told.
-/// 7. The team's text is not text: a conflict, as `merge_file` would answer one.
-/// 8. No edit of hers: the team's text, with no merge.
-/// 9. The team did nothing in the draft's coordinates: her text, and the start
-///    moves on. `merge_file` says `Converged` here too, and that one must not take
-///    the team's text, which would drop her edit.
-/// 10. The merge.
+/// 8. The team's text is not text, or her start is a digest: a conflict, as
+///    `merge_file` would answer one. There is nothing to merge against.
+/// 9. No edit of hers: the team's text, with no merge.
+/// 10. The team did nothing in the draft's coordinates: her text, and the start
+///     moves on. `merge_file` says `Converged` here too, and that one must not take
+///     the team's text, which would drop her edit.
+/// 11. The merge.
+///
+/// A `Take` is `edited` exactly when a merge changed her words, beyond
+/// `generated`: that is what she is told about.
 pub fn next_step(sides: &DraftSides<'_>) -> DraftStep {
     use DraftConflictKind::{AddAdd, DeleteEdit, EditDelete, EditEdit, UnknownStart};
 
     if !can_tell(sides) {
         return DraftStep::Conflict(UnknownStart);
     }
+    let sides = &after_her_share(sides);
     if has_landed(sides) {
         return DraftStep::Landed;
     }
     if sides.team_at_path != TeamText::Absent && sides.from != Some(sides.path) {
-        return DraftStep::Conflict(if sides.local.is_some() {
-            AddAdd
-        } else {
-            DeleteEdit
-        });
+        let at_path = Team::read(sides.team_at_path);
+        let hers = sides
+            .local
+            .zip(at_path.text())
+            .is_some_and(|(local, team)| same_but_generated(team, local));
+        if !hers {
+            let unreadable = matches!(at_path, Team::Unreadable(_))
+                || matches!(sides.team_at_from, TeamText::Unreadable { .. });
+            return DraftStep::Conflict(match sides.local {
+                _ if unreadable => UnknownStart,
+                Some(_) => AddAdd,
+                None => DeleteEdit,
+            });
+        }
     }
-    let start = sides.start.map(to_lf);
     let team = Team::read(sides.team_at_from);
-    let in_step = match (&team, &start) {
-        (Team::Absent, None) => true,
-        (Team::Text(team), Some(start)) => team == start,
-        _ => false,
-    };
-    if in_step {
+    if team.is_start(sides) {
         return DraftStep::InStep;
+    }
+    if let Team::Unreadable(_) = team {
+        return DraftStep::Conflict(UnknownStart);
     }
     let Some(local) = sides.local.map(to_lf) else {
         return DraftStep::Conflict(DeleteEdit);
     };
-    let team = match &team {
-        Team::Absent => return DraftStep::Conflict(EditDelete),
-        Team::NotText => {
-            return DraftStep::Conflict(if start.is_some() { EditEdit } else { AddAdd });
+    let (team, start) = match (&team, sides.start) {
+        (Team::Absent, _) => return DraftStep::Conflict(EditDelete),
+        (Team::Text { text, .. }, Some(start)) => (text, Some(to_lf(start))),
+        (Team::Text { text, .. }, None) if sides.start_sha256.is_none() => (text, None),
+        _ if sides.start.is_some() || sides.start_sha256.is_some() => {
+            return DraftStep::Conflict(EditEdit);
         }
-        Team::Text(team) => in_draft_coordinates(team, sides.from, sides.path),
+        _ => return DraftStep::Conflict(AddAdd),
     };
+    let team = in_draft_coordinates(team, sides.from, sides.path);
     let ancestor = start
         .as_deref()
         .map(|start| in_draft_coordinates(start, sides.from, sides.path));
@@ -265,7 +375,10 @@ pub fn next_step(sides: &DraftSides<'_>) -> DraftStep {
             edited: false,
         };
     }
-    if ancestor.as_deref() == Some(&*team) {
+    if ancestor
+        .as_deref()
+        .is_some_and(|ancestor| same_but_generated(ancestor, &team))
+    {
         return DraftStep::Take {
             text: local.into_owned(),
             edited: false,
@@ -277,15 +390,16 @@ pub fn next_step(sides: &DraftSides<'_>) -> DraftStep {
         Some(local.as_bytes()),
         Some(team.as_bytes()),
     );
+    let take = |text: String| DraftStep::Take {
+        edited: !same_but_generated(&text, &local),
+        text,
+    };
     match merged {
         FileMerge::Apply(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => DraftStep::Take { text, edited: true },
+            Ok(text) => take(text),
             Err(_) => DraftStep::Conflict(EditEdit),
         },
-        FileMerge::Converged => DraftStep::Take {
-            text: team.into_owned(),
-            edited: true,
-        },
+        FileMerge::Converged => take(team.into_owned()),
         // Her draft and the team's text are both here, so nothing says delete.
         FileMerge::Delete => DraftStep::Conflict(EditDelete),
         FileMerge::Conflict(kind) => DraftStep::Conflict(kind.into()),
@@ -306,7 +420,9 @@ impl From<ConflictKind> for DraftConflictKind {
 #[cfg(test)]
 mod tests {
     use super::DraftConflictKind::{AddAdd, DeleteEdit, EditDelete, EditEdit, UnknownStart};
-    use super::TeamText::{Absent, Held, Unreadable};
+    use super::TeamText::{Absent, Held};
+
+    const NO_COPY: TeamText<'static> = TeamText::Unreadable { sha256: "0000" };
     use super::*;
 
     // One text at every stage, in LF. Her line is at the top and his at the
@@ -365,17 +481,46 @@ mod tests {
         at_path: TeamText<'static>,
         at_from: TeamText<'static>,
         step: DraftStep,
+        disk: Disk,
+    }
+
+    /// Which disk kinds a row stands for. The function is pure, so a disk shows
+    /// only in which keys the snapshot holds and in `folds_case`; a row the two
+    /// answer alike runs on both.
+    #[derive(Clone, Copy)]
+    enum Disk {
+        Either,
+        Folding,
+        CaseSensitive,
+    }
+
+    impl Disk {
+        fn folds(self) -> &'static [bool] {
+            match self {
+                Disk::Either => &[true, false],
+                Disk::Folding => &[true],
+                Disk::CaseSensitive => &[false],
+            }
+        }
     }
 
     impl Row {
-        fn sides(&self) -> DraftSides<'_> {
+        fn on(mut self, disk: Disk) -> Self {
+            self.disk = disk;
+            self
+        }
+
+        fn sides(&self, folds_case: bool) -> DraftSides<'_> {
             DraftSides {
                 path: self.path,
                 from: self.from,
                 start: self.start,
+                start_sha256: None,
+                shared: None,
                 local: self.local,
                 team_at_path: self.at_path,
                 team_at_from: self.at_from,
+                folds_case,
             }
         }
     }
@@ -383,13 +528,15 @@ mod tests {
     fn check(rows: Vec<Row>) {
         let mut wrong = Vec::new();
         for row in &rows {
-            let step = next_step(&row.sides());
-            let landed = has_landed(&row.sides());
-            if step != row.step || landed != (row.step == DraftStep::Landed) {
-                wrong.push(format!(
-                    "{}: wanted {:?}, got {:?} (has_landed {landed})",
-                    row.name, row.step, step
-                ));
+            for &folds in row.disk.folds() {
+                let step = next_step(&row.sides(folds));
+                let landed = has_landed(&row.sides(folds));
+                if step != row.step || landed != (row.step == DraftStep::Landed) {
+                    wrong.push(format!(
+                        "{} (folds case: {folds}): wanted {:?}, got {:?} (has_landed {landed})",
+                        row.name, row.step, step
+                    ));
+                }
             }
         }
         assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
@@ -407,9 +554,20 @@ mod tests {
             path,
             from,
             start,
+            start_sha256: None,
+            shared: None,
             local,
             team_at_path,
             team_at_from,
+            folds_case: false,
+        }
+    }
+
+    /// The same sides on a disk that folds case.
+    fn folding(sides: DraftSides<'_>) -> DraftSides<'_> {
+        DraftSides {
+            folds_case: true,
+            ..sides
         }
     }
 
@@ -430,6 +588,7 @@ mod tests {
             at_path: team,
             at_from: team,
             step,
+            disk: Disk::Either,
         }
     }
 
@@ -450,6 +609,7 @@ mod tests {
             at_path,
             at_from,
             step,
+            disk: Disk::Either,
         }
     }
 
@@ -472,6 +632,7 @@ mod tests {
             at_path,
             at_from,
             step,
+            disk: Disk::Either,
         }
     }
 
@@ -491,6 +652,7 @@ mod tests {
             at_path,
             at_from: Absent,
             step,
+            disk: Disk::Either,
         }
     }
 
@@ -542,13 +704,6 @@ mod tests {
                 Absent,
                 DraftStep::Landed,
             ),
-            renamed(
-                "a peer put the same text at her path, from in step",
-                HERS,
-                held(HERS),
-                held(START),
-                DraftStep::Landed,
-            ),
             new_file("her new file landed", HERS, held(HERS), DraftStep::Landed),
             // Case move, edited, shared.
             case_moved(
@@ -557,14 +712,16 @@ mod tests {
                 held(HERS),
                 Absent,
                 DraftStep::Landed,
-            ),
+            )
+            .on(Disk::CaseSensitive),
             case_moved(
                 "[folding] edited case move landed at the team's spelling",
                 HERS,
                 Absent,
                 held(HERS),
                 DraftStep::Landed,
-            ),
+            )
+            .on(Disk::Folding),
         ]);
     }
 
@@ -627,14 +784,16 @@ mod tests {
                 held(NEW_FILE),
                 held(START),
                 conflict(AddAdd),
-            ),
+            )
+            .on(Disk::CaseSensitive),
             case_moved(
                 "[case-sensitive] same, her draft edited",
                 HERS,
                 held(NEW_FILE),
                 held(START),
                 conflict(AddAdd),
-            ),
+            )
+            .on(Disk::CaseSensitive),
             // The team made the same case move and went on.
             case_moved(
                 "[either disk] the team moved it to her spelling and edited it",
@@ -809,7 +968,8 @@ mod tests {
                 None,
                 held(HERS),
                 conflict(DeleteEdit),
-            ),
+            )
+            .on(Disk::Folding),
         ]);
     }
 
@@ -858,7 +1018,7 @@ mod tests {
                 HERS,
                 Absent,
                 held(HERS),
-                take(HERS, true),
+                take(HERS, false),
             ),
             // Nothing to work from: no start, so the two texts are a both-added.
             own(
@@ -882,33 +1042,28 @@ mod tests {
                 "tombstone over a key with no copy",
                 Some(START),
                 None,
-                Unreadable,
+                NO_COPY,
                 unknown(),
             ),
             own(
                 "draft at a key with no copy",
                 Some(START),
                 Some(HERS),
-                Unreadable,
+                NO_COPY,
                 unknown(),
             ),
             own(
                 "draft equal to the start at a key with no copy",
                 Some(START),
                 Some(START),
-                Unreadable,
+                NO_COPY,
                 unknown(),
             ),
-            new_file(
-                "new file over a key with no copy",
-                HERS,
-                Unreadable,
-                unknown(),
-            ),
+            new_file("new file over a key with no copy", HERS, NO_COPY, unknown()),
             renamed(
                 "no copy at the path, from in step",
                 HERS,
-                Unreadable,
+                NO_COPY,
                 held(START),
                 unknown(),
             ),
@@ -916,23 +1071,24 @@ mod tests {
                 "no copy at from, from would be gone",
                 HERS,
                 Absent,
-                Unreadable,
+                NO_COPY,
                 unknown(),
             ),
             renamed(
                 "no copy at from, her text at the path",
                 HERS,
                 held(HERS),
-                Unreadable,
+                NO_COPY,
                 unknown(),
             ),
             case_moved(
                 "[folding] the snapshot holds both spellings, with one copy",
                 HERS,
-                Unreadable,
-                Unreadable,
+                NO_COPY,
+                NO_COPY,
                 unknown(),
-            ),
+            )
+            .on(Disk::Folding),
             // Shapes no writer leaves.
             Row {
                 name: "new file with a start",
@@ -943,6 +1099,7 @@ mod tests {
                 at_path: Absent,
                 at_from: Absent,
                 step: unknown(),
+                disk: Disk::Either,
             },
             Row {
                 name: "new file with a team text at a from it does not have",
@@ -953,6 +1110,7 @@ mod tests {
                 at_path: Absent,
                 at_from: held(START),
                 step: unknown(),
+                disk: Disk::Either,
             },
             Row {
                 name: "one path, two team texts",
@@ -963,6 +1121,7 @@ mod tests {
                 at_path: held(HERS),
                 at_from: held(START),
                 step: unknown(),
+                disk: Disk::Either,
             },
         ]);
     }
@@ -981,6 +1140,7 @@ mod tests {
                 at_path: held(NEW_FILE),
                 at_from: held(START),
                 step: conflict(DeleteEdit),
+                disk: Disk::Either,
             },
             Row {
                 name: "no from, the team has this path",
@@ -991,6 +1151,7 @@ mod tests {
                 at_path: held(NEW_FILE),
                 at_from: Absent,
                 step: conflict(DeleteEdit),
+                disk: Disk::Either,
             },
             Row {
                 name: "from another path, the team does not have this path",
@@ -1001,6 +1162,7 @@ mod tests {
                 at_path: Absent,
                 at_from: held(HIS),
                 step: DraftStep::Landed,
+                disk: Disk::Either,
             },
         ]);
     }
@@ -1081,14 +1243,14 @@ mod tests {
     #[test]
     fn a_crlf_landed_case_move_at_the_old_spelling_has_landed() {
         let team = crlf(HERS);
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(HERS),
             Absent,
             Held(&team),
-        );
+        ));
         assert_eq!(next_step(&row), DraftStep::Landed);
     }
 
@@ -1122,122 +1284,124 @@ mod tests {
     #[test]
     fn an_unedited_case_move_has_not_landed() {
         // Team at from equals the start, on either disk, with no line touched.
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(START),
             Absent,
             held(START),
-        );
+        ));
         assert!(!has_landed(&row));
         assert_eq!(next_step(&row), DraftStep::InStep);
         // A CRLF team file is no change either.
         let team = crlf(START);
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(START),
             Absent,
             Held(&team),
-        );
+        ));
         assert!(!has_landed(&row));
         assert_eq!(next_step(&row), DraftStep::InStep);
         // The move touched her `generated` line; nothing else changed.
         let mine = stamped(START, "2026-11-06T11:00:00Z");
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(&mine),
             Absent,
             held(START),
-        );
+        ));
         assert!(!has_landed(&row));
         assert_eq!(next_step(&row), DraftStep::InStep);
     }
 
-    /// F5: a colleague's touch of the line that is no one's words must not end
-    /// her case move. The clause in the brief reads this as landed.
+    /// F5 and C8: a colleague's touch of the line that is no one's words is no
+    /// change. It neither ends her case move nor moves her start.
     #[test]
     fn a_peers_touch_of_generated_does_not_end_an_unedited_case_move() {
         let team = stamped(START, "2026-11-06T12:00:00Z");
-        let row = sides(
-            "Plan.md",
-            Some("plan.md"),
-            Some(START),
-            Some(START),
-            Absent,
-            Held(team.as_bytes()),
-        );
-        assert!(!has_landed(&row));
-        assert_eq!(next_step(&row), take(&team, false));
-        // Her move touched the line as well, with another stamp.
-        let mine = stamped(START, "2026-11-06T11:00:00Z");
-        let row = sides(
-            "Plan.md",
-            Some("plan.md"),
-            Some(START),
-            Some(&mine),
-            Absent,
-            Held(team.as_bytes()),
-        );
-        assert!(!has_landed(&row));
-        assert_eq!(next_step(&row), take(&team, false));
+        for mine in [START.to_string(), stamped(START, "2026-11-06T11:00:00Z")] {
+            for folds_case in [true, false] {
+                let row = DraftSides {
+                    folds_case,
+                    ..sides(
+                        "Plan.md",
+                        Some("plan.md"),
+                        Some(START),
+                        Some(&mine),
+                        Absent,
+                        Held(team.as_bytes()),
+                    )
+                };
+                assert!(!has_landed(&row));
+                assert_eq!(next_step(&row), DraftStep::InStep);
+            }
+        }
     }
 
+    /// M6: an unedited case move whose share changed only her stamp is no change
+    /// either, so it stays in step, as an unedited case move does, on both disks.
     #[test]
-    fn a_case_move_whose_only_change_is_generated_ends_when_it_lands() {
+    fn a_case_move_whose_only_change_is_generated_stays_in_step_when_it_lands() {
         let mine = stamped(START, "2026-11-06T11:00:00Z");
-        let row = sides(
-            "Plan.md",
-            Some("plan.md"),
-            Some(START),
-            Some(&mine),
-            Absent,
-            Held(mine.as_bytes()),
-        );
-        assert!(has_landed(&row));
-        assert_eq!(next_step(&row), DraftStep::Landed);
+        for folds_case in [true, false] {
+            let row = DraftSides {
+                folds_case,
+                ..sides(
+                    "Plan.md",
+                    Some("plan.md"),
+                    Some(START),
+                    Some(&mine),
+                    Absent,
+                    Held(mine.as_bytes()),
+                )
+            };
+            assert!(!has_landed(&row));
+            assert_eq!(next_step(&row), DraftStep::InStep);
+        }
     }
 
     #[test]
     fn an_edited_case_move_whose_text_stands_at_the_old_spelling_has_landed() {
         // [folding]: the share kept the team's spelling.
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(HERS),
             Absent,
             held(HERS),
-        );
+        ));
         assert!(has_landed(&row));
         assert_eq!(next_step(&row), DraftStep::Landed);
         // A touched stamp since then changes nothing.
         let team = stamped(HERS, "2026-11-06T12:00:00Z");
-        let row = sides(
+        let row = folding(sides(
             "Plan.md",
             Some("plan.md"),
             Some(START),
             Some(HERS),
             Absent,
             Held(team.as_bytes()),
-        );
+        ));
         assert!(has_landed(&row));
         // A spelling of another name is not a case move: this is a rename, and a
         // file holding her text at its old path has not landed at the new one.
-        let row = sides(
+        let row = folding(sides(
             "renamed.md",
             Some("plan.md"),
             Some(START),
             Some(HERS),
             Absent,
             held(HERS),
-        );
+        ));
         assert!(!has_landed(&row));
-        assert_eq!(next_step(&row), take(HERS, true));
+        assert_eq!(next_step(&row), take(HERS, false));
         // [case-sensitive] two files: his at her spelling, her text at the old one.
         // Her text did not land where she moved it.
         let row = sides(
@@ -1382,6 +1546,18 @@ mod tests {
         let start = "---\ntitle: Plan\n---\nsee [o](other.md)\nbeta\ngamma\ndelta\n";
         let his = "---\ntitle: Plan\n---\nsee [o](./other.md)\nbeta\ngamma\ndelta\n";
         let mine = "---\ntitle: Plan\n---\nsee [o](../a/other.md)\nbeta\ngamma\ndelta hers\n";
+        // His also touched the stamp: still nothing of his in the new folder.
+        let his_stamped =
+            "---\ntitle: Plan\ngenerated: x\n---\nsee [o](./other.md)\nbeta\ngamma\ndelta\n";
+        let row = sides(
+            "b/plan.md",
+            Some("a/plan.md"),
+            Some(start),
+            Some(mine),
+            Absent,
+            Held(his_stamped.as_bytes()),
+        );
+        assert_eq!(next_step(&row), take(mine, false));
         let row = sides(
             "b/plan.md",
             Some("a/plan.md"),
@@ -1676,26 +1852,6 @@ mod tests {
     }
 
     #[test]
-    fn a_peers_touch_of_generated_does_not_end_a_case_move_with_a_link_to_itself() {
-        // Her draft is the start with the link rebased, so only a start in the
-        // draft's coordinates reads it as unedited.
-        let start = "---\ntitle: Plan\nstatus: draft\n---\nself [me](plan.md)\n";
-        let mine = "---\ntitle: Plan\nstatus: draft\n---\nself [me](Plan.md)\n";
-        // A team text in her coordinates, one stamp apart: a peer who made this
-        // same link change has not landed her unedited move.
-        let team = stamped(mine, "2026-11-06T12:00:00Z");
-        let row = sides(
-            "Plan.md",
-            Some("plan.md"),
-            Some(start),
-            Some(mine),
-            Absent,
-            Held(team.as_bytes()),
-        );
-        assert!(!has_landed(&row));
-    }
-
-    #[test]
     fn a_merge_conflict_keeps_its_kind() {
         for (kind, wanted) in [
             (ConflictKind::EditEdit, EditEdit),
@@ -1705,6 +1861,330 @@ mod tests {
         ] {
             assert_eq!(DraftConflictKind::from(kind), wanted);
         }
+    }
+
+    /// C8 (review M1, N1): a team change of only `generated` is no change. A
+    /// tombstone against it is no conflict, an edit against it is in step and gets
+    /// no notice, on both disks.
+    #[test]
+    fn a_team_change_of_only_generated_is_no_change() {
+        let team = stamped(START, "2026-11-06T12:00:00Z");
+        let team = Held(team.as_bytes());
+        for folds_case in [true, false] {
+            let at = |path, from, local| DraftSides {
+                folds_case,
+                ..sides(path, from, Some(START), local, team, team)
+            };
+            // P1: her deletion.
+            assert_eq!(
+                next_step(&at("plan.md", Some("plan.md"), None)),
+                DraftStep::InStep
+            );
+            // P2: her edit at its own path, and moved.
+            assert_eq!(
+                next_step(&at("plan.md", Some("plan.md"), Some(HERS))),
+                DraftStep::InStep
+            );
+            let moved = DraftSides {
+                team_at_path: Absent,
+                ..at("renamed.md", Some("plan.md"), Some(HERS))
+            };
+            assert_eq!(next_step(&moved), DraftStep::InStep);
+        }
+        // A real change with a stamp on it is still a change, and her edit merges.
+        let his = stamped(HIS, "2026-11-06T12:00:00Z");
+        let row = sides(
+            "plan.md",
+            Some("plan.md"),
+            Some(START),
+            Some(HERS),
+            Held(his.as_bytes()),
+            Held(his.as_bytes()),
+        );
+        assert_eq!(
+            next_step(&row),
+            take(&stamped(BOTH, "2026-11-06T12:00:00Z"), true)
+        );
+    }
+
+    /// C8 (review N1): `edited` says whether her words changed, so a merge that
+    /// leaves her text as it was sends no notice.
+    #[test]
+    fn a_merge_that_changes_nothing_of_hers_is_not_edited() {
+        // The team made her edit too, with another stamp.
+        let mine = stamped(HERS, "2026-11-06T11:00:00Z");
+        let his = stamped(HERS, "2026-11-06T10:00:00Z");
+        let row = sides(
+            "renamed.md",
+            Some("plan.md"),
+            Some(START),
+            Some(&mine),
+            Absent,
+            Held(his.as_bytes()),
+        );
+        assert_eq!(next_step(&row), take(&mine, false));
+        // The other way round, the merge takes his newer stamp: her words are as
+        // they were, so still no notice.
+        let row = sides(
+            "renamed.md",
+            Some("plan.md"),
+            Some(START),
+            Some(&his),
+            Absent,
+            Held(mine.as_bytes()),
+        );
+        assert_eq!(next_step(&row), take(&mine, false));
+    }
+
+    /// C8 (review M2): her text at her new path ends the move only when the team
+    /// has let go of where she started, or, on a folding disk, keeps her case
+    /// move's text at the old spelling. Otherwise her deletion of `from` is still
+    /// to come and must not vanish with the draft.
+    #[test]
+    fn a_landed_text_ends_the_move_only_when_the_team_let_go_of_from() {
+        let stamped_hers: &'static str =
+            Box::leak(stamped(HERS, "2026-11-06T12:00:00Z").into_boxed_str());
+        check(vec![
+            renamed(
+                "P3: edited, a peer wrote her text at her path, from held at the start",
+                HERS,
+                held(HERS),
+                held(START),
+                DraftStep::InStep,
+            ),
+            renamed(
+                "P3: same, his copy with another stamp",
+                HERS,
+                held(stamped_hers),
+                held(START),
+                DraftStep::InStep,
+            ),
+            renamed(
+                "P3b: unedited, the team holds her text at both paths",
+                START,
+                held(START),
+                held(START),
+                DraftStep::InStep,
+            ),
+            renamed(
+                "P3, the team also changed from: merged in her coordinates",
+                HERS,
+                held(HERS),
+                held(HIS),
+                take(BOTH, true),
+            ),
+            renamed(
+                "from gone: landed",
+                HERS,
+                held(HERS),
+                Absent,
+                DraftStep::Landed,
+            ),
+            case_moved(
+                "[folding] P4's sides are her own landing at the old spelling",
+                HERS,
+                Absent,
+                held(HERS),
+                DraftStep::Landed,
+            )
+            .on(Disk::Folding),
+            case_moved(
+                "[case-sensitive] P4: a peer wrote her edit at plan.md, Plan.md absent",
+                HERS,
+                Absent,
+                held(HERS),
+                take(HERS, false),
+            )
+            .on(Disk::CaseSensitive),
+            case_moved(
+                "[case-sensitive] her landing there: her spelling held, the old one gone",
+                HERS,
+                held(HERS),
+                Absent,
+                DraftStep::Landed,
+            )
+            .on(Disk::CaseSensitive),
+        ]);
+    }
+
+    const AGAIN: &str = "---\ntitle: Plan\nstatus: draft\n---\nalpha hers\nbeta\ngamma again\ndelta\nepsilon\nzeta\neta\n";
+
+    /// C8 (review M3): her own share, edited again before a pass got to it, reads
+    /// her newer edit against what she shared, not as a conflict with herself.
+    #[test]
+    fn her_own_share_edited_again_after_a_failed_pass_is_in_step() {
+        let shared = |row: DraftSides<'static>| DraftSides {
+            shared: Some(HERS),
+            ..row
+        };
+        for folds_case in [true, false] {
+            let on = |row: DraftSides<'static>| DraftSides { folds_case, ..row };
+            // P9: a move shared directly, then edited again.
+            let p9 = shared(on(sides(
+                "renamed.md",
+                Some("plan.md"),
+                Some(START),
+                Some(AGAIN),
+                held(HERS),
+                Absent,
+            )));
+            assert!(!has_landed(&p9));
+            assert_eq!(next_step(&p9), DraftStep::InStep);
+            // P10: the same at its own path.
+            let p10 = shared(on(sides(
+                "plan.md",
+                Some("plan.md"),
+                Some(START),
+                Some(AGAIN),
+                held(HERS),
+                held(HERS),
+            )));
+            assert_eq!(next_step(&p10), DraftStep::InStep);
+            // The team's copy of her share carries another stamp: still hers.
+            let stamped_share: &'static str =
+                Box::leak(stamped(HERS, "2026-11-06T12:00:00Z").into_boxed_str());
+            let p10 = DraftSides {
+                team_at_path: held(stamped_share),
+                team_at_from: held(stamped_share),
+                ..p10
+            };
+            assert_eq!(next_step(&p10), DraftStep::InStep);
+            // Unedited since the share: landed, as without the record of it.
+            let landed = shared(on(sides(
+                "plan.md",
+                Some("plan.md"),
+                Some(START),
+                Some(HERS),
+                held(HERS),
+                held(HERS),
+            )));
+            assert_eq!(next_step(&landed), DraftStep::Landed);
+        }
+        // Without the record of her share these are the false conflicts.
+        let p9 = sides(
+            "renamed.md",
+            Some("plan.md"),
+            Some(START),
+            Some(AGAIN),
+            held(HERS),
+            Absent,
+        );
+        assert_eq!(next_step(&p9), conflict(AddAdd));
+        // The team went on after her share: nothing says it holds her share, so
+        // the start she had answers, and his line and her newer one both stay.
+        let on_top = "---\ntitle: Plan\nstatus: draft\n---\nalpha hers\nbeta\ngamma\ndelta\nepsilon\nzeta\neta his\n";
+        let row = shared(sides(
+            "plan.md",
+            Some("plan.md"),
+            Some(START),
+            Some(AGAIN),
+            held(on_top),
+            held(on_top),
+        ));
+        assert_eq!(
+            next_step(&row),
+            take(
+                "---\ntitle: Plan\nstatus: draft\n---\nalpha hers\nbeta\ngamma again\ndelta\nepsilon\nzeta\neta his\n",
+                true
+            )
+        );
+        // A share of a move whose start the team still holds is not taken as
+        // landed: her deletion of plan.md has not happened.
+        let row = shared(sides(
+            "renamed.md",
+            Some("plan.md"),
+            Some(START),
+            Some(AGAIN),
+            held(HERS),
+            held(START),
+        ));
+        assert_ne!(next_step(&row), DraftStep::Landed);
+        assert_ne!(next_step(&row), DraftStep::InStep);
+    }
+
+    /// C8 (review M4, M5): Keep mine on a team file with no text writes the
+    /// file's digest as the start, and that settles it: in step until the team's
+    /// bytes change again.
+    #[test]
+    fn keep_mine_settles_a_team_file_with_no_text() {
+        let not_text_sha = crate::engine::sha256_hex(NOT_TEXT);
+        let his_sha = crate::engine::sha256_hex(HIS.as_bytes());
+        let kept = |start_sha256, local, team| DraftSides {
+            start_sha256: Some(start_sha256),
+            ..sides("plan.md", Some("plan.md"), None, local, team, team)
+        };
+        for local in [Some(HERS), None] {
+            // A key with no readable copy: the stamp's digest.
+            assert_eq!(next_step(&kept("0000", local, NO_COPY)), DraftStep::InStep);
+            let other = TeamText::Unreadable { sha256: "1111" };
+            assert_eq!(
+                next_step(&kept("0000", local, other)),
+                conflict(UnknownStart)
+            );
+            // Bytes that are not UTF-8.
+            assert_eq!(
+                next_step(&kept(&not_text_sha, local, Held(NOT_TEXT))),
+                DraftStep::InStep
+            );
+            // The copy came back, or the team wrote text: the digest still compares.
+            assert_eq!(
+                next_step(&kept(&his_sha, local, held(HIS))),
+                DraftStep::InStep
+            );
+        }
+        // Changed since she kept hers: the kinds as before.
+        assert_eq!(
+            next_step(&kept(&his_sha, Some(HERS), Held(NOT_TEXT))),
+            conflict(EditEdit)
+        );
+        assert_eq!(
+            next_step(&kept(&not_text_sha, None, Held(&[0xfe]))),
+            conflict(DeleteEdit)
+        );
+        assert_eq!(
+            next_step(&kept(&not_text_sha, Some(HERS), held(HIS))),
+            conflict(EditEdit)
+        );
+        // Gone since: as for a text start.
+        assert_eq!(
+            next_step(&kept(&not_text_sha, Some(HERS), Absent)),
+            conflict(EditDelete)
+        );
+        assert_eq!(
+            next_step(&kept(&not_text_sha, None, Absent)),
+            DraftStep::Landed
+        );
+        // Shapes no writer leaves: a text and a digest, or a digest for a new file.
+        let both = DraftSides {
+            start: Some(START),
+            ..kept(&his_sha, Some(HERS), held(HIS))
+        };
+        assert_eq!(next_step(&both), conflict(UnknownStart));
+        let new_file = DraftSides {
+            from: None,
+            team_at_from: Absent,
+            team_at_path: Absent,
+            ..kept(&his_sha, Some(HERS), Absent)
+        };
+        assert_eq!(next_step(&new_file), conflict(UnknownStart));
+    }
+
+    /// C5 with N2: a key with no readable copy is never read as absent, also where
+    /// she never saw the file.
+    #[test]
+    fn a_key_with_no_copy_is_never_absent() {
+        let row = sides("plan.md", Some("plan.md"), None, None, NO_COPY, NO_COPY);
+        assert!(!has_landed(&row));
+        assert_eq!(next_step(&row), conflict(UnknownStart));
+        let row = sides(
+            "plan.md",
+            Some("plan.md"),
+            None,
+            Some(HERS),
+            NO_COPY,
+            NO_COPY,
+        );
+        assert_eq!(next_step(&row), conflict(UnknownStart));
     }
 
     #[test]
@@ -1730,7 +2210,7 @@ mod tests {
         let crlf_his = crlf(HIS);
         let teams: Vec<TeamText<'_>> = vec![
             Absent,
-            Unreadable,
+            NO_COPY,
             Held(NOT_TEXT),
             held(START),
             Held(&crlf_start),
@@ -1751,18 +2231,25 @@ mod tests {
         ];
         let froms = [None, Some("plan.md"), Some("Plan.md"), Some("old.md")];
         let mut seen = 0usize;
-        for from in froms {
+        for (from, folds_case) in froms
+            .into_iter()
+            .flat_map(|from| [(from, true), (from, false)])
+        {
             for start in [None, Some(START)] {
                 for local in locals {
                     for &at_path in &teams {
                         for &at_from in &teams {
                             seen += 1;
-                            let row = sides("plan.md", from, start, local, at_path, at_from);
+                            let row = DraftSides {
+                                folds_case,
+                                ..sides("plan.md", from, start, local, at_path, at_from)
+                            };
                             let context = format!("{row:?}");
                             let step = next_step(&row);
                             let landed = has_landed(&row);
                             assert_eq!(landed, step == DraftStep::Landed, "{context}");
-                            let unreadable = at_path == Unreadable || at_from == Unreadable;
+                            let unreadable = matches!(at_path, TeamText::Unreadable { .. })
+                                || matches!(at_from, TeamText::Unreadable { .. });
                             if unreadable {
                                 assert_eq!(step, conflict(UnknownStart), "{context}");
                             }
@@ -1779,25 +2266,40 @@ mod tests {
                                 // from is never written over with no word.
                                 DraftStep::InStep => {
                                     assert!(
-                                        at_path == Absent || from == Some("plan.md"),
+                                        at_path == Absent
+                                            || from == Some("plan.md")
+                                            || path_text.is_some() && path_text.as_deref() == local,
                                         "{context}"
                                     );
                                     assert_eq!(from_text.as_deref(), start, "{context}");
                                 }
                                 DraftStep::Landed => match local {
                                     None => assert_eq!(at_path, Absent, "{context}"),
+                                    // Her text stands where she put it and the team
+                                    // let go of where she started, or a folding
+                                    // disk kept the old spelling for it.
                                     Some(local) => assert!(
                                         path_text.as_deref() == Some(local)
-                                            || from_text.as_deref() == Some(local),
+                                            && (at_from == Absent
+                                                || from.is_none()
+                                                || from == Some("plan.md"))
+                                            || folds_case
+                                                && at_path == Absent
+                                                && from_text.as_deref() == Some(local),
                                         "{context}"
                                     ),
                                 },
-                                DraftStep::Take { text, .. } => {
+                                DraftStep::Take { text, edited } => {
                                     let local = local.expect("a tombstone never takes");
                                     let team =
                                         from_text.as_deref().expect("a take has a team text");
                                     assert!(!text.contains('\r'), "{context}");
                                     assert!(!text.contains('\u{fffd}'), "{context}");
+                                    // No notice when her words stayed as they were.
+                                    assert!(
+                                        !*edited || !same_but_generated(text, local),
+                                        "{context}"
+                                    );
                                     // His line stays, and hers stays when it is hers.
                                     if team.contains("eta his") {
                                         assert!(text.contains("eta his"), "{context}");
@@ -1813,6 +2315,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, 4 * 2 * 6 * 11 * 11);
+        assert_eq!(seen, 4 * 2 * 2 * 6 * 11 * 11);
     }
 }

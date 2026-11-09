@@ -359,6 +359,7 @@ fn in_step(path: &str, text: &str) -> DraftStart {
         path: path.to_string(),
         from: Some(path.to_string()),
         start: Some(text.to_string()),
+        start_sha256: None,
         shared: None,
         merged_at: None,
     }
@@ -571,6 +572,7 @@ async fn a_tombstone_over_a_draft_from_elsewhere_does_not_read_as_in_step() {
         path: "b.md".to_string(),
         from: Some("b.md".to_string()),
         start: None,
+        start_sha256: None,
         shared: None,
         merged_at: None,
     };
@@ -730,6 +732,7 @@ async fn a_new_file_records_no_start() {
             path: "fresh.md".to_string(),
             from: None,
             start: None,
+            start_sha256: None,
             shared: None,
             merged_at: None,
         }),
@@ -794,6 +797,7 @@ async fn a_tombstone_names_its_own_path_when_the_snapshot_does_not_hold_it() {
         path: path.to_string(),
         from: Some(from.to_string()),
         start: None,
+        start_sha256: None,
         shared: None,
         merged_at: None,
     };
@@ -1593,6 +1597,7 @@ async fn a_followed_team_rename_points_the_record_at_the_new_path() {
             path: "plan-v2.md".to_string(),
             from: Some("plan-v2.md".to_string()),
             start: Some(PLAN.to_string()),
+            start_sha256: None,
             shared: None,
             merged_at: None,
         })

@@ -61,8 +61,16 @@ pub struct DraftStart {
     pub path: String,
     /// The team path the row started from. `None` is a new file.
     pub from: Option<String>,
-    /// The LF text at `from` when last in step. `None` is absent there.
+    /// The LF text at `from` when last in step. `None` is absent there, unless
+    /// `start_sha256` says what stood there.
     pub start: Option<String>,
+    /// The sha-256 of the team's bytes at `from` when last in step, for a start
+    /// that has no text: bytes that are not UTF-8, or a key of the snapshot with no
+    /// readable copy, which Keep mine has to be able to settle. `start` is then
+    /// `None`. Absent from every record written before it, which serde reads as
+    /// `None`, as it does any missing `Option`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_sha256: Option<String>,
     /// What the open proposal holds.
     pub shared: Option<SharedText>,
     /// Set when a merge changed the row. Drives the notice.
@@ -270,6 +278,7 @@ mod tests {
             path: path.to_string(),
             from: Some(path.to_string()),
             start: Some(start.to_string()),
+            start_sha256: None,
             shared: None,
             merged_at: None,
         }
@@ -293,6 +302,7 @@ mod tests {
             path: "note.md".to_string(),
             from: Some("old/note.md".to_string()),
             start: Some("the team's text\n".to_string()),
+            start_sha256: None,
             shared: Some(SharedText {
                 proposal: 42,
                 text: Some("what the proposal holds\n".to_string()),
@@ -303,6 +313,7 @@ mod tests {
             path: "Note.md".to_string(),
             from: None,
             start: None,
+            start_sha256: None,
             shared: Some(SharedText {
                 proposal: 43,
                 text: None,
@@ -814,10 +825,38 @@ mod tests {
                 path: "note.md".to_string(),
                 from: None,
                 start: Some("text\n".to_string()),
+                start_sha256: None,
                 shared: None,
                 merged_at: None,
             })
         );
+    }
+
+    /// A start with no text (Keep mine over bytes that are not UTF-8, or a key
+    /// with no readable copy) keeps its digest. A record without one is written
+    /// as before, so a record of this build and of the build before read alike.
+    #[test]
+    fn a_start_with_no_text_keeps_its_digest_and_a_text_start_is_written_as_before() {
+        let tmp = dir();
+        let state = tmp.path();
+        let digest = DraftStart {
+            start: None,
+            start_sha256: Some("ab12".to_string()),
+            ..record("bytes.md", "unused")
+        };
+        save(state, "team", "alice", &digest).unwrap();
+        assert_eq!(
+            load(state, "team", "alice", "bytes.md").unwrap(),
+            Some(digest)
+        );
+
+        let text = record("text.md", "text\n");
+        save(state, "team", "alice", &text).unwrap();
+        let written =
+            std::fs::read_to_string(record_file(state, "team", "alice", "text.md").unwrap())
+                .unwrap();
+        assert!(!written.contains("start_sha256"), "{written}");
+        assert_eq!(load(state, "team", "alice", "text.md").unwrap(), Some(text));
     }
 
     /// The folder's order is the disk's, so enough names to make a lucky order

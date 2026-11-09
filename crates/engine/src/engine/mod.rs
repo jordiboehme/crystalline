@@ -6039,6 +6039,7 @@ impl Engine {
                     let elsewhere = crate::draft_start::DraftStart {
                         from: Some(desc.path.clone()),
                         start: None,
+                        start_sha256: None,
                         ..before.clone()
                     };
                     crate::draft_start::save(&state_dir, domain, actor, &elsewhere).map_err(io)?;
@@ -6164,6 +6165,7 @@ impl Engine {
                 path: path.to_string(),
                 from: text.is_some().then(|| path.to_string()),
                 start: text,
+                start_sha256: None,
                 shared: None,
                 merged_at: None,
             }))
@@ -6200,6 +6202,7 @@ impl Engine {
             path: path.to_string(),
             from: start.map(|_| path.to_string()),
             start: start.map(|text| crystalline_core::to_lf(text).into_owned()),
+            start_sha256: None,
             shared: None,
             merged_at: None,
         }))
