@@ -39,6 +39,7 @@ Dependency direction: core <- index <- identity <- engine <- rest <- service <- 
 - Rustdoc links: `RUSTDOCFLAGS="-D rustdoc::private_intra_doc_links" cargo doc --no-deps --workspace` (CI runs it since 0.25.1)
 - Style check: `bash scripts/style-lint.sh`
 - Fluid (from `fluid/`): `npm run build`, `npm test -- --run`, `npm run lint`, `pnpm run format:check`, `pnpm typecheck`; CI runs all five, so a change that skips the format check or the typecheck goes red on main. A change that adds, moves or renames a control also runs the browser smoke, `bash fluid/e2e/run-smoke.sh` (needs `pnpm build`, `cargo build -p crystalline` and the chromium install; on a mac export `CRYSTALLINE_TEST_NO_KEYCHAIN=1` first), and greps `fluid/e2e/*.spec.ts` for the accessible names it changed
+- Browser smoke in CI: `fluid-smoke-build` builds the binary once and checks the split, then the `fluid-smoke` matrix runs each shard (`SMOKE_SHARDS` in ci.yml, at the root and under `/crystalline`) with its own daemon. `fluid/scripts/smoke-shards.ts` picks a shard's spec files by measured time; repeat one leg locally with `bash fluid/e2e/run-smoke.sh $(cd fluid && node scripts/smoke-shards.ts 2 5)`, after `export FLUID_E2E_BASE_PATH=/crystalline` for a path leg. A new spec file needs no entry there, but its time in the script's table keeps the shards even
 
 ## Toolchain
 

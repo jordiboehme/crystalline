@@ -322,8 +322,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ env.IDLE != 'true' }}
         with:
-          # Named, so fluid-smoke reads this very entry (same job key as
-          # before). Both Windows partitions share it (the key adds the OS,
+          # Named, so fluid-smoke-build and mcpb read this very entry (same
+          # job key as before). Both Windows partitions share it (the key adds the OS,
           # not the partition) and they build the same thing, so only
           # partition 1 saves: two saves of one key would race for nothing.
           shared-key: test
@@ -521,8 +521,8 @@ jobs:
       # the same corepack release fluid/Dockerfile pins. zizmor's
       # adhoc-packages audit flags any install outside a lockfile; an exact
       # version is as pinned as npm gets here, so that finding is ignored on
-      # this step and on the other corepack steps (fluid-smoke, fluid-audit,
-      # build.yml fluid-dist, release.yml sbom).
+      # this step and on the other corepack steps (fluid-smoke-build,
+      # fluid-smoke, fluid-audit, build.yml fluid-dist, release.yml sbom).
       # Registry fetches retry (scripts/ci/retry.sh) so one slow answer cannot fail a release.
       - name: Enable corepack
         run: | # zizmor: ignore[adhoc-packages]
@@ -651,17 +651,31 @@ jobs:
           npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/desktop-only
 
   # The browser smoke: the built bundle, a real daemon and a real browser. It
-  # covers what jsdom cannot (see fluid/e2e/smoke.spec.ts) and is a job of its
-  # own because it needs the Rust toolchain as well as Node.
-  fluid-smoke:
-    name: fluid-smoke
-    timeout-minutes: 45
+  # covers what jsdom cannot (see fluid/e2e/smoke.spec.ts) and needs the Rust
+  # toolchain as well as Node.
+  #
+  # It runs as two jobs. This one builds the binary once and checks the split;
+  # `fluid-smoke` below is a matrix of shards that each download the binary,
+  # start their own daemon with run-smoke.sh and run a part of the spec files.
+  # The suite in one job took 17 minutes on main and over 28 on a branch with
+  # more diagram specs; the shards run side by side.
+  #
+  # The number of shards is set here once, in SMOKE_SHARDS. The build job
+  # hands it to the matrix as an output, so the legs and the split cannot
+  # disagree. Every shard runs twice: at the root, and under a path prefix.
+  fluid-smoke-build:
+    name: fluid-smoke-build
+    timeout-minutes: 30
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      SMOKE_SHARDS: '5'
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -697,15 +711,71 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: fluid
 
+      - name: Plan the shards
+        id: plan
+        run: |
+          set -euo pipefail
+          case "$SMOKE_SHARDS" in
+            ''|*[!0-9]*|0) echo "::error::SMOKE_SHARDS must be a whole number from 1, not '$SMOKE_SHARDS'"; exit 1 ;;
+          esac
+          echo "total=$SMOKE_SHARDS" >>"$GITHUB_OUTPUT"
+          echo "shards=$(jq -nc --argjson n "$SMOKE_SHARDS" '[range(1; $n + 1)]')" >>"$GITHUB_OUTPUT"
+
+      # The shards run what scripts/smoke-shards.ts gives them, and nothing
+      # may fall out between them. Playwright lists the tests without running
+      # them (no daemon, no browser), so this compares, for both runs, the
+      # tests the shards list together with the whole suite: a test no shard
+      # runs, a test two shards run or an empty shard fails here, before any
+      # shard starts.
+      - name: Every test is in exactly one shard
+        working-directory: fluid
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          # Playwright's --list prints one line per test: two spaces, the
+          # project in brackets, the file with line and column, and the title.
+          tests() {
+            pnpm exec playwright test --list "$@" >"$work/raw"
+            grep '^  \[' "$work/raw" | sort || true
+          }
+          for base in '' /crystalline; do
+            export FLUID_E2E_BASE_PATH="$base"
+            run="${base:-the root}"
+            tests >"$work/all"
+            if [ ! -s "$work/all" ]; then
+              echo "::error::playwright lists no test at all for the run at $run"
+              exit 1
+            fi
+            : >"$work/union"
+            for shard in $(seq 1 "$SMOKE_SHARDS"); do
+              files=$(node scripts/smoke-shards.ts "$shard" "$SMOKE_SHARDS")
+              mapfile -t args <<<"$files"
+              tests "${args[@]}" >"$work/shard"
+              if [ ! -s "$work/shard" ]; then
+                echo "::error::shard $shard/$SMOKE_SHARDS of the run at $run lists no test"
+                exit 1
+              fi
+              echo "shard $shard/$SMOKE_SHARDS ($run): $(wc -l <"$work/shard") tests in $(echo "$files" | tr '\n' ' ')"
+              cat "$work/shard" >>"$work/union"
+            done
+            sort "$work/union" -o "$work/union"
+            if ! diff -u "$work/all" "$work/union"; then
+              echo "::error::the shards of the run at $run do not add up to the suite: a line with - is a test no shard runs, a line with + a test two shards run"
+              exit 1
+            fi
+            echo "the $SMOKE_SHARDS shards of the run at $run hold all $(wc -l <"$work/all") tests, each once"
+          done
+
       # The bundle is built before the binary, and the order is the point: the
       # service crate's build script copies fluid/dist into its OUT_DIR at
       # compile time, so a binary compiled first carries nothing and answers
       # 503 on every navigation. This is the one job in CI that exercises a
       # real embedded bundle (the Rust matrix compiles against the empty
       # placeholder and covers the serving rules with fixture assets), and
-      # run-smoke.sh asserts it against the daemon's own port. The script
-      # builds the bundle again further on for `vite preview`; the second build
-      # is the same inputs and costs a few hundred milliseconds.
+      # run-smoke.sh asserts it against the daemon's own port. Only the binary
+      # travels to the shards: run-smoke.sh builds the bundle again for `vite
+      # preview` on purpose, and the build is the same inputs and costs a few
+      # seconds.
       - name: Build the bundle
         run: pnpm build
         working-directory: fluid
@@ -715,31 +785,103 @@ jobs:
       - name: Build crystalline
         run: cargo build -p crystalline --locked
 
+      # One day is enough: the shards of this run are the only readers. A
+      # re-run of this job uploads the same name again, hence overwrite.
+      - name: Upload the binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fluid-smoke-binary
+          path: target/debug/crystalline
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
+  # One shard of the browser smoke: `run` says at the root or under a path
+  # prefix, `shard` which part of the spec files. Every leg has its own
+  # daemon, its own fixture domains and one Playwright worker, as the whole
+  # suite had in one job. `ci-passed` needs this job, so every leg has to
+  # pass; a failed, cancelled or skipped leg uploads no tested-tree proof.
+  #
+  # The `if` names the build job's result: `!cancelled()` replaces the implicit
+  # success() check, so without it a failed build would still start every leg.
+  fluid-smoke:
+    name: fluid-smoke (${{ matrix.run }}, ${{ matrix.shard }}/${{ needs.fluid-smoke-build.outputs.total }})
+    timeout-minutes: 30
+    needs: fluid-smoke-build
+    if: ${{ !cancelled() && needs.fluid-smoke-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.fluid-smoke-build.outputs.shards) }}
+        run: [root, path]
+    env:
+      # See the fluid job: corepack must not stop to ask before fetching pnpm.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      CRYSTALLINE_BIN: ${{ github.workspace }}/target/debug/crystalline
+      # The run under a path prefix: the same journeys with the daemon under
+      # /crystalline, against the UI it serves itself. The base tag, the
+      # router basename and every address outside the router are what that
+      # run checks. Empty is the run at the root.
+      FLUID_E2E_BASE_PATH: ${{ matrix.run == 'path' && '/crystalline' || '' }}
+      SHARD: ${{ matrix.shard }}
+      TOTAL: ${{ needs.fluid-smoke-build.outputs.total }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same pin and major as the fluid job.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+
+      # Pinned corepack; the fluid job explains the zizmor ignore.
+      # Registry fetches retry (scripts/ci/retry.sh) so one slow answer cannot fail a release.
+      - name: Enable corepack
+        run: | # zizmor: ignore[adhoc-packages]
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 npm install --global corepack@0.36.0
+          corepack enable pnpm
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 pnpm --version
+        working-directory: fluid
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: fluid
+
+      - name: Download the binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: fluid-smoke-binary
+          path: target/debug
+
+      # An artifact does not keep the executable bit.
+      - name: Make the binary executable
+        run: chmod +x "$CRYSTALLINE_BIN"
+
       - name: Install the browser
         run: pnpm exec playwright install --with-deps chromium webkit
         working-directory: fluid
 
       # Stands up the daemon on a scratch state directory with the fixture
       # domains and four accounts (three of those domains private), checks
-      # the UI the daemon serves out of the binary, rebuilds
-      # the bundle and runs Playwright against `vite preview`.
-      # The script is the whole sequence, so a local run is the same run.
+      # the UI the daemon serves out of the binary, rebuilds the bundle and
+      # runs Playwright against `vite preview` (or, under a path, against the
+      # daemon's own UI) for this shard's spec files. The script is the whole
+      # sequence, so a local run of the same files is the same run.
       - name: Run the browser smoke
-        run: bash fluid/e2e/run-smoke.sh
-
-      # The same journeys with the daemon under a path prefix, against the UI
-      # it serves itself: the base tag, the router basename and every address
-      # outside the router are what this run checks.
-      - name: Run the browser smoke under a path
-        run: bash fluid/e2e/run-smoke.sh
-        env:
-          FLUID_E2E_BASE_PATH: /crystalline
+        run: |
+          set -euo pipefail
+          files=$(cd fluid && node scripts/smoke-shards.ts "$SHARD" "$TOTAL")
+          mapfile -t args <<<"$files"
+          echo "this shard runs: ${args[*]}"
+          bash fluid/e2e/run-smoke.sh "${args[@]}"
 
       - name: Upload the failure traces
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fluid-smoke-traces
+          name: fluid-smoke-traces-${{ matrix.run }}-${{ matrix.shard }}
           path: fluid/test-results
           if-no-files-found: ignore
 
@@ -1058,7 +1200,9 @@ jobs:
   # fluid-audit) are left out on purpose: they run again on every push to main,
   # and the two audits can go red on a new advisory that has nothing to do with
   # this tree. workflow-lint is ungated too but waited for: a workflow that
-  # fails it should not count as tested.
+  # fails it should not count as tested. A matrix job such as `test` or
+  # `fluid-smoke` is a success here only when every one of its legs is, so
+  # each shard of the browser smoke is required.
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
@@ -1066,6 +1210,7 @@ jobs:
       - changes
       - test
       - fluid
+      - fluid-smoke-build
       - fluid-smoke
       - fluid-image
       - mcpb
