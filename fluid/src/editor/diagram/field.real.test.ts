@@ -83,7 +83,7 @@ describe("the diagram field with real verdicts", () => {
   test("a flowchart inside a blockquote is never drawn", async () => {
     const body = "flowchart TD\n  A --> B";
     const v = mount(
-      `> \`\`\`mermaid\n> ${body.replace("\n", "\n> ")}\n> \`\`\`\n`,
+      `> \`\`\`mermaid\n> ${body.replaceAll("\n", "\n> ")}\n> \`\`\`\n`,
     );
     await settled(body);
     expect(v.state.facet(drawnDiagrams)).toEqual([]);
