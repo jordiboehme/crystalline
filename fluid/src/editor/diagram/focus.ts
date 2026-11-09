@@ -611,6 +611,171 @@ function leave(
   closeDiagramIntent(main, "user");
 }
 
+/** Alt+ArrowUp or Alt+ArrowDown, and no other modifier: a message's move. */
+function moveKey(event: KeyboardEvent): boolean {
+  return (
+    event.altKey &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.shiftKey &&
+    (event.key === "ArrowUp" || event.key === "ArrowDown")
+  );
+}
+
+/**
+ * Moves the message the stop stands on one step, and the stop goes with it. Only on
+ * a message: on any other stop the key is not the diagram's. A held key moves once
+ * (R81), and a stop a peer moved takes the first press as a reminder (R102).
+ */
+function onMoveKey(
+  main: EditorView,
+  host: DiagramHost,
+  from: number,
+  event: KeyboardEvent,
+): boolean {
+  const intent = main.state.field(diagramIntent);
+  const target = currentTarget(main, from);
+  if (intent?.mode === "connect" && intent.anchor === from) {
+    return true;
+  }
+  if (target.kind !== "message") {
+    return false;
+  }
+  if (event.repeat || !host.writable()) {
+    return true;
+  }
+  const direction = event.key === "ArrowUp" ? "up" : "down";
+  const turn = moveTurns.get(main) ?? 0;
+  const queued = (moveQueues.get(main) ?? Promise.resolve()).then(() =>
+    queuedMove(main, direction, turn),
+  );
+  moveQueues.set(main, queued);
+  return true;
+}
+
+/** The fence body the person's own last move wrote, per view. */
+const ownMoves = new WeakMap<EditorView, string>();
+/** Each view's presses, one after another: a press waits for the one before. */
+const moveQueues = new WeakMap<EditorView, Promise<void>>();
+/** Raised when a press is answered with a sentence: the presses after it are dropped. */
+const moveTurns = new WeakMap<EditorView, number>();
+
+function dropQueuedMoves(main: EditorView): void {
+  moveTurns.set(main, (moveTurns.get(main) ?? 0) + 1);
+}
+
+/**
+ * Whether the drawing is behind the text for any reason but the person's own last
+ * move. A move writes the text at once and the drawing follows a little later, so a
+ * quick next press acts on the text; a peer's change since is still "Try again".
+ */
+function behindForMove(main: EditorView, from: number): boolean {
+  const host = hostOf(main, from);
+  const drawn = main.state
+    .field(diagramField)
+    .fences.find((f) => f.from === from);
+  const behind = fenceIsBehind(main.state, from);
+  if (behind || (drawn && syntaxTree(main.state).length < drawn.to)) {
+    forceParsing(main, drawn?.to ?? from, PARSE_MS);
+  }
+  const body = fenceAt(main.state, from)?.body;
+  if (behind || body === undefined) {
+    return true;
+  }
+  return (
+    host !== null && body !== host.renderedBody() && body !== ownMoves.get(main)
+  );
+}
+
+/**
+ * One press's move, run after the presses before it, on the stop as it stands then:
+ * the last move put the stop on the message where it landed. A stop a peer moved
+ * (R102) or a peer's change since says so, and drops the presses still waiting.
+ */
+async function queuedMove(
+  main: EditorView,
+  direction: "up" | "down",
+  turn: number,
+): Promise<void> {
+  if ((moveTurns.get(main) ?? 0) !== turn || !main.dom.isConnected) {
+    return;
+  }
+  const intent = main.state.field(diagramIntent, false);
+  if (intent === null || intent === undefined) {
+    return;
+  }
+  const { anchor, target } = intent;
+  if (movedStops.delete(main)) {
+    dropQueuedMoves(main);
+    sayAt(main, anchor, "stale");
+    return;
+  }
+  if (target.kind !== "message" || intent.mode !== "focus") {
+    return;
+  }
+  if (behindForMove(main, anchor)) {
+    dropQueuedMoves(main);
+    sayAt(main, anchor, "stale");
+    return;
+  }
+  if (!(await moveMessageAt(main, anchor, target, direction))) {
+    dropQueuedMoves(main);
+  }
+}
+
+/**
+ * Moves a message one step, through its hold, and puts the stop on it where it
+ * lands, so the next press moves it on. `hold` is let go when done; with none, one
+ * is taken here.
+ */
+export async function moveMessageAt(
+  main: EditorView,
+  from: number,
+  target: Extract<TargetKey, { kind: "message" }>,
+  direction: "up" | "down",
+  given: LineHold | null = null,
+): Promise<boolean> {
+  const fence = fenceAt(main.state, from);
+  const read = fence === null ? null : modelOf(fence.body);
+  const hold =
+    given ??
+    (fence !== null && read !== null
+      ? holdLine(main, read, target, fence.bodyFrom)
+      : null);
+  try {
+    const outcome = await runDiagramOp(
+      main,
+      from,
+      seqKind,
+      heldMessageOp(
+        main,
+        hold,
+        target,
+        (message) => ({ op: "moveMessage", target: message, direction }),
+        read?.kind === "sequence" ? read : undefined,
+      ),
+    );
+    const anchor = main.state.field(diagramIntent)?.anchor ?? from;
+    if ("refused" in outcome) {
+      sayAt(main, anchor, outcome.refused);
+      return false;
+    }
+    if (outcome.applied && outcome.created !== undefined) {
+      // The text is what the next press reads, before the drawing catches up.
+      const body = fenceAt(main.state, anchor)?.body;
+      if (body !== undefined) {
+        ownMoves.set(main, body);
+      }
+      focusTarget(main, anchor, outcome.created);
+    }
+    return outcome.applied;
+  } finally {
+    if (hold !== null) {
+      letGoOfLine(main, hold);
+    }
+  }
+}
+
 /** Answers a key on the box; false when it is not one of the diagram's. */
 function onKey(
   main: EditorView,
@@ -621,6 +786,9 @@ function onKey(
   if (isUndoKey(event)) {
     // The drawing holds the focus, and the undo stack is the page's.
     return runScopeHandlers(main, event, "editor");
+  }
+  if (moveKey(event)) {
+    return onMoveKey(main, host, from, event);
   }
   if (event.ctrlKey || event.metaKey || event.altKey) {
     return false;
@@ -981,11 +1149,12 @@ const focusPlugin = ViewPlugin.fromClass(
     readonly awayKey = (event: KeyboardEvent): void => {
       const { view } = this;
       const active = view.root.activeElement;
+      const move = moveKey(event);
       if (
         (active !== null && active !== view.dom.ownerDocument.body) ||
         event.ctrlKey ||
         event.metaKey ||
-        event.altKey ||
+        (event.altKey && !move) ||
         event.isComposing
       ) {
         return;
@@ -994,7 +1163,7 @@ const focusPlugin = ViewPlugin.fromClass(
       const menu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
       if (
         (event.shiftKey && !menu) ||
-        !(menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))
+        !(move || menu || WALK_KEYS.has(key) || AWAY_KEYS.has(key))
       ) {
         return;
       }

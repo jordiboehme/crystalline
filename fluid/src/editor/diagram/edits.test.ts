@@ -180,6 +180,21 @@ describe("NOTICES", () => {
         "The new participant stays. Press Delete, or undo once, to take it back.",
       keptMessage:
         "The new message stays. Press Delete, or undo once, to take it back.",
+      atTop: "This message is already at the top, so nothing was changed.",
+      atBottom:
+        "This message is already at the bottom, so nothing was changed.",
+      sharedLine:
+        "This message shares its line with another statement, so nothing was changed.",
+      breaksActivation:
+        "That would end an activation before it starts, so nothing was changed.",
+      passesEnd:
+        "A message cannot move across the end of a participant, so nothing was changed.",
+      passesStart:
+        "A message cannot move across the start of a participant, so nothing was changed.",
+      passesDeclaration:
+        "A message cannot move across the line that declares its participant, so nothing was changed.",
+      changesOrder:
+        "That would change the order of the participants, so nothing was changed.",
     });
   });
 
@@ -191,6 +206,15 @@ describe("NOTICES", () => {
       leavesActive: "That would leave an activation open.",
       participantEnded:
         "A participant that has ended can take no more messages.",
+      atTop: "This message is already at the top.",
+      atBottom: "This message is already at the bottom.",
+      sharedLine: "This message shares its line with another statement.",
+      breaksActivation: "That would end an activation before it starts.",
+      passesEnd: "A message cannot move across the end of a participant.",
+      passesStart: "A message cannot move across the start of a participant.",
+      passesDeclaration:
+        "A message cannot move across the line that declares its participant.",
+      changesOrder: "That would change the order of the participants.",
     });
     // Every code an op's compile can answer, which is what a menu shows ahead.
     const compiled: RefusalCode[] = [
@@ -202,6 +226,14 @@ describe("NOTICES", () => {
       "emptiesBlock",
       "leavesActive",
       "participantEnded",
+      "atTop",
+      "atBottom",
+      "sharedLine",
+      "breaksActivation",
+      "passesEnd",
+      "passesStart",
+      "passesDeclaration",
+      "changesOrder",
     ];
     for (const code of compiled) {
       const reason = reasonFor(code);

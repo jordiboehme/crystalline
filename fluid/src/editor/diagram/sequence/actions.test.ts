@@ -39,13 +39,20 @@ import type { SeqOp } from "./ops";
 import { compileSeqOp } from "./ops";
 import { parseSequence } from "./parse";
 
+/** How long each render waits: a test may slow the drawing down behind the text. */
+const kit = vi.hoisted(() => ({ renderMs: 0 }));
+
 vi.mock("mermaid", async (original) => {
   const real = (await original<{ default: object }>()).default;
   return {
     default: {
       ...real,
-      render: (id: string, body: string) =>
-        Promise.resolve({ svg: sequenceDrawing(id, body) }),
+      render: async (id: string, body: string) => {
+        if (kit.renderMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, kit.renderMs));
+        }
+        return { svg: sequenceDrawing(id, body) };
+      },
     },
   };
 });
@@ -160,6 +167,7 @@ function typeInField(view: EditorView, value: string) {
 
 beforeEach(() => {
   forgetDrawings();
+  kit.renderMs = 0;
 });
 
 afterEach(() => {
@@ -179,7 +187,15 @@ describe("what the menus hold", () => {
       "a message",
       REQUEST,
       "Message actions",
-      ["Edit text", "Line", "Arrowhead", "Delete", "Remove block"],
+      [
+        "Edit text",
+        "Move up",
+        "Move down",
+        "Line",
+        "Arrowhead",
+        "Delete",
+        "Remove block",
+      ],
     ],
     [
       "the canvas",
@@ -900,6 +916,24 @@ describe("a key with the box away", () => {
     },
   );
 
+  it("Alt+ArrowUp on a message brings the stop back and moves nothing", async () => {
+    const view = await drawn(LONG);
+    focusTarget(view, fromOf(view), REPLY);
+    await awayNow(view);
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowUp",
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    await back(view);
+    expect(active()).toBe(lineOf(view, 1));
+    await flush();
+    expect(text(view)).toBe(LONG);
+  });
+
   it("Add message to... waiting: Enter brings it back on its participant, still waiting", async () => {
     const view = await drawn(LONG);
     openMenuOn(view, CALLER);
@@ -937,5 +971,324 @@ describe("a page that takes no writes", () => {
     expect(menus()).toHaveLength(0);
     expect(fieldOf(view)).toBeNull();
     expect(text(view)).toBe(page(STARTER));
+  });
+});
+
+describe("Move up and Move down", () => {
+  const TWELVE = `sequenceDiagram\n    participant a\n    participant b\n${Array.from(
+    { length: 12 },
+    (_, i) => `    a->>b: m${String(i + 1)}`,
+  ).join("\n")}`;
+  const lineOf = (view: EditorView, text: string) =>
+    [...view.dom.querySelectorAll('[data-et="message"]')].find(
+      (el) => el.getAttribute("aria-label")?.endsWith(`: ${text}`) === true,
+    );
+  const altKey = (key: string, options: KeyboardEventInit = {}) =>
+    press(key, { altKey: true, ...options });
+  /** The redraw after a move: the drawing shows the text again. */
+  const redrawn = async (view: EditorView, text: string) => {
+    await vi.waitFor(() => {
+      expect(lineOf(view, text)).toBe(active());
+    });
+    await flush();
+  };
+
+  it("the items are greyed at the top and the bottom, with the reason", async () => {
+    const view = await drawn();
+    openMenuOn(view, REQUEST);
+    expect(row("Move up").getAttribute("aria-disabled")).toBe("true");
+    expect(row("Move up").getAttribute("aria-description")).toBe(
+      "This message is already at the top.",
+    );
+    expect(row("Move down").getAttribute("aria-disabled")).toBeNull();
+    press("Escape");
+    await flush();
+    openMenuOn(view, REPLY);
+    expect(row("Move down").getAttribute("aria-description")).toBe(
+      "This message is already at the bottom.",
+    );
+  });
+
+  it("Move down is one undo step, and the stop goes with the message", async () => {
+    const view = await drawn();
+    const steps = undoSteps(view);
+    openMenuOn(view, REQUEST);
+    choose("Move down");
+    await changed(view, page(STARTER));
+    expect(text(view)).toBe(
+      page(
+        "sequenceDiagram\n    participant caller as Caller\n    participant service as Service\n    service-->>caller: Reply\n    caller->>service: Request",
+      ),
+    );
+    expect(undoSteps(view)).toBe(steps + 1);
+    await redrawn(view, "Request");
+    expect(view.state.field(diagramIntent)?.target).toEqual(REQUEST);
+    undoOnce(view);
+    expect(text(view)).toBe(page(STARTER));
+  });
+
+  it("Alt+ArrowUp moves the message on the stop, and the stop follows", async () => {
+    const view = await drawn();
+    focusTarget(view, fromOf(view), REPLY);
+    const event = altKey("ArrowUp");
+    expect(event.defaultPrevented).toBe(true);
+    await changed(view, page(STARTER));
+    expect(text(view)).toBe(
+      page(
+        "sequenceDiagram\n    participant caller as Caller\n    participant service as Service\n    service-->>caller: Reply\n    caller->>service: Request",
+      ),
+    );
+    await redrawn(view, "Reply");
+    expect(view.state.field(diagramIntent)?.target).toEqual(REPLY);
+  });
+
+  it("twelve messages: the last goes to second place by ten presses, one undo each", async () => {
+    const view = await drawn(page(TWELVE));
+    const steps = undoSteps(view);
+    focusTarget(view, fromOf(view), message("a", "b", "m12"));
+    for (let i = 0; i < 10; i++) {
+      const before = text(view);
+      altKey("ArrowUp");
+      await changed(view, before);
+      await redrawn(view, "m12");
+    }
+    const lines = Array.from(
+      { length: 12 },
+      (_, i) => `    a->>b: m${String(i + 1)}`,
+    );
+    expect(text(view)).toBe(
+      page(
+        `sequenceDiagram\n    participant a\n    participant b\n${[lines[0], lines[11], ...lines.slice(1, 11)].join("\n")}`,
+      ),
+    );
+    expect(undoSteps(view)).toBe(steps + 10);
+    // One more press: second place to the top, and then it stops there.
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(text(view)).toContain("participant b\n    a->>b: m12");
+    });
+    await redrawn(view, "m12");
+    const top = text(view);
+    altKey("ArrowUp");
+    await flush();
+    await flush();
+    expect(text(view)).toBe(top);
+    expect(noticeOf(view)).toBe(NOTICES.atTop);
+  });
+
+  it("eleven presses with no wait: the last of thirteen goes to second place, exact", async () => {
+    const lines = Array.from(
+      { length: 13 },
+      (_, i) => `    a->>b: m${String(i + 1)}`,
+    );
+    const body = `sequenceDiagram\n    participant a\n    participant b\n${lines.join("\n")}`;
+    const view = await drawn(page(body));
+    const steps = undoSteps(view);
+    focusTarget(view, fromOf(view), message("a", "b", "m13"));
+    for (let i = 0; i < 11; i++) {
+      altKey("ArrowUp");
+    }
+    const want = page(
+      `sequenceDiagram\n    participant a\n    participant b\n${[lines[0], lines[12], ...lines.slice(1, 12)].join("\n")}`,
+    );
+    await vi.waitFor(
+      () => {
+        expect(text(view)).toBe(want);
+      },
+      { timeout: 10_000 },
+    );
+    await flush();
+    await flush();
+    expect(text(view)).toBe(want);
+    expect(noticeOf(view)).toBe("");
+    expect(undoSteps(view)).toBe(steps + 11);
+    expect(view.state.field(diagramIntent)?.target).toEqual(
+      message("a", "b", "m13"),
+    );
+  });
+
+  it("eleven presses while each drawing lags behind the text: each press still moves", async () => {
+    const lines = Array.from(
+      { length: 13 },
+      (_, i) => `    a->>b: m${String(i + 1)}`,
+    );
+    const body = `sequenceDiagram\n    participant a\n    participant b\n${lines.join("\n")}`;
+    const view = await drawn(page(body));
+    kit.renderMs = 200;
+    focusTarget(view, fromOf(view), message("a", "b", "m13"));
+    for (let i = 0; i < 11; i++) {
+      altKey("ArrowUp");
+    }
+    const want = page(
+      `sequenceDiagram\n    participant a\n    participant b\n${[lines[0], lines[12], ...lines.slice(1, 12)].join("\n")}`,
+    );
+    await vi.waitFor(
+      () => {
+        expect(text(view)).toBe(want);
+      },
+      { timeout: 10_000 },
+    );
+    expect(noticeOf(view)).toBe("");
+  });
+
+  it("presses made before a peer's move was said are all dropped, and a later one moves", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>b: m1\n    a->>b: m2\n    a->>b: m3";
+    const peers = markPeers(page(body), modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(peers.local.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+    });
+    await flush();
+    const { local, peer, sync } = peers;
+    focusTarget(local, fromOf(local), message("a", "b", "m3"));
+    await flush();
+    const at = text(peer).indexOf("a->>b: m3") + 1;
+    peer.dispatch({ changes: { from: at, to: at + 3, insert: "-->>" } });
+    sync();
+    await vi.waitFor(() => {
+      expect(local.state.field(diagramIntent)?.target).toEqual({
+        kind: "participant",
+        name: "a",
+      });
+    });
+    // The person comes back to the message by its line and presses twice, quickly.
+    focusTarget(local, fromOf(local), message("a", "b", "m2"));
+    await flush();
+    const now = text(local);
+    altKey("ArrowUp");
+    altKey("ArrowUp");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(text(local)).toBe(now);
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("m2\n    a->>b: m1");
+    });
+  });
+
+  it("in a room, a peer's rewrite of the moved line between two presses: the next press only reminds", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>b: m1\n    a->>b: m2\n    a->>b: m3";
+    const peers = markPeers(page(body), modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(peers.local.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+    });
+    await flush();
+    const { local, peer, sync } = peers;
+    focusTarget(local, fromOf(local), message("a", "b", "m3"));
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("m3\n    a->>b: m2");
+    });
+    sync();
+    await flush();
+    // The peer rewrites that line's arrow: the stop cannot tell it is the same.
+    const at = text(peer).indexOf("a->>b: m3") + 1;
+    peer.dispatch({ changes: { from: at, to: at + 3, insert: "-->>" } });
+    sync();
+    await vi.waitFor(() => {
+      expect(noticeOf(local)).toBe(NOTICES.stale);
+    });
+    const now = text(local);
+    altKey("ArrowUp");
+    await flush();
+    await flush();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(text(local)).toBe(now);
+    expect(noticeOf(local)).toBe(NOTICES.stale);
+  });
+
+  it("a held Alt+ArrowUp moves once, also after the drawing caught up", async () => {
+    const view = await drawn(page(TWELVE));
+    focusTarget(view, fromOf(view), message("a", "b", "m12"));
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(text(view)).toContain("m12\n    a->>b: m11");
+    });
+    await redrawn(view, "m12");
+    altKey("ArrowUp", { repeat: true });
+    altKey("ArrowUp", { repeat: true });
+    await flush();
+    await flush();
+    expect(text(view)).toContain("a->>b: m10\n    a->>b: m12\n    a->>b: m11");
+  });
+
+  it("past its twin, the stop stays on the moved message, now the second", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a-->>b: hi\n    a->>b: hi";
+    const view = await drawn(page(body));
+    focusTarget(view, fromOf(view), message("a", "b", "hi", 0));
+    altKey("ArrowDown");
+    await changed(view, page(body));
+    expect(text(view)).toBe(
+      page(
+        "sequenceDiagram\n    participant a\n    participant b\n    a->>b: hi\n    a-->>b: hi",
+      ),
+    );
+    await vi.waitFor(() => {
+      expect(view.state.field(diagramIntent)?.target).toEqual(
+        message("a", "b", "hi", 1),
+      );
+    });
+  });
+
+  it("Alt+ArrowUp on a participant is not the diagram's", async () => {
+    const view = await drawn();
+    focusTarget(view, fromOf(view), CALLER);
+    const event = altKey("ArrowUp");
+    expect(event.defaultPrevented).toBe(false);
+    await flush();
+    expect(text(view)).toBe(page(STARTER));
+  });
+
+  it("an activation the move would break refuses with the sentence", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>+b: ask\n    b-->>-a: back";
+    const view = await drawn(page(body));
+    openMenuOn(view, message("b", "a", "back"));
+    expect(row("Move up").getAttribute("aria-description")).toBe(
+      "That would end an activation before it starts.",
+    );
+    press("Escape");
+    await flush();
+    focusTarget(view, fromOf(view), message("b", "a", "back"));
+    altKey("ArrowUp");
+    await vi.waitFor(() => {
+      expect(noticeOf(view)).toBe(NOTICES.breaksActivation);
+    });
+    expect(text(view)).toBe(page(body));
+  });
+
+  it("with a peer typing in another line meanwhile, the right message moves", async () => {
+    const body =
+      "sequenceDiagram\n    participant a\n    participant b\n    a->>b: hi\n    b->>a: x\n    a->>b: hi";
+    const peers = markPeers(page(body), modeOptions());
+    await prefetchDiagrams();
+    await vi.waitFor(() => {
+      expect(peers.local.dom.querySelector(".cm-diagram svg")).not.toBeNull();
+    });
+    await flush();
+    const { local, peer, sync } = peers;
+    focusTarget(local, fromOf(local), message("a", "b", "hi", 1));
+    altKey("ArrowUp");
+    // The press runs once the presses before it are done (none here): a microtask on.
+    await Promise.resolve();
+    await Promise.resolve();
+    // The peer adds a twin at the top while the move is checked.
+    const at = text(peer).indexOf("    a->>b: hi");
+    peer.dispatch({ changes: { from: at, insert: "    a->>b: hi\n" } });
+    sync();
+    await vi.waitFor(() => {
+      expect(text(local)).toContain("a->>b: hi\n    b->>a: x\n```");
+    });
+    sync();
+    expect(text(local)).toBe(
+      page(
+        "sequenceDiagram\n    participant a\n    participant b\n    a->>b: hi\n    a->>b: hi\n    a->>b: hi\n    b->>a: x",
+      ),
+    );
+    expect(text(peer)).toBe(text(local));
   });
 });

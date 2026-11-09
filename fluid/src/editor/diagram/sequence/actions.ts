@@ -27,7 +27,7 @@ import { fenceToAct, placeNow } from "../act";
 import { nextAnchorTicket, runDiagramOp, seqKind } from "../apply";
 import type { RefusalCode } from "../edits";
 import { reasonFor } from "../edits";
-import { sayAt } from "../focus";
+import { moveMessageAt, sayAt } from "../focus";
 import type { LineHold } from "../held";
 import {
   heldMessageOp,
@@ -297,6 +297,19 @@ function messageMenu(
         editText(main, anchor, hold, target);
       },
     },
+    ...(["up", "down"] as const).map((direction) => ({
+      label: direction === "up" ? "Move up" : "Move down",
+      run: () => {
+        acts.release();
+        const place = placeNow(main, anchor);
+        if (fenceToAct(main, place) === null) {
+          letGoOfLine(main, hold);
+          return;
+        }
+        void moveMessageAt(main, place, target, direction, hold);
+      },
+      ...blockedBy(model, { op: "moveMessage", target, direction }),
+    })),
     {
       label: "Line",
       submenu: (

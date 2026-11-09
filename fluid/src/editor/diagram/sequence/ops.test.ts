@@ -1795,3 +1795,263 @@ describe("sameReading compares each field", () => {
     }
   }
 });
+
+describe("moveMessage", () => {
+  const up = (target: MessageTarget): SeqOp => ({
+    op: "moveMessage",
+    target,
+    direction: "up",
+  });
+  const down = (target: MessageTarget): SeqOp => ({
+    op: "moveMessage",
+    target,
+    direction: "down",
+  });
+  const HEAD = "sequenceDiagram\n  participant a\n  participant b\n";
+
+  test.each<[string, string, SeqOp, string]>([
+    [
+      "up, at the same level",
+      `${HEAD}  a->>b: 1\n  b->>a: 2\n  a->>b: 3`,
+      up(message("b", "a", "2")),
+      `${HEAD}  b->>a: 2\n  a->>b: 1\n  a->>b: 3`,
+    ],
+    [
+      "down, at the same level",
+      `${HEAD}  a->>b: 1\n  b->>a: 2\n  a->>b: 3`,
+      down(message("b", "a", "2")),
+      `${HEAD}  a->>b: 1\n  a->>b: 3\n  b->>a: 2`,
+    ],
+    [
+      "up, past a whole block",
+      `${HEAD}  loop l\n    a->>b: in\n  end\n  b->>a: x`,
+      up(message("b", "a", "x")),
+      `${HEAD}  b->>a: x\n  loop l\n    a->>b: in\n  end`,
+    ],
+    [
+      "down, past a whole block",
+      `${HEAD}  b->>a: x\n  loop l\n    a->>b: in\n  end`,
+      down(message("b", "a", "x")),
+      `${HEAD}  loop l\n    a->>b: in\n  end\n  b->>a: x`,
+    ],
+    [
+      "up, out of a block at its first place",
+      `${HEAD}  a->>b: 0\n  loop l\n    a->>b: in\n    b->>a: 2\n  end`,
+      up(message("a", "b", "in")),
+      `${HEAD}  a->>b: 0\n  a->>b: in\n  loop l\n    b->>a: 2\n  end`,
+    ],
+    [
+      "down, out of a block at its last place",
+      `${HEAD}  loop l\n    a->>b: 1\n    b->>a: in\n  end\n  a->>b: 3`,
+      down(message("b", "a", "in")),
+      `${HEAD}  loop l\n    a->>b: 1\n  end\n  b->>a: in\n  a->>b: 3`,
+    ],
+    [
+      "up, out at the first place after an else",
+      `${HEAD}  alt yes\n    a->>b: 1\n  else no\n    b->>a: 2\n    a->>b: 3\n  end`,
+      up(message("b", "a", "2")),
+      `${HEAD}  b->>a: 2\n  alt yes\n    a->>b: 1\n  else no\n    a->>b: 3\n  end`,
+    ],
+    [
+      "down, out at the last place before an else",
+      `${HEAD}  alt yes\n    a->>b: 0\n    a->>b: 1\n  else no\n    b->>a: 2\n  end`,
+      down(message("a", "b", "1")),
+      `${HEAD}  alt yes\n    a->>b: 0\n  else no\n    b->>a: 2\n  end\n  a->>b: 1`,
+    ],
+    [
+      "up, past a note",
+      `${HEAD}  a->>b: 1\n  Note over a: n\n  b->>a: 2`,
+      up(message("b", "a", "2")),
+      `${HEAD}  a->>b: 1\n  b->>a: 2\n  Note over a: n`,
+    ],
+    [
+      "down, past an activate line",
+      `${HEAD}  a->>b: 1\n  activate a\n  b->>a: 2\n  deactivate a`,
+      down(message("a", "b", "1")),
+      `${HEAD}  activate a\n  a->>b: 1\n  b->>a: 2\n  deactivate a`,
+    ],
+    [
+      "a comment stays where it is",
+      `${HEAD}  a->>b: 1\n  %% about two\n  b->>a: 2`,
+      up(message("b", "a", "2")),
+      `${HEAD}  b->>a: 2\n  a->>b: 1\n  %% about two`,
+    ],
+    [
+      "the last line moves up, its break kept",
+      `${HEAD}  a->>b: 1\n  b->>a: 2`,
+      up(message("b", "a", "2")),
+      `${HEAD}  b->>a: 2\n  a->>b: 1`,
+    ],
+    [
+      "into the last place moving down",
+      `${HEAD}  a->>b: 1\n  b->>a: 2`,
+      down(message("a", "b", "1")),
+      `${HEAD}  b->>a: 2\n  a->>b: 1`,
+    ],
+    [
+      "inside a rect, at the same level",
+      `${HEAD}  rect rgb(1, 2, 3)\n    a->>b: 1\n    b->>a: 2\n  end`,
+      up(message("b", "a", "2")),
+      `${HEAD}  rect rgb(1, 2, 3)\n    b->>a: 2\n    a->>b: 1\n  end`,
+    ],
+    [
+      "below the boxes, the declarations stay",
+      "sequenceDiagram\n  box Here\n    participant a\n    participant b\n  end\n  a->>b: 1\n  b->>a: 2",
+      up(message("b", "a", "2")),
+      "sequenceDiagram\n  box Here\n    participant a\n    participant b\n  end\n  b->>a: 2\n  a->>b: 1",
+    ],
+  ])("%s", (_, body, op, want) => {
+    expect(run(body, op)).toBe(want);
+  });
+
+  test.each<[string, string, SeqOp, string]>([
+    [
+      "the top",
+      `${HEAD}  a->>b: 1\n  b->>a: 2`,
+      up(message("a", "b", "1")),
+      "atTop",
+    ],
+    [
+      "the bottom",
+      `${HEAD}  a->>b: 1\n  b->>a: 2`,
+      down(message("b", "a", "2")),
+      "atBottom",
+    ],
+    [
+      "the top below a box",
+      "sequenceDiagram\n  box Here\n    participant a\n  end\n  a->>a: 1",
+      up(message("a", "a", "1")),
+      "atTop",
+    ],
+    [
+      "a line it shares",
+      `${HEAD}  a->>b: 1;b->>a: 2\n  a->>b: 3`,
+      down(message("b", "a", "2")),
+      "sharedLine",
+    ],
+    [
+      "a - moved above its +",
+      `${HEAD}  a->>+b: ask\n  b-->>-a: back`,
+      up(message("b", "a", "back")),
+      "breaksActivation",
+    ],
+    [
+      "a message not there",
+      `${HEAD}  a->>b: 1`,
+      up(message("a", "b", "x")),
+      "gone",
+    ],
+  ])("refuses at %s", (_, body, op, want) => {
+    expect(code(body, op)).toBe(want);
+  });
+
+  test("past a declaration in a block that it does not name: mermaid reads the same", async () => {
+    const body = `${HEAD}  loop l\n    a->>b: 1\n    participant c as C\n    b->>c: 2\n  end`;
+    const after = run(body, down(message("a", "b", "1")));
+    expect(after).toBe(
+      `${HEAD}  loop l\n    participant c as C\n    a->>b: 1\n    b->>c: 2\n  end`,
+    );
+    expect(seqDbDelta(await seqDbFor(body), await seqDbFor(after))).toEqual([]);
+  });
+
+  test("a declaration first in a block: up goes out of the block past it", async () => {
+    const body = `${HEAD}  a->>a: 0\n  loop l\n    participant c as C\n    a->>b: 1\n    b->>c: 2\n  end`;
+    const after = run(body, up(message("a", "b", "1")));
+    expect(after).toBe(
+      `${HEAD}  a->>a: 0\n  a->>b: 1\n  loop l\n    participant c as C\n    b->>c: 2\n  end`,
+    );
+    await expect(seqDbFor(after)).resolves.toBeDefined();
+  });
+
+  test.each<[string, string, SeqOp, string]>([
+    [
+      "the declaration of its own participant",
+      `${HEAD}  loop l\n    participant c as C\n    b->>c: 2\n    a->>b: 3\n  end`,
+      up(message("b", "c", "2")),
+      "passesDeclaration",
+    ],
+    [
+      "a destroy line",
+      `${HEAD}  a->>a: 0\n  destroy b\n  a->>b: bye`,
+      down(message("a", "a", "0")),
+      "passesEnd",
+    ],
+    [
+      "the message a destroy line belongs to",
+      `${HEAD}  a->>a: 0\n  destroy b\n  a->>b: bye\n  a->>a: 1`,
+      down(message("a", "b", "bye")),
+      "passesEnd",
+    ],
+    [
+      "a create line",
+      `${HEAD}  a->>a: 0\n  create participant c\n  a->>c: hi`,
+      down(message("a", "a", "0")),
+      "passesStart",
+    ],
+    [
+      "the message a create line belongs to",
+      `${HEAD}  a->>a: 0\n  create participant c\n  a->>c: hi\n  a->>a: 1`,
+      down(message("a", "c", "hi")),
+      "passesStart",
+    ],
+  ])("refuses to cross %s, with a sentence of its own", (_, body, op, want) => {
+    expect(code(body, op)).toBe(want);
+  });
+
+  test("a move that keeps the activation whole applies, and mermaid reads it", async () => {
+    const body = `${HEAD}  a->>+b: ask\n  b->>b: think\n  b-->>-a: back`;
+    const after = run(body, up(message("b", "b", "think")));
+    expect(after).toBe(`${HEAD}  b->>b: think\n  a->>+b: ask\n  b-->>-a: back`);
+    await expect(seqDbFor(after)).resolves.toBeDefined();
+  });
+
+  test("CRLF: the moved line takes the document's own break", () => {
+    const body = `${HEAD}  a->>b: 1\n  b->>a: 2\n  a->>b: 3`;
+    const result = compileSeqOp(
+      parseSequence(body),
+      up(message("a", "b", "3")),
+    );
+    if ("refused" in result) throw new Error(result.refused);
+    let state = EditorState.create({
+      doc: `x\r\n${body.replaceAll("\n", "\r\n")}\r\ny`,
+      extensions: EditorState.lineSeparator.of("\r\n"),
+    });
+    state = state.update({
+      changes: toChanges(2, result.edits, state.lineBreak, body),
+    }).state;
+    expect(state.sliceDoc()).toBe(
+      `x\r\n${HEAD.replaceAll("\n", "\r\n")}  a->>b: 1\r\n  a->>b: 3\r\n  b->>a: 2\r\ny`,
+    );
+  });
+
+  test("twelve messages: the last one goes up to second place, press by press", () => {
+    const lines = Array.from(
+      { length: 12 },
+      (_, i) => `  a->>b: m${String(i + 1)}`,
+    );
+    let body = `${HEAD}${lines.join("\n")}`;
+    for (let i = 0; i < 10; i++) {
+      body = run(body, up(message("a", "b", "m12")));
+    }
+    expect(body).toBe(
+      `${HEAD}${[lines[0], "  a->>b: m12", ...lines.slice(1, 11)].join("\n")}`,
+    );
+  });
+
+  test("the moved message is named again, its occurrence as it reads now", () => {
+    const body = `${HEAD}  a->>b: hi\n  b->>a: x\n  a->>b: hi`;
+    const result = compileSeqOp(
+      parseSequence(body),
+      down(message("a", "b", "hi", 0)),
+    );
+    if ("refused" in result) throw new Error(result.refused);
+    expect(result.created).toEqual(message("a", "b", "hi", 0));
+    // Past its twin, the moved one is the second of the two.
+    const second = compileSeqOp(
+      parseSequence(`${HEAD}  a-->>b: hi\n  a->>b: hi`),
+      down(message("a", "b", "hi", 0)),
+    );
+    if ("refused" in second) throw new Error(second.refused);
+    expect(second.created).toEqual(message("a", "b", "hi", 1));
+  });
+});

@@ -254,3 +254,36 @@ test("by keys alone: Add message to..., the next participant, Enter, a text and 
     ),
   );
 });
+
+test("a new message moved up by keys to second place: one line moves, the file is exact", async ({
+  page,
+}) => {
+  const permalink = await scratch(page, BODY);
+  await edit(page, permalink);
+  const before = await saved(page, permalink);
+  // Add a message to service from caller by its menu, and name it.
+  await participant(page, "caller").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Add message to..." }).click();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await expect(field(page)).toHaveValue("New message");
+  await page.keyboard.type("Ping");
+  await page.keyboard.press("Enter");
+  await expect(field(page)).toHaveCount(0);
+  const ping = "Message from Caller to Service: Ping";
+  await expect.poll(() => focusedLabel(page)).toBe(ping);
+  // Up past Reply, then past the whole loop: second place, under Request. Two
+  // quick presses: the second acts on the text the first wrote.
+  await page.keyboard.press("Alt+ArrowUp");
+  await page.keyboard.press("Alt+ArrowUp");
+  await savedIs(
+    page,
+    permalink,
+    swap(
+      before,
+      "  caller->>service: Request\n",
+      "  caller->>service: Request\n  caller->>service: Ping\n",
+    ),
+  );
+  await expect.poll(() => focusedLabel(page)).toBe(ping);
+});

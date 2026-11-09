@@ -63,7 +63,8 @@ export type SeqOp =
   | { op: "deleteMessage"; target: MessageTarget }
   | { op: "deleteParticipant"; name: string }
   /** The block's number among `blocksOf`. */
-  | { op: "removeBlock"; block: number };
+  | { op: "removeBlock"; block: number }
+  | { op: "moveMessage"; target: MessageTarget; direction: "up" | "down" };
 
 const NEW_PARTICIPANT = "New participant";
 const NEW_MESSAGE = "New message";
@@ -1069,7 +1070,292 @@ export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult<SeqCreated> {
       return deleteParticipant(model, op.name);
     case "removeBlock":
       return removeBlock(model, op.block);
+    case "moveMessage":
+      return moveMessage(model, op.target, op.direction);
   }
+}
+
+/** What a moving message passes as one step: a statement line of these kinds. */
+const PASSABLE: ReadonlySet<SeqStatement["kind"]> = new Set([
+  "message",
+  "note",
+  "activate",
+  "deactivate",
+  "autonumber",
+]);
+
+/** `records` with `own` taken out and put back before `at`, or after it when `after`. */
+function reordered(
+  count: number,
+  own: readonly number[],
+  at: number,
+  after: boolean,
+): number[] {
+  const rest = Array.from({ length: count }, (_, i) => i).filter(
+    (i) => !own.includes(i),
+  );
+  const place = rest.indexOf(at) + (after ? 1 : 0);
+  return [...rest.slice(0, place), ...own, ...rest.slice(place)];
+}
+
+/** Whether a close comes before anything it could end, as mermaid's db reads it. */
+function endsTooEarly(records: Reading["records"]): boolean {
+  const open = new Map<string, number>();
+  for (const record of records) {
+    const name = record.from ?? "";
+    if (record.type === ACTIVE_START) {
+      open.set(name, (open.get(name) ?? 0) + 1);
+    } else if (record.type === ACTIVE_END) {
+      const count = open.get(name) ?? 0;
+      if (count < 1) {
+        return true;
+      }
+      open.set(name, count - 1);
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a message may pass the declaration line of `neighbour`. mermaid draws the
+ * same when it does, unless the message names a participant declared there: the
+ * first mention would move, and a label added below a first mention breaks
+ * mermaid's chain of neighbours (the message's room is lost). A `create` line
+ * belongs to the message after it. With no message beyond it in the same block,
+ * the line ends what it can pass: inside a block it goes out of the block, at the
+ * top level it is the top or the bottom.
+ */
+function passedDeclaration(
+  model: SeqModel,
+  own: SeqStatement,
+  neighbour: SeqStatement,
+  up: boolean,
+): "pass" | "out" | "edge" | "passesStart" | "passesDeclaration" {
+  const onLine = model.statements.filter((s) => s.line === neighbour.line);
+  const names = onLine.flatMap((s) => s.actors.map((a) => a.name));
+  const created = onLine.some(
+    (s) =>
+      s.kind === "declaration" &&
+      model.participants
+        .get(s.actors[0]?.name ?? "")
+        ?.declarations.some((d) => d.line === s.line && d.create) === true,
+  );
+  if (created) {
+    return "passesStart";
+  }
+  const start = model.statements.indexOf(neighbour);
+  let beyond = false;
+  for (
+    let i = start + (up ? -1 : 1);
+    i >= 0 && i < model.statements.length;
+    i += up ? -1 : 1
+  ) {
+    const next = model.statements[i];
+    if (next === undefined || next.depth < own.depth) {
+      break;
+    }
+    if (next.kind === "message") {
+      beyond = true;
+      break;
+    }
+  }
+  // Nothing left to pass at the top level: the top or the bottom.
+  if (!beyond && own.depth === 0) {
+    return "edge";
+  }
+  const mine = own.actors.map((a) => a.name);
+  if (names.some((name) => mine.includes(name))) {
+    return "passesDeclaration";
+  }
+  // Nothing left to pass in its block: out of it, as at its first or last place.
+  return beyond ? "pass" : "out";
+}
+
+/**
+ * Moves a message one step: past the next statement at its own nesting level, or past
+ * a whole block there, never into one. At the first or last place inside a block or
+ * a branch of it, it goes out of the block: above its start line, or below its end.
+ * Only the message's own line moves, with the indent of where it lands. `created`
+ * names it again, with its occurrence as it reads after the move.
+ */
+function moveMessage(
+  model: SeqModel,
+  target: MessageTarget,
+  direction: "up" | "down",
+): OpResult<SeqCreated> {
+  const message = messageAt(model, target);
+  const index =
+    message === undefined
+      ? -1
+      : (model.records[message.record]?.statement ?? -1);
+  const statement = model.statements[index];
+  if (message === undefined || statement === undefined) {
+    return refused("gone");
+  }
+  if (
+    model.statements.some((s) => s !== statement && s.line === statement.line)
+  ) {
+    return refused("sharedLine");
+  }
+  const up = direction === "up";
+  const edge = refused(up ? "atTop" : "atBottom");
+  const blockOf = new Map<SeqStatement, SeqStatement[]>();
+  for (const block of blocksOf(model)) {
+    for (const own of block) {
+      blockOf.set(own, block);
+    }
+  }
+  // A `create` and a `destroy` line belong to the message right after them.
+  if ([...model.destroyed.values()].includes(message.record)) {
+    return refused("passesEnd");
+  }
+  if ([...model.created.values()].includes(message.record)) {
+    return refused("passesStart");
+  }
+  const neighbour = model.statements[index + (up ? -1 : 1)];
+  if (neighbour === undefined) {
+    return edge;
+  }
+  // The statement the move passes last, and the line it lands beside.
+  let far: SeqStatement;
+  let indent = indentOf(model, statement.line);
+  const block = blockOf.get(neighbour);
+  if (neighbour.depth < statement.depth) {
+    // Its first or last place in a block or a branch: out of the whole block.
+    const around = block?.[up ? 0 : block.length - 1];
+    if (around === undefined) {
+      return edge;
+    }
+    far = around;
+    indent = indentOf(model, around.line);
+  } else if (
+    block !== undefined &&
+    (neighbour.kind === "blockEnd" || neighbour.kind === "blockStart")
+  ) {
+    const whole = block[up ? 0 : block.length - 1];
+    if (whole === undefined) {
+      return edge;
+    }
+    far = whole;
+  } else if (neighbour.kind === "destroy") {
+    return refused("passesEnd");
+  } else if (neighbour.kind === "declaration") {
+    const passing = passedDeclaration(model, statement, neighbour, up);
+    if (passing === "edge") {
+      return edge;
+    }
+    if (passing === "passesStart" || passing === "passesDeclaration") {
+      return refused(passing);
+    }
+    if (passing === "out") {
+      const enclosing = up
+        ? model.statements
+            .slice(0, index)
+            .findLast((s) => s.depth < statement.depth)
+        : model.statements
+            .slice(index + 1)
+            .find((s) => s.depth < statement.depth);
+      const whole = enclosing && blockOf.get(enclosing);
+      const around = whole?.[up ? 0 : whole.length - 1];
+      if (around === undefined) {
+        return edge;
+      }
+      far = around;
+      indent = indentOf(model, around.line);
+    } else {
+      far = neighbour;
+    }
+  } else if (PASSABLE.has(neighbour.kind)) {
+    far = neighbour;
+  } else {
+    return edge;
+  }
+  // A line it passes is passed whole, every statement on it.
+  const onFarLine = model.statements.filter((s) => s.line === far.line);
+  const farIndex = model.statements.indexOf(
+    (up ? onFarLine[0] : onFarLine.at(-1)) ?? far,
+  );
+  const lines = model.scan.lines;
+  const own = lines[statement.line];
+  const landing = lines[far.line];
+  if (own === undefined || landing === undefined) {
+    return refused("invalid");
+  }
+  const text = `${indent}${model.body.slice(own.from + own.indent.length, own.to)}`;
+  const next = lines[far.line + 1];
+  const insert: TextEdit = up
+    ? { from: landing.from, to: landing.from, insert: `${text}\n` }
+    : next
+      ? { from: next.from, to: next.from, insert: `${text}\n` }
+      : { from: landing.to, to: landing.to, insert: `\n${text}` };
+  const edits: TextEdit[] = [
+    ...lineDeletions(model, [statement.line]).map((span) => ({
+      ...span,
+      insert: "",
+    })),
+    insert,
+  ];
+  // The records in their new order: the message's own go before the first record it
+  // passes, or after the last.
+  const passed = model.statements
+    .slice(Math.min(farIndex, index + 1), Math.max(farIndex, index - 1) + 1)
+    .flatMap((s) => s.records);
+  // A `create` or `destroy` line belongs to the message right after it: landing
+  // between them, or before the start of a participant it names, is not a move.
+  const ends = new Set(model.destroyed.values());
+  const starts = new Set(model.created.values());
+  if (passed.some((r) => ends.has(r))) {
+    return refused("passesEnd");
+  }
+  if (passed.some((r) => starts.has(r))) {
+    return refused("passesStart");
+  }
+  const ownRecords = [...statement.records].sort((x, y) => x - y);
+  if (ownRecords.length === 0) {
+    return refused("invalid");
+  }
+  // Passing only lines with no records (a declaration) keeps the records' order.
+  const order =
+    passed.length === 0
+      ? model.records.map((_, i) => i)
+      : reordered(
+          model.records.length,
+          ownRecords,
+          up ? Math.min(...passed) : Math.max(...passed),
+          !up,
+        );
+  const where = new Map(order.map((old, now) => [old, now] as const));
+  const before = readingOf(model);
+  const wanted: Reading = {
+    ...before,
+    records: order.map((old) => before.records[old] as RecordRow),
+    created: new Map(
+      [...before.created].map(([name, i]) => [name, where.get(i) ?? i]),
+    ),
+    destroyed: new Map(
+      [...before.destroyed].map(([name, i]) => [name, where.get(i) ?? i]),
+    ),
+  };
+  if (endsTooEarly(wanted.records)) {
+    return refused("breaksActivation");
+  }
+  const moved = where.get(message.record);
+  const after = parseSequence(applyEdits(model.body, edits));
+  // A participant first named by this message would be drawn in another column.
+  if (after.order.join("\n") !== model.order.join("\n")) {
+    return refused("changesOrder");
+  }
+  const now = after.messages.find((m) => m.record === moved);
+  if (now === undefined) {
+    return refused("invalid");
+  }
+  return checkedSeq(model, edits, wanted, {
+    kind: "message",
+    from: now.from,
+    to: now.to,
+    text: textOf(after, now),
+    occurrence: now.occurrence,
+  });
 }
 
 /** How many messages say what `target` says, its occurrence aside. */
@@ -1205,7 +1491,8 @@ export function heldSeqOp(
     switch (op.op) {
       case "renameMessage":
       case "arrowStyle":
-      case "deleteMessage": {
+      case "deleteMessage":
+      case "moveMessage": {
         const now = seqMessageNow(model, op.target, offset, first);
         return typeof now === "string"
           ? { refused: now }

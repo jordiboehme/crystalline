@@ -1740,6 +1740,32 @@ describe("a sequence diagram", () => {
     expect(text(view)).toBe(SEQ_DOC);
   });
 
+  it("Alt+ArrowDown moves the message, the stop follows, and a held key moves once", async () => {
+    const view = await drawn(SEQ_DOC);
+    const request = {
+      kind: "message" as const,
+      from: "caller",
+      to: "service",
+      text: "Request",
+      occurrence: 0,
+    };
+    focusTarget(view, SEQ_FROM, request);
+    press("ArrowDown", { altKey: true });
+    press("ArrowDown", { altKey: true, repeat: true });
+    const after = SEQ_DOC.replace(
+      "    caller->>service: Request\n    service-->>caller: Reply",
+      "    service-->>caller: Reply\n    caller->>service: Request",
+    );
+    await settled(view, after);
+    await vi.waitFor(() => {
+      expect(active()?.getAttribute("aria-label")).toBe(
+        "Message from Caller to Service: Request",
+      );
+    });
+    expect(view.state.field(diagramIntent)?.target).toEqual(request);
+    expect(text(view)).toBe(after);
+  });
+
   it("a click on a message's text puts the stop on that message", async () => {
     const view = await drawn(SEQ_DOC);
     const texts = [...box(view).querySelectorAll(".messageText")];

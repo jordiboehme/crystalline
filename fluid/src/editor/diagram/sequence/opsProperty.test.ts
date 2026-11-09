@@ -174,7 +174,8 @@ type OpName =
   | "deleteParticipant"
   | "addParticipant"
   | "addMessage"
-  | "removeBlock";
+  | "removeBlock"
+  | "moveMessage";
 
 interface Tally {
   applied: Record<OpName, number>;
@@ -198,6 +199,7 @@ function emptyTally(): Tally {
       addParticipant: 0,
       addMessage: 0,
       removeBlock: 0,
+      moveMessage: 0,
     },
     refused: [],
     verifyRefused: [],
@@ -441,6 +443,40 @@ function pairedMarker(
   return partner !== undefined && onMessage ? [partner] : [];
 }
 
+/** The records as a set: what a move must keep. */
+function sortedRecords(db: SequenceDbView): string[] {
+  return db.records
+    .map((r) => JSON.stringify([r.from, r.to, r.message, r.type]))
+    .sort();
+}
+
+/**
+ * Null when a move changed only the message's own line, its indent apart: the other
+ * lines in their order, and the line's text unchanged. A refused move has nothing
+ * to check.
+ */
+function movedLine(
+  body: string,
+  model: SeqModel,
+  line: number,
+  op: SeqOp,
+): string | null {
+  const result = compileSeqOp(model, op);
+  if ("refused" in result) {
+    return null;
+  }
+  const before = body.split("\n");
+  const after = applyEdits(body, result.edits).split("\n");
+  const own = before[line] ?? "";
+  const rest = before.filter((_, i) => i !== line);
+  const at = after.findIndex(
+    (text, i) =>
+      text.trimStart() === own.trimStart() &&
+      JSON.stringify(after.filter((_, j) => j !== i)) === JSON.stringify(rest),
+  );
+  return at < 0 ? "more than its own line changed" : null;
+}
+
 /** Runs one op on `body` and files the result. */
 async function runOp(
   tally: Tally,
@@ -573,6 +609,40 @@ async function checkBody(body: string): Promise<Tally> {
       },
       ["invalid", "emptiesBlock", "leavesActive"],
     );
+    for (const direction of ["up", "down"] as const) {
+      const op: SeqOp = { op: "moveMessage", target, direction };
+      const moved = movedLine(body, model, message.line, op);
+      if (moved !== null) {
+        tally.failures.push(`move message ${String(i)} ${direction}: ${moved}`);
+      }
+      await runOp(
+        tally,
+        body,
+        db,
+        `move message ${String(i)} ${direction}`,
+        "moveMessage",
+        op,
+        {
+          // The same records, one message's in another place: what mermaid draws
+          // agrees with the parser (checked for every op), and nothing is lost.
+          holds: (after) =>
+            JSON.stringify(sortedRecords(after)) ===
+            JSON.stringify(sortedRecords(db))
+              ? null
+              : "the records are not the same ones",
+        },
+        [
+          "atTop",
+          "atBottom",
+          "sharedLine",
+          "breaksActivation",
+          "passesEnd",
+          "passesStart",
+          "passesDeclaration",
+          "changesOrder",
+        ],
+      );
+    }
   }
 
   for (const [block, own] of blocksOf(model).entries()) {
@@ -699,6 +769,7 @@ describe("every op on the corpus", () => {
     expect(total.applied.renameMessage).toBeGreaterThanOrEqual(243);
     expect(total.applied.arrowStyle).toBeGreaterThanOrEqual(2187);
     expect(total.applied.deleteMessage).toBeGreaterThanOrEqual(203);
+    expect(total.applied.moveMessage).toBeGreaterThanOrEqual(399);
     expect(total.applied.deleteParticipant).toBeGreaterThanOrEqual(94);
     expect(total.applied.addParticipant).toBe(corpus.length);
     expect(total.applied.addMessage).toBeGreaterThanOrEqual(249);
@@ -1010,6 +1081,17 @@ const CORPUS_REFUSALS: Record<string, number> = {
   "deleteMessage invalid": 7,
   "deleteParticipant emptiesBlock": 29,
   "deleteParticipant invalid": 2,
+  // Moves: the top and the bottom of each diagram and of each nested level that has
+  // nowhere left to go; a `-` above its `+`; a `create` or `destroy` crossed (c11,
+  // c13, s10, s15); s02's undeclared participants, whose column would move; and the
+  // lines that hold two messages.
+  "moveMessage atBottom": 19,
+  "moveMessage atTop": 28,
+  "moveMessage breaksActivation": 9,
+  "moveMessage changesOrder": 2,
+  "moveMessage passesEnd": 8,
+  "moveMessage passesStart": 17,
+  "moveMessage sharedLine": 4,
 };
 /**
  * An activation left unbalanced, which only mermaid's db sees: a `+` whose close is a
@@ -1031,5 +1113,12 @@ const EXTRA_REFUSALS: Record<string, number> = {
   "renameParticipant invalid": 4,
   // R61: `Web App`, `User One` and the `Web App` of the body with an alias beside it.
   "renameParticipant unsupported": 3,
+  "moveMessage atBottom": 29,
+  "moveMessage atTop": 22,
+  "moveMessage changesOrder": 14,
+  "moveMessage passesDeclaration": 2,
+  "moveMessage passesEnd": 6,
+  "moveMessage passesStart": 8,
+  "moveMessage sharedLine": 16,
 };
 const EXTRA_VERIFY_REFUSALS: Record<string, number> = {};
