@@ -148,6 +148,9 @@ export type SeqTarget =
       occurrence: number;
     };
 
+/** What an adding op made: the new participant's or message's target. */
+export type SeqCreated = Exclude<SeqTarget, { kind: "canvas" }>;
+
 /** mermaid's `LINETYPE` for the arrows the model holds. */
 export const ARROW_TYPES: readonly {
   line: SeqArrow["line"];

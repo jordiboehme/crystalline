@@ -45,10 +45,21 @@ vi.mock("mermaid", () => {
 });
 
 import { bytes, cleanupMarkViews, markView } from "../../test/markKit";
-import { flowKind, runDiagramOp } from "./apply";
+import { flowKind, runDiagramOp, seqKind } from "./apply";
 import { NOTICES } from "./edits";
 
 afterEach(cleanupMarkViews);
+
+// First: once mermaid has loaded, it stays loaded.
+test("a sequence op that cannot be verified writes nothing and says so", async () => {
+  const text =
+    "```mermaid\nsequenceDiagram\n  participant a\n  participant b\n  a->>b: x\n```\n";
+  const view = markView(text, { raw: true });
+  await expect(
+    runDiagramOp(view, 0, seqKind, { op: "addParticipant" }),
+  ).resolves.toEqual({ applied: false, refused: "unchecked" });
+  expect(bytes(view.state)).toBe(text);
+});
 
 test("an op that cannot be verified writes nothing, says so, and works next time", async () => {
   const text = "```mermaid\nflowchart TD\n  A\n  B\n```\n";

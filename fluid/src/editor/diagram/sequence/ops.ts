@@ -34,6 +34,7 @@ import {
 import {
   ARROW_TYPES,
   type Declaration,
+  type SeqCreated,
   type SeqHead,
   type SeqMessage,
   type SeqModel,
@@ -64,7 +65,7 @@ const NEW_PARTICIPANT = "New participant";
 const NEW_MESSAGE = "New message";
 const FALLBACK_INDENT = "    ";
 
-const refused = (code: RefusalCode): OpResult => ({ refused: code });
+const refused = (code: RefusalCode): OpResult<never> => ({ refused: code });
 
 /** One record as the check compares it. */
 interface RecordRow {
@@ -132,12 +133,12 @@ export function sameReading(a: Reading, b: Reading): boolean {
  * as `wanted`. Otherwise `invalid`. A `;` mermaid would drop, a keyword read in a
  * name, a line that lands in a block's text: all of them show up here.
  */
-function checkedSeq(
+function checkedSeq<C extends SeqCreated = never>(
   model: SeqModel,
   edits: TextEdit[],
   wanted: Reading,
-  created?: SeqTarget,
-): OpResult {
+  created?: C,
+): OpResult<C> {
   const after = parseSequence(applyEdits(model.body, edits));
   if (!after.understood || !sameReading(readingOf(after), wanted)) {
     return refused("invalid");
@@ -228,7 +229,7 @@ function renameMessage(
   model: SeqModel,
   target: MessageTarget,
   typed: string,
-): OpResult {
+): OpResult<never> {
   const message = messageAt(model, target);
   if (message === undefined) {
     return refused("gone");
@@ -403,7 +404,7 @@ function renameParticipant(
   model: SeqModel,
   name: string,
   typed: string,
-): OpResult {
+): OpResult<never> {
   const participant = model.participants.get(name);
   if (participant === undefined) {
     return refused("gone");
@@ -540,7 +541,7 @@ function newParticipantPlace(model: SeqModel): {
   return { line: anchor.line, indent: indentOf(model, anchor.line) };
 }
 
-function addParticipant(model: SeqModel): OpResult {
+function addParticipant(model: SeqModel): OpResult<SeqCreated> {
   const name = freeParticipantId(model);
   const place = newParticipantPlace(model);
   const edit = newLineAfter(
@@ -556,7 +557,11 @@ function addParticipant(model: SeqModel): OpResult {
   return checkedSeq(model, [edit], wanted, { kind: "participant", name });
 }
 
-function addMessage(model: SeqModel, from: string, to: string): OpResult {
+function addMessage(
+  model: SeqModel,
+  from: string,
+  to: string,
+): OpResult<SeqCreated> {
   if (!model.participants.has(from) || !model.participants.has(to)) {
     return refused("gone");
   }
@@ -611,7 +616,7 @@ function arrowStyle(
   target: MessageTarget,
   wantedLine: "solid" | "dotted" | undefined,
   wantedHead: SeqHead | "both" | undefined,
-): OpResult {
+): OpResult<never> {
   const message = messageAt(model, target);
   if (message === undefined) {
     return refused("gone");
@@ -813,7 +818,7 @@ function checkedRemoval(
   ranges: readonly Span[],
   wanted: Reading,
   leaving?: string,
-): OpResult {
+): OpResult<never> {
   const edits = ranges.map((span) => ({ ...span, insert: "" }));
   const plain = checkedSeq(model, edits, wanted);
   if (!("refused" in plain)) {
@@ -836,7 +841,10 @@ function checkedRemoval(
   return edit ? checkedSeq(model, [edit, ...edits], wanted) : plain;
 }
 
-function deleteMessage(model: SeqModel, target: MessageTarget): OpResult {
+function deleteMessage(
+  model: SeqModel,
+  target: MessageTarget,
+): OpResult<never> {
   const message = messageAt(model, target);
   const statement = message
     ? model.statements[model.records[message.record]?.statement ?? -1]
@@ -879,7 +887,7 @@ export function blocksOf(model: SeqModel): SeqStatement[][] {
 }
 
 /** R66: only the block's own keyword lines go. What it holds stays, with its indent. */
-function removeBlock(model: SeqModel, index: number): OpResult {
+function removeBlock(model: SeqModel, index: number): OpResult<never> {
   const own = blocksOf(model)[index];
   if (own === undefined) {
     return refused("gone");
@@ -894,7 +902,7 @@ function removeBlock(model: SeqModel, index: number): OpResult {
   );
 }
 
-function deleteParticipant(model: SeqModel, name: string): OpResult {
+function deleteParticipant(model: SeqModel, name: string): OpResult<never> {
   if (!model.participants.has(name)) {
     return refused("gone");
   }
@@ -960,7 +968,7 @@ function deleteParticipant(model: SeqModel, name: string): OpResult {
  * for a body that is not understood and a rename of a name with a space (R61);
  * `invalid` for all the rest.
  */
-export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult {
+export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult<SeqCreated> {
   if (!model.understood) {
     return refused("unsupported");
   }
@@ -982,4 +990,85 @@ export function compileSeqOp(model: SeqModel, op: SeqOp): OpResult {
     case "removeBlock":
       return removeBlock(model, op.block);
   }
+}
+
+/** How many messages say what `target` says, its occurrence aside. */
+function equalMessages(model: SeqModel, target: MessageTarget): number {
+  return model.messages.filter(
+    (m) =>
+      m.from === target.from &&
+      m.to === target.to &&
+      textOf(model, m) === target.text,
+  ).length;
+}
+
+/** A block as its own lines read: two blocks in the same words are the same. */
+function blockWords(model: SeqModel, block: readonly SeqStatement[]): string {
+  return JSON.stringify(
+    block.map((s) => model.body.slice(s.span.from, s.span.to)),
+  );
+}
+
+/**
+ * `op` as an `OpResolver` for `runDiagramOp`: the op that is meant on each read of
+ * the fence, or `stale` where that cannot be told (R94). A message is named by its
+ * occurrence and a block by its number, and a peer's edit moves both, so on a body
+ * that is no longer the one read first (`read`, or else the first pass) such an op
+ * holds only for a message with no equal in either reading, or a block with no
+ * other in the same words: it is then that one wherever it went. Otherwise
+ * `stale`, which is true: a retry reads what stands now. A message whose pair has
+ * none left is `gone`. An op naming participants by name, or naming nothing,
+ * stands as given.
+ *
+ * Callers pass this, never a plain op with a message or a block in it: the apply
+ * layer compiles a plain op again on a changed body as it is.
+ */
+export function heldSeqOp(
+  op: SeqOp,
+  read?: SeqModel,
+): (model: SeqModel) => SeqOp | { refused: RefusalCode } {
+  let first = read;
+  return (model) => {
+    first ??= model;
+    if (model.body === first.body) {
+      return op;
+    }
+    switch (op.op) {
+      case "renameMessage":
+      case "arrowStyle":
+      case "deleteMessage": {
+        const { target } = op;
+        if (equalMessages(model, target) === 0) {
+          const pair = model.messages.some(
+            (m) => m.from === target.from && m.to === target.to,
+          );
+          return { refused: pair ? "stale" : "gone" };
+        }
+        if (
+          equalMessages(first, target) !== 1 ||
+          equalMessages(model, target) !== 1
+        ) {
+          return { refused: "stale" };
+        }
+        return op;
+      }
+      case "removeBlock": {
+        const was = blocksOf(first);
+        const own = was[op.block];
+        if (own === undefined) {
+          return { refused: "gone" };
+        }
+        const words = blockWords(first, own);
+        const same = (m: SeqModel, blocks: SeqStatement[][]) =>
+          blocks.flatMap((b, i) => (blockWords(m, b) === words ? [i] : []));
+        const now = same(model, blocksOf(model));
+        if (same(first, was).length !== 1 || now.length !== 1) {
+          return { refused: "stale" };
+        }
+        return { ...op, block: now[0] as number };
+      }
+      default:
+        return op;
+    }
+  };
 }

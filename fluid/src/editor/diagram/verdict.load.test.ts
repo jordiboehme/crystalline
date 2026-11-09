@@ -122,6 +122,7 @@ describe("the diagram chunk failing to load inside mermaid", () => {
     expect(first.ok).toBe(false);
     if (!first.ok) {
       expect(first.reason).toMatch(/could not be loaded/);
+      expect(first.unavailable).toBe(true);
     }
     expect(verdictFor(body)).toBe(undefined);
   });

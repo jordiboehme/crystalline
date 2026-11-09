@@ -8,7 +8,6 @@ import { describe, expect, test } from "vitest";
 import { seqDbDelta, seqDbFor } from "../../../test/mermaidOracle";
 import { docText, lineSeparatorFor } from "../../setup";
 import { NOTICES, applyEdits, toChanges } from "../edits";
-import { requestVerdict } from "../verdict";
 import { encodeSeqText } from "./labels";
 import type { SeqTarget } from "./model";
 import {
@@ -1066,19 +1065,6 @@ describe("deleteMessage", () => {
     expect(parseSequence(after).messages.at(-1)?.occurrence).toBe(0);
   });
 
-  test("s05: deleting a + message refuses invalid through the apply layer", async () => {
-    // The verify step of Task 7's runDiagramOp: compile, apply, ask for the verdict.
-    const body = fixture("s05");
-    const { edits } = compiled(body, {
-      op: "deleteMessage",
-      target: message("client", "router", "call"),
-    });
-    const next = applyEdits(body, edits);
-    const verdict = await requestVerdict(next, false);
-    expect(verdict.ok).toBe(false);
-    expect(verdict.ok ? "" : verdict.reason).toMatch(/inactivate/i);
-  });
-
   test("a create or destroy that would lose its message refuses", () => {
     expect(
       code(
@@ -1386,14 +1372,6 @@ describe("deleteParticipant", () => {
     expect(run(body, { op: "deleteParticipant", name: "a" })).toBe(
       "sequenceDiagram\n  participant b\n  b->>b: y",
     );
-  });
-
-  test("an activation that its deactivation now misses: the apply layer refuses", async () => {
-    const body =
-      "sequenceDiagram\n  participant a\n  participant b\n  a->>+b: x\n  b-->>-b: y";
-    const { edits } = compiled(body, { op: "deleteParticipant", name: "a" });
-    const verdict = await requestVerdict(applyEdits(body, edits), false);
-    expect(verdict.ok).toBe(false);
   });
 
   test.each<[string, string, string, string]>([

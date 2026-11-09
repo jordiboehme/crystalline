@@ -4,7 +4,7 @@
 
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
-import { requestVerdict } from "./verdict";
+import { requestVerdict, verdictFor } from "./verdict";
 import { parseSequence } from "./sequence/parse";
 
 vi.mock("./sequence/parse", async (original) => {
@@ -35,5 +35,19 @@ describe("the verdict's dispatch", () => {
       false,
     );
     expect(verdict).toMatchObject({ ok: true, kind: "flowchart" });
+  });
+
+  test("a sequence check that throws is no verdict: unavailable, not cached", async () => {
+    const body = "sequenceDiagram\n  A->>B: throws";
+    vi.mocked(parseSequence).mockImplementationOnce(() => {
+      throw new Error("boom");
+    });
+    const first = await requestVerdict(body, false);
+    expect(first).toMatchObject({ ok: false, unavailable: true });
+    expect(first.ok ? "" : first.reason).toMatch(/check failed: boom/);
+    expect(verdictFor(body)).toBe(undefined);
+    await expect(requestVerdict(body, false)).resolves.toMatchObject({
+      ok: true,
+    });
   });
 });
