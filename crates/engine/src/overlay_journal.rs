@@ -755,6 +755,30 @@ pub fn journal_save_record(
     save(&file, &bytes)
 }
 
+/// The mark a fold leaves while it runs, beside the convergence record. It
+/// stands from just before the review key comes off until every row is
+/// dropped, so a fold that stopped part way leaves it: while it stands, the
+/// drafts still merge and settle as they do in review mode.
+const FOLD_MARK: &str = ".fold-unfinished";
+
+/// Whether a fold of `domain` began and did not finish. A name that cannot
+/// address a journal folder holds no mark.
+pub(crate) fn fold_unfinished(state_dir: &Path, domain: &str) -> bool {
+    domain_dir(state_dir, domain).is_ok_and(|dir| dir.join(FOLD_MARK).is_file())
+}
+
+/// Leave the mark of a fold that has begun.
+pub(crate) fn mark_fold_unfinished(state_dir: &Path, domain: &str) -> io::Result<()> {
+    let dir = domain_dir(state_dir, domain)?;
+    std::fs::create_dir_all(&dir)?;
+    save(&dir.join(FOLD_MARK), b"")
+}
+
+/// Take the mark away once the fold finished, or the domain reviews again.
+pub(crate) fn clear_fold_unfinished(state_dir: &Path, domain: &str) -> io::Result<()> {
+    remove_if_present(&domain_dir(state_dir, domain)?.join(FOLD_MARK))
+}
+
 /// The file one domain's convergence record lives in.
 fn record_path(state_dir: &Path, domain: &str) -> io::Result<PathBuf> {
     Ok(domain_dir(state_dir, domain)?.join(RECORD_FILE))

@@ -800,12 +800,32 @@ impl Engine {
                 )
                 .await?
         };
-        // The pass first, for the plan and the fold alike, while the domain
-        // still reviews: a stale draft that merges is merged now, so the fold
-        // lands the team's line beside hers rather than over it. A failed pass
-        // stays a warning, as it does before a share: the check below reads
-        // what stands, so a stale draft still refuses. With the key already off
-        // (the mid-fold recovery) the pass does nothing.
+        // A fold that stopped part way left the key off and drafts behind. The
+        // mark says so, so the pass below and resolve treat those drafts as in
+        // review mode until the fold finishes. A fold from before the mark
+        // existed gets it here.
+        let recovering = !entry.is_overlay();
+        if recovering
+            && !self
+                .overlay_actor_drafts(domain, domain_id)
+                .await?
+                .is_empty()
+        {
+            self.mark_fold(domain, true)?;
+        }
+        let viewer = crate::scope::overlay_actor(scope);
+        let reader = review::Reader {
+            viewer: viewer.as_deref(),
+            admin: matches!(
+                scope,
+                crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+            ),
+        };
+        // The pass first, for the plan and the fold alike: a stale draft that
+        // merges is merged now, so the fold lands the team's line beside hers
+        // rather than over it. A failed pass stays a warning, as it does before
+        // a share: the check below reads what stands, so a stale draft still
+        // refuses.
         if let Err(e) = self.converge_overlays(domain).await {
             tracing::warn!("converging the drafts in '{domain}' before leaving review failed: {e}");
         }
@@ -837,7 +857,14 @@ impl Engine {
                         }
                     }
                 }
-                let viewer = crate::scope::overlay_actor(scope);
+                let removed = self
+                    .removed_names(
+                        conflicts
+                            .iter()
+                            .filter(|(_, found)| !found.is_empty())
+                            .map(|(actor, _)| actor),
+                    )
+                    .await?;
                 return Ok(review::plan_json(
                     domain,
                     entry,
@@ -846,7 +873,8 @@ impl Engine {
                     &review::PlanConflicts {
                         conflicts: &conflicts,
                         unreadable: &unreadable,
-                        viewer: viewer.as_deref(),
+                        removed: &removed,
+                        reader,
                     },
                 ));
             }
@@ -870,7 +898,10 @@ impl Engine {
         if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             return Err(EngineError::Conflict(refusal));
         }
-        if let Some(refusal) = self.unsettled_folds(domain, &folding).await? {
+        if let Some(refusal) = self
+            .unsettled_folds(domain, &folding, reader, recovering)
+            .await?
+        {
             return Err(EngineError::Conflict(refusal));
         }
 
@@ -932,6 +963,12 @@ impl Engine {
         // drafts but missing from the map would fall through this filter
         // unnamed, and their room would save into the tree rather than close
         // discarding - the publish this call exists to prevent.
+        // The mark goes down before the key comes off, so a fold that stops
+        // anywhere after this leaves drafts that can still be settled.
+        self.run_fold_hook(FoldStep::KeyOff).await;
+        if !drafts.is_empty() {
+            self.mark_fold(domain, true)?;
+        }
         self.write_review_key(domain, None)?;
         let discarded: HashSet<String> = choices
             .iter()
@@ -956,7 +993,56 @@ impl Engine {
         // their sockets and nothing else: the key goes back on, no file is
         // written and no row is dropped, so the same call works once one of the
         // two engrams has an address of its own.
-        self.run_fold_recheck_hook();
+        self.run_fold_hook(FoldStep::RoomsClosed).await;
+        // **From here until every row is dropped, the origin lock is held**, so
+        // no pull lands between the checks below and the writes they approve.
+        // The order is the house order: admin, fence, then origin, as a domain
+        // rename takes them. Nothing below takes the origin lock again.
+        let origin = self.origin_lock_registered(domain)?;
+        let origin_guard = origin.lock().await;
+        // The drafts again, as they stand now: a pull before the key came off
+        // merged into them through its pass, and the fold lands that text, not
+        // the text this call read at its start. An actor not in `choices` wrote
+        // a draft in that window; step 4 drops it.
+        let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
+        let folding: Vec<&ActorDrafts> = drafts
+            .iter()
+            .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
+            .collect();
+        // A refusal below puts the domain back as it was when this call began:
+        // reviewing, or, in a repeat of a fold that stopped part way, still
+        // folding with its mark.
+        let put_back = |this: &Self| -> Result<()> {
+            if !recovering {
+                this.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+                this.mark_fold(domain, false)?;
+            }
+            Ok(())
+        };
+        let rooms_saved = match rooms_closed {
+            0 => String::new(),
+            _ => " What those rooms saved is in the folder now, which `origin status` lists as \
+                  out-of-band work."
+                .to_string(),
+        };
+        let reviews_again = match recovering {
+            false => ", and the domain reviews changes again",
+            true => "",
+        };
+
+        // **And the same question again, of the folder the folded rooms just
+        // wrote into.** The key is off, so every swept room that saved wrote
+        // into the folder,
+        // and a participant who edited the frontmatter's permalink line has
+        // moved a base engram's address between the check above and this line; a fold validated
+        // against the older folder would write a second engram at that address
+        // and the first thing to notice would be the `sync` at the end - by
+        // which time the files are written, every actor's rows are dropped and
+        // every later sync of this domain fails the same way, with nothing left
+        // to undo it from. Asked here instead, the refusal costs the rooms
+        // their sockets and nothing else: the key goes back on, no file is
+        // written and no row is dropped, so the same call works once one of the
+        // two engrams has an address of its own.
         let base = {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
@@ -967,29 +1053,38 @@ impl Engine {
             // harmless: each of those rooms saved its text first, and its
             // editors can open the page again.
             self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+            self.mark_fold(domain, false)?;
             return Err(EngineError::Conflict(format!(
                 "{refusal}. The folder changed while this domain's co-editing rooms were being \
                  closed, so nothing was folded and the domain reviews changes again; what those \
                  rooms saved is in the folder now, which `origin status` lists as out-of-band work"
             )));
         }
-        // And her drafts asked again, of the snapshot as it stands now: a pull
-        // in that window can make a draft stale, and with the key off no pass
-        // merges it. This list does not ask the key. Its refusal, or a list
-        // that cannot be read, puts the key back as the address check does.
-        let unsettled = match self.unsettled_folds(domain, &folding).await {
+        // And her drafts asked again, of the snapshot as it stands now. This
+        // list does not ask the key. Its refusal, or a list that cannot be
+        // read, puts the domain back as the address check does.
+        let unsettled = match self
+            .unsettled_folds(domain, &folding, reader, recovering)
+            .await
+        {
             Ok(None) => None,
             Ok(Some(refusal)) => Some(EngineError::Conflict(format!(
-                "{refusal} This changed while the co-editing rooms were being closed, and the \
-                 domain reviews changes again. What those rooms saved is in the folder now, \
-                 which `origin status` lists as out-of-band work."
+                "{refusal} This changed while the fold was under way{reviews_again}.{rooms_saved}"
+            ))),
+            Err(EngineError::Conflict(refusal)) => Some(EngineError::Conflict(format!(
+                "{refusal}{}{rooms_saved}",
+                match recovering {
+                    false => " The domain reviews changes again.",
+                    true => "",
+                }
             ))),
             Err(e) => Some(e),
         };
         if let Some(refusal) = unsettled {
-            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+            put_back(self)?;
             return Err(refusal);
         }
+        self.run_fold_hook(FoldStep::Checked).await;
 
         // A folded MANIFEST draft may move the switch.
         let switch_before = self.reflection_switch(domain);
@@ -1075,6 +1170,13 @@ impl Engine {
             }
         }
         drop(pending);
+        // Every row is gone, so the fold is done: the mark goes, and a pull may
+        // land again. A mark that stays is logged; it only keeps a pass
+        // running over a domain with no drafts left.
+        if let Err(e) = self.mark_fold(domain, false) {
+            tracing::warn!("the fold mark of '{domain}' could not be taken away: {e}");
+        }
+        drop(origin_guard);
         // The files go with the rows, folded and discarded alike: whichever
         // answer each actor gave, drafting in this domain is over, and a files
         // overlay left behind would be bytes belonging to nobody in a domain
@@ -1125,31 +1227,88 @@ impl Engine {
     /// A name is removed when the accounts store holds no account under it and
     /// it is not the machine owner's. With no accounts store, as on the CLI or
     /// a test engine, no name is removed.
+    ///
+    /// A list that cannot be read refuses as a conflict (409) that names the
+    /// actor and says discard is the way left; the cause goes to the log.
     async fn unsettled_folds(
         &self,
         domain: &str,
         folding: &[&ActorDrafts],
+        reader: review::Reader<'_>,
+        recovering: bool,
     ) -> Result<Option<String>> {
         let mut conflicts = HashMap::new();
-        let mut removed = HashSet::new();
         for held in folding {
-            let found = self.draft_conflicts(domain, &held.actor).await?;
-            if found.is_empty() {
-                continue;
+            let found = match self.draft_conflicts(domain, &held.actor).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        actor = held.actor.as_str(),
+                        "the conflicts of '{}' could not be read, so the fold refused: {e}",
+                        held.actor
+                    );
+                    return Err(EngineError::Conflict(review::unreadable(
+                        domain,
+                        &held.actor,
+                        reader,
+                        recovering,
+                    )));
+                }
+            };
+            if !found.is_empty() {
+                conflicts.insert(held.actor.clone(), found);
             }
-            if held.actor != OWNER_IDENTITY_NAME
-                && let Some(access) = self.domain_access.get()
+        }
+        let removed = self.removed_names(conflicts.keys()).await?;
+        Ok(review::unsettled(
+            domain, folding, &conflicts, &removed, reader, recovering,
+        ))
+    }
+
+    /// The names among `actors` with no account any more: the accounts store
+    /// holds none under them and they are not the machine owner's. With no
+    /// accounts store, as on the CLI or a test engine, no name is removed.
+    async fn removed_names(
+        &self,
+        actors: impl Iterator<Item = &String>,
+    ) -> Result<HashSet<String>> {
+        let mut removed = HashSet::new();
+        let Some(access) = self.domain_access.get() else {
+            return Ok(removed);
+        };
+        for actor in actors {
+            if actor != OWNER_IDENTITY_NAME
                 && access
-                    .account_born(&held.actor)
+                    .account_born(actor)
                     .await
                     .map_err(|e| EngineError::Internal(e.to_string()))?
                     .is_none()
             {
-                removed.insert(held.actor.clone());
+                removed.insert(actor.clone());
             }
-            conflicts.insert(held.actor.clone(), found);
         }
-        Ok(review::unsettled(domain, folding, &conflicts, &removed))
+        Ok(removed)
+    }
+
+    /// Leave or take away the mark of an unfinished fold
+    /// ([`crate::overlay_journal::fold_unfinished`]).
+    /// A process with no state folder holds no drafts, so it has no mark to
+    /// take away.
+    fn mark_fold(&self, domain: &str, unfinished: bool) -> Result<()> {
+        let state_dir = match self.journal_state_dir() {
+            Ok(state_dir) => state_dir,
+            Err(_) if !unfinished => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let written = match unfinished {
+            true => crate::overlay_journal::mark_fold_unfinished(&state_dir, domain),
+            false => crate::overlay_journal::clear_fold_unfinished(&state_dir, domain),
+        };
+        written.map_err(|source| EngineError::Io {
+            path: format!("the fold mark of '{domain}'"),
+            source,
+        })
     }
 
     /// Land one folding actor's files in the folder the team shares, answering

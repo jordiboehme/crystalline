@@ -1075,10 +1075,10 @@ pub struct Engine {
     // fails once. See `Engine::fail_next_half_settle`.
     #[cfg(any(test, feature = "testing"))]
     fail_next_half_settle: std::sync::atomic::AtomicBool,
-    // When armed, a fold runs this once after its rooms closed and before it
-    // asks again for conflicts. See `Engine::before_next_fold_recheck`.
+    // When armed, a fold runs each of these once at the step it names. See
+    // `Engine::at_next_fold_step`.
     #[cfg(any(test, feature = "testing"))]
-    before_next_fold_recheck: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fold_hooks: std::sync::Mutex<Vec<(FoldStep, FoldHook)>>,
     // When armed, the next resolution of a share's credential answers that the
     // caller connected no personal identity, once. See
     // `Engine::refuse_next_personal_credential`.
@@ -2566,7 +2566,7 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_half_settle: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
-            before_next_fold_recheck: std::sync::Mutex::new(None),
+            fold_hooks: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "testing"))]
             refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
@@ -2812,30 +2812,38 @@ impl Engine {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Run `change` once in the next fold, after its rooms closed with the key
-    /// off and before it asks again for conflicts: the moment a pull can land
-    /// unseen by the first check. Nothing in the daemon, the CLI or the MCP
+    /// Run `hook` once in the next fold, at `step`: the moments a pull can
+    /// land while a fold runs. Nothing in the daemon, the CLI or the MCP
     /// surface calls this.
     #[cfg(any(test, feature = "testing"))]
-    pub fn before_next_fold_recheck(&self, change: Box<dyn FnOnce() + Send>) {
-        *self
-            .before_next_fold_recheck
+    pub fn at_next_fold_step(&self, step: FoldStep, hook: FoldHook) {
+        self.fold_hooks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(change);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((step, hook));
     }
 
-    /// Run what [`Engine::before_next_fold_recheck`] armed, once. Does nothing
-    /// outside a test build.
-    pub(super) fn run_fold_recheck_hook(&self) {
+    /// Run what [`Engine::at_next_fold_step`] armed for `step`, once. Does
+    /// nothing outside a test build.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        allow(clippy::unused_async, unused_variables)
+    )]
+    pub(super) async fn run_fold_hook(&self, step: FoldStep) {
         #[cfg(any(test, feature = "testing"))]
         {
-            let change = self
-                .before_next_fold_recheck
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(change) = change {
-                change();
+            let hook = {
+                let mut hooks = self
+                    .fold_hooks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                hooks
+                    .iter()
+                    .position(|(at, _)| *at == step)
+                    .map(|i| hooks.remove(i).1)
+            };
+            if let Some(hook) = hook {
+                hook().await;
             }
         }
     }
@@ -5787,6 +5795,18 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Whether `name`'s drafts still merge and settle: it reviews changes, or
+    /// a fold of it began and did not finish
+    /// ([`crate::overlay_journal::fold_unfinished`]). The pass and resolve ask
+    /// this, so a fold that stopped part way still has a way to settle each
+    /// draft before it is repeated.
+    pub(crate) fn drafts_stay_open(&self, name: &str) -> bool {
+        self.reviews_changes(name)
+            || self
+                .journal_state_dir()
+                .is_ok_and(|dir| crate::overlay_journal::fold_unfinished(&dir, name))
+    }
+
     /// Whether `name` is a read-only domain: its MANIFEST as the team has it
     /// (the folder for a file domain, the base row for a virtual one, never a
     /// draft) says `read_only: on`. A name nobody registers is not read-only;
@@ -6622,7 +6642,10 @@ impl Engine {
     /// is rather than saved over.
     ///
     /// A domain that takes changes directly returns at the first line and
-    /// touches nothing - no store read, no base file, no journal.
+    /// touches nothing - no store read, no base file, no journal beyond the
+    /// one mark that says a fold of it stopped part way. While that mark
+    /// stands the pass runs as in review mode, so the drafts the fold left
+    /// can still merge ([`Engine::drafts_stay_open`]).
     async fn converge_pulled_overlays(
         &self,
         domain: &str,
@@ -6641,7 +6664,7 @@ impl Engine {
         touched: &[String],
         only: Option<&str>,
     ) -> Result<ConvergenceReport> {
-        if !self.reviews_changes(domain) {
+        if !self.drafts_stay_open(domain) {
             return Ok(ConvergenceReport::default());
         }
         if self.take_failed_convergence() {
@@ -8851,6 +8874,23 @@ use doc_file::{
     remove_if_there,
 };
 pub use draft_conflicts::DraftConflict;
+
+/// The moments in a fold a test can step into with `Engine::at_next_fold_step`,
+/// which only a test build has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldStep {
+    /// Just before the review key comes off.
+    KeyOff,
+    /// After the rooms closed with the key off, before the second checks.
+    RoomsClosed,
+    /// After the second checks, before the first fold is written.
+    Checked,
+}
+
+/// What a test runs at a [`FoldStep`].
+#[cfg(any(test, feature = "testing"))]
+pub type FoldHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 mod domain_add;
 mod domain_settings;
 mod domains;

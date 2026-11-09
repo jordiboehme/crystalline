@@ -2808,8 +2808,10 @@ pub struct ReviewBody {
             description = "The domain cannot take the mode asked for: no \
                            GitHub origin, a virtual domain, unshared work in \
                            the folder, an answer that does not cover every \
-                           actor holding drafts, or a fold two engrams would \
-                           come out of.",
+                           actor holding drafts, a fold two engrams would \
+                           come out of, or a folded draft that does not fit \
+                           the team's text or whose conflicts could not be \
+                           read. Each names the actor; discard always works.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

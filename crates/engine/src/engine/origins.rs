@@ -4105,7 +4105,7 @@ impl Engine {
         // A draft settles with collaboration off, so only a domain that takes
         // changes directly is refused here. Its folder conflict is refused
         // again below, for a reviewing domain too.
-        if !self.config.read().unwrap().github_enabled() && !self.reviews_changes(domain) {
+        if !self.config.read().unwrap().github_enabled() && !self.drafts_stay_open(domain) {
             return Err(RemoteError::NotEnabled.into());
         }
         if self.read_only {
@@ -4158,7 +4158,13 @@ impl Engine {
                 ));
             }
         }
-        if let Some(who) = self.overlay_share_identity(domain, &actor)? {
+        // A fold that stopped part way leaves the drafts settling as in review
+        // mode, so the fold can be repeated once each one is settled.
+        let drafting = match self.drafts_stay_open(domain) {
+            true => Some(share_staging::overlay_share_actor(&actor)?),
+            false => None,
+        };
+        if let Some(who) = drafting {
             let held = {
                 let store = self.store.lock().await;
                 match store.domain_id(domain).await? {

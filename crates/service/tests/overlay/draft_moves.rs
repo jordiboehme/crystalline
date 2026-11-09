@@ -16,7 +16,7 @@ use crystalline_index::{DomainKind, EngramRecord, FileStamp, Store, TursoStore};
 use crystalline_remote::ops::DiscardTarget;
 use crystalline_remote::state::{BaseStamp, OriginState, remove_base_file, write_base_file};
 use crystalline_service::draft_start::{self, DraftStart};
-use crystalline_service::engine::{DraftConflict, DraftConflictKind};
+use crystalline_service::engine::{DraftConflict, DraftConflictKind, FoldHook, FoldStep};
 use crystalline_service::overlay_journal;
 use crystalline_service::params::{
     DeleteParams, EditParams, MoveParams, ReadParams, SaveParams, SplitParams, WriteParams,
@@ -2394,6 +2394,14 @@ async fn a_merged_resolve_tells_the_caller_when_its_mirror_failed() {
 
 // --- leaving review refuses a draft that cannot be merged --------------------
 
+/// A fold step that runs `change` and waits for nothing.
+fn sync_hook(change: impl FnOnce() + Send + 'static) -> FoldHook {
+    Box::new(move || {
+        change();
+        Box::pin(async {})
+    })
+}
+
 /// The fold's sentence for a person whose conflicts stand.
 fn unsettled_of(actor: &str, paths: &str) -> String {
     format!(
@@ -2402,12 +2410,17 @@ fn unsettled_of(actor: &str, paths: &str) -> String {
     )
 }
 
-/// The fold's sentence for a name with no account any more.
-fn unsettled_of_removed(actor: &str) -> String {
+/// The fold's sentence, to an admin, for a name with no account any more.
+fn unsettled_of_removed(actor: &str, paths: &str) -> String {
     format!(
-        "'{actor}' has no account any more, so nobody can settle these. Choose discard, or end \
-         the drafts on the users screen."
+        "'{actor}' has conflicts in {paths} and no account any more, so nobody can settle \
+         them. Choose discard, or end their drafts on the Users screen."
     )
+}
+
+/// The plan's sentence on a colleague's row in conflict.
+fn row_of(actor: &str) -> String {
+    format!("'{actor}' has a conflict here. Ask them to settle it, or choose discard.")
 }
 
 fn bob() -> Scope {
@@ -2561,14 +2574,12 @@ async fn a_fold_plan_names_the_conflict_on_the_row() {
     let rows = &plan["actors"][0]["drafts"];
     assert_eq!(rows[0]["path"], "note.md", "{plan}");
     assert_eq!(
-        rows[0]["conflict"], "alice has a conflict here. Ask them to settle it, or choose discard.",
+        rows[0]["conflict"],
+        row_of("alice"),
         "a deletion stands too: {plan}"
     );
     assert_eq!(rows[1]["path"], "plan.md", "{plan}");
-    assert_eq!(
-        rows[1]["conflict"], "alice has a conflict here. Ask them to settle it, or choose discard.",
-        "{plan}"
-    );
+    assert_eq!(rows[1]["conflict"], row_of("alice"), "{plan}");
 
     let own = Scope::User {
         account: "alice".to_string(),
@@ -2586,11 +2597,7 @@ async fn a_fold_plan_names_the_conflict_on_the_row() {
     let plan = f.plan(&Scope::Unrestricted).await;
     let rows = &plan["actors"][0]["drafts"];
     for row in [0, 1] {
-        assert_eq!(
-            rows[row]["conflict"],
-            "alice has a conflict here. Ask them to settle it, or choose discard.",
-            "{plan}"
-        );
+        assert_eq!(rows[row]["conflict"], row_of("alice"), "{plan}");
     }
 }
 
@@ -2661,35 +2668,40 @@ async fn discard_still_works_on_a_conflict() {
 /// stale in that window is the team's change arriving with it, which the seam
 /// stands in for. The refusal puts the key back, as the address check does.
 #[tokio::test]
-async fn a_room_that_saves_into_a_conflict_during_the_fold_puts_the_key_back() {
+async fn a_pull_during_the_fold_puts_the_key_back() {
     let f = fixture(&[("plan.md", LONG)]).await;
     f.replace("plan", "the first line", "alice's first line")
         .await;
     let hers = f.row("plan.md").await;
     let (folder, snapshot) = (f.root.join("team"), f.snapshot_dir());
-    f.engine.before_next_fold_recheck(Box::new(move || {
-        let bytes = bobs(LONG).into_bytes();
-        std::fs::write(folder.join("plan.md"), &bytes).unwrap();
-        let mut state = OriginState::load(&snapshot).unwrap().unwrap();
-        state.files.insert(
-            "plan.md".to_string(),
-            BaseStamp {
-                sha256: crate::support::sha256_hex(&bytes),
-                size: bytes.len() as u64,
-            },
-        );
-        write_base_file(&snapshot, "plan.md", &bytes).unwrap();
-        state.save(&snapshot).unwrap();
-    }));
+    f.engine.at_next_fold_step(
+        FoldStep::RoomsClosed,
+        sync_hook(move || {
+            let bytes = bobs(LONG).into_bytes();
+            std::fs::write(folder.join("plan.md"), &bytes).unwrap();
+            let mut state = OriginState::load(&snapshot).unwrap().unwrap();
+            state.files.insert(
+                "plan.md".to_string(),
+                BaseStamp {
+                    sha256: crate::support::sha256_hex(&bytes),
+                    size: bytes.len() as u64,
+                },
+            );
+            write_base_file(&snapshot, "plan.md", &bytes).unwrap();
+            state.save(&snapshot).unwrap();
+        }),
+    );
 
     let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
     let words = refused.to_string();
     assert!(words.contains(&unsettled_of("alice", "plan.md")), "{words}");
     assert!(
-        words.contains("the domain reviews changes again"),
+        words.ends_with(
+            "This changed while the fold was under way, and the domain reviews changes again."
+        ),
         "{words}"
     );
-    assert!(words.contains("out-of-band work"), "{words}");
+    assert!(!words.contains("out-of-band"), "no room closed: {words}");
     assert!(f.reviews(), "the key is back on");
     assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
     assert_eq!(f.row("plan.md").await, hers);
@@ -2697,7 +2709,7 @@ async fn a_room_that_saves_into_a_conflict_during_the_fold_puts_the_key_back() {
 }
 
 /// A fold that failed part way leaves the key off and her rows standing. The
-/// repeat still asks for conflicts, though no pass runs with the key off.
+/// repeat still asks for conflicts, and says what the earlier fold left.
 #[tokio::test]
 async fn a_mid_fold_recovery_still_refuses_a_conflict() {
     let f = fixture(&[("plan.md", LONG)]).await;
@@ -2723,12 +2735,15 @@ async fn a_mid_fold_recovery_still_refuses_a_conflict() {
     f.team_has("plan.md", bobs(LONG).as_bytes());
     std::fs::remove_file(f.root.join("team").join("sub")).unwrap();
     let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains(&unsettled_of("alice", "plan.md")),
-        "{refused}"
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "Nothing more in 'team' was folded. {} An earlier fold stopped part way, and what it \
+             wrote stays in the folder whatever you choose.",
+            unsettled_of("alice", "plan.md")
+        )
     );
+    assert!(!f.reviews(), "the key stays off");
     assert_eq!(f.rows().await.len(), 2);
     assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
 }
@@ -2741,8 +2756,18 @@ async fn a_removed_names_conflict_refuses_the_fold_with_its_two_ways_out() {
 
     let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
     let words = refused.to_string();
-    assert!(words.contains(&unsettled_of_removed("alice")), "{words}");
+    assert!(
+        words.contains(&unsettled_of_removed("alice", "plan.md")),
+        "{words}"
+    );
     assert!(f.reviews());
+    let plan = f.plan(&Scope::Unrestricted).await;
+    assert_eq!(
+        plan["actors"][0]["drafts"][0]["conflict"],
+        "'alice' has no account any more, so nobody can settle this. Choose discard, or end \
+         their drafts on the Users screen.",
+        "nobody is told to ask a removed name: {plan}"
+    );
     assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
 
     f.fold(&[("alice", FoldChoice::Discard)]).await.unwrap();
@@ -2846,7 +2871,20 @@ async fn a_fold_with_a_broken_record_refuses_and_changes_nothing() {
 
     let plan = f.plan(&Scope::Unrestricted).await;
     assert_eq!(plan["actors"][0]["conflicts_unreadable"], true, "{plan}");
-    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            crystalline_service::engine::EngineError::Conflict(_)
+        ),
+        "a 409, not a 500: {refused:?}"
+    );
+    assert_eq!(
+        refused.to_string(),
+        "Nothing in 'team' was folded. The conflicts of 'alice' could not be read, so their \
+         drafts cannot be folded safely. Choose discard for 'alice', which ends their text, or \
+         fold again once the problem in the log is fixed."
+    );
     assert!(f.reviews());
     assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
     assert_eq!(f.folder("plan.md").as_deref(), Some(LONG));
@@ -2877,8 +2915,12 @@ async fn the_machine_owners_conflict_is_never_a_removed_names() {
 
     let refused = f.fold(&[("owner", FoldChoice::Fold)]).await.unwrap_err();
     let words = refused.to_string();
-    assert!(words.contains(&unsettled_of("owner", "plan.md")), "{words}");
-    assert!(!words.contains("no account"), "{words}");
+    assert_eq!(
+        words,
+        "Nothing in 'team' was folded. You have conflicts in plan.md. Settle them first, or \
+         choose discard, which ends your text.",
+        "the owner reads their own drafts as theirs"
+    );
 }
 
 /// C1 at the second check: a record that breaks while the rooms close refuses
@@ -2888,12 +2930,210 @@ async fn a_record_broken_during_the_fold_puts_the_key_back() {
     let f = fixture(&[("plan.md", LONG)]).await;
     f.append("plan", HER_LINE).await;
     let file = draft_start::record_file(&f.state, "team", "alice", "plan.md").unwrap();
-    f.engine.before_next_fold_recheck(Box::new(move || {
-        std::fs::write(&file, "not a record").unwrap();
-    }));
+    f.engine.at_next_fold_step(
+        FoldStep::RoomsClosed,
+        sync_hook(move || {
+            std::fs::write(&file, "not a record").unwrap();
+        }),
+    );
 
-    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            crystalline_service::engine::EngineError::Conflict(_)
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .ends_with("The domain reviews changes again."),
+        "{refused}"
+    );
     assert!(f.reviews(), "the key is back on");
     assert_eq!(f.rows().await, vec![("plan.md".to_string(), false)]);
     assert_eq!(f.folder("plan.md").as_deref(), Some(LONG));
+}
+
+/// Window A: the team's change is pulled while the key is still on, and the
+/// pull's pass merges it into her row. The fold lands that row, not the text it
+/// read before the pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_before_the_key_comes_off_keeps_the_teams_line() {
+    let f = Arc::new(fixture(&[("plan.md", LONG)]).await);
+    f.append("plan", HER_LINE).await;
+    let g = f.clone();
+    f.engine.at_next_fold_step(
+        FoldStep::KeyOff,
+        Box::new(move || {
+            Box::pin(async move {
+                // The update's tail waits for the admin lock the fold holds, so
+                // the pull runs on its own and the fold goes on once the pass
+                // has merged the team's line into her row.
+                let h = g.clone();
+                tokio::spawn(async move {
+                    h.push(&[("plan.md", Some(bobs(LONG)))]).await;
+                });
+                for _ in 0..200 {
+                    if g.row("plan.md").await.contains(BOB_LINE) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the pull never merged into her row");
+            })
+        }),
+    );
+
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    let landed = f.folder("plan.md").unwrap();
+    assert!(
+        landed.contains(BOB_LINE) && landed.contains(HER_LINE),
+        "{landed}"
+    );
+}
+
+/// Window B: a pull that starts after the last check waits for the fold, so
+/// it merges into what the fold wrote and the team's line stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_after_the_last_check_waits_for_the_fold() {
+    let f = Arc::new(fixture(&[("plan.md", LONG)]).await);
+    f.append("plan", HER_LINE).await;
+    let pull: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::default();
+    let (g, slot) = (f.clone(), pull.clone());
+    f.engine.at_next_fold_step(
+        FoldStep::Checked,
+        Box::new(move || {
+            Box::pin(async move {
+                let task = tokio::spawn(async move {
+                    g.push(&[("plan.md", Some(bobs(LONG)))]).await;
+                });
+                *slot.lock().unwrap() = Some(task);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            })
+        }),
+    );
+
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    let task = pull.lock().unwrap().take().unwrap();
+    task.await.unwrap();
+    let landed = f.folder("plan.md").unwrap();
+    assert!(
+        landed.contains(BOB_LINE) && landed.contains(HER_LINE),
+        "{landed}"
+    );
+}
+
+/// From a stale row in a fold that stopped part way to a finished fold: the
+/// pass still merges what merges, resolve still settles the rest, and the
+/// repeat lands both.
+#[tokio::test]
+async fn a_mid_fold_recovery_merges_settles_and_finishes() {
+    let f = fixture(&[("plan.md", LONG), ("rich.md", RICH)]).await;
+    f.append("plan", HER_LINE).await;
+    f.replace("rich", "the first thing", "alice's first thing")
+        .await;
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("sub".to_string()),
+                ..write_params("Fresh", "her new page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(f.root.join("team").join("sub"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(!f.reviews());
+    assert!(
+        f.state.join("overlays/team/.fold-unfinished").is_file(),
+        "the stopped fold leaves its mark, so a pull before the repeat still merges"
+    );
+
+    // The team changes both pages: one change merges with hers, one does not.
+    f.team_has("plan.md", bobs(LONG).as_bytes());
+    let bobs_rich = RICH.replace("the first thing", "bob's first thing");
+    f.team_has("rich.md", bobs_rich.as_bytes());
+    std::fs::remove_file(f.root.join("team").join("sub")).unwrap();
+
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(&unsettled_of("alice", "rich.md")),
+        "only the page that does not merge stands: {refused}"
+    );
+    let merged = f.row("plan.md").await;
+    assert!(
+        merged.contains(BOB_LINE) && merged.contains(HER_LINE),
+        "{merged}"
+    );
+
+    let receipt = f.resolve("rich.md", "mine").await;
+    assert_eq!(receipt["kept"], "mine", "{receipt}");
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    assert!(!f.reviews());
+    assert_eq!(f.rows().await, vec![]);
+    let plan = f.folder("plan.md").unwrap();
+    assert!(plan.contains(BOB_LINE) && plan.contains(HER_LINE), "{plan}");
+    assert!(f.folder("rich.md").unwrap().contains("alice's first thing"));
+    assert!(f.folder("sub/fresh.md").is_some());
+    assert!(
+        !f.state.join("overlays/team/.fold-unfinished").exists(),
+        "the mark is gone once the fold finished"
+    );
+}
+
+/// A repeated fold that meets a new conflict at its second check leaves the
+/// domain as it found it: the key stays off and the mark stays.
+#[tokio::test]
+async fn a_pull_during_a_repeated_fold_leaves_the_key_off() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("sub".to_string()),
+                ..write_params("Fresh", "her new page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(f.root.join("team").join("sub"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    std::fs::remove_file(f.root.join("team").join("sub")).unwrap();
+
+    let (folder, snapshot) = (f.root.join("team"), f.snapshot_dir());
+    f.engine.at_next_fold_step(
+        FoldStep::RoomsClosed,
+        sync_hook(move || {
+            let bytes = bobs(LONG).into_bytes();
+            std::fs::write(folder.join("plan.md"), &bytes).unwrap();
+            let mut state = OriginState::load(&snapshot).unwrap().unwrap();
+            state.files.insert(
+                "plan.md".to_string(),
+                BaseStamp {
+                    sha256: crate::support::sha256_hex(&bytes),
+                    size: bytes.len() as u64,
+                },
+            );
+            write_base_file(&snapshot, "plan.md", &bytes).unwrap();
+            state.save(&snapshot).unwrap();
+        }),
+    );
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    let words = refused.to_string();
+    assert!(
+        words.ends_with("This changed while the fold was under way."),
+        "{words}"
+    );
+    assert!(!f.reviews(), "the key stays off");
+    assert!(f.state.join("overlays/team/.fold-unfinished").is_file());
+    assert_eq!(f.rows().await.len(), 2);
 }
