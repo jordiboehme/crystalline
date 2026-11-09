@@ -32,6 +32,11 @@
 #   bash fluid/e2e/run-smoke.sh                 # the whole suite
 #   bash fluid/e2e/run-smoke.sh --headed        # arguments reach playwright
 #
+# CI runs the suite in shards, each one a run of this script with a part of the
+# spec files as arguments (see scripts/smoke-shards.ts). One shard by hand:
+#
+#   bash fluid/e2e/run-smoke.sh $(cd fluid && node scripts/smoke-shards.ts 2 5)
+#
 # `FLUID_E2E_BASE_PATH=/crystalline` runs the same journeys with the daemon
 # under a path prefix, against its embedded UI. The binary must be built after
 # `pnpm build`, as for the curl block.
