@@ -329,6 +329,8 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
   // and not their sum, also while it animates over several frames. A layout
   // change above the line changes the sum. That is a jump, unless the layer's own
   // `scrollBy` took it back in that frame, so that is counted and subtracted.
+  // `shifted` is the largest such scroll, by either party, in a frame where a box
+  // above the window changed its height: the correction of a landing ran.
   await page.evaluate(() => {
     const log = {
       frames: 0,
@@ -343,6 +345,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
     let was = new Map<string, number>();
     let lastAt = scroller.scrollTop;
     let taken = 0;
+    let boxHeights = new Map<Element, number>();
     const scrollBy = Object.getOwnPropertyDescriptor(
       Element.prototype,
       "scrollBy",
@@ -354,8 +357,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
       };
     // CodeMirror keeps the text still after a height correction with a window
     // scroll in the same frame (the page scrolls the document), so those scrolls
-    // are taken back too. They stay out of `shifted`, which counts the widget's
-    // own correction only.
+    // are taken back too.
     let compensated = 0;
     // The global object holds its own scroll methods (they are not on
     // Window.prototype), so the hooks go on `window` itself.
@@ -414,7 +416,6 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
           if (before !== undefined) {
             const moved = Math.abs(place - before - taken - compensated);
             log.worst = Math.max(log.worst, moved);
-            log.shifted = Math.max(log.shifted, Math.abs(taken));
             if (moved > 2 && log.jumps.length < 8) {
               log.jumps.push(
                 `${text} moved ${moved.toFixed(1)} scroll ${(at - lastAt).toFixed(1)} taken ${taken.toFixed(1)} at ${at.toFixed(0)}`,
@@ -422,6 +423,28 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
             }
           }
         }
+      }
+      const windowTop =
+        scroller === document.scrollingElement
+          ? 0
+          : scroller.getBoundingClientRect().top;
+      const heightsNow = new Map<Element, number>();
+      let landedAbove = false;
+      for (const el of document.querySelectorAll(".cm-diagram")) {
+        const rect = el.getBoundingClientRect();
+        heightsNow.set(el, rect.height);
+        const before = boxHeights.get(el);
+        if (
+          before !== undefined &&
+          before !== rect.height &&
+          rect.top < windowTop
+        ) {
+          landedAbove = true;
+        }
+      }
+      boxHeights = heightsNow;
+      if (landedAbove) {
+        log.shifted = Math.max(log.shifted, Math.abs(taken + compensated));
       }
       taken = 0;
       compensated = 0;

@@ -815,34 +815,63 @@ describe("off screen", () => {
   });
 
   describe("a drawing landing above the window, the page scrolling outside the editor", () => {
+    /** How far the page has scrolled since the box was first drawn. */
+    let scrolled = 0;
+
+    /**
+     * The box at `top` less the scroll; the editor's lines after it 600 px below
+     * its bottom, those before it 20 px above it. 300 px tall before its drawing,
+     * 374 px after.
+     */
     function rects(top: number, bodyTop = 0) {
+      scrolled = 0;
       return vi
         .spyOn(HTMLElement.prototype, "getBoundingClientRect")
         .mockImplementation(function rect(this: HTMLElement) {
-          const height = this.classList.contains("cm-diagram")
-            ? this.querySelector("svg") === null
-              ? 300
-              : 374
-            : 0;
+          const boxHeight =
+            document.querySelector(".cm-diagram svg") === null ? 300 : 374;
+          let place: number | null = null;
+          let height = 0;
+          if (this.classList.contains("cm-diagram")) {
+            place = top;
+            height = boxHeight;
+          } else if (this.classList.contains("cm-editor")) {
+            place = 0;
+          } else if (this.parentElement?.classList.contains("cm-content")) {
+            const box = document.querySelector(".cm-diagram");
+            const after =
+              box !== null &&
+              (box.compareDocumentPosition(this) &
+                Node.DOCUMENT_POSITION_FOLLOWING) !==
+                0;
+            place = after ? top + boxHeight + 600 : top - 20;
+          }
+          const y =
+            place === null
+              ? this === document.body
+                ? bodyTop
+                : 0
+              : place - scrolled;
           return {
             height,
             width: 0,
-            top: this.classList.contains("cm-diagram")
-              ? top
-              : this === document.body
-                ? bodyTop
-                : 0,
+            top: y,
             left: 0,
             right: 0,
-            bottom: top + height,
+            bottom: y + height,
             x: 0,
-            y: top,
+            y,
             toJSON: () => ({}),
           };
         });
     }
 
-    async function land(top: number) {
+    /**
+     * Lands the drawing. `person` is a scroll between the paste and the measure
+     * pass; `pass` is one that something later in the same pass makes, the way
+     * CodeMirror keeps its first line still.
+     */
+    async function land(top: number, { person = 0, pass = 0 } = {}) {
       const scrollBy = vi.fn();
       // jsdom has neither.
       const scroller = document.documentElement;
@@ -854,6 +883,24 @@ describe("off screen", () => {
       kit.hold.value = true;
       const view = await drawn();
       const spy = rects(top);
+      const ask = view.requestMeasure.bind(view);
+      let armed = true;
+      const asked = vi
+        .spyOn(view, "requestMeasure")
+        .mockImplementation((request) => {
+          ask(request);
+          if (armed && request?.write !== undefined) {
+            // The landing's own request, asked right after the paste.
+            armed = false;
+            scrolled += person;
+            ask({
+              read: () => null,
+              write: () => {
+                scrolled += pass;
+              },
+            });
+          }
+        });
       try {
         const render = renders().at(-1);
         render?.resolve(recordedAs(render.id));
@@ -861,8 +908,10 @@ describe("off screen", () => {
           expect(box(view).querySelector("svg")).not.toBeNull();
         });
         measured(view);
+        await flush();
       } finally {
         spy.mockRestore();
+        asked.mockRestore();
       }
       return scrollBy;
     }
@@ -904,6 +953,7 @@ describe("off screen", () => {
           expect(box(view).querySelector("svg")).not.toBeNull();
         });
         measured(view);
+        await flush();
         expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
         expect(fallback).not.toHaveBeenCalled();
       } finally {
@@ -916,6 +966,23 @@ describe("off screen", () => {
     it("leaves the scroller alone when the box is in the window", async () => {
       const scrollBy = await land(100);
       expect(scrollBy).not.toHaveBeenCalled();
+    });
+
+    it("scrolls nothing when the same pass already kept the text still", async () => {
+      const scrollBy = await land(-500, { pass: 74 });
+      expect(scrollBy).not.toHaveBeenCalled();
+    });
+
+    it("takes only what the pass left over", async () => {
+      const scrollBy = await land(-500, { pass: 30 });
+      expect(scrollBy).toHaveBeenCalledTimes(1);
+      expect(scrollBy).toHaveBeenCalledWith({ top: 44, behavior: "instant" });
+    });
+
+    it("keeps the person's own scroll between the paste and the pass", async () => {
+      const scrollBy = await land(-500, { person: 200 });
+      expect(scrollBy).toHaveBeenCalledTimes(1);
+      expect(scrollBy).toHaveBeenCalledWith({ top: 74, behavior: "instant" });
     });
   });
 
