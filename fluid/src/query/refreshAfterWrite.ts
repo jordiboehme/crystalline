@@ -17,6 +17,12 @@
  * under `refetchType: "active"`, the default) is never cancelled, because a
  * `fetchQuery` caller may be waiting on it and nothing would start it again.
  *
+ * One cost: a `fetchQuery` or `ensureQueryData` call that joined an active
+ * first load is rejected with a `CancelledError` instead of getting the old
+ * snapshot, as query-core already does to such callers when the query has
+ * data. No caller in Fluid joins a first load that way today; one that does
+ * should catch the cancel and read again.
+ *
  * The returned promise is the invalidate's, so awaiting this still means the
  * refetch has settled.
  */
