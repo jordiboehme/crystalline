@@ -194,10 +194,11 @@ describe("NOTICES", () => {
       passesDeclaration:
         "A message cannot move across the line that declares its participant, so nothing was changed.",
       mixedLine:
-        "The next line holds a block's start or end and more, so nothing was changed.",
+        "The next line holds a block's own line (such as loop, else or end) and another statement, so nothing was changed.",
       changesOrder:
         "That would change the order of the participants, so nothing was changed.",
-      failed: "That change did not finish. Look at the diagram and try again.",
+      failed:
+        "Something went wrong with that move. Look at the diagram before you try again.",
     });
   });
 
@@ -217,7 +218,8 @@ describe("NOTICES", () => {
       passesStart: "A message cannot move across the start of a participant.",
       passesDeclaration:
         "A message cannot move across the line that declares its participant.",
-      mixedLine: "The next line holds a block's start or end and more.",
+      mixedLine:
+        "The next line holds a block's own line (such as loop, else or end) and another statement.",
       changesOrder: "That would change the order of the participants.",
     });
     // Every code an op's compile can answer, which is what a menu shows ahead.
