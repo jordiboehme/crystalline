@@ -27,6 +27,7 @@ import {
   mintDraftLink,
   revokeDraftLink,
 } from "../api/draftLinks";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export interface DraftLinkDialogProps {
   /** The domain the draft lives in. */
@@ -54,7 +55,7 @@ export function DraftLinkDialog({
   });
 
   const refresh = (): void => {
-    void queryClient.invalidateQueries({
+    void refreshAfterWrite(queryClient, {
       queryKey: draftLinksKey(domain, path),
     });
   };

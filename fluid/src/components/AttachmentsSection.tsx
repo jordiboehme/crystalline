@@ -37,6 +37,7 @@ import { assetRefsIn } from "../editor/imageFormat";
 import { formatBytes } from "../format";
 import { BUTTON, Chip, FOCUS_RING, IconButton, RAIL_LABEL } from "./primitives";
 import { useEngramAssetHome } from "./useEngramAssetHome";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export interface AttachmentsSectionProps {
   /** The domain the paths are relative to. */
@@ -200,7 +201,7 @@ export function AttachmentsSection({
         // or its size changed, and it is the same listing the upload flow
         // picks a free path against, so it is refreshed rather than patched
         // in place.
-        await queryClient.invalidateQueries({ queryKey: home.key });
+        await refreshAfterWrite(queryClient, { queryKey: home.key });
         focusAfter.current = { kind: "file", path: question.path };
         setAsking(null);
       } catch (cause) {

@@ -31,6 +31,7 @@ import {
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
 import { BUTTON, Field } from "./primitives";
 import { SuggestInput, suggestionsAreOpen } from "./SuggestInput";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -101,7 +102,7 @@ export default function CreateEngramDialogBody({
       // drawn from, and a create is a row that was not in it a moment ago.
       // Every level of the domain at once rather than the one folder: a new
       // engram can make a folder that no level had listed before.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(created.domain),
       });
       wasCreated.current = true;

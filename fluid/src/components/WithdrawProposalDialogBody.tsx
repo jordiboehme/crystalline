@@ -35,6 +35,7 @@ import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { BUTTON } from "./primitives";
 import { useShareIdentity } from "./useShareIdentity";
 import type { WithdrawProposalDialogProps } from "./WithdrawProposalDialog";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export default function WithdrawProposalDialogBody({
   domain,
@@ -63,7 +64,7 @@ export default function WithdrawProposalDialogBody({
       }
       // Always: this proposal is not open any more, and the card that lists it
       // and the card that counts it both read this one status.
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
       if (receipt.restored.length === 0 && receipt.deleted.length === 0) {
         return;
       }
@@ -72,11 +73,11 @@ export default function WithdrawProposalDialogBody({
       // navigation walks, every listing either view of the domain screen has
       // paged, and the listing every sidebar, card and switcher counts
       // engrams from.
-      void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, { queryKey: domainTreeKey(domain) });
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(domain),
       });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
     },
     onError: (error: Error) => {
       onProblem(problemDetail(error));

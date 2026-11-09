@@ -39,6 +39,7 @@ import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { formatInstant, plural, relativeTime } from "../format";
 import { ConflictDialog } from "./ConflictDialog";
 import { BUTTON, FOCUS_RING } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /**
  * The warning face, for the one thing here that is neither fine nor a failure:
@@ -111,8 +112,8 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
       // Both of the things a pull can have changed: this card's own status,
       // and the listing every sidebar, card and switcher draws from - a pull
       // that applied files moves a domain's engram count and its last sync.
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: syncStatusKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
     },
   });
 

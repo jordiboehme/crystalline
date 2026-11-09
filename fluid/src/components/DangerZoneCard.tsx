@@ -56,6 +56,7 @@ import {
   READ_ONLY_REASON,
   RENAMING_REASON,
 } from "./DestructiveAction";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export function DangerZoneCard({
   domain,
@@ -97,7 +98,7 @@ export function DangerZoneCard({
     onSuccess: () => {
       // The listing is what every sidebar, card and switcher draws from, and
       // the domain this screen is about is no longer in it.
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
       // Nowhere to stay: this address is now a wrong address.
       void navigate("/");
     },
@@ -118,7 +119,7 @@ export function DangerZoneCard({
       );
       // The members card reads the same key and says which state the domain
       // is in beside its own heading, so it hears about this at once.
-      void queryClient.invalidateQueries({ queryKey: membersKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: membersKey(domain) });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));

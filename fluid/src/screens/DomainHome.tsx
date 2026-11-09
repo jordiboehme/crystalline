@@ -148,6 +148,7 @@ import {
   useReflectionStatus,
 } from "../components/ReflectionModeSwitch";
 import { PREFETCH, prefetchManifestEditor } from "../prefetch";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export default function DomainHome() {
   const { domain = "" } = useParams();
@@ -1006,7 +1007,7 @@ function PendingRenameBanner({
     },
     onMutate: () => setFailure(null),
     onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY }),
+      refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY }),
     onError: (error) =>
       setFailure(
         error instanceof ApiProblem && error.status === 409

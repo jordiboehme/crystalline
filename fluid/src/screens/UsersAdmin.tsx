@@ -36,6 +36,7 @@ import { ReflectionLevelSelect } from "../components/ReflectionLevelSelect";
 import { raiseForNone, reflectionAfter } from "../components/reflectionLevels";
 import { formatDay } from "../format";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The roles an account can hold, least privileged first, as the API orders them. */
 const ROLES: Role[] = ["none", "viewer", "editor", "admin"];
@@ -75,7 +76,7 @@ function UsersPanel() {
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: USERS_QUERY_KEY });
+    refreshAfterWrite(queryClient, { queryKey: USERS_QUERY_KEY });
 
   const patch = useMutation({
     mutationFn: ({ name, body }: { name: string; body: PatchUserBody }) =>

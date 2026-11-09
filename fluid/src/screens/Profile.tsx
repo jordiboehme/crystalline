@@ -99,6 +99,7 @@ import {
 } from "../components/primitives";
 import { formatDay } from "../format";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** How often the identity is asked again while a device flow is running. */
 const POLL_MS = 3000;
@@ -383,8 +384,8 @@ function GithubLinkPanel({
           ? { kind: "done", text: "The older sign-in is forgotten." }
           : { kind: "problem", text: gone.warning },
       );
-      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
-      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: MY_GITHUB_IDENTITY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: MY_GITHUB_LINK_KEY });
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });
@@ -435,10 +436,10 @@ function GithubLinkPanel({
           ? { kind: "done", text: "Your GitHub account is unlinked." }
           : { kind: "problem", text: warning },
       );
-      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: MY_GITHUB_LINK_KEY });
       // The share dialog reads the personal identity, and the unlink took
       // its token away.
-      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: MY_GITHUB_IDENTITY_KEY });
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });
@@ -570,7 +571,7 @@ function SsoIdentityCard({ user }: { user: User }) {
     mutationFn: (issuer: string) => unlinkIdentity(issuer),
     onSuccess: () => {
       setNotice({ kind: "done", text: "The identity is unlinked." });
-      void queryClient.invalidateQueries({ queryKey: IDENTITY_LINKS_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: IDENTITY_LINKS_KEY });
     },
     onError: (error: Error) => {
       // Including the refusal that keeps an account reachable, whose words
@@ -756,7 +757,7 @@ function IdentityPanel() {
   });
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
+    refreshAfterWrite(queryClient, { queryKey: MY_GITHUB_IDENTITY_KEY });
 
   const connect = useMutation({
     mutationFn: startMyGithubIdentityDevice,
@@ -1144,7 +1145,7 @@ export function AgentAccessCard() {
   });
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: MCP_TOKENS_KEY });
+    refreshAfterWrite(queryClient, { queryKey: MCP_TOKENS_KEY });
 
   const issue = useMutation({
     // Never retried: the client default inherits `retry: 1` for anything but
@@ -1610,7 +1611,7 @@ export function OauthGrantsCard() {
   });
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: OAUTH_GRANTS_KEY });
+    refreshAfterWrite(queryClient, { queryKey: OAUTH_GRANTS_KEY });
 
   const revoke = useMutation({
     mutationFn: (id: number) => revokeOauthGrant(id),

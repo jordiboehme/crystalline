@@ -17,6 +17,7 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import { api, encodeSegment } from "./client";
 import { asArray, asNumber, asObject, asString, asStrings } from "./json";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /**
  * The reflection right, least to most (spec B5): `read` reads and comments,
@@ -203,7 +204,7 @@ export function invalidateReflection(
   domain: string,
 ): void {
   for (const queryKey of reflectionKeys(domain)) {
-    void queryClient.invalidateQueries({ queryKey });
+    void refreshAfterWrite(queryClient, { queryKey });
   }
 }
 
