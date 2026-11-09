@@ -2640,9 +2640,12 @@ impl<'a> DomainView<'a> {
         let _guard = lock.lock().await;
         let before = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
-        if before == crate::overlay_files::Held::Nothing {
-            self.refuse_case_twin(path)?;
-        }
+        self.refuse_case_twin(
+            &state_dir,
+            actor,
+            path,
+            before == crate::overlay_files::Held::Nothing,
+        )?;
         let shown = self.shows_file(path).await?;
         let mut shown_sha = None;
         if shown {
@@ -2760,9 +2763,12 @@ impl<'a> DomainView<'a> {
                 path,
             )));
         }
-        if held == crate::overlay_files::Held::Nothing {
-            self.refuse_case_twin(path)?;
-        }
+        self.refuse_case_twin(
+            &state_dir,
+            actor,
+            path,
+            held == crate::overlay_files::Held::Nothing,
+        )?;
         let base_holds = match self.engine.attachment_delete_size(&self.domain, path).await {
             Ok(_) => true,
             Err(EngineError::NotFound(_)) => false,
@@ -2797,15 +2803,36 @@ impl<'a> DomainView<'a> {
         Ok(())
     }
 
-    /// Refuse a new draft file whose spelling differs from the team's file only
-    /// by case, where the disk keeps one file for the two: a share would write
-    /// her bytes over the team's without a word. Her own draft at a spelling is
-    /// never refused, so she can still change or delete it.
-    fn refuse_case_twin(&self, path: &str) -> Result<()> {
+    /// Refuse a draft file whose spelling differs only by case from another
+    /// file where a disk may keep one file for the two, so a share would write
+    /// one over the other without a word:
+    ///
+    /// - another spelling she drafts herself, asked for every write;
+    /// - the team's file, asked only for a new entry (`new_entry`), so her own
+    ///   draft at a spelling can still be changed or deleted.
+    fn refuse_case_twin(
+        &self,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+        new_entry: bool,
+    ) -> Result<()> {
+        if let Some(own) = self
+            .engine
+            .own_case_twin(&self.domain, state_dir, actor, path)?
+        {
+            return Err(EngineError::Conflict(format!(
+                "You already draft '{own}', and on this disk the two names may be one file. \
+                 Use '{own}'."
+            )));
+        }
+        if !new_entry {
+            return Ok(());
+        }
         match self.engine.team_case_twin(&self.domain, path)? {
             Some(team) => Err(EngineError::Conflict(format!(
-                "'{path}' is the team's file '{team}' on this disk, which does not tell the two \
-                 spellings apart. Use the name '{team}'."
+                "'{path}' and the team's file '{team}' differ only by case, and this disk may \
+                 keep only one of them. Use the name '{team}'."
             ))),
             None => Ok(()),
         }

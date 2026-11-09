@@ -3852,6 +3852,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "The kept copy is a file, not text. The detail says where it is.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       },

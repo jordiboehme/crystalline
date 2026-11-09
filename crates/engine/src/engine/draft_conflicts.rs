@@ -268,9 +268,9 @@ pub(super) enum FileStep {
     Conflict(DraftConflictKind),
 }
 
-/// The table for a file, first match wins. `landed` says her version reached
-/// the team: her bytes are the team's at the path now, or a merged proposal
-/// held exactly her bytes (or her deletion) there. `team` is the team's digest
+/// The table for a file, first match wins. `landed` says her bytes have
+/// nothing left to say: they are the team's at the path now, or the very bytes
+/// she started from. `team` is the team's digest
 /// at the path, `record` where she started, and `start_elsewhere` that the
 /// bytes her deletion started from stand at another key of the snapshot.
 ///
@@ -288,10 +288,10 @@ pub(super) enum FileStep {
 ///    (`EditDelete`), added a file where she started from none (`AddAdd`), or
 ///    changed what she edited (`EditEdit`) or deleted (`DeleteEdit`).
 ///
-/// A merged proposal that held her bytes ends the draft even when the team
-/// changed the file since: what she proposed reached the team, and a later
-/// change is the team's own, as a merged page's is (C19). One whose bytes a
-/// reviewer changed is not hers and is asked about as rule 4 says.
+/// Her own shared proposal, merged with what she shared, moves her start to
+/// that version first ([`FileDraft::read`]), as a merged page's does (C19). Her
+/// bytes then equal her start and end, and a team change since is the team's
+/// own. A merged proposal that was not hers decides nothing.
 ///
 /// `listed_in_record` is asked only for rule 2's last case, so a broken record
 /// file refuses only where it decides something.
@@ -338,6 +338,9 @@ pub(super) struct FileDraft {
     pub(super) landed: bool,
     /// For a deletion: the bytes it started from stand at another key.
     pub(super) start_elsewhere: bool,
+    /// Her shared proposal merged with what she shared, so `record` already
+    /// starts there; the pass saves that.
+    pub(super) settled_shared: bool,
 }
 
 /// The key of the snapshot that holds the team's file at `path`: the exact key,
@@ -345,7 +348,11 @@ pub(super) struct FileDraft {
 /// for case, since the folder holds one file for the two and a share writes
 /// her bytes into it. Several such keys answer with no key and `true`: the
 /// team holds a file there whose digest cannot be named.
-fn team_key<'s>(state: &'s OriginState, path: &str, folds: bool) -> (Option<&'s str>, bool) {
+pub(super) fn team_key<'s>(
+    state: &'s OriginState,
+    path: &str,
+    folds: bool,
+) -> (Option<&'s str>, bool) {
     if let Some((key, _)) = state.files.get_key_value(path) {
         return (Some(key.as_str()), true);
     }
@@ -386,37 +393,42 @@ impl FileDraft {
         // A file held under several spellings has no digest to name; an empty
         // one equals no start, so it reads as a conflict.
         let team = held.then(|| stamp.map_or_else(String::new, |stamp| stamp.sha256.clone()));
-        let at_her_key = |file: &crystalline_remote::state::ProposedFile| {
-            file.path == entry.path || Some(file.path.as_str()) == key
+        // C19: her own proposal, merged, holding exactly what she shared there.
+        // The team had her version then, so her start is that version; a team
+        // change since is the team's own, and a proposal that was not hers
+        // decides nothing about her draft.
+        let merged_shared = record
+            .as_ref()
+            .and_then(|record| record.shared.as_ref())
+            .filter(|shared| merged_holds(state, shared, &entry.path, key))
+            .cloned();
+        let settled_shared = merged_shared.is_some();
+        let record = match merged_shared {
+            Some(shared) => record.map(|record| DraftFileStart {
+                start_sha: shared.sha,
+                shared: None,
+                ..record
+            }),
+            None => record,
         };
-        let merged: Vec<&crystalline_remote::state::ProposedFile> = state
-            .history
-            .iter()
-            .filter(|proposal| proposal.status == crystalline_remote::state::ProposalStatus::Merged)
-            .flat_map(|proposal| proposal.files.iter())
-            .filter(|file| at_her_key(file))
-            .collect();
-        let landed = if entry.tombstone {
-            merged
-                .iter()
-                .any(|file| file.change == crystalline_remote::state::ProposedChange::Deleted)
-        } else {
+        // Her bytes are the team's now, or the very bytes she started from:
+        // either way her draft has nothing left to say.
+        let landed = !entry.tombstone && {
             let now = match stamp {
                 Some(stamp) => {
                     same_bytes_as(journal_dir, domain, actor, &entry.path, stamp).map_err(io)?
                 }
                 None => false,
             };
-            now || (merged.iter().any(|file| file.sha256.is_some())
-                && crate::overlay_files::read(journal_dir, domain, actor, &entry.path)
+            now || match record
+                .as_ref()
+                .and_then(|record| record.start_sha.as_deref())
+            {
+                Some(start) => crate::overlay_files::read(journal_dir, domain, actor, &entry.path)
                     .map_err(io)?
-                    .is_some_and(|bytes| {
-                        let hers = sha256_hex(&bytes);
-                        merged.iter().any(|file| {
-                            file.change != crystalline_remote::state::ProposedChange::Deleted
-                                && file.sha256.as_deref() == Some(hers.as_str())
-                        })
-                    }))
+                    .is_some_and(|bytes| sha256_hex(&bytes) == start),
+                None => false,
+            }
         };
         let start_elsewhere = entry.tombstone
             && team.is_none()
@@ -431,8 +443,41 @@ impl FileDraft {
             team,
             landed,
             start_elsewhere,
+            settled_shared,
         })
     }
+}
+
+/// Whether the merged proposal `shared` names still lists her file at `path`
+/// (or the team's key for it) with exactly what she shared, as
+/// `draft_merge::settle_shared` asks it of a page. A proposal still open, or one
+/// that ended any other way, settles nothing.
+fn merged_holds(
+    state: &OriginState,
+    shared: &draft_start::SharedFile,
+    path: &str,
+    key: Option<&str>,
+) -> bool {
+    use crystalline_remote::state::{ProposalStatus, ProposedChange};
+    if state.proposals.iter().any(|p| p.number == shared.proposal) {
+        return false;
+    }
+    state
+        .history
+        .iter()
+        .find(|p| p.number == shared.proposal && p.status == ProposalStatus::Merged)
+        .is_some_and(|merged| {
+            merged.files.iter().any(|file| {
+                let at_her_key = file.path == path || Some(file.path.as_str()) == key;
+                let same = match (&shared.sha, file.change, file.sha256.as_deref()) {
+                    (None, ProposedChange::Deleted, _) => true,
+                    (Some(_), ProposedChange::Deleted, _) => false,
+                    (Some(sha), _, Some(digest)) => sha == digest,
+                    _ => false,
+                };
+                at_her_key && same
+            })
+        })
 }
 
 /// Whether `actor`'s bytes at `path` are the bytes `stamp` describes. The size
@@ -960,7 +1005,7 @@ impl Engine {
         let mut frozen: Option<HashSet<String>> = None;
         let mut found = Vec::new();
         for entry in &read.entries {
-            let folds = folder_may_fold_case(&root, &entry.path);
+            let folds = self.file_may_fold_case(domain, &root, &entry.path);
             let draft = FileDraft::read(&journal_dir, domain, actor, entry, &state, folds)?;
             let step = file_step(&draft, || {
                 let listed = match &frozen {

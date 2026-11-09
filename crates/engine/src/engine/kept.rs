@@ -75,9 +75,16 @@ impl Engine {
         scope: &Scope,
     ) -> Result<(KeptText, String)> {
         let found = self.kept_entry(domain, id, scope).await?;
-        let text = kept::read(&found).map_err(|source| EngineError::Io {
-            path: found.file.display().to_string(),
-            source,
+        let text = kept::read(&found).map_err(|source| {
+            // A draft file kept as its bytes: say so and where it is.
+            if source.kind() == std::io::ErrorKind::InvalidData {
+                EngineError::Invalid(kept::not_text(&found))
+            } else {
+                EngineError::Io {
+                    path: found.file.display().to_string(),
+                    source,
+                }
+            }
         })?;
         Ok((found, text))
     }

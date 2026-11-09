@@ -426,9 +426,27 @@ pub fn find(root: &Path, id: &str) -> Option<KeptText> {
     scan(root).into_iter().find(|kept| kept.id == id)
 }
 
-/// The text of `kept`.
+/// The text of `kept`. A copy that is not text (a draft file kept as its
+/// bytes) is an error of kind [`std::io::ErrorKind::InvalidData`] whose
+/// message says so and where the file is, so a reader can tell a person.
 pub fn read(kept: &KeptText) -> std::io::Result<String> {
-    std::fs::read_to_string(&kept.file)
+    String::from_utf8(std::fs::read(&kept.file)?)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, not_text(kept)))
+}
+
+/// What a person is told of a kept copy that is a file, not a text.
+pub fn not_text(kept: &KeptText) -> String {
+    format!(
+        "This kept copy is a file, not text. It is at {}.",
+        kept.file.display()
+    )
+}
+
+/// Whether `kept` is a draft file kept as its bytes rather than a text. A
+/// text is kept for a page, an engram or a comment, whose path is markdown; a
+/// file beside the pages never is.
+pub fn is_file_copy(kept: &KeptText) -> bool {
+    !kept.path.ends_with(".md")
 }
 
 /// Delete `kept`'s file, then every folder it leaves empty up to (not

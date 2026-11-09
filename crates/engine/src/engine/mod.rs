@@ -6550,6 +6550,7 @@ impl Engine {
         Ok(Some(crate::draft_start::DraftFileStart {
             path: path.to_string(),
             start_sha,
+            shared: None,
         }))
     }
 
@@ -6563,7 +6564,7 @@ impl Engine {
         let Ok(ContentSource::File { root }) = self.content_source(domain) else {
             return Ok(None);
         };
-        if !folder_may_fold_case(&root, path) {
+        if !self.file_may_fold_case(domain, &root, path) {
             return Ok(None);
         }
         let folded = crystalline_core::fold_path_case(path);
@@ -6586,6 +6587,52 @@ impl Engine {
                 parent => format!("{parent}/{name}"),
             })
             .find(|name| twin(name)))
+    }
+
+    /// Another spelling of the file `path` that `actor` drafts herself, differing
+    /// only by case, where a disk a share writes to may fold case. On a state
+    /// disk that folds case the two are one file of hers already; on one that
+    /// keeps them apart both would stage, and one would land over the other.
+    pub(crate) fn own_case_twin(
+        &self,
+        domain: &str,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let folded = crystalline_core::fold_path_case(path);
+        let read = crate::overlay_files::actor_entries(state_dir, domain, actor);
+        let Some(own) = read
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .find(|other| other != path && crystalline_core::fold_path_case(other) == folded)
+        else {
+            return Ok(None);
+        };
+        let may_fold = match self.content_source(domain) {
+            Ok(ContentSource::File { root }) => self.file_may_fold_case(domain, &root, path),
+            _ => true,
+        };
+        Ok(may_fold.then_some(own))
+    }
+
+    /// Whether two spellings of the file `path` may be one file somewhere a
+    /// share writes it: the domain's folder `root`, or the folder a share stages
+    /// its tree in under the origin state. Either one folding is enough for a
+    /// share to write one spelling over the other. A folder that cannot say
+    /// counts as folding ([`folder_may_fold_case`]).
+    pub(crate) fn file_may_fold_case(&self, domain: &str, root: &Path, path: &str) -> bool {
+        if folder_may_fold_case(root, path) {
+            return true;
+        }
+        match self.origin_state_dir(domain) {
+            Ok(state_dir) => folder_may_fold_case(
+                &state_dir,
+                &format!("{}/{path}", crate::share_staging::OVERLAY_STAGING_DIR),
+            ),
+            Err(_) => true,
+        }
     }
 
     /// The record of a new tombstone at `path`, whose `from` is always its path.
@@ -7928,15 +7975,32 @@ impl Engine {
             path: format!("the files overlay of '{domain}' at '{}'", file.path),
             source,
         };
+        let read = |file: &crate::overlay_files::FileEntry| {
+            let folds = self.file_may_fold_case(domain, root, &file.path);
+            draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state, folds)
+        };
+        // The frozen list decides nothing about a file that has landed.
         let landed = |file: &crate::overlay_files::FileEntry| -> Result<bool> {
-            let folds = folder_may_fold_case(root, &file.path);
-            let draft =
-                draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state, folds)?;
-            // The frozen list decides nothing about a file that has landed.
-            let step = draft_conflicts::file_step(&draft, || Ok(false))?;
+            let step = draft_conflicts::file_step(&read(file)?, || Ok(false))?;
             Ok(step == draft_conflicts::FileStep::Landed)
         };
         if !landed(file)? {
+            // Her merged proposal moved her start: saved under the lock from a
+            // fresh read, so a later pass reads it once the proposal is gone
+            // from the history.
+            if read(file)?.settled_shared {
+                let abs = crate::overlay_files::file(journal_dir, domain, actor, &file.path)
+                    .map_err(io)?;
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                let draft = read(file)?;
+                if draft.settled_shared
+                    && let Some(record) = draft.record
+                {
+                    crate::draft_start::save_file(journal_dir, domain, actor, &record)
+                        .map_err(io)?;
+                }
+            }
             return Ok(false);
         }
         self.run_file_settle_hook();

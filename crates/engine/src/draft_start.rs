@@ -120,6 +120,21 @@ pub struct DraftFileStart {
     /// The sha-256 of the team's bytes at `path` when the draft started, or
     /// when its author last chose to keep it. `None` is no team file there.
     pub start_sha: Option<String>,
+    /// What her open proposal holds of the file, written when a share carries
+    /// it. Absent from every record written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared: Option<SharedFile>,
+}
+
+/// What an open proposal holds of one draft file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedFile {
+    /// The proposal's number.
+    pub proposal: u64,
+    /// The sha-256 of the bytes it holds. `None` is the proposal deleting the
+    /// file.
+    pub sha: Option<String>,
 }
 
 /// The folder one actor's records stand in.
@@ -1042,6 +1057,7 @@ mod tests {
         let deck = DraftFileStart {
             path: "assets/deck.png".to_string(),
             start_sha: Some("abc".to_string()),
+            shared: None,
         };
         save_file(state, "team", "alice", &deck).unwrap();
         assert_eq!(

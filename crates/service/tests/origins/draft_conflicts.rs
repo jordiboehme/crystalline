@@ -4666,6 +4666,7 @@ async fn a_new_file_where_the_team_added_one_is_add_add() {
         Some(draft_start::DraftFileStart {
             path: DECK.to_string(),
             start_sha: None,
+            shared: None,
         })
     );
     t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
@@ -4797,8 +4798,8 @@ async fn a_case_twin_of_a_team_file_is_refused_where_the_disk_folds_case() {
         assert!(matches!(err, EngineError::Conflict(_)), "{err}");
         assert_eq!(
             err.to_string(),
-            "'assets/Deck.png' is the team's file 'assets/deck.png' on this disk, which does \
-             not tell the two spellings apart. Use the name 'assets/deck.png'."
+            "'assets/Deck.png' and the team's file 'assets/deck.png' differ only by case, and \
+             this disk may keep only one of them. Use the name 'assets/deck.png'."
         );
         assert_eq!(t.held_file("alice", DECK_TWIN), None);
         let err = t
@@ -4839,6 +4840,10 @@ async fn a_team_case_rename_under_her_file_reads_per_disk() {
     );
     assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
     assert_eq!(t.branch_file("main", DECK_TWIN).unwrap(), BOBS_DECK);
+
+    // Keep mine reads the team's file where the gate reads it, so it settles.
+    t.resolve("alice", DECK, Some("mine"), None).await.unwrap();
+    assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
 /// I-2: Take theirs on a file from before the record keeps her bytes as a
@@ -4866,6 +4871,21 @@ async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].path, DECK);
     assert_eq!(std::fs::read(&listed[0].file).unwrap(), HER_DECK);
+
+    // Read as a kept text it is a plain sentence that says where it is.
+    let err = t
+        .eng
+        .kept_text("team", &listed[0].id, &scope("alice"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "This kept copy is a file, not text. It is at {}.",
+            listed[0].file.display()
+        )
+    );
 }
 
 /// I-2: a new conflict is not the last copy, so Take theirs keeps none.
@@ -4966,4 +4986,95 @@ async fn an_upload_between_the_pass_deciding_and_clearing_stays() {
     // The team takes her first bytes: her file would land.
     t.push(&[(DECK, Some(HER_DECK.to_vec()))]).await;
     assert_eq!(t.held_file("alice", DECK), Some(Some(later)));
+}
+
+/// N-2: a deletion she makes again after a merged proposal of hers deleted the
+/// file once is a new draft. It stays, and its share deletes the team's file.
+#[tokio::test]
+async fn a_deletion_again_after_an_old_merged_deletion_stays() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec()), ("plan.md", plan())]).await;
+    t.delete_file("alice", DECK).await;
+    let (answer, _, _) = proposed(&t, "alice").await;
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.held_file("alice", DECK), None, "her deletion landed");
+
+    t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+    t.delete_file("alice", DECK).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(t.held_file("alice", DECK), Some(None), "never dropped");
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// N-2: putting back the bytes an old merged proposal held, over a newer team
+/// file, is a new draft. It stays.
+#[tokio::test]
+async fn a_revert_to_an_old_merged_version_stays() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec()), ("plan.md", plan())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let (answer, _, _) = proposed(&t, "alice").await;
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.held_file("alice", DECK), None, "her file landed");
+
+    t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// Her own two spellings of one file name are one file where the disk may
+/// fold case, so the second is refused and names the first.
+#[tokio::test]
+async fn her_own_case_twin_is_refused_where_the_disk_folds_case() {
+    let t = team(&[]).await;
+    t.upload("alice", "assets/new.png", HER_DECK).await;
+    let attempt = t
+        .eng
+        .attachment_write_as(
+            "team",
+            "assets/New.png",
+            BOBS_DECK.to_vec(),
+            &scope("alice"),
+        )
+        .await;
+    if folds_case(&t.root()) {
+        let err = attempt.unwrap_err();
+        assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "You already draft 'assets/new.png', and on this disk the two names may be one \
+             file. Use 'assets/new.png'."
+        );
+        assert_eq!(
+            t.held_file("alice", "assets/new.png"),
+            Some(Some(HER_DECK.to_vec()))
+        );
+    } else {
+        attempt.unwrap();
+        assert_eq!(
+            t.held_file("alice", "assets/New.png"),
+            Some(Some(BOBS_DECK.to_vec()))
+        );
+    }
+}
+
+/// N-2: a file her open proposal holds is not settled by that proposal until
+/// it merges. A pull meanwhile leaves it as it is.
+#[tokio::test]
+async fn a_file_in_an_open_proposal_stays_until_it_merges() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec()), ("plan.md", plan())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let (_, number, _) = proposed(&t, "alice").await;
+    assert_eq!(
+        t.file_record("alice", DECK).unwrap().shared,
+        Some(draft_start::SharedFile {
+            proposal: number,
+            sha: Some(sha256_hex(HER_DECK)),
+        })
+    );
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+    assert_eq!(t.conflicts("alice").await, vec![]);
 }

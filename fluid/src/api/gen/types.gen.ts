@@ -4650,6 +4650,10 @@ export type ReadKeptTextErrors = {
      * No such domain or kept text for this caller.
      */
     404: ProblemDetail;
+    /**
+     * The kept copy is a file, not text. The detail says where it is.
+     */
+    422: ProblemDetail;
 };
 
 export type ReadKeptTextError = ReadKeptTextErrors[keyof ReadKeptTextErrors];

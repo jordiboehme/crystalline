@@ -313,3 +313,39 @@ fn a_new_domain_never_reaches_texts_left_under_its_name() {
     assert_eq!(all[0]["removed"], true, "{all:?}");
     assert!(!kept_root(home.path()).join("fresh").exists());
 }
+
+/// A draft file kept as its bytes is shown as a plain sentence that says
+/// where it is, never as a text error, and the list gives no text hint for it.
+#[test]
+fn a_kept_file_is_shown_as_a_file_and_not_as_text() {
+    let home = tempfile::tempdir().unwrap();
+    let root = kept_root(home.path());
+    let file = kept::write_bytes(
+        &root,
+        "team",
+        Some("alice"),
+        KeptKind::Engram,
+        "assets/deck.png",
+        Utc::now(),
+        b"\x89PNG\r\n\x1a\n\x00\xff her deck",
+    )
+    .unwrap();
+    let all = listed(home.path(), &[]);
+    let id = all[0]["id"].as_str().unwrap();
+
+    let out = run(home.path(), &["kept", "show", id]);
+    assert!(!out.status.success(), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "This kept copy is a file, not text. It is at {}.",
+            file.display()
+        )),
+        "{err}"
+    );
+    assert!(!err.contains("UTF-8"), "{err}");
+
+    let human = stdout(&run(home.path(), &["kept", "list"]));
+    assert!(human.contains("A file, not text."), "{human}");
+    assert!(!human.contains("Copy the text back"), "{human}");
+}

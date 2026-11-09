@@ -2717,6 +2717,8 @@ impl Engine {
                 warn(&path, &e);
             }
         }
+        self.record_shared_files(domain, actor, &journal_dir, carried_files, number)
+            .await;
         for who in actors {
             let records = match crate::draft_start::all(&journal_dir, domain, &who) {
                 Ok(records) => records,
@@ -2757,6 +2759,115 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// After a share that opened or amended proposal `number`: each of
+    /// `actor`'s draft files the proposal carries records what it holds of it
+    /// (`DraftFileStart::shared`), as `record_one_shared_row` does for a row.
+    /// Under the file's lock, and only when her bytes now are the ones the
+    /// proposal recorded, or her deletion is one it makes. A file that keeps
+    /// what an earlier share of the same proposal recorded keeps it. Every
+    /// other record of anyone's that names this proposal forgets it.
+    ///
+    /// Best effort: a failure is warned about and the record keeps its start,
+    /// which reads as a conflict after the merge rather than losing anything.
+    async fn record_shared_files(
+        &self,
+        domain: &str,
+        actor: &str,
+        journal_dir: &Path,
+        carried: &[crystalline_remote::state::ProposedFile],
+        number: u64,
+    ) {
+        let files = self.overlay_domain_files(domain);
+        for (who, read) in &files.per_actor {
+            for entry in &read.entries {
+                let carries = (who == actor)
+                    .then(|| carried.iter().find(|file| file.path == entry.path))
+                    .flatten();
+                if let Err(e) = self
+                    .record_one_shared_file(domain, who, journal_dir, &entry.path, carries, number)
+                    .await
+                {
+                    tracing::warn!(
+                        domain,
+                        actor = who.as_str(),
+                        path = entry.path.as_str(),
+                        "what proposal #{number} holds of this draft file could not be \
+                         recorded: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// [`Engine::record_shared_files`] for one file, under its write lock.
+    async fn record_one_shared_file(
+        &self,
+        domain: &str,
+        actor: &str,
+        journal_dir: &Path,
+        path: &str,
+        carries: Option<&crystalline_remote::state::ProposedFile>,
+        number: u64,
+    ) -> Result<()> {
+        let io = |source| EngineError::Io {
+            path: format!("the draft start record of the file '{path}'"),
+            source,
+        };
+        let abs = crate::overlay_files::file(journal_dir, domain, actor, path).map_err(io)?;
+        let lock = self.write_lock(&abs);
+        let _guard = lock.lock().await;
+        let Some(record) =
+            crate::draft_start::load_file(journal_dir, domain, actor, path).map_err(io)?
+        else {
+            return Ok(());
+        };
+        let names_this = record
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.proposal == number);
+        if carries.is_none() && !names_this {
+            return Ok(());
+        }
+        let mine = match crate::overlay_files::held(journal_dir, domain, actor, path).map_err(io)? {
+            crate::overlay_files::Held::Nothing => return Ok(()),
+            crate::overlay_files::Held::Tombstone => None,
+            crate::overlay_files::Held::Bytes => Some(sha256_hex(
+                &crate::overlay_files::read(journal_dir, domain, actor, path)
+                    .map_err(io)?
+                    .unwrap_or_default(),
+            )),
+        };
+        let proposed = carries.map(|file| match file.change {
+            crystalline_remote::state::ProposedChange::Deleted => None,
+            _ => file.sha256.clone(),
+        });
+        let shared = match proposed {
+            Some(holds) if holds == mine => Some(crate::draft_start::SharedFile {
+                proposal: number,
+                sha: mine,
+            }),
+            // Her file changed since it was staged: the branch holds what an
+            // earlier share of this proposal recorded, when it still does.
+            Some(holds)
+                if names_this
+                    && record.shared.as_ref().map(|shared| &shared.sha) == Some(&holds) =>
+            {
+                record.shared.clone()
+            }
+            _ => None,
+        };
+        if record.shared != shared {
+            crate::draft_start::save_file(
+                journal_dir,
+                domain,
+                actor,
+                &crate::draft_start::DraftFileStart { shared, ..record },
+            )
+            .map_err(io)?;
+        }
+        Ok(())
     }
 
     /// Record what proposal `number` holds of `actor`'s row at `path`, which
@@ -4277,14 +4388,16 @@ impl Engine {
         let mut kept_file: Option<String> = None;
         let kept = match resolution {
             ops::Resolution::Mine => {
-                // With no snapshot nothing can say where a file starts, and no
-                // conflict stands either, so nothing is written.
-                let state =
-                    crystalline_remote::state::OriginState::load(&self.origin_state_dir(domain)?)?;
-                if let Some(state) = state {
+                // The start is the team's file where the gate reads it, the
+                // key that differs only by case on a disk that may fold, so
+                // Keep mine always clears the conflict. With no snapshot nothing
+                // can say where a file starts, and no conflict stands either,
+                // so nothing is written.
+                if let Some(draft) = self.file_draft_of(domain, &journal_dir, actor, path)? {
                     let start = crate::draft_start::DraftFileStart {
                         path: path.to_string(),
-                        start_sha: state.files.get(path).map(|stamp| stamp.sha256.clone()),
+                        start_sha: draft.team,
+                        shared: None,
                     };
                     crate::draft_start::save_file(&journal_dir, domain, actor, &start)
                         .map_err(io)?;
@@ -4357,31 +4470,9 @@ impl Engine {
         actor: &str,
         path: &str,
     ) -> Result<super::draft_conflicts::FileStep> {
-        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let Some(state) = crystalline_remote::state::OriginState::load(&state_dir)? else {
+        let Some(draft) = self.file_draft_of(domain, journal_dir, actor, path)? else {
             return Ok(super::draft_conflicts::FileStep::InStep);
         };
-        let tombstone =
-            crate::overlay_files::held(journal_dir, domain, actor, path).map_err(|source| {
-                EngineError::Io {
-                    path: format!("your draft file '{path}' in '{domain}'"),
-                    source,
-                }
-            })? == crate::overlay_files::Held::Tombstone;
-        let entry = crate::overlay_files::FileEntry {
-            actor: actor.to_string(),
-            path: path.to_string(),
-            tombstone,
-        };
-        let folds = super::folder_may_fold_case(&root, path);
-        let draft = super::draft_conflicts::FileDraft::read(
-            journal_dir,
-            domain,
-            actor,
-            &entry,
-            &state,
-            folds,
-        )?;
         let journal = journal_dir.to_path_buf();
         super::draft_conflicts::file_step(&draft, || {
             Ok(
@@ -4395,6 +4486,36 @@ impl Engine {
                     .is_some_and(|paths| paths.iter().any(|held| held == path)),
             )
         })
+    }
+
+    /// `actor`'s draft file at `path` read as the gate reads it, or `None` with
+    /// no base snapshot.
+    fn file_draft_of(
+        &self,
+        domain: &str,
+        journal_dir: &Path,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<super::draft_conflicts::FileDraft>> {
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&state_dir)? else {
+            return Ok(None);
+        };
+        let tombstone =
+            crate::overlay_files::held(journal_dir, domain, actor, path).map_err(|source| {
+                EngineError::Io {
+                    path: format!("your draft file '{path}' in '{domain}'"),
+                    source,
+                }
+            })? == crate::overlay_files::Held::Tombstone;
+        let entry = crate::overlay_files::FileEntry {
+            actor: actor.to_string(),
+            path: path.to_string(),
+            tombstone,
+        };
+        let folds = self.file_may_fold_case(domain, &root, path);
+        super::draft_conflicts::FileDraft::read(journal_dir, domain, actor, &entry, &state, folds)
+            .map(Some)
     }
 
     /// Whether the domain's own origin state records a conflict at `path`: one

@@ -200,6 +200,13 @@ pub async fn list(
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 422,
+            description = "The kept copy is a file, not text. The detail says \
+                           where it is.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn read(
