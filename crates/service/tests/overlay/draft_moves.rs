@@ -3240,3 +3240,65 @@ async fn a_repeated_folds_address_refusal_leaves_the_key_off() {
     assert!(f.state.join("overlays/team/.fold-unfinished").is_file());
     assert_eq!(f.rows().await.len(), 2);
 }
+
+/// A file stopped part way through a fold is settled as a page is (C21): the
+/// team's change to it refuses the repeat, Keep mine works with the key off, and
+/// the repeat then lands her bytes.
+#[tokio::test]
+async fn a_mid_fold_recovery_settles_a_stale_file() {
+    const DECK: &str = "assets/deck.png";
+    let f = fixture(&[("plan.md", LONG)]).await;
+    std::fs::create_dir_all(f.root.join("team").join("assets")).unwrap();
+    f.team_has(DECK, b"\x89PNG\r\n\x1a\n\x00the team's deck");
+    f.engine
+        .attachment_write_as(
+            "team",
+            DECK,
+            b"\x89PNG\r\n\x1a\n\x00alice's deck".to_vec(),
+            &alice(),
+        )
+        .await
+        .unwrap();
+    f.replace("plan", "the first line", "alice's first line")
+        .await;
+    f.engine
+        .write_engram_as(
+            &WriteParams {
+                folder: Some("sub".to_string()),
+                ..write_params("Fresh", "her new page")
+            },
+            None,
+            &alice(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(f.root.join("team").join("sub"), "not a folder").unwrap();
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(!f.reviews());
+    std::fs::remove_file(f.root.join("team").join("sub")).unwrap();
+
+    let bobs_deck = b"\x89PNG\r\n\x1a\n\x00bob's newer deck";
+    f.team_has(DECK, bobs_deck);
+    let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
+    assert!(
+        refused.to_string().contains(&unsettled_of("alice", DECK)),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read(f.root.join("team").join(DECK)).unwrap(),
+        bobs_deck
+    );
+
+    let receipt = f.resolve(DECK, "mine").await;
+    assert_eq!(receipt["kept"], "mine", "{receipt}");
+    assert_eq!(receipt["file"], true, "{receipt}");
+    f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap();
+    assert_eq!(
+        std::fs::read(f.root.join("team").join(DECK)).unwrap(),
+        b"\x89PNG\r\n\x1a\n\x00alice's deck"
+    );
+    assert!(
+        !f.state.join("overlays/team/.fold-unfinished").exists(),
+        "the mark is gone once the fold finished"
+    );
+}

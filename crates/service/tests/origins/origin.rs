@@ -296,6 +296,38 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     );
 }
 
+/// In a domain that takes changes directly a resolution settles only a page,
+/// and naming a file there says what settles one instead.
+#[tokio::test]
+async fn a_direct_domain_still_refuses_to_resolve_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        true,
+        false,
+    )
+    .await;
+    let err = eng
+        .origin_resolve(
+            "brand",
+            "assets/deck.png",
+            Some("mine"),
+            None,
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("upload the file again") && text.contains("delete it"),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5651,7 +5683,8 @@ async fn a_pull_converges_a_byte_equal_file_and_a_sidecar_of_a_gone_base_file() 
 }
 
 /// The team changes a file under the actor drafting it, and that is their
-/// conflict and nobody else's - settled by the next write of the same path.
+/// conflict and nobody else's. Writing the path again does not settle it; her
+/// choice in a resolution does.
 #[tokio::test]
 async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5704,8 +5737,7 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
         "and nobody else's: {his}"
     );
 
-    // A conflict resolution settles an engram, so it says what to do with a
-    // file instead of normalizing the path into a miss.
+    // Somebody with no draft at the path has nothing to settle there.
     let refused = eng
         .origin_resolve(
             "team",
@@ -5715,25 +5747,37 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
             ShareActor::Owner,
         )
         .await
-        .expect_err("a resolution settles an engram's markdown");
-    let text = refused.to_string();
-    assert!(
-        text.contains("upload the file again") && text.contains("delete it"),
-        "and it teaches the pair of verbs that do settle one: {text}"
-    );
+        .expect_err("the owner holds no draft of this file");
+    assert!(matches!(refused, EngineError::NotFound(_)), "{refused}");
 
-    // Her next write of the same path is what settles it.
+    // Her next write of the same path does not settle it.
     file(&eng, "alice", "assets/deck.png", b"a third deck").await;
     let hers = eng
         .origin_status(Some("team"), false, false, &scope_of("alice"))
         .await
         .unwrap();
-    // Nothing converged on that pass and nothing conflicts any more, which is
-    // exactly what this key's absence means.
-    assert!(
-        hers["domains"][0]["converged"].is_null(),
-        "writing the path again is the answer, and it leaves the conflict list: {hers}"
+    assert_eq!(
+        hers["domains"][0]["converged"]["mine"],
+        serde_json::json!(["assets/deck.png"]),
+        "an upload is not a choice: {hers}"
     );
+
+    // Keep mine is.
+    let settled = eng
+        .origin_resolve(
+            "team",
+            "assets/deck.png",
+            Some("mine"),
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled["kept"], "mine", "{settled}");
+    let hers = eng
+        .origin_status(Some("team"), false, false, &scope_of("alice"))
+        .await
+        .unwrap();
     assert!(
         !hers.to_string().contains("assets/deck.png"),
         "her conflict is named nowhere now: {hers}"

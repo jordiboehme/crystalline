@@ -4402,3 +4402,378 @@ async fn a_folder_conflict_in_a_reviewing_domain_still_needs_github() {
     }
     assert_eq!(std::fs::read(t.root().join("plan.md")).unwrap(), plan());
 }
+
+// --- Files beside the pages -------------------------------------------------
+//
+// A file never merges. Its record says which team bytes it started from, and a
+// team change since is a conflict that only a choice settles: an upload of other
+// bytes does not.
+
+const DECK: &str = "assets/deck.png";
+const TEAM_DECK: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's deck";
+const BOBS_DECK: &[u8] = b"\x89PNG\r\n\x1a\n\x00bob's newer deck";
+const HER_DECK: &[u8] = b"\x89PNG\r\n\x1a\n\x00alice's deck";
+
+fn file_conflict(actor: &str, path: &str, kind: DraftConflictKind) -> DraftConflict {
+    DraftConflict {
+        file: true,
+        ..conflict(actor, path, kind)
+    }
+}
+
+impl Team {
+    /// `actor` uploads `bytes` at `path`, which lands as their draft file.
+    async fn upload(&self, actor: &str, path: &str, bytes: &[u8]) {
+        let written = self
+            .eng
+            .attachment_write_as("team", path, bytes.to_vec(), &scope(actor))
+            .await
+            .unwrap();
+        assert!(written.draft, "an upload in review mode is a draft");
+    }
+
+    /// `actor` deletes the file at `path`, which lands as their draft deletion.
+    async fn delete_file(&self, actor: &str, path: &str) {
+        let draft = self
+            .eng
+            .attachment_delete_as("team", path, &scope(actor))
+            .await
+            .unwrap();
+        assert!(draft, "a deletion in review mode is a draft");
+    }
+
+    /// The bytes `actor` holds at `path` in their files overlay, `Some(None)`
+    /// for a deletion, `None` for nothing.
+    fn held_file(&self, actor: &str, path: &str) -> Option<Option<Vec<u8>>> {
+        let file = self
+            .state()
+            .join("overlays")
+            .join("team")
+            .join(actor)
+            .join("files")
+            .join(path);
+        let mut sidecar = file.clone().into_os_string();
+        sidecar.push(".tombstone");
+        match std::fs::read(&file) {
+            Ok(bytes) => Some(Some(bytes)),
+            Err(_) if Path::new(&sidecar).exists() => Some(None),
+            Err(_) => None,
+        }
+    }
+
+    fn file_record(&self, actor: &str, path: &str) -> Option<draft_start::DraftFileStart> {
+        draft_start::load_file(&self.state(), "team", actor, path).unwrap()
+    }
+
+    /// What `actor` reads at the file `path`.
+    async fn reads_file(&self, actor: &str, path: &str) -> Option<Vec<u8>> {
+        match self
+            .eng
+            .attachment_read_as("team", path, &scope(actor))
+            .await
+        {
+            Ok((bytes, _)) => Some(bytes),
+            Err(EngineError::NotFound(_)) => None,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// Alice uploads her deck over the team's, and bob's newer deck lands first.
+async fn a_stale_upload(t: &mut Team) {
+    t.upload("alice", DECK, HER_DECK).await;
+    t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditEdit)]
+    );
+}
+
+#[tokio::test]
+async fn a_stale_uploaded_file_refuses_the_share_and_the_peers_file_stays() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+    assert_eq!(t.conflicts("bob").await, vec![], "nobody else's");
+
+    for files in [None, Some(&[DECK][..])] {
+        let answer = t.share("alice", files).await;
+        assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+        assert_eq!(answer["conflicts"][0]["path"], DECK, "{answer}");
+        assert_eq!(answer["conflicts"][0]["file"], true, "{answer}");
+    }
+    assert_eq!(t.branch_file("main", DECK).unwrap(), BOBS_DECK);
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+
+    // Another upload is not a choice: the start stays where she began.
+    t.upload("alice", DECK, b"\x89PNG\r\n\x1a\n\x00her second try")
+        .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditEdit)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), BOBS_DECK);
+}
+
+#[tokio::test]
+async fn a_stale_deleted_file_refuses_the_share() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.delete_file("alice", DECK).await;
+    t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, DeleteEdit)]
+    );
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), BOBS_DECK);
+    assert_eq!(t.held_file("alice", DECK), Some(None));
+}
+
+#[tokio::test]
+async fn keep_mine_on_a_file_lands_her_bytes() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+
+    let receipt = t.resolve("alice", DECK, Some("mine"), None).await.unwrap();
+    settled(&receipt, DECK, "mine", false);
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+    assert_eq!(
+        t.file_record("alice", DECK).unwrap().start_sha.as_deref(),
+        Some(sha256_hex(BOBS_DECK).as_str())
+    );
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), HER_DECK);
+    assert_eq!(t.held_file("alice", DECK), None, "her file has landed");
+    assert_eq!(t.file_record("alice", DECK), None);
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn take_theirs_on_a_file_clears_hers() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+
+    let receipt = t
+        .resolve("alice", DECK, Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, DECK, "theirs", false);
+    assert_eq!(t.held_file("alice", DECK), None);
+    assert_eq!(t.file_record("alice", DECK), None);
+    assert_eq!(t.reads_file("alice", DECK).await.unwrap(), BOBS_DECK);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn merged_on_a_file_refuses() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+
+    let err = t
+        .resolve("alice", DECK, None, Some("merged bytes"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "A file cannot be merged here. Keep one of the two."
+    );
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditEdit)]
+    );
+}
+
+#[tokio::test]
+async fn an_old_uploaded_file_is_unknown_start() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    assert_eq!(
+        t.file_record("alice", DECK).unwrap().start_sha.as_deref(),
+        Some(sha256_hex(TEAM_DECK).as_str())
+    );
+    // A file uploaded before the record: nothing says where it started.
+    draft_start::clear_file(&t.state(), "team", "alice", DECK).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, UnknownStart)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+
+    // Keep mine gives it its first record.
+    t.resolve("alice", DECK, Some("mine"), None).await.unwrap();
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn the_same_bytes_as_the_team_clear() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+
+    // She uploads bob's bytes: her draft is the team's file.
+    t.upload("alice", DECK, BOBS_DECK).await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "nothing_to_share", "{answer}");
+    assert_eq!(t.held_file("alice", DECK), None, "the share's pass ends it");
+    assert_eq!(t.file_record("alice", DECK), None);
+
+    // And a team change to exactly her bytes ends her draft as well.
+    t.upload("alice", DECK, HER_DECK).await;
+    t.push(&[(DECK, Some(HER_DECK.to_vec()))]).await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.held_file("alice", DECK), None);
+    assert_eq!(t.file_record("alice", DECK), None);
+}
+
+#[tokio::test]
+async fn a_fold_refuses_a_stale_file() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+
+    let err = t
+        .eng
+        .set_review_mode(
+            "team",
+            None,
+            crystalline_service::ReviewModeConfirm::Confirmed {
+                folds: [("alice".to_string(), crystalline_service::FoldChoice::Fold)]
+                    .into_iter()
+                    .collect(),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    assert!(err.to_string().contains(DECK), "{err}");
+    assert_eq!(std::fs::read(t.root().join(DECK)).unwrap(), BOBS_DECK);
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+}
+
+#[tokio::test]
+async fn a_new_file_where_the_team_added_one_is_add_add() {
+    let mut t = team_direct(&[]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    assert_eq!(
+        t.file_record("alice", DECK),
+        Some(draft_start::DraftFileStart {
+            path: DECK.to_string(),
+            start_sha: None,
+        })
+    );
+    t.push(&[(DECK, Some(BOBS_DECK.to_vec()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, AddAdd)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), BOBS_DECK);
+}
+
+#[tokio::test]
+async fn an_upload_over_a_file_the_team_deleted_is_edit_delete() {
+    let mut t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    t.push(&[(DECK, None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditDelete)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.branch_file("main", DECK), None);
+
+    // Keep mine lands it as a new file.
+    t.resolve("alice", DECK, Some("mine"), None).await.unwrap();
+    assert_eq!(t.file_record("alice", DECK).unwrap().start_sha, None);
+    assert_eq!(t.share("alice", None).await["outcome"], "committed");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), HER_DECK);
+}
+
+#[tokio::test]
+async fn resolving_a_file_she_does_not_hold_is_not_found() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    a_stale_upload(&mut t).await;
+    let err = t
+        .resolve("bob", DECK, Some("theirs"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)), "{err}");
+    assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
+}
+
+/// A pull moved the snapshot and its folder write failed, so her view still
+/// shows the old file. She replaces what she saw, which is not the team's now.
+#[tokio::test]
+async fn an_upload_while_the_folder_lags_the_snapshot_is_a_conflict() {
+    let t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.snapshot_only(DECK, BOBS_DECK);
+    t.upload("alice", DECK, HER_DECK).await;
+    assert_eq!(
+        t.file_record("alice", DECK).unwrap().start_sha.as_deref(),
+        Some(sha256_hex(TEAM_DECK).as_str())
+    );
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditEdit)]
+    );
+}
+
+/// A file from before the record that a pull from before saw the team delete:
+/// the frozen list says so, and its share would bring the file back.
+#[tokio::test]
+async fn an_old_uploaded_file_the_team_deleted_is_edit_delete() {
+    let t = team(&[]).await;
+    for path in [DECK, "assets/other.png"] {
+        t.upload("alice", path, HER_DECK).await;
+        draft_start::clear_file(&t.state(), "team", "alice", path).unwrap();
+    }
+    let mut record = ConvergenceRecord::default();
+    record
+        .conflicts
+        .insert("alice".to_string(), vec![DECK.to_string()]);
+    overlay_journal::journal_save_record(&t.state(), "team", &record).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditDelete)],
+        "the file the list does not name is a new file"
+    );
+
+    // Take theirs takes it off the list with the file.
+    t.resolve("alice", DECK, Some("theirs"), None)
+        .await
+        .unwrap();
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    let record = overlay_journal::journal_record(&t.state(), "team");
+    assert_eq!(record.conflicts.get("alice"), None);
+}
+
+/// A file's record that cannot be read refuses the list and the share, and is
+/// never read as a file with no record (C1).
+#[tokio::test]
+async fn a_broken_file_record_refuses_the_list_and_the_share() {
+    let t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let file = draft_start::file_record_file(&t.state(), "team", "alice", DECK).unwrap();
+    std::fs::write(&file, b"").unwrap();
+
+    t.eng.draft_conflicts("team", "alice").await.unwrap_err();
+    t.eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(t.branch_file("main", DECK).unwrap(), TEAM_DECK);
+}

@@ -26,6 +26,18 @@
 //! `.md.tombstone`, and a record ends in `.json`. Removing an actor or a domain
 //! takes the records with the folder, and a domain rename moves them with it.
 //!
+//! **A file beside the pages has a record of its own kind**, in a folder of its
+//! own below the pages' records:
+//!
+//! ```text
+//! <state_dir>/overlays/<domain>/<actor>/.draft-starts/files/<sha256 of path>.json
+//! ```
+//!
+//! A file never merges, so all its record holds is the digest of the team's
+//! bytes it started from ([`DraftFileStart`]). It stands in its own folder so
+//! [`all`] and [`load`] never read one as a page's record, whose fields are all
+//! optional and would read a file's record as a blank one.
+//!
 //! Every name is screened before a path is built: `domain` and `actor` by
 //! `overlay_journal::actor_dir`, which holds each to one contained segment, and
 //! the row's path by `overlay_journal::entry_path`. A hash could hold any path
@@ -48,6 +60,10 @@ const STARTS_DIR: &str = ".draft-starts";
 
 /// The ending of a record's file name.
 const RECORD_SUFFIX: &str = ".json";
+
+/// The folder inside [`STARTS_DIR`] the records of files beside the pages
+/// stand in.
+const FILES_DIR: &str = "files";
 
 /// How long [`save`] waits before each extra try. Short, since it can run on an
 /// async worker, but long enough for a scanner to let go of a file on Windows.
@@ -94,6 +110,18 @@ pub struct SharedText {
     pub text: Option<String>,
 }
 
+/// Where one draft file beside the pages started. A file never merges, so the
+/// digest of the team's bytes is all a conflict needs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftFileStart {
+    /// The file's exact path. Guards the hash in the file name.
+    pub path: String,
+    /// The sha-256 of the team's bytes at `path` when the draft started, or
+    /// when its author last chose to keep it. `None` is no team file there.
+    pub start_sha: Option<String>,
+}
+
 /// The folder one actor's records stand in.
 fn starts_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf> {
     Ok(actor_dir(state_dir, domain, actor)?.join(STARTS_DIR))
@@ -108,6 +136,26 @@ pub fn record_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> i
     entry_path(state_dir, domain, actor, path)?;
     let name = format!("{}{RECORD_SUFFIX}", sha256_hex(path.as_bytes()));
     Ok(starts_dir(state_dir, domain, actor)?.join(name))
+}
+
+/// The folder one actor's records of files stand in.
+fn file_starts_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf> {
+    Ok(starts_dir(state_dir, domain, actor)?.join(FILES_DIR))
+}
+
+/// The file the record of the draft file `path` stands in. The path is screened
+/// by the attachment rules first, as the files overlay screens it. Public for a
+/// test, as [`record_file`] is.
+#[doc(hidden)]
+pub fn file_record_file(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<PathBuf> {
+    crate::overlay_files::file(state_dir, domain, actor, path)?;
+    let name = format!("{}{RECORD_SUFFIX}", sha256_hex(path.as_bytes()));
+    Ok(file_starts_dir(state_dir, domain, actor)?.join(name))
 }
 
 /// The error of a file that does not hold the record it should.
@@ -219,6 +267,68 @@ pub fn clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Res
     }
     let stop = actor_dir(state_dir, domain, actor)?;
     prune_empty(file.parent(), &stop);
+    Ok(())
+}
+
+/// The record of one draft file. As [`load`]: `Ok(None)` means no file, and a
+/// file that is not this path's record is an error of kind
+/// [`io::ErrorKind::InvalidData`].
+pub fn load_file(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+) -> io::Result<Option<DraftFileStart>> {
+    let file = file_record_file(state_dir, domain, actor, path)?;
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if no_such_file(&e) => {
+            no_file_in_a_folders_place(state_dir, domain, actor)?;
+            let dir = file_starts_dir(state_dir, domain, actor)?;
+            if std::fs::metadata(&dir).is_ok_and(|found| !found.is_dir()) {
+                return Err(broken(&dir, "a file stands where the folder belongs"));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let record: DraftFileStart = serde_json::from_slice(&bytes).map_err(|e| broken(&file, e))?;
+    if record.path != path {
+        return Err(broken(&file, "it names another path"));
+    }
+    Ok(Some(record))
+}
+
+/// Write one draft file's record, as [`save`] writes a page's.
+pub fn save_file(
+    state_dir: &Path,
+    domain: &str,
+    actor: &str,
+    start: &DraftFileStart,
+) -> io::Result<()> {
+    let file = file_record_file(state_dir, domain, actor, &start.path)?;
+    let bytes = serde_json::to_vec_pretty(start).map_err(io::Error::other)?;
+    with_retries(|| crate::overlay_journal::save(&file, &bytes))
+}
+
+/// Drop one draft file's record, as [`clear`] drops a page's.
+pub fn clear_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<()> {
+    let file = file_record_file(state_dir, domain, actor, path)?;
+    match remove_if_present(&file) {
+        Err(e) if !no_such_file(&e) => return Err(e),
+        _ => {}
+    }
+    let stop = actor_dir(state_dir, domain, actor)?;
+    prune_empty(file.parent(), &stop);
+    Ok(())
+}
+
+/// Drop every record of one actor's draft files, as their files go with them.
+pub fn clear_files(state_dir: &Path, domain: &str, actor: &str) -> io::Result<()> {
+    let dir = file_starts_dir(state_dir, domain, actor)?;
+    crystalline_core::tree::remove_tree(&dir).map_err(io::Error::from)?;
+    let stop = actor_dir(state_dir, domain, actor)?;
+    prune_empty(dir.parent(), &stop);
     Ok(())
 }
 
@@ -921,5 +1031,59 @@ mod tests {
         // A folder that still holds `files/` is not pruned from under it.
         clear(state, "team", "alice", "note.md").unwrap();
         assert!(starts.join("files").join(name).is_file());
+    }
+
+    /// A file's record stands in its own folder: a page's reader never sees it,
+    /// a page's record is never read as one, and each clears on its own.
+    #[test]
+    fn a_file_record_is_never_read_as_a_page_record() {
+        let tmp = dir();
+        let state = tmp.path();
+        let deck = DraftFileStart {
+            path: "assets/deck.png".to_string(),
+            start_sha: Some("abc".to_string()),
+        };
+        save_file(state, "team", "alice", &deck).unwrap();
+        assert_eq!(
+            load_file(state, "team", "alice", "assets/deck.png").unwrap(),
+            Some(deck.clone())
+        );
+        assert_eq!(all(state, "team", "alice").unwrap(), Vec::new());
+        // No row stands at a file's path, so a page's reader refuses to name one.
+        assert!(load(state, "team", "alice", "assets/deck.png").is_err());
+
+        let page = record("note.md", "text\n");
+        save(state, "team", "alice", &page).unwrap();
+        assert_eq!(all(state, "team", "alice").unwrap(), vec![page]);
+
+        // A page's record where a file's belongs is broken, not a blank one.
+        let file = file_record_file(state, "team", "alice", "assets/other.png").unwrap();
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&record("assets/other.png", "x")).unwrap(),
+        )
+        .unwrap();
+        let err = load_file(state, "team", "alice", "assets/other.png").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        std::fs::remove_file(&file).unwrap();
+
+        // A path that is no attachment is refused.
+        assert!(load_file(state, "team", "alice", "notes/a.md").is_err());
+
+        clear_file(state, "team", "alice", "assets/deck.png").unwrap();
+        assert_eq!(
+            load_file(state, "team", "alice", "assets/deck.png").unwrap(),
+            None
+        );
+        save_file(state, "team", "alice", &deck).unwrap();
+        clear_files(state, "team", "alice").unwrap();
+        assert_eq!(
+            load_file(state, "team", "alice", "assets/deck.png").unwrap(),
+            None
+        );
+        assert_eq!(
+            all(state, "team", "alice").unwrap(),
+            vec![record("note.md", "text\n")]
+        );
     }
 }

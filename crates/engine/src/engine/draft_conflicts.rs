@@ -10,6 +10,10 @@
 //! reaches [`next_step`], which would read it as her own new file: it gets
 //! [`has_landed`] and then the old-draft rows (option A, below).
 //!
+//! A file beside the pages never merges and answers to no address, so it has a
+//! table of its own ([`file_step`]): its bytes against the digest its record
+//! started from and the team's digest now.
+//!
 //! Nothing here asks whether the domain reviews changes, because a fold's
 //! second check runs with the key off, and nothing here takes the origin lock:
 //! status asks it outside the per-domain lock.
@@ -30,7 +34,7 @@ use crate::draft_merge::{
     DraftConflictKind, DraftSides, DraftStep, SharedFate, TeamText, answers_at_path, has_landed,
     next_step, settle_shared,
 };
-use crate::draft_start::{self, DraftStart};
+use crate::draft_start::{self, DraftFileStart, DraftStart};
 use crate::origin::takes_part_in_local_change;
 
 /// One draft of one person that does not fit the team's text.
@@ -44,7 +48,7 @@ pub struct DraftConflict {
     pub kind: DraftConflictKind,
     /// The path a moved draft left, where her tombstone stands.
     pub moved_from: Option<String>,
-    /// A file beside the pages rather than a page (Task 11).
+    /// A file beside the pages rather than a page.
     pub file: bool,
     /// For `AddressTaken`: the team's path that holds the draft's address.
     pub other: Option<String>,
@@ -251,6 +255,147 @@ fn old_moves(rows: &[StoredEngram], records: &[Option<DraftStart>]) -> HashMap<u
 }
 
 // --- end of option A ---------------------------------------------------------
+
+/// What one draft file is, against the team's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileStep {
+    /// The team holds exactly what she holds: her bytes, or nothing where she
+    /// deleted. The draft has nothing left to say.
+    Landed,
+    /// The team's file is the one she started from.
+    InStep,
+    /// The team changed it since she started, or we cannot tell.
+    Conflict(DraftConflictKind),
+}
+
+/// The table for a file, first match wins. `mine_is_team` says her bytes are
+/// the team's bytes at the path, `team` is the team's digest there (a real key
+/// of the snapshot) and `record` where she started.
+///
+/// 1. Landed: her bytes are the team's, or her deletion stands where the team
+///    holds nothing.
+/// 2. No record (a file from before the record): the team holds a file there,
+///    so `UnknownStart`. A file over nothing is a new file, unless the frozen
+///    convergence record lists it, which means a pull from before saw the team
+///    delete it: `EditDelete`. A deletion over nothing has landed (rule 1).
+/// 3. The team's digest is the one she started from: in step.
+/// 4. Otherwise a conflict, by what changed: the team deleted what she edited
+///    (`EditDelete`), added a file where she started from none (`AddAdd`), or
+///    changed what she edited (`EditEdit`) or deleted (`DeleteEdit`).
+///
+/// `listed_in_record` is asked only for rule 2's last case, so a broken record
+/// file refuses only where it decides something.
+pub(super) fn file_step(
+    tombstone: bool,
+    mine_is_team: bool,
+    record: Option<&DraftFileStart>,
+    team: Option<&str>,
+    listed_in_record: impl FnOnce() -> Result<bool>,
+) -> Result<FileStep> {
+    if (tombstone && team.is_none()) || (!tombstone && mine_is_team) {
+        return Ok(FileStep::Landed);
+    }
+    let Some(record) = record else {
+        return Ok(match team {
+            Some(_) => FileStep::Conflict(DraftConflictKind::UnknownStart),
+            None if listed_in_record()? => FileStep::Conflict(DraftConflictKind::EditDelete),
+            None => FileStep::InStep,
+        });
+    };
+    if record.start_sha.as_deref() == team {
+        return Ok(FileStep::InStep);
+    }
+    Ok(FileStep::Conflict(match (tombstone, team) {
+        (true, _) => DraftConflictKind::DeleteEdit,
+        (false, None) => DraftConflictKind::EditDelete,
+        (false, Some(_)) if record.start_sha.is_none() => DraftConflictKind::AddAdd,
+        (false, Some(_)) => DraftConflictKind::EditEdit,
+    }))
+}
+
+/// One draft file of one actor, with what its decision needs.
+pub(super) struct FileDraft {
+    pub(super) path: String,
+    pub(super) tombstone: bool,
+    pub(super) record: Option<DraftFileStart>,
+    /// The team's digest at the path, from a real key of the snapshot.
+    pub(super) team: Option<String>,
+    /// Whether her bytes are the team's bytes there.
+    pub(super) mine_is_team: bool,
+}
+
+impl FileDraft {
+    /// Read one of `actor`'s draft files against `state`. A record that cannot
+    /// be read is an error (C1).
+    pub(super) fn read(
+        journal_dir: &Path,
+        domain: &str,
+        actor: &str,
+        entry: &crate::overlay_files::FileEntry,
+        state: &OriginState,
+    ) -> Result<FileDraft> {
+        let io = |source| EngineError::Io {
+            path: format!("the draft file '{}' in '{domain}'", entry.path),
+            source,
+        };
+        let record = draft_start::load_file(journal_dir, domain, actor, &entry.path).map_err(io)?;
+        let stamp = state.files.get(&entry.path);
+        let mine_is_team = match stamp {
+            Some(stamp) if !entry.tombstone => {
+                same_bytes_as(journal_dir, domain, actor, &entry.path, stamp).map_err(io)?
+            }
+            _ => false,
+        };
+        Ok(FileDraft {
+            path: entry.path.clone(),
+            tombstone: entry.tombstone,
+            record,
+            team: stamp.map(|stamp| stamp.sha256.clone()),
+            mine_is_team,
+        })
+    }
+}
+
+/// Whether `actor`'s bytes at `path` are the bytes `stamp` describes. The size
+/// is asked first, so a file of another size is never read.
+pub(super) fn same_bytes_as(
+    journal_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+    stamp: &crystalline_remote::state::BaseStamp,
+) -> std::io::Result<bool> {
+    let abs = crate::overlay_files::file(journal_dir, domain, actor, path)?;
+    match std::fs::metadata(&abs) {
+        Ok(meta) if meta.len() != stamp.size => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    Ok(
+        crate::overlay_files::read(journal_dir, domain, actor, path)?
+            .is_some_and(|bytes| sha256_hex(&bytes) == stamp.sha256),
+    )
+}
+
+/// The paths the frozen convergence record lists for `actor`: conflicts a pull
+/// from before the record saw. Read strictly, so a broken file refuses.
+fn frozen_list(journal_dir: &Path, domain: &str, actor: &str) -> Result<HashSet<String>> {
+    let read =
+        crate::overlay_journal::journal_record_strict(journal_dir, domain).map_err(|source| {
+            EngineError::Io {
+                path: format!("the convergence record of '{domain}'"),
+                source,
+            }
+        })?;
+    Ok(read
+        .conflicts
+        .get(actor)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect())
+}
 
 /// Whether a key of the base snapshot can hold an address: a page inside the
 /// domain that takes part in a share. A log, a listing or a dotfile is never
@@ -546,6 +691,23 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::NotFound(format!("no conflict {id} among your drafts in '{domain}'"))
             })?;
+        if found.conflict.file {
+            let conflict = found.conflict;
+            return Ok(json!({
+                "id": conflict.id,
+                "path": conflict.path,
+                "kind": conflict.kind,
+                "draft": true,
+                "detected_at": null,
+                "base": null,
+                "local": null,
+                "upstream": null,
+                "moved_from": null,
+                "other": null,
+                "file": true,
+                "note": "a file has no text to compare; keep yours or take the team's",
+            }));
+        }
         // One note per side that needs one, kept together: a start with no text
         // and a team file that is not text are two facts.
         let mut notes: Vec<String> = Vec::new();
@@ -689,6 +851,71 @@ impl Engine {
     /// Rows 2 and 3 are asked before row 1 in [`Reading::decide`]; a row they
     /// silence has no answer of its own either way.
     async fn found_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
+        let mut found = self.found_row_conflicts(domain, actor).await?;
+        found.extend(self.found_file_conflicts(domain, actor)?);
+        found.sort_by(|a, b| a.conflict.path.cmp(&b.conflict.path));
+        Ok(found)
+    }
+
+    /// The draft files of `actor` that do not fit the team's bytes, by
+    /// [`file_step`]. A files folder or a record that cannot be read is an
+    /// error, never a clean answer (C1).
+    fn found_file_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
+        if self.domain_entry(domain)?.origin.is_none() {
+            return Ok(Vec::new());
+        }
+        let (_, _, state_dir) = self.origin_spec_for_domain(domain)?;
+        let Some(state) = OriginState::load(&state_dir)? else {
+            return Ok(Vec::new());
+        };
+        let journal_dir = self.journal_state_dir()?;
+        // A name that cannot address a folder holds no files: every write
+        // screens the name the same way, so nothing is left unread.
+        let read = crate::overlay_files::actor_entries(&journal_dir, domain, actor);
+        if read.unreadable {
+            return Err(EngineError::Io {
+                path: format!("the draft files of '{actor}' in '{domain}'"),
+                source: std::io::Error::other("the files folder could not be read in full"),
+            });
+        }
+        let mut frozen: Option<HashSet<String>> = None;
+        let mut found = Vec::new();
+        for entry in &read.entries {
+            let draft = FileDraft::read(&journal_dir, domain, actor, entry, &state)?;
+            let step = file_step(
+                draft.tombstone,
+                draft.mine_is_team,
+                draft.record.as_ref(),
+                draft.team.as_deref(),
+                || {
+                    let listed = match &frozen {
+                        Some(listed) => listed,
+                        None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
+                    };
+                    Ok(listed.contains(&draft.path))
+                },
+            )?;
+            if let FileStep::Conflict(kind) = step {
+                found.push(Found {
+                    conflict: DraftConflict {
+                        id: conflict_id(actor, &draft.path),
+                        path: draft.path.clone(),
+                        kind,
+                        moved_from: None,
+                        file: true,
+                        other: None,
+                    },
+                    record: None,
+                    local: None,
+                    upstream: Held::Absent,
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`Engine::found_conflicts`] for the rows, the pages and their deletions.
+    async fn found_row_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
         if self.domain_entry(domain)?.origin.is_none() {
             return Ok(Vec::new());
         }
@@ -740,28 +967,10 @@ impl Engine {
                 Decision::NoRecord => {
                     let row = &reading.rows[i];
                     old_draft_conflict(row, team.at_path.team(), || {
-                        let listed =
-                            match &frozen {
-                                Some(listed) => listed,
-                                None => {
-                                    let read = crate::overlay_journal::journal_record_strict(
-                                        &journal_dir,
-                                        domain,
-                                    )
-                                    .map_err(|source| EngineError::Io {
-                                        path: format!("the convergence record of '{domain}'"),
-                                        source,
-                                    })?;
-                                    frozen.insert(
-                                        read.conflicts
-                                            .get(actor)
-                                            .into_iter()
-                                            .flatten()
-                                            .cloned()
-                                            .collect(),
-                                    )
-                                }
-                            };
+                        let listed = match &frozen {
+                            Some(listed) => listed,
+                            None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
+                        };
                         Ok(listed.contains(&row.path))
                     })?
                 }

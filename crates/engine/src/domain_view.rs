@@ -2626,6 +2626,11 @@ impl<'a> DomainView<'a> {
     /// the answer says `unchanged` and whether those bytes are this actor's
     /// own (`in_overlay`) or the folder's. A retry after a timeout is safe
     /// that way.
+    ///
+    /// **A new entry gets the record of where it started**, written before the
+    /// bytes: the folder's bytes it replaces, as its view showed them. An upload
+    /// over this actor's own bytes or deletion leaves the record alone, so a
+    /// second upload does not move the start and does not settle a conflict.
     async fn put_file_ruled(&self, path: &str, bytes: &[u8], create_only: bool) -> Result<PutFile> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
@@ -2633,7 +2638,10 @@ impl<'a> DomainView<'a> {
             .map_err(|e| self.files_io(path, e))?;
         let lock = self.engine.write_lock(&abs);
         let _guard = lock.lock().await;
+        let before = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
         let shown = self.shows_file(path).await?;
+        let mut shown_sha = None;
         if shown {
             // What this actor's view shows, read the way a read of it reads
             // it. A folder half with no file (a row a hand edit left) shows
@@ -2647,15 +2655,16 @@ impl<'a> DomainView<'a> {
                 Err(EngineError::NotFound(_)) => None,
                 Err(e) => return Err(e),
             };
-            if let Some(row) = held
-                && crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)?
-            {
-                return Ok(PutFile {
-                    row,
-                    created: false,
-                    unchanged: true,
-                    in_overlay,
-                });
+            if let Some(row) = held {
+                if crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)? {
+                    return Ok(PutFile {
+                        row,
+                        created: false,
+                        unchanged: true,
+                        in_overlay,
+                    });
+                }
+                shown_sha = Some(row.sha256);
             }
         }
         if create_only && shown {
@@ -2664,8 +2673,16 @@ impl<'a> DomainView<'a> {
                 crate::engine::ASSET_EXISTS
             )));
         }
-        crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
-            .map_err(|e| self.files_io(path, e))?;
+        let new_entry = before == crate::overlay_files::Held::Nothing;
+        if new_entry {
+            self.start_file(&state_dir, actor, path, shown_sha.as_deref())?;
+        }
+        if let Err(e) = crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes) {
+            if new_entry {
+                self.forget_file_start(&state_dir, actor, path);
+            }
+            return Err(self.files_io(path, e));
+        }
         let row = crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))?;
         Ok(PutFile {
             row,
@@ -2715,9 +2732,17 @@ impl<'a> DomainView<'a> {
     ///
     /// [`EngineError::NotFound`] when neither the overlay nor the folder holds
     /// the path, which is the miss [`Engine::attachment_delete`] reports.
+    ///
+    /// A new deletion of a reviewed file gets the record of where it started,
+    /// written before the marker: the folder's bytes it deletes. A deletion of
+    /// this actor's own bytes keeps the record those bytes started from.
     pub(crate) async fn tombstone_file(&self, path: &str) -> Result<()> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
+        let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        let lock = self.engine.write_lock(&abs);
+        let _guard = lock.lock().await;
         let held = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
         // **A path this actor has already deleted is a miss**, not a second
@@ -2743,12 +2768,61 @@ impl<'a> DomainView<'a> {
                 path,
             )));
         }
-        let done = if base_holds {
-            crate::overlay_files::tombstone(&state_dir, &self.domain, actor, path)
-        } else {
-            crate::overlay_files::clear(&state_dir, &self.domain, actor, path)
+        if !base_holds {
+            return crate::overlay_files::clear(&state_dir, &self.domain, actor, path)
+                .map_err(|e| self.files_io(path, e));
+        }
+        let new_entry = held == crate::overlay_files::Held::Nothing;
+        if new_entry {
+            // What she deletes, as her view shows it: the folder's bytes.
+            let shown = match self.engine.attachment_read(&self.domain, path).await {
+                Ok((_, row)) => Some(row.sha256),
+                Err(EngineError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+            self.start_file(&state_dir, actor, path, shown.as_deref())?;
+        }
+        if let Err(e) = crate::overlay_files::tombstone(&state_dir, &self.domain, actor, path) {
+            if new_entry {
+                self.forget_file_start(&state_dir, actor, path);
+            }
+            return Err(self.files_io(path, e));
+        }
+        Ok(())
+    }
+
+    /// Write the record of a new draft file at `path`, from the folder's bytes
+    /// its view showed (`shown`). With no snapshot no record is written, and one
+    /// an earlier entry left behind goes, since it would read as a known start.
+    fn start_file(
+        &self,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+        shown: Option<&str>,
+    ) -> Result<()> {
+        let saved = match self.engine.fresh_file_start(&self.domain, path, shown)? {
+            Some(start) => draft_start::save_file(state_dir, &self.domain, actor, &start),
+            None => draft_start::clear_file(state_dir, &self.domain, actor, path),
         };
-        done.map_err(|e| self.files_io(path, e))
+        saved.map_err(|source| EngineError::Io {
+            path: format!("the draft start record of the file '{path}'"),
+            source,
+        })
+    }
+
+    /// Take back the record [`DomainView::start_file`] wrote for an entry that
+    /// was not written. A record left behind is harmless, since the next new
+    /// entry at the path writes its own, so a failure is only logged.
+    fn forget_file_start(&self, state_dir: &Path, actor: &str, path: &str) {
+        if let Err(e) = draft_start::clear_file(state_dir, &self.domain, actor, path) {
+            tracing::warn!(
+                domain = self.domain.as_str(),
+                actor,
+                path,
+                "the record of a draft file that was not written could not be removed: {e}"
+            );
+        }
     }
 
     /// Whose files overlay a write on this view lands in.

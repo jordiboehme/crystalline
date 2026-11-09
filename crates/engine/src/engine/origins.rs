@@ -4122,11 +4122,24 @@ impl Engine {
             self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
                 .await?;
         }
-        // An attachment is not an engram and this verb settles engrams. The
-        // path would be normalized to `<path>.md` on the next line and then
-        // miss everything, so the refusal comes first and says what to do
-        // instead: the bytes are settled by writing them again or by deleting
-        // them, which is the same pair of verbs that put them there.
+        // A draft file is settled here as a page is, from its own record. It
+        // is never merged. Under the origin lock, as a page is, so a resolve
+        // waits out a fold's locked window.
+        if is_assets_reserved(path) && self.drafts_stay_open(domain) {
+            let who = share_staging::overlay_share_actor(&actor)?;
+            let resolution = origin::resolution_from(keep, content)?;
+            let lock = self.origin_lock_registered(domain)?;
+            let _guard = lock.lock().await;
+            return self
+                .resolve_file_in_overlay(domain, &who, path, resolution)
+                .await;
+        }
+        // An attachment is not an engram, and in a domain that takes changes
+        // directly this verb settles engrams. The path would be normalized to
+        // `<path>.md` on the next line and then miss everything, so the
+        // refusal comes first and says what to do instead: the bytes are
+        // settled by writing them again or by deleting them, which is the same
+        // pair of verbs that put them there.
         if is_assets_reserved(path) {
             return Err(EngineError::Invalid(format!(
                 "'{path}' is an attachment, and a conflict resolution settles an engram's \
@@ -4220,6 +4233,89 @@ impl Engine {
         Ok(json!({
             "resolved": report.resolved,
             "remaining": report.remaining,
+        }))
+    }
+
+    /// Settles one actor's draft file beside the pages. A file never merges.
+    ///
+    /// - **Keep mine** leaves her bytes or her deletion and moves the start to
+    ///   the team's digest now, so hers replaces the team's when she shares. A
+    ///   team file that is gone leaves no start, so her file lands as a new one.
+    /// - **Take theirs** ends the draft file and its record.
+    /// - **Merged** is refused: there is no text to merge.
+    ///
+    /// Under the file's write lock, the one an upload takes, so an upload and a
+    /// resolve of one file never cross. The caller holds the origin lock.
+    async fn resolve_file_in_overlay(
+        &self,
+        domain: &str,
+        actor: &str,
+        path: &str,
+        resolution: ops::Resolution<'_>,
+    ) -> Result<Value> {
+        super::validate_attachment_path(path)?;
+        if matches!(resolution, ops::Resolution::Merged(_)) {
+            return Err(EngineError::Invalid(
+                "A file cannot be merged here. Keep one of the two.".to_string(),
+            ));
+        }
+        let journal_dir = self.journal_state_dir()?;
+        let io = |source| EngineError::Io {
+            path: format!("your draft file '{path}' in '{domain}'"),
+            source,
+        };
+        let abs = crate::overlay_files::file(&journal_dir, domain, actor, path).map_err(io)?;
+        let lock = self.write_lock(&abs);
+        let guard = lock.lock().await;
+        let held = crate::overlay_files::held(&journal_dir, domain, actor, path).map_err(io)?;
+        if held == crate::overlay_files::Held::Nothing {
+            return Err(EngineError::NotFound(format!(
+                "you are not drafting the file '{path}' in domain '{domain}'. This domain \
+                 reviews changes, so what a resolution settles is your own draft"
+            )));
+        }
+        let kept = match resolution {
+            ops::Resolution::Mine => {
+                // With no snapshot nothing can say where a file starts, and no
+                // conflict stands either, so nothing is written.
+                let state =
+                    crystalline_remote::state::OriginState::load(&self.origin_state_dir(domain)?)?;
+                if let Some(state) = state {
+                    let start = crate::draft_start::DraftFileStart {
+                        path: path.to_string(),
+                        start_sha: state.files.get(path).map(|stamp| stamp.sha256.clone()),
+                    };
+                    crate::draft_start::save_file(&journal_dir, domain, actor, &start)
+                        .map_err(io)?;
+                }
+                "mine"
+            }
+            _ => {
+                crate::overlay_files::clear(&journal_dir, domain, actor, path).map_err(io)?;
+                crate::maintenance::record_pending(domain);
+                "theirs"
+            }
+        };
+        drop(guard);
+        self.settle_convergence(domain, actor, path);
+        let remaining = match self.draft_conflicts(domain, actor).await {
+            Ok(left) => json!(left.len()),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    "the conflicts left after settling '{path}' could not be counted: {e}"
+                );
+                Value::Null
+            }
+        };
+        Ok(json!({
+            "resolved": path,
+            "remaining": remaining,
+            "draft": true,
+            "file": true,
+            "kept": kept,
+            "kept_copy": false,
         }))
     }
 

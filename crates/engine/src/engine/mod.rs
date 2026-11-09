@@ -6484,6 +6484,35 @@ impl Engine {
         }))
     }
 
+    /// The record of a new draft file at `path`, upload or deletion. `shown` is
+    /// the digest of the folder's bytes the writer's view showed there, and the
+    /// start is those bytes: what she replaced or deleted. The snapshot says only
+    /// whether the team holds the path; a path it does not hold starts from no
+    /// file, which a file in the folder nobody shared is too. `None` with no
+    /// snapshot, where no record is the honest answer.
+    ///
+    /// The shown bytes and not the snapshot's digest: a pull or a commit can move
+    /// the snapshot ahead of the folder, and a start taken from the snapshot then
+    /// reads as in step over a file she never saw.
+    pub(crate) fn fresh_file_start(
+        &self,
+        domain: &str,
+        path: &str,
+        shown: Option<&str>,
+    ) -> Result<Option<crate::draft_start::DraftFileStart>> {
+        let dir = self.origin_state_dir(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&dir)? else {
+            return Ok(None);
+        };
+        let start_sha = shown
+            .filter(|_| state.files.contains_key(path))
+            .map(str::to_string);
+        Ok(Some(crate::draft_start::DraftFileStart {
+            path: path.to_string(),
+            start_sha,
+        }))
+    }
+
     /// The record of a new tombstone at `path`, whose `from` is always its path.
     fn fresh_tombstone_start(
         &self,
@@ -6766,7 +6795,7 @@ impl Engine {
         {
             let report = ConvergenceReport {
                 cleared: 0,
-                diverged: record.as_ref().map_or(0, file_conflicts),
+                diverged: 0,
                 merged: 0,
             };
             if let Some(mut record) = record {
@@ -6874,39 +6903,15 @@ impl Engine {
                 }
             }
             pending.push_drops_from(domain, &view);
-            // And their files, in the same pass and into the same record: a
-            // conflict is one actor's conflict at one path, whatever kind of
-            // thing stands there.
+            // And their files: one whose bytes the team now holds, or whose
+            // deletion the team made too, has landed and ends. Everything else
+            // stands, in step or a conflict the gates read; a file never merges.
             for file in files {
-                let base = crystalline_remote::state::read_base_file(&state_dir, &file.path)?;
-                let bytes = if file.tombstone {
-                    None
-                } else {
-                    crate::overlay_files::read(&journal_dir, domain, actor, &file.path).map_err(
-                        |source| EngineError::Io {
-                            path: format!("the files overlay of '{domain}' at '{}'", file.path),
-                            source,
-                        },
-                    )?
-                };
-                match settle_overlay_file(file, base.as_deref(), bytes.as_deref(), &touched) {
-                    Settle::Clear => {
-                        crate::overlay_files::clear(&journal_dir, domain, actor, &file.path)
-                            .map_err(|source| EngineError::Io {
-                                path: format!("the files overlay of '{domain}' at '{}'", file.path),
-                                source,
-                            })?;
-                        if let Some(record) = record.as_mut() {
-                            record.settle(actor, &file.path);
-                        }
-                        cleared += 1;
-                    }
-                    Settle::Diverge => {
-                        if let Some(record) = record.as_mut() {
-                            record.diverge(actor, &file.path);
-                        }
-                    }
-                    Settle::Leave => {}
+                if self
+                    .settle_overlay_file(&journal_dir, domain, actor, file, &state)
+                    .await?
+                {
+                    cleared += 1;
                 }
             }
             // Once this actor's entries have settled, their references are read
@@ -6922,8 +6927,11 @@ impl Engine {
         }
         drop(pending);
         // What stands now, read the way the gates read it.
-        let mut diverged = record.as_ref().map_or(0, file_conflicts);
-        for holding in held.iter().filter(|holding| !holding.entries.is_empty()) {
+        let mut diverged = 0u64;
+        for holding in held
+            .iter()
+            .filter(|holding| !holding.entries.is_empty() || !holding.files.is_empty())
+        {
             match self.draft_conflicts(domain, &holding.actor).await {
                 Ok(conflicts) => diverged += conflicts.len() as u64,
                 Err(e) => tracing::warn!(
@@ -7756,7 +7764,9 @@ impl Engine {
     ) -> Option<Value> {
         let journal_dir = self.journal_state_dir().ok()?;
         let record = crate::overlay_journal::journal_record(&journal_dir, domain);
-        let drafting: Vec<String> = {
+        // Everyone holding rows or files: an actor with only files is in no
+        // `overlay_counts` answer.
+        let mut drafting: BTreeSet<String> = {
             let store = self.store.lock().await;
             let domain_id = store.domain_id(domain).await.ok().flatten()?;
             store
@@ -7767,11 +7777,17 @@ impl Engine {
                 .map(|(actor, _)| actor)
                 .collect()
         };
-        let mut per_actor: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (who, paths) in &record.conflicts {
-            let files = paths.iter().filter(|path| !path.ends_with(".md")).cloned();
-            per_actor.entry(who.clone()).or_default().extend(files);
+        let files = self.overlay_domain_files(domain);
+        if files.unreadable {
+            tracing::warn!(
+                domain,
+                "the draft files could not be listed, so the status says nothing about their \
+                 conflicts"
+            );
+            return None;
         }
+        drafting.extend(files.per_actor.into_keys());
+        let mut per_actor: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for who in drafting {
             match self.draft_conflicts(domain, &who).await {
                 Ok(conflicts) => per_actor
@@ -7819,6 +7835,58 @@ impl Engine {
         Some(value)
     }
 
+    /// End one of `actor`'s draft files when it has landed: the team holds her
+    /// bytes, or holds nothing where she deleted. Answers whether it ended.
+    ///
+    /// Decided on what the pass read, then asked again under the file's write
+    /// lock, so an upload in between is never cleared for the bytes it replaced.
+    async fn settle_overlay_file(
+        &self,
+        journal_dir: &Path,
+        domain: &str,
+        actor: &str,
+        file: &crate::overlay_files::FileEntry,
+        state: &crystalline_remote::state::OriginState,
+    ) -> Result<bool> {
+        let io = |source| EngineError::Io {
+            path: format!("the files overlay of '{domain}' at '{}'", file.path),
+            source,
+        };
+        let landed = |file: &crate::overlay_files::FileEntry| -> Result<bool> {
+            let draft = draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state)?;
+            // The frozen list decides nothing about a file that has landed.
+            let step = draft_conflicts::file_step(
+                draft.tombstone,
+                draft.mine_is_team,
+                draft.record.as_ref(),
+                draft.team.as_deref(),
+                || Ok(false),
+            )?;
+            Ok(step == draft_conflicts::FileStep::Landed)
+        };
+        if !landed(file)? {
+            return Ok(false);
+        }
+        let abs = crate::overlay_files::file(journal_dir, domain, actor, &file.path).map_err(io)?;
+        let lock = self.write_lock(&abs);
+        let _guard = lock.lock().await;
+        let now =
+            match crate::overlay_files::held(journal_dir, domain, actor, &file.path).map_err(io)? {
+                crate::overlay_files::Held::Nothing => return Ok(false),
+                crate::overlay_files::Held::Bytes => false,
+                crate::overlay_files::Held::Tombstone => true,
+            };
+        let again = crate::overlay_files::FileEntry {
+            tombstone: now,
+            ..file.clone()
+        };
+        if !landed(&again)? {
+            return Ok(false);
+        }
+        crate::overlay_files::clear(journal_dir, domain, actor, &file.path).map_err(io)?;
+        Ok(true)
+    }
+
     /// Take one path out of one actor's recorded conflicts, and answer how
     /// many they have left. A resolution settles it whichever way it went, so
     /// this runs for every arm.
@@ -7835,59 +7903,6 @@ impl Engine {
         let left = record.settle(actor, path);
         self.save_convergence(&journal_dir, domain, &record);
         left
-    }
-
-    /// Settle one actor's recorded conflict at one FILE path, under the
-    /// domain's origin lock, and only when there is one to settle.
-    ///
-    /// **The lock is the point.** [`Engine::save_convergence`] writes the whole
-    /// record at once - the conflicts and the proposal owners beside them - so
-    /// two writers that both loaded before either saved lose one of the two
-    /// edits, and its doc states that every caller holds the domain's origin
-    /// lock. [`Engine::origin_resolve`] earns its place on that list by taking
-    /// one; an upload is not an origin verb and holds nothing of its own, so it
-    /// takes the lock here. Without it a draft upload racing a poller tick's
-    /// pull would drop another actor's conflicts, or the record of whose open
-    /// proposal is whose.
-    ///
-    /// **The read in front of it is not an optimization alone.** Every draft
-    /// upload would otherwise do a full read-modify-write of the record and
-    /// queue behind the domain's origin lock to do it, for a path that is not in
-    /// conflict at all - which is every upload but the rare one. A record this
-    /// read finds nothing in is a record this call has nothing to say about, and
-    /// a conflict that appears between the read and the lock is recorded by a
-    /// pull that has not finished yet, so the next write of the same path
-    /// settles it.
-    ///
-    /// **A lock that cannot be taken skips the settle rather than failing the
-    /// write.** A reviewing domain always has an origin (the mode requires one),
-    /// so this is the domain being unregistered underneath; losing somebody's
-    /// upload over a bookkeeping write would be the wrong way round.
-    async fn settle_file_convergence(&self, domain: &str, actor: &str, path: &str) {
-        let Ok(journal_dir) = self.journal_state_dir() else {
-            return;
-        };
-        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
-        if !record
-            .conflicts
-            .get(actor)
-            .is_some_and(|paths| paths.iter().any(|held| held == path))
-        {
-            return;
-        }
-        let Ok(lock) = self.origin_lock_registered(domain) else {
-            tracing::warn!(
-                domain,
-                actor,
-                path,
-                "a draft file was written at a path recorded as a conflict, and the domain's \
-                 origin lock could not be taken to settle it; the record is behind until the \
-                 next write of this path"
-            );
-            return;
-        };
-        let _guard = lock.lock().await;
-        self.settle_convergence(domain, actor, path);
     }
 
     /// Record which overlay actor a proposal belongs to, or forget one that has
@@ -11712,18 +11727,6 @@ fn prune_settled_file_conflicts(
     });
 }
 
-/// How many file conflicts a convergence record lists. Its `.md` paths are the
-/// frozen list of drafts from before the record, which the conflict table
-/// counts in its own way.
-fn file_conflicts(record: &crate::overlay_journal::ConvergenceRecord) -> u64 {
-    record
-        .conflicts
-        .values()
-        .flatten()
-        .filter(|path| !path.ends_with(".md"))
-        .count() as u64
-}
-
 /// What [`Engine::take_merge`] did with a merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
@@ -11753,16 +11756,6 @@ struct ActorHolding {
     files: Vec<crate::overlay_files::FileEntry>,
 }
 
-/// What a pull leaves one overlay file to be.
-enum Settle {
-    /// Untouched by this pull and still its author's draft.
-    Leave,
-    /// The folder has caught up with it: take it out.
-    Clear,
-    /// Its author has a conflict to settle.
-    Diverge,
-}
-
 /// Where the team moved the file of this plain draft, if a pull did: the one
 /// question the pass asks before it decides a row. Pure.
 ///
@@ -11790,44 +11783,6 @@ fn settle_overlay_entry(
         .get(&entry.permalink)
         .filter(|held| held.as_str() != at && !own.contains(held.as_str()))
         .cloned()
-}
-
-/// What one pull leaves one overlay FILE to be. Pure.
-///
-/// `base` is the path's own bytes in the base snapshot AFTER the pull, `bytes`
-/// what this actor holds there (`None` for a deletion), and `touched` the paths
-/// the pull applied.
-///
-/// A file answers to no address, so there is no rename for it to follow and no
-/// address for another file to spend: the `MoveTo` and `elsewhere` arms of the
-/// row rule have nothing to read here. What is left is the pair that matters -
-/// the folder has caught up, or it has moved somewhere else.
-fn settle_overlay_file(
-    entry: &crate::overlay_files::FileEntry,
-    base: Option<&[u8]>,
-    bytes: Option<&[u8]>,
-    touched: &HashSet<&str>,
-) -> Settle {
-    let pulled = touched.contains(entry.path.as_str());
-    if entry.tombstone {
-        return match base {
-            // The team deleted it too, so the marker has nothing left to hide.
-            None => Settle::Clear,
-            Some(_) if pulled => Settle::Diverge,
-            Some(_) => Settle::Leave,
-        };
-    }
-    match (base, bytes) {
-        // The folder holds exactly these bytes now: the draft is the team's
-        // file, under any pull or none. Asked of every entry on every pass, so
-        // an author who uploads the team's own version again has it cleared by
-        // the next pass rather than left listed.
-        (Some(base), Some(bytes)) if base == bytes => Settle::Clear,
-        // The pull changed or removed what stood under this file, and what the
-        // actor holds is not it.
-        (_, _) if pulled => Settle::Diverge,
-        _ => Settle::Leave,
-    }
 }
 
 /// The addresses the base files a pull applied answer to, permalink to path.

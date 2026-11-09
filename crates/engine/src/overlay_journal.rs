@@ -98,7 +98,10 @@ const RECORD_FILE: &str = ".convergence.json";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergenceRecord {
     /// Every path still standing as a conflict, per actor, each list ordered
-    /// and free of duplicates.
+    /// and free of duplicates. Nothing adds to it any more: a conflict is now
+    /// read from what stands. What older pulls wrote here is a frozen list the
+    /// conflict table reads for a draft from before the records, page or file,
+    /// and a resolution takes its path out.
     #[serde(default)]
     pub conflicts: BTreeMap<String, Vec<String>>,
     /// How many entries the last convergence pass took out of the overlay.
@@ -121,14 +124,6 @@ pub struct ConvergenceRecord {
 }
 
 impl ConvergenceRecord {
-    /// Record that `actor` has a conflict at `path`, once.
-    pub fn diverge(&mut self, actor: &str, path: &str) {
-        let paths = self.conflicts.entry(actor.to_string()).or_default();
-        if let Err(at) = paths.binary_search(&path.to_string()) {
-            paths.insert(at, path.to_string());
-        }
-    }
-
     /// Take `path` out of `actor`'s conflicts, answering how many they have
     /// left. An actor with none left leaves no entry behind.
     pub fn settle(&mut self, actor: &str, path: &str) -> u64 {
@@ -141,14 +136,6 @@ impl ConvergenceRecord {
             self.conflicts.remove(actor);
         }
         left
-    }
-
-    /// Every conflict standing, across every actor.
-    pub fn diverged(&self) -> u64 {
-        self.conflicts
-            .values()
-            .map(|paths| paths.len() as u64)
-            .sum()
     }
 }
 
