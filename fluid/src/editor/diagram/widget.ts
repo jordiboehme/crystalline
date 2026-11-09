@@ -387,7 +387,6 @@ function cancelRetry(box: Box): void {
   }
 }
 
-/** Brings the box to what it should show, at once when a drawing is at hand. */
 /** The box's name for a screen reader, by the kind its body says. */
 function boxName(body: string): string {
   return diagramKindOf(body) === "sequenceDiagram"
@@ -395,6 +394,7 @@ function boxName(body: string): string {
     : "Flowchart";
 }
 
+/** Brings the box to what it should show, at once when a drawing is at hand. */
 function draw(box: Box): void {
   box.dom.setAttribute("aria-label", boxName(box.body));
   const key = drawKey(box.body, box.dark);

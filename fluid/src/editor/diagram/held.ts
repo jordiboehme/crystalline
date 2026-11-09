@@ -133,11 +133,6 @@ export function letGoOfLine(main: EditorView, hold: LineHold): void {
   }
 }
 
-/** The ticket a hold asked for, or null. */
-export function holdTicket(hold: LineHold | null): number | null {
-  return hold?.ticket ?? null;
-}
-
 /** Whether `hold` names `target`'s line, whatever its occurrence is now. */
 export function holdsLine(hold: LineHold, target: TargetKey): boolean {
   if (isMessageHold(hold)) {

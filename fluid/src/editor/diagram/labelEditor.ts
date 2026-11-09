@@ -78,6 +78,7 @@ import {
 } from "./held";
 import type { DiagramModel } from "./kinds";
 import { labelOfTarget } from "./kinds";
+import { seqMessageTexts } from "./sequence/hit";
 import { tidySeqText } from "./sequence/labels";
 import type { SeqOp } from "./sequence/ops";
 import { compileSeqOp, heldSeqOp } from "./sequence/ops";
@@ -195,7 +196,9 @@ function placeOf(
   });
   if (target.kind === "message") {
     // A message's text where it has one, its line otherwise.
-    const texts = textsBefore(el).map((text) => text.getBoundingClientRect());
+    const texts = seqMessageTexts(el).map((text) =>
+      text.getBoundingClientRect(),
+    );
     const drawn = texts.filter((rect) => rect.width > 0);
     if (drawn.length === 0) {
       return from(el.getBoundingClientRect());
@@ -228,19 +231,6 @@ function placeOf(
   const screen = path.getScreenCTM();
   const at = screen === null ? point : point.matrixTransform(screen);
   return from({ left: at.x, top: at.y, width: 0, height: 0 });
-}
-
-/** The texts a message's line has right before it: what it says, row by row. */
-function textsBefore(line: Element): Element[] {
-  const texts: Element[] = [];
-  for (
-    let el = line.previousElementSibling;
-    el !== null && el.classList.contains("messageText");
-    el = el.previousElementSibling
-  ) {
-    texts.push(el);
-  }
-  return texts;
 }
 
 /** Stands the field over its target, or in the box's middle before it is drawn. */

@@ -838,9 +838,11 @@ async function chooseBox(main: EditorView, to: string): Promise<void> {
   }
   const sequence = modelNow(fence)?.kind === "sequence";
   open.running = true;
-  // Whoever left during the check meant no arrow.
+  // Whoever left during the check meant no arrow. Each kind's own check runs.
   const verify = async (body: string, dark: boolean): Promise<Verdict> => {
-    const verdict = await flowKind.verify(body, dark);
+    const verdict = sequence
+      ? await seqKind.verify(body, dark)
+      : await flowKind.verify(body, dark);
     return open.cancelled
       ? { ok: false, reason: "the person left connect mode" }
       : verdict;

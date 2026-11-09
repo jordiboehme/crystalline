@@ -13,18 +13,12 @@
 import type { TargetKey } from "../intent";
 import type { Verdict } from "../verdict";
 import type { SeqMessage, SeqModel, SeqTarget } from "./model";
-import { decodeSeqText } from "./parse";
+import { textOf } from "./ops";
 
 type MessageTarget = SeqTarget & { kind: "message" };
 
 const CANVAS: TargetKey = { kind: "canvas" };
 const SVG_NS = "http://www.w3.org/2000/svg";
-
-function textOf(model: SeqModel, message: SeqMessage): string {
-  return message.text === null
-    ? ""
-    : decodeSeqText(model.body.slice(message.text.from, message.text.to));
-}
 
 /** The target of a message: its ends, its text and its occurrence among equals. */
 export function messageTarget(
@@ -242,16 +236,6 @@ export function seqMessageSpanOf(
   target: MessageTarget,
 ): number | null {
   return seqMessageOf(model, target)?.arrow.span.from ?? null;
-}
-
-/** How many messages say what `target` says, its occurrence aside. */
-export function seqEqualCount(model: SeqModel, target: MessageTarget): number {
-  return model.messages.filter(
-    (m) =>
-      m.from === target.from &&
-      m.to === target.to &&
-      textOf(model, m) === target.text,
-  ).length;
 }
 
 /** The stop whose source holds `offset`, a position in the body; the canvas otherwise. */

@@ -25,6 +25,7 @@ import { MERMAID_STARTER_GROUPS, mermaidFence } from "../../mermaidStarters";
 import { insertBlock } from "../../toolbar";
 import { drawnFenceLines } from "../draws";
 import { sequenceDrawing } from "../../../test/sequenceDrawing";
+import { seqKind } from "../apply";
 import { applyEdits, NOTICES } from "../edits";
 import { focusTarget } from "../focus";
 import type { TargetKey } from "../intent";
@@ -433,6 +434,26 @@ describe("Add message to...", () => {
     await vi.waitFor(() => {
       expect(fieldOf(view)).not.toBeNull();
     });
+  });
+
+  it("runs the sequence kind's own check", async () => {
+    const view = await drawn();
+    const own = seqKind.verify.bind(seqKind);
+    seqKind.verify = () =>
+      Promise.resolve({ ok: false, reason: "the sequence check says no" });
+    try {
+      openMenuOn(view, CALLER);
+      choose("Add message to...");
+      await flush();
+      press("ArrowRight");
+      press("Enter");
+      await vi.waitFor(() => {
+        expect(noticeOf(view)).toBe(NOTICES.invalid);
+      });
+      expect(text(view)).toBe(page(STARTER));
+    } finally {
+      seqKind.verify = own;
+    }
   });
 
   it("Escape ends it and writes nothing", async () => {

@@ -163,7 +163,8 @@ function messageAt(
   });
 }
 
-function textOf(model: SeqModel, message: SeqMessage): string {
+/** A message's text as mermaid draws it; empty with none. */
+export function textOf(model: SeqModel, message: SeqMessage): string {
   return message.text
     ? decodeSeqText(model.body.slice(message.text.from, message.text.to))
     : "";
