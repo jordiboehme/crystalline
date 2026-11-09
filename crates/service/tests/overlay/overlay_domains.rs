@@ -8067,8 +8067,9 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
     let allowed = [
         // The constructor itself.
         ("domain_view.rs", "for_actor"),
-        // The convergence pass a pull runs, which walks every actor's entries.
-        ("engine.rs", "converge_pulled_overlays"),
+        // The convergence pass a pull runs, which walks every actor's entries
+        // (or, for a preview, only the caller's own).
+        ("engine.rs", "converge_overlays_of"),
         // ...and the rename it performs when the base carried the draft along.
         ("engine.rs", "move_draft_with_the_base"),
         // The fold, which ends every actor's drafts on the way out.

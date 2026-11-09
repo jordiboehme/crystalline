@@ -6444,7 +6444,7 @@ export type GetDomainShareChangesError = GetDomainShareChangesErrors[keyof GetDo
 
 export type GetDomainShareChangesResponses = {
     /**
-     * The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`.
+     * The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. On a domain that reviews changes, a preview naming `files` answers `conflicts_pending` with `count` and `conflicts` (each `{ id, path, kind, moved_from, file, other, draft: true }`) when one of the caller's own drafts among them does not fit the team's text, and `changes` stays filled. A preview with no `files` keeps its action and names those drafts in `draft_conflicts`, in the same shape.
      */
     200: {
         [key: string]: unknown;
@@ -6652,9 +6652,9 @@ export type ShareDomainError = ShareDomainErrors[keyof ShareDomainErrors];
 
 export type ShareDomainResponses = {
     /**
-     * The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.
+     * The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts (on a domain that reviews changes, the sharer's own drafts that do not fit the team's text, each with `draft: true`), or `proposal_diverged` with guidance.
      *
-     * A domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists, `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.
+     * A domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists (on a domain that reviews changes, with `free_error`, a sentence to show as given, when a draft the commit's deletion freed could not be updated), `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.
      *
      * A `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.
      */

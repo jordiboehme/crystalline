@@ -1585,7 +1585,15 @@ pub async fn sync_now(
                            lands on and how many layers the amend would \
                            rebuild), `count` for \
                            `conflicts_pending`, and nothing extra for a \
-                           `create` or a `nothing_to_share`.",
+                           `create` or a `nothing_to_share`. On a domain \
+                           that reviews changes, a preview naming `files` \
+                           answers `conflicts_pending` with `count` and \
+                           `conflicts` (each `{ id, path, kind, moved_from, \
+                           file, other, draft: true }`) when one of the \
+                           caller's own drafts among them does not fit the \
+                           team's text, and `changes` stays filled. A preview \
+                           with no `files` keeps its action and names those \
+                           drafts in `draft_conflicts`, in the same shape.",
             body = Object,
             examples(
                 ("update" = (
@@ -1810,11 +1818,17 @@ pub struct ShareBody {
             description = "The engine's own share outcome: `proposed` with the \
                            new proposal's number and url, `updated` carrying \
                            the proposal it refreshed, `nothing_to_share`, \
-                           `conflicts_pending` with the conflicts, or \
+                           `conflicts_pending` with the conflicts (on a \
+                           domain that reviews changes, the sharer's own \
+                           drafts that do not fit the team's text, each \
+                           with `draft: true`), or \
                            `proposal_diverged` with guidance.\n\nA domain \
                            that shares directly answers one of four outcomes \
                            instead: `committed` with the commit's sha, url \
-                           and branch beside the three file lists, \
+                           and branch beside the three file lists (on a \
+                           domain that reviews changes, with `free_error`, a \
+                           sentence to show as given, when a draft the \
+                           commit's deletion freed could not be updated), \
                            `proposal_open` with the number, url and title of \
                            another person's proposal that is still open; \
                            share again once it is merged or closed, \

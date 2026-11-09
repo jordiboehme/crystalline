@@ -1070,6 +1070,11 @@ pub struct Engine {
     // once. See `Engine::fail_next_merge_start`.
     #[cfg(any(test, feature = "testing"))]
     fail_next_merge_start: std::sync::atomic::AtomicBool,
+    // When armed, the next resolution of a share's credential answers that the
+    // caller connected no personal identity, once. See
+    // `Engine::refuse_next_personal_credential`.
+    #[cfg(any(test, feature = "testing"))]
+    refuse_next_personal_credential: std::sync::atomic::AtomicBool,
     // When armed, the next rename-question scan fails once. See
     // `Engine::fail_next_rename_scan`.
     #[cfg(any(test, feature = "testing"))]
@@ -2532,6 +2537,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_merge_start: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             lose_next_relink_swap: std::sync::atomic::AtomicBool::new(false),
@@ -2769,6 +2776,30 @@ impl Engine {
         #[cfg(any(test, feature = "testing"))]
         {
             self.fail_next_merge_start
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Make the next resolution of a share's credential refuse as one for a
+    /// caller who connected no personal GitHub identity does, once, even under
+    /// a test's provider override, so the read-scope preview can be reached.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn refuse_next_personal_credential(&self) {
+        self.refuse_next_personal_credential
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::refuse_next_personal_credential`] is armed, consuming
+    /// the arming. Constant `false` outside a test build.
+    pub(super) fn take_refused_personal_credential(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.refuse_next_personal_credential
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
         }
         #[cfg(not(any(test, feature = "testing")))]
@@ -6478,6 +6509,19 @@ impl Engine {
         domain: &str,
         touched: &[String],
     ) -> Result<ConvergenceReport> {
+        self.converge_overlays_of(domain, touched, None).await
+    }
+
+    /// [`Engine::converge_pulled_overlays`] for one actor's drafts and files
+    /// only, when `only` names them, so a caller who asked about their own
+    /// drafts writes nobody else's. The convergence record keeps the other
+    /// actors' entries and its `cleared` count as they stand.
+    pub(super) async fn converge_overlays_of(
+        &self,
+        domain: &str,
+        touched: &[String],
+        only: Option<&str>,
+    ) -> Result<ConvergenceReport> {
         if !self.reviews_changes(domain) {
             return Ok(ConvergenceReport::default());
         }
@@ -6568,6 +6612,10 @@ impl Engine {
         if let Some(record) = record.as_mut() {
             prune_settled_file_conflicts(record, &held);
         }
+        // Narrowed only now, so the prune above still sees every actor's files.
+        if let Some(only) = only {
+            held.retain(|holding| holding.actor == only);
+        }
         let state = crystalline_remote::state::OriginState::load(&state_dir)?;
         if held
             .iter()
@@ -6580,7 +6628,9 @@ impl Engine {
                 merged: 0,
             };
             if let Some(mut record) = record {
-                record.cleared = 0;
+                if only.is_none() {
+                    record.cleared = 0;
+                }
                 self.save_convergence(&journal_dir, domain, &record);
             }
             return Ok(report);
@@ -6738,7 +6788,9 @@ impl Engine {
             }
         }
         if let Some(mut record) = record {
-            record.cleared = cleared;
+            if only.is_none() {
+                record.cleared = cleared;
+            }
             self.save_convergence(&journal_dir, domain, &record);
         }
         Ok(ConvergenceReport {

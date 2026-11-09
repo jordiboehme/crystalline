@@ -993,37 +993,30 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
 
 /// A share refused because drafts it would carry do not fit the team's text:
 /// `{ outcome: "conflicts_pending", count, conflicts }`, the shape the
-/// non-review refusal has, with each conflict as the conflict list names it.
+/// non-review refusal has, with each conflict as [`draft_conflicts_json`] gives
+/// it.
 pub(crate) fn draft_conflicts_pending_json(conflicts: &[DraftConflict]) -> Value {
     json!({
         "outcome": "conflicts_pending",
         "count": conflicts.len(),
-        "conflicts": conflicts,
+        "conflicts": draft_conflicts_json(conflicts),
     })
 }
 
-/// A share plan whose share would be refused for `conflicts`: the action becomes
-/// `conflicts_pending` with `count` and `conflicts`, and the keys the planned
-/// action carried go, so nobody reads a branch or a proposal the share will not
-/// reach. `changes` stays as planned.
-pub(crate) fn plan_refused_for_draft_conflicts(plan: &mut Value, conflicts: &[DraftConflict]) {
-    if let Some(fields) = plan.as_object_mut() {
-        for key in [
-            "number",
-            "url",
-            "title",
-            "top_number",
-            "top_title",
-            "layers_above",
-            "branch",
-            "own",
-        ] {
-            fields.remove(key);
-        }
-    }
-    plan["action"] = json!("conflicts_pending");
-    plan["count"] = json!(conflicts.len());
-    plan["conflicts"] = json!(conflicts);
+/// Draft conflicts as a share or a preview names them: each as the conflict
+/// list has it, with `draft: true`, as the status detail marks one, so a reader
+/// tells it from a conflict of a domain that takes changes directly.
+pub(crate) fn draft_conflicts_json(conflicts: &[DraftConflict]) -> Value {
+    Value::Array(
+        conflicts
+            .iter()
+            .map(|conflict| {
+                let mut entry = json!(conflict);
+                entry["draft"] = json!(true);
+                entry
+            })
+            .collect(),
+    )
 }
 
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
@@ -2471,8 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_refused_for_draft_conflicts_drops_the_planned_actions_keys() {
-        use crystalline_remote::changes::{LocalChange, LocalChanges};
+    fn a_draft_conflicts_refusal_marks_each_conflict_as_a_draft() {
         let conflict = DraftConflict {
             id: "d0000000".to_string(),
             path: "plan.md".to_string(),
@@ -2481,45 +2473,12 @@ mod tests {
             file: false,
             other: None,
         };
-        for action in [
-            ops::PlannedAction::Commit {
-                branch: "main".to_string(),
-            },
-            ops::PlannedAction::Amend {
-                number: 4,
-                url: "https://github.test/pull/4".to_string(),
-                title: "Share".to_string(),
-                layers_above: 1,
-            },
-        ] {
-            let mut v = plan_json(&ops::SharePlan {
-                note: None,
-                action,
-                changes: LocalChanges {
-                    changes: vec![LocalChange::Modified {
-                        path: "plan.md".to_string(),
-                        sha256: "aa".to_string(),
-                    }],
-                    ..Default::default()
-                },
-                effective_title: "Share updates".to_string(),
-                sharing: crystalline_core::Sharing::Direct,
-            });
-            plan_refused_for_draft_conflicts(&mut v, std::slice::from_ref(&conflict));
-            assert_eq!(v["action"], "conflicts_pending");
-            assert_eq!(v["count"], 1);
-            assert_eq!(v["conflicts"][0]["path"], "plan.md");
-            assert_eq!(v["conflicts"][0]["kind"], "EditEdit");
-            assert_eq!(v["changes"][0]["path"], "plan.md");
-            assert_eq!(v["effective_title"], "Share updates");
-            for gone in ["branch", "number", "url", "title", "layers_above"] {
-                assert!(v.get(gone).is_none(), "{gone}: {v}");
-            }
-        }
         let refused = draft_conflicts_pending_json(&[conflict]);
         assert_eq!(refused["outcome"], "conflicts_pending");
         assert_eq!(refused["count"], 1);
         assert_eq!(refused["conflicts"][0]["id"], "d0000000");
+        assert_eq!(refused["conflicts"][0]["kind"], "EditEdit");
+        assert_eq!(refused["conflicts"][0]["draft"], true);
     }
 
     #[test]

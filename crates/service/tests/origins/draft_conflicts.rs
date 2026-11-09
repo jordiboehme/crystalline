@@ -2354,7 +2354,7 @@ async fn a_conflict_and_another_file() -> Team {
 }
 
 #[tokio::test]
-async fn a_preview_names_the_conflicts_beside_the_plan_and_changes_nothing() {
+async fn a_preview_names_the_conflicts_beside_the_plan_and_leaves_the_forge_and_her_draft() {
     let t = a_conflict_and_another_file().await;
     let hers = t.row("alice", "plan.md").await;
     let before = t.tree();
@@ -2500,7 +2500,7 @@ async fn sharing_only_the_deletion_of_a_move_frees_the_draft() {
 /// Her draft lands and the team still holds where she started, so her deletion
 /// stands, in step and with no conflict, for the next share to carry.
 #[tokio::test]
-async fn sharing_only_the_draft_of_a_move_leaves_no_row() {
+async fn sharing_only_the_draft_of_a_move_leaves_no_conflict() {
     let t = team_direct(&[("plan.md", plan())]).await;
     t.moved("alice", "plan", "renamed.md").await;
 
@@ -2509,6 +2509,14 @@ async fn sharing_only_the_draft_of_a_move_leaves_no_row() {
     assert!(t.forge_file("renamed.md").is_some());
     assert_eq!(t.forge_file("plan.md"), Some(text(&plan())));
     assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(
+        t.rows("alice").await,
+        vec![
+            ("plan.md".to_string(), true),
+            ("renamed.md".to_string(), false)
+        ],
+        "both halves stand, in step"
+    );
 
     let answer = t.share("alice", None).await;
     assert_eq!(answer["outcome"], "committed", "{answer}");
@@ -2582,6 +2590,11 @@ async fn a_merged_move_of_a_crlf_file_lands_crlf() {
         "{forge}"
     );
     assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(
+        t.rows("alice").await,
+        vec![],
+        "the move ended with the commit"
+    );
 }
 
 #[tokio::test]
@@ -2594,6 +2607,11 @@ async fn an_edit_of_a_crlf_file_lands_crlf() {
     let forge = t.forge_file("plan.md").unwrap();
     assert!(wholly_crlf(&forge), "{forge:?}");
     assert!(forge.contains(HER_WORD), "{forge}");
+    assert_eq!(
+        t.rows("alice").await,
+        vec![],
+        "the draft ended with the commit"
+    );
 }
 
 #[tokio::test]
@@ -2675,4 +2693,126 @@ async fn a_share_refuses_when_her_records_cannot_be_read() {
         .await
         .unwrap_err();
     assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+/// The share dialog's discard sends back the digest the preview showed. For a
+/// draft of a CRLF team file that is the digest of the staged CRLF bytes, and
+/// the discard takes it.
+#[tokio::test]
+async fn a_discard_from_the_share_dialog_of_a_crlf_draft_goes_through() {
+    let t = team(&[("plan.md", crlf(&plan()))]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let plan = t.preview("alice", None).await;
+    let sha = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"] == "plan.md")
+        .unwrap_or_else(|| panic!("{plan}"))["sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let report = t
+        .eng
+        .discard_local_changes(
+            "team",
+            &[DiscardTarget {
+                path: "plan.md".to_string(),
+                sha256: Some(sha),
+            }],
+            &ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report["refused"], serde_json::json!([]), "{report}");
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+/// A direct commit whose deletion she shared, where her draft could not be told
+/// that it starts nowhere now: the receipt says so in a sentence.
+#[tokio::test]
+async fn a_direct_commit_says_when_her_moved_draft_could_not_be_freed() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    // Another record in her folder cannot be read, so the list of her records
+    // fails while each draft's own record still reads.
+    let folder = draft_start::record_file(&t.state(), "team", "alice", "plan.md")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(
+        folder.join(format!("{}.json", "0".repeat(64))),
+        b"{ not a record",
+    )
+    .unwrap();
+
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let said = answer["free_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{answer}"));
+    assert!(said.contains("plan.md"), "{said}");
+    assert!(!said.contains('\n'), "{said}");
+    assert_eq!(t.forge_file("plan.md"), None);
+}
+
+/// A preview runs the pass for the caller's own drafts only: a colleague's stale
+/// draft stays as it is until a pull or a share of theirs.
+#[tokio::test]
+async fn a_preview_merges_only_her_own_drafts() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.append("bob", "plan", "bob's own last word").await;
+    let his = t.row("bob", "plan.md").await;
+    t.push_with_no_pass(&[("plan.md", Some(plan_later()))])
+        .await;
+
+    t.preview("alice", None).await;
+    assert!(t.row("alice", "plan.md").await.contains(BOB_LINE));
+    assert_eq!(t.row("bob", "plan.md").await, his);
+}
+
+/// A preview made on the instance's credential, for a caller who connected no
+/// GitHub identity of their own, writes no draft at all.
+#[tokio::test]
+async fn a_preview_on_read_scope_writes_no_draft() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let hers = t.row("alice", "plan.md").await;
+    t.push_with_no_pass(&[("plan.md", Some(plan_later()))])
+        .await;
+    t.eng.refuse_next_personal_credential();
+
+    let plan = t
+        .eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+            PreviewCredential::ReadScopeFallback,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["draft_conflicts"][0]["kind"], "EditEdit",
+        "the stale draft is still named: {plan}"
+    );
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+}
+
+/// Each conflict in a refusal says it is a draft's, as the status detail does,
+/// so a reader can tell it from a conflict of a domain without review.
+#[tokio::test]
+async fn a_refused_share_marks_each_conflict_as_a_draft() {
+    let t = a_conflict_and_another_file().await;
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["conflicts"][0]["draft"], true, "{answer}");
+    let plan = t.preview("alice", None).await;
+    assert_eq!(plan["draft_conflicts"][0]["draft"], true, "{plan}");
+    let plan = t.preview("alice", Some(&["plan.md"])).await;
+    assert_eq!(plan["conflicts"][0]["draft"], true, "{plan}");
 }

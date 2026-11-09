@@ -2102,6 +2102,11 @@ impl Engine {
     /// `cleanup` is what the pull does with a queued share branch. A share and
     /// a preview both pass `Defer`: the preview makes no provider write, and
     /// the share's own pull in `ops::propose` runs the cleanup, once.
+    ///
+    /// `pass` is whose drafts the convergence pass may write (see
+    /// [`SharePass`]). The answer carries the acting person's conflicts, read
+    /// after the pass and before the tree is staged.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn overlay_share_tree(
         &self,
         domain: &str,
@@ -2110,6 +2115,7 @@ impl Engine {
         origin: (&OriginSpec, &Path, &Path),
         acting: Option<&str>,
         cleanup: ops::BranchCleanup,
+        pass: SharePass,
     ) -> Result<Option<PreparedShare>> {
         let Some(who) = drafting else {
             return Ok(None);
@@ -2141,11 +2147,26 @@ impl Engine {
         {
             tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
         }
-        if let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await {
+        let only = match pass {
+            SharePass::Everyone => Some(None),
+            SharePass::Own => Some(Some(who)),
+            SharePass::Nobody => None,
+        };
+        if let Some(only) = only
+            && let Err(e) = self
+                .converge_overlays_of(domain, &report.applied, only)
+                .await
+        {
             tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
         }
+        // The gate's list, read before the tree is staged: a step that settles a
+        // conflict between the two can then only make a refusal stricter, never
+        // let a tree staged from a stale row travel. A list that cannot be read
+        // refuses, and is never read as empty.
+        let conflicts = self.draft_conflicts(domain, who).await?;
         Ok(Some(
-            self.stage_overlay_share(domain, who, state_dir).await?,
+            self.stage_overlay_share(domain, who, state_dir, conflicts)
+                .await?,
         ))
     }
 
@@ -2166,6 +2187,7 @@ impl Engine {
         domain: &str,
         actor: &str,
         state_dir: &Path,
+        conflicts: Vec<DraftConflict>,
     ) -> Result<PreparedShare> {
         let state = crystalline_remote::state::OriginState::load(state_dir)?.ok_or_else(|| {
             EngineError::Conflict(format!(
@@ -2176,6 +2198,7 @@ impl Engine {
         Ok(PreparedShare {
             staging: view.materialise(state_dir, &state.files).await?,
             pinned: state.base_commit,
+            conflicts,
         })
     }
 
@@ -2309,6 +2332,7 @@ impl Engine {
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
                 ops::BranchCleanup::Defer,
+                SharePass::Everyone,
             )
             .await?;
         // The share runs against the staged tree, and the provider it runs with
@@ -2348,14 +2372,13 @@ impl Engine {
             .and_then(|plan| plan.files.as_deref())
             .or(files);
         // The gate of a reviewing domain: a draft of hers that does not fit the
-        // team's text, among what this share carries, refuses it, read after
-        // the pull and the pass above, so only what they could not settle
-        // stands. A list that cannot be read refuses too, and is never read as
-        // empty. In review mode the marker is only staged, so there is nothing
-        // to take back.
-        if let Some(who) = drafting.as_deref() {
-            let blocking =
-                draft_conflicts::conflicts_block(&self.draft_conflicts(domain, who).await?, files);
+        // team's text, among what this share carries, refuses it. The list was
+        // read after the pull and its pass and before the tree was staged (see
+        // `Engine::overlay_share_tree`); only the files it is matched against
+        // are known here, after the marker step. In review mode the marker is
+        // only staged, so there is nothing to take back.
+        if let Some(prepared) = staging.as_ref() {
+            let blocking = draft_conflicts::conflicts_block(&prepared.conflicts, files);
             if !blocking.is_empty() {
                 self.index_what_the_share_pull_applied(domain, "sharing")
                     .await;
@@ -2435,11 +2458,13 @@ impl Engine {
                     // `committed` receipt stands. The reviewed folder then
                     // differs from its base copies, which `origin_status`
                     // counts as local changes and `discard_changes` restores.
-                    // A pull does not heal it on its own: after the failure
-                    // the head equals the base, so the pull is up to date and
-                    // runs no convergence; the drafts fold once a later
-                    // upstream write touches those paths, or when the person
-                    // discards them.
+                    // An update does not heal a failed fold on its own: after
+                    // the failure the head equals the base, so its pull is up
+                    // to date and runs no convergence. Her next share or
+                    // preview does, since those run the pass on every call
+                    // (a preview for her own drafts only); otherwise the
+                    // drafts fold once a later upstream write touches those
+                    // paths, or when the person discards them.
                     if let Err(e) = ops::materialise_base_paths(&root, &state_dir, &paths) {
                         tracing::warn!("writing the direct commit's files in '{domain}': {e}");
                     }
@@ -2452,8 +2477,12 @@ impl Engine {
                     }
                     // Before the pass, which would otherwise read a draft whose
                     // start this commit deleted as the team deleting it.
-                    self.free_drafts_of_shared_deletions(domain, who, &report.deleted)
-                        .await;
+                    if let Some(said) = self
+                        .free_drafts_of_shared_deletions(domain, who, &report.deleted)
+                        .await
+                    {
+                        receipt["free_error"] = json!(said);
+                    }
                     match self.converge_pulled_overlays(domain, &paths).await {
                         Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
                         Err(e) => {
@@ -2516,12 +2545,30 @@ impl Engine {
     ///
     /// Best effort, like the rest of the commit's tail: the branch has moved and
     /// nothing here may turn that into an error. A record that cannot be read or
-    /// saved is warned about and stays; the pass then reads that draft as
-    /// `EditDelete`, which refuses its share rather than losing anything.
-    async fn free_drafts_of_shared_deletions(&self, domain: &str, actor: &str, deleted: &[String]) {
+    /// saved stays, and the answer is a sentence for the receipt's `free_error`:
+    /// the pass then reads that draft as `EditDelete`, as if the team had
+    /// deleted the page, which refuses its share rather than losing anything,
+    /// and she needs to know that the deletion was hers and the draft holds the
+    /// only copy.
+    async fn free_drafts_of_shared_deletions(
+        &self,
+        domain: &str,
+        actor: &str,
+        deleted: &[String],
+    ) -> Option<String> {
         if deleted.is_empty() {
-            return;
+            return None;
         }
+        let said = |e: &dyn std::fmt::Display| {
+            let error = e.to_string().replace(['\n', '\r'], " ");
+            format!(
+                "Your deletion of {} reached the team, but a draft you moved from there could \
+                 not be updated ({error}). It will look as if the team deleted the page. Do not \
+                 discard that draft: it holds the only copy of the page.",
+                deleted.join(", ")
+            )
+        };
+        let mut failed: Option<String> = None;
         let records = self.journal_state_dir().and_then(|dir| {
             crate::draft_start::all(&dir, domain, actor)
                 .map(|records| (dir, records))
@@ -2534,7 +2581,7 @@ impl Engine {
             Ok(read) => read,
             Err(e) => {
                 tracing::warn!("reading the drafts a direct commit in '{domain}' freed: {e}");
-                return;
+                return Some(said(&e));
             }
         };
         for record in records {
@@ -2548,6 +2595,7 @@ impl Engine {
                 Ok(lock) => lock,
                 Err(e) => {
                     tracing::warn!("freeing the draft '{}' in '{domain}': {e}", record.path);
+                    failed.get_or_insert_with(|| said(&e));
                     continue;
                 }
             };
@@ -2572,8 +2620,10 @@ impl Engine {
             };
             if let Err(e) = freed {
                 tracing::warn!("freeing the draft '{}' in '{domain}': {e}", record.path);
+                failed.get_or_insert_with(|| said(&e));
             }
         }
+        failed
     }
 
     /// One actor's case-only moves in a domain: a tombstone at one spelling and
@@ -2740,6 +2790,13 @@ impl Engine {
     /// as a share is - and, for the same reason, it ends with the same sync and
     /// embed tail (see `Engine::index_what_the_share_pull_applied`).
     ///
+    /// On a domain that reviews changes it also runs the convergence pass, as
+    /// the share does, but for the caller's own drafts only: a clean merge of
+    /// hers is written into her rows, so the plan shows what her share would
+    /// carry. A caller on the instance's credential (`ReadScopeFallback` taken)
+    /// writes no draft at all, and the plan names a stale draft of hers as a
+    /// conflict until a pass has merged it.
+    ///
     /// It carries the share's own credential resolution too, `actor` and all:
     /// a preview that resolved a different identity than the share would could
     /// promise a plan this instance then refuses to perform.
@@ -2808,12 +2865,16 @@ impl Engine {
             // confirm a share this instance would then refuse.
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
+        // A caller on the instance's credential only reads, so its preview
+        // converges nobody's drafts.
+        let mut pass = SharePass::Own;
         let (provider, login) = match self.resolve_share_provider(&actor, &spec.repo).await {
             Ok(resolved) => resolved,
             Err(e)
                 if credential == PreviewCredential::ReadScopeFallback
                     && is_personal_token_missing(&e) =>
             {
+                pass = SharePass::Nobody;
                 (
                     self.resolve_origin_provider()
                         .map_err(|e| refusal_for(&actor, e))?,
@@ -2825,7 +2886,8 @@ impl Engine {
         let acting = self.personal_write_login(login.as_deref());
         // The share's own staging, for the share's own reason: a preview that
         // planned against the folder would promise a share of files nobody
-        // drafted (see `Engine::overlay_share_tree`).
+        // drafted (see `Engine::overlay_share_tree`). Its pass writes only the
+        // caller's own drafts, since a preview is a question about those.
         let staging = self
             .overlay_share_tree(
                 domain,
@@ -2834,6 +2896,7 @@ impl Engine {
                 (&spec, &root, &state_dir),
                 acting.as_deref(),
                 ops::BranchCleanup::Defer,
+                pass,
             )
             .await?;
         // Pinned exactly as the share pins it, and for the same reason: a
@@ -2849,13 +2912,13 @@ impl Engine {
             .as_ref()
             .map_or(root.as_path(), |prepared| prepared.staging.root());
         // The share's own gate, read at the same point (see
-        // `Engine::origin_share_with`), and answered in the plan rather than
+        // `Engine::overlay_share_tree`), and answered in the plan rather than
         // as an error, so the changes still show beside it.
-        let conflicts = match drafting.as_deref() {
-            Some(who) => self.draft_conflicts(domain, who).await?,
-            None => Vec::new(),
-        };
-        let plan = ops::propose_preview(
+        let conflicts = staging
+            .as_ref()
+            .map(|prepared| prepared.conflicts.clone())
+            .unwrap_or_default();
+        let mut plan = ops::propose_preview(
             preview_provider,
             &spec,
             detect_in,
@@ -2888,7 +2951,26 @@ impl Engine {
         // plan is one of this actor's own drafts. So the plan is served without
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
+        // Named files with a conflict among them: the share would refuse, so the
+        // plan's action is that refusal, and the keys it carries follow from it
+        // as for any other action. With no files the plan stays the ordinary
+        // one and names her conflicts beside it: Fluid asks with no files and
+        // then lets her tick, and a conflicted file only takes its box away.
+        let blocking = match files {
+            Some(_) => draft_conflicts::conflicts_block(&conflicts, files),
+            None => Vec::new(),
+        };
+        if !blocking.is_empty() {
+            plan.action = ops::PlannedAction::ConflictsPending {
+                count: blocking.len(),
+            };
+        }
         let mut plan = origin::share_plan_json(&plan, provenance);
+        if !blocking.is_empty() {
+            plan["conflicts"] = origin::draft_conflicts_json(&blocking);
+        } else if files.is_none() && !conflicts.is_empty() {
+            plan["draft_conflicts"] = origin::draft_conflicts_json(&conflicts);
+        }
         // The marker the share would add, named beside the plan rather than
         // in its change list: the folder does not hold it yet, and the
         // change list is what a person ticks and discards.
@@ -2906,18 +2988,6 @@ impl Engine {
         if let Some(who) = drafting.as_deref() {
             let moves = self.case_only_moves(domain, who, &state_dir).await?;
             note_unshared_spelling(&mut plan, &moves);
-        }
-        // Named files with a conflict among them: the share would refuse, so
-        // the plan says that. With no files the plan stays the ordinary one and
-        // names her conflicts beside it: Fluid asks with no files and then lets
-        // her tick, and a conflicted file only takes its box away.
-        if files.is_some() {
-            let blocking = draft_conflicts::conflicts_block(&conflicts, files);
-            if !blocking.is_empty() {
-                origin::plan_refused_for_draft_conflicts(&mut plan, &blocking);
-            }
-        } else if !conflicts.is_empty() {
-            plan["draft_conflicts"] = json!(conflicts);
         }
         Ok(plan)
     }
@@ -3086,18 +3156,8 @@ impl Engine {
             // What was proposed, against what this actor holds now. A
             // tombstone proposed a deletion and carries no content of its own,
             // so its digest is the absence the proposal recorded.
-            // A share stages a draft in the team's line endings, and the
-            // proposal records the staged bytes, so a draft of a CRLF file
-            // matches in its CRLF form.
             let unchanged = match file.sha256.as_deref() {
-                Some(proposed) => {
-                    !held.tombstone
-                        && (sha256_hex(held.content.as_bytes()) == proposed
-                            || sha256_hex(
-                                crystalline_core::with_line_endings_of(&held.content, b"\r\n")
-                                    .as_bytes(),
-                            ) == proposed)
-                }
+                Some(proposed) => !held.tombstone && is_draft_digest(&held.content, proposed),
                 None => held.tombstone,
             };
             if !unchanged {
@@ -3507,9 +3567,7 @@ impl Engine {
                 // whatever the write recorded there, which is a fact about a
                 // file the draft may not have.
                 let unchanged = match target.sha256.as_deref() {
-                    Some(expected) => {
-                        !held.tombstone && sha256_hex(held.content.as_bytes()) == expected
-                    }
+                    Some(expected) => !held.tombstone && is_draft_digest(&held.content, expected),
                     None => true,
                 };
                 if !unchanged {
@@ -4247,6 +4305,9 @@ impl Engine {
         actor: &ShareActor,
         repo: &str,
     ) -> Result<(Arc<dyn Provider>, Option<String>)> {
+        if self.take_refused_personal_credential() {
+            return Err(RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into());
+        }
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
@@ -4894,4 +4955,26 @@ enum Holder {
 /// nothing is recorded.
 fn subscribed_reflection_mode(root: &Path) -> crystalline_core::ReflectionMode {
     crystalline_index::reflection_mode(root, std::iter::empty::<&str>())
+}
+
+/// Whose drafts the convergence pass in front of a share or a preview may
+/// write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SharePass {
+    /// Every person's, as an update does: a share writes to the team.
+    Everyone,
+    /// Only the acting person's: a preview asks about their own drafts.
+    Own,
+    /// Nobody's: a preview made on the instance's credential for a caller who
+    /// connected no identity of their own only reads.
+    Nobody,
+}
+
+/// Whether `digest` names this draft's text: as it is stored (LF), or as a share
+/// stages it for a wholly CRLF team file. A preview's change list and a
+/// proposal both record the staged bytes, so a discard or a withdrawal that
+/// sends one of those digests back finds the draft unchanged in either form.
+fn is_draft_digest(content: &str, digest: &str) -> bool {
+    sha256_hex(content.as_bytes()) == digest
+        || sha256_hex(crystalline_core::with_line_endings_of(content, b"\r\n").as_bytes()) == digest
 }

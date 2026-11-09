@@ -1053,12 +1053,22 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                     "conflicts need"
                 )
             ));
-            for c in data["conflicts"].as_array().unwrap_or(&empty) {
+            let conflicts = data["conflicts"].as_array().unwrap_or(&empty);
+            for c in conflicts {
                 lines.push(format!("  conflict: {}", c["path"].as_str().unwrap_or("")));
             }
-            lines.push(format!(
-                "Run: crystalline origin resolve {domain} <path> --keep mine|theirs"
-            ));
+            // A draft's conflict in a domain that reviews changes is not settled
+            // by `origin resolve` yet, so its line names what she can do today.
+            if conflicts.iter().any(|c| c["draft"] == true) {
+                lines.push(format!(
+                    "These drafts of yours do not fit the team's text. You can still share your \
+                     other files: crystalline origin share {domain} --file <path>"
+                ));
+            } else {
+                lines.push(format!(
+                    "Run: crystalline origin resolve {domain} <path> --keep mine|theirs"
+                ));
+            }
         }
         other => lines.push(format!(
             "origin share '{domain}': unexpected outcome '{other}'"
@@ -4606,6 +4616,45 @@ fn print_report(r: &crystalline_index::SyncReport) {
 #[cfg(test)]
 mod origin_share_tests {
     use super::origin_share_lines;
+
+    #[test]
+    fn a_refusal_for_drafts_names_no_resolve_verb() {
+        let drafts = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 1,
+                "conflicts": [{ "path": "plan.md", "kind": "EditEdit", "draft": true }],
+            }),
+        );
+        assert!(
+            drafts.contains(&"  conflict: plan.md".to_string()),
+            "{drafts:?}"
+        );
+        assert!(
+            drafts.iter().all(|line| !line.contains("origin resolve")),
+            "{drafts:?}"
+        );
+        assert!(
+            drafts
+                .last()
+                .is_some_and(|line| line.contains("crystalline origin share team --file")),
+            "{drafts:?}"
+        );
+
+        let folder = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 1,
+                "conflicts": [{ "path": "plan.md" }],
+            }),
+        );
+        assert!(
+            folder
+                .last()
+                .is_some_and(|line| line.contains("origin resolve team")),
+            "{folder:?}"
+        );
+    }
 
     #[test]
     fn a_share_says_when_a_spelling_did_not_travel() {
