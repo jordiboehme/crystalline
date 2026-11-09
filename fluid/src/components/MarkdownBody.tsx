@@ -41,7 +41,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { ComponentProps, ReactNode } from "react";
+import type { CSSProperties, ComponentProps, ReactNode } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -1232,6 +1232,29 @@ function MarkdownImage({
     const wrapper = wrapperRef.current;
     setLinked(wrapper !== null && wrapper.closest("a") !== null);
   }, []);
+  // The picture's own size, known once it has loaded. On paper the print
+  // sheet prints it at that size, less when the column or one page cannot
+  // hold it, never more (`index.css`); on screen nothing reads it. A picture
+  // the cache had ready may have loaded before React listened, so the effect
+  // reads it as well.
+  const imageRef = useRef<HTMLImageElement>(null);
+  const [natural, setNatural] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
+  const readNatural = useCallback((image: HTMLImageElement | null) => {
+    if (
+      image !== null &&
+      image.complete &&
+      image.naturalWidth > 0 &&
+      image.naturalHeight > 0
+    ) {
+      setNatural({ width: image.naturalWidth, height: image.naturalHeight });
+    }
+  }, []);
+  useEffect(() => {
+    readNatural(imageRef.current);
+  }, [readNatural]);
   if (refusal !== null) {
     return (
       <span>
@@ -1267,7 +1290,20 @@ function MarkdownImage({
   return (
     <span ref={wrapperRef} className="group relative" style={wrapperStyle}>
       <img
+        ref={imageRef}
         src={shown}
+        data-picture=""
+        style={
+          natural === null
+            ? undefined
+            : ({
+                "--picture-width": natural.width,
+                "--picture-height": natural.height,
+              } as CSSProperties)
+        }
+        onLoad={(event) => {
+          readNatural(event.currentTarget);
+        }}
         // Never null: react-markdown hands the alt text through as written,
         // and an image with no alt at all is one a screen reader cannot skip.
         alt={alt ?? ""}
