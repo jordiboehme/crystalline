@@ -4084,9 +4084,9 @@ async fn keep_mine_is_refused_for_a_taken_address() {
         assert_eq!(
             said,
             "The team's file bobs.md now uses the same address as your draft of mine.md, so \
-             keeping yours would put two pages at one address. Give it another address in a \
-             merged text (Edit merged in Fluid, --content-file on the command line), or take \
-             theirs.",
+             keeping yours would put two pages at one address. Give it another address (its \
+             permalink) in a merged text: Edit merged in Fluid, --content-file on the command \
+             line, or resolve_conflict with merged for an agent. Or take theirs.",
             "changed {changed}"
         );
         // A merged text at that address is refused the same way.
@@ -5435,4 +5435,33 @@ async fn the_owners_kept_file_is_named_in_her_receipt() {
         .as_str()
         .unwrap_or_else(|| panic!("{receipt}"));
     assert_eq!(std::fs::read(kept).unwrap(), HER_DECK);
+}
+
+/// Re-review N-1: her own draft file that a direct commit landed but the pass
+/// could not end is named in `fold_error`, in plain words about her draft and
+/// with no place on the server's disk.
+#[tokio::test]
+async fn a_direct_share_says_when_her_own_file_could_not_be_ended() {
+    let t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let record = draft_start::file_record_file(&t.state(), "team", "alice", DECK).unwrap();
+    // Between the pass deciding her file landed and ending it, its record
+    // breaks, so the pass cannot end it.
+    t.eng.before_next_file_settle(Box::new(move || {
+        std::fs::write(&record, b"").unwrap();
+    }));
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.branch_file("main", DECK).unwrap(), HER_DECK);
+    assert_eq!(
+        answer["fold_error"],
+        format!(
+            "Your draft of {DECK} is on the branch now, but it could not be ended here, so it \
+             stays in your drafts. Your next share ends it, or you can discard it."
+        ),
+        "{answer}"
+    );
+    let state = t.state().display().to_string();
+    assert!(!answer.to_string().contains(&state), "{answer}");
 }

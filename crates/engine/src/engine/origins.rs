@@ -2621,7 +2621,21 @@ impl Engine {
                         receipt["free_error"] = json!(said);
                     }
                     match self.converge_pulled_overlays(domain, &paths).await {
-                        Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
+                        Ok(folded) => {
+                            receipt["drafts_folded"] = json!(folded.cleared);
+                            // The pass only logs a draft file it cannot end, and
+                            // another person's stays a log line. The sharer's own
+                            // is said here, in her words and with her paths only.
+                            let left = self.own_files_not_ended(domain, who, &paths);
+                            if !left.is_empty() {
+                                receipt["fold_error"] = json!(format!(
+                                    "Your draft of {} is on the branch now, but it could not \
+                                     be ended here, so it stays in your drafts. Your next share \
+                                     ends it, or you can discard it.",
+                                    left.join(", ")
+                                ));
+                            }
+                        }
                         Err(e) => {
                             tracing::warn!("folding the shared drafts in '{domain}': {e}");
                             // The one key that says the commit landed and the
@@ -4581,6 +4595,33 @@ impl Engine {
         }))
     }
 
+    /// The draft files of `actor` among `paths` that a direct commit landed but
+    /// the pass did not end: each one she still holds that reads as landed, or
+    /// that cannot be read at all. Asked after the pass, so only her own.
+    fn own_files_not_ended(&self, domain: &str, actor: &str, paths: &[String]) -> Vec<String> {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return Vec::new();
+        };
+        paths
+            .iter()
+            .filter(|path| is_assets_reserved(path))
+            .filter(|path| {
+                matches!(
+                    crate::overlay_files::held(&journal_dir, domain, actor, path),
+                    Ok(crate::overlay_files::Held::Bytes | crate::overlay_files::Held::Tombstone)
+                )
+            })
+            .filter(|path| {
+                !matches!(
+                    self.file_step_of(domain, &journal_dir, actor, path),
+                    Ok(super::draft_conflicts::FileStep::InStep
+                        | super::draft_conflicts::FileStep::Conflict(_))
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     /// What `actor`'s draft file at `path` is now, by the table the gate reads.
     fn file_step_of(
         &self,
@@ -4753,8 +4794,9 @@ impl Engine {
                         return Err(EngineError::Conflict(format!(
                             "The team's file {other} now uses the same address as your draft \
                              of {}, so keeping yours would put two pages at one address. Give it \
-                             another address in a merged text (Edit merged in Fluid, \
-                             --content-file on the command line), or take theirs.",
+                             another address (its permalink) in a merged text: Edit merged in \
+                             Fluid, --content-file on the command line, or resolve_conflict \
+                             with merged for an agent. Or take theirs.",
                             row.path
                         )));
                     }
