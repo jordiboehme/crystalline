@@ -487,9 +487,15 @@ jobs:
   # Fluid, the browser UI. Nothing under fluid/ is part of the cargo workspace,
   # so its gates are a job of their own: they neither wait on the Rust matrix
   # nor hold it up.
+  #
+  # This job runs the fast gates: the version check, the API types, typecheck,
+  # lint, format check, the build and the bundle budget. The unit tests are
+  # the slow part (9 to 12 minutes of a 15 minute job on main, and past the
+  # old 20 minute limit on a branch with more diagram tests), so they run in
+  # the fluid-unit matrix below, side by side with this job.
   fluid:
     name: fluid
-    timeout-minutes: 20
+    timeout-minutes: 15
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
@@ -521,8 +527,9 @@ jobs:
       # the same corepack release fluid/Dockerfile pins. zizmor's
       # adhoc-packages audit flags any install outside a lockfile; an exact
       # version is as pinned as npm gets here, so that finding is ignored on
-      # this step and on the other corepack steps (fluid-smoke-build,
-      # fluid-smoke, fluid-audit, build.yml fluid-dist, release.yml sbom).
+      # this step and on the other corepack steps (fluid-unit,
+      # fluid-unit-total, fluid-smoke-build, fluid-smoke, fluid-audit,
+      # build.yml fluid-dist, release.yml sbom).
       # Registry fetches retry (scripts/ci/retry.sh) so one slow answer cannot fail a release.
       - name: Enable corepack
         run: | # zizmor: ignore[adhoc-packages]
@@ -571,8 +578,7 @@ jobs:
       - name: Format check
         run: pnpm format:check
 
-      - name: Unit tests
-        run: pnpm test
+      # The unit tests run in fluid-unit.
 
       # The /π route's lazy chunks must fit on one 1.44 MB floppy, gzipped;
       # the eager JS (entry plus modulepreloads, raw) must stay under its
@@ -586,6 +592,221 @@ jobs:
 
       - name: Bundle size
         run: node scripts/bundle-budget.ts
+
+  # The Fluid unit tests (vitest), in parallel legs. Each leg runs `pnpm test`
+  # with `--shard=<shard>/<legs>`: the same run the fluid job made, limited to
+  # one part of the test files. vitest sorts the files by a hash of their path
+  # and gives every shard an equal run of them, so a shard is a fixed set of
+  # whole files and a new file lands in any shard. The split is by file count,
+  # not by time: the two slowest files (editor/marks/fidelity and
+  # diagram/flowchart/opsProperty, about 2.5 minutes each in CI) are next to
+  # each other in that order and share shard 4/4, which therefore carries
+  # about twice the work of the others. Measured on 2026-11-09 against the
+  # per-file times of CI run 42635034806, that leg still needs only about 5
+  # minutes of tests. More legs do not separate the two; a split of either
+  # file, or a sequencer that shards by measured time, would.
+  #
+  # The number of legs is the length of the shard list and nothing else: the
+  # leg reads it from strategy.job-total, so the list and the split cannot
+  # disagree. Add a leg by adding the next number to the list.
+  #
+  # Every leg writes its file and test count to the job summary and hands the
+  # list of files it ran to fluid-unit-total, which checks that the legs
+  # together ran every test file once. `ci-passed` needs both jobs, so a
+  # failed, cancelled or skipped leg uploads no tested-tree proof.
+  fluid-unit:
+    name: fluid-unit (${{ matrix.shard }}/${{ strategy.job-total }})
+    timeout-minutes: 15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      # See the fluid job: corepack must not stop to ask before fetching pnpm.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      SHARD: ${{ matrix.shard }}
+      TOTAL: ${{ strategy.job-total }}
+      LEG: ${{ strategy.job-index }}
+    defaults:
+      run:
+        working-directory: fluid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same pin and major as the fluid job.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+
+      # Pinned corepack; the fluid job explains the zizmor ignore.
+      # Registry fetches retry (scripts/ci/retry.sh) so one slow answer cannot fail a release.
+      - name: Enable corepack
+        run: | # zizmor: ignore[adhoc-packages]
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 npm install --global corepack@0.36.0
+          corepack enable pnpm
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The shard list must read 1, 2, ... in order, with no second matrix
+      # dimension beside it: otherwise one shard runs twice and another never,
+      # and the total no longer counts shards. This stops that before any test.
+      - name: The shard matches its leg
+        run: |
+          set -euo pipefail
+          if [ "$SHARD" != "$((LEG + 1))" ]; then
+            echo "::error::leg $((LEG + 1)) of $TOTAL runs shard '$SHARD'. The shard list must be 1, 2, ... in order, and the matrix must have no other dimension."
+            exit 1
+          fi
+          echo "this leg runs shard $SHARD of $TOTAL"
+
+      # On GitHub vitest reports with `default` and `github-actions` (the
+      # failure annotations) unless told otherwise. Naming `json` for the count
+      # replaces that list, so the two are named here as well.
+      - name: Unit tests
+        run: >-
+          pnpm test --shard="$SHARD/$TOTAL"
+          --reporter=default --reporter=github-actions
+          --reporter=json --outputFile.json="$RUNNER_TEMP/vitest.json"
+
+      # Runs after a red test run too, so the summary still says what ran.
+      - name: Count what this shard ran
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/vitest.json"
+          out="$RUNNER_TEMP/fluid-unit"
+          mkdir -p "$out"
+          if [ ! -s "$report" ]; then
+            echo "::error::shard $SHARD/$TOTAL wrote no vitest report"
+            exit 1
+          fi
+          # The report names every file with its absolute path.
+          jq -r --arg root "$PWD/" '.testResults[].name | ltrimstr($root)' "$report" \
+            | sort >"$out/files-$SHARD.txt"
+          files=$(awk 'END { print NR }' "$out/files-$SHARD.txt")
+          tests=$(jq '.numTotalTests' "$report")
+          printf '%s %s %s %s\n' "$SHARD" "$TOTAL" "$files" "$tests" >"$out/count-$SHARD.txt"
+          line=$(jq -r --arg shard "$SHARD/$TOTAL" --arg files "$files" \
+            '"shard \($shard): \($files) files, \(.numTotalTests) tests (\(.numPassedTests) passed, \(.numFailedTests) failed, \(.numPendingTests) skipped, \(.numTodoTests) todo)"' \
+            "$report")
+          echo "$line"
+          {
+            echo "$line"
+            echo
+            echo "<details><summary>the files of shard $SHARD/$TOTAL</summary>"
+            echo
+            sed 's/^/    /' "$out/files-$SHARD.txt"
+            echo
+            echo "</details>"
+          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$files" -eq 0 ] || [ "$tests" -eq 0 ]; then
+            echo "::error::shard $SHARD/$TOTAL ran no test"
+            exit 1
+          fi
+
+      # One day is enough: fluid-unit-total of this run is the only reader. A
+      # re-run of this leg uploads the same name again, hence overwrite.
+      - name: Upload the count
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fluid-unit-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/fluid-unit
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
+  # The legs of fluid-unit add up to the whole suite: vitest lists the test
+  # files without running them, and that list must equal the files the legs
+  # ran together, each once. Every shard must have reported. The sum of the
+  # test counts goes to the job summary. Runs only when every leg passed (the
+  # implicit success()), so a red leg shows as that leg and not as this check.
+  fluid-unit-total:
+    name: fluid-unit-total
+    timeout-minutes: 10
+    needs: fluid-unit
+    runs-on: ubuntu-latest
+    env:
+      # See the fluid job: corepack must not stop to ask before fetching pnpm.
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    defaults:
+      run:
+        working-directory: fluid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same pin and major as the fluid job.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+
+      # Pinned corepack; the fluid job explains the zizmor ignore.
+      # Registry fetches retry (scripts/ci/retry.sh) so one slow answer cannot fail a release.
+      - name: Enable corepack
+        run: | # zizmor: ignore[adhoc-packages]
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 npm install --global corepack@0.36.0
+          corepack enable pnpm
+          "$GITHUB_WORKSPACE"/scripts/ci/retry.sh 5 pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download the counts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fluid-unit-shard-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/fluid-unit
+
+      - name: Every test file ran in exactly one shard
+        run: |
+          set -euo pipefail
+          counts="$RUNNER_TEMP/fluid-unit"
+          work="$(mktemp -d)"
+          shopt -s nullglob
+          count_files=("$counts"/count-*.txt)
+          if [ "${#count_files[@]}" -eq 0 ]; then
+            echo "::error::no shard of fluid-unit left a count"
+            exit 1
+          fi
+          # Each count file is one line: shard, total, files, tests.
+          sort -n "${count_files[@]}" >"$work/counts"
+          total=$(awk 'NR == 1 { print $2 }' "$work/counts")
+          if ! awk -v total="$total" '$1 != NR || $2 != total { bad = 1 } END { exit (bad || NR != total) }' "$work/counts"; then
+            echo "::error::the counts are not one per shard from 1 to $total:"
+            cat "$work/counts"
+            exit 1
+          fi
+          pnpm exec vitest list --filesOnly | sort >"$work/all"
+          if [ ! -s "$work/all" ]; then
+            echo "::error::vitest lists no test file at all"
+            exit 1
+          fi
+          cat "$counts"/files-*.txt | sort >"$work/union"
+          if ! diff -u "$work/all" "$work/union"; then
+            echo "::error::the shards do not add up to the suite: a line with - is a test file no shard ran, a line with + one that two shards ran"
+            exit 1
+          fi
+          files=$(awk 'END { print NR }' "$work/all")
+          tests=$(awk '{ sum += $4 } END { print sum }' "$work/counts")
+          line="the $total shards ran all $files test files, each once, with $tests tests together"
+          echo "$line"
+          {
+            echo "$line"
+            echo
+            echo "| shard | files | tests |"
+            echo "| --- | --- | --- |"
+            awk '{ printf "| %s/%s | %s | %s |\n", $1, $2, $3, $4 }' "$work/counts"
+          } >>"$GITHUB_STEP_SUMMARY"
 
   # The Claude Desktop launcher and the two bundle manifests. The launcher
   # is plain Node, so its tests run here on every change rather than only
@@ -1297,9 +1518,10 @@ jobs:
   # fluid-audit) are left out on purpose: they run again on every push to main,
   # and the two audits can go red on a new advisory that has nothing to do with
   # this tree. workflow-lint is ungated too but waited for: a workflow that
-  # fails it should not count as tested. A matrix job such as `test` or
-  # `fluid-smoke` is a success here only when every one of its legs is, so
-  # each shard of the browser smoke is required.
+  # fails it should not count as tested. A matrix job such as `test`,
+  # `fluid-unit` or `fluid-smoke` is a success here only when every one of its
+  # legs is, so each shard of the unit tests and of the browser smoke is
+  # required.
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
@@ -1307,6 +1529,8 @@ jobs:
       - changes
       - test
       - fluid
+      - fluid-unit
+      - fluid-unit-total
       - fluid-smoke-build
       - fluid-smoke
       - fluid-image
