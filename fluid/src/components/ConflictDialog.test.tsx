@@ -470,6 +470,7 @@ function draftSides(overrides: Record<string, unknown> = {}) {
     base: "the start",
     local: "my draft text",
     upstream: "the team's new text",
+    upstream_sha256: "sha-of-the-teams-new-text",
     note: null,
     detected_at: null,
     draft: true,
@@ -565,7 +566,13 @@ describe("the conflict dialog for a draft", () => {
       within(dialog).getByRole("button", { name: "Keep mine" }),
     );
     await waitFor(() => {
-      expect(resolved).toEqual([{ resolution: "mine" }]);
+      // With the team side it was shown, so a newer one is refused (C25).
+      expect(resolved).toEqual([
+        {
+          resolution: "mine",
+          expected_upstream_sha256: "sha-of-the-teams-new-text",
+        },
+      ]);
     });
     await waitFor(() => {
       expect(onClose).toHaveBeenCalled();
@@ -664,7 +671,8 @@ describe("the conflict dialog for a draft", () => {
       name: "Keep mine",
     });
 
-    expect(mine).toBeDisabled();
+    // Off, but still reachable, so its reason is heard.
+    expect(mine).toHaveAttribute("aria-disabled", "true");
     expect(hintOf(mine)).toBe(
       "Change the address in Edit merged, or take theirs.",
     );
@@ -835,5 +843,116 @@ describe("the conflict dialog for a draft", () => {
         path.startsWith("/domains/eng/drafts/conflicts/"),
       ),
     ).toBe(false);
+  });
+});
+
+describe("the conflict dialog for a draft, against a moving team side", () => {
+  const T1 = "the team's text when she looked";
+  const T2 = "the team's text after a pull";
+  const REFUSAL =
+    "The team changed this page since you looked at it. Look at it again before you settle it.";
+
+  it("never settles against a team side she was not shown", async () => {
+    let sides = draftSides({ upstream: T1, upstream_sha256: "sha-1" });
+    let reads = 0;
+    const sent: Record<string, unknown>[] = [];
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      await Promise.resolve();
+      if (path === "/domains/eng/drafts/conflicts/d1234567") {
+        reads += 1;
+        return sides;
+      }
+      if (path.endsWith("/resolve") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body as string)) as Record<
+          string,
+          unknown
+        >;
+        sent.push(body);
+        if (body.expected_upstream_sha256 !== sides.upstream_sha256) {
+          throw new ApiProblem(409, "conflict", REFUSAL);
+        }
+        return { draft: true, kept: "merged", kept_copy: false, remaining: 0 };
+      }
+      throw new ApiProblem(404, "not found", path);
+    });
+    const onClose = vi.fn();
+    const { client } = mountDraft(EDIT_EDIT, onClose);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    expect(await within(dialog).findByText(T1)).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Edit merged" }),
+    );
+    const editor = within(dialog).getByLabelText("Merged content");
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "her merge of T1");
+
+    // A pull brings T2. With the merge editor open nothing re-reads the
+    // sides: not a window coming back, not a bulk invalidation.
+    sides = draftSides({ upstream: T2, upstream_sha256: "sha-2" });
+    const before = reads;
+    window.dispatchEvent(new Event("focus"));
+    await client.invalidateQueries({ queryKey: ["domains"] });
+    expect(reads).toBe(before);
+    expect(within(dialog).getByText(T1)).toBeVisible();
+
+    // Her save names T1, so it is refused, and the sides are read again: she
+    // sees T2, and her merge is still in the editor.
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Save merged" }),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(REFUSAL);
+    expect(sent[0]).toEqual({
+      resolution: "merged",
+      content: "her merge of T1",
+      expected_upstream_sha256: "sha-1",
+    });
+    expect(await within(dialog).findByText(T2)).toBeVisible();
+    expect(within(dialog).getByLabelText("Merged content")).toHaveValue(
+      "her merge of T1",
+    );
+    expect(onClose).not.toHaveBeenCalled();
+
+    // Saved again, it names the side she now sees.
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Save merged" }),
+    );
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+    expect(sent[1]?.expected_upstream_sha256).toBe("sha-2");
+  });
+
+  it("takes the kind and the address from the sides it just read", async () => {
+    // The list said EditEdit; by the time the dialog opened a team rename
+    // made it AddressTaken, and the sides say so.
+    serveDraft(draftSides({ kind: "AddressTaken", other: "notes/z.md" }));
+    mountDraft(EDIT_EDIT);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    await waitFor(() => {
+      expect(dialog).toHaveAccessibleDescription(
+        "The team's file notes/z.md now uses the same address as your draft of notes/a.md.",
+      );
+    });
+    expect(
+      within(dialog).getByRole("button", { name: "Keep mine" }),
+    ).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("starts Edit merged from the team's text when her side is a deletion", async () => {
+    serveDraft(draftSides({ kind: "DeleteEdit", local: null }));
+    mountDraft({ ...EDIT_EDIT, kind: "DeleteEdit" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Edit merged" }),
+    );
+    expect(within(dialog).getByLabelText("Merged content")).toHaveValue(
+      "the team's new text",
+    );
   });
 });

@@ -2177,6 +2177,25 @@ mod chain {
             "{out}"
         );
 
+        // C25: the team side she read travels with the resolve.
+        let daemon = Daemon::answering(
+            "resolve-expect-upstream",
+            json!({ "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine" }),
+        );
+        daemon.run(&[
+            "origin",
+            "resolve",
+            "team",
+            "plan.md",
+            "--keep",
+            "mine",
+            "--expect-upstream",
+            "abc123",
+        ]);
+        let sent = daemon.request();
+        assert_eq!(sent["cmd"], "origin_resolve", "{sent}");
+        assert_eq!(sent["expected_upstream_sha256"], "abc123", "{sent}");
+
         // A file: the team's file, and where her bytes are kept.
         let daemon = Daemon::answering(
             "resolve-theirs-file",

@@ -1088,6 +1088,7 @@ describe("the admin client layer", () => {
       base: "start",
       local: "mine",
       upstream: "theirs",
+      upstream_sha256: "abc123",
       note: null,
       detected_at: null,
       draft: true,
@@ -1107,6 +1108,7 @@ describe("the admin client layer", () => {
       base: "start",
       local: "mine",
       upstream: "theirs",
+      upstreamSha256: "abc123",
       note: null,
     });
   });
@@ -1138,11 +1140,21 @@ describe("the admin client layer", () => {
     });
 
     apiMock.mockResolvedValueOnce({ kept: "merged", remaining: null });
-    await resolveDraftConflict("eng", "d1234567", "merged", "both lines");
+    await resolveDraftConflict(
+      "eng",
+      "d1234567",
+      "merged",
+      "both lines",
+      "abc123",
+    );
     expect(apiMock).toHaveBeenLastCalledWith(
       "/domains/eng/drafts/conflicts/d1234567/resolve",
       expect.objectContaining({
-        body: JSON.stringify({ resolution: "merged", content: "both lines" }),
+        body: JSON.stringify({
+          resolution: "merged",
+          content: "both lines",
+          expected_upstream_sha256: "abc123",
+        }),
       }),
     );
   });
@@ -1177,7 +1189,9 @@ describe("the admin client layer", () => {
       action: "conflicts_pending",
       count: 1,
       changes: [],
-      conflicts: [entry],
+      // A folder's conflict is never read as a draft's: it would take a box
+      // away and open the draft dialog on an id the draft routes do not know.
+      conflicts: [entry, { id: "c1", path: "notes/b.md", kind: "EditEdit" }],
     });
     expect(
       (await fetchShareChanges("eng")).draftConflicts.map((c) => c.id),

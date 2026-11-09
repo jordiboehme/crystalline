@@ -2428,9 +2428,14 @@ function draftSidesRoute(path: string): Record<string, Answer> {
       base: "start",
       local: "my draft text",
       upstream: "the team's text",
+      upstream_sha256: "sha-of-the-teams-text",
       note: null,
       detected_at: null,
     }),
+    "/domains/eng/drafts/conflicts/d1234567/resolve": (_path, init) =>
+      init?.method === "POST"
+        ? { draft: true, kept: "mine", kept_copy: false, remaining: 0 }
+        : null,
   };
 }
 
@@ -2465,9 +2470,18 @@ describe("the share dialog with draft conflicts", () => {
 
     // Both ends of a move are off, as is the plain conflict; the rest is
     // ticked and goes.
+    // Each says why, through the caption that names them, and stays
+    // reachable so a screen reader hears it; a press ticks nothing.
+    const caption =
+      "These files do not fit the team's text, so you cannot share them yet: notes/a.md, notes/new.md, notes/old.md. Press a path to settle it. You can share the other files now.";
+    expect(await within(dialog).findByText(caption)).toBeVisible();
     for (const path of ["notes/a.md", "notes/new.md", "notes/old.md"]) {
-      const box = await within(dialog).findByRole("checkbox", { name: path });
-      expect(box).toBeDisabled();
+      const box = within(dialog).getByRole("checkbox", { name: path });
+      expect(box).toHaveAttribute("aria-disabled", "true");
+      expect(box).not.toBeDisabled();
+      expect(box).toHaveAccessibleDescription(caption);
+      expect(box).not.toBeChecked();
+      await userEvent.click(box);
       expect(box).not.toBeChecked();
     }
     expect(
@@ -2588,7 +2602,16 @@ describe("the share dialog with draft conflicts", () => {
 
     expect(
       await within(dialog).findByRole("checkbox", { name: "notes/a.md" }),
+    ).toHaveAttribute("aria-disabled", "true");
+    // The group's own box has nothing it could take in.
+    expect(
+      within(dialog).getByRole("checkbox", { name: "Share all modified" }),
     ).toBeDisabled();
+    expect(
+      within(dialog).getByText(
+        "These files do not fit the team's text, so you cannot share them yet: notes/a.md. Press a path to settle it.",
+      ),
+    ).toBeVisible();
     expect(
       within(dialog).getByText("Conflicts need settling before sharing."),
     ).toBeVisible();
@@ -2633,5 +2656,16 @@ describe("the share dialog with draft conflicts", () => {
       name: "Settle conflict",
     });
     expect(await within(settle).findByText("my draft text")).toBeVisible();
+
+    // Settled, its path leaves the receipt: pressing it again would open a
+    // conflict that is no longer there.
+    await userEvent.click(
+      within(settle).getByRole("button", { name: "Keep mine" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(dialog).queryByRole("button", { name: "notes/a.md" }),
+      ).toBeNull();
+    });
   });
 });

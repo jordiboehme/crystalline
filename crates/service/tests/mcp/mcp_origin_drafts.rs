@@ -46,6 +46,7 @@ fn plan(first: &str) -> Vec<u8> {
 const START: &str = "the first line of the plan";
 const BOB_LINE: &str = "bob's first line";
 const HER_LINE: &str = "her own first line";
+const CAROL_LINE: &str = "carol's first line";
 
 /// A domain that reviews changes, subscribed from the mock forge, and the
 /// tempdir that holds every folder of it.
@@ -271,6 +272,73 @@ async fn an_agent_settles_with_resolve_conflict_merged_from_the_status_sides() {
     .await;
     let read = read.to_string();
     assert!(read.contains(BOB_LINE) && read.contains(HER_LINE), "{read}");
+}
+
+/// C25: an agent that passes back the team side it read is refused, in plain
+/// text, when a pull changed that side since; read again, it settles.
+#[tokio::test]
+async fn a_resolve_names_the_team_side_it_read_and_a_newer_one_refuses() {
+    let t = Team::new().await;
+    t.replace_first_line(&Scope::Unrestricted, HER_LINE).await;
+    t.team_changes_the_plan(plan(BOB_LINE));
+    let (client, _server) = serve(McpServer::new(t.eng.clone())).await;
+    call(&client, "update_domain", json!({ "domain": "team" })).await;
+    let read = |status: &serde_json::Value| {
+        status["domains"][0]["conflicts"][0]["upstream_sha256"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{status}"))
+            .to_string()
+    };
+    let (_, status) = call(
+        &client,
+        "origin_status",
+        json!({ "domain": "team", "detail": true }),
+    )
+    .await;
+    let seen = read(&status);
+
+    t.team_changes_the_plan(plan(CAROL_LINE));
+    call(&client, "update_domain", json!({ "domain": "team" })).await;
+    let (is_error, refused) = call(
+        &client,
+        "resolve_conflict",
+        json!({
+            "domain": "team",
+            "path": "plan.md",
+            "resolution": "mine",
+            "expected_upstream_sha256": seen,
+        }),
+    )
+    .await;
+    assert!(is_error, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("The team changed this page since you looked at it."),
+        "{refused}"
+    );
+
+    let (_, status) = call(
+        &client,
+        "origin_status",
+        json!({ "domain": "team", "detail": true }),
+    )
+    .await;
+    let now = read(&status);
+    assert_ne!(seen, now);
+    let (is_error, receipt) = call(
+        &client,
+        "resolve_conflict",
+        json!({
+            "domain": "team",
+            "path": "plan.md",
+            "resolution": "mine",
+            "expected_upstream_sha256": now,
+        }),
+    )
+    .await;
+    assert!(!is_error, "{receipt}");
+    assert_eq!(receipt["kept"], "mine", "{receipt}");
 }
 
 #[tokio::test]

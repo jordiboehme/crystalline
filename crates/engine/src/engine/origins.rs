@@ -4352,8 +4352,34 @@ impl Engine {
         content: Option<&[u8]>,
         actor: ShareActor,
     ) -> Result<Value> {
-        self.resolve_reaching(domain, Reach::Path(path), keep, content, actor)
+        self.resolve_reaching(domain, Reach::Path(path), keep, content, None, actor)
             .await
+    }
+
+    /// [`Engine::origin_resolve`] for a draft that was read before it is
+    /// settled (C25): `expected_upstream` is the `upstream_sha256` its sides
+    /// answered. When the team's side is another one now, the resolve is
+    /// refused (409 on REST) and nothing changes, so nobody settles against
+    /// team text they were not shown. `None` checks nothing. A folder conflict
+    /// is not checked.
+    pub async fn origin_resolve_expecting(
+        &self,
+        domain: &str,
+        path: &str,
+        keep: Option<&str>,
+        content: Option<&[u8]>,
+        expected_upstream: Option<&str>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.resolve_reaching(
+            domain,
+            Reach::Path(path),
+            keep,
+            content,
+            expected_upstream,
+            actor,
+        )
+        .await
     }
 
     /// [`Engine::origin_resolve`] for the folder's own conflict at `path` and
@@ -4368,7 +4394,7 @@ impl Engine {
         content: Option<&[u8]>,
         actor: ShareActor,
     ) -> Result<Value> {
-        self.resolve_reaching(domain, Reach::Folder(path), keep, content, actor)
+        self.resolve_reaching(domain, Reach::Folder(path), keep, content, None, actor)
             .await
     }
 
@@ -4377,17 +4403,26 @@ impl Engine {
     /// the caller's conflicts under the origin lock, so a draft that ended in
     /// the meantime is not found rather than settled as the folder's conflict
     /// at its path. An id that is not the caller's, or a domain whose drafts do
-    /// not stay open, is not found.
+    /// not stay open, is not found. `expected_upstream` is checked as
+    /// [`Engine::origin_resolve_expecting`] checks it.
     pub async fn resolve_own_draft_conflict(
         &self,
         domain: &str,
         id: &str,
         keep: Option<&str>,
         content: Option<&[u8]>,
+        expected_upstream: Option<&str>,
         actor: ShareActor,
     ) -> Result<Value> {
-        self.resolve_reaching(domain, Reach::OwnDraft(id), keep, content, actor)
-            .await
+        self.resolve_reaching(
+            domain,
+            Reach::OwnDraft(id),
+            keep,
+            content,
+            expected_upstream,
+            actor,
+        )
+        .await
     }
 
     /// The body of the three resolve verbs. See [`Reach`] for what each may
@@ -4398,6 +4433,7 @@ impl Engine {
         reach: Reach<'_>,
         keep: Option<&str>,
         content: Option<&[u8]>,
+        expected_upstream: Option<&str>,
         actor: ShareActor,
     ) -> Result<Value> {
         let drafts_open = self.drafts_stay_open(domain);
@@ -4424,7 +4460,7 @@ impl Engine {
         let (path, folder_only) = match reach {
             Reach::OwnDraft(id) => {
                 return self
-                    .resolve_own_draft(domain, id, keep, content, actor)
+                    .resolve_own_draft(domain, id, keep, content, expected_upstream, actor)
                     .await;
             }
             Reach::Path(path) => (path, false),
@@ -4438,6 +4474,8 @@ impl Engine {
             let resolution = origin::resolution_from(keep, content)?;
             let lock = self.origin_lock_registered(domain)?;
             let _guard = lock.lock().await;
+            self.refuse_unseen_team_side(domain, &who, |c| c.path == path, expected_upstream)
+                .await?;
             return self
                 .resolve_file_in_overlay(domain, &who, path, resolution)
                 .await;
@@ -4488,6 +4526,15 @@ impl Engine {
             };
             match held {
                 Some((domain_id, Some(_))) => {
+                    // C25, as for a draft settled by its id: the conflict at
+                    // this path, from either end of a move.
+                    self.refuse_unseen_team_side(
+                        domain,
+                        &who,
+                        |c| c.path == *path || c.moved_from.as_deref() == Some(path.as_str()),
+                        expected_upstream,
+                    )
+                    .await?;
                     return self
                         .resolve_in_overlay(domain, domain_id, &who, path, resolution, &state_dir)
                         .await;
@@ -4540,6 +4587,7 @@ impl Engine {
         id: &str,
         keep: Option<&str>,
         content: Option<&[u8]>,
+        expected_upstream: Option<&str>,
         actor: ShareActor,
     ) -> Result<Value> {
         let who = share_staging::overlay_share_actor(&actor)?;
@@ -4561,6 +4609,11 @@ impl Engine {
             .into_iter()
             .find(|conflict| conflict.id == id)
             .ok_or_else(|| not_among_drafts(domain, id))?;
+        // C25: never settle against a team side she was not shown. Read under
+        // the origin lock, which a pull also takes, so the side cannot move
+        // between this check and the write.
+        self.refuse_unseen_team_side(domain, &who, |c| c.id == id, expected_upstream)
+            .await?;
         if conflict.file {
             return self
                 .resolve_file_in_overlay(domain, &who, &conflict.path, resolution)

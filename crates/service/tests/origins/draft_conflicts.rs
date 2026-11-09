@@ -662,6 +662,8 @@ async fn the_conflict_sides_are_start_mine_and_the_teams() {
             "base": text(&plan()),
             "local": t.row("alice", "plan.md").await,
             "upstream": text(&plan_later()),
+            // C25: the team side named, so a resolve can hand it back.
+            "upstream_sha256": sha256_hex(&plan_later()),
             "moved_from": null,
             "other": null,
             "note": null,
@@ -3794,6 +3796,88 @@ async fn a_same_line_conflict(t: &mut Team) -> String {
     t.row("alice", "plan.md").await
 }
 
+/// The plan after bob's first line and a colleague's new paragraph.
+fn plan_with_a_paragraph() -> Vec<u8> {
+    engram(
+        "Plan",
+        "plan",
+        "bob's first line\n\nthe middle of the plan\n\nthe last line of the plan\n\n\
+         a colleague's new paragraph",
+    )
+}
+
+/// C25 (Task 14 review I-1): she merges against the team text she was shown
+/// (T1); a pull brings newer team text (T2); her save names T1, so it is
+/// refused, nothing changes, and T2 stays the team's. With T2's digest, read
+/// again, the same save settles.
+#[tokio::test]
+async fn a_resolve_against_team_text_she_was_not_shown_is_refused() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    let hers = a_same_line_conflict(&mut t).await;
+    let shown = t.sides("alice", "plan.md").await;
+    let t1 = shown["upstream_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{shown}"))
+        .to_string();
+    assert_eq!(t1, sha256_hex(&plan_later()));
+    let merged = text(&plan_later()).replace("the last line of the plan", HER_WORD);
+
+    t.push(&[("plan.md", Some(plan_with_a_paragraph()))]).await;
+    for (keep, content) in [
+        (Some("mine"), None),
+        (None, Some(merged.as_str())),
+        (Some("theirs"), None),
+    ] {
+        let refused = t
+            .eng
+            .origin_resolve_expecting(
+                "team",
+                "plan.md",
+                keep,
+                content.map(str::as_bytes),
+                Some(&t1),
+                ShareActor::Account("alice".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(EngineError::Conflict(words)) if words
+                == "The team changed this page since you looked at it. Look at it again before you settle it."),
+            "{keep:?}: {refused:?}"
+        );
+        assert_eq!(t.row("alice", "plan.md").await, hers, "her draft stays");
+        assert_eq!(
+            t.conflicts("alice").await,
+            vec![conflict("alice", "plan.md", EditEdit)],
+            "the conflict stands"
+        );
+    }
+    // Nothing she settled can carry T1 over the colleague's paragraph.
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(
+        t.forge_file("plan.md").unwrap(),
+        text(&plan_with_a_paragraph())
+    );
+
+    let again = t.sides("alice", "plan.md").await;
+    let t2 = again["upstream_sha256"].as_str().unwrap().to_string();
+    assert_eq!(t2, sha256_hex(&plan_with_a_paragraph()));
+    let merged = text(&plan_with_a_paragraph()).replace("bob's first line", ALICE_LINE);
+    let receipt = t
+        .eng
+        .origin_resolve_expecting(
+            "team",
+            "plan.md",
+            None,
+            Some(merged.as_bytes()),
+            Some(&t2),
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "merged", false);
+    assert_eq!(t.row("alice", "plan.md").await, merged);
+}
+
 #[tokio::test]
 async fn keep_mine_lands_her_text_and_the_second_share_has_nothing() {
     let mut t = team_direct(&[("plan.md", plan())]).await;
@@ -5230,6 +5314,8 @@ async fn status_detail_carries_both_texts_and_only_her_own() {
     expected["base"] = serde_json::json!(text(&plan()));
     expected["local"] = serde_json::json!(hers);
     expected["upstream"] = serde_json::json!(text(&plan_later()));
+    // C25: what an agent hands back to settle against this team side.
+    expected["upstream_sha256"] = serde_json::json!(sha256_hex(&plan_later()));
     assert_eq!(
         domain["conflicts"],
         serde_json::json!([expected]),

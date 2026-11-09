@@ -2251,6 +2251,14 @@ pub struct ResolveBody {
     #[serde(default)]
     #[schema(example = "---\ntitle: A\n---\n\nboth points, one file\n")]
     pub content: Option<String>,
+    /// For a draft conflict: the `upstream_sha256` its sides answered when
+    /// they were shown. When the team's side changed since, the resolve is
+    /// refused with 409 and nothing changes, so nobody settles against team
+    /// text they did not see. Left out, nothing is checked. The folder's
+    /// conflict route ignores it.
+    #[serde(default)]
+    #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
+    pub expected_upstream_sha256: Option<String>,
 }
 
 /// `POST /domains/{domain}/sync/conflicts/{id}/resolve` - settle one recorded
@@ -2649,7 +2657,10 @@ pub async fn get_draft_conflict(
         ),
         (
             status = 409,
-            description = "Another instance on this shared database hosts \
+            description = "The team's side changed since the sides named \
+                           in `expected_upstream_sha256` were read, so \
+                           nothing was settled: read the sides again. Or \
+                           another instance on this shared database hosts \
                            this file domain, so it is written there.",
             body = ProblemDetail,
             content_type = "application/problem+json",
@@ -2704,6 +2715,7 @@ pub async fn resolve_draft_conflict(
                 &id,
                 keep,
                 content.as_deref(),
+                body.expected_upstream_sha256.as_deref(),
                 ShareActor::Account(user.name.clone()),
             )
             .await

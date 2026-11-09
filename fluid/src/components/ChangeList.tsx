@@ -168,11 +168,14 @@ function GroupCheckbox({
   label,
   checked,
   indeterminate,
+  disabled,
   onChange,
 }: {
   label: string;
   checked: boolean;
   indeterminate: boolean;
+  /** A group with nothing it could take in or out. */
+  disabled: boolean;
   onChange: (next: boolean) => void;
 }): ReactElement {
   const box = useRef<HTMLInputElement>(null);
@@ -190,6 +193,7 @@ function GroupCheckbox({
       type="checkbox"
       aria-label={label}
       checked={checked}
+      disabled={disabled}
       onChange={(event) => {
         onChange(event.target.checked);
       }}
@@ -218,6 +222,7 @@ function ChangeRow({
   onOpen,
   onDiscard,
   onSettle,
+  settleReasonId,
 }: {
   path: string;
   kind: string;
@@ -228,6 +233,8 @@ function ChangeRow({
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
   /** Set for a draft that does not fit the team's text: opens its dialog. */
   onSettle?: (() => void) | undefined;
+  /** The element that says why a conflicted row's box is off. */
+  settleReasonId?: string | undefined;
 }): ReactElement {
   const trigger = useRef<HTMLButtonElement>(null);
   // The row's own refusal, named so the tick box can point at it: a reason
@@ -240,13 +247,25 @@ function ChangeRow({
         <input
           type="checkbox"
           aria-label={path}
-          aria-describedby={refusal !== null ? refusalId : undefined}
+          aria-describedby={
+            [
+              onSettle !== undefined ? settleReasonId : undefined,
+              refusal !== null ? refusalId : undefined,
+            ]
+              .filter((id) => id !== undefined)
+              .join(" ") || undefined
+          }
           checked={checked && onSettle === undefined}
-          disabled={onSettle !== undefined}
+          // Off for a draft in conflict, but still reachable, so a screen
+          // reader hears the reason it points at; a press changes nothing.
+          aria-disabled={onSettle !== undefined ? true : undefined}
           onChange={(event) => {
+            if (onSettle !== undefined) {
+              return;
+            }
             onToggle(path, event.target.checked);
           }}
-          className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
+          className="size-3.5 shrink-0 accent-accent-600 aria-disabled:opacity-50 dark:accent-accent-400"
         />
         <ChangeKindBadge kind={kind} />
         {/* The path is the way into the diff: a button named by it, in
@@ -328,6 +347,7 @@ function ChangeGroup({
   onDiscard,
   refusals,
   onSettle,
+  settleReasonId,
 }: {
   kind: string;
   paths: string[];
@@ -338,6 +358,7 @@ function ChangeGroup({
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
   refusals: ReadonlyMap<string, string>;
   onSettle?: ((path: string) => (() => void) | undefined) | undefined;
+  settleReasonId?: string | undefined;
 }): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const face = faceFor(kind);
@@ -357,6 +378,7 @@ function ChangeGroup({
           label={`Share all ${face.word.toLowerCase()}`}
           checked={open.length > 0 && ticked === open.length}
           indeterminate={ticked > 0 && ticked < open.length}
+          disabled={open.length === 0}
           onChange={(next) => {
             onToggleGroup(open, next);
           }}
@@ -375,6 +397,7 @@ function ChangeGroup({
             onOpen={onOpen}
             onDiscard={onDiscard}
             onSettle={onSettle?.(path)}
+            settleReasonId={settleReasonId}
           />
         ))}
       </ul>
@@ -423,6 +446,7 @@ export function ChangeList({
   onDiscard,
   refusals,
   onSettle,
+  settleReasonId,
 }: {
   changes: ShareChange[];
   selected: ReadonlySet<string>;
@@ -442,6 +466,8 @@ export function ChangeList({
    * one has its box off.
    */
   onSettle?: ((path: string) => (() => void) | undefined) | undefined;
+  /** The element that says why a conflicted row's box is off. */
+  settleReasonId?: string | undefined;
 }): ReactElement | null {
   const groups = groupChanges(substantive(changes));
   if (groups.length === 0) {
@@ -464,6 +490,7 @@ export function ChangeList({
           onDiscard={onDiscard}
           refusals={refusals}
           onSettle={onSettle}
+          settleReasonId={settleReasonId}
         />
       ))}
       {(hint ?? null) !== null && (

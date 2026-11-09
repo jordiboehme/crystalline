@@ -600,21 +600,25 @@ fn parse_temp_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
 
 /// The extension a kept copy of the file `name` is named with: the file's
 /// own, so a page's text ends in `.md` and a kept draft file in its own kind
-/// (`deck.pdf` keeps as `.pdf`). A file with none of its own keeps as `.bin`.
+/// (`deck.pdf` keeps as `.pdf`). A file with none of its own keeps as `.bin`,
+/// and so does a name that ends in a dot: its extension is empty, and a kept
+/// name ending in a dot loses that dot on Windows and would never list.
 fn kept_extension(name: &str) -> &str {
     Path::new(name)
         .extension()
         .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
         .unwrap_or("bin")
 }
 
 /// `<name>.<stamp>.<ext>` or `<name>.<stamp>-<n>.<ext>`, where `<ext>` is the
-/// original file's own ([`kept_extension`]): the original file name and the
-/// time.
+/// original file's own ([`kept_extension`]), or `md`: a draft file kept before
+/// kept files took their own extension was named `.md`, and it may be the
+/// last copy of somebody's bytes. Answers the original file name and the time.
 fn parse_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
     let (stem, ext) = file.rsplit_once('.')?;
     let (name, tail) = stem.rsplit_once('.')?;
-    if name.is_empty() || ext != kept_extension(name) {
+    if name.is_empty() || (ext != kept_extension(name) && ext != "md") {
         return None;
     }
     let (stamp, counter) = match tail.split_once('-') {
@@ -1223,16 +1227,57 @@ mod tests {
         assert_eq!(found[0].sender.as_ref(), Some(&ada));
     }
 
-    /// The extension after the stamp must be the file's own: a name that
-    /// ends in another one does not follow the layout and is not listed.
+    /// A name that ends in a dot keeps as `.bin`, never as a name that ends in
+    /// a dot itself, which Windows would strip so the copy never listed.
+    #[test]
+    fn a_kept_file_whose_name_ends_in_a_dot_is_named_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = write_bytes(
+            root,
+            "eng",
+            None,
+            KeptKind::Engram,
+            "assets/deck.",
+            at(8),
+            b"x",
+        )
+        .unwrap();
+        assert_eq!(file.file_name().unwrap(), "deck..20261015T080000Z.bin");
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/deck.");
+    }
+
+    /// The extension after the stamp must be the file's own or `md`: a name
+    /// that ends in another one does not follow the layout and is not listed.
     #[test]
     fn a_kept_name_with_another_extension_is_not_listed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let folder = root.join("eng/engram/assets");
         std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), b"x").unwrap();
         std::fs::write(folder.join("a.md.20261015T080000Z.pdf"), b"x").unwrap();
+        std::fs::write(folder.join("deck.pdf.20261015T080000Z.png"), b"x").unwrap();
         assert_eq!(scan(root), vec![]);
+    }
+
+    /// A draft file kept before kept files took their own extension was named
+    /// `.md` (`deck.pdf.<stamp>.md`). It is the last copy of her bytes, so it
+    /// still lists under the file's path, as a file, and its bytes read back.
+    #[test]
+    fn an_old_md_named_kept_file_still_lists_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let folder = root.join("eng/draft/ada/engram/assets");
+        std::fs::create_dir_all(&folder).unwrap();
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x41];
+        std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), bytes).unwrap();
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/deck.pdf");
+        assert_eq!(found[0].owner.as_deref(), Some("ada"));
+        assert!(is_file_copy(&found[0]));
+        assert_eq!(std::fs::read(&found[0].file).unwrap(), bytes);
     }
 }

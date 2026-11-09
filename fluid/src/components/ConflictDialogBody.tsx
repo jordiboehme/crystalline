@@ -57,7 +57,7 @@ import {
   sharePlanKey,
   syncStatusKey,
 } from "../api/admin";
-import { problemDetail } from "../api/client";
+import { ApiProblem, problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
@@ -121,6 +121,7 @@ export default function ConflictDialogBody({
   conflictId,
   onClose,
   draft,
+  onSettled,
 }: ConflictDialogProps): ReactElement {
   const queryClient = useQueryClient();
   const mergedField = useId();
@@ -155,6 +156,12 @@ export default function ConflictDialogBody({
   // A draft's sides are read off the draft route, and the read stops once it
   // is settled: the invalidations below reach this key too, and a read of a
   // conflict that is no longer one would put a 404 over the receipt.
+  //
+  // And a draft's sides hold still while the merge editor is open (C25): the
+  // merge is written against the team text on the screen, so neither a
+  // window coming back nor a bulk invalidation may swap that text under it.
+  // The resolve names the team side that was shown; when the server says it
+  // moved (409), the sides are read again on purpose, below.
   const detail = useQuery<ConflictDetail | DraftConflictDetail>({
     queryKey:
       draft === undefined
@@ -165,11 +172,16 @@ export default function ConflictDialogBody({
         ? fetchConflict(domain, conflictId)
         : fetchDraftConflict(domain, conflictId),
     retry: false,
-    enabled: receipt === null,
+    refetchOnWindowFocus: draft === undefined,
+    enabled: receipt === null && !(draft !== undefined && mergeOpen),
   });
 
   const resolve = useMutation({
-    mutationFn: async (choice: { resolution: string; content?: string }) =>
+    mutationFn: async (choice: {
+      resolution: string;
+      content?: string;
+      expectedUpstream?: string | null;
+    }) =>
       draft === undefined
         ? (await resolveConflict(
             domain,
@@ -183,8 +195,10 @@ export default function ConflictDialogBody({
             conflictId,
             choice.resolution,
             choice.content,
+            choice.expectedUpstream,
           ),
     onSuccess: (settled) => {
+      onSettled?.();
       // A receipt with a sentence of its own stays up until it is read; any
       // other settle leaves at once, as the folder's always did.
       if (
@@ -219,12 +233,40 @@ export default function ConflictDialogBody({
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));
+      // The team's side moved since it was shown: read it again, so "look
+      // at it again" shows what is there now. A merge being written stays.
+      if (
+        draft !== undefined &&
+        error instanceof ApiProblem &&
+        error.status === 409
+      ) {
+        void detail.refetch();
+      }
     },
   });
 
   const conflict = detail.data ?? null;
-  const file = draft?.file === true;
-  const addressTaken = draft?.kind === "AddressTaken";
+  // What this conflict is, from the sides just read once they are here, and
+  // from the list that opened the dialog until then: the kind can have moved
+  // in between (a team rename makes an address taken).
+  // With `draft` the query reads the draft route, so its answer is a draft's.
+  const sides: DraftConflictDetail | null =
+    draft !== undefined && conflict !== null
+      ? (conflict as DraftConflictDetail)
+      : null;
+  const shown =
+    draft === undefined
+      ? undefined
+      : sides !== null && sides.kind !== ""
+        ? {
+            kind: sides.kind,
+            movedFrom: sides.movedFrom,
+            other: sides.other,
+            file: sides.file,
+          }
+        : draft;
+  const file = shown?.file === true;
+  const addressTaken = shown?.kind === "AddressTaken";
   const readProblem =
     detail.error === null ? null : problemDetail(detail.error);
 
@@ -233,9 +275,12 @@ export default function ConflictDialogBody({
       return;
     }
     setProblem(null);
-    resolve.mutate(
-      content === undefined ? { resolution } : { resolution, content },
-    );
+    resolve.mutate({
+      resolution,
+      ...(content === undefined ? {} : { content }),
+      // The team side on the screen right now, which is what she decided on.
+      expectedUpstream: sides?.upstreamSha256 ?? null,
+    });
   }
 
   return (
@@ -258,13 +303,13 @@ export default function ConflictDialogBody({
           <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
             {conflict === null
               ? "Reading both sides of this conflict."
-              : draft === undefined
+              : shown === undefined
                 ? `${conflict.path} - this copy and the team's changed the same engram.`
                 : draftKindSentence(
-                    draft.kind,
+                    shown.kind,
                     conflict.path,
-                    draft.movedFrom,
-                    draft.other,
+                    shown.movedFrom,
+                    shown.other,
                   )}
           </Dialog.Description>
 
@@ -299,7 +344,7 @@ export default function ConflictDialogBody({
             </div>
           )}
 
-          {receipt === null && conflict !== null && draft !== undefined && (
+          {receipt === null && conflict !== null && shown !== undefined && (
             <>
               {conflict.note !== null && (
                 <p className="mt-3 text-sm text-slate-500 dark:text-slate-400">
@@ -348,14 +393,19 @@ export default function ConflictDialogBody({
               {/* One choice per row, each with what it does beside it. */}
               <ul className="mt-3 flex flex-col gap-2 text-sm">
                 <li className="flex flex-wrap items-center gap-2">
+                  {/* Off for a taken address, but still reachable, so a
+                      screen reader hears the hint that says why. */}
                   <button
                     type="button"
-                    disabled={resolve.isPending || addressTaken}
+                    disabled={resolve.isPending}
+                    aria-disabled={addressTaken ? true : undefined}
                     aria-describedby={mineHint}
                     onClick={() => {
-                      settle("mine");
+                      if (!addressTaken) {
+                        settle("mine");
+                      }
                     }}
-                    className={BUTTON.secondary}
+                    className={`${BUTTON.secondary} aria-disabled:cursor-default aria-disabled:opacity-50`}
                   >
                     Keep mine
                   </button>
@@ -378,7 +428,7 @@ export default function ConflictDialogBody({
                     Take theirs
                   </button>
                   <span id={theirsHintId} className={HINT_CLASSES}>
-                    {theirsHint(draft.kind, conflict.local, file)}
+                    {theirsHint(shown.kind, conflict.local, file)}
                   </span>
                 </li>
                 <li className="flex flex-wrap items-center gap-2">
@@ -392,7 +442,12 @@ export default function ConflictDialogBody({
                         type="button"
                         aria-expanded={mergeOpen}
                         onClick={() => {
-                          setMerged((text) => text ?? conflict.local ?? "");
+                          // Her text, or the team's where her side is a
+                          // deletion: an empty start would save nothing.
+                          setMerged(
+                            (text) =>
+                              text ?? conflict.local ?? conflict.upstream ?? "",
+                          );
                           setMergeOpen((open) => !open);
                         }}
                         className={BUTTON.secondary}

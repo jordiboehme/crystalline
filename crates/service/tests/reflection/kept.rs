@@ -479,6 +479,43 @@ async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
     assert_eq!(status, 404);
 }
 
+/// A draft file kept before kept files took their own extension is named
+/// `.md`. It is still listed as a file, downloads as its bytes and can be
+/// dropped (Task 14 review I-2).
+#[tokio::test]
+async fn an_old_md_named_kept_file_lists_downloads_and_drops() {
+    let s = serve().await;
+    let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
+    let folder = root.join("eng/draft/ed/engram/assets");
+    std::fs::create_dir_all(&folder).unwrap();
+    let bytes = b"%PDF-1.7\n\xff\xfe her old deck".to_vec();
+    std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), &bytes).unwrap();
+    let id = kept::scan(&root)[0].id.clone();
+
+    let ed = Session::login(s.addr, "ed").await;
+    let (_, body) = ed.get("/api/v1/domains/eng/kept").await;
+    assert_eq!(body["kept"][0]["path"], "assets/deck.pdf", "{body}");
+    assert_eq!(body["kept"][0]["file"], true, "{body}");
+    let (status, headers, got) = ed
+        .get_raw(&format!("/api/v1/domains/eng/kept/{id}/file"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(got, bytes);
+    assert_eq!(
+        headers.get("content-disposition").unwrap(),
+        "attachment; filename=\"deck.pdf\""
+    );
+    let (status, _) = ed
+        .send(
+            Method::DELETE,
+            &format!("/api/v1/domains/eng/kept/{id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(kept::scan(&root).is_empty());
+}
+
 /// A kept copy the server cannot read is a fault on the server's side: the
 /// read and the download answer 500 in a sentence that names no place on the
 /// server's disk (C24); the cause goes to the log.

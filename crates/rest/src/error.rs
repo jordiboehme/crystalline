@@ -32,6 +32,7 @@ use serde::de::DeserializeOwned;
 use crate::auth_store::GITHUB_ID_TAKEN;
 use crate::engine::{
     EngineError, FILE_HOSTED_MARK, FILE_NO_HOST_MARK, LinkSetupReason, ONLY_ELSEWHERE,
+    TEAM_CHANGED_SINCE,
 };
 
 /// An error response in RFC 9457 shape. `title` is a short stable slug a
@@ -738,6 +739,12 @@ impl From<EngineError> for ApiError {
             // account is taken until an admin unlinks it there, and the
             // store's sentence says so.
             EngineError::Conflict(ref text) if text.contains(GITHUB_ID_TAKEN) => {
+                ApiError::conflict(detail)
+            }
+            // And an eighth: a resolve made against a team side the person
+            // was not shown (C25). The request is fine; the team's text moved
+            // since it was read, so the client reads the sides again.
+            EngineError::Conflict(ref text) if text.contains(TEAM_CHANGED_SINCE) => {
                 ApiError::conflict(detail)
             }
             // And a sixth: a write into a file domain another instance on

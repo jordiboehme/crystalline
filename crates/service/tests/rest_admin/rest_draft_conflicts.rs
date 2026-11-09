@@ -759,6 +759,52 @@ async fn a_merged_resolve_lands_in_her_draft() {
     );
 }
 
+/// C25: a resolve that names the team side it was shown is refused with 409
+/// when a pull has brought newer team text since, and nothing changes; with
+/// the side read again it settles.
+#[tokio::test]
+async fn a_resolve_against_team_text_she_was_not_shown_is_a_409() {
+    let t = team().await;
+    let hers = t.alice_in_conflict().await;
+    let served = t.serve().await;
+    let alice = served.login("alice").await;
+    let (status, shown) = alice.get(&sides(&hers)).await;
+    assert_eq!(status, 200, "{shown}");
+    let t1 = shown["upstream_sha256"].as_str().unwrap().to_string();
+
+    let newer = engram(
+        "Plan",
+        "plan",
+        "bob's first line\n\nthe middle of the plan\n\nthe last line of the plan\n\n\
+         a colleague's new paragraph",
+    );
+    t.push(&[("plan.md", newer)]).await;
+    let (status, body) = alice
+        .resolve(
+            &hers,
+            json!({"resolution": "mine", "expected_upstream_sha256": t1}),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        body["detail"],
+        "The team changed this page since you looked at it. Look at it again before you settle it."
+    );
+    let (_, list) = alice.get("/domains/team/drafts/conflicts").await;
+    assert_eq!(list["conflicts"][0]["id"], json!(hers), "it stands: {list}");
+
+    let (_, again) = alice.get(&sides(&hers)).await;
+    let t2 = again["upstream_sha256"].as_str().unwrap().to_string();
+    assert_ne!(t1, t2);
+    let (status, receipt) = alice
+        .resolve(
+            &hers,
+            json!({"resolution": "mine", "expected_upstream_sha256": t2}),
+        )
+        .await;
+    assert_eq!(status, 200, "{receipt}");
+}
+
 /// The sentence a list of her conflicts that cannot be read is answered with,
 /// on status and on every draft conflict route alike.
 const UNREADABLE: &str = "Your conflicts in this domain cannot be read, so none are listed, and a share of this domain refuses until they can. Try again, and if it stays, ask whoever runs this server.";

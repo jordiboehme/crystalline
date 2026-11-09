@@ -65,13 +65,13 @@ function serve(list: () => unknown) {
   });
 }
 
-function mount() {
+function mount(locked = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <DraftConflictsNotice domain="eng" />
+      <DraftConflictsNotice domain="eng" locked={locked} />
     </QueryClientProvider>,
   );
 }
@@ -122,6 +122,28 @@ describe("the draft conflicts notice", () => {
       within(notice).getAllByRole("button", { name: /^notes\// }),
     ).toHaveLength(8);
     expect(within(notice).getByText("and 2 more")).toBeVisible();
+    // Only the sentence is announced when the list changes, not every path
+    // button with it.
+    const status = within(notice).getByRole("status");
+    expect(status).toHaveTextContent(
+      "10 of your drafts do not fit with the team's text. Settle them before you share.",
+    );
+    expect(within(status).queryByRole("button")).toBeNull();
+  });
+
+  it("says what a read-only domain leaves her", async () => {
+    serve(() => ({ conflicts: [entry("notes/a.md")], merged: [] }));
+    mount(true);
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(
+      within(notice).getByText(
+        "This domain is read-only. Until its owner switches read_only off, you can only take the team's text for these drafts.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(notice).getByRole("button", { name: "notes/a.md" }),
+    ).toBeVisible();
   });
 
   it("shows nothing with no conflicts and no merges", async () => {

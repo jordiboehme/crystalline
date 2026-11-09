@@ -880,9 +880,17 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 },
                 None => None,
             };
+            let expected = req.get("expected_upstream_sha256").and_then(Value::as_str);
             match shared
                 .engine
-                .origin_resolve(domain, path, keep, content.as_deref(), ShareActor::Owner)
+                .origin_resolve_expecting(
+                    domain,
+                    path,
+                    keep,
+                    content.as_deref(),
+                    expected,
+                    ShareActor::Owner,
+                )
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

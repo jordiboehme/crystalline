@@ -157,7 +157,33 @@ struct Found {
     record: Option<DraftStart>,
     local: Option<String>,
     upstream: Held,
+    /// What the team's side is, as [`team_side_digest`] names it.
+    team_digest: String,
 }
+
+/// The token for a team side that holds nothing, in `upstream_sha256`.
+pub const TEAM_SIDE_ABSENT: &str = "absent";
+
+/// The token for a team side whose copy cannot be read, in `upstream_sha256`.
+pub const TEAM_SIDE_UNREADABLE: &str = "unreadable";
+
+/// What the team's side of a conflict is, as the sides answer it in
+/// `upstream_sha256` and a resolve hands it back (C25): the SHA-256 of its
+/// bytes, or [`TEAM_SIDE_ABSENT`] when the team holds nothing there, or
+/// [`TEAM_SIDE_UNREADABLE`].
+fn team_side_digest(held: &Held) -> String {
+    match held {
+        Held::Absent => TEAM_SIDE_ABSENT.to_string(),
+        Held::Bytes(bytes) => sha256_hex(bytes),
+        Held::Unreadable(_) => TEAM_SIDE_UNREADABLE.to_string(),
+    }
+}
+
+/// How a resolve against a team side the person was not shown is refused
+/// (C25): the sentence ends the same way for a page and a file, so a surface
+/// tells it apart from every other refusal.
+pub const TEAM_CHANGED_SINCE: &str =
+    " since you looked at it. Look at it again before you settle it.";
 
 /// A row's kind, with the path whose team text it is about.
 #[derive(Clone, Debug)]
@@ -209,6 +235,7 @@ fn sides_json(found: Found) -> Value {
     if found.conflict.file {
         let conflict = found.conflict;
         return json!({
+            "upstream_sha256": found.team_digest,
             "id": conflict.id,
             "path": conflict.path,
             "kind": conflict.kind,
@@ -256,6 +283,7 @@ fn sides_json(found: Found) -> Value {
     let note = (!notes.is_empty()).then(|| notes.join("; "));
     let conflict = found.conflict;
     json!({
+        "upstream_sha256": found.team_digest,
         "id": conflict.id,
         "path": conflict.path,
         "kind": conflict.kind,
@@ -921,6 +949,39 @@ impl Engine {
         Ok(sides_json(found))
     }
 
+    /// Refuses a resolve made against a team side the person was not shown
+    /// (C25). `expected` is the `upstream_sha256` the sides answered when they
+    /// were read; the conflict `settles` names is read again now, and when its
+    /// team side is another one the resolve is refused with a sentence that
+    /// ends in [`TEAM_CHANGED_SINCE`]. No `expected` checks nothing, as before,
+    /// and a conflict no longer found is left to the resolve to answer.
+    pub(crate) async fn refuse_unseen_team_side(
+        &self,
+        domain: &str,
+        actor: &str,
+        settles: impl Fn(&DraftConflict) -> bool,
+        expected: Option<&str>,
+    ) -> Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let Some(found) = self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .find(|found| settles(&found.conflict))
+        else {
+            return Ok(());
+        };
+        if found.team_digest == expected {
+            return Ok(());
+        }
+        let what = if found.conflict.file { "file" } else { "page" };
+        Err(EngineError::Conflict(format!(
+            "The team changed this {what}{TEAM_CHANGED_SINCE}"
+        )))
+    }
+
     /// `actor`'s conflicts as status lists them with `detail`: each as
     /// [`crate::origin::draft_conflicts_json`] has it, plus its `base`, `local`
     /// and `upstream` text as [`Engine::draft_conflict_sides`] answers them, and
@@ -939,7 +1000,7 @@ impl Engine {
                     crate::origin::draft_conflicts_json(std::slice::from_ref(&found.conflict))[0]
                         .take();
                 let sides = sides_json(found);
-                for key in ["base", "local", "upstream"] {
+                for key in ["base", "local", "upstream", "upstream_sha256"] {
                     entry[key] = sides[key].clone();
                 }
                 if !sides["note"].is_null() {
@@ -1094,6 +1155,10 @@ impl Engine {
                     record: None,
                     local: None,
                     upstream: Held::Absent,
+                    team_digest: draft
+                        .team
+                        .clone()
+                        .unwrap_or_else(|| TEAM_SIDE_ABSENT.to_string()),
                 });
             }
         }
@@ -1209,6 +1274,7 @@ impl Engine {
                 continue;
             };
             let row = &reading.rows[i];
+            let upstream = reading.base.at(&upstream_at)?;
             found.push(Found {
                 conflict: DraftConflict {
                     id: conflict_id(actor, &row.path),
@@ -1220,7 +1286,8 @@ impl Engine {
                 },
                 record: reading.records[i].clone(),
                 local: (!row.tombstone).then(|| row.content.clone()),
-                upstream: reading.base.at(&upstream_at)?,
+                team_digest: team_side_digest(&upstream),
+                upstream,
             });
         }
         found.sort_by(|a, b| a.conflict.path.cmp(&b.conflict.path));

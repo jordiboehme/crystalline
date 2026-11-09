@@ -467,6 +467,12 @@ pub struct DraftConflictSides {
     pub local: Option<String>,
     #[schema(required = true)]
     pub upstream: Option<String>,
+    /// What the team's side is: the SHA-256 of its bytes (a page's text or a
+    /// file's), `absent` when the team holds nothing there, `unreadable` when
+    /// its copy cannot be read. Pass it back as `expected_upstream_sha256`
+    /// when settling, so a team change made since is not overwritten.
+    #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
+    pub upstream_sha256: String,
     #[schema(required = true)]
     pub moved_from: Option<String>,
     #[schema(required = true)]

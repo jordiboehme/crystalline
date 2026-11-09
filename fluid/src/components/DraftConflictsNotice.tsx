@@ -45,8 +45,15 @@ const PATH_CLASSES = `font-mono underline ${FOCUS_RING}`;
 
 export function DraftConflictsNotice({
   domain,
+  locked = false,
 }: {
   domain: string;
+  /**
+   * Whether the domain's MANIFEST says `read_only: on`. Keeping her text or
+   * a merge is refused there until the owner switches it off; taking the
+   * team's text, which is what a pull does, is not.
+   */
+  locked?: boolean;
 }): ReactElement | null {
   const [open, setOpen] = useState<DraftConflict | null>(null);
   // No retry: every refusal here is immediate and final.
@@ -104,8 +111,10 @@ export function DraftConflictsNotice({
         </p>
       )}
       {conflicts.length > 1 && (
-        <p role="status" className="flex flex-wrap items-center gap-x-2">
-          <span>
+        <p className="flex flex-wrap items-center gap-x-2">
+          {/* Only the sentence is the live region: a change to the list
+              announces it once, not every path button with it. */}
+          <span role="status">
             {`${String(conflicts.length)} of your drafts do not fit with the team's text. Settle them before you share.`}
           </span>
           {conflicts.slice(0, SHOWN).map(pathButton)}
@@ -114,6 +123,12 @@ export function DraftConflictsNotice({
           {conflicts.length > SHOWN && (
             <span>{`and ${String(conflicts.length - SHOWN)} more`}</span>
           )}
+        </p>
+      )}
+      {locked && conflicts.length > 0 && (
+        <p>
+          This domain is read-only. Until its owner switches read_only off, you
+          can only take the team&apos;s text for these drafts.
         </p>
       )}
       {merged.map((path) => (

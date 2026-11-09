@@ -32,7 +32,8 @@ export interface ConflictDialogProps {
     movedFrom: string | null;
     other: string | null;
     file: boolean;
-  };
+  }; /** Told once the conflict is settled, before the dialog leaves. */
+  onSettled?: () => void;
 }
 
 export function ConflictDialog(props: ConflictDialogProps): ReactElement {

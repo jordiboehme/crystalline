@@ -1574,7 +1574,9 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     // A plan of every file names them beside its action; a plan of named
     // files that one of them blocks names them as its `conflicts`.
     draftConflicts: readDraftConflicts(
-      record?.draft_conflicts ?? record?.conflicts,
+      asArray(record?.draft_conflicts ?? record?.conflicts).filter(
+        (entry) => asObject(entry)?.draft === true,
+      ),
     ),
   };
 }
@@ -1767,6 +1769,12 @@ export interface DraftConflictDetail extends DraftConflict {
   base: string | null;
   local: string | null;
   upstream: string | null;
+  /**
+   * What the team's side is (the SHA-256 of its bytes, `absent` or
+   * `unreadable`), handed back with a resolve so a team change made since it
+   * was shown is refused rather than overwritten. Null from an older server.
+   */
+  upstreamSha256: string | null;
   note: string | null;
 }
 
@@ -1871,21 +1879,35 @@ export async function fetchDraftConflict(
     base: asString(record?.base),
     local: asString(record?.local),
     upstream: asString(record?.upstream),
+    upstreamSha256: asString(record?.upstream_sha256),
     note: asString(record?.note),
   };
 }
 
-/** Settle one draft conflict: `mine`, `theirs`, or `merged` with content. */
+/**
+ * Settle one draft conflict: `mine`, `theirs`, or `merged` with content.
+ *
+ * `expectedUpstream` is the `upstreamSha256` of the sides that were shown:
+ * the server refuses the resolve (409) when the team's side changed since,
+ * so nobody settles against team text they did not see.
+ */
 export async function resolveDraftConflict(
   domain: string,
   id: string,
   resolution: string,
   content?: string,
+  expectedUpstream?: string | null,
 ): Promise<DraftResolveReceipt> {
   const record = asObject(
     await api<unknown>(`${draftConflictsPath(domain, id)}/resolve`, {
       method: "POST",
-      body: JSON.stringify({ resolution, content }),
+      body: JSON.stringify({
+        resolution,
+        content,
+        ...(expectedUpstream == null
+          ? {}
+          : { expected_upstream_sha256: expectedUpstream }),
+      }),
     }),
   );
   return {

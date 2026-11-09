@@ -9036,7 +9036,9 @@ use doc_file::{
     FileLock, Swap, SwapRefused, check_swap, is_case_only_rename, read_opt, read_stamped,
     remove_if_there,
 };
-pub use draft_conflicts::DraftConflict;
+pub use draft_conflicts::{
+    DraftConflict, TEAM_CHANGED_SINCE, TEAM_SIDE_ABSENT, TEAM_SIDE_UNREADABLE,
+};
 pub use origins::{CONFLICTS_UNREADABLE, not_among_drafts};
 
 /// The moments in a fold a test can step into with `Engine::at_next_fold_step`,

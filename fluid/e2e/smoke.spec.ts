@@ -881,6 +881,7 @@ test("a person settles a draft conflict in the browser", async ({ page }) => {
           base: "The start.\n",
           local: `My line in ${found.path}.\n`,
           upstream: `The team's line in ${found.path}.\n`,
+          upstream_sha256: `sha-${found.id}`,
           note: null,
           detected_at: null,
         },
@@ -924,12 +925,20 @@ test("a person settles a draft conflict in the browser", async ({ page }) => {
   await dialog.getByRole("button", { name: "Save merged" }).click();
   await expect(dialog).toBeHidden();
 
+  // Each names the team side it was shown, so a newer one would be refused.
   expect(bodies).toEqual({
-    "notes/one.md": { resolution: "mine" },
-    "notes/two.md": { resolution: "theirs" },
+    "notes/one.md": {
+      resolution: "mine",
+      expected_upstream_sha256: "sha-d0000001",
+    },
+    "notes/two.md": {
+      resolution: "theirs",
+      expected_upstream_sha256: "sha-d0000002",
+    },
     "notes/three.md": {
       resolution: "merged",
       content: "My line and the team's line.\n",
+      expected_upstream_sha256: "sha-d0000003",
     },
   });
   await expect(notice).toBeHidden();

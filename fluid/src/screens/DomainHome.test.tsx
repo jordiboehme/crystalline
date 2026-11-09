@@ -1390,6 +1390,47 @@ describe("the domain screen", () => {
     expect(within(card).queryByText(/conflicts? to settle/)).toBeNull();
   });
 
+  it("shows her draft conflict on a read-only domain, with what is left to her", async () => {
+    serve({
+      "/domains": () => ({
+        ...domainsResponse(),
+        domains: [{ ...domainsResponse().domains[0], read_only: true }],
+      }),
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: "# eng",
+        sections: manifestSectionsResponse({
+          policies: defaultPolicyRows().map((row) =>
+            row.key === "read_only"
+              ? { ...row, declared: "on", effective: "on" }
+              : row,
+          ),
+        }),
+      }),
+      "/domains/eng/drafts/conflicts": () => ({
+        conflicts: [
+          {
+            id: "d1234567",
+            path: "notes/a.md",
+            kind: "EditEdit",
+            moved_from: null,
+            other: null,
+            file: false,
+            draft: true,
+          },
+        ],
+        merged: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(notice).toHaveTextContent(
+      "This domain is read-only. Until its owner switches read_only off, you can only take the team's text for these drafts.",
+    );
+  });
+
   it("shows her draft conflict while a fold that stopped part way is unfinished", async () => {
     // The listing says the domain takes changes directly - the fold took the
     // review key off - but her drafts still stand and must be settled, and

@@ -108,7 +108,7 @@ import { DiscardConfirm } from "./DiscardConfirm";
 import type { ShareDialogProps } from "./ShareDialog";
 import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { preselect, substantive } from "./changes";
-import { BUTTON, Field } from "./primitives";
+import { BUTTON, FOCUS_RING, Field } from "./primitives";
 import { useShareIdentity } from "./useShareIdentity";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
@@ -193,6 +193,9 @@ export default function ShareDialogBody({
   const [discardProblem, setDiscardProblem] = useState<string | null>(null);
   /** The draft conflict being settled over this dialog, or null. */
   const [settling, setSettling] = useState<DraftConflict | null>(null);
+  /** Draft conflicts settled from a refusal's list, which leave that list. */
+  const [settledIds, setSettledIds] = useState<ReadonlySet<string>>(new Set());
+  const settleReasonId = useId();
   const paneHeading = useId();
 
   // Always fresh, and never retried: the plan is the whole point of opening
@@ -290,6 +293,8 @@ export default function ShareDialogBody({
     }
   }
   const free = real.filter((change) => !conflictAt.has(change.path));
+  /** Every path a draft conflict holds, as the caption names them. */
+  const conflictPaths = [...conflictAt.keys()].sort();
   // Keyed on the plan itself rather than on its change array, which is a
   // fresh array on every render while the plan is still arriving.
   const preset = useMemo(
@@ -573,20 +578,24 @@ export default function ShareDialogBody({
               {/* A refusal for this session's own drafts names them, each
                   a way into the dialog that settles it. */}
               {outcome.conflicts !== undefined &&
-                outcome.conflicts.length > 0 && (
+                outcome.conflicts.some(
+                  (conflict) => !settledIds.has(conflict.id),
+                ) && (
                   <p className="flex flex-wrap gap-x-2 text-sm">
-                    {outcome.conflicts.map((conflict) => (
-                      <button
-                        key={conflict.id}
-                        type="button"
-                        onClick={() => {
-                          setSettling(conflict);
-                        }}
-                        className="font-mono underline underline-offset-2 hover:no-underline"
-                      >
-                        {conflict.path}
-                      </button>
-                    ))}
+                    {outcome.conflicts
+                      .filter((conflict) => !settledIds.has(conflict.id))
+                      .map((conflict) => (
+                        <button
+                          key={conflict.id}
+                          type="button"
+                          onClick={() => {
+                            setSettling(conflict);
+                          }}
+                          className={`font-mono underline underline-offset-2 hover:no-underline ${FOCUS_RING}`}
+                        >
+                          {conflict.path}
+                        </button>
+                      ))}
                   </p>
                 )}
               {problem !== null && (
@@ -790,6 +799,7 @@ export default function ShareDialogBody({
                 }}
                 onOpen={setPane}
                 refusals={refusals}
+                settleReasonId={settleReasonId}
                 onSettle={(path) => {
                   const conflict = conflictAt.get(path);
                   return conflict === undefined
@@ -817,10 +827,14 @@ export default function ShareDialogBody({
                     : undefined
                 }
               />
-              {draftConflicts.length > 0 && !onlyConflicts && (
-                <p className="text-caption text-slate-500 dark:text-slate-400">
-                  A file with its box off does not fit the team&apos;s text.
-                  Press its path to settle it. Other files can still be shared.
+              {/* Why those boxes are off, and the way out. The boxes point
+                  at this line, so a screen reader hears it on each. */}
+              {draftConflicts.length > 0 && (
+                <p
+                  id={settleReasonId}
+                  className="text-caption text-slate-500 dark:text-slate-400"
+                >
+                  {`These files do not fit the team's text, so you cannot share them yet: ${conflictPaths.join(", ")}. Press a path to settle it.${free.length > 0 ? " You can share the other files now." : ""}`}
                 </p>
               )}
               {/* A file the share adds on its own is named apart from the
@@ -986,6 +1000,10 @@ export default function ShareDialogBody({
                 movedFrom: settling.movedFrom,
                 other: settling.other,
                 file: settling.file,
+              }}
+              onSettled={() => {
+                const id = settling.id;
+                setSettledIds((held) => new Set([...held, id]));
               }}
               onClose={() => {
                 setSettling(null);

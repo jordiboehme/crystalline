@@ -716,7 +716,14 @@ function DomainPage({
           must still be settled, and the listing cannot tell that apart. The
           list answers empty, and cheaply, on every other domain.
         */}
-        {canWrite && <DraftConflictsNotice domain={domain} />}
+        {/*
+          A read-only domain too: her drafts there still do not fit, and
+          taking the team's text stays allowed, so the notice says what is
+          left to her. A reader holds no drafts and the list answers empty.
+        */}
+        {(canWrite || domainLocked) && (
+          <DraftConflictsNotice domain={domain} locked={domainLocked} />
+        )}
 
         <ManifestProsePanel
           domain={domain}

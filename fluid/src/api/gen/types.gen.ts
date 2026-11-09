@@ -622,6 +622,13 @@ export type DraftConflictSides = {
     other: string | null;
     path: string;
     upstream: string | null;
+    /**
+     * What the team's side is: the SHA-256 of its bytes (a page's text or a
+     * file's), `absent` when the team holds nothing there, `unreadable` when
+     * its copy cannot be read. Pass it back as `expected_upstream_sha256`
+     * when settling, so a team change made since is not overwritten.
+     */
+    upstream_sha256: string;
 };
 
 /**
@@ -2259,6 +2266,14 @@ export type ResolveBody = {
      * The merged markdown. Required for `merged`, meaningless otherwise.
      */
     content?: string | null;
+    /**
+     * For a draft conflict: the `upstream_sha256` its sides answered when
+     * they were shown. When the team's side changed since, the resolve is
+     * refused with 409 and nothing changes, so nobody settles against team
+     * text they did not see. Left out, nothing is checked. The folder's
+     * conflict route ignores it.
+     */
+    expected_upstream_sha256?: string | null;
     /**
      * mine | theirs | merged
      */
@@ -4080,7 +4095,7 @@ export type ResolveDraftConflictErrors = {
      */
     404: ProblemDetail;
     /**
-     * Another instance on this shared database hosts this file domain, so it is written there.
+     * The team's side changed since the sides named in `expected_upstream_sha256` were read, so nothing was settled: read the sides again. Or another instance on this shared database hosts this file domain, so it is written there.
      */
     409: ProblemDetail;
     /**

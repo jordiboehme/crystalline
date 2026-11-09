@@ -2494,7 +2494,7 @@
             }
           },
           "409": {
-            "description": "Another instance on this shared database hosts this file domain, so it is written there.",
+            "description": "The team's side changed since the sides named in `expected_upstream_sha256` were read, so nothing was settled: read the sides again. Or another instance on this shared database hosts this file domain, so it is written there.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -13659,6 +13659,7 @@
           "base",
           "local",
           "upstream",
+          "upstream_sha256",
           "moved_from",
           "other",
           "note"
@@ -13728,6 +13729,11 @@
               "string",
               "null"
             ]
+          },
+          "upstream_sha256": {
+            "type": "string",
+            "description": "What the team's side is: the SHA-256 of its bytes (a page's text or a\nfile's), `absent` when the team holds nothing there, `unreadable` when\nits copy cannot be read. Pass it back as `expected_upstream_sha256`\nwhen settling, so a team change made since is not overwritten.",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           }
         }
       },
@@ -16036,6 +16042,14 @@
             ],
             "description": "The merged markdown. Required for `merged`, meaningless otherwise.",
             "example": "---\ntitle: A\n---\n\nboth points, one file\n"
+          },
+          "expected_upstream_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a draft conflict: the `upstream_sha256` its sides answered when\nthey were shown. When the team's side changed since, the resolve is\nrefused with 409 and nothing changes, so nobody settles against team\ntext they did not see. Left out, nothing is checked. The folder's\nconflict route ignores it.",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           },
           "resolution": {
             "type": "string",

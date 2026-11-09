@@ -2035,6 +2035,11 @@ enum OriginCommand {
         /// required.
         #[arg(long)]
         content_file: Option<PathBuf>,
+        /// For your own draft: the upstream_sha256 that `origin status
+        /// --json` gave for the team's side you read. If the team changed it
+        /// since, the resolve is refused and nothing changes.
+        #[arg(long, value_name = "SHA256")]
+        expect_upstream: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -3670,6 +3675,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             path,
             keep,
             content_file,
+            expect_upstream,
             config,
         } => {
             if keep.is_some() == content_file.is_some() {
@@ -3688,6 +3694,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                 &path,
                 keep_str,
                 content.as_deref(),
+                expect_upstream.as_deref(),
                 db.as_deref(),
                 config.as_deref(),
             )
