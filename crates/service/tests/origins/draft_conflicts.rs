@@ -16,8 +16,11 @@ use crate::support::{MockProvider, sha256_hex};
 use crystalline_core::config::{DomainEntry, GlobalConfig, ReviewMode};
 use crystalline_index::{Store, TursoStore};
 use crystalline_remote::ops::DiscardTarget;
-use crystalline_remote::state::{BaseStamp, OriginState, remove_base_file, write_base_file};
-use crystalline_service::draft_start::{self, DraftStart};
+use crystalline_remote::provider::ProposalState;
+use crystalline_remote::state::{
+    BaseStamp, OriginState, ProposalStatus, remove_base_file, write_base_file,
+};
+use crystalline_service::draft_start::{self, DraftStart, SharedText};
 use crystalline_service::engine::{
     DraftConflict, DraftConflictKind, EngineError, PreviewCredential, ShareActor,
 };
@@ -2857,4 +2860,556 @@ async fn a_read_scope_preview_whose_pull_applied_a_rename_takes_her_draft_along(
         .unwrap();
     assert_eq!(t.rows("alice").await, vec![("new.md".to_string(), false)]);
     assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+// --- A proposal knows what it holds ------------------------------------------
+
+/// A word of the reviewer's in place of hers, made on the proposal's branch.
+const REVIEWED_WORD: &str = "the reviewer's own last word";
+
+/// A line she adds in the middle, which a reviewer may take out again.
+const HER_EXTRA: &str = "alice's extra line in the middle";
+
+impl Team {
+    /// This machine pulls what the forge holds.
+    async fn pull(&self) {
+        self.eng
+            .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+
+    /// The team merges the proposal `answer` opened: its branch with `changes`
+    /// made on it first (a reviewer's edits, or the merge the forge makes with a
+    /// `main` that moved), as `main`, and the forge says it merged.
+    fn merge(&self, answer: &serde_json::Value, changes: &[(&str, Option<Vec<u8>>)]) {
+        let number = answer["number"].as_u64().unwrap();
+        let branch = answer["branch"].as_str().unwrap();
+        let head = self.mock.branch_commit(branch).unwrap();
+        let mut files: BTreeMap<String, Vec<u8>> = self
+            .mock
+            .commit_paths(&head)
+            .into_iter()
+            .map(|path| {
+                let bytes = self.mock.commit_file(&head, &path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        for (path, bytes) in changes {
+            match bytes {
+                Some(bytes) => files.insert((*path).to_string(), bytes.clone()),
+                None => files.remove(*path),
+            };
+        }
+        let commit = self.mock.add_commit(files);
+        self.mock.set_branch("main", &commit);
+        self.mock.set_proposal_state(number, ProposalState::Merged);
+    }
+
+    /// What `actor`'s record at `path` says the open proposal holds.
+    fn shared(&self, actor: &str, path: &str) -> Option<SharedText> {
+        self.record(actor, path).and_then(|record| record.shared)
+    }
+
+    /// Change the origin state as `change` says, the way a step this test does
+    /// not run would leave it.
+    fn state_edit(&self, change: impl FnOnce(&mut OriginState)) {
+        let dir = self.snapshot_dir();
+        let mut state = OriginState::load(&dir).unwrap().unwrap();
+        change(&mut state);
+        state.save(&dir).unwrap();
+    }
+}
+
+/// `actor`'s share of everything opens a proposal: its number and branch.
+async fn proposed(t: &Team, actor: &str) -> (serde_json::Value, u64, String) {
+    let answer = t.share(actor, None).await;
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let number = answer["number"].as_u64().unwrap();
+    let branch = answer["branch"].as_str().unwrap().to_string();
+    (answer, number, branch)
+}
+
+fn holds(proposal: u64, text: Option<String>) -> Option<SharedText> {
+    Some(SharedText { proposal, text })
+}
+
+/// N1 by the proposal road: her edited move merges, both rows end, and a later
+/// peer edit of the moved page is what she reads.
+#[tokio::test]
+async fn a_merged_proposal_of_an_edited_move_ends_both_rows() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    let hers = t.row("alice", "renamed.md").await;
+    assert_eq!(t.shared("alice", "renamed.md"), holds(number, Some(hers)));
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, None));
+    let held = text(&t.branch_file(&branch, "renamed.md").unwrap());
+
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let his = held.replace("the first line of the plan", BOB_LINE);
+    t.push(&[("renamed.md", Some(his.into_bytes()))]).await;
+    let read = t.reads("alice", "plan").await;
+    assert!(read.contains(BOB_LINE) && read.contains(HER_WORD), "{read}");
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+/// A reviewer rewrote her line on the branch before it merged: her draft ends
+/// and she reads the reviewer's words, with no conflict against her own share.
+#[tokio::test]
+async fn a_merged_proposal_a_reviewer_changed_ends_her_draft_with_no_conflict() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    assert_eq!(
+        t.shared("alice", "plan.md"),
+        holds(number, Some(t.row("alice", "plan.md").await))
+    );
+    let reviewed =
+        text(&t.branch_file(&branch, "plan.md").unwrap()).replace(HER_WORD, REVIEWED_WORD);
+
+    t.merge(&answer, &[("plan.md", Some(reviewed.into_bytes()))]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.rows("alice").await, vec![]);
+    let read = t.reads("alice", "plan").await;
+    assert!(
+        read.contains(REVIEWED_WORD) && !read.contains(HER_WORD),
+        "{read}"
+    );
+}
+
+/// A line she added that a reviewer took out before merging stays out: the
+/// merge reads her row against what the branch held, not against her old start.
+#[tokio::test]
+async fn a_line_a_reviewer_removed_stays_removed_after_the_merge() {
+    let t = team(&[("plan.md", plan())]).await;
+    let middle = "the middle of the plan";
+    t.replace("alice", "plan", middle, &format!("{middle}\n\n{HER_EXTRA}"))
+        .await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    assert_eq!(
+        t.shared("alice", "plan.md"),
+        holds(number, Some(t.row("alice", "plan.md").await))
+    );
+    let reviewed =
+        text(&t.branch_file(&branch, "plan.md").unwrap()).replace(&format!("\n\n{HER_EXTRA}"), "");
+    assert!(!reviewed.contains(HER_EXTRA), "{reviewed}");
+
+    t.merge(&answer, &[("plan.md", Some(reviewed.into_bytes()))]);
+    t.pull().await;
+    assert_eq!(t.rows("alice").await, vec![]);
+    let read = t.reads("alice", "plan").await;
+    assert!(
+        read.contains(HER_WORD) && !read.contains(HER_EXTRA),
+        "{read}"
+    );
+}
+
+/// She edits again after sharing, and a reviewer rewrites her shared line: her
+/// later edit merges against what the branch held, so the two fit.
+#[tokio::test]
+async fn an_edit_after_sharing_merges_against_what_the_branch_held() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    let shared = t.row("alice", "plan.md").await;
+    same_line(&t).await;
+    assert_eq!(
+        t.shared("alice", "plan.md"),
+        holds(number, Some(shared)),
+        "an edit keeps what the proposal holds"
+    );
+    let reviewed =
+        text(&t.branch_file(&branch, "plan.md").unwrap()).replace(HER_WORD, REVIEWED_WORD);
+
+    t.merge(&answer, &[("plan.md", Some(reviewed.clone().into_bytes()))]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    let row = t.row("alice", "plan.md").await;
+    assert!(
+        row.contains(ALICE_LINE) && row.contains(REVIEWED_WORD) && !row.contains(HER_WORD),
+        "{row}"
+    );
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.shared, None);
+    assert_eq!(record.start.as_deref(), Some(reviewed.as_str()));
+}
+
+/// A peer's change lands while her proposal is open: it merges into her row,
+/// the record still says what the branch holds, and the proposal's merge ends
+/// her draft.
+#[tokio::test]
+async fn a_peer_change_while_a_proposal_is_open_merges_into_her_row_and_the_merge_ends_it() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, _) = proposed(&t, "alice").await;
+    let shared = t.row("alice", "plan.md").await;
+
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains(BOB_LINE) && row.contains(HER_WORD), "{row}");
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, Some(shared)));
+
+    // The forge merges her branch into the `main` bob moved: both lines.
+    t.merge(&answer, &[("plan.md", Some(row.into_bytes()))]);
+    t.pull().await;
+    assert_eq!(t.rows("alice").await, vec![]);
+    let read = t.reads("alice", "plan").await;
+    assert!(read.contains(BOB_LINE) && read.contains(HER_WORD), "{read}");
+}
+
+/// A peer's change to her very line while her proposal is open: her row stands
+/// as a conflict, and sharing again refuses rather than amend the branch.
+#[tokio::test]
+async fn a_peer_change_on_the_same_line_while_a_proposal_is_open_refuses_the_amend() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    let (_, number, branch) = proposed(&t, "alice").await;
+    let shared = t.row("alice", "plan.md").await;
+
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+    let again = t.share("alice", None).await;
+    assert_eq!(again["outcome"], "conflicts_pending", "{again}");
+    let held = text(&t.branch_file(&branch, "plan.md").unwrap());
+    assert!(
+        held.contains(ALICE_LINE) && !held.contains(BOB_LINE),
+        "{held}"
+    );
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, Some(shared)));
+}
+
+/// A status probe marks the proposal merged before any pull brought its text
+/// in. A pass then leaves her draft and what it holds alone; the pull that
+/// takes the merge ends it.
+#[tokio::test]
+async fn a_proposal_a_probe_marked_merged_keeps_its_text_until_the_pull() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, _) = proposed(&t, "alice").await;
+    let hers = t.row("alice", "plan.md").await;
+    t.merge(&answer, &[]);
+    // What a status probe leaves: the record marked, still in the chain.
+    t.state_edit(|state| {
+        let open = state
+            .proposals
+            .iter_mut()
+            .find(|p| p.number == number)
+            .unwrap();
+        open.status = ProposalStatus::Merged;
+    });
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.shared, holds(number, Some(hers.clone())));
+    assert_eq!(record.start, Some(text(&plan())));
+
+    t.pull().await;
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert!(t.reads("alice", "plan").await.contains(HER_WORD));
+}
+
+/// She withdraws a proposal after a peer's change merged into her row: the row
+/// is left and named, and the next pass forgets what the proposal held while
+/// her start stays the team's text the merge read.
+#[tokio::test]
+async fn a_withdrawn_proposal_forgets_what_it_held_and_a_merged_row_is_left() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (_, number, _) = proposed(&t, "alice").await;
+    let shared = t.row("alice", "plan.md").await;
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, Some(shared)));
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let merged = t.row("alice", "plan.md").await;
+
+    let report = t
+        .eng
+        .origin_withdraw("team", None, true, ShareActor::Account("alice".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        report["skipped_diverged"],
+        serde_json::json!(["plan.md"]),
+        "{report}"
+    );
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, merged);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.shared, None);
+    assert_eq!(record.start, Some(text(&plan_later())));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// A reviewer declines her proposal: her draft stands as it was, and once the
+/// record leaves the chain the next pass forgets what it held, start untouched.
+#[tokio::test]
+async fn a_declined_proposal_leaves_the_draft_as_it_stands() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (_, number, _) = proposed(&t, "alice").await;
+    let hers = t.row("alice", "plan.md").await;
+    assert_eq!(
+        t.shared("alice", "plan.md"),
+        holds(number, Some(hers.clone()))
+    );
+
+    t.mock.set_proposal_state(number, ProposalState::Declined);
+    t.pull().await;
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    // The next share moves a declined record to history; this test does it.
+    t.state_edit(|state| {
+        let at = state
+            .proposals
+            .iter()
+            .position(|p| p.number == number)
+            .unwrap();
+        let declined = state.proposals.remove(at);
+        assert_eq!(declined.status, ProposalStatus::Declined);
+        state.push_history(declined);
+    });
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.shared, None);
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start, Some(text(&plan())));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// She amends her open proposal with another page only, after editing the
+/// shared one again. An amend proposes exactly what it carries, so the branch
+/// no longer holds that page: the record forgets it, and her draft stays with
+/// both her edits once the proposal merges.
+#[tokio::test]
+async fn an_amend_that_leaves_a_page_out_forgets_what_the_branch_held_of_it() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    let shared = t.row("alice", "plan.md").await;
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, Some(shared)));
+    same_line(&t).await;
+    t.write("alice", "Other", "a page only alice has").await;
+
+    let again = t.share("alice", Some(&["other.md"])).await;
+    assert_eq!(again["outcome"], "updated", "{again}");
+    assert_eq!(
+        again["proposal"]["number"].as_u64(),
+        Some(number),
+        "{again}"
+    );
+    assert_eq!(t.branch_file(&branch, "plan.md"), Some(plan()));
+    assert_eq!(t.shared("alice", "plan.md"), None);
+    let other = t.row("alice", "other.md").await;
+    assert_eq!(t.shared("alice", "other.md"), holds(number, Some(other)));
+
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.rows("alice").await, vec![("plan.md".to_string(), false)]);
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains(ALICE_LINE) && row.contains(HER_WORD), "{row}");
+}
+
+/// She edits the draft while her share is between the forge and recording
+/// what the proposal holds: the branch holds the text from before her edit, so
+/// the record is left without it, and her edit survives the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_while_a_share_records_what_it_holds_is_not_taken_for_it() {
+    let t = Arc::new(team(&[("plan.md", plan())]).await);
+    t.append("alice", "plan", HER_WORD).await;
+    let (entered, release) = t.eng.hold_next_proposal_record_until();
+    let share = {
+        let t = t.clone();
+        tokio::spawn(async move { t.share("alice", None).await })
+    };
+    entered.notified().await;
+    same_line(&t).await;
+    release.notify_one();
+    let answer = share.await.unwrap();
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let branch = answer["branch"].as_str().unwrap();
+    let held = text(&t.branch_file(branch, "plan.md").unwrap());
+    assert!(
+        held.contains(HER_WORD) && !held.contains(ALICE_LINE),
+        "{held}"
+    );
+    assert_eq!(t.shared("alice", "plan.md"), None);
+
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains(ALICE_LINE) && row.contains(HER_WORD), "{row}");
+}
+
+/// A reviewer took her whole change back out before merging, and the pass of
+/// the pull that brought the merge failed. Her record still starts from before
+/// the merge, where the team's text reads as in step, so the draft stands
+/// refused until a pass settles it, and no share carries her line again.
+#[tokio::test]
+async fn a_merged_proposal_whose_pass_failed_is_refused_until_settled() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, _, _) = proposed(&t, "alice").await;
+
+    t.merge(&answer, &[("plan.md", Some(plan()))]);
+    t.eng.fail_next_convergence();
+    t.pull().await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+    t.eng.fail_next_convergence();
+    let refused = t.share("alice", None).await;
+    assert_eq!(refused["outcome"], "conflicts_pending", "{refused}");
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan())));
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert!(!t.reads("alice", "plan").await.contains(HER_WORD));
+}
+
+/// A proposal of only the deletion half of her move merges: the deletion was
+/// hers, so the draft she moved starts nowhere and is a new page, as after a
+/// direct commit of that half.
+#[tokio::test]
+async fn a_merged_proposal_of_only_the_deletion_of_a_move_frees_the_draft() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let number = answer["number"].as_u64().unwrap();
+    assert_eq!(t.shared("alice", "plan.md"), holds(number, None));
+    assert_eq!(t.shared("alice", "renamed.md"), None);
+
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(
+        t.rows("alice").await,
+        vec![("renamed.md".to_string(), false)]
+    );
+    let record = t.record("alice", "renamed.md").unwrap();
+    assert_eq!((record.from, record.start), (None, None));
+}
+
+/// How her case move's proposal merged.
+#[derive(Clone, Copy, PartialEq)]
+enum CaseMerge {
+    /// As she shared it.
+    AsShared,
+    /// With the reviewer's word in place of hers.
+    Reviewed,
+    /// As she shared it, and she edited the draft again after sharing.
+    EditedSince,
+}
+
+/// Her edited case move `plan.md` to `Plan.md`, proposed and merged. A share
+/// does not carry the spelling, so the team's file stays `plan.md`.
+///
+/// Asserted per disk. Where the folder folds case the team's `plan.md` is her
+/// file, and both halves end, unless she edited the draft since. Where it keeps
+/// the two apart, her case move stays, in step with what merged: the start is
+/// the snapshot's real key, never `Plan.md`, which the snapshot does not hold
+/// and would read as the team deleting her page.
+async fn an_edited_case_move_merged(how: CaseMerge) {
+    let t = team(&[("plan.md", plan())]).await;
+    let folds = folds_case(&t.root());
+    eprintln!("the temp folder folds case: {folds}");
+    t.append("alice", "plan", HER_WORD).await;
+    t.moved("alice", "plan", "Plan.md").await;
+    let (answer, number, branch) = proposed(&t, "alice").await;
+    let held = text(&t.branch_file(&branch, "plan.md").unwrap());
+    assert!(held.contains(HER_WORD), "{held}");
+    assert_eq!(
+        t.shared("alice", "Plan.md"),
+        holds(number, Some(t.row("alice", "Plan.md").await))
+    );
+    assert_eq!(
+        t.shared("alice", "plan.md"),
+        None,
+        "the proposal does not delete the team's file"
+    );
+    let merged = match how {
+        CaseMerge::Reviewed => held.replace(HER_WORD, REVIEWED_WORD),
+        CaseMerge::AsShared | CaseMerge::EditedSince => held,
+    };
+    if how == CaseMerge::EditedSince {
+        same_line(&t).await;
+    }
+
+    t.merge(&answer, &[("plan.md", Some(merged.clone().into_bytes()))]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    if how == CaseMerge::EditedSince {
+        assert_eq!(
+            t.rows("alice").await,
+            vec![
+                ("Plan.md".to_string(), false),
+                ("plan.md".to_string(), true)
+            ]
+        );
+        let row = t.row("alice", "Plan.md").await;
+        assert!(row.contains(ALICE_LINE) && row.contains(HER_WORD), "{row}");
+        let record = t.record("alice", "Plan.md").unwrap();
+        assert_eq!(record.from.as_deref(), Some("plan.md"));
+        assert_eq!(record.start, t.forge_file("plan.md"));
+        return;
+    }
+    let reviewed = how == CaseMerge::Reviewed;
+    if folds {
+        assert_eq!(t.rows("alice").await, vec![]);
+        let read = t.reads("alice", "plan").await;
+        assert!(
+            read.contains(if reviewed { REVIEWED_WORD } else { HER_WORD }),
+            "{read}"
+        );
+    } else {
+        assert_eq!(
+            t.rows("alice").await,
+            vec![
+                ("Plan.md".to_string(), false),
+                ("plan.md".to_string(), true)
+            ]
+        );
+        let record = t.record("alice", "Plan.md").unwrap();
+        assert_eq!(record.from.as_deref(), Some("plan.md"));
+        assert_eq!(record.start, t.forge_file("plan.md"));
+        assert_eq!(record.shared, None);
+        assert_eq!(t.row("alice", "Plan.md").await, merged);
+    }
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn a_merged_proposal_of_an_edited_case_move_ends_on_a_folding_disk() {
+    an_edited_case_move_merged(CaseMerge::AsShared).await;
+}
+
+#[tokio::test]
+async fn a_merged_proposal_of_an_edited_case_move_a_reviewer_changed_ends_on_a_folding_disk() {
+    an_edited_case_move_merged(CaseMerge::Reviewed).await;
+}
+
+/// On either disk her case move stays when she wrote more since sharing: the
+/// merge carried only what she shared.
+#[tokio::test]
+async fn a_merged_proposal_of_a_case_move_she_edited_since_stays_on_either_disk() {
+    an_edited_case_move_merged(CaseMerge::EditedSince).await;
 }

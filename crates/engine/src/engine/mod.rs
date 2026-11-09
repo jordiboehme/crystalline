@@ -897,8 +897,9 @@ fn manifest_stamp(root: &Path) -> Option<(u64, i64)> {
     Some((meta.len(), i64::try_from(nanos).unwrap_or(i64::MAX)))
 }
 
-/// The two signals of `Engine::hold_next_room_screen_until` and
-/// `Engine::hold_next_apply_until`.
+/// The two signals of `Engine::hold_next_room_screen_until`,
+/// `Engine::hold_next_apply_until` and
+/// `Engine::hold_next_proposal_record_until`.
 #[cfg(any(test, feature = "testing"))]
 struct RoomScreenGate {
     entered: std::sync::Arc<tokio::sync::Notify>,
@@ -1112,6 +1113,12 @@ pub struct Engine {
     // `release`. See `Engine::hold_next_apply_until`.
     #[cfg(any(test, feature = "testing"))]
     hold_next_apply: std::sync::Mutex<Option<RoomScreenGate>>,
+    // A gate: when armed, the next share that opened or amended a proposal
+    // signals `entered` before it records what the proposal holds of each
+    // draft, then waits for `release`. See
+    // `Engine::hold_next_proposal_record_until`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_proposal_record: std::sync::Mutex<Option<RoomScreenGate>>,
     // A gate: when armed, the next try of an edit's live arm, or an
     // overwrite's, signals `entered` after it looked at the room and computed
     // its target, then waits for `release` before it composes. See
@@ -2552,6 +2559,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             hold_next_apply: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
+            hold_next_proposal_record: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
             hold_next_live_compose: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             hold_next_row_fence: std::sync::Mutex::new(None),
@@ -2978,6 +2987,41 @@ impl Engine {
         #[cfg(any(test, feature = "testing"))]
         {
             let gate = self.hold_next_live_compose.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+    }
+
+    /// Hold the next share that opened or amended a proposal after the forge
+    /// took it and before it records what the proposal holds of each draft: it
+    /// signals `entered` there and waits for `release`. Lets a test edit a
+    /// draft inside that window, which a person's typing cannot be timed to
+    /// hit. Armed for one share and consumed by it, and compiled out of a
+    /// released binary like the seams above.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_proposal_record_until(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let gate = RoomScreenGate {
+            entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let handles = (gate.entered.clone(), gate.release.clone());
+        *self.hold_next_proposal_record.lock().unwrap() = Some(gate);
+        handles
+    }
+
+    /// The gate above, consuming the arming; returns at once when none is
+    /// armed. Does nothing at all outside a test build.
+    async fn take_proposal_record_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let gate = self.hold_next_proposal_record.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
@@ -6656,6 +6700,11 @@ impl Engine {
             // a draft, which is why it screens nothing.
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
+            // What her proposals hold, settled before anything reads her
+            // records: a merged one moves the start of every row it carried.
+            let ends = self
+                .settle_shared_texts(domain, actor, entries, &state, &root)
+                .await;
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
             // First the renames the pull brought in: a plain draft follows its
             // file to where the team moved it, and is decided there below.
@@ -6709,7 +6758,7 @@ impl Engine {
                 match reading {
                     Ok(mut reading) => {
                         let settled = self
-                            .settle_drafts(&view, domain, domain_id, actor, &mut reading)
+                            .settle_drafts(&view, domain, domain_id, actor, &mut reading, &ends)
                             .await;
                         // What ended before an error is announced all the same.
                         pending.push_drops_from(domain, &view);
@@ -6812,6 +6861,10 @@ impl Engine {
     /// every write and every drop that acts on it re-reads its row under that
     /// row's draft lock and leaves a row that changed in between for the next
     /// pass, so a writer that came in meanwhile never loses its text.
+    ///
+    /// `ends` names the drafts whose case move a merged proposal of hers landed
+    /// (`Engine::settle_shared_texts`): each ends with its tombstone, by the
+    /// same locked re-read as any landed draft.
     async fn settle_drafts(
         &self,
         view: &DomainView<'_>,
@@ -6819,10 +6872,17 @@ impl Engine {
         domain_id: DomainId,
         actor: &str,
         reading: &mut draft_conflicts::Reading<'_>,
+        ends: &HashSet<String>,
     ) -> Result<Settled> {
         let mut settled = Settled::default();
         for i in 0..reading.rows.len() {
             if reading.is_old_half(i) {
+                continue;
+            }
+            if !reading.rows[i].tombstone && ends.contains(&reading.rows[i].path) {
+                settled.cleared += self
+                    .end_draft(view, domain, domain_id, actor, reading, i)
+                    .await?;
                 continue;
             }
             let (decision, team) = reading.decide(i)?;
@@ -6860,6 +6920,186 @@ impl Engine {
             }
         }
         Ok(settled)
+    }
+
+    /// Settle each of `actor`'s records that names a proposal by what became of
+    /// it ([`settle_shared`]), before her rows are read for the decision, so
+    /// the decision, the move pairs and the renames all read the settled
+    /// records.
+    ///
+    /// - A proposal still in the chain, in any status: left as it is.
+    /// - Merged: a draft starts from what the proposal held, at the key of the
+    ///   snapshot that holds the team's text for it ([`merged_key`]), so a
+    ///   reviewer's change merges as theirs and a later edit of hers merges
+    ///   against what the branch held. A tombstone starts from nothing at its
+    ///   own path, and a draft of hers that started there and that the
+    ///   proposal did not carry starts nowhere: the deletion that merged was
+    ///   hers, as after a direct commit of only that half.
+    /// - Anything else: the record forgets the proposal and keeps its start.
+    ///
+    /// **Her case move on a disk that folds case** lands at the spelling the
+    /// team has, so the snapshot holds no key at her path, and the start moved
+    /// to the shared text would leave the move in step for good. When her row
+    /// is still what the proposal held, the merge carried all of it: the record
+    /// is left as it is and the draft is answered, to end with its tombstone
+    /// under the same locked re-read as any landed draft. Should that end not
+    /// happen, the next pass settles it again. A row she edited since merges
+    /// from the key the team holds.
+    ///
+    /// Each record is saved under its draft lock, and only when it is still the
+    /// one read. Nothing here fails the pass: a record that cannot be read or
+    /// saved stays, and the next pass settles it.
+    async fn settle_shared_texts(
+        &self,
+        domain: &str,
+        actor: &str,
+        entries: &[StoredEngram],
+        state: &crystalline_remote::state::OriginState,
+        root: &Path,
+    ) -> HashSet<String> {
+        let mut ends = HashSet::new();
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return ends;
+        };
+        let load = |path: &str| {
+            crate::draft_start::load(&journal_dir, domain, actor, path)
+                .ok()
+                .flatten()
+        };
+        // A broken record is never read as none: the decision refuses it.
+        let mut held: Vec<(&StoredEngram, crate::draft_start::DraftStart)> = entries
+            .iter()
+            .filter_map(|entry| Some((entry, load(&entry.path)?)))
+            .filter(|(_, record)| record.shared.is_some())
+            .collect();
+        // Drafts first, and which proposal carried each, read before any is
+        // settled: a tombstone's rule leaves the drafts of its own proposal be.
+        held.sort_by_key(|(entry, _)| entry.tombstone);
+        let carried: HashSet<(String, u64)> = held
+            .iter()
+            .filter(|(entry, _)| !entry.tombstone)
+            .filter_map(|(entry, record)| {
+                Some((entry.path.clone(), record.shared.as_ref()?.proposal))
+            })
+            .collect();
+        let root_is_there = root.is_dir();
+        for (entry, record) in &held {
+            let Some(shared) = record.shared.clone() else {
+                continue;
+            };
+            let fate = settle_shared(record, state);
+            let settled = match fate {
+                SharedFate::Open => continue,
+                SharedFate::Ended => crate::draft_start::DraftStart {
+                    shared: None,
+                    ..record.clone()
+                },
+                SharedFate::Merged if entry.tombstone => crate::draft_start::DraftStart {
+                    from: Some(entry.path.clone()),
+                    start: shared.text.clone(),
+                    start_sha256: None,
+                    shared: None,
+                    ..record.clone()
+                },
+                SharedFate::Merged => {
+                    // C11: a folder that cannot say does not fold here.
+                    let folds_case =
+                        root_is_there && folder_folds_case(root, &entry.path) == Some(true);
+                    let key = merged_key(
+                        &entry.path,
+                        record.from.as_deref(),
+                        &state.files,
+                        folds_case,
+                    );
+                    let hers = shared.text.as_deref().is_some_and(|text| {
+                        crystalline_core::frontmatter::same_but_generated(
+                            text,
+                            &crystalline_core::to_lf(&entry.content),
+                        )
+                    });
+                    if folds_case && key != entry.path && hers {
+                        ends.insert(entry.path.clone());
+                        continue;
+                    }
+                    crate::draft_start::DraftStart {
+                        from: Some(key.to_string()),
+                        start: shared.text.clone(),
+                        start_sha256: None,
+                        shared: None,
+                        ..record.clone()
+                    }
+                }
+            };
+            let saved = self
+                .save_start_as_read(domain, actor, record, &settled)
+                .await;
+            if !(saved && entry.tombstone && fate == SharedFate::Merged) {
+                continue;
+            }
+            // Her deletion merged: a draft that started there and that the
+            // proposal did not carry starts nowhere now.
+            for draft in entries.iter().filter(|draft| !draft.tombstone) {
+                if carried.contains(&(draft.path.clone(), shared.proposal)) {
+                    continue;
+                }
+                let Some(start) = load(&draft.path) else {
+                    continue;
+                };
+                if start.from.as_deref() != Some(entry.path.as_str()) {
+                    continue;
+                }
+                let freed = crate::draft_start::DraftStart {
+                    from: None,
+                    start: None,
+                    start_sha256: None,
+                    ..start.clone()
+                };
+                self.save_start_as_read(domain, actor, &start, &freed).await;
+            }
+        }
+        ends
+    }
+
+    /// Save `settled` over `actor`'s record `read`, under that row's draft lock
+    /// and only when the record is still `read`. Answers whether it was saved; a
+    /// record somebody changed since is left for the next pass, and a failure
+    /// is warned about.
+    async fn save_start_as_read(
+        &self,
+        domain: &str,
+        actor: &str,
+        read: &crate::draft_start::DraftStart,
+        settled: &crate::draft_start::DraftStart,
+    ) -> bool {
+        let saved = async {
+            let lock = self.draft_lock(domain, actor, &read.path)?;
+            let _guard = lock.lock().await;
+            let journal_dir = self.journal_state_dir()?;
+            let now = crate::draft_start::load(&journal_dir, domain, actor, &read.path).map_err(
+                |source| EngineError::Io {
+                    path: format!("the draft start record of '{}'", read.path),
+                    source,
+                },
+            )?;
+            if now.as_ref() != Some(read) {
+                return Ok(false);
+            }
+            self.save_start(domain, actor, settled)?;
+            Ok::<bool, EngineError>(true)
+        };
+        match saved.await {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = read.path.as_str(),
+                    "what a proposal held of this draft could not be settled; the next pass \
+                     tries again: {e}"
+                );
+                false
+            }
+        }
     }
 
     /// End row `i` of a reading, and the tombstone half of its move first, so
@@ -8524,7 +8764,9 @@ mod disclosure;
 mod doc_file;
 mod draft_conflicts;
 pub use crate::draft_merge::DraftConflictKind;
-use crate::draft_merge::{DraftStep, answers_at_path, has_landed};
+use crate::draft_merge::{
+    DraftStep, SharedFate, answers_at_path, has_landed, merged_key, settle_shared,
+};
 #[allow(unused_imports)] // the Reflection verbs (Task 12) use the rest
 use doc_file::{
     FileLock, Swap, SwapRefused, check_swap, is_case_only_rename, read_opt, read_stamped,

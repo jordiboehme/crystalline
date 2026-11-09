@@ -33,13 +33,17 @@
 //!   domain's address map, and the caller asks that first.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use crystalline_core::frontmatter::same_but_generated;
 use crystalline_core::relink::{rebase_relative_links, respell_path_wikilinks};
 use crystalline_core::to_lf;
 use crystalline_remote::merge::{ConflictKind, FileMerge};
 use crystalline_remote::ops::merge_with_manifest_rule;
+use crystalline_remote::state::{BaseStamp, OriginState, ProposalStatus};
 use serde::Serialize;
+
+use crate::draft_start::DraftStart;
 
 /// Why a draft does not fit the team's text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -426,6 +430,75 @@ pub fn next_step(sides: &DraftSides<'_>) -> DraftStep {
         FileMerge::Delete => DraftStep::Conflict(EditDelete),
         FileMerge::Conflict(kind) => DraftStep::Conflict(kind.into()),
     }
+}
+
+/// What became of the proposal a record says holds this row
+/// (`DraftStart::shared`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedFate {
+    /// No proposal named, or one the chain still holds, whatever its status.
+    Open,
+    /// The team merged it: the row's start is now what the proposal held.
+    Merged,
+    /// Withdrawn, declined or no longer known: the proposal holds nothing of
+    /// hers any more, and the row keeps the start it had.
+    Ended,
+}
+
+/// What became of the proposal `record` says holds its row, read from the
+/// origin state.
+///
+/// Only history decides a merge. A status probe marks a record `Merged` in the
+/// chain before a pull has brought its text into the base, and moving the start
+/// to the shared text then would read the team's old text as a change of
+/// theirs: her own draft would take it. So a proposal still in the chain, in
+/// any status, is left as it is. One found in neither list is ended: history is
+/// capped, and a start that stays where it was can only refuse, never lose a
+/// word.
+pub fn settle_shared(record: &DraftStart, state: &OriginState) -> SharedFate {
+    let Some(shared) = record.shared.as_ref() else {
+        return SharedFate::Open;
+    };
+    if state.proposals.iter().any(|p| p.number == shared.proposal) {
+        return SharedFate::Open;
+    }
+    match state.history.iter().find(|p| p.number == shared.proposal) {
+        Some(p) if p.status == ProposalStatus::Merged => SharedFate::Merged,
+        _ => SharedFate::Ended,
+    }
+}
+
+/// The key of the base snapshot that holds the team's text for her row at
+/// `path` once a proposal of hers merged, which is where her start now is.
+///
+/// Her own path when the snapshot holds it. A share does not carry a case-only
+/// change of spelling, so her case move from `plan.md` to `Plan.md` lands at
+/// `plan.md`, and `Plan.md` is no key on either disk: then the key is where she
+/// started, when it is that spelling of her path. On a disk that folds case the
+/// folder holds one file for the two spellings, so the one key spelled so
+/// answers. Anywhere else her path, which the snapshot does not hold and which
+/// reads as the team having deleted it: a refusal, never a guess.
+pub fn merged_key<'a>(
+    path: &'a str,
+    from: Option<&'a str>,
+    files: &'a BTreeMap<String, BaseStamp>,
+    folds_case: bool,
+) -> &'a str {
+    if files.contains_key(path) {
+        return path;
+    }
+    let folded = crystalline_core::fold_path_case(path);
+    let spelled_so = |key: &str| crystalline_core::fold_path_case(key) == folded;
+    if let Some(from) = from.filter(|from| spelled_so(from) && files.contains_key(*from)) {
+        return from;
+    }
+    if folds_case {
+        let mut keys = files.keys().filter(|key| spelled_so(key));
+        if let (Some(key), None) = (keys.next(), keys.next()) {
+            return key;
+        }
+    }
+    path
 }
 
 impl From<ConflictKind> for DraftConflictKind {
@@ -2401,5 +2474,138 @@ mod tests {
             }
         }
         assert_eq!(seen, 4 * 2 * 2 * 6 * 11 * 11);
+    }
+
+    fn proposal(number: u64, status: ProposalStatus) -> crystalline_remote::state::Proposal {
+        crystalline_remote::state::Proposal {
+            number,
+            url: String::new(),
+            branch: format!("share/{number}"),
+            title: String::new(),
+            created_at: chrono::Utc::now(),
+            status,
+            files: Vec::new(),
+            head_commit: None,
+            pending_head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
+            author_login: None,
+        }
+    }
+
+    fn sharing(proposal: Option<u64>) -> DraftStart {
+        DraftStart {
+            path: "plan.md".to_string(),
+            from: Some("plan.md".to_string()),
+            start: Some(START.to_string()),
+            start_sha256: None,
+            shared: proposal.map(|proposal| crate::draft_start::SharedText {
+                proposal,
+                text: Some(HERS.to_string()),
+            }),
+            merged_at: None,
+            merging: None,
+        }
+    }
+
+    /// Only history decides a merge; the chain, in any status, leaves the
+    /// record be; anything else ends what the proposal held.
+    #[test]
+    fn settle_shared_reads_history_and_never_the_chain() {
+        use ProposalStatus::{Declined, Merged, Open, Withdrawn};
+        let state = |chain: Vec<(u64, ProposalStatus)>, history: Vec<(u64, ProposalStatus)>| {
+            let mut state = OriginState::new("acme/team", "main");
+            state.proposals = chain.into_iter().map(|(n, s)| proposal(n, s)).collect();
+            state.history = history.into_iter().map(|(n, s)| proposal(n, s)).collect();
+            state
+        };
+        let record = sharing(Some(7));
+        assert_eq!(
+            settle_shared(&sharing(None), &state(vec![], vec![(7, Merged)])),
+            SharedFate::Open,
+            "a record that names no proposal"
+        );
+        for status in [Open, Merged, Declined, Withdrawn] {
+            assert_eq!(
+                settle_shared(&record, &state(vec![(7, status)], vec![(7, Merged)])),
+                SharedFate::Open,
+                "{status:?} in the chain"
+            );
+        }
+        assert_eq!(
+            settle_shared(
+                &record,
+                &state(vec![(8, Open)], vec![(6, Withdrawn), (7, Merged)])
+            ),
+            SharedFate::Merged
+        );
+        for status in [Open, Declined, Withdrawn] {
+            assert_eq!(
+                settle_shared(&record, &state(vec![], vec![(7, status)])),
+                SharedFate::Ended,
+                "{status:?} in history"
+            );
+        }
+        assert_eq!(
+            settle_shared(&record, &state(vec![], vec![(8, Merged)])),
+            SharedFate::Ended,
+            "in neither list"
+        );
+    }
+
+    /// Her path when held; else where her case move started, on either disk;
+    /// else, only where the folder folds case, the one key spelled so; else her
+    /// path.
+    #[test]
+    fn merged_key_is_never_a_spelling_the_snapshot_does_not_hold() {
+        let files = |keys: &[&str]| -> BTreeMap<String, BaseStamp> {
+            keys.iter()
+                .map(|key| {
+                    let stamp = BaseStamp {
+                        sha256: String::new(),
+                        size: 0,
+                    };
+                    (key.to_string(), stamp)
+                })
+                .collect()
+        };
+        for folds in [true, false] {
+            let held = files(&["Plan.md", "plan.md"]);
+            assert_eq!(
+                merged_key("Plan.md", Some("plan.md"), &held, folds),
+                "Plan.md"
+            );
+            let held = files(&["plan.md"]);
+            assert_eq!(
+                merged_key("Plan.md", Some("plan.md"), &held, folds),
+                "plan.md"
+            );
+            let held = files(&["other.md"]);
+            assert_eq!(
+                merged_key("Plan.md", Some("plan.md"), &held, folds),
+                "Plan.md"
+            );
+            // A move to another name is no spelling of where it started.
+            let held = files(&["plan.md"]);
+            assert_eq!(
+                merged_key("renamed.md", Some("plan.md"), &held, folds),
+                "renamed.md"
+            );
+        }
+        let held = files(&["PLAN.md"]);
+        assert_eq!(merged_key("Plan.md", None, &held, true), "PLAN.md");
+        assert_eq!(merged_key("Plan.md", None, &held, false), "Plan.md");
+        assert_eq!(
+            merged_key("Plan.md", Some("plan.md"), &held, true),
+            "PLAN.md"
+        );
+        let held = files(&["PLAN.md", "plan.md"]);
+        assert_eq!(
+            merged_key("Plan.md", None, &held, true),
+            "Plan.md",
+            "two spellings are no one file"
+        );
     }
 }

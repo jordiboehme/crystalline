@@ -2504,11 +2504,15 @@ impl Engine {
                 // Whose the proposal is, in the sense review mode means it. The
                 // forge record cannot say (see
                 // `Engine::refuse_open_proposal_while_reviewing`), so it is
-                // recorded here, beside the drafts it carried.
+                // recorded here, beside the drafts it carried. So is what it
+                // holds of each draft, which becomes the draft's start once the
+                // team merges it.
                 if let Some(who) = drafting.as_deref()
                     && let Some(number) = proposal_number_of(&receipt)
                 {
                     self.record_proposal_actor(domain, number, Some(who));
+                    self.record_what_the_proposal_holds(domain, who, &state_dir, number)
+                        .await;
                 }
                 Ok(receipt)
             }
@@ -2539,6 +2543,170 @@ impl Engine {
                 }
                 Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
             }
+        }
+    }
+
+    /// After a share that opened or amended proposal `number`: each of
+    /// `actor`'s rows the proposal carries records what the branch holds of it
+    /// (`DraftStart::shared`), so that once the team merges it the draft starts
+    /// from that text and a reviewer's change reads as theirs (see
+    /// `Engine::settle_shared_texts`).
+    ///
+    /// A file the proposal changes maps to her draft at that path, or to her
+    /// case move whose record starts there: a share does not carry a case-only
+    /// change of spelling, so `plan.md` holds her `Plan.md`. A file it deletes
+    /// maps to her tombstone at that path. A row an earlier share of the same
+    /// proposal carried and this one did not forgets it: an amend proposes
+    /// exactly what it carries.
+    ///
+    /// **Only the text the branch holds is recorded.** Draft writers do not take
+    /// the origin lock, so a row can change between staging and here; it is
+    /// read again under its draft lock and recorded only when its digest is the
+    /// one the proposal recorded, in either line ending, or keeps what an
+    /// earlier share of the same proposal recorded when that is still the
+    /// digest. Any other row forgets what was recorded: a newer text taken as
+    /// the start would read her newer words as no edit, and the team's text
+    /// would replace them.
+    /// A row with no record is an old draft, which nothing here makes into a
+    /// known start.
+    ///
+    /// Best effort, like the rest of the share's tail: the proposal is on the
+    /// forge, so a failure is warned about. A row left without it merges against
+    /// the start it had, which can refuse but loses nothing.
+    async fn record_what_the_proposal_holds(
+        &self,
+        domain: &str,
+        actor: &str,
+        state_dir: &Path,
+        number: u64,
+    ) {
+        self.take_proposal_record_hold().await;
+        let recorded = async {
+            let Some(state) = crystalline_remote::state::OriginState::load(state_dir)? else {
+                return Ok(());
+            };
+            let Some(proposal) = state.proposals.iter().find(|p| p.number == number) else {
+                return Ok(());
+            };
+            let (domain_id, rows) = {
+                let store = self.store.lock().await;
+                let Some(domain_id) = store.domain_id(domain).await? else {
+                    return Ok(());
+                };
+                (domain_id, store.overlay_entries(domain_id, actor).await?)
+            };
+            let journal_dir = self.journal_state_dir()?;
+            let started_at = |path: &str| {
+                crate::draft_start::load(&journal_dir, domain, actor, path)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.from)
+            };
+            let fold = crystalline_core::fold_path_case;
+            let mut carried_rows: HashSet<String> = HashSet::new();
+            for file in &proposal.files {
+                let deletes = file.change == crystalline_remote::state::ProposedChange::Deleted;
+                let carried = rows
+                    .iter()
+                    .find(|row| row.tombstone == deletes && row.path == file.path)
+                    .or_else(|| {
+                        rows.iter().find(|row| {
+                            !deletes
+                                && !row.tombstone
+                                && row.path != file.path
+                                && fold(&row.path) == fold(&file.path)
+                                && started_at(&row.path).as_deref() == Some(file.path.as_str())
+                        })
+                    });
+                let Some(path) = carried.map(|row| row.path.clone()) else {
+                    continue;
+                };
+                carried_rows.insert(path.clone());
+                let lock = self.draft_lock(domain, actor, &path)?;
+                let _guard = lock.lock().await;
+                let row = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &path).await?
+                };
+                let Some(row) = row else {
+                    continue;
+                };
+                let record = crate::draft_start::load(&journal_dir, domain, actor, &path).map_err(
+                    |source| EngineError::Io {
+                        path: format!("the draft start record of '{path}'"),
+                        source,
+                    },
+                )?;
+                let Some(record) = record else {
+                    continue;
+                };
+                let holds = match file.sha256.as_deref() {
+                    Some(digest) => !row.tombstone && is_draft_digest(&row.content, digest),
+                    None => row.tombstone,
+                };
+                // A row edited since an earlier share of this proposal, which
+                // this one did not carry again: the branch still holds what was
+                // recorded then.
+                let held_before = record.shared.as_ref().is_some_and(|before| {
+                    before.proposal == number
+                        && match (file.sha256.as_deref(), before.text.as_deref()) {
+                            (Some(digest), Some(text)) => is_draft_digest(text, digest),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                });
+                let shared = if holds {
+                    Some(crate::draft_start::SharedText {
+                        proposal: number,
+                        text: (!row.tombstone)
+                            .then(|| crystalline_core::to_lf(&row.content).into_owned()),
+                    })
+                } else if held_before {
+                    record.shared.clone()
+                } else {
+                    None
+                };
+                if record.shared != shared {
+                    self.save_start(
+                        domain,
+                        actor,
+                        &crate::draft_start::DraftStart { shared, ..record },
+                    )?;
+                }
+            }
+            // An amend proposes what this share carried and nothing else, so a
+            // row an earlier share of it carried and this one left out is no
+            // longer on the branch.
+            for row in rows.iter().filter(|row| !carried_rows.contains(&row.path)) {
+                let lock = self.draft_lock(domain, actor, &row.path)?;
+                let _guard = lock.lock().await;
+                let record = crate::draft_start::load(&journal_dir, domain, actor, &row.path)
+                    .map_err(|source| EngineError::Io {
+                        path: format!("the draft start record of '{}'", row.path),
+                        source,
+                    })?;
+                if let Some(record) = record
+                    && record.shared.as_ref().is_some_and(|s| s.proposal == number)
+                {
+                    self.save_start(
+                        domain,
+                        actor,
+                        &crate::draft_start::DraftStart {
+                            shared: None,
+                            ..record
+                        },
+                    )?;
+                }
+            }
+            Ok::<(), EngineError>(())
+        };
+        if let Err(e) = recorded.await {
+            tracing::warn!(
+                domain,
+                actor,
+                "what proposal #{number} holds of the drafts could not be recorded; they merge \
+                 against where they started: {e}"
+            );
         }
     }
 

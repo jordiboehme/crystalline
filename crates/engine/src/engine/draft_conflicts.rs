@@ -27,7 +27,8 @@ use super::{
     sha256_hex, utf8_side,
 };
 use crate::draft_merge::{
-    DraftConflictKind, DraftSides, DraftStep, TeamText, answers_at_path, has_landed, next_step,
+    DraftConflictKind, DraftSides, DraftStep, SharedFate, TeamText, answers_at_path, has_landed,
+    next_step, settle_shared,
 };
 use crate::draft_start::{self, DraftStart};
 use crate::origin::takes_part_in_local_change;
@@ -362,6 +363,21 @@ impl Reading<'_> {
                 .filter(|other| **other != row.path)
         {
             return Ok((Decision::AddressTaken(other.clone()), team));
+        }
+        // A proposal of hers merged and no pass has settled what it held: her
+        // start is from before the merge, so the team's text cannot be read
+        // against it. A reviewer who took her change back out would read as in
+        // step, and a share would carry her change again. It stands refused
+        // until a pass settles it, as a merge whose start has not moved does.
+        if let Some(record) = &self.records[i]
+            && settle_shared(record, self.base.state) == SharedFate::Merged
+        {
+            let kind = if row.tombstone {
+                DraftConflictKind::DeleteEdit
+            } else {
+                DraftConflictKind::EditEdit
+            };
+            return Ok((Decision::Step(DraftStep::Conflict(kind)), team));
         }
         // C9: branch on the record before the decision.
         let decision = match self.records[i] {
