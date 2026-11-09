@@ -21,6 +21,18 @@ export interface ConflictDialogProps {
   conflictId: string;
   /** Leave the dialog: cancelled, dismissed, or a conflict that was settled. */
   onClose: () => void;
+  /**
+   * Set for one of this session's own drafts that does not fit the team's
+   * text, and absent for the folder's conflict. With it the dialog reads and
+   * settles through the draft routes and says the kind in plain words; what
+   * it knows of the conflict before the sides arrive comes from here.
+   */
+  draft?: {
+    kind: string;
+    movedFrom: string | null;
+    other: string | null;
+    file: boolean;
+  };
 }
 
 export function ConflictDialog(props: ConflictDialogProps): ReactElement {

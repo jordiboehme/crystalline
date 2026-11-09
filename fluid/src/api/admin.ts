@@ -1216,6 +1216,9 @@ function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
   const connection = asObject(record?.connection);
   const connected = connection?.connected;
+  const folderConflicts = asArray(record?.conflicts).filter(
+    (entry) => asObject(entry)?.draft !== true,
+  );
   return {
     repo: asString(record?.repo) ?? "",
     branch: asString(record?.branch),
@@ -1227,7 +1230,12 @@ function readSyncStatus(payload: unknown): SyncStatus {
     ownedChanges: asNumber(record?.owned_changes),
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
-    conflicts: asCount(record?.conflicts),
+    // The folder's conflicts only. A reviewing domain's status also lists
+    // this session's own draft conflicts (`draft: true`); those are settled
+    // from the domain page through the draft routes, so the sync card neither
+    // counts them nor opens them, and one conflict is never drawn twice. A
+    // number is a count already (the poll overview counts the folder's).
+    conflicts: asNumber(record?.conflicts) ?? folderConflicts.length,
     // The key's presence is what says the domain reviews at all: the server
     // leaves both draft keys out of a domain that takes changes directly,
     // where `0 drafts` would read as "you could have some".
@@ -1255,7 +1263,7 @@ function readSyncStatus(payload: unknown): SyncStatus {
     ]
       .map(readProposal)
       .filter((proposal): proposal is SyncProposal => proposal !== null),
-    conflictList: asArray(record?.conflicts)
+    conflictList: folderConflicts
       .map(readConflict)
       .filter((conflict): conflict is SyncConflict => conflict !== null),
     // The four chain keys, which the route always sends and an older report
@@ -1461,6 +1469,14 @@ export interface SharePlan {
    * what a person ticks and discards.
    */
   teamMarker: TeamMarker | null;
+  /**
+   * This session's own drafts that do not fit the team's text, in a domain
+   * that reviews changes: the plan's `draft_conflicts` (a plan of every file)
+   * or its `conflicts` (a `conflicts_pending` plan of named files). Empty
+   * elsewhere, and from an older server. A file among them cannot travel
+   * until it is settled.
+   */
+  draftConflicts: DraftConflict[];
 }
 
 /** A file a share adds on its own, and why: the team marker in the MANIFEST. */
@@ -1555,6 +1571,11 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     note: asString(record?.note),
     spellingNote: asString(record?.spelling_note),
     teamMarker: readTeamMarker(record?.team_marker),
+    // A plan of every file names them beside its action; a plan of named
+    // files that one of them blocks names them as its `conflicts`.
+    draftConflicts: readDraftConflicts(
+      record?.draft_conflicts ?? record?.conflicts,
+    ),
   };
 }
 
@@ -1709,6 +1730,171 @@ export async function resolveConflict(
     `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
     { method: "POST", body: JSON.stringify({ resolution, content }) },
   );
+}
+
+/**
+ * Why one of your drafts does not fit the team's text, in the server's word:
+ * `EditEdit`, `EditDelete`, `DeleteEdit`, `AddAdd`, `UnknownStart` or
+ * `AddressTaken`. Kept as a string, so a word this side has not been taught
+ * still opens the dialog rather than vanishing.
+ */
+export type DraftConflictKind = string;
+
+/** One of this session's own drafts that does not fit the team's text. */
+export interface DraftConflict {
+  /** `d` and seven hex digits; what the draft routes are addressed by. */
+  id: string;
+  /** The draft's path, or the deletion's when it stands alone. */
+  path: string;
+  kind: DraftConflictKind;
+  /** The path a moved draft left, or null. */
+  movedFrom: string | null;
+  /** For `AddressTaken`: the team's path that holds the address, or null. */
+  other: string | null;
+  /** A file beside the pages rather than a page. */
+  file: boolean;
+}
+
+/** This session's own draft conflicts in one domain, and its merged drafts. */
+export interface DraftConflicts {
+  conflicts: DraftConflict[];
+  /** Paths of drafts a merge changed since they last settled, sorted. */
+  merged: string[];
+}
+
+/** One draft conflict with its sides, for the dialog that settles it. */
+export interface DraftConflictDetail extends DraftConflict {
+  base: string | null;
+  local: string | null;
+  upstream: string | null;
+  note: string | null;
+}
+
+/** What settling one draft conflict did. */
+export interface DraftResolveReceipt {
+  /** `mine`, `theirs` or `merged`. */
+  kept: string;
+  /** Whether a copy of the text or file was kept before taking the team's. */
+  keptCopy: boolean;
+  /** For a kept file: where to find it, in the server's words. */
+  keptNote: string | null;
+  /** The draft landed but its copy on the server's disk did not. */
+  draftWarning: string | null;
+  /** How many conflicts are left, or null when they could not be counted. */
+  remaining: number | null;
+}
+
+/**
+ * The cache key of one domain's own draft conflicts.
+ *
+ * Under the `["domains", ...]` family on purpose: the list is a plain GET that
+ * pulls nothing, so a bulk invalidation re-reading it costs one round trip,
+ * and a Sync now that merged a team change into a draft is then shown at once.
+ */
+export function draftConflictsKey(domain: string): readonly unknown[] {
+  return ["domains", domain, "draft-conflicts"];
+}
+
+/** The cache key of one draft conflict with its sides. */
+export function draftConflictKey(
+  domain: string,
+  id: string,
+): readonly unknown[] {
+  return ["domains", domain, "draft-conflicts", id];
+}
+
+/** One draft conflict entry, or nothing when it has no id or path. */
+export function readDraftConflict(value: unknown): DraftConflict | null {
+  const record = asObject(value);
+  const id = asString(record?.id);
+  const path = asString(record?.path);
+  if (id === null || path === null) {
+    return null;
+  }
+  return {
+    id,
+    path,
+    kind: asString(record?.kind) ?? "",
+    movedFrom: asString(record?.moved_from),
+    other: asString(record?.other),
+    file: record?.file === true,
+  };
+}
+
+/** Every entry of a list that reads as a draft conflict. */
+function readDraftConflicts(value: unknown): DraftConflict[] {
+  return asArray(value)
+    .map(readDraftConflict)
+    .filter((conflict): conflict is DraftConflict => conflict !== null);
+}
+
+function draftConflictsPath(domain: string, id?: string): string {
+  const base = `/domains/${encodeSegment(domain)}/drafts/conflicts`;
+  return id === undefined ? base : `${base}/${encodeSegment(id)}`;
+}
+
+/**
+ * This session's own draft conflicts and merged drafts in `domain`.
+ *
+ * Any writer may ask, the editor with no share role included: the route is
+ * the draft's author's, where `/sync` is the folder's and needs that role. A
+ * list that cannot be read is refused with the server's sentence (422), never
+ * answered as empty.
+ */
+export async function fetchDraftConflicts(
+  domain: string,
+): Promise<DraftConflicts> {
+  const record = asObject(await api<unknown>(draftConflictsPath(domain)));
+  return {
+    conflicts: readDraftConflicts(record?.conflicts),
+    merged: asStrings(record?.merged),
+  };
+}
+
+/** One of this session's draft conflicts, with its sides. */
+export async function fetchDraftConflict(
+  domain: string,
+  id: string,
+): Promise<DraftConflictDetail> {
+  const record = asObject(await api<unknown>(draftConflictsPath(domain, id)));
+  return {
+    // The id that was asked for, when the answer did not repeat it: the
+    // resolve is addressed by it.
+    ...(readDraftConflict({ id, ...record }) ?? {
+      id,
+      path: "",
+      kind: "",
+      movedFrom: null,
+      other: null,
+      file: false,
+    }),
+    base: asString(record?.base),
+    local: asString(record?.local),
+    upstream: asString(record?.upstream),
+    note: asString(record?.note),
+  };
+}
+
+/** Settle one draft conflict: `mine`, `theirs`, or `merged` with content. */
+export async function resolveDraftConflict(
+  domain: string,
+  id: string,
+  resolution: string,
+  content?: string,
+): Promise<DraftResolveReceipt> {
+  const record = asObject(
+    await api<unknown>(`${draftConflictsPath(domain, id)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution, content }),
+    }),
+  );
+  return {
+    kept: asString(record?.kept) ?? resolution,
+    keptCopy: record?.kept_copy === true,
+    keptNote: asString(record?.kept_note),
+    draftWarning: asString(record?.draft_warning),
+    remaining: asNumber(record?.remaining),
+  };
 }
 
 /** The engram a changed file holds, when it holds one and it parses. */

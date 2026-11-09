@@ -8,7 +8,8 @@
  * on the screen could open it.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,6 +22,8 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import type { ConflictDialogProps } from "./ConflictDialog";
+import { ConflictDialog } from "./ConflictDialog";
 
 // Above roughly load average 33 this file's slower tests exceed the 5000 ms
 // default (a threshold effect measured 2026-08-14, plans history); the raise
@@ -453,5 +456,384 @@ describe("the conflict dialog", () => {
     expect(within(dialog).queryByRole("button", { name: "Take theirs" })).toBe(
       null,
     );
+  });
+});
+
+/** One of this session's draft conflicts with its sides, as the route sends it. */
+function draftSides(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "d1234567",
+    path: "notes/a.md",
+    kind: "EditEdit",
+    moved_from: null,
+    other: null,
+    base: "the start",
+    local: "my draft text",
+    upstream: "the team's new text",
+    note: null,
+    detected_at: null,
+    draft: true,
+    ...overrides,
+  };
+}
+
+/**
+ * Serve the two draft routes for `d1234567`, recording each resolve body;
+ * every other path is a 404, the folder's routes included.
+ */
+function serveDraft(sides: Record<string, unknown> = draftSides()) {
+  const resolved: unknown[] = [];
+  apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+    await Promise.resolve();
+    if (path === "/domains/eng/drafts/conflicts/d1234567") {
+      return sides;
+    }
+    if (
+      path === "/domains/eng/drafts/conflicts/d1234567/resolve" &&
+      init?.method === "POST"
+    ) {
+      resolved.push(
+        typeof init.body === "string" ? JSON.parse(init.body) : init.body,
+      );
+      return {
+        draft: true,
+        kept: "mine",
+        kept_copy: false,
+        remaining: 0,
+      };
+    }
+    throw new ApiProblem(404, "not found", `no stub for ${path}`);
+  });
+  return resolved;
+}
+
+/** The dialog for a draft conflict, mounted on its own. */
+function mountDraft(
+  draft: NonNullable<ConflictDialogProps["draft"]>,
+  onClose: () => void = vi.fn(),
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <ConflictDialog
+        domain="eng"
+        conflictId="d1234567"
+        draft={draft}
+        onClose={onClose}
+      />
+    </QueryClientProvider>,
+  );
+  return { client, unmount: view.unmount };
+}
+
+const EDIT_EDIT = {
+  kind: "EditEdit",
+  movedFrom: null,
+  other: null,
+  file: false,
+};
+
+/** The accessible description a control points at, as one string. */
+function hintOf(control: HTMLElement): string {
+  return (control.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter((id) => id !== "")
+    .map((id) => document.getElementById(id)?.textContent ?? "")
+    .join(" ");
+}
+
+describe("the conflict dialog for a draft", () => {
+  it("uses the draft routes and the labels Your draft and The team's text", async () => {
+    const resolved = serveDraft();
+    const onClose = vi.fn();
+    mountDraft(EDIT_EDIT, onClose);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+
+    expect(await within(dialog).findByText("my draft text")).toBeVisible();
+    expect(within(dialog).getByText("the team's new text")).toBeVisible();
+    expect(within(dialog).getByText("Your draft")).toBeVisible();
+    expect(within(dialog).getByText("The team's text")).toBeVisible();
+    // The folder's words are not a draft's.
+    expect(within(dialog).queryByText("Mine (local)")).toBeNull();
+    expect(within(dialog).queryByText("Theirs (upstream)")).toBeNull();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Keep mine" }),
+    );
+    await waitFor(() => {
+      expect(resolved).toEqual([{ resolution: "mine" }]);
+    });
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalled();
+    });
+    // Never the folder's route, which answers 404 for a draft's id.
+    expect(
+      apiMock.mock.calls.some(([path]) => path.includes("/sync/conflicts")),
+    ).toBe(false);
+  });
+
+  it("says the kind's sentence for each kind", async () => {
+    const rows: [Record<string, unknown>, string][] = [
+      [
+        { kind: "EditEdit" },
+        "You and the team changed the same lines of notes/a.md.",
+      ],
+      [
+        { kind: "EditEdit", moved_from: "notes/old.md" },
+        "You moved notes/old.md to notes/a.md, and the team changed it. The changes do not fit together.",
+      ],
+      [{ kind: "EditDelete" }, "You changed notes/a.md. The team deleted it."],
+      [{ kind: "DeleteEdit" }, "You deleted notes/a.md. The team changed it."],
+      [
+        { kind: "AddAdd" },
+        "You and the team both have a file at notes/a.md, with different text.",
+      ],
+      [
+        { kind: "UnknownStart" },
+        "This draft is from an older version, so we cannot tell what the team changed since. Compare the two texts.",
+      ],
+      [
+        { kind: "AddressTaken", other: "notes/z.md" },
+        "The team's file notes/z.md now uses the same address as your draft of notes/a.md.",
+      ],
+    ];
+    for (const [over, sentence] of rows) {
+      serveDraft(draftSides(over));
+      const view = mountDraft({
+        kind: String(over.kind),
+        movedFrom: (over.moved_from as string | undefined) ?? null,
+        other: (over.other as string | undefined) ?? null,
+        file: false,
+      });
+      const dialog = await screen.findByRole("dialog", {
+        name: "Settle conflict",
+      });
+      await waitFor(() => {
+        expect(dialog).toHaveAccessibleDescription(sentence);
+      });
+      view.unmount();
+    }
+  });
+
+  it("says what each choice does", async () => {
+    serveDraft();
+    mountDraft(EDIT_EDIT);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const mine = await within(dialog).findByRole("button", {
+      name: "Keep mine",
+    });
+    const theirs = within(dialog).getByRole("button", { name: "Take theirs" });
+
+    expect(hintOf(mine)).toBe("Your text replaces the team's when you share.");
+    expect(hintOf(theirs)).toBe("Your draft ends and your text is gone.");
+    expect(
+      within(dialog).getByRole("button", { name: "Edit merged" }),
+    ).toBeEnabled();
+  });
+
+  it("says a copy is kept for an old draft", async () => {
+    serveDraft(draftSides({ kind: "UnknownStart" }));
+    mountDraft({ ...EDIT_EDIT, kind: "UnknownStart" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const theirs = await within(dialog).findByRole("button", {
+      name: "Take theirs",
+    });
+
+    expect(hintOf(theirs)).toBe(
+      "Your draft ends. A copy stays in your kept texts.",
+    );
+  });
+
+  it("turns Keep mine off for a taken address with the hint", async () => {
+    const resolved = serveDraft(
+      draftSides({ kind: "AddressTaken", other: "notes/z.md" }),
+    );
+    mountDraft({ ...EDIT_EDIT, kind: "AddressTaken", other: "notes/z.md" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const mine = await within(dialog).findByRole("button", {
+      name: "Keep mine",
+    });
+
+    expect(mine).toBeDisabled();
+    expect(hintOf(mine)).toBe(
+      "Change the address in Edit merged, or take theirs.",
+    );
+    // The two ways it does name stay open.
+    expect(
+      within(dialog).getByRole("button", { name: "Edit merged" }),
+    ).toBeEnabled();
+    expect(
+      within(dialog).getByRole("button", { name: "Take theirs" }),
+    ).toBeEnabled();
+    await userEvent.click(mine);
+    expect(resolved).toEqual([]);
+  });
+
+  it("hides Edit merged for a file", async () => {
+    serveDraft(
+      draftSides({
+        path: "assets/deck.pdf",
+        base: null,
+        local: null,
+        upstream: null,
+        note: "A file has no text to compare. Keep yours or take the team's.",
+        file: true,
+      }),
+    );
+    mountDraft({ ...EDIT_EDIT, file: true });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+
+    expect(
+      await within(dialog).findByText(
+        "A file cannot be merged here. Keep one of the two.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).queryByRole("button", { name: "Edit merged" }),
+    ).toBeNull();
+    expect(
+      within(dialog).getByRole("button", { name: "Keep mine" }),
+    ).toBeEnabled();
+    expect(
+      within(dialog).getByRole("button", { name: "Take theirs" }),
+    ).toBeEnabled();
+    // The server's own sentence about the file, as it was sent.
+    expect(
+      within(dialog).getByText(
+        "A file has no text to compare. Keep yours or take the team's.",
+      ),
+    ).toBeVisible();
+    // A file's sides are not deletions.
+    expect(within(dialog).queryByText("You deleted this file.")).toBeNull();
+    expect(
+      within(dialog).queryByText("The team deleted this file."),
+    ).toBeNull();
+  });
+
+  it("says You deleted this file. and The team deleted this file. on an empty side", async () => {
+    serveDraft(draftSides({ kind: "DeleteEdit", local: null }));
+    const first = mountDraft({ ...EDIT_EDIT, kind: "DeleteEdit" });
+    let dialog = await screen.findByRole("dialog", { name: "Settle conflict" });
+    expect(
+      await within(dialog).findByText("You deleted this file."),
+    ).toBeVisible();
+    expect(within(dialog).getByText("the team's new text")).toBeVisible();
+    first.unmount();
+
+    serveDraft(draftSides({ kind: "EditDelete", upstream: null }));
+    mountDraft({ ...EDIT_EDIT, kind: "EditDelete" });
+    dialog = await screen.findByRole("dialog", { name: "Settle conflict" });
+    expect(
+      await within(dialog).findByText("The team deleted this file."),
+    ).toBeVisible();
+    expect(within(dialog).getByText("my draft text")).toBeVisible();
+  });
+
+  it("shows the server's note about a kept copy before it closes", async () => {
+    const onClose = vi.fn();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      await Promise.resolve();
+      if (path === "/domains/eng/drafts/conflicts/d1234567") {
+        return draftSides({
+          kind: "UnknownStart",
+          file: true,
+          local: null,
+          upstream: null,
+        });
+      }
+      if (init?.method === "POST") {
+        return {
+          draft: true,
+          file: true,
+          kept: "theirs",
+          kept_copy: true,
+          kept_note: "A copy of your file is kept. Find it in your kept list.",
+          remaining: 0,
+        };
+      }
+      throw new ApiProblem(404, "not found", path);
+    });
+    mountDraft({ ...EDIT_EDIT, kind: "UnknownStart", file: true }, onClose);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Take theirs" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "A copy of your file is kept. Find it in your kept list.",
+      ),
+    ).toBeVisible();
+    expect(onClose).not.toHaveBeenCalled();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close" }),
+    );
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("reads the draft list and the share plan again once settled", async () => {
+    serveDraft();
+    const { client } = mountDraft(EDIT_EDIT);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Take theirs" }),
+    );
+
+    await waitFor(() => {
+      const keys = invalidate.mock.calls.map((call) =>
+        JSON.stringify(call[0]?.queryKey),
+      );
+      expect(keys).toContain(
+        JSON.stringify(["domains", "eng", "draft-conflicts"]),
+      );
+      expect(keys).toContain(JSON.stringify(["share-plan", "eng"]));
+      expect(keys).toContain(JSON.stringify(["domains", "eng", "sync"]));
+    });
+  });
+
+  it("a dialog with no draft prop reads as before", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const dialog = await openConflictDialog();
+
+    // The folder's conflict keeps its own words and its own route.
+    expect(await within(dialog).findByText("Mine (local)")).toBeVisible();
+    expect(within(dialog).getByText("Theirs (upstream)")).toBeVisible();
+    expect(dialog).toHaveAccessibleDescription(
+      "notes/a.md - this copy and the team's changed the same engram.",
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Keep mine" }),
+    ).toBeEnabled();
+    expect(
+      within(dialog).getByRole("button", { name: "Edit merged" }),
+    ).toBeEnabled();
+    // Never a draft's sides or resolve. (The domain page's notice reads the
+    // draft list beside the card; that is the notice's, not this dialog's.)
+    expect(
+      apiMock.mock.calls.some(([path]) =>
+        path.startsWith("/domains/eng/drafts/conflicts/"),
+      ),
+    ).toBe(false);
   });
 });

@@ -95,6 +95,23 @@ impl Engine {
         Ok((found, text))
     }
 
+    /// One kept copy of `domain` as its bytes, with the same rights and
+    /// answers as [`Engine::kept_text`]. A draft file kept as its bytes can
+    /// only be had this way; a text comes back as it was kept.
+    pub async fn kept_bytes(
+        &self,
+        domain: &str,
+        id: &str,
+        scope: &Scope,
+    ) -> Result<(KeptText, Vec<u8>)> {
+        let found = self.kept_entry(domain, id, scope).await?;
+        let bytes = std::fs::read(&found.file).map_err(|source| EngineError::Io {
+            path: found.file.display().to_string(),
+            source,
+        })?;
+        Ok((found, bytes))
+    }
+
     /// Delete one kept text of `domain`, with the same rights and answers
     /// as [`Engine::kept_text`]. Only ever on a person's request.
     pub async fn drop_kept_text(&self, domain: &str, id: &str, scope: &Scope) -> Result<()> {

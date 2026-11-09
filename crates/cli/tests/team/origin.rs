@@ -2187,7 +2187,7 @@ mod chain {
                 "file": true,
                 "kept": "theirs",
                 "kept_copy": true,
-                "kept_file": "/home/me/kept/team/assets/deck.png.md",
+                "kept_file": "/home/me/kept/team/draft/owner/engram/assets/deck.png.20261015T080000Z.png",
             }),
         );
         let out = daemon.run(&[
@@ -2204,7 +2204,7 @@ mod chain {
         );
         assert!(
             out.contains(
-                "A copy is kept at /home/me/kept/team/assets/deck.png.md: see crystalline kept \
+                "A copy is kept at /home/me/kept/team/draft/owner/engram/assets/deck.png.20261015T080000Z.png: see crystalline kept \
                  list."
             ),
             "{out}"

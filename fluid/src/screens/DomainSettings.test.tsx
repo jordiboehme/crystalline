@@ -843,6 +843,38 @@ describe("the domain settings kept texts section", () => {
     ).toHaveTextContent("Please add the rollback step.");
   });
 
+  it("offers a kept file as a download, not as a text to show", async () => {
+    serveKept([
+      keptEntry({
+        id: "f1",
+        draft: true,
+        path: "assets/deck.pdf",
+        file: true,
+      }),
+    ]);
+    renderApp("/d/eng/settings");
+    const section = await screen.findByRole("region", { name: "Kept texts" });
+
+    // A link the browser saves from, at the route that serves the bytes;
+    // there is no text to show.
+    const download = within(section).getByRole("link", {
+      name: "Download the kept file for assets/deck.pdf",
+    });
+    expect(download).toHaveAttribute(
+      "href",
+      "/api/v1/domains/eng/kept/f1/file",
+    );
+    expect(download).toHaveAttribute("download");
+    expect(
+      within(section).queryByRole("button", { name: /^Show the kept/ }),
+    ).toBeNull();
+    expect(
+      within(section).getByRole("button", {
+        name: "Drop the kept file for assets/deck.pdf",
+      }),
+    ).toBeVisible();
+  });
+
   it("drops a kept text after a confirm, then says none are left", async () => {
     const dropped = serveKept([keptEntry()]);
     renderApp("/d/eng/settings");

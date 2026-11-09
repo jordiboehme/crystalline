@@ -247,11 +247,16 @@ pub(crate) fn plan_json(
                 object.insert("files_unreadable".to_string(), json!(true));
             }
             // The same for an actor whose conflicts could not be read: a fold
-            // of them refuses, and the plan says why before anyone answers.
+            // of them refuses, and the plan says why before anyone answers,
+            // in the refusal's own sentence for this reader.
             if standing.unreadable.contains(&held.actor)
                 && let Some(object) = actor.as_object_mut()
             {
                 object.insert("conflicts_unreadable".to_string(), json!(true));
+                object.insert(
+                    "conflicts_unreadable_reason".to_string(),
+                    json!(unreadable_reason(&held.actor, standing.reader)),
+                );
             }
             actor
         })
@@ -397,6 +402,13 @@ pub(crate) fn unreadable(
         false => format!("Nothing in '{domain}' was folded."),
         true => format!("Nothing more in '{domain}' was folded."),
     };
+    format!("{lead} {}", unreadable_reason(actor, reader))
+}
+
+/// Why `actor`'s drafts cannot be folded when their conflicts could not be
+/// read, and the way out `reader` can take: the refusal's sentence without
+/// its lead, which a plan carries on that actor before anybody answers.
+pub(crate) fn unreadable_reason(actor: &str, reader: Reader<'_>) -> String {
     // Only an admin can read the daemon log the cause went to, or repair the
     // records under the state folder.
     let repair = match reader.admin {
@@ -405,13 +417,13 @@ pub(crate) fn unreadable(
     };
     if reader.viewer == Some(actor) {
         format!(
-            "{lead} Your draft records could not be read, so your drafts cannot be folded \
-             safely. Choose discard, which ends your text, or {repair}."
+            "Your draft records could not be read, so your drafts cannot be folded safely. \
+             Choose discard, which ends your text, or {repair}."
         )
     } else {
         format!(
-            "{lead} The draft records of '{actor}' could not be read, so their drafts cannot be \
-             folded safely. Choose discard for '{actor}', which ends their text, or {repair}."
+            "The draft records of '{actor}' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for '{actor}', which ends their text, or {repair}."
         )
     }
 }
@@ -754,6 +766,42 @@ mod tests {
         let own = unreadable("eng", "jo", reader, false);
         assert!(!own.contains("log"), "{own}");
         assert!(own.contains("ask an admin"), "{own}");
+    }
+
+    /// The plan's sentence for an actor whose conflicts could not be read is
+    /// the refusal's without its lead: their own to the actor, a colleague's
+    /// to anyone else, and the repair the reader can do.
+    #[test]
+    fn an_unreadable_actor_reason_is_the_refusal_without_its_lead() {
+        let as_jo = |admin| Reader {
+            viewer: Some("jo"),
+            admin,
+        };
+        assert_eq!(
+            unreadable_reason("ada", as_jo(false)),
+            "The draft records of 'ada' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for 'ada', which ends their text, or ask an admin to repair \
+             the records and fold again."
+        );
+        assert_eq!(
+            unreadable_reason("jo", as_jo(false)),
+            "Your draft records could not be read, so your drafts cannot be folded safely. \
+             Choose discard, which ends your text, or ask an admin to repair the records and \
+             fold again."
+        );
+        assert_eq!(
+            unreadable_reason("ada", as_jo(true)),
+            "The draft records of 'ada' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for 'ada', which ends their text, or repair the records the \
+             daemon log names and fold again."
+        );
+        assert_eq!(
+            unreadable("eng", "ada", as_jo(true), false),
+            format!(
+                "Nothing in 'eng' was folded. {}",
+                unreadable_reason("ada", as_jo(true))
+            )
+        );
     }
 
     /// A domain owner who is not an admin cannot end a removed name's drafts,

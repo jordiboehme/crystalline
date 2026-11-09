@@ -77,7 +77,7 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 import { useEffect, useId, useMemo, useState } from "react";
 
-import type { DiscardReceipt, SharePlan } from "../api/admin";
+import type { DiscardReceipt, DraftConflict, SharePlan } from "../api/admin";
 import {
   SYNC_SUMMARY_KEY,
   discardChanges,
@@ -85,6 +85,7 @@ import {
   fetchSyncStatus,
   localChangeKey,
   localChangesKey,
+  readDraftConflict,
   readStackPlacement,
   readTeamMarker,
   refusalSentence,
@@ -96,11 +97,12 @@ import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
-import { asNumber, asObject, asString } from "../api/json";
+import { asArray, asNumber, asObject, asString } from "../api/json";
 import { useAuth } from "../auth/AuthContext";
 import { useDomainWritable } from "../domainWritable";
 import { isWebAddress, plural } from "../format";
 import { ChangeList } from "./ChangeList";
+import { ConflictDialog } from "./ConflictDialog";
 import { DiffPane } from "./DiffPaneLazy";
 import { DiscardConfirm } from "./DiscardConfirm";
 import type { ShareDialogProps } from "./ShareDialog";
@@ -189,6 +191,8 @@ export default function ShareDialogBody({
   const [receipt, setReceipt] = useState<DiscardReceipt | null>(null);
   /** A discard that failed outright, said inside the strip that asked. */
   const [discardProblem, setDiscardProblem] = useState<string | null>(null);
+  /** The draft conflict being settled over this dialog, or null. */
+  const [settling, setSettling] = useState<DraftConflict | null>(null);
   const paneHeading = useId();
 
   // Always fresh, and never retried: the plan is the whole point of opening
@@ -273,18 +277,42 @@ export default function ShareDialogBody({
   // the listing of any folder a chosen file lives in, whoever asked.
   const changes = plan.data?.changes ?? [];
   const real = substantive(changes);
+  // This session's drafts that do not fit the team's text, by every path
+  // they hold: a moved draft blocks its new path and the one it left, as the
+  // share's gate does. Such a file cannot travel, so its box is off, it is
+  // never among the ticks, and its path opens the dialog that settles it.
+  const draftConflicts = plan.data?.draftConflicts ?? [];
+  const conflictAt = new Map<string, DraftConflict>();
+  for (const conflict of draftConflicts) {
+    conflictAt.set(conflict.path, conflict);
+    if (conflict.movedFrom !== null) {
+      conflictAt.set(conflict.movedFrom, conflict);
+    }
+  }
+  const free = real.filter((change) => !conflictAt.has(change.path));
   // Keyed on the plan itself rather than on its change array, which is a
   // fresh array on every render while the plan is still arriving.
   const preset = useMemo(
     () => preselect(plan.data?.changes ?? [], account),
     [plan.data, account],
   );
-  const selected: ReadonlySet<string> = picked ?? new Set(preset.paths);
-  /** Everything a reader could choose is chosen: the share it always was. */
-  const allPicked = real.every((change) => selected.has(change.path));
+  const selected: ReadonlySet<string> = new Set(
+    [...(picked ?? preset.paths)].filter((path) => !conflictAt.has(path)),
+  );
+  /**
+   * Everything a reader could choose is chosen and nothing is held back: the
+   * share it always was. A plan naming a draft conflict is never that, since
+   * a share of everything would be refused for it, so it always names files.
+   */
+  const allPicked =
+    draftConflicts.length === 0 &&
+    real.every((change) => selected.has(change.path));
   /** Nothing is: there is a decision to make before there is a share. */
   const nothingPicked =
-    real.length > 0 && !real.some((change) => selected.has(change.path));
+    free.length > 0 && !free.some((change) => selected.has(change.path));
+  /** Every change waits on a conflict, so nothing can go yet. */
+  const onlyConflicts =
+    draftConflicts.length > 0 && real.length > 0 && free.length === 0;
 
   const share = useMutation({
     mutationFn: (asProposal: boolean) =>
@@ -304,7 +332,7 @@ export default function ShareDialogBody({
         ...(allPicked
           ? {}
           : {
-              files: real
+              files: free
                 .filter((change) => selected.has(change.path))
                 .map((change) => change.path),
             }),
@@ -438,11 +466,12 @@ export default function ShareDialogBody({
 
   const action = plan.data?.action ?? null;
   const shareable =
-    action === "create" ||
-    action === "update" ||
-    action === "stack" ||
-    action === "amend" ||
-    action === "commit";
+    !onlyConflicts &&
+    (action === "create" ||
+      action === "update" ||
+      action === "stack" ||
+      action === "amend" ||
+      action === "commit");
   const planProblem = plan.error === null ? null : problemDetail(plan.error);
 
   return (
@@ -541,6 +570,25 @@ export default function ShareDialogBody({
                   {outcome.spelling}
                 </p>
               )}
+              {/* A refusal for this session's own drafts names them, each
+                  a way into the dialog that settles it. */}
+              {outcome.conflicts !== undefined &&
+                outcome.conflicts.length > 0 && (
+                  <p className="flex flex-wrap gap-x-2 text-sm">
+                    {outcome.conflicts.map((conflict) => (
+                      <button
+                        key={conflict.id}
+                        type="button"
+                        onClick={() => {
+                          setSettling(conflict);
+                        }}
+                        className="font-mono underline underline-offset-2 hover:no-underline"
+                      >
+                        {conflict.path}
+                      </button>
+                    ))}
+                  </p>
+                )}
               {problem !== null && (
                 <p role="alert" className={ALERT_CLASSES}>
                   {problem}
@@ -672,11 +720,23 @@ export default function ShareDialogBody({
                   button would send. */}
               <Dialog.Description className="text-sm text-slate-500 dark:text-slate-400">
                 {planProblem === null
-                  ? amending === null
-                    ? plan.data?.note
-                      ? plan.data.note
-                      : actionLine(plan.data ?? null)
-                    : amendLine(amending, chosenLayersAbove)
+                  ? onlyConflicts
+                    ? // The plan's own sentence for a share that waits on
+                      // conflicts, unchanged: nothing else is left to share.
+                      actionLine(
+                        plan.data === undefined
+                          ? null
+                          : {
+                              ...plan.data,
+                              action: "conflicts_pending",
+                              count: null,
+                            },
+                      )
+                    : amending === null
+                      ? plan.data?.note
+                        ? plan.data.note
+                        : actionLine(plan.data ?? null)
+                      : amendLine(amending, chosenLayersAbove)
                   : "This share could not be planned."}
               </Dialog.Description>
               {plan.data?.spellingNote != null && (
@@ -730,6 +790,14 @@ export default function ShareDialogBody({
                 }}
                 onOpen={setPane}
                 refusals={refusals}
+                onSettle={(path) => {
+                  const conflict = conflictAt.get(path);
+                  return conflict === undefined
+                    ? undefined
+                    : () => {
+                        setSettling(conflict);
+                      };
+                }}
                 onDiscard={
                   mayDiscard
                     ? (path, from) => {
@@ -749,6 +817,12 @@ export default function ShareDialogBody({
                     : undefined
                 }
               />
+              {draftConflicts.length > 0 && !onlyConflicts && (
+                <p className="text-caption text-slate-500 dark:text-slate-400">
+                  A file with its box off does not fit the team&apos;s text.
+                  Press its path to settle it. Other files can still be shared.
+                </p>
+              )}
               {/* A file the share adds on its own is named apart from the
                   list: the folder does not hold it yet, so there is nothing
                   to tick or discard, only a reason to read. */}
@@ -902,6 +976,21 @@ export default function ShareDialogBody({
                 )}
               </div>
             </form>
+          )}
+          {settling !== null && (
+            <ConflictDialog
+              domain={domain}
+              conflictId={settling.id}
+              draft={{
+                kind: settling.kind,
+                movedFrom: settling.movedFrom,
+                other: settling.other,
+                file: settling.file,
+              }}
+              onClose={() => {
+                setSettling(null);
+              }}
+            />
           )}
         </Dialog.Content>
       </Dialog.Portal>
@@ -1076,6 +1165,12 @@ interface OutcomeSentence {
    * commit the branch refused, answered with `fallback: "proposal"`.
    */
   offerProposal?: boolean;
+  /**
+   * On a `conflicts_pending` refusal in a domain that reviews changes: this
+   * session's own drafts that do not fit the team's text, each a way into
+   * the dialog that settles it.
+   */
+  conflicts?: DraftConflict[];
 }
 
 /** A sentence with nothing to link. */
@@ -1198,9 +1293,17 @@ function describeShareOutcome(result: unknown): OutcomeSentence {
           : "Nothing to share.",
       );
     case "conflicts_pending":
-      return plainSentence(
-        "Conflicts need settling before sharing. Nothing was shared.",
-      );
+      return {
+        ...plainSentence(
+          "Conflicts need settling before sharing. Nothing was shared.",
+        ),
+        // Only a draft's: the folder's conflicts are settled on the sync
+        // card, through routes a draft's id does not reach.
+        conflicts: asArray(record?.conflicts)
+          .filter((entry) => asObject(entry)?.draft === true)
+          .map(readDraftConflict)
+          .filter((entry): entry is DraftConflict => entry !== null),
+      };
     case "committed": {
       // The commit itself is what a reader follows, by the short sha every
       // forge names one by; a report that carried none says what it did

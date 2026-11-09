@@ -170,6 +170,7 @@ use crate::scope::{DomainAccess, DomainRight};
         automation::read,
         kept::list,
         kept::read,
+        kept::download,
         kept::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
@@ -894,6 +895,7 @@ fn routes(state: RestState) -> Router {
             "/domains/{domain}/kept/{id}",
             get(kept::read).delete(kept::remove),
         )
+        .route("/domains/{domain}/kept/{id}/file", get(kept::download))
         // Admin only as well. The GET is a pure read and stays served on a
         // read-only instance; the POST is a pull that writes, and does not.
         .route(

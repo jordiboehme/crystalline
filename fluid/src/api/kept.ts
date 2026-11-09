@@ -13,7 +13,7 @@
 
 import { queryOptions } from "@tanstack/react-query";
 
-import { ApiProblem, api, encodeSegment } from "./client";
+import { API_BASE, ApiProblem, api, encodeSegment } from "./client";
 import type {
   KeptTextEntry,
   KeptTextResponse,
@@ -49,6 +49,19 @@ export async function fetchKeptText(
   id: string,
 ): Promise<KeptTextResponse> {
   return api<KeptTextResponse>(keptPath(domain, id));
+}
+
+/**
+ * Where one kept copy is downloaded from, as its bytes.
+ *
+ * An address rather than a fetch: an anchor performs the cookie-authenticated
+ * GET and the browser saves the file itself. The server always answers it as
+ * a download named for the file, never rendered in place. This is the only
+ * way a draft file kept as its bytes comes back to a person who cannot reach
+ * the server's disk.
+ */
+export function keptDownloadUrl(domain: string, id: string): string {
+  return `${API_BASE}${keptPath(domain, id)}/file`;
 }
 
 /** Delete one kept text. Only ever on a person's request. */

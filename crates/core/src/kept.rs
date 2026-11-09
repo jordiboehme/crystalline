@@ -17,7 +17,10 @@
 //! [`scan`] reads as [`KeptText::sender`]. A second text kept under the same
 //! name in the same second gets `-2`, `-3` and so on after the time. A room over somebody's
 //! review draft keeps its text under `<domain>/draft/<owner>/` instead of
-//! `<domain>/`, because a draft is private to its owner.
+//! `<domain>/`, because a draft is private to its owner. A draft file beside
+//! the pages, kept as its bytes ([`write_bytes`]), ends in its own extension
+//! instead of `.md` (`.bin` when it has none), so `deck.pdf` is kept as
+//! `deck.pdf.<YYYYMMDDTHHMMSSZ>.pdf`.
 //!
 //! A kept text is the last copy of somebody's work, so nothing here deletes
 //! one on its own: [`remove`] runs only when a person asks for it. This
@@ -233,9 +236,10 @@ pub fn write(
 }
 
 /// [`write`](fn@write) for bytes that need not be text: a draft file beside
-/// the pages, kept when it is the last copy. The layout and the name are a
-/// text's, so a listing finds it under its path; [`read`] of it fails when the
-/// bytes are not UTF-8, and the file itself holds them as they were.
+/// the pages, kept when it is the last copy. The layout is a text's, so a
+/// listing finds it under its path, and the name ends in the file's own
+/// extension rather than `.md`; [`read`] of it fails when the bytes are not
+/// UTF-8, and the file itself holds them as they were.
 pub fn write_bytes(
     root: &Path,
     domain: &str,
@@ -334,9 +338,10 @@ fn place(
     text: &[u8],
 ) -> std::io::Result<PathBuf> {
     for n in 1u32.. {
+        let ext = kept_extension(name);
         let file = base.with_file_name(match n {
-            1 => format!("{name}.{stamp}.md"),
-            n => format!("{name}.{stamp}-{n}.md"),
+            1 => format!("{name}.{stamp}.{ext}"),
+            n => format!("{name}.{stamp}-{n}.{ext}"),
         });
         match std::fs::hard_link(temp, &file) {
             Ok(()) => return Ok(file),
@@ -593,12 +598,23 @@ fn parse_temp_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
     (!name.is_empty()).then(|| (name, at.and_utc()))
 }
 
-/// `<name>.<stamp>.md` or `<name>.<stamp>-<n>.md`: the original file name
-/// and the time.
+/// The extension a kept copy of the file `name` is named with: the file's
+/// own, so a page's text ends in `.md` and a kept draft file in its own kind
+/// (`deck.pdf` keeps as `.pdf`). A file with none of its own keeps as `.bin`.
+fn kept_extension(name: &str) -> &str {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("bin")
+}
+
+/// `<name>.<stamp>.<ext>` or `<name>.<stamp>-<n>.<ext>`, where `<ext>` is the
+/// original file's own ([`kept_extension`]): the original file name and the
+/// time.
 fn parse_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
-    let stem = file.strip_suffix(".md")?;
+    let (stem, ext) = file.rsplit_once('.')?;
     let (name, tail) = stem.rsplit_once('.')?;
-    if name.is_empty() {
+    if name.is_empty() || ext != kept_extension(name) {
         return None;
     }
     let (stamp, counter) = match tail.split_once('-') {
@@ -1147,5 +1163,76 @@ mod tests {
         remove(root, &left[0]).unwrap();
         assert!(root.is_dir(), "the kept folder stays");
         assert!(!root.join("eng").exists());
+    }
+
+    /// A draft file kept as its bytes is named for its own extension, not
+    /// `.md`, so no copy that is not markdown is named as one; a second keep
+    /// in the same second takes the next `-N`. The listing finds both under
+    /// the file's own path, as file copies.
+    #[test]
+    fn a_kept_file_is_named_for_its_own_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x41];
+        let owner = Some("ada");
+        let kind = KeptKind::Engram;
+        let first =
+            write_bytes(root, "eng", owner, kind, "assets/deck.pdf", at(8), &bytes).unwrap();
+        let second =
+            write_bytes(root, "eng", owner, kind, "assets/deck.pdf", at(8), &bytes).unwrap();
+        assert_eq!(first.file_name().unwrap(), "deck.pdf.20261015T080000Z.pdf");
+        assert_eq!(
+            second.file_name().unwrap(),
+            "deck.pdf.20261015T080000Z-2.pdf"
+        );
+        let found = scan(root);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for kept in &found {
+            assert_eq!(kept.path, "assets/deck.pdf");
+            assert_eq!(kept.owner.as_deref(), Some("ada"));
+            assert!(is_file_copy(kept));
+            assert_eq!(std::fs::read(&kept.file).unwrap(), bytes);
+        }
+    }
+
+    /// A file with no extension of its own is kept as `.bin`, and the file
+    /// beside it that names its sender is still no kept copy.
+    #[test]
+    fn a_kept_file_with_no_extension_is_named_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = write_bytes(
+            root,
+            "eng",
+            None,
+            KeptKind::Engram,
+            "assets/LICENSE",
+            at(8),
+            b"\xff",
+        )
+        .unwrap();
+        assert_eq!(file.file_name().unwrap(), "LICENSE.20261015T080000Z.bin");
+        let ada = Sender {
+            account: "ada".to_string(),
+            name: "Ada".to_string(),
+        };
+        record_sender(&file, &ada).unwrap();
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/LICENSE");
+        assert_eq!(found[0].sender.as_ref(), Some(&ada));
+    }
+
+    /// The extension after the stamp must be the file's own: a name that
+    /// ends in another one does not follow the layout and is not listed.
+    #[test]
+    fn a_kept_name_with_another_extension_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let folder = root.join("eng/engram/assets");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), b"x").unwrap();
+        std::fs::write(folder.join("a.md.20261015T080000Z.pdf"), b"x").unwrap();
+        assert_eq!(scan(root), vec![]);
     }
 }

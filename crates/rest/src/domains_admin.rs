@@ -1211,7 +1211,11 @@ pub async fn sync_status(
                            is nobody to ask about - the pairing a picker row \
                            draws. `open_proposals`, `declined_proposals` and \
                            `conflicts` are counts here rather than the \
-                           records the per-domain route returns. `errors` \
+                           records the per-domain route returns, and \
+                           `conflicts` counts the folder's conflicts only: \
+                           your own draft conflicts in a domain that reviews \
+                           changes are listed by `GET \
+                           /domains/{domain}/drafts/conflicts`. `errors` \
                            holds one entry per domain that could not be read \
                            at all, so a single broken domain never blanks the \
                            summary.\n\nThree chain-health keys ride along, \
@@ -1392,7 +1396,19 @@ fn summarize_origin_domain(entry: &Value, owned: Value) -> Value {
         "last_checked": field("last_checked"),
         "open_proposals": count("open_proposals"),
         "declined_proposals": count("declined_proposals"),
-        "conflicts": count("conflicts"),
+        // The folder's conflicts only. In a reviewing domain the status also
+        // lists the caller's own draft conflicts (`draft: true`); those are
+        // settled from the domain page through the draft routes, and a count
+        // here would offer a row whose conflict the sync card does not show.
+        "conflicts": entry
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter(|c| c.get("draft").and_then(Value::as_bool) != Some(true))
+                    .count()
+            })
+            .unwrap_or(0),
         "local_changes": field("local_changes"),
         // Not the engine's, but the route's own, computed for the session that
         // asked: how much of this domain's waiting work that account last
@@ -4041,6 +4057,25 @@ mod tests {
             unknown["owned_changes"].is_null(),
             "the key is present and null: {unknown}"
         );
+    }
+
+    /// A reviewing domain's status lists the caller's own draft conflicts after
+    /// the folder's, each with `draft: true`. The overview's count is the
+    /// folder's alone: a draft conflict is settled from the domain page, and
+    /// counting it here would offer a row whose conflict the sync card does not
+    /// show.
+    #[test]
+    fn a_summary_row_counts_only_the_folders_conflicts() {
+        let entry = serde_json::json!({
+            "domain": "eng",
+            "conflicts": [
+                { "id": "c1", "path": "a.md" },
+                { "id": "d0000001", "path": "b.md", "draft": true },
+                { "id": "d0000002", "path": "c.md", "draft": true },
+            ],
+        });
+        let row = summarize_origin_domain(&entry, Value::Null);
+        assert_eq!(row["conflicts"], 1, "{row}");
     }
 
     /// The anonymous viewer has no account, so there is nothing to attribute

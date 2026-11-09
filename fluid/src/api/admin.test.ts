@@ -19,8 +19,11 @@ import {
   disconnectGithub,
   disconnectMyGithubIdentity,
   discardChanges,
+  draftConflictsKey,
   fetchChange,
   fetchConflict,
+  fetchDraftConflict,
+  fetchDraftConflicts,
   fetchGithubStatus,
   fetchMyGithubIdentity,
   fetchLocalChanges,
@@ -37,6 +40,7 @@ import {
   refusalSentence,
   renameDomain,
   resolveConflict,
+  resolveDraftConflict,
   shareDomain,
   sharePlanKey,
   startGithubConnect,
@@ -980,6 +984,206 @@ describe("the admin client layer", () => {
     expect(status.conflicts).toBe(2);
   });
 
+  it("leaves draft conflicts out of the SyncCard count", async () => {
+    // A reviewing domain's status lists the caller's own draft conflicts
+    // after the folder's. They are settled from the domain page through the
+    // draft routes, so the sync card neither counts them nor opens them
+    // through the folder's route, and one conflict is never drawn twice.
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      conflicts: [
+        {
+          id: "9f3c1ab0",
+          path: "notes/a.md",
+          kind: "EditEdit",
+          detected_at: "2026-08-10T07:59:00Z",
+        },
+        {
+          id: "d1234567",
+          path: "notes/b.md",
+          kind: "EditEdit",
+          moved_from: null,
+          file: false,
+          other: null,
+          draft: true,
+        },
+      ],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.conflicts).toBe(1);
+    expect(status.conflictList.map((conflict) => conflict.id)).toEqual([
+      "9f3c1ab0",
+    ]);
+  });
+
+  it("reads a session's own draft conflicts and merged drafts off their own route", async () => {
+    apiMock.mockResolvedValueOnce({
+      conflicts: [
+        {
+          id: "d1234567",
+          path: "notes/new.md",
+          kind: "EditEdit",
+          moved_from: "notes/old.md",
+          other: null,
+          file: false,
+          draft: true,
+        },
+        {
+          id: "d7654321",
+          path: "assets/deck.pdf",
+          kind: "UnknownStart",
+          moved_from: null,
+          other: null,
+          file: true,
+          draft: true,
+        },
+        // No id is nothing the dialog could open: dropped.
+        { path: "notes/c.md", kind: "EditEdit" },
+      ],
+      merged: ["notes/x.md"],
+    });
+    const drafts = await fetchDraftConflicts("my eng");
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/my%20eng/drafts/conflicts",
+    );
+    expect(drafts).toEqual({
+      conflicts: [
+        {
+          id: "d1234567",
+          path: "notes/new.md",
+          kind: "EditEdit",
+          movedFrom: "notes/old.md",
+          other: null,
+          file: false,
+        },
+        {
+          id: "d7654321",
+          path: "assets/deck.pdf",
+          kind: "UnknownStart",
+          movedFrom: null,
+          other: null,
+          file: true,
+        },
+      ],
+      merged: ["notes/x.md"],
+    });
+    // Filed with the domain's own reads: a plain GET that pulls nothing.
+    expect(draftConflictsKey("eng")).toEqual([
+      "domains",
+      "eng",
+      "draft-conflicts",
+    ]);
+  });
+
+  it("reads one draft conflict's sides off the draft route", async () => {
+    apiMock.mockResolvedValueOnce({
+      id: "d1234567",
+      path: "notes/a.md",
+      kind: "AddressTaken",
+      moved_from: null,
+      other: "notes/z.md",
+      base: "start",
+      local: "mine",
+      upstream: "theirs",
+      note: null,
+      detected_at: null,
+      draft: true,
+    });
+    const detail = await fetchDraftConflict("eng", "d1234567");
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/drafts/conflicts/d1234567",
+    );
+    expect(detail).toEqual({
+      id: "d1234567",
+      path: "notes/a.md",
+      kind: "AddressTaken",
+      movedFrom: null,
+      other: "notes/z.md",
+      file: false,
+      base: "start",
+      local: "mine",
+      upstream: "theirs",
+      note: null,
+    });
+  });
+
+  it("settles a draft conflict on the draft route and reads the receipt", async () => {
+    apiMock.mockResolvedValueOnce({
+      draft: true,
+      kept: "theirs",
+      kept_copy: true,
+      kept_note: "A copy of your file is kept. Find it in your kept list.",
+      remaining: 2,
+      file: true,
+    });
+    const receipt = await resolveDraftConflict("eng", "d1234567", "theirs");
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/drafts/conflicts/d1234567/resolve",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ resolution: "theirs" }),
+      }),
+    );
+    expect(receipt).toEqual({
+      kept: "theirs",
+      keptCopy: true,
+      keptNote: "A copy of your file is kept. Find it in your kept list.",
+      draftWarning: null,
+      remaining: 2,
+    });
+
+    apiMock.mockResolvedValueOnce({ kept: "merged", remaining: null });
+    await resolveDraftConflict("eng", "d1234567", "merged", "both lines");
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/drafts/conflicts/d1234567/resolve",
+      expect.objectContaining({
+        body: JSON.stringify({ resolution: "merged", content: "both lines" }),
+      }),
+    );
+  });
+
+  it("reads the draft conflicts a share plan names, in either key", async () => {
+    const entry = {
+      id: "d1234567",
+      path: "notes/a.md",
+      kind: "EditDelete",
+      moved_from: null,
+      other: null,
+      file: false,
+      draft: true,
+    };
+    apiMock.mockResolvedValueOnce({
+      action: "create",
+      changes: [],
+      draft_conflicts: [entry],
+    });
+    expect((await fetchShareChanges("eng")).draftConflicts).toEqual([
+      {
+        id: "d1234567",
+        path: "notes/a.md",
+        kind: "EditDelete",
+        movedFrom: null,
+        other: null,
+        file: false,
+      },
+    ]);
+
+    apiMock.mockResolvedValueOnce({
+      action: "conflicts_pending",
+      count: 1,
+      changes: [],
+      conflicts: [entry],
+    });
+    expect(
+      (await fetchShareChanges("eng")).draftConflicts.map((c) => c.id),
+    ).toEqual(["d1234567"]);
+  });
+
   it("reads the instance-wide summary, and files it outside the domain family", async () => {
     apiMock.mockResolvedValueOnce({
       connection: { connected: true, user: "octo", token_store: "keychain" },
@@ -1139,6 +1343,8 @@ describe("the admin client layer", () => {
       spellingNote: null,
       // No marker: the share adds nothing of its own.
       teamMarker: null,
+      // No draft of this session's is in the way: an older server, too.
+      draftConflicts: [],
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:

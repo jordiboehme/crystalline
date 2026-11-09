@@ -26,6 +26,7 @@ function entry(): KeptTextEntry {
     draft: true,
     kind: "engram",
     path: "assets/deck.png",
+    file: true,
     kept_at: "2026-11-09T08:00:00Z",
     bytes: 20,
     sender: null,

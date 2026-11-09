@@ -2405,3 +2405,233 @@ describe("seeing and discarding changes from the dialog", () => {
     expect(screen.queryByRole("menuitem", { name: "Discard" })).toBeNull();
   });
 });
+
+/** One of this session's draft conflicts, as a plan or a receipt names it. */
+function draftEntry(path: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id: "d1234567",
+    path,
+    kind: "EditEdit",
+    moved_from: null,
+    other: null,
+    file: false,
+    draft: true,
+    ...overrides,
+  };
+}
+
+/** The draft sides route for `d1234567`. */
+function draftSidesRoute(path: string): Record<string, Answer> {
+  return {
+    "/domains/eng/drafts/conflicts/d1234567": () => ({
+      ...draftEntry(path),
+      base: "start",
+      local: "my draft text",
+      upstream: "the team's text",
+      note: null,
+      detected_at: null,
+    }),
+  };
+}
+
+describe("the share dialog with draft conflicts", () => {
+  it("the share dialog turns off a conflicted box and shares the others with files", async () => {
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 4 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "modified" },
+          { path: "notes/b.md", kind: "modified" },
+          { path: "notes/new.md", kind: "added" },
+          { path: "notes/old.md", kind: "deleted" },
+        ],
+        draft_conflicts: [
+          draftEntry("notes/a.md"),
+          draftEntry("notes/new.md", {
+            id: "d7654321",
+            moved_from: "notes/old.md",
+          }),
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+      ...draftSidesRoute("notes/a.md"),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Both ends of a move are off, as is the plain conflict; the rest is
+    // ticked and goes.
+    for (const path of ["notes/a.md", "notes/new.md", "notes/old.md"]) {
+      const box = await within(dialog).findByRole("checkbox", { name: path });
+      expect(box).toBeDisabled();
+      expect(box).not.toBeChecked();
+    }
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/b.md" }),
+    ).toBeChecked();
+    // A group's own box speaks for what can go: with all of that ticked it
+    // reads as full, so one press takes it out and the next puts it back,
+    // and the conflicted file is never taken in.
+    const group = within(dialog).getByRole("checkbox", {
+      name: "Share all modified",
+    });
+    expect(group).toBeChecked();
+    await userEvent.click(group);
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/b.md" }),
+    ).not.toBeChecked();
+    await userEvent.click(group);
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/b.md" }),
+    ).toBeChecked();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // Every other file was ticked, and the files still go by name: a share
+    // of everything would be refused for the conflicted one.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/b.md"],
+    });
+  });
+
+  it("names the files even when every listed file is ticked", async () => {
+    // Her conflict sits on a path the change list does not carry. A share of
+    // everything would still be refused for it, so the ticked files go by
+    // name.
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/b.md", kind: "modified" }],
+        draft_conflicts: [draftEntry("notes/a.md", { kind: "DeleteEdit" })],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      await within(dialog).findByRole("checkbox", { name: "notes/b.md" }),
+    ).toBeChecked();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/b.md"],
+    });
+  });
+
+  it("opens the settle dialog from a conflicted path, and Escape leaves only that", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "modified" },
+          { path: "notes/b.md", kind: "modified" },
+        ],
+        draft_conflicts: [draftEntry("notes/a.md")],
+      }),
+      ...draftSidesRoute("notes/a.md"),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "notes/a.md" }),
+    );
+    const settle = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    expect(await within(settle).findByText("my draft text")).toBeVisible();
+
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "Settle conflict" }),
+      ).toBeNull();
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Share changes" }),
+    ).toBeInTheDocument();
+  });
+
+  it("the share dialog offers no share when only conflicted files are left", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        draft_conflicts: [draftEntry("notes/a.md")],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(
+      await within(dialog).findByRole("checkbox", { name: "notes/a.md" }),
+    ).toBeDisabled();
+    expect(
+      within(dialog).getByText("Conflicts need settling before sharing."),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("button", { name: "Share" }),
+    ).toBeDisabled();
+  });
+
+  it("a conflicts_pending receipt lists the paths and opens the dialog", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "conflicts_pending",
+              count: 1,
+              conflicts: [draftEntry("notes/a.md")],
+            }
+          : null,
+      ...draftSidesRoute("notes/a.md"),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "Conflicts need settling before sharing. Nothing was shared.",
+      ),
+    ).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "notes/a.md" }),
+    );
+    const settle = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    expect(await within(settle).findByText("my draft text")).toBeVisible();
+  });
+});

@@ -1106,6 +1106,12 @@ export type KeptTextEntry = {
      */
     draft: boolean;
     /**
+     * Whether it is a draft file beside the pages, kept as its bytes rather
+     * than a text: it has no text to read, and is had through
+     * `GET /domains/{domain}/kept/{id}/file`.
+     */
+    file: boolean;
+    /**
      * A short, stable id for the routes below.
      */
     id: string;
@@ -4915,6 +4921,10 @@ export type ReadKeptTextErrors = {
      * The kept copy is a file, not text. The detail says so in a sentence to show.
      */
     422: ProblemDetail;
+    /**
+     * The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
 };
 
 export type ReadKeptTextError = ReadKeptTextErrors[keyof ReadKeptTextErrors];
@@ -4927,6 +4937,52 @@ export type ReadKeptTextResponses = {
 };
 
 export type ReadKeptTextResponse = ReadKeptTextResponses[keyof ReadKeptTextResponses];
+
+export type DownloadKeptCopyData = {
+    body?: never;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+        /**
+         * The id from the listing.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/kept/{id}/file';
+};
+
+export type DownloadKeptCopyErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Neither write access to the engrams nor edit access to the Reflection.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or kept copy for this caller.
+     */
+    404: ProblemDetail;
+    /**
+     * The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
+};
+
+export type DownloadKeptCopyError = DownloadKeptCopyErrors[keyof DownloadKeptCopyErrors];
+
+export type DownloadKeptCopyResponses = {
+    /**
+     * The kept copy's bytes.
+     */
+    200: Array<number>;
+};
+
+export type DownloadKeptCopyResponse = DownloadKeptCopyResponses[keyof DownloadKeptCopyResponses];
 
 export type GetDomainManifestData = {
     body?: never;
@@ -8725,7 +8781,7 @@ export type GetSyncSummaryError = GetSyncSummaryErrors[keyof GetSyncSummaryError
 
 export type GetSyncSummaryResponses = {
     /**
-     * The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+     * The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns, and `conflicts` counts the folder's conflicts only: your own draft conflicts in a domain that reviews changes are listed by `GET /domains/{domain}/drafts/conflicts`. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
      *
      * Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
      */

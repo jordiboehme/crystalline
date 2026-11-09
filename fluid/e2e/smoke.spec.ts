@@ -814,6 +814,128 @@ test("a refused direct share offers to share as a proposal", async ({
   await page.unrouteAll({ behavior: "ignoreErrors" });
 });
 
+test("a person settles a draft conflict in the browser", async ({ page }) => {
+  // The fixture domain does not review changes and has no origin, so the
+  // domain listing is the real one with this domain marked as reviewing, and
+  // the draft routes are canned in the shapes they send: three of her drafts
+  // that do not fit the team's text, each settled one way.
+  const listing = await page.request.get(`${BASE_PATH}/api/v1/domains`);
+  expect(listing.ok()).toBe(true);
+  const domains = (await listing.json()) as {
+    domains: { name: string; review?: string | null }[];
+  };
+  for (const row of domains.domains) {
+    if (row.name === DOMAIN) {
+      row.review = "overlay";
+    }
+  }
+  await page.route("**/api/v1/domains", (route) =>
+    route.fulfill({ json: domains }),
+  );
+  const entry = (id: string, path: string) => ({
+    id,
+    path,
+    kind: "EditEdit",
+    moved_from: null,
+    other: null,
+    file: false,
+    draft: true,
+  });
+  let open = [
+    entry("d0000001", "notes/one.md"),
+    entry("d0000002", "notes/two.md"),
+    entry("d0000003", "notes/three.md"),
+  ];
+  const bodies: Record<string, Record<string, unknown>> = {};
+  await page.route(
+    new RegExp(
+      `/api/v1/domains/${DOMAIN}/drafts/conflicts(/[^/?]+)?(/resolve)?$`,
+    ),
+    (route) => {
+      const url = new URL(route.request().url());
+      const parts = url.pathname.split("/drafts/conflicts")[1] ?? "";
+      const [, id, verb] = parts.split("/");
+      if (id === undefined) {
+        return route.fulfill({ json: { conflicts: open, merged: [] } });
+      }
+      const found = open.find((conflict) => conflict.id === id);
+      if (found === undefined) {
+        return route.fulfill({ status: 404, json: { detail: "gone" } });
+      }
+      if (verb === "resolve") {
+        const body = route.request().postDataJSON() as Record<string, unknown>;
+        bodies[found.path] = body;
+        open = open.filter((conflict) => conflict.id !== id);
+        return route.fulfill({
+          json: {
+            draft: true,
+            kept: body.resolution,
+            kept_copy: false,
+            remaining: open.length,
+          },
+        });
+      }
+      return route.fulfill({
+        json: {
+          ...found,
+          base: "The start.\n",
+          local: `My line in ${found.path}.\n`,
+          upstream: `The team's line in ${found.path}.\n`,
+          note: null,
+          detected_at: null,
+        },
+      });
+    },
+  );
+
+  await page.goto(`d/${DOMAIN}`);
+  const notice = page.getByRole("region", { name: "Your drafts" });
+  await expect(notice).toContainText(
+    "3 of your drafts do not fit with the team's text. Settle them before you share.",
+  );
+
+  const settle = async (path: string) => {
+    await notice.getByRole("button", { name: path }).click();
+    const dialog = page.getByRole("dialog", { name: "Settle conflict" });
+    await expect(dialog.getByText("Your draft", { exact: true })).toBeVisible();
+    await expect(
+      dialog.getByText("The team's text", { exact: true }),
+    ).toBeVisible();
+    await expect(dialog.getByText(`My line in ${path}.`)).toBeVisible();
+    await expect(dialog.getByText(`The team's line in ${path}.`)).toBeVisible();
+    await expect(dialog).toHaveAccessibleDescription(
+      `You and the team changed the same lines of ${path}.`,
+    );
+    return dialog;
+  };
+
+  let dialog = await settle("notes/one.md");
+  await dialog.getByRole("button", { name: "Keep mine" }).click();
+  await expect(dialog).toBeHidden();
+
+  dialog = await settle("notes/two.md");
+  await dialog.getByRole("button", { name: "Take theirs" }).click();
+  await expect(dialog).toBeHidden();
+
+  dialog = await settle("notes/three.md");
+  await dialog.getByRole("button", { name: "Edit merged" }).click();
+  const merged = dialog.getByLabel("Merged content");
+  await merged.fill("My line and the team's line.\n");
+  await dialog.getByRole("button", { name: "Save merged" }).click();
+  await expect(dialog).toBeHidden();
+
+  expect(bodies).toEqual({
+    "notes/one.md": { resolution: "mine" },
+    "notes/two.md": { resolution: "theirs" },
+    "notes/three.md": {
+      resolution: "merged",
+      content: "My line and the team's line.\n",
+    },
+  });
+  await expect(notice).toBeHidden();
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
 test("an undeclared MANIFEST section explains itself and can be started", async ({
   page,
 }) => {

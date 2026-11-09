@@ -2871,6 +2871,15 @@ async fn a_fold_with_a_broken_record_refuses_and_changes_nothing() {
 
     let plan = f.plan(&Scope::Unrestricted).await;
     assert_eq!(plan["actors"][0]["conflicts_unreadable"], true, "{plan}");
+    // And why, in the refusal's own sentence for this reader, before anybody
+    // answers.
+    assert_eq!(
+        plan["actors"][0]["conflicts_unreadable_reason"],
+        "The draft records of 'alice' could not be read, so their drafts cannot be folded \
+         safely. Choose discard for 'alice', which ends their text, or repair the records the \
+         daemon log names and fold again.",
+        "{plan}"
+    );
     let refused = f.fold(&[("alice", FoldChoice::Fold)]).await.unwrap_err();
     assert!(
         matches!(
