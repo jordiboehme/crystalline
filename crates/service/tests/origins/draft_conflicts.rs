@@ -3734,3 +3734,621 @@ async fn a_share_that_updates_a_proposal_merged_meanwhile_keeps_her_newer_text()
     assert_eq!(t.conflicts("alice").await, vec![]);
     assert!(t.forge_file("plan.md").unwrap().contains(HER_WORD));
 }
+
+// --- Keep mine and Take theirs ----------------------------------------------
+
+impl Team {
+    /// `actor` settles their draft at `path`: `keep` is mine or theirs, or
+    /// `merged` is the text to write.
+    async fn resolve(
+        &self,
+        actor: &str,
+        path: &str,
+        keep: Option<&str>,
+        merged: Option<&str>,
+    ) -> Result<serde_json::Value, EngineError> {
+        self.eng
+            .origin_resolve(
+                "team",
+                path,
+                keep,
+                merged.map(str::as_bytes),
+                ShareActor::Account(actor.to_string()),
+            )
+            .await
+    }
+
+    /// The kept texts of `actor`'s drafts, with their text.
+    fn kept_of(&self, actor: &str) -> Vec<(String, String)> {
+        let root = self.state().join(crystalline_core::kept::KEPT_DIR);
+        crystalline_core::kept::held_by(&root, actor)
+            .unwrap()
+            .into_iter()
+            .map(|kept| {
+                (
+                    kept.path.clone(),
+                    std::fs::read_to_string(&kept.file).unwrap(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// The receipt of a settled draft at `path`.
+fn settled(receipt: &serde_json::Value, path: &str, kept: &str, kept_copy: bool) {
+    assert_eq!(receipt["resolved"], path, "{receipt}");
+    assert_eq!(receipt["remaining"], 0, "{receipt}");
+    assert_eq!(receipt["draft"], true, "{receipt}");
+    assert_eq!(receipt["kept"], kept, "{receipt}");
+    assert_eq!(receipt["kept_copy"], kept_copy, "{receipt}");
+}
+
+/// A same-line conflict at plan.md: alice's first line against bob's.
+async fn a_same_line_conflict(t: &mut Team) -> String {
+    same_line(t).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+    t.row("alice", "plan.md").await
+}
+
+#[tokio::test]
+async fn keep_mine_lands_her_text_and_the_second_share_has_nothing() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    let hers = a_same_line_conflict(&mut t).await;
+    // A merge mark a pass left behind (N-2) goes with the settled conflict.
+    let marked = DraftStart {
+        merging: Some(true),
+        ..t.record("alice", "plan.md").unwrap()
+    };
+    draft_start::save(&t.state(), "team", "alice", &marked).unwrap();
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    assert_eq!(t.row("alice", "plan.md").await, hers, "her text stays");
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(text(&plan_later()).as_str()));
+    assert_eq!(record.merging, None);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(
+        forge.contains(ALICE_LINE) && !forge.contains(BOB_LINE),
+        "{forge}"
+    );
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn take_theirs_ends_the_draft_and_she_reads_the_team() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "theirs", false);
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert_eq!(t.record("alice", "plan.md"), None);
+    let read = t.reads("alice", "plan").await;
+    assert!(
+        read.contains(BOB_LINE) && !read.contains(ALICE_LINE),
+        "{read}"
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "nothing_to_share");
+}
+
+#[tokio::test]
+async fn merged_lands_her_merged_text() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+    let merged = text(&plan_later()).replace("the last line of the plan", HER_WORD);
+
+    let receipt = t
+        .resolve("alice", "plan.md", None, Some(&merged))
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "merged", false);
+    assert_eq!(t.row("alice", "plan.md").await, merged);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(text(&plan_later()).as_str()));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(
+        forge.contains(BOB_LINE) && forge.contains(HER_WORD),
+        "{forge}"
+    );
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn keep_mine_on_a_peer_deleted_file_lands_as_a_new_file() {
+    let mut t = team_direct(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.push(&[("plan.md", None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditDelete)]
+    );
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(
+        (record.from, record.start, record.start_sha256),
+        (None, None, None)
+    );
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(t.forge_file("plan.md").unwrap().contains(HER_WORD));
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn keep_mine_on_her_delete_of_a_peer_edit_deletes_knowingly() {
+    let mut t = team_direct(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    t.delete("alice", "plan").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", DeleteEdit)]
+    );
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+    assert_eq!(record.start.as_deref(), Some(text(&plan_later()).as_str()));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn take_theirs_on_her_delete_brings_the_file_back_for_her() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.delete("alice", "plan").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "theirs", false);
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert!(t.reads("alice", "plan").await.contains(BOB_LINE));
+}
+
+#[tokio::test]
+async fn keep_mine_on_a_peer_file_at_her_path_replaces_it_knowingly() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let his = engram("Renamed", "renamed", "bob's own page at that path");
+    t.push(&[("renamed.md", Some(his.clone()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", AddAdd)
+        }]
+    );
+
+    let receipt = t
+        .resolve("alice", "renamed.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "renamed.md", "mine", false);
+    let record = t.record("alice", "renamed.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("renamed.md"));
+    assert_eq!(record.start.as_deref(), Some(text(&his).as_str()));
+    let half = t.record("alice", "plan.md").unwrap();
+    assert_eq!(half.from.as_deref(), Some("plan.md"));
+    assert_eq!(half.start.as_deref(), Some(text(&plan()).as_str()));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("renamed.md").unwrap();
+    assert!(forge.contains("the first line of the plan"), "{forge}");
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn keep_mine_on_an_old_draft_writes_the_first_record() {
+    let t = team(&[("plan.md", plan_later())]).await;
+    t.old_draft(
+        "alice",
+        "plan.md",
+        &text(&plan()).replace("the last line", "alice's last line"),
+    )
+    .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", UnknownStart)]
+    );
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    assert_eq!(
+        t.record("alice", "plan.md"),
+        Some(DraftStart {
+            path: "plan.md".to_string(),
+            from: Some("plan.md".to_string()),
+            start: Some(text(&plan_later())),
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+            merging: None,
+        })
+    );
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn keep_mine_on_an_old_move_settles_both_halves_with_one_press() {
+    let t = team_direct(&[("plan.md", plan_later())]).await;
+    t.old_tombstone("alice", "plan.md", &plan()).await;
+    t.old_draft(
+        "alice",
+        "renamed.md",
+        &text(&plan()).replace("the last line", "alice's last line"),
+    )
+    .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", UnknownStart)
+        }]
+    );
+
+    let receipt = t
+        .resolve("alice", "renamed.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "renamed.md", "mine", false);
+    for path in ["renamed.md", "plan.md"] {
+        let record = t.record("alice", path).unwrap();
+        assert_eq!(record.from.as_deref(), Some("plan.md"), "{path}");
+        assert_eq!(
+            record.start.as_deref(),
+            Some(text(&plan_later()).as_str()),
+            "{path}"
+        );
+    }
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(
+        t.forge_file("renamed.md")
+            .unwrap()
+            .contains("alice's last line")
+    );
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+/// I-1: bob renames the page she moved and changes no byte. The index then
+/// reads the renamed page's address from its path, so the gate sees the page
+/// gone. Keep mine reads the team's copy, finds her address taken and refuses,
+/// as it does when the gate says so.
+#[tokio::test]
+async fn keep_mine_is_refused_for_a_taken_address() {
+    for changed in [false, true] {
+        let mut t = team(&[("plan.md", plan())]).await;
+        t.moved("alice", "plan", "mine.md").await;
+        let his = if changed { plan_later() } else { plan() };
+        t.push(&[("plan.md", None), ("bobs.md", Some(his))]).await;
+        let rows = t.rows("alice").await;
+        let record = t.record("alice", "mine.md");
+        let conflicts = t.conflicts("alice").await;
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+
+        let err = t
+            .resolve("alice", "mine.md", Some("mine"), None)
+            .await
+            .unwrap_err();
+        let said = err.to_string();
+        assert!(
+            said.contains("bobs.md") && said.contains("mine.md") && said.contains("take theirs"),
+            "changed {changed}: {said}"
+        );
+        // A merged text at that address is refused the same way.
+        let same = t.row("alice", "mine.md").await;
+        let err = t
+            .resolve("alice", "mine.md", None, Some(&same))
+            .await
+            .unwrap_err();
+        let said = err.to_string();
+        assert!(
+            said.contains("bobs.md")
+                && said.contains("merged text")
+                && said.contains("take theirs"),
+            "changed {changed}: {said}"
+        );
+        assert_eq!(t.rows("alice").await, rows, "changed {changed}");
+        assert_eq!(t.record("alice", "mine.md"), record, "changed {changed}");
+        assert_eq!(t.conflicts("alice").await, conflicts, "changed {changed}");
+    }
+}
+
+#[tokio::test]
+async fn a_later_peer_edit_after_keep_mine_merges_again_against_the_new_start() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+    t.resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+
+    t.push(&[("plan.md", Some(plan_carol()))]).await;
+    let row = t.row("alice", "plan.md").await;
+    assert!(
+        row.contains(ALICE_LINE) && row.contains("carol's middle") && !row.contains(BOB_LINE),
+        "{row}"
+    );
+    assert_eq!(
+        t.record("alice", "plan.md").unwrap().start.as_deref(),
+        Some(text(&plan_carol()).as_str())
+    );
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+#[tokio::test]
+async fn resolving_another_persons_path_finds_nothing_of_hers() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    let hers = a_same_line_conflict(&mut t).await;
+    let record = t.record("alice", "plan.md");
+
+    for keep in ["mine", "theirs"] {
+        let err = t
+            .resolve("bob", "plan.md", Some(keep), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NotFound(_)), "{keep}: {err}");
+    }
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+    assert_eq!(t.record("alice", "plan.md"), record);
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+}
+
+/// Settling a draft makes no call to the forge, so it works with GitHub off.
+#[tokio::test]
+async fn a_draft_settles_with_github_off() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+    let off = t.engine_over(t.eng.store(), |config| {
+        config.github = Some(crystalline_core::config::GitHubConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+    });
+    assert!(!off.github_enabled());
+
+    let receipt = off
+        .origin_resolve(
+            "team",
+            "plan.md",
+            Some("mine"),
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    assert_eq!(off.draft_conflicts("team", "alice").await.unwrap(), vec![]);
+}
+
+/// M-2: a direct commit of only the deletion half of her move could not free
+/// the draft. It reads `EditDelete`, and Keep mine keeps the page as a new file.
+#[tokio::test]
+async fn keep_mine_after_a_failed_freeing_keeps_the_page() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    let folder = draft_start::record_file(&t.state(), "team", "alice", "plan.md")
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let broken = folder.join(format!("{}.json", "0".repeat(64)));
+    std::fs::write(&broken, b"{ not a record").unwrap();
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(answer["free_error"].is_string(), "{answer}");
+    std::fs::remove_file(&broken).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", EditDelete)
+        }]
+    );
+
+    let receipt = t
+        .resolve("alice", "renamed.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "renamed.md", "mine", false);
+    let record = t.record("alice", "renamed.md").unwrap();
+    assert_eq!((record.from, record.start), (None, None));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("renamed.md").unwrap();
+    assert!(forge.contains("the first line of the plan"), "{forge}");
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+/// M-1: Keep mine forgets the proposal, so a later pass does not settle a merged
+/// proposal over the start she chose and take the reviewer's text into her row.
+#[tokio::test]
+async fn keep_mine_after_a_merged_proposal_is_not_undone_by_the_next_pass() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let (answer, _, branch) = proposed(&t, "alice").await;
+    let hers = t.row("alice", "plan.md").await;
+    let reviewed =
+        text(&t.branch_file(&branch, "plan.md").unwrap()).replace(HER_WORD, REVIEWED_WORD);
+    t.merge(&answer, &[("plan.md", Some(reviewed.clone().into_bytes()))]);
+    t.eng.fail_next_convergence();
+    t.pull().await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)],
+        "a merged proposal no pass settled"
+    );
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.shared, None);
+    assert_eq!(record.merging, None);
+    assert_eq!(record.start.as_deref(), Some(reviewed.as_str()));
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, hers, "her choice stands");
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// M18: Keep mine over a team file with no text writes a digest and no text.
+/// The merge of her proposal then settles a text start alone, so the draft ends
+/// rather than reading `UnknownStart` for good.
+#[tokio::test]
+async fn keep_mine_on_a_file_with_no_text_then_a_merged_proposal_reads_one_start() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let not_text = vec![0xff, 0xfe, 0x00, 0x41];
+    t.push(&[("plan.md", Some(not_text.clone()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "mine", false);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(record.start, None);
+    assert_eq!(record.start_sha256, Some(sha256_hex(&not_text)));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let (answer, _, _) = proposed(&t, "alice").await;
+    t.merge(&answer, &[]);
+    t.pull().await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert!(t.reads("alice", "plan").await.contains(HER_WORD));
+}
+
+// Option A's kept copy (owner question 2). Reversible: these three tests and the
+// keep in `resolve_in_overlay`.
+
+#[tokio::test]
+async fn take_theirs_on_an_old_draft_keeps_a_copy_for_its_owner() {
+    let t = team(&[("plan.md", plan_later())]).await;
+    let hers = text(&plan()).replace("the last line", "alice's last line");
+    t.old_draft("alice", "plan.md", &hers).await;
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "theirs", true);
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert_eq!(t.kept_of("alice"), vec![("plan.md".to_string(), hers)]);
+    assert_eq!(t.kept_of("bob"), vec![]);
+}
+
+#[tokio::test]
+async fn take_theirs_on_a_new_conflict_keeps_no_copy() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "theirs", false);
+    assert_eq!(t.kept_of("alice"), vec![]);
+}
+
+#[tokio::test]
+async fn a_failed_keep_refuses_the_take() {
+    let t = team(&[("plan.md", plan_later())]).await;
+    let hers = text(&plan()).replace("the last line", "alice's last line");
+    t.old_draft("alice", "plan.md", &hers).await;
+    // A file where the kept folder goes, so no text can be kept.
+    std::fs::write(
+        t.state().join(crystalline_core::kept::KEPT_DIR),
+        b"in the way",
+    )
+    .unwrap();
+
+    t.resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(t.row("alice", "plan.md").await, hers, "the last copy stays");
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", UnknownStart)]
+    );
+}
+
+/// `remaining` counts her own conflicts still standing, not the old record's.
+#[tokio::test]
+async fn the_receipt_counts_her_conflicts_left() {
+    let mut t = team(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    same_line(&t).await;
+    t.append("alice", "gone", HER_WORD).await;
+    t.push(&[("plan.md", Some(plan_later())), ("gone.md", None)])
+        .await;
+    assert_eq!(t.conflicts("alice").await.len(), 2);
+
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    assert_eq!(receipt["remaining"], 1, "{receipt}");
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "gone.md", EditDelete)]
+    );
+}

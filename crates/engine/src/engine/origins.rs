@@ -4081,7 +4081,9 @@ impl Engine {
     /// `keep` is `"mine"` or `"theirs"`; exactly one of `keep` or `content`
     /// must be supplied (see `origin::resolution_from`). Refuses with
     /// `github.enabled`'s message when collaboration is off, and with
-    /// `EngineError::ReadOnly` on a read-only instance.
+    /// `EngineError::ReadOnly` on a read-only instance. A draft in a domain
+    /// that reviews changes settles with collaboration off: that makes no call
+    /// to the forge, and leaving review needs every draft settled.
     ///
     /// `actor` makes no provider call of its own - resolving writes this
     /// machine and reaches the forge later, on the next share, under whoever
@@ -4100,7 +4102,10 @@ impl Engine {
         content: Option<&[u8]>,
         actor: ShareActor,
     ) -> Result<Value> {
-        if !self.config.read().unwrap().github_enabled() {
+        // A draft settles with collaboration off, so only a domain that takes
+        // changes directly is refused here. Its folder conflict is refused
+        // again below, for a reviewing domain too.
+        if !self.config.read().unwrap().github_enabled() && !self.reviews_changes(domain) {
             return Err(RemoteError::NotEnabled.into());
         }
         if self.read_only {
@@ -4166,7 +4171,7 @@ impl Engine {
             match held {
                 Some((domain_id, Some(_))) => {
                     return self
-                        .resolve_in_overlay(domain, domain_id, &who, path, resolution)
+                        .resolve_in_overlay(domain, domain_id, &who, path, resolution, &state_dir)
                         .await;
                 }
                 // Nothing of this caller's stands here. A conflict the pull
@@ -4188,6 +4193,9 @@ impl Engine {
                 }
                 _ => {}
             }
+        }
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
         }
         let report = ops::resolve(&root, &state_dir, path, resolution)?;
 
@@ -4212,30 +4220,43 @@ impl Engine {
             .is_some_and(|state| state.conflicts.iter().any(|c| c.path == path)))
     }
 
-    /// Settles one actor's conflict inside their own overlay: the draft that
-    /// was standing against a base that moved under it.
+    /// Settles one actor's draft inside their own overlay, from either end of a
+    /// move: a path that is the deletion half of a move settles as its draft,
+    /// and the draft takes that deletion along.
     ///
-    /// Three answers and one shape. Keeping the team's version ENDS the draft -
-    /// what the folder says is what this actor reads at that path again - and
-    /// merged content becomes their new draft, written through the one overlay
-    /// writer so it carries the address rule every draft carries. Keeping their
-    /// own changes nothing on purpose: the draft as it stands IS the answer,
-    /// and the conflict was never a record for a write to clear, only the last
-    /// pull's reading of a draft against a folder that had moved. All three
-    /// settle the conflict, so all three take it out of what
-    /// [`Engine::converged_json`] reports.
+    /// - **Keep mine** leaves the row and moves its start to the team's text,
+    ///   so her text replaces the team's when she shares. The start is read
+    ///   where the decision reads the team's text: her own path when the team
+    ///   holds a file there she did not start from, otherwise where she started,
+    ///   which for a case move is the snapshot's real key. A team file that is
+    ///   gone leaves no start, so the draft lands as a new file. A draft from
+    ///   before the record gets its first one here. Refused when another team
+    ///   page answers to the draft's address, since Keep mine cannot clear it.
+    /// - **Take theirs** ends the draft, both halves of a move, the deletion
+    ///   first. Refused while a room is open over the draft, whose next save
+    ///   would write it straight back. A draft from before the record is kept
+    ///   as a copy first, and a copy that cannot be kept refuses, since it is
+    ///   the last one.
+    /// - **Merged** writes the text as her draft, row first, then moves the
+    ///   start as Keep mine does. A room open over it meets the new row at its
+    ///   next save, as an external change, and merges it.
     ///
-    /// The domain's own conflict records are deliberately untouched: those are
-    /// [`ops::resolve`]'s, they belong to the folder every actor shares, and
-    /// clearing one from inside a draft would settle it on everybody's behalf.
+    /// Every start saved here clears `shared` and `merging`: a merge mark or a
+    /// merged proposal no pass settled must not outlive her choice, nor move
+    /// her start back to what the proposal held. Nothing here runs the pass or
+    /// settles a proposal: the snapshot is read as it stands, so a merge no
+    /// pull has brought in is never read as the team's text.
     ///
-    /// **No recorded conflict is required**, and that is a widening worth
-    /// naming: any path this actor is drafting can be resolved, whether or not
-    /// a pull ever flagged it. Requiring the record would make a conflict
-    /// unsettleable whenever the record could not be read, and the arms are
-    /// what a draft's author may already do to their own draft anyway - the
-    /// merged arm is `write_engram` by another name, and the `theirs` arm is
-    /// their own deletion of their own draft.
+    /// Everything is read outside the locks. Each row is then written under its
+    /// own draft lock, one at a time, and only while it and its record are
+    /// still what was read. The domain's own conflict records are untouched:
+    /// those are [`ops::resolve`]'s, they belong to the folder every actor
+    /// shares.
+    ///
+    /// **No conflict is required.** Any path this actor is drafting can be
+    /// settled: the arms are what a draft's author may already do to their own
+    /// draft, and requiring a conflict would leave one that cannot be read
+    /// with no way out.
     async fn resolve_in_overlay(
         &self,
         domain: &str,
@@ -4243,12 +4264,155 @@ impl Engine {
         actor: &str,
         path: &str,
         resolution: ops::Resolution<'_>,
+        state_dir: &Path,
     ) -> Result<Value> {
+        let (_, root, _) = self.origin_spec_for_domain(domain)?;
         let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
-        match resolution {
-            ops::Resolution::Mine => {}
+        // The kind as she sees it: an old move lists once, at its draft.
+        let listed = self.draft_conflicts(domain, actor).await?;
+        // With no snapshot nothing can say where a draft starts, so no start
+        // is written, as no new draft gets one then.
+        let snapshot = crystalline_remote::state::OriginState::load(state_dir)?;
+        let can_record = snapshot.is_some();
+        let state = snapshot.unwrap_or_else(|| crystalline_remote::state::OriginState::new("", ""));
+        let rows = {
+            let store = self.store.lock().await;
+            store.overlay_entries(domain_id, actor).await?
+        };
+        let mut reading = self
+            .read_drafts(domain, domain_id, actor, rows, &root, state_dir, &state)
+            .await?;
+        let at = reading
+            .rows
+            .iter()
+            .position(|row| row.path == path)
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "you are not drafting '{path}' in domain '{domain}' any more"
+                ))
+            })?;
+        let (d, half) = if reading.rows[at].tombstone {
+            let draft = (0..reading.rows.len())
+                .find(|&d| !reading.rows[d].tombstone && reading.half_of(d) == Some(at));
+            match draft {
+                Some(d) => (d, Some(at)),
+                None => (at, None),
+            }
+        } else {
+            (at, reading.half_of(at))
+        };
+        let row = reading.rows[d].clone();
+        let kind = listed
+            .iter()
+            .find(|conflict| conflict.path == row.path)
+            .map(|conflict| conflict.kind);
+        let mut kept_copy = false;
+        let kept = match resolution {
+            ops::Resolution::Mine => {
+                if !row.tombstone {
+                    // What the list says, and what the team's copies say, since
+                    // the index can read an address the copies do not hold.
+                    let listed_other = listed
+                        .iter()
+                        .find(|conflict| {
+                            conflict.path == row.path
+                                && conflict.kind == DraftConflictKind::AddressTaken
+                        })
+                        .and_then(|conflict| conflict.other.clone());
+                    let other = match listed_other {
+                        Some(other) => Some(other),
+                        None => reading.team_file_at_address(&row.permalink)?,
+                    };
+                    if let Some(other) = other {
+                        return Err(EngineError::Conflict(format!(
+                            "The team's file {other} now uses the same address as your draft \
+                             of {}. Change the address in Edit merged, or take theirs.",
+                            row.path
+                        )));
+                    }
+                }
+                let (start, half_start) = settled_starts(&mut reading, d, half, can_record)?;
+                self.settle_row(
+                    &view,
+                    domain,
+                    domain_id,
+                    actor,
+                    &reading,
+                    d,
+                    Settle::Keep,
+                    start,
+                )
+                .await?;
+                if let Some(t) = half {
+                    self.settle_row(
+                        &view,
+                        domain,
+                        domain_id,
+                        actor,
+                        &reading,
+                        t,
+                        Settle::Keep,
+                        half_start,
+                    )
+                    .await?;
+                }
+                "mine"
+            }
             ops::Resolution::Theirs => {
-                view.drop(domain_id, path).await?;
+                let open = match self.collab_rooms() {
+                    Some(rooms) if !row.tombstone => {
+                        rooms
+                            .has_live_room(domain, &row.permalink, Some(actor))
+                            .await
+                    }
+                    _ => false,
+                };
+                if open {
+                    return Err(EngineError::Conflict(format!(
+                        "'{}' is open in an editor. Close it, then take the team's text.",
+                        row.path
+                    )));
+                }
+                // Option A (owner question 2): a draft from before the record
+                // did not cause its conflict, and its text exists nowhere else.
+                if kind == Some(DraftConflictKind::UnknownStart) && !row.tombstone {
+                    self.keep_a_copy(domain, actor, &row)?;
+                    kept_copy = true;
+                }
+                if let Some(t) = half {
+                    self.settle_row(
+                        &view,
+                        domain,
+                        domain_id,
+                        actor,
+                        &reading,
+                        t,
+                        Settle::Drop,
+                        None,
+                    )
+                    .await?;
+                }
+                let dropped = self
+                    .settle_row(
+                        &view,
+                        domain,
+                        domain_id,
+                        actor,
+                        &reading,
+                        d,
+                        Settle::Drop,
+                        None,
+                    )
+                    .await;
+                if let Err(e) = dropped {
+                    // The draft stands, so its deletion half comes back with it.
+                    if let Some(t) = half {
+                        self.put_half_back(domain, domain_id, actor, &reading, t)
+                            .await;
+                    }
+                    return Err(e);
+                }
+                "theirs"
             }
             ops::Resolution::Merged(bytes) => {
                 let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -4256,17 +4420,132 @@ impl Engine {
                         "the merged content is not valid UTF-8, so it is not an engram".to_string(),
                     )
                 })?;
-                view.write(domain_id, path, text).await?;
+                let address = Engine::overlay_record(&row.path, text)?.permalink;
+                if let Some(other) = reading.team_file_at_address(&address)? {
+                    return Err(EngineError::Conflict(format!(
+                        "The team's file {other} now uses the same address as your merged text \
+                         of {}. Change its address, or take theirs.",
+                        row.path
+                    )));
+                }
+                let (start, half_start) = settled_starts(&mut reading, d, half, can_record)?;
+                self.settle_row(
+                    &view,
+                    domain,
+                    domain_id,
+                    actor,
+                    &reading,
+                    d,
+                    Settle::Write(text),
+                    start,
+                )
+                .await?;
+                if let Some(t) = half {
+                    self.settle_row(
+                        &view,
+                        domain,
+                        domain_id,
+                        actor,
+                        &reading,
+                        t,
+                        Settle::Keep,
+                        half_start,
+                    )
+                    .await?;
+                }
+                "merged"
             }
+        };
+        // The frozen list of drafts from before the record forgets both paths.
+        self.settle_convergence(domain, actor, &row.path);
+        if let Some(t) = half {
+            self.settle_convergence(domain, actor, &reading.rows[t].path);
         }
-        let remaining = self.settle_convergence(domain, actor, path);
+        let remaining = match self.draft_conflicts(domain, actor).await {
+            Ok(conflicts) => json!(conflicts.len()),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    "the conflicts left after settling '{}' could not be counted: {e}",
+                    row.path
+                );
+                Value::Null
+            }
+        };
         Ok(json!({
-            "resolved": path,
+            "resolved": row.path,
             "remaining": remaining,
             // The receipt says where the resolution landed: in this actor's
             // draft, not in the folder the team reviewed.
             "draft": true,
+            "kept": kept,
+            "kept_copy": kept_copy,
         }))
+    }
+
+    /// Row `i` of `reading`, under its draft lock and only while it and its
+    /// record are still what was read: `settle` it, then save `start` when
+    /// there is one. A row or record that changed meanwhile is refused, with
+    /// nothing written.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_row(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        i: usize,
+        settle: Settle<'_>,
+        start: Option<crate::draft_start::DraftStart>,
+    ) -> Result<()> {
+        let row = &reading.rows[i];
+        let lock = self.draft_lock(domain, actor, &row.path)?;
+        let _guard = lock.lock().await;
+        if !self
+            .still_as_read(view, domain_id, actor, row, reading.records[i].as_ref())
+            .await?
+        {
+            return Err(EngineError::Conflict(format!(
+                "your draft of '{}' changed while it was being settled. Look at it again, \
+                 then settle it.",
+                row.path
+            )));
+        }
+        match settle {
+            Settle::Keep => {}
+            Settle::Write(text) => {
+                if let Some(warning) = view.write(domain_id, &row.path, text).await? {
+                    tracing::warn!(domain, actor, path = row.path.as_str(), "{warning}");
+                }
+            }
+            Settle::Drop => view.drop(domain_id, &row.path).await?,
+        }
+        if let Some(start) = start {
+            self.save_start(domain, actor, &start)?;
+        }
+        Ok(())
+    }
+
+    /// Keep a copy of `row`'s text for its owner, the way a room keeps a text
+    /// it could not save. A copy that cannot be kept is an error.
+    fn keep_a_copy(&self, domain: &str, actor: &str, row: &StoredEngram) -> Result<()> {
+        let what = format!("a kept copy of your draft of '{}'", row.path);
+        let kept = self
+            .kept_dir()
+            .ok_or_else(|| EngineError::Internal(format!("{what}: no state folder")))?;
+        crystalline_core::kept::write(
+            &kept,
+            domain,
+            Some(actor),
+            crystalline_core::kept::KeptKind::Engram,
+            &row.path,
+            chrono::Utc::now(),
+            &row.content,
+        )
+        .map(|_| ())
+        .map_err(|source| EngineError::Io { path: what, source })
     }
 
     /// Resolves a single domain's `OriginSpec`, root and state directory for
@@ -5332,4 +5611,108 @@ fn merged_before_the_update(number: u64) -> String {
         "The team merged proposal #{number} while this change was on its way. If your change \
          is not in it, it stays in your drafts and you can share it again."
     )
+}
+
+/// What settling does to one row.
+enum Settle<'t> {
+    /// Leave the row as it is: only its start moves.
+    Keep,
+    /// Write this text as the draft.
+    Write(&'t str),
+    /// End the row, and its record with it.
+    Drop,
+}
+
+/// The start a team text gives: the text as LF, or for bytes that are not
+/// UTF-8 or a key with no readable copy the digest alone, never both. Nothing
+/// for a file the team does not hold.
+fn start_of(held: &draft_conflicts::Held) -> (Option<String>, Option<String>) {
+    match held {
+        draft_conflicts::Held::Absent => (None, None),
+        draft_conflicts::Held::Bytes(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => (Some(crystalline_core::to_lf(text).into_owned()), None),
+            Err(_) => (None, Some(sha256_hex(bytes))),
+        },
+        draft_conflicts::Held::Unreadable(sha256) => (None, Some(sha256.clone())),
+    }
+}
+
+/// The records a settled draft `d` and its deletion half `half` are saved
+/// with: each starts from the team's text as it stands, with nothing shared
+/// and no merge marked. `None` for each when no start can be known.
+///
+/// The draft starts where the decision reads the team's text. With a record:
+/// its own path when the team holds a file there she did not start from
+/// ([`answers_at_path`](crate::draft_merge::answers_at_path)), otherwise its
+/// `from`, which a case move keeps at the snapshot's real key. A draft from
+/// before the record starts at its own path when the team holds it, otherwise
+/// where its old move pair stood, otherwise at its own path. A key the team
+/// does not hold leaves no start and no `from`: the draft is a new file. A
+/// tombstone always starts at its own path.
+fn settled_starts(
+    reading: &mut draft_conflicts::Reading<'_>,
+    d: usize,
+    half: Option<usize>,
+    can_record: bool,
+) -> Result<(
+    Option<crate::draft_start::DraftStart>,
+    Option<crate::draft_start::DraftStart>,
+)> {
+    if !can_record {
+        return Ok((None, None));
+    }
+    let row = reading.rows[d].clone();
+    let record = reading.records[d].clone();
+    let from = if row.tombstone {
+        Some(row.path.clone())
+    } else if let Some(record) = &record {
+        let team = reading.team(d)?;
+        if crate::draft_merge::answers_at_path(&reading.sides(d, &team)) {
+            Some(row.path.clone())
+        } else {
+            record.from.clone()
+        }
+    } else if !matches!(reading.team_at(&row.path)?, draft_conflicts::Held::Absent) {
+        Some(row.path.clone())
+    } else {
+        Some(half.map_or_else(|| row.path.clone(), |t| reading.rows[t].path.clone()))
+    };
+    let held = match &from {
+        Some(key) => reading.team_at(key)?,
+        None => draft_conflicts::Held::Absent,
+    };
+    let (start, start_sha256) = start_of(&held);
+    let from = if row.tombstone || !matches!(held, draft_conflicts::Held::Absent) {
+        from
+    } else {
+        None
+    };
+    let settled = crate::draft_start::DraftStart {
+        path: row.path.clone(),
+        from,
+        start,
+        start_sha256,
+        shared: None,
+        merged_at: record.and_then(|record| record.merged_at),
+        merging: None,
+    };
+    let half = match half {
+        Some(t) => {
+            let path = reading.rows[t].path.clone();
+            let (start, start_sha256) = start_of(&reading.team_at(&path)?);
+            Some(crate::draft_start::DraftStart {
+                path: path.clone(),
+                from: Some(path),
+                start,
+                start_sha256,
+                shared: None,
+                merged_at: reading.records[t]
+                    .as_ref()
+                    .and_then(|record| record.merged_at),
+                merging: None,
+            })
+        }
+        None => None,
+    };
+    Ok((Some(settled), half))
 }

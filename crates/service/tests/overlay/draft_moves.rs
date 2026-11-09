@@ -1210,9 +1210,10 @@ async fn a_discard_takes_the_record() {
     assert_eq!(f.start("plan.md"), None);
 }
 
-/// Taking the team's side ends the draft through the same drop.
+/// Taking the team's side ends the draft through the same drop. A merged text
+/// keeps the record and moves its start to the team's text it was merged with.
 #[tokio::test]
-async fn a_resolve_for_theirs_takes_the_record_and_a_merged_one_keeps_it() {
+async fn a_resolve_for_theirs_takes_the_record_and_a_merged_one_moves_it() {
     let f = fixture(&[("plan.md", PLAN)]).await;
     f.draft_plan().await;
     f.team_has("plan.md", PLAN_LATER.as_bytes());
@@ -1226,11 +1227,7 @@ async fn a_resolve_for_theirs_takes_the_record_and_a_merged_one_keeps_it() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        f.start("plan.md"),
-        Some(in_step("plan.md", PLAN)),
-        "moving the start is Task 9's, not this writer's"
-    );
+    assert_eq!(f.start("plan.md"), Some(in_step("plan.md", PLAN_LATER)));
 
     f.engine
         .origin_resolve(
@@ -2173,4 +2170,112 @@ async fn an_edit_between_the_two_drops_of_a_landed_move_keeps_the_move_whole() {
         !kinds.contains(&DraftConflictKind::AddressTaken),
         "{kinds:?}"
     );
+}
+
+// --- Keep mine and Take theirs on a move ------------------------------------
+
+impl Fixture {
+    async fn resolve(&self, path: &str, keep: &str) -> serde_json::Value {
+        self.engine
+            .origin_resolve(
+                "team",
+                path,
+                Some(keep),
+                None,
+                ShareActor::Account("alice".to_string()),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Alice moves the plan to `to` with her own first line, and bob changes the
+    /// same line: one conflict, at her new path.
+    async fn a_move_in_conflict(&self, to: &str) {
+        self.replace("plan", "the first line", "alice's first line")
+            .await;
+        self.moved("plan", to).await;
+        self.push(&[("plan.md", Some(bobs(LONG)))]).await;
+        assert_eq!(
+            self.conflicts().await,
+            vec![moved_conflict(to, "plan.md", DraftConflictKind::EditEdit)]
+        );
+    }
+}
+
+/// N4: Take theirs at the path she moved from settles the whole move, for a
+/// rename and for a case move, on either disk.
+#[tokio::test]
+async fn resolving_a_move_at_the_old_path_settles_the_whole_move() {
+    for to in ["renamed.md", "Plan.md"] {
+        let f = fixture(&[("plan.md", LONG)]).await;
+        eprintln!("{to}: the temp folder folds case: {}", folds_case(&f.root));
+        f.a_move_in_conflict(to).await;
+
+        let receipt = f.resolve("plan.md", "theirs").await;
+        assert_eq!(receipt["resolved"], to, "{receipt}");
+        assert_eq!(receipt["kept"], "theirs", "{receipt}");
+        assert_eq!(receipt["remaining"], 0, "{receipt}");
+        assert_eq!(f.rows().await, vec![], "{to}");
+        assert_eq!((f.start("plan.md"), f.start(to)), (None, None), "{to}");
+        assert_eq!(f.conflicts().await, vec![], "{to}");
+        assert!(f.reads("plan").await.contains(BOB_LINE), "{to}");
+        assert_eq!(f.share().await["outcome"], "nothing_to_share", "{to}");
+    }
+}
+
+/// N1 after a resolve: Keep mine on an edited move in conflict, then her direct
+/// share, ends both halves with no row left.
+#[tokio::test]
+async fn keep_mine_on_an_edited_move_ends_when_shared_with_no_row_left() {
+    let f = fixture_direct(&[("plan.md", LONG)]).await;
+    f.a_move_in_conflict("renamed.md").await;
+
+    let receipt = f.resolve("renamed.md", "mine").await;
+    assert_eq!(receipt["resolved"], "renamed.md", "{receipt}");
+    assert_eq!(receipt["kept"], "mine", "{receipt}");
+    for path in ["renamed.md", "plan.md"] {
+        let record = f.start(path).unwrap();
+        assert_eq!(record.from.as_deref(), Some("plan.md"), "{path}");
+        assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()), "{path}");
+    }
+    assert_eq!(f.conflicts().await, vec![]);
+
+    let answer = f.share().await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(f.rows().await, vec![], "{answer}");
+    assert!(
+        f.forge_file("renamed.md")
+            .unwrap()
+            .contains("alice's first line")
+    );
+    assert_eq!(f.forge_file("plan.md"), None);
+    assert_eq!(f.share().await["outcome"], "nothing_to_share");
+}
+
+/// Keep mine on a case move starts it at the spelling the snapshot holds, never
+/// at her own spelling, which the team does not hold: a later change of the
+/// team's merges, on either disk, rather than reading as the page deleted.
+#[tokio::test]
+async fn keep_mine_on_a_case_move_starts_at_the_teams_spelling() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.a_move_in_conflict("Plan.md").await;
+
+    f.resolve("Plan.md", "mine").await;
+    for path in ["Plan.md", "plan.md"] {
+        let record = f.start(path).unwrap();
+        assert_eq!(record.from.as_deref(), Some("plan.md"), "{path}");
+        assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()), "{path}");
+    }
+    assert_eq!(f.conflicts().await, vec![]);
+
+    let later = bobs(LONG).replace("the last line", "carol's last line");
+    f.push(&[("plan.md", Some(later.clone()))]).await;
+    let row = f.row("Plan.md").await;
+    assert!(
+        row.contains("alice's first line") && row.contains("carol's last line"),
+        "{row}"
+    );
+    assert_eq!(f.start("Plan.md").unwrap().start, Some(later));
+    assert_eq!(f.conflicts().await, vec![]);
 }

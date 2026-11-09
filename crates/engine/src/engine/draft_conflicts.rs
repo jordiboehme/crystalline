@@ -318,6 +318,38 @@ impl Reading<'_> {
         Ok(RowTeam { at_path, at_from })
     }
 
+    /// What the team holds at `path`, read from a real key of the snapshot.
+    pub(super) fn team_at(&mut self, path: &str) -> Result<Held> {
+        self.base.at(path)
+    }
+
+    /// The team's page whose base copy answers to `permalink`, among the pages
+    /// of the snapshot she holds no row at (C13).
+    ///
+    /// Read from the copies and never from the index: after a rename that
+    /// changed no byte the index reads the new file's address from its path,
+    /// though its frontmatter names another. A copy that two spellings share
+    /// on a disk that folds case cannot say whose bytes it holds, so it answers
+    /// to nothing, as the conflict list reads it.
+    pub(super) fn team_file_at_address(&self, permalink: &str) -> Result<Option<String>> {
+        let own: HashSet<&str> = self.rows.iter().map(|row| row.path.as_str()).collect();
+        for key in self.base.state.files.keys() {
+            if !holds_an_address(key)
+                || own.contains(key.as_str())
+                || self.base.shared_spelling.contains(key)
+            {
+                continue;
+            }
+            let Some(bytes) = read_base_file(self.base.state_dir, key)? else {
+                continue;
+            };
+            if address_of(key, &bytes).as_deref() == Some(permalink) {
+                return Ok(Some(key.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     /// The row's sides for the decision, with `team` from [`Reading::team`].
     pub(super) fn sides<'a>(&'a self, i: usize, team: &'a RowTeam) -> DraftSides<'a> {
         let row = &self.rows[i];
