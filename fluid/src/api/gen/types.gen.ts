@@ -581,11 +581,11 @@ export type DraftConflictEntry = {
     /**
      * The path a moved draft left.
      */
-    moved_from?: string | null;
+    moved_from: string | null;
     /**
      * For `AddressTaken`: the team's path that holds the address.
      */
-    other?: string | null;
+    other: string | null;
     /**
      * The draft's path, or the deletion's when it stands alone.
      */
@@ -601,11 +601,11 @@ export type DraftConflictKind = 'EditEdit' | 'EditDelete' | 'DeleteEdit' | 'AddA
  * One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.
  */
 export type DraftConflictSides = {
-    base?: string | null;
+    base: string | null;
     /**
      * Always null: a draft conflict is read from what stands, never stored.
      */
-    detected_at?: string | null;
+    detected_at: string | null;
     /**
      * Always true.
      */
@@ -616,12 +616,12 @@ export type DraftConflictSides = {
     file?: boolean | null;
     id: string;
     kind: DraftConflictKind;
-    local?: string | null;
-    moved_from?: string | null;
-    note?: string | null;
-    other?: string | null;
+    local: string | null;
+    moved_from: string | null;
+    note: string | null;
+    other: string | null;
     path: string;
-    upstream?: string | null;
+    upstream: string | null;
 };
 
 /**
@@ -677,7 +677,7 @@ export type DraftResolveReceipt = {
      * How many of your conflicts in this domain are left, or null when they
      * could not be counted.
      */
-    remaining?: number | null;
+    remaining: number | null;
     /**
      * The draft's path. A move is settled whole, at its draft.
      */
@@ -4066,7 +4066,7 @@ export type ResolveDraftConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived (except for `theirs`), or the trusted-header identity names a disabled account.
+     * The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived or its MANIFEST says `read_only: on` (both except for `theirs`), the result would switch `read_only` on (the owner's step), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -4074,13 +4074,21 @@ export type ResolveDraftConflictErrors = {
      */
     404: ProblemDetail;
     /**
+     * Another instance on this shared database hosts this file domain, so it is written there.
+     */
+    409: ProblemDetail;
+    /**
      * The body is not `application/json`.
      */
     415: ProblemDetail;
     /**
-     * An unknown `resolution`, `merged` with no `content`, a merge of a file, or a resolution the draft refuses; the detail says why and what to do.
+     * An unknown `resolution`, `merged` with no `content`, a merge of a file, a resolution the draft refuses, or your conflicts cannot be read, which blocks every resolve until they can; the detail says why and what to do.
      */
     422: ProblemDetail;
+    /**
+     * The conflict could not be settled for a reason on the server's side, so nothing was changed. The detail says so and names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
 };
 
 export type ResolveDraftConflictError = ResolveDraftConflictErrors[keyof ResolveDraftConflictErrors];

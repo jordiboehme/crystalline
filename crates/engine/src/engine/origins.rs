@@ -1705,15 +1705,7 @@ impl Engine {
                     actor,
                     "the conflicts of '{actor}' could not be read: {e}"
                 );
-                (
-                    Vec::new(),
-                    Some(
-                        "Your conflicts in this domain cannot be read, so none are listed, and \
-                         a share of this domain refuses until they can. Try again, and if it \
-                         stays, ask whoever runs this server."
-                            .to_string(),
-                    ),
-                )
+                (Vec::new(), Some(CONFLICTS_UNREADABLE.to_string()))
             }
         };
         let mut merged = self.drafts_merged(domain, actor);
@@ -4554,9 +4546,18 @@ impl Engine {
         let resolution = origin::resolution_from(keep, content)?;
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
+        // A read that fails for the server's reason is told apart from the
+        // write below: it is the list status gives, in status's sentence.
         let conflict = self
             .draft_conflicts(domain, &who)
-            .await?
+            .await
+            .map_err(|e| match e {
+                EngineError::Io { .. } | EngineError::Remote(_) | EngineError::Internal(_) => {
+                    tracing::warn!(domain, actor = %who, "the conflicts of '{who}' could not be read: {e}");
+                    EngineError::Conflict(CONFLICTS_UNREADABLE.to_string())
+                }
+                e => e,
+            })?
             .into_iter()
             .find(|conflict| conflict.id == id)
             .ok_or_else(|| not_among_drafts(domain, id))?;
@@ -6267,6 +6268,15 @@ impl Engine {
     }
 }
 
+/// Why a caller's own conflicts are not listed when the reason is the
+/// server's: anything but a record that cannot be read, which has a sentence
+/// of its own. It names no place on the server's disk; the cause goes to the
+/// log. `origin_status` carries it, and the draft conflict routes answer with
+/// it, so one failure reads the same everywhere.
+pub const CONFLICTS_UNREADABLE: &str = "Your conflicts in this domain cannot be read, so none \
+     are listed, and a share of this domain refuses until they can. Try again, and if it stays, \
+     ask whoever runs this server.";
+
 /// Which conflict a resolve may settle. The share surface and the draft
 /// surface each name exactly one kind, so neither can settle the other's: a
 /// folder conflict needs the share role, a draft only its author.
@@ -6284,7 +6294,7 @@ enum Reach<'a> {
 /// The refusal for a draft conflict id the caller does not hold, in one
 /// wording for the sides and the resolve, so a reader cannot tell somebody
 /// else's id from one that never was.
-pub(super) fn not_among_drafts(domain: &str, id: &str) -> EngineError {
+pub fn not_among_drafts(domain: &str, id: &str) -> EngineError {
     EngineError::NotFound(format!("no conflict {id} among your drafts in '{domain}'"))
 }
 

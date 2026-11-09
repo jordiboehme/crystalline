@@ -484,6 +484,10 @@ async fn another_accounts_conflict_is_not_found() {
     // An id nobody holds reads the same.
     let (status, unknown) = bob.get(&sides("d0000000")).await;
     assert_eq!(status, 404);
+    assert_eq!(
+        unknown["detail"],
+        json!("no conflict d0000000 among your drafts in 'team'")
+    );
     let (_, foreign) = bob.get(&sides(&hers)).await;
     assert_eq!(
         unknown["detail"]
@@ -617,10 +621,14 @@ async fn a_non_reviewing_domain_lists_nothing() {
     let (status, list) = alice.get(LIST).await;
     assert_eq!(status, 200, "{list}");
     assert_eq!(list, json!({"conflicts": [], "merged": []}));
-    let (status, _) = alice.get(&sides(&hers)).await;
+    // In the words an id that is not hers gets, so the two read the same.
+    let not_hers = json!(format!("no conflict {hers} among your drafts in 'team'"));
+    let (status, body) = alice.get(&sides(&hers)).await;
     assert_eq!(status, 404);
+    assert_eq!(body["detail"], not_hers, "{body}");
     let (status, body) = alice.resolve(&hers, json!({"resolution": "mine"})).await;
     assert_eq!(status, 404, "{body}");
+    assert_eq!(body["detail"], not_hers, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -749,4 +757,76 @@ async fn a_merged_resolve_lands_in_her_draft() {
         text.contains("bob's first line") && text.contains("alice rewrote the plan"),
         "{text}"
     );
+}
+
+/// The sentence a list of her conflicts that cannot be read is answered with,
+/// on status and on every draft conflict route alike.
+const UNREADABLE: &str = "Your conflicts in this domain cannot be read, so none are listed, and a share of this domain refuses until they can. Try again, and if it stays, ask whoever runs this server.";
+
+/// A team state file that cannot be parsed is refused in one plain sentence on
+/// all three routes, to every reader, and names no place on the server's disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_state_file_names_no_server_path() {
+    let t = team().await;
+    let hers = t.alice_in_conflict().await;
+    let state_dir = t.tmp.path().join("origins").join("team");
+    std::fs::write(state_dir.join("state.json"), b"{ not json").unwrap();
+    let served = t.serve().await;
+    let alice = served.login("alice").await;
+    let vera = served.login("vera").await;
+    let secret = t.tmp.path().to_str().unwrap().to_string();
+
+    let mut answers = vec![
+        ("alice list", alice.get(LIST).await),
+        ("alice sides", alice.get(&sides(&hers)).await),
+        ("vera sides", vera.get(&sides("d0000000")).await),
+        (
+            "alice resolve",
+            alice.resolve(&hers, json!({"resolution": "mine"})).await,
+        ),
+    ];
+    for (what, (status, body)) in answers.drain(..) {
+        assert_eq!(status, 422, "{what}: {body}");
+        assert_eq!(body["detail"], json!(UNREADABLE), "{what}: {body}");
+        assert!(!body.to_string().contains(&secret), "{what}: {body}");
+        assert!(!body.to_string().contains("state.json"), "{what}: {body}");
+    }
+}
+
+/// What a resolve whose write failed answers: nothing changed, and what to do.
+const NOT_SETTLED: &str = "The conflict could not be settled, so nothing was changed. Try again, or ask whoever runs this server to look at its log.";
+
+/// A resolve that read her conflicts and then could not write is told so in
+/// its own words, as a server fault, and with no place on the server's disk.
+/// It is not told that her conflicts cannot be read: they were.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_write_says_nothing_was_changed() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = team().await;
+    let hers = t.alice_in_conflict().await;
+    let record = crystalline_service::draft_start::record_file(
+        &t.tmp.path().join("state"),
+        "team",
+        "alice",
+        "plan.md",
+    )
+    .unwrap();
+    let folder = record.parent().unwrap().to_path_buf();
+    assert!(record.exists(), "{}", record.display());
+    let served = t.serve().await;
+    let alice = served.login("alice").await;
+    let secret = t.tmp.path().to_str().unwrap().to_string();
+
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (status, body) = alice.resolve(&hers, json!({"resolution": "mine"})).await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["detail"], json!(NOT_SETTLED), "{body}");
+    assert!(!body.to_string().contains(&secret), "{body}");
+    // Her conflicts still read, and the one she pressed stands.
+    let (status, list) = alice.get(LIST).await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(list["conflicts"][0]["id"], json!(hers));
 }

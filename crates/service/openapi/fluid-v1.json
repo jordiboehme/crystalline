@@ -2474,7 +2474,7 @@
             }
           },
           "403": {
-            "description": "The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived (except for `theirs`), or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived or its MANIFEST says `read_only: on` (both except for `theirs`), the result would switch `read_only` on (the owner's step), or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2485,6 +2485,16 @@
           },
           "404": {
             "description": "No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another instance on this shared database hosts this file domain, so it is written there.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2504,7 +2514,17 @@
             }
           },
           "422": {
-            "description": "An unknown `resolution`, `merged` with no `content`, a merge of a file, or a resolution the draft refuses; the detail says why and what to do.",
+            "description": "An unknown `resolution`, `merged` with no `content`, a merge of a file, a resolution the draft refuses, or your conflicts cannot be read, which blocks every resolve until they can; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The conflict could not be settled for a reason on the server's side, so nothing was changed. The detail says so and names no place on the server's disk; the cause is in the server's log.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -13476,7 +13496,9 @@
           "path",
           "kind",
           "draft",
-          "file"
+          "moved_from",
+          "file",
+          "other"
         ],
         "properties": {
           "draft": {
@@ -13535,7 +13557,14 @@
           "id",
           "path",
           "kind",
-          "draft"
+          "draft",
+          "detected_at",
+          "base",
+          "local",
+          "upstream",
+          "moved_from",
+          "other",
+          "note"
         ],
         "properties": {
           "base": {
@@ -13637,6 +13666,7 @@
         "description": "Where the resolution landed: in your draft.",
         "required": [
           "resolved",
+          "remaining",
           "draft",
           "kept",
           "kept_copy"

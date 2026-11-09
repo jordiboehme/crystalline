@@ -9037,6 +9037,7 @@ use doc_file::{
     remove_if_there,
 };
 pub use draft_conflicts::DraftConflict;
+pub use origins::{CONFLICTS_UNREADABLE, not_among_drafts};
 
 /// The moments in a fold a test can step into with `Engine::at_next_fold_step`,
 /// which only a test build has.

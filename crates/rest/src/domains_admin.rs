@@ -2371,20 +2371,38 @@ pub async fn resolve_conflict(
     ))
 }
 
+/// What a resolve whose write failed answers: a server fault, in words that
+/// name no place on this server's disk and say that nothing changed.
+const NOT_SETTLED: &str = "The conflict could not be settled, so nothing was \
+     changed. Try again, or ask whoever runs this server to look at its log.";
+
+/// Which half of a draft conflict route failed, for [`draft_conflict_error`].
+#[derive(Clone, Copy)]
+enum Step {
+    /// Reading the caller's conflicts: the list, the sides.
+    Read,
+    /// Settling one: the resolve. A read that fails there comes back from the
+    /// engine already as the read sentence, a refusal and not a fault.
+    Write,
+}
+
 /// An engine error on a draft conflict route, as the caller is told it. A
-/// failure to read or write is logged with its cause and answered in one
-/// sentence that names no place on this server's disk; every other refusal
-/// is answered as the engine words it.
-fn draft_conflict_error(domain: &str, e: EngineError) -> ApiError {
-    match e {
-        EngineError::Io { .. } | EngineError::Internal(_) => {
-            tracing::warn!(domain, "a draft conflict route failed: {e}");
-            ApiError::internal(
-                "Your conflicts in this domain could not be read or settled here. Try again, \
-                 and if it stays, ask whoever runs this server.",
-            )
-        }
-        e => e.into(),
+/// failure on the server's side (anything REST would answer 500: a read or
+/// write that failed, a team state file that cannot be parsed) is logged with
+/// its cause and answered in a sentence that names no place on this server's
+/// disk: on a read, 422 with the sentence the list and the status give; on a
+/// write, 500 with [`NOT_SETTLED`]. Every other refusal is answered as the
+/// engine words it.
+fn draft_conflict_error(domain: &str, step: Step, e: EngineError) -> ApiError {
+    let cause = e.to_string();
+    let api: ApiError = e.into();
+    if api.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return api;
+    }
+    tracing::warn!(domain, "a draft conflict route failed: {cause}");
+    match step {
+        Step::Read => ApiError::unprocessable(crate::engine::CONFLICTS_UNREADABLE),
+        Step::Write => ApiError::internal(NOT_SETTLED),
     }
 }
 
@@ -2461,7 +2479,7 @@ pub async fn list_draft_conflicts(
             .engine
             .own_draft_conflicts(&domain, user.name.as_str())
             .await
-            .map_err(|e| draft_conflict_error(&domain, e))?,
+            .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?,
     ))
 }
 
@@ -2536,16 +2554,14 @@ pub async fn get_draft_conflict(
     require_domain_read(&state, &identity, &domain).await?;
     let user = identity.require_account()?;
     if !state.engine.drafts_stay_open(&domain) {
-        return Err(ApiError::not_found(format!(
-            "no conflict {id} among your drafts in '{domain}'"
-        )));
+        return Err(crate::engine::not_among_drafts(&domain, &id).into());
     }
     Ok(Json(
         state
             .engine
             .draft_conflict_sides(&domain, user.name.as_str(), &id)
             .await
-            .map_err(|e| draft_conflict_error(&domain, e))?,
+            .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?,
     ))
 }
 
@@ -2600,8 +2616,10 @@ pub async fn get_draft_conflict(
             description = "The caller may not write this domain, the request \
                            did not echo its CSRF token, this instance is \
                            read-only, the domain's repository is archived \
-                           (except for `theirs`), or the trusted-header \
-                           identity names a disabled account.",
+                           or its MANIFEST says `read_only: on` (both except \
+                           for `theirs`), the result would switch \
+                           `read_only` on (the owner's step), or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -2614,6 +2632,13 @@ pub async fn get_draft_conflict(
             content_type = "application/problem+json",
         ),
         (
+            status = 409,
+            description = "Another instance on this shared database hosts \
+                           this file domain, so it is written there.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 415,
             description = "The body is not `application/json`.",
             body = ProblemDetail,
@@ -2622,8 +2647,19 @@ pub async fn get_draft_conflict(
         (
             status = 422,
             description = "An unknown `resolution`, `merged` with no \
-                           `content`, a merge of a file, or a resolution the \
-                           draft refuses; the detail says why and what to do.",
+                           `content`, a merge of a file, a resolution the \
+                           draft refuses, or your conflicts cannot be read, \
+                           which blocks every resolve until they can; the \
+                           detail says why and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The conflict could not be settled for a reason on \
+                           the server's side, so nothing was changed. The \
+                           detail says so and names no place on the server's \
+                           disk; the cause is in the server's log.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -2655,7 +2691,7 @@ pub async fn resolve_draft_conflict(
                 ShareActor::Account(user.name.clone()),
             )
             .await
-            .map_err(|e| draft_conflict_error(&domain, e))?,
+            .map_err(|e| draft_conflict_error(&domain, Step::Write, e))?,
     ))
 }
 

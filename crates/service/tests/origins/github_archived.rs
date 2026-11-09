@@ -510,12 +510,43 @@ async fn every_write_path_refuses_on_an_archived_domain() {
         };
         expect(&format!("REST share as {who}"), text);
     }
+    // Settling one's own draft conflict is a write too. The gate comes before
+    // any id is read, so an id nobody holds meets the sentence as well.
+    for (who, s) in [("gwrite", &session), ("root", &root)] {
+        for resolution in ["mine", "merged"] {
+            let (status, body) = send(
+                &fx,
+                s,
+                reqwest::Method::POST,
+                &format!("/api/v1/domains/{KB}/drafts/conflicts/d0000000/resolve"),
+                Some(json!({"resolution": resolution, "content": "x"})),
+            )
+            .await;
+            let text = if status == 403 {
+                body.to_string()
+            } else {
+                format!("answered {status}: {body}")
+            };
+            expect(&format!("REST draft resolve {resolution} as {who}"), text);
+        }
+    }
     assert!(
         wrong.is_empty(),
         "{} wrong:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
+    // Taking the team's text is what a pull does, so the archived gate lets
+    // it through to the lookup, which finds no such conflict here.
+    let (status, body) = send(
+        &fx,
+        &session,
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/{KB}/drafts/conflicts/d0000000/resolve"),
+        Some(json!({"resolution": "theirs"})),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
     // Nothing went out.
     assert!(fx.forge.commits().is_empty(), "{:?}", fx.forge.commits());
     // And the Reflection file is where it was.

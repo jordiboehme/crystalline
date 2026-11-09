@@ -421,10 +421,12 @@ pub struct DraftConflictEntry {
     /// Always true: the entry is a draft's, never the folder's.
     pub draft: bool,
     /// The path a moved draft left.
+    #[schema(required = true)]
     pub moved_from: Option<String>,
     /// A file beside the pages rather than a page.
     pub file: bool,
     /// For `AddressTaken`: the team's path that holds the address.
+    #[schema(required = true)]
     pub other: Option<String>,
 }
 
@@ -457,12 +459,19 @@ pub struct DraftConflictSides {
     /// Always true.
     pub draft: bool,
     /// Always null: a draft conflict is read from what stands, never stored.
+    #[schema(required = true)]
     pub detected_at: Option<String>,
+    #[schema(required = true)]
     pub base: Option<String>,
+    #[schema(required = true)]
     pub local: Option<String>,
+    #[schema(required = true)]
     pub upstream: Option<String>,
+    #[schema(required = true)]
     pub moved_from: Option<String>,
+    #[schema(required = true)]
     pub other: Option<String>,
+    #[schema(required = true)]
     pub note: Option<String>,
     /// Present, and true, only for a file.
     pub file: Option<bool>,
@@ -477,6 +486,7 @@ pub struct DraftResolveReceipt {
     pub resolved: String,
     /// How many of your conflicts in this domain are left, or null when they
     /// could not be counted.
+    #[schema(required = true)]
     pub remaining: Option<u64>,
     /// Always true.
     pub draft: bool,
