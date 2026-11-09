@@ -18,6 +18,7 @@ exists because one assertion in `fluid/e2e/smoke.spec.ts` depends on it.
 ## Scope
 
 - A diagram fence, so a rendered SVG can be asserted on
+- A flowchart with a comment, a chain and odd spacing, so an edit can be held to its exact bytes
 - An engram in a subfolder, so a multi-segment permalink can be deep linked
 - Relations between the engrams, so a neighborhood has arrows to draw
 - Distinct titles and tags, so a search and the palette have something to find
