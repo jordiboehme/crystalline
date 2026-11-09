@@ -711,6 +711,32 @@ pub fn journal_record(state_dir: &Path, domain: &str) -> ConvergenceRecord {
     }
 }
 
+/// The convergence record one domain's journal holds, read strictly: no file is
+/// an empty record, and a file that cannot be read or parsed is an error.
+///
+/// For the one reader that decides with it: an old draft whose file the team no
+/// longer holds is a deletion she has to see only when this record lists it, so
+/// an unreadable record read as empty would let her share add back what the
+/// team deleted. Every other reader keeps [`journal_record`], for which the
+/// record is a report.
+pub fn journal_record_strict(state_dir: &Path, domain: &str) -> io::Result<ConvergenceRecord> {
+    let file = record_path(state_dir, domain)?;
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ConvergenceRecord::default()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the convergence record {} could not be parsed: {e}",
+                file.display()
+            ),
+        )
+    })
+}
+
 /// Write one domain's convergence record, creating the journal folder for it.
 ///
 /// A record with nothing in it removes the file instead of writing an empty

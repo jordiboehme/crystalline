@@ -105,7 +105,7 @@ async fn engine_with_env(
 /// after its first share from 0.30.0 on, so a share here carries exactly the
 /// changes a scenario makes. [`manifest_unmarked`] is the repository from
 /// before.
-fn manifest() -> Vec<u8> {
+pub(super) fn manifest() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
@@ -133,14 +133,14 @@ fn manifest_sharing_direct() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
-fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
+pub(super) fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
     )
     .into_bytes()
 }
 
-fn commit_files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+pub(super) fn commit_files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
     pairs
         .iter()
         .map(|(p, c)| (p.to_string(), c.clone()))
@@ -4415,7 +4415,7 @@ fn overlay_record(text: &str, path: &str) -> crystalline_index::EngramRecord {
 ///
 /// Returns the engine, the working tree root and the origins directory. The
 /// temp directory is the caller's to hold: everything here lives under it.
-async fn reviewing_domain(
+pub(super) async fn reviewing_domain(
     tmp: &Path,
     mock: Arc<MockProvider>,
     files: &[(&str, Vec<u8>)],
@@ -4455,7 +4455,7 @@ async fn reviewing_domain(
 /// Write one actor's draft of `path` straight into the index, the way a write
 /// verb in review mode does: a row in that actor's dimension, and nothing on
 /// disk.
-async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
+pub(super) async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
     let store = eng.store();
     let store = store.lock().await;
     let id = store
@@ -5394,7 +5394,7 @@ fn journal_file(tmp: &Path, actor: &str, path: &str) -> std::path::PathBuf {
 /// `draft` helper above writes the row alone on purpose; a scenario about
 /// convergence needs both halves, because clearing exactly one of them is the
 /// bug it exists to catch.
-fn mirror(tmp: &Path, actor: &str, path: &str, text: &str) {
+pub(super) fn mirror(tmp: &Path, actor: &str, path: &str, text: &str) {
     let file = journal_file(tmp, actor, path);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(file, text).unwrap();

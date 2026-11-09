@@ -7844,11 +7844,14 @@ pub use contradictions::run_contradiction_worker;
 mod delete;
 mod disclosure;
 mod doc_file;
+mod draft_conflicts;
+pub use crate::draft_merge::DraftConflictKind;
 #[allow(unused_imports)] // the Reflection verbs (Task 12) use the rest
 use doc_file::{
     FileLock, Swap, SwapRefused, check_swap, is_case_only_rename, read_opt, read_stamped,
     remove_if_there,
 };
+pub use draft_conflicts::DraftConflict;
 mod domain_add;
 mod domain_settings;
 mod domains;
