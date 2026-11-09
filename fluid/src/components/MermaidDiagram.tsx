@@ -13,13 +13,14 @@
 
 import mermaid from "mermaid";
 import { useEffect, useId, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 
 import { useTheme } from "../theme/context";
 import { mermaidConfig } from "../theme/mermaid";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
 import { queuePaper } from "./paperQueue";
-import { unclampDiagram } from "./wideDiagram";
+import { naturalSize, unclampDiagram } from "./wideDiagram";
 
 /**
  * The scroll container's own classes, the ones that hold whether or not there
@@ -49,6 +50,29 @@ const SCROLLER =
  */
 const SCROLLABLE =
   "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
+
+/**
+ * What a wrapper holding a drawing tells the print sheet: `data-drawing`
+ * marks it, and the drawing's own width and height ride along as unitless
+ * numbers. On paper the sheet prints the drawing at that width, less when the
+ * column or one page cannot hold it, never more (`index.css`). On screen
+ * nothing reads them.
+ */
+function paperProps(svg: string): {
+  "data-drawing": "";
+  style?: CSSProperties;
+} {
+  const size = naturalSize(svg);
+  return size === null
+    ? { "data-drawing": "" }
+    : {
+        "data-drawing": "",
+        style: {
+          "--diagram-width": size.width,
+          "--diagram-height": size.height,
+        } as CSSProperties,
+      };
+}
 
 export default function MermaidDiagram({
   source,
@@ -230,6 +254,7 @@ export default function MermaidDiagram({
             }
             tabIndex={overflowing ? 0 : undefined}
             className={`${SCROLLER}${overflowing ? ` ${SCROLLABLE}` : ""}`}
+            {...paperProps(drawn.svg)}
             dangerouslySetInnerHTML={{ __html: markup }}
           />
         ) : (
@@ -238,6 +263,7 @@ export default function MermaidDiagram({
           // height.
           <div
             className="flex justify-center [&_svg]:h-auto [&_svg]:max-w-full"
+            {...paperProps(drawn.svg)}
             dangerouslySetInnerHTML={{ __html: markup }}
           />
         )}
@@ -247,6 +273,7 @@ export default function MermaidDiagram({
           hidden
           data-print=""
           className="[&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-w-full"
+          {...paperProps(paper)}
           dangerouslySetInnerHTML={{ __html: paper }}
         />
       )}

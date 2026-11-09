@@ -690,8 +690,17 @@
     max-width: none;
     padding: 0;
   }
-  /* The frame's own gutters go: the page margins are the gutters on paper. */
-  :has(> main) {
+  /*
+   * The frame's own gutters go: the page margins are the gutters on paper.
+   * The frame around `main` and the stack inside it that holds the column
+   * are flex containers on screen, and WebKit does not honour a
+   * `break-inside: avoid` below a flex item when it prints: a kept heading
+   * and its diagram, or a figure itself, was cut at the page edge. On paper
+   * both are block layout.
+   */
+  :has(> main),
+  main :has(> [data-print-column]) {
+    display: block !important;
     padding: 0 !important;
     gap: 0 !important;
   }
@@ -768,6 +777,18 @@
   [data-keep] {
     display: block;
   }
+  /*
+   * A heading and its diagram are one inline block on paper, a box no
+   * browser breaks: WebKit still left a kept heading at the foot of a page
+   * now and then and moved only its diagram on. Safe because a diagram
+   * prints no taller than a page less its heading (below), so the pair
+   * always fits on one page.
+   */
+  .measured > [data-keep]:has(> figure) {
+    display: inline-block;
+    width: 100%;
+    vertical-align: top;
+  }
   [data-keep],
   .print-title,
   .measured li[data-short],
@@ -843,11 +864,42 @@
     overflow-wrap: anywhere;
   }
 
-  /* Diagrams and pictures fit the width, as vectors where they are. */
-  .measured figure svg,
+  /* Pictures fit the width. */
   .measured img {
     max-width: 100% !important;
     height: auto;
+  }
+
+  /*
+   * A diagram prints at its own size: the width of its viewBox in CSS pixels,
+   * the size it has on screen in a column wide enough for it. It is scaled
+   * down to fit the column, and to fit one page in height, and never up, so
+   * a small diagram keeps small text and a tall one is never cut at a page
+   * edge. Mermaid's inline `max-width` with `width="100%"` says the first two
+   * on screen, but a widened diagram drops it, and paper has to say the page
+   * as well. The numbers come from the wrapper (`MermaidDiagram`); without
+   * them a diagram fills the column.
+   *
+   * One page is 215mm here: the page height of US Letter (279.4mm less the
+   * 40mm of top and bottom margin above), the shorter of Letter and A4, less
+   * room for the heading kept with the diagram and for the figure's frame.
+   * The scroller of a widened diagram would clip it and fade its edge.
+   */
+  [data-drawing] {
+    overflow: visible !important;
+    mask-image: none !important;
+  }
+  [data-drawing] > svg {
+    display: block;
+    margin-inline: auto;
+    width: min(
+      100%,
+      calc(var(--diagram-width, 100000) * 1px),
+      calc(215mm * var(--diagram-width, 1) / var(--diagram-height, 1))
+    ) !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    height: auto !important;
   }
   .measured img {
     max-height: 190mm;
