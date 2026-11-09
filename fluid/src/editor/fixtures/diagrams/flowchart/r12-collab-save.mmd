@@ -1,0 +1,11 @@
+flowchart LR
+  %% how typing in a room reaches the file
+  peer1[Browser A] -->|yjs update| room[Room]
+  peer2[Browser B] -->|yjs update| room
+  agent[Agent presence] -.-> room
+  room --> live[live_text]
+  live --> merge[merge with the file on disk]
+  merge -->|clean| save[Engine write]
+  merge -->|conflict| keep[Keep both, report]
+  save --> file[/Engram file/]
+  file --> sync[Sync]

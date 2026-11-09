@@ -1,0 +1,12 @@
+flowchart LR
+    %% two control doors, two scopes
+    subgraph local [This machine]
+        socket[Control socket] --> owner[Scope::Unrestricted, ShareActor::Owner]
+    end
+    subgraph remote [Over HTTPS]
+        ctl["POST /api/v1/ctl"] --> user[Scope::User of the token]
+        user --> list[REMOTE_COMMANDS allow-list]
+    end
+    owner --> engine[Engine]
+    list --> engine
+    socket ~~~ ctl

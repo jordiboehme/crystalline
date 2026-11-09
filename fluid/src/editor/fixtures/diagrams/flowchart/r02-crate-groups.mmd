@@ -1,0 +1,25 @@
+flowchart LR
+    %% the workspace by what each crate is for
+    subgraph format [Format layer]
+        core[core: parser, emitter, schema, verify, prompt]
+    end
+    subgraph data [Data]
+        index[index: Store, sync, search, embeddings]
+        remote[remote: GitHub plumbing, merge engine]
+    end
+    subgraph serving [Serving]
+        identity[identity] --> engine[engine]
+        engine --> rest[rest: JSON API, sign-in]
+        rest --> service[service: daemon, MCP, control]
+    end
+    service --> cli([crystalline binary])
+
+    index --> core
+    remote --> core
+    identity --> index
+    engine --> remote
+
+    classDef pure fill:#eef6ff,stroke:#4a7bd0
+    classDef bin fill:#f3f3f3,stroke:#555,stroke-width:2px
+    class core pure
+    class cli bin

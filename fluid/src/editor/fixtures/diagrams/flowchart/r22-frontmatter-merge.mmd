@@ -1,0 +1,9 @@
+flowchart LR
+    %% one frontmatter key, both sides
+    key[Key] --> both{Both sides changed it?}
+    both -- no --> one[The changed side wins]
+    both -- yes --> same{Same value?}
+    same -- yes --> once[Lands once]
+    same -- no --> lines{Lines merge into one clean block?}
+    lines -- yes --> merged[Merged]
+    lines -- no --> conflict[Conflict]

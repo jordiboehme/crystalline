@@ -5,14 +5,22 @@
  * own DOM while confirming the buffer itself is untouched.
  */
 
-import { EditorSelection, EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
+import { Compartment, EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import mermaid from "mermaid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parsedState } from "../test/parse";
-import { describeMermaidError, fencePreviews } from "./fencePreviews";
+import {
+  describeMermaidError,
+  fencePreviews,
+  holdPreviewHeight,
+  offerPreviewDrawing,
+} from "./fencePreviews";
+import { drawnDiagrams } from "./diagram/draws";
 import { gridLoaded } from "./grid/draws";
+import { mathSections } from "./mathBlocks";
 import { baseExtensions } from "./setup";
 
 vi.mock("mermaid", () => ({
@@ -122,6 +130,21 @@ describe("fence previews", () => {
     });
     // The source is still the buffer, untouched.
     expect(view.state.doc.toString()).toContain("graph TD; A-->B;");
+    view.destroy();
+  });
+
+  it("draws a label's entity forms as the characters they stand for", async () => {
+    vi.mocked(mermaid.render).mockImplementationOnce(() =>
+      Promise.resolve({
+        svg: "<svg><text><tspan>say &amp;quot;hi&amp;quot;</tspan></text></svg>",
+      } as Awaited<ReturnType<typeof mermaid.render>>),
+    );
+    const view = editor("```mermaid\ngraph TD; A-->B;\n```\n");
+    await vi.waitFor(() => {
+      expect(
+        view.dom.querySelector(".cm-mermaid-preview tspan")?.textContent,
+      ).toBe('say "hi"');
+    });
     view.destroy();
   });
 
@@ -689,6 +712,237 @@ describe("the table preview and the grid", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(view.dom.querySelector(".cm-table-preview")).not.toBeNull();
+    view.destroy();
+  });
+});
+
+describe("the hand-over to the diagram layer", () => {
+  const FLOW = "```mermaid\nflowchart TD\n  A --> B\n```";
+
+  function withDrawn(doc: string, drawn: readonly number[]) {
+    const compartment = new Compartment();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            compartment.of(drawnDiagrams.of(drawn)),
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    return { v, compartment };
+  }
+
+  it("gives a drawn fence no preview and an undrawn one keeps it", () => {
+    const doc = `${FLOW}\n\n${FLOW}`;
+    const { v } = withDrawn(doc, [0]);
+    expect(v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(1);
+    v.destroy();
+    const none = withDrawn(doc, []);
+    expect(none.v.dom.querySelectorAll(".cm-mermaid-preview")).toHaveLength(2);
+    none.v.destroy();
+  });
+
+  it("takes the preview away and gives it back when the set of drawn fences changes", () => {
+    const { v, compartment } = withDrawn(FLOW, []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([0])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.dispatch({ effects: compartment.reconfigure(drawnDiagrams.of([])) });
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    v.destroy();
+  });
+
+  it("draws an unclosed mermaid fence as text plus a drawing, as the page does (D43)", () => {
+    const { v } = withDrawn("```mermaid\nflowchart TD\n  A --> B", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    expect(v.state.doc.toString()).toBe("```mermaid\nflowchart TD\n  A --> B");
+    v.destroy();
+  });
+
+  it("draws nothing for an unclosed fence with no body", () => {
+    const { v } = withDrawn("```mermaid", []);
+    expect(v.dom.querySelector(".cm-mermaid-preview")).toBeNull();
+    v.destroy();
+  });
+});
+
+describe("what the preview hands mermaid", () => {
+  async function renderedFor(doc: string, extra: Extension[] = []) {
+    vi.mocked(mermaid.render).mockClear();
+    const v = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          extensions: [
+            ...baseExtensions(false),
+            fencePreviews(false),
+            ...extra,
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const sources = vi.mocked(mermaid.render).mock.calls.map((call) => call[1]);
+    v.destroy();
+    return sources;
+  }
+
+  it.each([
+    [
+      "a closed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B\n> ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed fence in a quote",
+      "> ```mermaid\n> graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a nested quote",
+      "> > ```mermaid\n> > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "an unclosed top-level fence",
+      "```mermaid\ngraph TD; A-->B\nB-->C",
+      "graph TD; A-->B\nB-->C",
+    ],
+    [
+      "a list item's fence loses the list item's indent",
+      "- ```mermaid\n  graph TD; A-->B\n  ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, closed",
+      "- > ```mermaid\n  > graph TD; A-->B\n  > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a bullet's line, unclosed",
+      "- > ```mermaid\n  > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, closed",
+      "1. > ```mermaid\n   > graph TD; A-->B\n   > ```",
+      "graph TD; A-->B",
+    ],
+    [
+      "a quote on a numbered item's line, unclosed",
+      "1. > ```mermaid\n   > graph TD; A-->B",
+      "graph TD; A-->B",
+    ],
+  ])("%s", async (_name, doc, source) => {
+    expect(await renderedFor(doc)).toEqual([source]);
+  });
+
+  it("draws no preview for a fence in the frontmatter", async () => {
+    const doc =
+      "---\nnote: |\n  ```mermaid\n  graph TD; A-->B\n  ```\n---\n\nbody";
+    expect(await renderedFor(doc)).toEqual([]);
+  });
+
+  it("stops an unclosed fence at a section heading only where the page reads sections", async () => {
+    const doc = "```mermaid\ngraph TD; A-->B\n\n## Next\n\nmore";
+    expect(await renderedFor(doc, [mathSections.of(true)])).toEqual([]);
+    expect(await renderedFor(doc)).toHaveLength(1);
+  });
+});
+
+describe("the flip back from a drawn diagram", () => {
+  const SOURCE = "flowchart TD\n  A --> B";
+  const doc = `\`\`\`mermaid\n${SOURCE}\n\`\`\`\n`;
+
+  it("draws what the box was showing in the first frame, under an id of its own", () => {
+    offerPreviewDrawing(
+      SOURCE,
+      false,
+      '<svg id="cm-diagram-9"><style>#cm-diagram-9 .a{}</style></svg>',
+      "cm-diagram-9",
+    );
+    const render = vi.mocked(mermaid.render);
+    render.mockClear();
+    const view = editor(doc);
+    const svg = view.dom.querySelector(".cm-mermaid-preview svg");
+    expect(svg).not.toBeNull();
+    expect(svg?.id).toMatch(/^cm-mermaid-/);
+    expect(svg?.outerHTML).not.toContain("cm-diagram-9");
+    expect(render).not.toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it("asks mermaid for a body no box has shown", async () => {
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  X --> Y\n\`\`\`\n`);
+    await vi.waitFor(() => {
+      expect(view.dom.querySelector(".cm-mermaid-preview svg")).not.toBeNull();
+    });
+    expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it("gives a held height back when the caption lands, not before", async () => {
+    let fail: (cause: Error) => void = () => undefined;
+    vi.mocked(mermaid.render).mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          fail = reject;
+        }),
+    );
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  P -->\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    });
+    holdPreviewHeight(box, 120);
+    expect(box.style.minHeight).toBe("120px");
+    fail(new Error("no"));
+    await vi.waitFor(() => {
+      expect(box.querySelector(".cm-mermaid-error")).not.toBeNull();
+    });
+    expect(box.style.minHeight).toBe("");
+    view.destroy();
+  });
+
+  it("gives a held height back when the drawing lands", async () => {
+    let draw: (result: { svg: string }) => void = () => undefined;
+    vi.mocked(mermaid.render).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          draw = resolve as typeof draw;
+        }),
+    );
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  S --> T\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(vi.mocked(mermaid.render)).toHaveBeenCalled();
+    });
+    holdPreviewHeight(box, 120);
+    draw({ svg: "<svg></svg>" });
+    await vi.waitFor(() => {
+      expect(box.querySelector("svg")).not.toBeNull();
+    });
+    expect(box.style.minHeight).toBe("");
+    view.destroy();
+  });
+
+  it("holds nothing for a preview that has drawn", async () => {
+    const view = editor(`\`\`\`mermaid\nflowchart TD\n  Q --> R\n\`\`\`\n`);
+    const box = view.dom.querySelector<HTMLElement>(".cm-mermaid-preview");
+    if (box === null) throw new Error("no preview");
+    await vi.waitFor(() => {
+      expect(box.querySelector("svg")).not.toBeNull();
+    });
+    holdPreviewHeight(box, 120);
+    expect(box.style.minHeight).toBe("");
     view.destroy();
   });
 });

@@ -1,0 +1,9 @@
+flowchart LR
+    %% search_engrams, end to end
+    q[Query text] --> embed[Embed the query]
+    q --> fts[Full text match]
+    embed --> vec[Vector neighbours]
+    vec & fts --> rank[rank.rs: blend and order]
+    rank --> salience[Salience lift]
+    salience --> snippet[snippet.rs: best passage]
+    snippet --> out[Hits, TOON encoded]

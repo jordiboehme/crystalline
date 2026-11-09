@@ -1,0 +1,28 @@
+flowchart TD
+    %% Change request process, as a team would draw it on a wiki page
+    start([Request comes in]) --> triage{Is it a bug?}
+    triage -->|yes| repro[Reproduce locally]
+    triage -->|no| scope[Write a short scope]
+
+    subgraph dev [Development]
+        repro --> fix[Fix and add a test]
+        scope --> build[Build the change]
+        fix --> pr[Open pull request]
+        build --> pr
+        pr --> ci{CI green?}
+        ci -->|no| rework[Fix the failures]
+        rework --> ci
+    end
+
+    subgraph release [Release]
+        ci -->|yes| review{Review approved?}
+        review -->|changes requested| rework
+        review -->|approved| merge[Merge to main]
+        merge --> notes[Write release notes]
+        notes --> tag[Tag the version]
+    end
+
+    tag --> done([Shipped])
+
+    classDef decision fill:#fff4d6,stroke:#c90
+    class triage,ci,review decision

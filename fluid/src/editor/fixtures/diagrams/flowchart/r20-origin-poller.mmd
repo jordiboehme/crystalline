@@ -1,0 +1,13 @@
+flowchart TD
+    %% Engine::origin_poll_tick, run by run_origin_poller
+    tick([Tick]) --> due{Domain due?}
+    due -->|no| sleep[Wait with jitter]
+    due -->|yes| update[origin_update]
+    update --> changed[Upstream changed paths]
+    changed --> merge[merge_file per path]
+    merge --> apply[Apply, delete or keep local]
+    merge --> conflict[Record a conflict]
+    apply & conflict --> state[OriginPollerState]
+    state --> report[status_report origins block]
+    sleep --> tick
+    state --> tick

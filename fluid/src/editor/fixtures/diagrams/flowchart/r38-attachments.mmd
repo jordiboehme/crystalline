@@ -1,0 +1,8 @@
+flowchart TD
+    %% files under assets/ are hashed, never parsed
+    walk[Sync walk] --> prefix{Under assets/?}
+    prefix -->|no| engram[Engram path: parse and chunk]
+    prefix -->|yes| attach[Attachment: hash and record metadata]
+    engram --> apply[apply_scan]
+    attach --> apply
+    apply --> rows[(engrams and attachments)]

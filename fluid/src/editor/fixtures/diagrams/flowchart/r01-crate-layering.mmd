@@ -1,0 +1,16 @@
+graph BT
+    %% Crate dependency direction, lowest crate at the bottom.
+    %% An arrow points from a crate to the crate it depends on.
+    index[crystalline-index] --> core[crystalline-core]
+    identity[crystalline-identity] --> index
+    engine[crystalline-engine] --> identity
+    rest[crystalline-rest] --> engine
+    service[crystalline-service] --> rest
+    cli[crystalline] --> service
+
+    %% remote sits beside index
+    remote[crystalline-remote] --> core
+    engine --> remote
+    rest --> remote
+    service --> remote
+    cli --> remote

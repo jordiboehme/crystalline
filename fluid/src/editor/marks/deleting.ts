@@ -57,6 +57,7 @@ import {
 } from "./caret";
 import type { Mark } from "./hiddenMarks";
 import { marksOnLine, runAt, scanMarks } from "./hiddenMarks";
+import { stepIntoDrawnFence } from "../diagram/draws";
 import { marksHiddenOnLine, pictureForKeys } from "./mode";
 import {
   PARSE_BUDGET,
@@ -257,6 +258,9 @@ function deleteAtEdge(
 ): boolean {
   const { state } = view;
   if (joinsHiddenFence(state, pos, forward)) {
+    return true;
+  }
+  if (stepIntoDrawnFence(view, pos, forward)) {
     return true;
   }
   if (state.selection.main.head === pos) {
@@ -627,6 +631,12 @@ function overHidden(command: Command, forward: boolean): Command {
     }
     if (!visibleBetween(range.from, range.to, [], marks)) {
       // Nothing visible lies that way: the key is spent.
+      return true;
+    }
+    if (
+      (range.from < line.from && stepIntoDrawnFence(view, line.from, false)) ||
+      (range.to > line.to && stepIntoDrawnFence(view, line.to, true))
+    ) {
       return true;
     }
     view.dispatch({

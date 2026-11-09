@@ -1,0 +1,9 @@
+flowchart LR
+    %% write_engram from a tool call to the index
+    tool[write_engram] --> validate[Validate frontmatter]
+    validate --> emit[core::emit]
+    emit --> path[Place under the given folder]
+    path --> disk[/Markdown file on disk/]
+    disk --> sync[Targeted sync]
+    sync --> index[(Index)]
+    tool -.->|headless run| note[note_run_writes]

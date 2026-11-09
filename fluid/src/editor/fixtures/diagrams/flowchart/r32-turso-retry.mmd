@@ -1,0 +1,12 @@
+flowchart TD
+    %% Conn: the retried temp directory create
+    stmt[Run statement] --> err{IoError PermissionDenied tempdir?}
+    err -->|no| result([Return result or error])
+    err -->|yes| tx{Transaction dropped?}
+    tx -->|no| again[Run the statement once more]
+    tx -->|yes| replay[Replay the journal]
+    replay --> same{Every statement returns what it did?}
+    same -->|yes| again
+    same -->|no| original[Return the original error]
+    again --> result
+    original --> result

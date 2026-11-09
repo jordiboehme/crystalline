@@ -1,0 +1,11 @@
+flowchart TB
+    %% nested subgraphs, a direction inside, a node used inside and outside
+    subgraph outer [Daemon]
+        direction LR
+        subgraph inner [Engine]
+            X[Write] --> Y[Sync]
+        end
+        Z[Watcher] --> X
+    end
+    Y --> Q[Index]
+    Q -.-> Z

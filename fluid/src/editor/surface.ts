@@ -17,6 +17,7 @@ import type { DocumentAdapter } from "./adapter";
 import type { ElementFace } from "./elementContext";
 import { codeBlocks } from "./codeBlocks";
 import { copyAsHtml } from "./copyHtml";
+import { diagramAnchors } from "./diagramAnchors";
 import { elementContextListener } from "./elementContext";
 import type { ElementEdit } from "./elementEdit";
 import { elementEditListener } from "./elementEdit";
@@ -25,6 +26,7 @@ import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
 import type { FloatingContext } from "./floatingContext";
 import { floatingContextListener } from "./floatingContext";
+import { diagramLayer } from "./diagram/loader";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
@@ -177,6 +179,10 @@ export function previewConfig(
         // comes first: an arrow at a line's visible edge, with hidden marks
         // up to the raw edge, goes over the line break.
         crossEdge,
+        // Before the read-only previews: the diagram layer takes over the
+        // editable mermaid fences once its chunk is in and a fence's verdict
+        // is ok, and `fencePreviews` then leaves those fences alone.
+        diagramLayer(),
         fencePreviews(dark),
         // The code box: a fence's lines drawn as a box with a header, in
         // the main view only (a table cell holds no fence).
@@ -221,6 +227,9 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // And for the callout and status segments: a callout's kind is text in
     // Raw mode too.
     elementContextListener(options.onElementContext),
+    // Where a diagram op's fence has gone while the op is being verified.
+    // Outside the preview compartment: Raw turning on must not lose it.
+    diagramAnchors,
     // And for the floating action bar. Outside the preview compartment: a
     // selection is a selection in Raw mode too, and the screen decides
     // there whether the bar draws.

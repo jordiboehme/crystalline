@@ -1,0 +1,15 @@
+flowchart TB
+    %% LoadedConfig keeps the two layers apart
+    file[(config.yaml)] --> loaded
+    env[CRYSTALLINE_* variables] --> parse[EnvOverlay: parse once at startup]
+    parse --> check{Known variable?}
+    check -->|no| warn[Warn and ignore]
+    check -->|yes, bad value| fatal[Refuse to start, name the variable]
+    check -->|yes| loaded
+    subgraph loaded [LoadedConfig]
+        direction LR
+        persisted[file: what writes go to]
+        effective[effective: file plus overlay]
+    end
+    effective --> reads[Every runtime read]
+    persisted --> writes[config set]

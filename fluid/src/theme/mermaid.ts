@@ -184,7 +184,9 @@ const VARIABLES = {
  * foreignObject whose size mermaid measures before Safari applies its page
  * zoom: under zoom the text overflows the node it belongs to. SVG text scales
  * with its node. `wrappingWidth` is wide because SVG labels wrap at it, and a
- * long identifier broken across two lines is no longer the identifier.
+ * long identifier broken across two lines is no longer the identifier. SVG
+ * text leaves entity forms undecoded, so everything `mermaid.render` draws goes
+ * through `drawnLabels` (`mermaidText.ts`).
  */
 export function mermaidConfig(dark: boolean): MermaidConfig {
   return {
@@ -201,4 +203,31 @@ export function mermaidConfig(dark: boolean): MermaidConfig {
       ? { ...VARIABLES.dark, ...seriesVariables(RAMP.dark) }
       : { ...VARIABLES.light, ...seriesVariables(RAMP.light) },
   };
+}
+
+/** The theme mermaid was last given, and how often that changed. */
+let lastDark: boolean | null = null;
+let themeChanges = 0;
+
+/**
+ * The one way the app initializes mermaid, so every change of theme counts.
+ * Mermaid queues its renders and reads the configuration when a render's turn
+ * comes, so a render that saw this number change may have drawn in the other
+ * theme. Returns the number as it stands after this call.
+ */
+export function initializeMermaid(
+  mermaid: { initialize(config: MermaidConfig): void },
+  dark: boolean,
+): number {
+  mermaid.initialize(mermaidConfig(dark));
+  if (lastDark !== null && lastDark !== dark) {
+    themeChanges += 1;
+  }
+  lastDark = dark;
+  return themeChanges;
+}
+
+/** How often the theme mermaid was given has changed. */
+export function mermaidThemeChanges(): number {
+  return themeChanges;
 }

@@ -23,6 +23,7 @@ import type { ViewUpdate } from "@codemirror/view";
 import { EditorView, ViewPlugin, keymap } from "@codemirror/view";
 
 import { picturesDrawn } from "./marks/mode";
+import { drawnFenceLines } from "./diagram/draws";
 import { mainSelectionParked, parkingChanged } from "./parkedSelection";
 import { selectedPicture } from "./pictures/refs";
 
@@ -255,6 +256,15 @@ function derive(hub: Hub): FloatingContext {
   // Parked behind an open cell whose editor is not mounted (its table
   // scrolled away): main's selection is stale, so no bar stands by it.
   if (main.state.facet(mainSelectionParked) && !mainFocused(main)) return null;
+  // Inside a drawn diagram there is no text to format (a search hit lands here).
+  const { from, to } = main.state.selection.main;
+  if (
+    main.state
+      .facet(drawnFenceLines)
+      .some((fence) => fence.from <= from && to <= fence.to)
+  ) {
+    return null;
+  }
   const range = main.state.selection.main;
   if (range.empty) return null;
   // A selected picture is a non-empty selection too, so it is asked first.

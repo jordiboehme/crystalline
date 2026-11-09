@@ -1,0 +1,8 @@
+flowchart TD
+    %% the routing prompt an agent is onboarded with
+    domains[Registered domains] --> manifests[Each MANIFEST.md]
+    manifests --> routing[Routing line per domain]
+    rules[Behavior rules] --> prompt
+    routing --> prompt[core::prompt]
+    prompt --> instructions[MCP instructions]
+    prompt --> list[list_domains include_routing=true]

@@ -1,0 +1,9 @@
+flowchart TD
+    %% with_launcher_note on relayed answers
+    answer[Daemon answer] --> kind{initialize or server/discover?}
+    kind -- no --> forward[Forward unchanged]
+    kind -- yes --> launcher{Desktop launcher older than MINIMUM_LAUNCHER?}
+    launcher -- no --> forward
+    launcher -- yes --> append[Append LAUNCHER_NOTE to instructions]
+    append --> forward
+    forward --> client([Client])

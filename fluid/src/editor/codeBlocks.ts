@@ -623,7 +623,9 @@ const writesOffFenceLines = EditorState.transactionFilter.of((tr) => {
     tr.annotation(Transaction.remote) !== undefined ||
     // A picture's removal names its picture, not the caret: it is no key
     // pressed from a fence line (Part 3, P7).
-    tr.isUserEvent("delete.picture")
+    tr.isUserEvent("delete.picture") ||
+    // The same for a diagram's: it names its fence (R85).
+    tr.isUserEvent("delete.diagram")
   ) {
     return tr;
   }
