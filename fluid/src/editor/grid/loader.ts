@@ -19,6 +19,7 @@ import { Compartment } from "@codemirror/state";
 import type { EditorView, ViewUpdate } from "@codemirror/view";
 import { ViewPlugin } from "@codemirror/view";
 
+import { parseAdvanced } from "../parseProgress";
 import { gridDraws, gridUnavailable } from "./draws";
 
 interface GridChunk {
@@ -97,7 +98,17 @@ export function tableGridWith(load: () => Promise<GridChunk>): TableGrid {
       }
 
       update(update: ViewUpdate): void {
-        if (update.docChanged || update.viewportChanged) this.check();
+        // The first parse has a small time budget and can stop before the
+        // table. The rest of the tree comes later in a transaction that
+        // changes neither the text nor the viewport, so a tree that grew is
+        // a reason to look again too.
+        if (
+          update.docChanged ||
+          update.viewportChanged ||
+          parseAdvanced(update)
+        ) {
+          this.check();
+        }
       }
 
       check(): void {
