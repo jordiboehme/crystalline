@@ -1366,6 +1366,40 @@ mod chain {
         }
     }
 
+    /// Task 14 re-review N-3: comparing a draft in conflict with `origin
+    /// diff --path` ends with the resolve line, which carries the team
+    /// side's digest so the resolve is checked against what she compared.
+    #[test]
+    fn origin_diff_of_a_draft_conflict_names_the_team_side_to_resolve_against() {
+        let daemon = Daemon::answering(
+            "diff-draft-conflict",
+            json!({
+                "changes": [{
+                    "path": "plan.md",
+                    "kind": "modified",
+                    "base": "bob's first line\n",
+                    "current": "her first line\n",
+                }],
+                "draft_conflict": {
+                    "id": "d7ffdbcd",
+                    "path": "plan.md",
+                    "kind": "EditEdit",
+                    "draft": true,
+                    "upstream_sha256": "e8871fd4",
+                },
+            }),
+        );
+        let out = daemon.run(&["origin", "diff", "team", "--path", "plan.md"]);
+        assert!(
+            out.contains(
+                "Your draft does not fit the team's text. To settle it against the team's text \
+                 as it is now: crystalline origin resolve team plan.md --keep mine|theirs, or \
+                 --content-file <f>, with --expect-upstream e8871fd4"
+            ),
+            "{out}"
+        );
+    }
+
     #[test]
     fn share_with_a_proposal_number_amends_that_layer_and_names_the_chain() {
         let daemon = Daemon::answering(

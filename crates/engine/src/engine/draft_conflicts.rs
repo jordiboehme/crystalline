@@ -949,6 +949,38 @@ impl Engine {
         Ok(sides_json(found))
     }
 
+    /// `actor`'s draft conflict at `path` (her draft's path or the path a
+    /// move left), with its sides as [`Engine::draft_conflict_sides`] answers
+    /// them, or `None` when she holds none there, when the domain's drafts do
+    /// not stay open, or when the caller has no draft identity. The CLI's
+    /// `origin diff --path` prints the resolve line from it, with the team
+    /// side's `upstream_sha256` (C25).
+    pub async fn draft_conflict_at(
+        &self,
+        domain: &str,
+        actor: &super::ShareActor,
+        path: &str,
+    ) -> Result<Option<Value>> {
+        if !self.drafts_stay_open(domain) {
+            return Ok(None);
+        }
+        let Ok(who) = crate::share_staging::overlay_share_actor(actor) else {
+            return Ok(None);
+        };
+        let page = super::normalize_md(path);
+        let found = self
+            .found_conflicts(domain, &who)
+            .await?
+            .into_iter()
+            .find(|found| {
+                let c = &found.conflict;
+                [path, page.as_str()]
+                    .iter()
+                    .any(|p| c.path == *p || c.moved_from.as_deref() == Some(*p))
+            });
+        Ok(found.map(sides_json))
+    }
+
     /// Refuses a resolve made against a team side the person was not shown
     /// (C25). `expected` is the `upstream_sha256` the sides answered when they
     /// were read; the conflict `settles` names is read again now, and when its

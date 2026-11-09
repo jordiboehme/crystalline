@@ -710,19 +710,17 @@ function DomainPage({
           This session's own drafts that do not fit the team's text. Outside
           the banners on purpose: an editor whose role cannot share must
           still see and settle her own conflict, and a warning must never
-          fold away on a phone. For any session that may write, and not only
-          where the listing says the domain reviews: a fold that stopped part
-          way has taken the review key off while her drafts still stand and
-          must still be settled, and the listing cannot tell that apart. The
-          list answers empty, and cheaply, on every other domain.
+          fold away on a phone. For any signed-in session, and not only where
+          the listing says the domain reviews or that it may write: a fold
+          that stopped part way has taken the review key off while her drafts
+          still stand, and on a locked domain, a read-only server or without
+          the write right her drafts still do not fit. What she can still do
+          there is the server's to say (`settle_note`); this side cannot tell
+          it from the listing, whose read-only mark folds all of them in. The
+          list answers empty, and cheaply, wherever she holds nothing.
         */}
-        {/*
-          A read-only domain too: her drafts there still do not fit, and
-          taking the team's text stays allowed, so the notice says what is
-          left to her. A reader holds no drafts and the list answers empty.
-        */}
-        {(canWrite || domainLocked) && (
-          <DraftConflictsNotice domain={domain} locked={domainLocked} />
+        {capabilities.role !== null && !capabilities.anonymous && (
+          <DraftConflictsNotice domain={domain} />
         )}
 
         <ManifestProsePanel

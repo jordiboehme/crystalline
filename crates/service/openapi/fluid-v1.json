@@ -13742,7 +13742,8 @@
         "description": "Your own draft conflicts in this domain, and the drafts an update merged team changes into since they last settled.",
         "required": [
           "conflicts",
-          "merged"
+          "merged",
+          "settle_note"
         ],
         "properties": {
           "conflicts": {
@@ -13761,6 +13762,13 @@
             "example": [
               "notes/plan.md"
             ]
+          },
+          "settle_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What you may not do with these conflicts here, in a sentence to show:\non a read-only server or without write access none can be settled,\nand on a read-only domain or an archived repository only the team's\ntext can be taken. Null when every choice is open or nothing is listed."
           }
         }
       },

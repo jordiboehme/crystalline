@@ -1372,6 +1372,30 @@ pub(crate) fn print_origin_diff(domain: &str, data: &serde_json::Value, json: bo
                 .header(&format!("a/{path} (team)"), &format!("b/{path} (mine)"))
         );
     }
+    if let Some(line) = draft_conflict_resolve_line(domain, &data["draft_conflict"]) {
+        println!();
+        println!("{line}");
+    }
+}
+
+/// The resolve line `origin diff --path` ends with for a draft in conflict:
+/// the ways out its kind leaves, with `--expect-upstream` and the team side's
+/// digest, so the resolve is refused if the team's text moves before it runs
+/// (C25). `None` for anything that is not a draft conflict.
+fn draft_conflict_resolve_line(domain: &str, conflict: &serde_json::Value) -> Option<String> {
+    let path = conflict["path"].as_str()?;
+    let digest = conflict["upstream_sha256"].as_str()?;
+    let ways = if conflict["kind"] == "AddressTaken" {
+        "--keep theirs, or --content-file <f> with another address"
+    } else if conflict["file"] == true {
+        "--keep mine|theirs"
+    } else {
+        "--keep mine|theirs, or --content-file <f>"
+    };
+    Some(format!(
+        "Your draft does not fit the team's text. To settle it against the team's text as it is \
+         now: crystalline origin resolve {domain} {path} {ways}, with --expect-upstream {digest}"
+    ))
 }
 
 /// `origin discard`'s preview: one line per named path saying what the

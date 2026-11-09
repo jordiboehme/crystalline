@@ -65,13 +65,13 @@ function serve(list: () => unknown) {
   });
 }
 
-function mount(locked = false) {
+function mount() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <DraftConflictsNotice domain="eng" locked={locked} />
+      <DraftConflictsNotice domain="eng" />
     </QueryClientProvider>,
   );
 }
@@ -131,14 +131,19 @@ describe("the draft conflicts notice", () => {
     expect(within(status).queryByRole("button")).toBeNull();
   });
 
-  it("says what a read-only domain leaves her", async () => {
-    serve(() => ({ conflicts: [entry("notes/a.md")], merged: [] }));
-    mount(true);
+  it("says what is left to her here, in the server's words", async () => {
+    serve(() => ({
+      conflicts: [entry("notes/a.md")],
+      merged: [],
+      settle_note:
+        "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
+    }));
+    mount();
 
     const notice = await screen.findByRole("region", { name: "Your drafts" });
     expect(
       within(notice).getByText(
-        "This domain is read-only. Until its owner switches read_only off, you can only take the team's text for these drafts.",
+        "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
       ),
     ).toBeVisible();
     expect(

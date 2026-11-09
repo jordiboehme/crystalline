@@ -1420,6 +1420,8 @@ describe("the domain screen", () => {
           },
         ],
         merged: [],
+        settle_note:
+          "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
       }),
     });
 
@@ -1427,7 +1429,7 @@ describe("the domain screen", () => {
 
     const notice = await screen.findByRole("region", { name: "Your drafts" });
     expect(notice).toHaveTextContent(
-      "This domain is read-only. Until its owner switches read_only off, you can only take the team's text for these drafts.",
+      "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
     );
   });
 
@@ -1474,17 +1476,39 @@ describe("the domain screen", () => {
     expect(screen.queryByRole("region", { name: "Your drafts" })).toBeNull();
   });
 
-  it("asks nothing about draft conflicts for a session that may not write", async () => {
-    serve({}, "editor", () =>
-      meResponse({ user: userFixture({ role: "viewer" }) }),
+  it("tells a session that may not write that its drafts cannot be settled here", async () => {
+    // A viewer now, who still holds a draft in conflict: the listing says
+    // she may not write, and the server says what that leaves her.
+    serve(
+      {
+        "/domains/eng/drafts/conflicts": () => ({
+          conflicts: [
+            {
+              id: "d1234567",
+              path: "notes/a.md",
+              kind: "EditEdit",
+              moved_from: null,
+              other: null,
+              file: false,
+              draft: true,
+            },
+          ],
+          merged: [],
+          settle_note:
+            "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for write access.",
+        }),
+      },
+      "editor",
+      () => meResponse({ user: userFixture({ role: "viewer" }) }),
     );
 
     renderApp("/d/eng");
 
-    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
-    expect(requested().some((path) => path.includes("/drafts/conflicts"))).toBe(
-      false,
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(notice).toHaveTextContent(
+      "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for write access.",
     );
+    expect(notice).not.toHaveTextContent("take the team's text");
   });
 
   it("says nothing about drafts on a domain that takes changes directly", async () => {

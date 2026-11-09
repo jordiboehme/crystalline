@@ -3878,6 +3878,41 @@ async fn a_resolve_against_team_text_she_was_not_shown_is_refused() {
     assert_eq!(t.row("alice", "plan.md").await, merged);
 }
 
+/// Re-review N-3: `origin diff --path` reads her conflict at a path with the
+/// team side's digest, by the path or its permalink spelling; a path with no
+/// conflict of hers is none.
+#[tokio::test]
+async fn her_conflict_at_a_path_carries_the_team_side() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+    let alice = ShareActor::Account("alice".to_string());
+    for asked in ["plan.md", "plan"] {
+        let found = t
+            .eng
+            .draft_conflict_at("team", &alice, asked)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{asked}"));
+        assert_eq!(found["upstream_sha256"], sha256_hex(&plan_later()));
+        assert_eq!(found["kind"], "EditEdit");
+    }
+    let bob = ShareActor::Account("bob".to_string());
+    assert_eq!(
+        t.eng
+            .draft_conflict_at("team", &bob, "plan.md")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        t.eng
+            .draft_conflict_at("team", &alice, "other.md")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn keep_mine_lands_her_text_and_the_second_share_has_nothing() {
     let mut t = team_direct(&[("plan.md", plan())]).await;

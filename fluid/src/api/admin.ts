@@ -1762,6 +1762,13 @@ export interface DraftConflicts {
   conflicts: DraftConflict[];
   /** Paths of drafts a merge changed since they last settled, sorted. */
   merged: string[];
+  /**
+   * What cannot be done with these conflicts here, in the server's own
+   * sentence: none can be settled on a read-only server or without write
+   * access, only the team's text can be taken on a locked domain or an
+   * archived repository. Null when every choice is open.
+   */
+  settleNote: string | null;
 }
 
 /** One draft conflict with its sides, for the dialog that settles it. */
@@ -1856,6 +1863,7 @@ export async function fetchDraftConflicts(
   return {
     conflicts: readDraftConflicts(record?.conflicts),
     merged: asStrings(record?.merged),
+    settleNote: asString(record?.settle_note),
   };
 }
 

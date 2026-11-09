@@ -1101,6 +1101,11 @@ pub(crate) async fn origin_changes_inline(
         // by name; the list is then exactly that one entry.
         let one = engine.local_change(domain, path, actor, None).await?;
         listed["changes"] = json!([one]);
+        // Her draft conflict at this path, with the team side's digest, so
+        // the resolve line can name the text she compared against (C25).
+        if let Some(conflict) = engine.draft_conflict_at(domain, actor, path).await? {
+            listed["draft_conflict"] = conflict;
+        }
         return Ok(listed);
     }
     if sides {

@@ -1069,6 +1069,7 @@ describe("the admin client layer", () => {
         },
       ],
       merged: ["notes/x.md"],
+      settleNote: null,
     });
     // Filed with the domain's own reads: a plain GET that pulls nothing.
     expect(draftConflictsKey("eng")).toEqual([

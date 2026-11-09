@@ -2551,6 +2551,64 @@ describe("the share dialog with draft conflicts", () => {
     });
   });
 
+  it("a press on a conflicted box is no pick once the conflict is settled", async () => {
+    // Her own file opens ticked and bob's does not. Bob's is also a draft
+    // conflict of hers; a press on its box while it is off must not leave a
+    // pick behind that ticks it once the conflict is settled.
+    let settled = false;
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "modified", last_author: "human:bob" },
+          { path: "notes/b.md", kind: "modified", last_author: "human:ada" },
+        ],
+        ...(settled ? {} : { draft_conflicts: [draftEntry("notes/a.md")] }),
+      }),
+      ...draftSidesRoute("notes/a.md"),
+      "/domains/eng/drafts/conflicts/d1234567/resolve": (_path, init) => {
+        if (init?.method !== "POST") {
+          return null;
+        }
+        settled = true;
+        return { draft: true, kept: "mine", kept_copy: false, remaining: 0 };
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const box = await within(dialog).findByRole("checkbox", {
+      name: "notes/a.md",
+    });
+    await userEvent.click(box);
+    expect(box).not.toBeChecked();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "notes/a.md" }),
+    );
+    const settle = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    await userEvent.click(
+      await within(settle).findByRole("button", { name: "Keep mine" }),
+    );
+
+    // The plan comes back with no conflict: the box is on again, and it is
+    // as the preselection left it, unticked.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+      ).not.toHaveAttribute("aria-disabled");
+    });
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/b.md" }),
+    ).toBeChecked();
+  });
+
   it("opens the settle dialog from a conflicted path, and Escape leaves only that", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({

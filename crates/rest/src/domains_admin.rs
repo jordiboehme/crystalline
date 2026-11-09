@@ -2496,15 +2496,54 @@ pub async fn list_draft_conflicts(
     require_domain_read(&state, &identity, &domain).await?;
     let user = identity.require_account()?;
     if !state.engine.drafts_stay_open(&domain) {
-        return Ok(Json(serde_json::json!({ "conflicts": [], "merged": [] })));
+        return Ok(Json(
+            serde_json::json!({ "conflicts": [], "merged": [], "settle_note": null }),
+        ));
     }
-    Ok(Json(
-        state
-            .engine
-            .own_draft_conflicts(&domain, user.name.as_str())
-            .await
-            .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?,
-    ))
+    let mut answer = state
+        .engine
+        .own_draft_conflicts(&domain, user.name.as_str())
+        .await
+        .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?;
+    let held = answer["conflicts"]
+        .as_array()
+        .is_some_and(|conflicts| !conflicts.is_empty());
+    let note = match held {
+        true => settle_note(&state, &identity, &domain).await,
+        false => None,
+    };
+    answer["settle_note"] = serde_json::json!(note);
+    Ok(Json(answer))
+}
+
+/// What a person told about their draft conflicts may not do with them here,
+/// in plain words, or `None` when every choice is open. The resolve route
+/// refuses each of these; this says so before anybody presses.
+async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Option<&'static str> {
+    if refuse_read_only(state).is_err() {
+        return Some("This server is read-only, so these drafts cannot be settled here.");
+    }
+    if require_domain_write(state, identity, domain).await.is_err() {
+        return Some(
+            "You cannot write in this domain, so these drafts cannot be settled here. Ask its \
+             owner for write access.",
+        );
+    }
+    // Taking the team's text is what a pull does, so it stays open on a
+    // locked domain and on an archived repository; the other two do not.
+    if state.engine.domain_is_read_only(domain).await {
+        return Some(
+            "This domain is read-only. Until its owner turns read-only off, you can only take \
+             the team's text for these drafts.",
+        );
+    }
+    if state.engine.github_archived_repo(domain).is_some() {
+        return Some(
+            "This domain's repository is archived, so you can only take the team's text for \
+             these drafts.",
+        );
+    }
+    None
 }
 
 /// `GET /domains/{domain}/drafts/conflicts/{id}` - one of the caller's own

@@ -441,6 +441,12 @@ pub struct DraftConflictsResponse {
     /// Paths of your drafts a merge changed, sorted.
     #[schema(example = json!(["notes/plan.md"]))]
     pub merged: Vec<String>,
+    /// What you may not do with these conflicts here, in a sentence to show:
+    /// on a read-only server or without write access none can be settled,
+    /// and on a read-only domain or an archived repository only the team's
+    /// text can be taken. Null when every choice is open or nothing is listed.
+    #[schema(required = true)]
+    pub settle_note: Option<String>,
 }
 
 /// What `GET /domains/{domain}/drafts/conflicts/{id}` answers.

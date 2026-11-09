@@ -45,15 +45,8 @@ const PATH_CLASSES = `font-mono underline ${FOCUS_RING}`;
 
 export function DraftConflictsNotice({
   domain,
-  locked = false,
 }: {
   domain: string;
-  /**
-   * Whether the domain's MANIFEST says `read_only: on`. Keeping her text or
-   * a merge is refused there until the owner switches it off; taking the
-   * team's text, which is what a pull does, is not.
-   */
-  locked?: boolean;
 }): ReactElement | null {
   const [open, setOpen] = useState<DraftConflict | null>(null);
   // No retry: every refusal here is immediate and final.
@@ -69,6 +62,7 @@ export function DraftConflictsNotice({
       : problemDetail(drafts.error);
   const conflicts = drafts.data?.conflicts ?? [];
   const merged = drafts.data?.merged ?? [];
+  const settleNote = drafts.data?.settleNote ?? null;
   // The dialog stays mounted while it is open, even once the list it was
   // opened from has emptied: a receipt it is still showing is the server's
   // only word on where a kept copy went.
@@ -125,12 +119,10 @@ export function DraftConflictsNotice({
           )}
         </p>
       )}
-      {locked && conflicts.length > 0 && (
-        <p>
-          This domain is read-only. Until its owner switches read_only off, you
-          can only take the team&apos;s text for these drafts.
-        </p>
-      )}
+      {/* What she cannot do with them here, in the server's words: it
+          alone knows a read-only server, a missing write right, a locked
+          domain or an archived repository apart. */}
+      {settleNote !== null && conflicts.length > 0 && <p>{settleNote}</p>}
       {merged.map((path) => (
         <p
           key={path}

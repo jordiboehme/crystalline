@@ -643,6 +643,13 @@ export type DraftConflictsResponse = {
      * Paths of your drafts a merge changed, sorted.
      */
     merged: Array<string>;
+    /**
+     * What you may not do with these conflicts here, in a sentence to show:
+     * on a read-only server or without write access none can be settled,
+     * and on a read-only domain or an archived repository only the team's
+     * text can be taken. Null when every choice is open or nothing is listed.
+     */
+    settle_note: string | null;
 };
 
 /**

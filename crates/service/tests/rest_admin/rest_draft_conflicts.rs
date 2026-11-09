@@ -88,6 +88,7 @@ struct Team {
 /// A served engine and the accounts that sign in to it.
 struct Served {
     addr: std::net::SocketAddr,
+    auth: Arc<AuthStore>,
 }
 
 fn config_with(edit: impl FnOnce(&mut GlobalConfig), root: &std::path::Path) -> GlobalConfig {
@@ -296,7 +297,14 @@ async fn serve(engine: Arc<Engine>, dir: &std::path::Path) -> Served {
             .await
             .unwrap();
     }
-    let router = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None).unwrap();
+    let router = http_router(
+        engine,
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -307,7 +315,7 @@ async fn serve(engine: Arc<Engine>, dir: &std::path::Path) -> Served {
         .await
         .unwrap();
     });
-    Served { addr }
+    Served { addr, auth }
 }
 
 fn client() -> reqwest::Client {
@@ -410,6 +418,8 @@ async fn an_editor_with_no_share_role_can_settle_her_own_conflict() {
                 "other": null,
             }],
             "merged": [],
+            // Every choice is open to her here.
+            "settle_note": null,
         })
     );
 
@@ -447,7 +457,10 @@ async fn an_editor_with_no_share_role_can_settle_her_own_conflict() {
 
     let (status, list) = alice.get(LIST).await;
     assert_eq!(status, 200);
-    assert_eq!(list, json!({"conflicts": [], "merged": []}));
+    assert_eq!(
+        list,
+        json!({"conflicts": [], "merged": [], "settle_note": null})
+    );
     assert_eq!(t.rows("alice").await, vec!["plan.md".to_string()]);
 }
 
@@ -465,7 +478,10 @@ async fn another_accounts_conflict_is_not_found() {
 
     let (status, list) = bob.get(LIST).await;
     assert_eq!(status, 200, "{list}");
-    assert_eq!(list, json!({"conflicts": [], "merged": []}));
+    assert_eq!(
+        list,
+        json!({"conflicts": [], "merged": [], "settle_note": null})
+    );
 
     // Not her id, not even for an admin: a draft is its author's alone.
     for who in [&bob, &root] {
@@ -517,7 +533,10 @@ async fn a_reader_cannot_resolve() {
 
     let (status, list) = vera.get(LIST).await;
     assert_eq!(status, 200, "a reader lists her own, which is none: {list}");
-    assert_eq!(list, json!({"conflicts": [], "merged": []}));
+    assert_eq!(
+        list,
+        json!({"conflicts": [], "merged": [], "settle_note": null})
+    );
 
     for id in [hers.as_str(), "d0000000"] {
         let (status, body) = vera.resolve(id, json!({"resolution": "theirs"})).await;
@@ -544,6 +563,11 @@ async fn a_read_only_instance_lists_and_refuses_the_resolve() {
     let (status, list) = alice.get(LIST).await;
     assert_eq!(status, 200, "{list}");
     assert_eq!(list["conflicts"][0]["id"], json!(hers));
+    // Said before she presses: nothing can be settled on this server.
+    assert_eq!(
+        list["settle_note"],
+        "This server is read-only, so these drafts cannot be settled here."
+    );
     let (status, both) = alice.get(&sides(&hers)).await;
     assert_eq!(status, 200, "{both}");
 
@@ -620,7 +644,10 @@ async fn a_non_reviewing_domain_lists_nothing() {
 
     let (status, list) = alice.get(LIST).await;
     assert_eq!(status, 200, "{list}");
-    assert_eq!(list, json!({"conflicts": [], "merged": []}));
+    assert_eq!(
+        list,
+        json!({"conflicts": [], "merged": [], "settle_note": null})
+    );
     // In the words an id that is not hers gets, so the two read the same.
     let not_hers = json!(format!("no conflict {hers} among your drafts in 'team'"));
     let (status, body) = alice.get(&sides(&hers)).await;
@@ -803,6 +830,26 @@ async fn a_resolve_against_team_text_she_was_not_shown_is_a_409() {
         )
         .await;
     assert_eq!(status, 200, "{receipt}");
+}
+
+/// Task 14 re-review N-1: an account that lost its write right still lists
+/// its conflicts, and is told before it presses that none can be settled.
+#[tokio::test]
+async fn a_session_without_the_write_right_is_told_it_cannot_settle() {
+    let t = team().await;
+    t.alice_in_conflict().await;
+    let served = t.serve().await;
+    served.auth.set_role("alice", Role::Viewer).await.unwrap();
+    let alice = served.login("alice").await;
+
+    let (status, list) = alice.get(LIST).await;
+    assert_eq!(status, 200, "{list}");
+    assert_eq!(list["conflicts"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(
+        list["settle_note"],
+        "You cannot write in this domain, so these drafts cannot be settled here. Ask its \
+         owner for write access."
+    );
 }
 
 /// The sentence a list of her conflicts that cannot be read is answered with,
