@@ -167,6 +167,100 @@ struct Kind {
     upstream_at: String,
 }
 
+/// The refusal of a draft whose record cannot be read (C1, the Task 5
+/// review's M2): it names the two ways out. Discard ends the draft without
+/// reading the record, and a removed record reads as a draft from before
+/// 0.32.0, which is `UnknownStart`. The cause goes to the log.
+fn unreadable_record(
+    domain: &str,
+    actor: &str,
+    path: &str,
+    file: std::io::Result<PathBuf>,
+    source: &std::io::Error,
+) -> EngineError {
+    tracing::warn!(
+        domain,
+        actor,
+        path,
+        "the record of where a draft started cannot be read: {source}"
+    );
+    let file = match file {
+        Ok(file) => file.display().to_string(),
+        Err(_) => "its record".to_string(),
+    };
+    EngineError::Conflict(format!(
+        "The record of where your draft of {path} started cannot be read. Discard that \
+         draft, or remove {file} so it is read as a draft from before 0.32.0."
+    ))
+}
+
+/// One conflict's sides, in the shape `origin_conflict_detail` answers, so
+/// Fluid reads one shape. A file has no text and says so.
+fn sides_json(found: Found) -> Value {
+    if found.conflict.file {
+        let conflict = found.conflict;
+        return json!({
+            "id": conflict.id,
+            "path": conflict.path,
+            "kind": conflict.kind,
+            "draft": true,
+            "detected_at": null,
+            "base": null,
+            "local": null,
+            "upstream": null,
+            "moved_from": null,
+            "other": null,
+            "file": true,
+            "note": "a file has no text to compare; keep yours or take the team's",
+        });
+    }
+    // One note per side that needs one, kept together: a start with no text
+    // and a team file that is not text are two facts.
+    let mut notes: Vec<String> = Vec::new();
+    let base = match &found.record {
+        Some(DraftStart {
+            start: Some(start), ..
+        }) => Value::String(start.clone()),
+        Some(DraftStart {
+            start_sha256: Some(_),
+            ..
+        }) => {
+            notes.push("the base side has no text and is omitted".to_string());
+            Value::Null
+        }
+        _ => Value::Null,
+    };
+    let local = found.local.clone().map_or(Value::Null, Value::String);
+    let upstream = match found.upstream {
+        Held::Absent => Value::Null,
+        Held::Bytes(bytes) => {
+            let mut note = None;
+            let side = utf8_side(Some(bytes), "upstream", &mut note);
+            notes.extend(note);
+            side
+        }
+        Held::Unreadable(_) => {
+            notes.push("the upstream side has no readable copy and is omitted".to_string());
+            Value::Null
+        }
+    };
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
+    let conflict = found.conflict;
+    json!({
+        "id": conflict.id,
+        "path": conflict.path,
+        "kind": conflict.kind,
+        "draft": true,
+        "detected_at": null,
+        "base": base,
+        "local": local,
+        "upstream": upstream,
+        "moved_from": conflict.moved_from,
+        "other": conflict.other,
+        "note": note,
+    })
+}
+
 fn conflict_id(actor: &str, path: &str) -> String {
     let hash = sha256_hex(format!("{actor}\0{path}").as_bytes());
     format!("d{}", &hash[..7])
@@ -387,7 +481,11 @@ impl FileDraft {
             path: format!("the draft file '{}' in '{domain}'", entry.path),
             source,
         };
-        let record = draft_start::load_file(journal_dir, domain, actor, &entry.path).map_err(io)?;
+        let record =
+            draft_start::load_file(journal_dir, domain, actor, &entry.path).map_err(|source| {
+                let file = draft_start::file_record_file(journal_dir, domain, actor, &entry.path);
+                unreadable_record(domain, actor, &entry.path, file, &source)
+            })?;
         let (key, held) = team_key(state, &entry.path, folds);
         let stamp = key.and_then(|key| state.files.get(key));
         // A file held under several spellings has no digest to name; an empty
@@ -737,10 +835,8 @@ impl Engine {
             .iter()
             .map(|row| {
                 draft_start::load(&journal_dir, domain, actor, &row.path).map_err(|source| {
-                    EngineError::Io {
-                        path: format!("the draft start record of '{}'", row.path),
-                        source,
-                    }
+                    let file = draft_start::record_file(&journal_dir, domain, actor, &row.path);
+                    unreadable_record(domain, actor, &row.path, file, &source)
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -815,77 +911,41 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::NotFound(format!("no conflict {id} among your drafts in '{domain}'"))
             })?;
-        if found.conflict.file {
-            let conflict = found.conflict;
-            return Ok(json!({
-                "id": conflict.id,
-                "path": conflict.path,
-                "kind": conflict.kind,
-                "draft": true,
-                "detected_at": null,
-                "base": null,
-                "local": null,
-                "upstream": null,
-                "moved_from": null,
-                "other": null,
-                "file": true,
-                "note": "a file has no text to compare; keep yours or take the team's",
-            }));
-        }
-        // One note per side that needs one, kept together: a start with no text
-        // and a team file that is not text are two facts.
-        let mut notes: Vec<String> = Vec::new();
-        let base = match &found.record {
-            Some(DraftStart {
-                start: Some(start), ..
-            }) => Value::String(start.clone()),
-            Some(DraftStart {
-                start_sha256: Some(_),
-                ..
-            }) => {
-                notes.push("the base side has no text and is omitted".to_string());
-                Value::Null
-            }
-            _ => Value::Null,
-        };
-        let local = found.local.clone().map_or(Value::Null, Value::String);
-        let upstream = match found.upstream {
-            Held::Absent => Value::Null,
-            Held::Bytes(bytes) => {
-                let mut note = None;
-                let side = utf8_side(Some(bytes), "upstream", &mut note);
-                notes.extend(note);
-                side
-            }
-            Held::Unreadable(_) => {
-                notes.push("the upstream side has no readable copy and is omitted".to_string());
-                Value::Null
-            }
-        };
-        let note = (!notes.is_empty()).then(|| notes.join("; "));
-        let conflict = found.conflict;
-        Ok(json!({
-            "id": conflict.id,
-            "path": conflict.path,
-            "kind": conflict.kind,
-            "draft": true,
-            "detected_at": null,
-            "base": base,
-            "local": local,
-            "upstream": upstream,
-            "moved_from": conflict.moved_from,
-            "other": conflict.other,
-            "note": note,
-        }))
+        Ok(sides_json(found))
+    }
+
+    /// `actor`'s conflicts as status lists them with `detail`: each as
+    /// [`crate::origin::draft_conflicts_json`] has it, plus its `base`, `local`
+    /// and `upstream` text as [`Engine::draft_conflict_sides`] answers them, and
+    /// that answer's `note` when it has one. The list is read once.
+    pub(crate) async fn draft_conflicts_with_sides(
+        &self,
+        domain: &str,
+        actor: &str,
+    ) -> Result<Vec<Value>> {
+        Ok(self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .map(|found| {
+                let mut entry =
+                    crate::origin::draft_conflicts_json(std::slice::from_ref(&found.conflict))[0]
+                        .take();
+                let sides = sides_json(found);
+                for key in ["base", "local", "upstream"] {
+                    entry[key] = sides[key].clone();
+                }
+                if !sides["note"].is_null() {
+                    entry["note"] = sides["note"].clone();
+                }
+                entry
+            })
+            .collect())
     }
 
     /// The paths of `actor`'s drafts a merge changed since they last settled:
     /// the records with `merged_at`. A notice, not a gate, so a records folder
     /// that cannot be read answers empty with a warning.
-    #[allow(
-        dead_code,
-        reason = "read once status names the drafts a merge changed"
-    )]
     pub(crate) fn drafts_merged(&self, domain: &str, actor: &str) -> Vec<String> {
         let read = self
             .journal_state_dir()

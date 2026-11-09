@@ -1914,4 +1914,266 @@ mod chain {
         let err = daemon.run_failing(&["origin", "share", "brand"]);
         assert!(err.contains(refusal), "{err}");
     }
+
+    // --- a draft's conflict, as the engine answers it (Task 12) ---------------
+
+    /// One draft conflict as status, update and the share list it: the engine's
+    /// `draft_conflicts_json` shape.
+    fn draft_conflict(path: &str, kind: &str) -> Value {
+        json!({
+            "id": "d1234567",
+            "path": path,
+            "kind": kind,
+            "draft": true,
+            "moved_from": Value::Null,
+            "other": Value::Null,
+            "file": false,
+        })
+    }
+
+    /// An update of `brand` with `conflicts` and `drafts_merged` as given.
+    fn update_payload(up_to_date: bool, conflicts: Vec<Value>, merged: Vec<&str>) -> Value {
+        json!({
+            "domains": [{
+                "domain": "brand",
+                "up_to_date": up_to_date,
+                "applied": if up_to_date { json!([]) } else { json!(["notes/plan.md"]) },
+                "merged": [],
+                "conflicts": conflicts,
+                "proposals": [],
+                "skipped_large": [],
+                "re_baselined": false,
+                "open_proposals": [],
+                "drafts_merged": merged,
+            }],
+            "errors": [],
+        })
+    }
+
+    #[test]
+    fn origin_status_prints_the_unresolved_draft() {
+        let mut payload = status_payload(vec![], vec![], false, false);
+        payload["domains"][0]["conflicts"] = json!([
+            {
+                "id": "0a1b2c3d", "path": "folder.md", "kind": "EditEdit",
+                "base_commit": "abc123", "upstream_commit": "def456",
+                "detected_at": "2026-11-09T10:00:00Z",
+            },
+            draft_conflict("notes/plan.md", "EditEdit"),
+        ]);
+        payload["domains"][0]["drafts_merged"] = json!(["notes/other.md"]);
+        let daemon = Daemon::answering("status-draft", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("  unresolved conflict: folder.md\n"), "{out}");
+        assert!(
+            out.contains(
+                "  unresolved conflict in your draft: notes/plan.md (you and the team changed \
+                 the same lines)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  merged into your draft: notes/other.md"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn origin_update_prints_merged_into_your_draft() {
+        // Up to date: the merge was a poller's, and she is still told.
+        let daemon = Daemon::answering(
+            "update-merged",
+            update_payload(true, vec![], vec!["notes/plan.md"]),
+        );
+        let out = daemon.run(&["origin", "update"]);
+        assert!(out.contains("brand: up to date"), "{out}");
+        assert!(
+            out.contains("  merged into your draft: notes/plan.md"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn origin_update_prints_how_to_compare_and_the_content_file_way_out() {
+        let daemon = Daemon::answering(
+            "update-conflict",
+            update_payload(
+                false,
+                vec![draft_conflict("notes/plan.md", "EditEdit")],
+                vec![],
+            ),
+        );
+        let out = daemon.run(&["origin", "update"]);
+        assert!(
+            out.contains(
+                "  conflict: notes/plan.md (compare: crystalline origin diff brand --path \
+                 notes/plan.md; resolve: crystalline origin resolve brand notes/plan.md --keep \
+                 mine|theirs, or --content-file <f>)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("you and the team changed the same lines"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn origin_share_prints_conflicts_pending_for_a_draft() {
+        let daemon = Daemon::answering(
+            "share-draft-conflict",
+            json!({
+                "outcome": "conflicts_pending",
+                "count": 1,
+                "conflicts": [draft_conflict("notes/plan.md", "EditDelete")],
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        assert!(
+            out.contains("Cannot share 'brand': 1 conflict needs to be resolved first."),
+            "{out}"
+        );
+        assert!(
+            out.contains("  conflict: notes/plan.md (you changed it, the team deleted it)"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "Settle each with: crystalline origin resolve brand <path> --keep mine|theirs, \
+                 or --content-file <f>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("crystalline origin share brand --file <path>"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn origin_resolve_old_path_prints_the_draft_path() {
+        let daemon = Daemon::answering(
+            "resolve-move",
+            json!({
+                "resolved": "notes/renamed.md",
+                "remaining": 0,
+                "draft": true,
+                "kept": "mine",
+                "kept_copy": false,
+            }),
+        );
+        let out = daemon.run(&[
+            "origin",
+            "resolve",
+            "brand",
+            "notes/plan.md",
+            "--keep",
+            "mine",
+        ]);
+        assert_eq!(daemon.request()["path"], "notes/plan.md");
+        assert!(out.contains("Resolved: notes/renamed.md"), "{out}");
+        assert!(
+            out.contains(
+                "You named notes/plan.md. Your draft is at notes/renamed.md, and this settles \
+                 the whole move."
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Your text replaces the team's when you share."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn origin_resolve_theirs_prints_your_text_is_gone() {
+        let daemon = Daemon::answering(
+            "resolve-theirs",
+            json!({
+                "resolved": "notes/plan.md",
+                "remaining": 1,
+                "draft": true,
+                "kept": "theirs",
+                "kept_copy": false,
+            }),
+        );
+        let out = daemon.run(&[
+            "origin",
+            "resolve",
+            "brand",
+            "notes/plan.md",
+            "--keep",
+            "theirs",
+        ]);
+        assert!(
+            out.contains("Your draft of notes/plan.md is gone. You now read the team's text."),
+            "{out}"
+        );
+        assert!(!out.contains("kept list"), "{out}");
+        assert!(out.contains("Remaining conflicts: 1"), "{out}");
+
+        // An old draft keeps a copy, and the line says where.
+        let daemon = Daemon::answering(
+            "resolve-theirs-kept",
+            json!({
+                "resolved": "notes/plan.md",
+                "remaining": null,
+                "draft": true,
+                "kept": "theirs",
+                "kept_copy": true,
+            }),
+        );
+        let out = daemon.run(&[
+            "origin",
+            "resolve",
+            "brand",
+            "notes/plan.md",
+            "--keep",
+            "theirs",
+        ]);
+        assert!(
+            out.contains(
+                "Your draft of notes/plan.md is gone. You now read the team's text. A copy is \
+                 in crystalline kept list."
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("The number of conflicts left could not be read."),
+            "{out}"
+        );
+
+        // A file: the team's file, and where her bytes are kept.
+        let daemon = Daemon::answering(
+            "resolve-theirs-file",
+            json!({
+                "resolved": "assets/deck.png",
+                "remaining": 0,
+                "draft": true,
+                "file": true,
+                "kept": "theirs",
+                "kept_copy": true,
+                "kept_file": "/home/me/kept/team/assets/deck.png.md",
+            }),
+        );
+        let out = daemon.run(&[
+            "origin",
+            "resolve",
+            "brand",
+            "assets/deck.png",
+            "--keep",
+            "theirs",
+        ]);
+        assert!(
+            out.contains(
+                "Your draft of assets/deck.png is gone. You now read the team's file. A copy is \
+                 in crystalline kept list."
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Your file is kept at /home/me/kept/team/assets/deck.png.md."),
+            "{out}"
+        );
+    }
 }

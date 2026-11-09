@@ -5075,3 +5075,278 @@ async fn a_file_in_an_open_proposal_stays_until_it_merges() {
     assert_eq!(t.held_file("alice", DECK), Some(Some(HER_DECK.to_vec())));
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
+
+// --- Task 12: status and update name her own conflicts ------------------------
+
+/// Her own conflict as status and update list it, with `draft: true`.
+fn listed(actor: &str, path: &str, kind: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id(actor, path),
+        "path": path,
+        "kind": kind,
+        "draft": true,
+        "moved_from": null,
+        "other": null,
+        "file": false,
+    })
+}
+
+/// What `scope`'s status of the team domain says, with `detail` as given.
+async fn status_of(t: &Team, scope: &Scope, detail: bool) -> serde_json::Value {
+    t.eng
+        .origin_status(Some("team"), detail, false, scope)
+        .await
+        .unwrap()["domains"][0]
+        .clone()
+}
+
+#[tokio::test]
+async fn an_update_names_her_conflict_and_a_colleague_reads_none_of_it() {
+    let t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+
+    let hers = t
+        .eng
+        .origin_update(Some("team"), &scope("alice"))
+        .await
+        .unwrap();
+    let domain = &hers["domains"][0];
+    assert_eq!(
+        domain["conflicts"],
+        serde_json::json!([listed("alice", "plan.md", "EditEdit")]),
+        "{hers}"
+    );
+    assert_eq!(domain["drafts_merged"], serde_json::json!([]), "{hers}");
+
+    let his = t
+        .eng
+        .origin_update(Some("team"), &scope("bob"))
+        .await
+        .unwrap();
+    let domain = &his["domains"][0];
+    assert_eq!(domain["conflicts"], serde_json::json!([]), "{his}");
+    assert_eq!(domain["drafts_merged"], serde_json::json!([]), "{his}");
+    assert!(!his.to_string().contains(&id("alice", "plan.md")), "{his}");
+}
+
+#[tokio::test]
+async fn an_update_names_a_merged_draft() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+
+    let hers = t
+        .eng
+        .origin_update(Some("team"), &scope("alice"))
+        .await
+        .unwrap();
+    let domain = &hers["domains"][0];
+    assert_eq!(
+        domain["drafts_merged"],
+        serde_json::json!(["plan.md"]),
+        "{hers}"
+    );
+    assert_eq!(domain["conflicts"], serde_json::json!([]), "{hers}");
+
+    // Up to date now, and she is still told until the draft ends.
+    let again = t
+        .eng
+        .origin_update(Some("team"), &scope("alice"))
+        .await
+        .unwrap();
+    assert_eq!(again["domains"][0]["up_to_date"], true, "{again}");
+    assert_eq!(
+        again["domains"][0]["drafts_merged"],
+        serde_json::json!(["plan.md"]),
+        "{again}"
+    );
+}
+
+/// A merge the poller did reaches her through status: she ran nothing.
+#[tokio::test]
+async fn status_names_a_merge_a_poller_did() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+    assert_eq!(
+        status_of(&t, &scope("alice"), false).await["drafts_merged"],
+        serde_json::json!([])
+    );
+
+    let tokens = t.tmp.path().join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    crystalline_remote::TokenStore::File {
+        path: tokens.join("github-token.json"),
+    }
+    .save(&crystalline_remote::StoredToken {
+        access_token: "test-token".to_string(),
+        host: "github.com".to_string(),
+        user: "mock-user".to_string(),
+        created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
+    })
+    .unwrap();
+    let poller = t
+        .engine_over(t.eng.store(), |_| {})
+        .with_token_store_dir(tokens);
+    poller
+        .origin_poll_tick(std::time::Instant::now(), chrono::Utc::now())
+        .await;
+    assert!(t.row("alice", "plan.md").await.contains(BOB_LINE));
+
+    let domain = status_of(&t, &scope("alice"), false).await;
+    assert_eq!(
+        domain["drafts_merged"],
+        serde_json::json!(["plan.md"]),
+        "{domain}"
+    );
+    assert_eq!(domain["conflicts"], serde_json::json!([]), "{domain}");
+    let his = status_of(&t, &scope("bob"), false).await;
+    assert_eq!(his["drafts_merged"], serde_json::json!([]), "{his}");
+}
+
+const BOB_DRAFT: &str = "bob's own draft of the first line";
+
+#[tokio::test]
+async fn status_detail_carries_both_texts_and_only_her_own() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.replace("bob", "plan", "the first line of the plan", BOB_DRAFT)
+        .await;
+    let hers = t.row("alice", "plan.md").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+
+    let domain = status_of(&t, &scope("alice"), true).await;
+    let mut expected = listed("alice", "plan.md", "EditEdit");
+    expected["base"] = serde_json::json!(text(&plan()));
+    expected["local"] = serde_json::json!(hers);
+    expected["upstream"] = serde_json::json!(text(&plan_later()));
+    assert_eq!(
+        domain["conflicts"],
+        serde_json::json!([expected]),
+        "{domain}"
+    );
+    assert!(!domain.to_string().contains(BOB_DRAFT), "{domain}");
+    assert!(
+        !domain.to_string().contains(&id("bob", "plan.md")),
+        "{domain}"
+    );
+
+    // Without detail the entry names the conflict and carries no text.
+    let plain = status_of(&t, &scope("alice"), false).await;
+    assert_eq!(
+        plain["conflicts"],
+        serde_json::json!([listed("alice", "plan.md", "EditEdit")]),
+        "{plain}"
+    );
+}
+
+#[tokio::test]
+async fn a_domain_owner_reads_counts_not_paths() {
+    let other = |first: &str| {
+        engram(
+            "Other",
+            "other",
+            &format!("{first}\n\nthe middle of the other page\n\nthe end of the other page"),
+        )
+    };
+    let mut t = team(&[("plan.md", plan()), ("other.md", other("the other page"))]).await;
+    same_line(&t).await;
+    t.append("alice", "other", HER_WORD).await;
+    t.push(&[
+        ("plan.md", Some(plan_later())),
+        ("other.md", Some(other("bob changed the other page"))),
+    ])
+    .await;
+    assert_eq!(
+        status_of(&t, &scope("alice"), false).await["drafts_merged"],
+        serde_json::json!(["other.md"])
+    );
+
+    let owners = status_of(&t, &Scope::Unrestricted, true).await;
+    assert_eq!(owners["conflicts"], serde_json::json!([]), "{owners}");
+    assert_eq!(owners["drafts_merged"], serde_json::json!([]), "{owners}");
+    assert_eq!(
+        owners["converged"]["actors"],
+        serde_json::json!([{ "actor": "alice", "entries": 1 }]),
+        "{owners}"
+    );
+    let said = owners.to_string();
+    assert!(!said.contains(&id("alice", "plan.md")), "{said}");
+    assert!(!said.contains(ALICE_LINE), "{said}");
+    assert!(!said.contains(HER_WORD), "{said}");
+}
+
+/// The Task 5 review's M2: a record that cannot be read names the two ways
+/// out, in status and in the share's refusal, and both ways work.
+#[tokio::test]
+async fn a_broken_record_names_its_ways_out() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let file = draft_start::record_file(&t.state(), "team", "alice", "plan.md").unwrap();
+    let said = format!(
+        "The record of where your draft of plan.md started cannot be read. Discard that \
+         draft, or remove {} so it is read as a draft from before 0.32.0.",
+        file.display()
+    );
+
+    std::fs::write(&file, b"{ not a record").unwrap();
+    let domain = status_of(&t, &scope("alice"), false).await;
+    assert_eq!(domain["conflicts_unreadable"], said, "{domain}");
+    assert_eq!(domain["conflicts"], serde_json::json!([]), "{domain}");
+    let err = t
+        .eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err:?}");
+    assert_eq!(err.to_string(), said);
+
+    // A file removed reads as a draft from before 0.32.0.
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", UnknownStart)]
+    );
+    assert!(
+        status_of(&t, &scope("alice"), false)
+            .await
+            .get("conflicts_unreadable")
+            .is_none()
+    );
+
+    // Discard ends the draft without reading the record.
+    std::fs::write(&file, b"{ not a record").unwrap();
+    t.discard("alice", "plan.md").await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// [`a_broken_record_names_its_ways_out`] for a file beside the pages.
+#[tokio::test]
+async fn a_broken_file_record_names_its_ways_out() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    let file = draft_start::file_record_file(&t.state(), "team", "alice", DECK).unwrap();
+    std::fs::write(&file, b"").unwrap();
+
+    let err = t.eng.draft_conflicts("team", "alice").await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "The record of where your draft of {DECK} started cannot be read. Discard that \
+             draft, or remove {} so it is read as a draft from before 0.32.0.",
+            file.display()
+        )
+    );
+}

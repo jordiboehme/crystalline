@@ -79,6 +79,36 @@ fn note_unshared_spelling(answer: &mut Value, moves: &[Value]) {
 
 /// The text of an error a list answer carries in a row, in the words of who reads
 /// it: the same list as [`plain_refusal_text`], here where the caller is known.
+/// What status and update say about the caller's own drafts in a domain
+/// whose drafts stay open: her conflicts, the drafts a merge changed, and the
+/// sentence that says why her conflicts could not be listed. Nobody else's.
+pub(super) struct OwnDrafts {
+    conflicts: Vec<Value>,
+    merged: Vec<String>,
+    unreadable: Option<String>,
+}
+
+impl OwnDrafts {
+    /// Appends her conflicts after the folder's in `conflicts`, and sets
+    /// `drafts_merged` and, when the list could not be read,
+    /// `conflicts_unreadable`.
+    fn add_to(&self, value: &mut Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        let conflicts = object
+            .entry("conflicts")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(list) = conflicts.as_array_mut() {
+            list.extend(self.conflicts.iter().cloned());
+        }
+        object.insert("drafts_merged".to_string(), json!(self.merged));
+        if let Some(sentence) = &self.unreadable {
+            object.insert("conflicts_unreadable".to_string(), json!(sentence));
+        }
+    }
+}
+
 fn row_error(scope: &crate::scope::Scope, e: &EngineError) -> String {
     let text = e.to_string();
     let admin = matches!(
@@ -1126,9 +1156,21 @@ impl Engine {
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
+        let actor = crate::scope::overlay_actor(scope);
         for (name, entry) in targets {
             match self.origin_update_one(&name, &entry).await {
-                Ok(v) => domains.push(v),
+                Ok(mut v) => {
+                    // The caller's own drafts, read after the pull let go of
+                    // the origin lock, as status reads them. Only here and not
+                    // in the per-domain body: the poller runs that body too,
+                    // and it acts for nobody.
+                    if self.drafts_stay_open(&name) {
+                        self.own_drafts(&name, actor.as_deref(), false)
+                            .await
+                            .add_to(&mut v);
+                    }
+                    domains.push(v);
+                }
                 Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
             }
         }
@@ -1538,7 +1580,7 @@ impl Engine {
             // overview asks this of every team domain at once. A fold that
             // stopped part way counts too: its drafts can still be settled,
             // so their authors are told which ones stand.
-            let (view, converged) = if self.drafts_stay_open(&name) {
+            let (view, converged, own) = if self.drafts_stay_open(&name) {
                 // Whoever owns the domain sees who else is drafting in it. One
                 // comparison covers the whole rule: an instance admin owns
                 // every domain, a private domain's owner owns theirs, and
@@ -1571,12 +1613,16 @@ impl Engine {
                     // Read here for the reason the counts are: outside the
                     // per-domain lock, from what stands, and it fails no report.
                     self.converged_json(&name, actor.as_deref(), everyone).await,
+                    // The caller's own conflicts and merges, read the same way.
+                    // Only the caller's: whoever owns the domain reads counts.
+                    Some(self.own_drafts(&name, actor.as_deref(), detail).await),
                 )
             } else {
                 // Never read: the per-domain body reports the draft keys only
                 // for a reviewing domain, which this is not.
                 (
                     crate::review::DraftView::new(None, actor.clone(), false),
+                    None,
                     None,
                 )
             };
@@ -1605,6 +1651,7 @@ impl Engine {
                     diff_block.as_ref(),
                     &view,
                     converged.as_ref(),
+                    own.as_ref(),
                     viewer.as_ref().map(Option::as_deref),
                 )
                 .await
@@ -1614,6 +1661,62 @@ impl Engine {
             }
         }
         Ok(json!({ "connection": connection, "domains": domains, "errors": errors }))
+    }
+
+    /// `actor`'s own conflicts and merged drafts in `domain`, read from what
+    /// stands and outside the origin lock. With `sides`, each conflict carries
+    /// its `base`, `local` and `upstream` text. No actor, as for an agent with
+    /// no identity, holds no draft. A list that cannot be read lists nothing
+    /// and says why in one sentence, never reads as clean (C1).
+    pub(super) async fn own_drafts(
+        &self,
+        domain: &str,
+        actor: Option<&str>,
+        sides: bool,
+    ) -> OwnDrafts {
+        let Some(actor) = actor else {
+            return OwnDrafts {
+                conflicts: Vec::new(),
+                merged: Vec::new(),
+                unreadable: None,
+            };
+        };
+        let listed = if sides {
+            self.draft_conflicts_with_sides(domain, actor).await
+        } else {
+            self.draft_conflicts(domain, actor).await.map(|conflicts| {
+                match origin::draft_conflicts_json(&conflicts) {
+                    Value::Array(entries) => entries,
+                    _ => Vec::new(),
+                }
+            })
+        };
+        let (conflicts, unreadable) = match listed {
+            Ok(conflicts) => (conflicts, None),
+            Err(EngineError::Conflict(sentence)) => (Vec::new(), Some(sentence)),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    "the conflicts of '{actor}' could not be read: {e}"
+                );
+                (
+                    Vec::new(),
+                    Some(
+                        "Your conflicts in this domain cannot be read, so none are listed, and \
+                         a share of this domain refuses until they can."
+                            .to_string(),
+                    ),
+                )
+            }
+        };
+        let mut merged = self.drafts_merged(domain, actor);
+        merged.sort();
+        OwnDrafts {
+            conflicts,
+            merged,
+            unreadable,
+        }
     }
 
     /// Reports one domain's status, under its origin lock. The per-domain
@@ -1654,6 +1757,7 @@ impl Engine {
         diff: Option<&Value>,
         drafts: &crate::review::DraftView,
         converged: Option<&Value>,
+        own: Option<&OwnDrafts>,
         viewer: Option<Option<&str>>,
     ) -> Result<Value> {
         let lock = self.origin_lock(name);
@@ -1744,6 +1848,10 @@ impl Engine {
                 && let Some(object) = value.as_object_mut()
             {
                 object.insert("converged".to_string(), converged.clone());
+            }
+            // The folder's conflicts first, then the caller's own drafts'.
+            if let Some(own) = own {
+                own.add_to(&mut value);
             }
             value
         };

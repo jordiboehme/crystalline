@@ -926,6 +926,68 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// line. The three direct refusals are reported too: a proposal still open
 /// (the sharer's own, or another person's), a branch whose rules refuse the
 /// commit, a branch that moved twice.
+/// What a draft's conflict is, in plain words, for a line about it: `None`
+/// for a conflict of the folder, which carries no `draft: true`.
+pub(crate) fn draft_kind_words(conflict: &serde_json::Value) -> Option<String> {
+    if conflict["draft"] != true {
+        return None;
+    }
+    let words = match conflict["kind"].as_str().unwrap_or("") {
+        "EditEdit" => match conflict["moved_from"].as_str() {
+            Some(from) => format!("you moved it from {from}, and the team changed it"),
+            None => "you and the team changed the same lines".to_string(),
+        },
+        "EditDelete" => "you changed it, the team deleted it".to_string(),
+        "DeleteEdit" => "you deleted it, the team changed it".to_string(),
+        "AddAdd" => "you and the team both have a file here, with different text".to_string(),
+        "UnknownStart" => "a draft from an older version; compare the two texts".to_string(),
+        "AddressTaken" => format!(
+            "the team's file {} now uses the same address",
+            conflict["other"].as_str().unwrap_or("")
+        ),
+        other => other.to_string(),
+    };
+    Some(words)
+}
+
+/// The lines `origin update` and `origin status` print about the caller's own
+/// drafts in one domain: each draft that took the team's change, and why her
+/// conflicts could not be listed when they could not.
+pub(crate) fn own_draft_lines(domain: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for path in domain["drafts_merged"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  merged into your draft: {}",
+            path.as_str().unwrap_or("")
+        ));
+    }
+    if let Some(sentence) = domain["conflicts_unreadable"].as_str() {
+        lines.push(format!("  {sentence}"));
+    }
+    lines
+}
+
+/// The line `origin update` prints for one conflict of `name`: how to compare
+/// and the ways out for a draft, the resolve command for the folder's own.
+pub(crate) fn update_conflict_lines(name: &str, conflict: &serde_json::Value) -> Vec<String> {
+    let path = conflict["path"].as_str().unwrap_or("");
+    let Some(words) = draft_kind_words(conflict) else {
+        return vec![format!(
+            "  conflict: {path} (resolve with: crystalline origin resolve {name} {path} --keep mine|theirs)"
+        )];
+    };
+    let first = if conflict["file"] == true {
+        format!(
+            "  conflict: {path} (a file: resolve: crystalline origin resolve {name} {path} --keep mine|theirs)"
+        )
+    } else {
+        format!(
+            "  conflict: {path} (compare: crystalline origin diff {name} --path {path}; resolve: crystalline origin resolve {name} {path} --keep mine|theirs, or --content-file <f>)"
+        )
+    };
+    vec![first, format!("    {words}")]
+}
+
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -1073,14 +1135,23 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
             ));
             let conflicts = data["conflicts"].as_array().unwrap_or(&empty);
             for c in conflicts {
-                lines.push(format!("  conflict: {}", c["path"].as_str().unwrap_or("")));
+                let path = c["path"].as_str().unwrap_or("");
+                match draft_kind_words(c) {
+                    Some(words) => lines.push(format!("  conflict: {path} ({words})")),
+                    None => lines.push(format!("  conflict: {path}")),
+                }
             }
-            // A draft's conflict in a domain that reviews changes is not settled
-            // by `origin resolve` yet, so its line names what she can do today.
+            // A draft's conflict is settled on her draft, and her other files
+            // can still be shared meanwhile.
             if conflicts.iter().any(|c| c["draft"] == true) {
                 lines.push(format!(
-                    "These drafts of yours do not fit the team's text. You can still share your \
-                     other files: crystalline origin share {domain} --file <path>"
+                    "These drafts of yours do not fit the team's text. Settle each with: \
+                     crystalline origin resolve {domain} <path> --keep mine|theirs, or \
+                     --content-file <f>"
+                ));
+                lines.push(format!(
+                    "You can still share your other files: crystalline origin share {domain} \
+                     --file <path>"
                 ));
             } else {
                 lines.push(format!(
@@ -1374,23 +1445,58 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
 
 /// Print `origin resolve`'s result: the resolved path and how many
 /// conflicts remain open.
-pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {
+pub(crate) fn print_origin_resolve(asked: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
         return;
     }
-    for line in origin_resolve_lines(data) {
+    for line in origin_resolve_lines(asked, data) {
         println!("{line}");
     }
 }
 
-/// The lines [`print_origin_resolve`] prints. A count the engine could not
-/// read (`remaining: null`) is said so, never printed as 0.
-fn origin_resolve_lines(data: &serde_json::Value) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Resolved: {}",
-        data["resolved"].as_str().unwrap_or("")
-    )];
+/// The lines [`print_origin_resolve`] prints for a resolve of `asked`. A
+/// draft's receipt (`draft: true`) says what each choice did: theirs ends the
+/// draft and says where a kept copy is, and a path at the other end of a move
+/// names where the draft is. A count the engine could not read
+/// (`remaining: null`) is said so, never printed as 0.
+fn origin_resolve_lines(asked: &str, data: &serde_json::Value) -> Vec<String> {
+    let resolved = data["resolved"].as_str().unwrap_or("");
+    let file = data["file"] == true;
+    let mut lines = Vec::new();
+    if data["draft"] == true && data["kept"] == "theirs" {
+        let theirs = if file { "file" } else { "text" };
+        let mut line =
+            format!("Your draft of {resolved} is gone. You now read the team's {theirs}.");
+        if data["kept_copy"] == true {
+            line.push_str(" A copy is in crystalline kept list.");
+        }
+        lines.push(line);
+        // A kept file is not text, so `kept show` cannot print it: its place
+        // on this machine's disk is how it is found.
+        if let Some(kept) = data["kept_file"].as_str() {
+            lines.push(format!("Your file is kept at {kept}."));
+        }
+    } else {
+        lines.push(format!("Resolved: {resolved}"));
+        if data["draft"] == true {
+            match data["kept"].as_str() {
+                Some("mine") if file => {
+                    lines.push("Your file replaces the team's when you share.".to_string())
+                }
+                Some("mine") => {
+                    lines.push("Your text replaces the team's when you share.".to_string())
+                }
+                Some("merged") => lines.push("Your draft now holds the merged text.".to_string()),
+                _ => {}
+            }
+        }
+    }
+    if data["draft"] == true && !asked.is_empty() && !resolved.is_empty() && asked != resolved {
+        lines.push(format!(
+            "You named {asked}. Your draft is at {resolved}, and this settles the whole move."
+        ));
+    }
     lines.push(match data["remaining"].as_u64() {
         Some(n) => format!("Remaining conflicts: {n}"),
         None => "The number of conflicts left could not be read.".to_string(),
@@ -1407,10 +1513,13 @@ mod origin_resolve_tests {
 
     #[test]
     fn a_count_that_could_not_be_read_is_not_printed_as_zero() {
-        let lines = origin_resolve_lines(&serde_json::json!({
-            "resolved": "plan.md",
-            "remaining": null,
-        }));
+        let lines = origin_resolve_lines(
+            "plan.md",
+            &serde_json::json!({
+                "resolved": "plan.md",
+                "remaining": null,
+            }),
+        );
         assert_eq!(
             lines,
             vec![
@@ -1418,11 +1527,14 @@ mod origin_resolve_tests {
                 "The number of conflicts left could not be read.".to_string(),
             ]
         );
-        let lines = origin_resolve_lines(&serde_json::json!({
-            "resolved": "plan.md",
-            "remaining": 2,
-            "draft_warning": "a note from the writer",
-        }));
+        let lines = origin_resolve_lines(
+            "plan.md",
+            &serde_json::json!({
+                "resolved": "plan.md",
+                "remaining": 2,
+                "draft_warning": "a note from the writer",
+            }),
+        );
         assert_eq!(
             lines,
             vec![
@@ -4684,7 +4796,7 @@ mod origin_share_tests {
     use super::origin_share_lines;
 
     #[test]
-    fn a_refusal_for_drafts_names_no_resolve_verb() {
+    fn a_refusal_for_drafts_names_the_resolve_verb_and_the_other_files() {
         let drafts = origin_share_lines(
             "team",
             &serde_json::json!({
@@ -4693,11 +4805,15 @@ mod origin_share_tests {
             }),
         );
         assert!(
-            drafts.contains(&"  conflict: plan.md".to_string()),
+            drafts.contains(
+                &"  conflict: plan.md (you and the team changed the same lines)".to_string()
+            ),
             "{drafts:?}"
         );
         assert!(
-            drafts.iter().all(|line| !line.contains("origin resolve")),
+            drafts
+                .iter()
+                .any(|line| line.contains("crystalline origin resolve team <path>")),
             "{drafts:?}"
         );
         assert!(
