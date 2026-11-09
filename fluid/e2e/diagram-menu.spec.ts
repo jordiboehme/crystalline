@@ -564,7 +564,9 @@ async function ownUndoJourney(page: Page): Promise<void> {
   await expect.poll(() => docText(page)).toContain("-->");
   await expect.poll(() => focusedLabel(page)).toBe(arrow);
   await noPanel();
-  await page.keyboard.press("ControlOrMeta+Shift+z");
+  // Capital Z: with a lowercase "z" Playwright sends no shifted key, and on Linux
+  // CodeMirror matches Ctrl-z (undo) before Mod-Shift-z (redo).
+  await page.keyboard.press("ControlOrMeta+Shift+Z");
   await expect.poll(() => docText(page)).toContain("-.->");
   await expect.poll(() => focusedLabel(page)).toBe(arrow);
   await noPanel();

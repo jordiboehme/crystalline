@@ -246,11 +246,94 @@ function outerScroller(view: EditorView): Element | null {
   return document.scrollingElement;
 }
 
+function windowTopOf(scroller: Element): number {
+  return scroller === document.scrollingElement
+    ? 0
+    : scroller.getBoundingClientRect().top;
+}
+
+/**
+ * The kind of value CodeMirror's scroll requests carry (`scrollIntoView`, a
+ * snapshot): their effect type is not exported, its value's class is.
+ */
+export const ScrollRequest = (View.scrollIntoView(0).value as object)
+  .constructor as abstract new (...args: never[]) => object;
+
+/**
+ * How far under the window's top CodeMirror looks for the line its anchor step
+ * keeps still (`scrollAnchorAt`): a box ending above that is wholly above to it.
+ */
+const ANCHOR_REACH_PX = 12;
+
+/** Views with a scroll to a target asked for since their last measure pass. */
+const scrollAsks = new WeakSet<EditorView>();
+
+/**
+ * Notes an update that asks CodeMirror to scroll to a target (an undo, a key
+ * that moves the caret, a scroll effect): it does so in the next measure pass.
+ */
+export const scrollAskWatcher = ViewPlugin.define((view) => ({
+  update(update: ViewUpdate) {
+    const asks = update.transactions.some(
+      (tr) =>
+        tr.scrollIntoView ||
+        tr.effects.some((effect) => effect.value instanceof ScrollRequest),
+    );
+    if (!asks) {
+      return;
+    }
+    scrollAsks.add(view);
+    view.requestMeasure({
+      key: scrollAsks,
+      read: () => null,
+      write: () => {
+        // That pass is over once the queue gets here.
+        queueMicrotask(() => {
+          scrollAsks.delete(view);
+        });
+      },
+    });
+  },
+}));
+
+/** What the boxes that landed above the window in one measure pass grew by. */
+interface Settle {
+  scroller: Element;
+  /** The editor's top in the pass's reads, before any scroll of the pass. */
+  editorTop: number;
+  /** Boxes wholly above the window. */
+  above: number;
+  /** Boxes across the window's top. */
+  across: number;
+}
+
+const settles = new WeakMap<EditorView, Settle>();
+
+/**
+ * After CodeMirror's pass, before the frame is painted. In a pass with no scroll
+ * to a target, a scroll of CodeMirror's is its anchor step: it kept the line at
+ * the window's top still through every change above it, a box wholly above
+ * among them. It keeps a box across the top still itself, so the text under
+ * that box is this step's in any case.
+ */
+function settleScroll(view: EditorView, settle: Settle): void {
+  settles.delete(view);
+  if (!view.dom.isConnected) {
+    return;
+  }
+  const scrolled = settle.editorTop - view.dom.getBoundingClientRect().top;
+  // CodeMirror leaves a pixel or less as it is.
+  const off = settle.across + (Math.abs(scrolled) < 1 ? settle.above : 0);
+  if (off !== 0) {
+    settle.scroller.scrollBy({ top: off, behavior: "instant" });
+  }
+}
+
 /**
  * The drawing is on screen: its id counts, its height is read, the map hears.
  * `before` is the box's height a moment ago, when it was on screen already: a
  * box that starts above the window then grew or shrank above what the person is
- * reading, so the scroller takes the difference in the same frame.
+ * reading, so the text in the window is put back before the frame is painted.
  */
 function landed(
   box: Box,
@@ -266,26 +349,57 @@ function landed(
   box.shownId = id;
   box.dom.style.minHeight = "";
   box.failures = 0;
-  box.view.requestMeasure({
+  const { view } = box;
+  view.requestMeasure({
     read: () => {
       const rect = box.dom.getBoundingClientRect();
-      const scroller = before === null ? null : outerScroller(box.view);
-      const windowTop =
-        scroller === null || scroller === document.scrollingElement
-          ? 0
-          : scroller.getBoundingClientRect().top;
+      const scroller = before === null ? null : outerScroller(view);
+      if (scroller === null || before === null) {
+        return { height: rect.height, scroller: null, across: false, top: 0 };
+      }
+      const windowTop = windowTopOf(scroller);
+      // A box that shrank with the page at its last position: the browser's
+      // clamp of the scroll has already kept the text still.
+      const clamped =
+        rect.height < before &&
+        scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 1;
       return {
         height: rect.height,
-        scroller: rect.top < windowTop ? scroller : null,
+        scroller: rect.top < windowTop && !clamped ? scroller : null,
+        // Its bottom as CodeMirror's height map still has it.
+        across: rect.top + before > windowTop + ANCHOR_REACH_PX,
+        top: view.dom.getBoundingClientRect().top,
       };
     },
-    write: ({ height, scroller }) => {
+    write: ({ height, scroller, across, top }) => {
       if (height > 0) {
         keep(heights, key, height, HEIGHTS_KEPT);
         box.height = height;
       }
-      if (scroller !== null && before !== null && height !== before) {
-        scroller.scrollBy({ top: height - before, behavior: "instant" });
+      if (scroller === null || before === null || height === before) {
+        return;
+      }
+      const growth = height - before;
+      if (scrollAsks.has(view)) {
+        // CodeMirror scrolls to the target after these writes, from the new
+        // layout, and keeps no line still in that pass: the growth goes now.
+        scroller.scrollBy({ top: growth, behavior: "instant" });
+        return;
+      }
+      let settle = settles.get(view);
+      if (settle === undefined) {
+        const fresh = { scroller, editorTop: top, above: 0, across: 0 };
+        settles.set(view, fresh);
+        // Runs once CodeMirror's measure pass is over, still before the paint.
+        queueMicrotask(() => {
+          settleScroll(view, fresh);
+        });
+        settle = fresh;
+      }
+      if (across) {
+        settle.across += growth;
+      } else {
+        settle.above += growth;
       }
     },
   });
@@ -293,6 +407,9 @@ function landed(
 }
 
 function paste(box: Box, key: string, body: string, svg: string, id: string) {
+  // On a drawing from the cache this runs inside CodeMirror's update, and the
+  // read lays the page out there: the height before the drawing is known
+  // nowhere else.
   const before = box.dom.isConnected
     ? box.dom.getBoundingClientRect().height
     : null;

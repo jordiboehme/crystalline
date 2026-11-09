@@ -13,13 +13,15 @@
 
 import mermaid from "mermaid";
 import { useEffect, useId, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 
 import { useTheme } from "../theme/context";
 import { initializeMermaid, mermaidConfig } from "../theme/mermaid";
 import { drawnLabels } from "../theme/mermaidText";
 import DiagramOverlay from "./DiagramOverlay";
 import DiagramToolbar from "./DiagramToolbar";
-import { unclampDiagram } from "./wideDiagram";
+import { queuePaper } from "./paperQueue";
+import { naturalSize, unclampDiagram } from "./wideDiagram";
 
 /**
  * The scroll container's own classes, the ones that hold whether or not there
@@ -50,18 +52,27 @@ const SCROLLER =
 const SCROLLABLE =
   "[mask-image:linear-gradient(to_right,black_calc(100%_-_1.5rem),transparent)] focus-visible:ring-2 focus-visible:ring-accent-600 focus-visible:outline-none dark:focus-visible:ring-accent-400";
 
-/** Run `work` once the browser is idle (soon, where it cannot say); returns the cancel. */
-function whenIdle(work: () => void): () => void {
-  if (typeof window.requestIdleCallback === "function") {
-    const handle = window.requestIdleCallback(work, { timeout: 2000 });
-    return () => {
-      window.cancelIdleCallback(handle);
-    };
-  }
-  const timer = setTimeout(work, 200);
-  return () => {
-    clearTimeout(timer);
-  };
+/**
+ * What a wrapper holding a drawing tells the print sheet: `data-drawing`
+ * marks it, and the drawing's own width and height ride along as unitless
+ * numbers. On paper the sheet prints the drawing at that width, less when the
+ * column or one page cannot hold it, never more (`index.css`). On screen
+ * nothing reads them.
+ */
+function paperProps(svg: string): {
+  "data-drawing": "";
+  style?: CSSProperties;
+} {
+  const size = naturalSize(svg);
+  return size === null
+    ? { "data-drawing": "" }
+    : {
+        "data-drawing": "",
+        style: {
+          "--diagram-width": size.width,
+          "--diagram-height": size.height,
+        } as CSSProperties,
+      };
 }
 
 export default function MermaidDiagram({
@@ -122,8 +133,9 @@ export default function MermaidDiagram({
   // into its markup, so a light copy is drawn beside it for the printer. Its
   // theme rides in the source as a directive: the one config a render reads
   // whatever another diagram initialised the library with meanwhile. It is
-  // drawn when the browser is idle, so a dark page does not pay for it while
-  // it opens.
+  // drawn through the page's one paper queue, one copy at a time and after
+  // the screen drawings, so a dark page does not pay for it while it opens
+  // and a page full of diagrams still answers a click.
   const [paperDrawn, setPaperDrawn] = useState<{
     source: string;
     svg: string;
@@ -147,7 +159,7 @@ export default function MermaidDiagram({
         themeCSS: light.themeCSS,
         themeVariables,
       })}}%%`;
-      mermaid
+      return mermaid
         .render(`${id}-paper`, `${source}\n${directive}\n`)
         .then((result) => {
           if (live) {
@@ -160,7 +172,7 @@ export default function MermaidDiagram({
           }
         });
     };
-    const cancel = whenIdle(drawPaper);
+    const cancel = queuePaper(drawPaper);
     return () => {
       live = false;
       cancel();
@@ -243,6 +255,7 @@ export default function MermaidDiagram({
             }
             tabIndex={overflowing ? 0 : undefined}
             className={`${SCROLLER}${overflowing ? ` ${SCROLLABLE}` : ""}`}
+            {...paperProps(drawn.svg)}
             dangerouslySetInnerHTML={{ __html: markup }}
           />
         ) : (
@@ -251,6 +264,7 @@ export default function MermaidDiagram({
           // height.
           <div
             className="flex justify-center [&_svg]:h-auto [&_svg]:max-w-full"
+            {...paperProps(drawn.svg)}
             dangerouslySetInnerHTML={{ __html: markup }}
           />
         )}
@@ -260,6 +274,7 @@ export default function MermaidDiagram({
           hidden
           data-print=""
           className="[&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-w-full"
+          {...paperProps(paper)}
           dangerouslySetInnerHTML={{ __html: paper }}
         />
       )}

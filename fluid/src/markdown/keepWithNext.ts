@@ -8,9 +8,14 @@
  * A block that would make the pair taller than about half a page is left
  * out (a long table, a long list, a picture whose height is not known yet):
  * keeping it with its heading could leave a page half empty. Its heading then
- * keeps only its own lines together. The height is an estimate from the
+ * keeps only its own lines together. A diagram is the exception: it never
+ * breaks and prints no taller than a page less room for its heading
+ * (`index.css`), so the space it leaves at the foot of a page is left either
+ * way, and its heading always goes with it. The height is an estimate from the
  * text, so a kept pair can still come out taller than a page; the browser
- * then breaks it like any other block, and nothing is cut off.
+ * then breaks it like any other block, and nothing is cut off. A heading and
+ * its diagram are the one pair that never breaks (an inline block on paper),
+ * which is safe only because the diagram's height is capped.
  *
  * It also marks a table short enough to keep on one page and a list item
  * short enough to keep whole (`data-short`); a longer one breaks between its
@@ -172,6 +177,18 @@ export function linesOf(node: Node): number | null {
   return blockLines(node);
 }
 
+/** Whether a block is a mermaid fence, which prints as one diagram. */
+function isDiagram(node: Node): boolean {
+  const code = node.children?.find((kid) => kid.type === "element");
+  const classes = code?.properties?.className;
+  return (
+    node.tagName === "pre" &&
+    code?.tagName === "code" &&
+    Array.isArray(classes) &&
+    classes.includes("language-mermaid")
+  );
+}
+
 /**
  * A node between two blocks that draws nothing: a line break or a comment.
  * `dropHtmlComments` has taken the comments out before this step; a raw
@@ -232,8 +249,7 @@ export function keepWithNext() {
         next === undefined ||
         next.type !== "element" ||
         HEADING.test(next.tagName ?? "") ||
-        lines === null ||
-        lines > HALF_PAGE_LINES
+        (!isDiagram(next) && (lines === null || lines > HALF_PAGE_LINES))
       ) {
         out.push(kid);
         continue;

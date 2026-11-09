@@ -59,6 +59,26 @@ describe("keepWithNext", () => {
     ).toEqual(["h2", "h3", "p", "h2", "table", "h2"]);
   });
 
+  it("keeps a heading with a diagram of any length, and not with long code", () => {
+    // A diagram never breaks and prints no taller than a page less its
+    // heading, so the heading goes with it whatever its source counts.
+    const fence = (lang: string) =>
+      el("pre", [el("code", [text("x\n".repeat(40))], { className: [lang] })]);
+    const tree = {
+      type: "root",
+      children: [
+        el("h2", [text("Diagram")]),
+        fence("language-mermaid"),
+        el("h2", [text("Code")]),
+        fence("language-rust"),
+      ],
+    };
+    keepWithNext()(tree);
+    expect(
+      tree.children.map((c) => (c as { tagName?: string }).tagName),
+    ).toEqual(["div", "h2", "pre"]);
+  });
+
   it("counts a diagram taller than its source", () => {
     const code = (lang: string, lines: number) =>
       el("pre", [

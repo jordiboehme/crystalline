@@ -214,6 +214,43 @@ describe("MermaidDiagram", () => {
     });
   });
 
+  it("tells the print sheet each drawing's own size, the paper copy's too", async () => {
+    // Paper prints a diagram at its viewBox width, less to fit the column or
+    // a page, never more (`index.css`); the wrapper carries the numbers.
+    localStorage.setItem("fluid-theme", "dark");
+    renderDiagram.mockImplementation((id: string) =>
+      Promise.resolve({
+        svg: id.endsWith("-paper")
+          ? '<svg data-paper viewBox="0 0 230 410"><g/></svg>'
+          : '<svg data-diagram viewBox="0 0 228 400"><g/></svg>',
+        diagramType: "er",
+      }),
+    );
+    const { container } = draw("erDiagram\n A ||--o{ B : has");
+    await waitFor(() => {
+      expect(container.querySelector("svg[data-paper]")).not.toBeNull();
+    });
+    const screenBox = container.querySelector("svg[data-diagram]")
+      ?.parentElement as HTMLElement;
+    expect(screenBox).toHaveAttribute("data-drawing");
+    expect(screenBox.style.getPropertyValue("--diagram-width")).toBe("228");
+    expect(screenBox.style.getPropertyValue("--diagram-height")).toBe("400");
+    const paperBox = container.querySelector("svg[data-paper]")
+      ?.parentElement as HTMLElement;
+    expect(paperBox).toHaveAttribute("data-drawing");
+    expect(paperBox.style.getPropertyValue("--diagram-width")).toBe("230");
+    expect(paperBox.style.getPropertyValue("--diagram-height")).toBe("410");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show at full width" }),
+    );
+    const wideBox = container.querySelector("svg[data-diagram]")
+      ?.parentElement as HTMLElement;
+    expect(wideBox.className).toContain("overflow-x-auto");
+    expect(wideBox).toHaveAttribute("data-drawing");
+    expect(wideBox.style.getPropertyValue("--diagram-width")).toBe("228");
+  });
+
   it("draws no printer copy on a light screen", async () => {
     const { container } = draw("graph TD; A-->B;");
     await waitFor(() => {
@@ -224,6 +261,172 @@ describe("MermaidDiagram", () => {
       false,
     );
     expect(container.querySelector("[data-print]")).toBeNull();
+  });
+
+  /**
+   * The paper copies of a whole page share one queue. Safari and Playwright's
+   * WebKit have no idle callback, and there all copies once started in one
+   * burst 200 ms after the drawings, so the page painted nothing and a click
+   * landed a second late. Each paper render here is held until the test lets
+   * it go, so what is in flight at any moment can be counted.
+   */
+  describe("the paper copies of a dark page", () => {
+    /** Each held paper render's way out, by the first line of its source. */
+    const held = new Map<string, (fail: boolean) => void>();
+
+    function papers(): string[] {
+      return renderDiagram.mock.calls
+        .filter(([id]) => id.endsWith("-paper"))
+        .map(([, text]) => text.split("\n")[0] ?? "");
+    }
+
+    function release(source: string, fail = false) {
+      const go = held.get(source);
+      if (go === undefined) {
+        throw new Error(`no paper render held for ${source}`);
+      }
+      held.delete(source);
+      go(fail);
+    }
+
+    /** A macrotask of its own, after any 0 ms timer queued before it. */
+    async function aTask(ms = 0) {
+      await act(() => new Promise((resolve) => setTimeout(resolve, ms)));
+    }
+
+    /**
+     * Release one render and count the paper renders once its microtasks have
+     * run, before any timer can: the count is taken inside `act`, whose own
+     * flush afterwards may run a task.
+     */
+    async function releaseAndCount(source: string): Promise<number> {
+      let count = -1;
+      await act(async () => {
+        release(source);
+        for (let i = 0; i < 20; i += 1) {
+          await Promise.resolve();
+        }
+        count = papers().length;
+      });
+      return count;
+    }
+
+    beforeEach(() => {
+      localStorage.setItem("fluid-theme", "dark");
+      held.clear();
+      renderDiagram.mockImplementation((id: string, text: string) => {
+        if (!id.endsWith("-paper")) {
+          return Promise.resolve({
+            svg: "<svg data-diagram></svg>",
+            diagramType: "flowchart-v2",
+          });
+        }
+        return new Promise((resolve, reject) => {
+          held.set(text.split("\n")[0] ?? "", (fail) => {
+            if (fail) {
+              reject(new Error("paper failed"));
+            } else {
+              resolve({
+                svg: "<svg data-paper></svg>",
+                diagramType: "flowchart-v2",
+              });
+            }
+          });
+        });
+      });
+    });
+
+    afterEach(async () => {
+      // The queue is shared by the whole module: a render left held would
+      // keep it busy for the next test.
+      for (const source of [...held.keys()]) {
+        release(source);
+      }
+      await aTask(250);
+    });
+
+    function Page({ show }: { show: string[] }) {
+      return (
+        <ThemeProvider>
+          {show.map((source) => (
+            <MermaidDiagram key={source} source={source} />
+          ))}
+        </ThemeProvider>
+      );
+    }
+
+    const AB = "graph TD; A-->B;";
+    const CD = "graph TD; C-->D;";
+    const EF = "graph TD; E-->F;";
+
+    it("draws them one at a time, a task apart, where there is no idle callback", async () => {
+      // jsdom has none, as Safari and Playwright's WebKit: pinned, not assumed.
+      expect(typeof window.requestIdleCallback).toBe("undefined");
+      render(<Page show={[AB, CD, EF]} />);
+      await waitFor(() => {
+        expect(papers()).toHaveLength(1);
+      });
+      // Long past the 200 ms the old burst waited for: still the one.
+      await aTask(400);
+      expect(papers()).toEqual([AB]);
+
+      // Settled, but the next render waits for a task of its own.
+      expect(await releaseAndCount(AB)).toBe(1);
+      await aTask(5);
+      expect(papers()).toEqual([AB, CD]);
+
+      release(CD);
+      await aTask(5);
+      expect(papers()).toEqual([AB, CD, EF]);
+      release(EF);
+      await aTask(5);
+      expect(
+        document.querySelectorAll("[data-print] svg[data-paper]"),
+      ).toHaveLength(3);
+    });
+
+    it("goes on past a paper render that fails", async () => {
+      render(<Page show={[AB, CD]} />);
+      await waitFor(() => {
+        expect(papers()).toHaveLength(1);
+      });
+      release(AB, true);
+      await aTask(5);
+      expect(papers()).toEqual([AB, CD]);
+    });
+
+    it("never draws the copy of a diagram that left while it waited", async () => {
+      const view = render(<Page show={[AB, CD, EF]} />);
+      await waitFor(() => {
+        expect(papers()).toHaveLength(1);
+      });
+      view.rerender(<Page show={[AB, EF]} />);
+      release(AB);
+      await aTask(5);
+      expect(papers()).toEqual([AB, EF]);
+      release(EF);
+      await aTask(250);
+      expect(papers()).toEqual([AB, EF]);
+    });
+
+    it("leaves nothing behind when the page goes mid-queue", async () => {
+      const view = render(<Page show={[AB, CD, EF]} />);
+      await waitFor(() => {
+        expect(papers()).toHaveLength(1);
+      });
+      view.unmount();
+      // The render that was running settles after its diagram is gone.
+      release(AB);
+      await aTask(250);
+      expect(papers()).toEqual([AB]);
+      expect(document.querySelector("[data-print]")).toBeNull();
+      // And the queue is free: the next page's copy is drawn.
+      const GH = "graph TD; G-->H;";
+      render(<Page show={[GH]} />);
+      await waitFor(() => {
+        expect(papers()).toEqual([AB, GH]);
+      });
+    });
   });
 
   it("centers the diagram it rendered", async () => {

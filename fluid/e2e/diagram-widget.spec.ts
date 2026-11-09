@@ -299,6 +299,7 @@ interface ScrollReport {
   deepest: number;
   worst: number;
   shifted: number;
+  own: number;
   jumps: string[];
 }
 
@@ -329,6 +330,11 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
   // and not their sum, also while it animates over several frames. A layout
   // change above the line changes the sum. That is a jump, unless the layer's own
   // `scrollBy` took it back in that frame, so that is counted and subtracted.
+  // `shifted` is the largest such scroll, by either party, in a frame where a box
+  // above the window changed its height: the correction of a landing ran. `own`
+  // is the widget's part alone. Which party corrects depends on whether the
+  // wheel step was less than 100 ms before, so `own` is reported, not asserted;
+  // widget.test.ts pins the widget's correction when CodeMirror scrolls nothing.
   await page.evaluate(() => {
     const log = {
       frames: 0,
@@ -336,6 +342,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
       deepest: 0,
       worst: 0,
       shifted: 0,
+      own: 0,
       jumps: [] as string[],
     };
     (window as unknown as { __jumps: typeof log }).__jumps = log;
@@ -343,6 +350,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
     let was = new Map<string, number>();
     let lastAt = scroller.scrollTop;
     let taken = 0;
+    let boxHeights = new Map<Element, number>();
     const scrollBy = Object.getOwnPropertyDescriptor(
       Element.prototype,
       "scrollBy",
@@ -352,6 +360,45 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
         taken += options.top ?? 0;
         scrollBy.call(this, options);
       };
+    // CodeMirror keeps the text still after a height correction with a window
+    // scroll in the same frame (the page scrolls the document), so those scrolls
+    // are taken back too.
+    let compensated = 0;
+    // The global object holds its own scroll methods (they are not on
+    // Window.prototype), so the hooks go on `window` itself.
+    const win = window as unknown as Record<
+      string,
+      (this: Window, ...args: unknown[]) => void
+    >;
+    const delta = (win: Window, args: unknown[]) => {
+      const first = args[0];
+      if (typeof first === "object" && first !== null) {
+        const opts = first as ScrollToOptions;
+        return opts.top === undefined ? 0 : opts.top - win.scrollY;
+      }
+      return typeof args[1] === "number" ? args[1] - win.scrollY : 0;
+    };
+    for (const name of ["scrollTo", "scroll"]) {
+      const original = win[name] as (this: Window, ...a: unknown[]) => void;
+      win[name] = function counted(this: Window, ...args: unknown[]) {
+        compensated += delta(this, args);
+        original.apply(this, args);
+      };
+    }
+    const windowScrollBy = win.scrollBy as (
+      this: Window,
+      ...a: unknown[]
+    ) => void;
+    win.scrollBy = function counted(this: Window, ...args: unknown[]) {
+      const first = args[0];
+      compensated +=
+        typeof first === "object" && first !== null
+          ? ((first as ScrollToOptions).top ?? 0)
+          : typeof args[1] === "number"
+            ? args[1]
+            : 0;
+      windowScrollBy.apply(this, args);
+    };
     const tick = () => {
       const now = new Map<string, number>();
       const at = scroller.scrollTop;
@@ -372,9 +419,8 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
           now.set(text, place);
           const before = was.get(text);
           if (before !== undefined) {
-            const moved = Math.abs(place - before - taken);
+            const moved = Math.abs(place - before - taken - compensated);
             log.worst = Math.max(log.worst, moved);
-            log.shifted = Math.max(log.shifted, Math.abs(taken));
             if (moved > 2 && log.jumps.length < 8) {
               log.jumps.push(
                 `${text} moved ${moved.toFixed(1)} scroll ${(at - lastAt).toFixed(1)} taken ${taken.toFixed(1)} at ${at.toFixed(0)}`,
@@ -383,7 +429,31 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
           }
         }
       }
+      const windowTop =
+        scroller === document.scrollingElement
+          ? 0
+          : scroller.getBoundingClientRect().top;
+      const heightsNow = new Map<Element, number>();
+      let landedAbove = false;
+      for (const el of document.querySelectorAll(".cm-diagram")) {
+        const rect = el.getBoundingClientRect();
+        heightsNow.set(el, rect.height);
+        const before = boxHeights.get(el);
+        if (
+          before !== undefined &&
+          before !== rect.height &&
+          rect.top < windowTop
+        ) {
+          landedAbove = true;
+        }
+      }
+      boxHeights = heightsNow;
+      if (landedAbove) {
+        log.shifted = Math.max(log.shifted, Math.abs(taken + compensated));
+        log.own = Math.max(log.own, Math.abs(taken));
+      }
       taken = 0;
+      compensated = 0;
       lastAt = at;
       log.frames += 1;
       was = now;
@@ -409,6 +479,7 @@ async function scrollWalk(page: Page, content: string): Promise<ScrollReport> {
               deepest: number;
               worst: number;
               shifted: number;
+              own: number;
               jumps: string[];
             };
           }
@@ -477,8 +548,133 @@ test("scrolling a long document with several diagrams does not jump", async ({
   expect(report.boxes).toBeGreaterThan(0);
   expect(report.deepest).toBeGreaterThan(5000);
   expect(report.worst).toBeLessThanOrEqual(control.worst + SCROLL_JUMP_PX);
-  // The walk did reach a diagram landing above the window, and the correction ran.
+  // The walk did reach a diagram landing above the window, and a correction ran:
+  // the widget's or CodeMirror's anchor step, one of them.
   expect(report.shifted).toBeGreaterThan(0);
+});
+
+/**
+ * Adds a child to a drawing, then undoes and redoes it from below: each step
+ * with the box scrolled above the window and the caret on a line in the window.
+ * Says, for each, whether the box came into the window and how far that line
+ * moved.
+ */
+async function undoRedoFromAbove(page: Page) {
+  const filler = Array.from(
+    { length: 60 },
+    (_, i) => `Filler line ${String(i)}`,
+  ).join("\n\n");
+  await openEditor(
+    page,
+    `Top line\n\n\`\`\`mermaid\nflowchart TD\n  A[One] --> B[Two]\n\`\`\`\n\n${filler}\n`,
+  );
+  const drawn = page.locator(".cm-diagram");
+  await expect(drawn.locator("svg")).toBeVisible();
+  await settle(page);
+  const short = (await drawn.boundingBox())?.height ?? 0;
+  await page
+    .locator('.cm-diagram g.node[id*="flowchart-B-"]')
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Add child" }).click();
+  await expect(page.locator(".cm-diagram-label-field")).toBeVisible();
+  await page.keyboard.type("Kid");
+  await page.keyboard.press("Enter");
+  await expect
+    .poll(async () => (await drawn.boundingBox())?.height ?? 0)
+    .toBeGreaterThan(short + 40);
+  await settle(page);
+
+  const height = async () => (await drawn.boundingBox())?.height ?? 0;
+  /**
+   * Each step from the box above the window, still in CodeMirror's reach, with
+   * the caret in a line in the window; the name and the new node may be two
+   * steps. Ends at the step that changes the drawing's height.
+   */
+  const fromAbove = async (key: string, done: (h: number) => boolean) => {
+    for (let step = 0; step < 3; step++) {
+      const bottom = await drawn.evaluate(
+        (el) => el.getBoundingClientRect().bottom,
+      );
+      await page.evaluate((by) => {
+        window.scrollBy(0, by);
+      }, bottom + 150);
+      await settle(page, 500);
+      expect(
+        await drawn.evaluate((el) => el.getBoundingClientRect().bottom),
+      ).toBeLessThan(0);
+      const inWindow = await page.evaluate(() => {
+        const found = [
+          ...document.querySelectorAll(".cm-content > .cm-line"),
+        ].find((el) => {
+          const rect = el.getBoundingClientRect();
+          return (
+            /^Filler line \d+$/.test(el.textContent ?? "") &&
+            rect.top > 100 &&
+            rect.bottom < window.innerHeight - 100
+          );
+        });
+        return found?.textContent ?? "";
+      });
+      await line(page, inWindow).click();
+      const was = await top(line(page, inWindow));
+      await page.keyboard.press(key);
+      await settle(page);
+      if (done(await height())) {
+        return {
+          text: inWindow,
+          moved: (await top(line(page, inWindow))) - was,
+        };
+      }
+    }
+    return { text: "", moved: Number.NaN };
+  };
+  const inView = async () => {
+    const box = await drawn.evaluate((el) => {
+      const rect = el.getBoundingClientRect();
+      return { top: rect.top, bottom: rect.bottom, window: window.innerHeight };
+    });
+    return box.bottom > 0 && box.top < box.window;
+  };
+
+  const undone = await fromAbove("ControlOrMeta+z", (h) => h < short + 2);
+  expect(await height()).toBeLessThan(short + 2);
+  const undoShows = await inView();
+  // CodeMirror matches Ctrl-z (undo) before Mod-Shift-z (redo).
+  const redone = await fromAbove(
+    "ControlOrMeta+Shift+Z",
+    (h) => h > short + 40,
+  );
+  expect(await height()).toBeGreaterThan(short + 40);
+  const redoShows = await inView();
+  return { undone, undoShows, redone, redoShows };
+}
+
+test("solo: an undo or a redo with the box above the window scrolls to its change", async ({
+  page,
+}) => {
+  // No room to join: the solo surface, whose undo scrolls to the selection it
+  // restores, here at the drawing.
+  await page.routeWebSocket(/\/collab\//, (socket) => {
+    void socket.close();
+  });
+  const steps = await undoRedoFromAbove(page);
+  // The step's own scroll stands: the change it made is in the window.
+  expect(steps.undoShows).toBe(true);
+  expect(steps.redoShows).toBe(true);
+});
+
+test("in a room: an undo or a redo with the box above the window keeps the text still", async ({
+  page,
+}, info) => {
+  // The room's undo scrolls too, in a second transaction after its change, to
+  // the selection it stored: here the caret's line in the window, so that scroll
+  // has nothing to do and the drawing's change must not move the text.
+  const steps = await undoRedoFromAbove(page);
+  info.annotations.push({ type: "steps", description: JSON.stringify(steps) });
+  expect(steps.undoShows).toBe(false);
+  expect(Math.abs(steps.undone.moved)).toBeLessThanOrEqual(STILL_PX);
+  expect(steps.redoShows).toBe(false);
+  expect(Math.abs(steps.redone.moved)).toBeLessThanOrEqual(STILL_PX);
 });
 
 test("a new drawing landing after an edit does not collapse the box, and moves the text once", async ({
@@ -570,28 +766,34 @@ test("a new drawing landing after an edit does not collapse the box, and moves t
   ).toBeLessThanOrEqual(STILL_PX);
 });
 
-/** Logs each painted frame: where a line stands, and the box. */
+/**
+ * Logs each painted frame: where a line stands, and the box. Resolves once the
+ * first frame is recorded, so a key pressed right after it is seen by a sample.
+ */
 async function sampleFrames(page: Page, text: string): Promise<void> {
   await page.evaluate((wanted) => {
     const frames: { top: number; box: number; svg: boolean }[] = [];
     (window as unknown as { __frames: typeof frames }).__frames = frames;
-    const channel = new MessageChannel();
-    const after = () => {
-      channel.port2.postMessage(null);
-    };
-    channel.port1.onmessage = () => {
-      const below = [
-        ...document.querySelectorAll(".cm-content > .cm-line"),
-      ].find((el) => el.textContent === wanted);
-      const box = document.querySelector(".cm-diagram");
-      frames.push({
-        top: below?.getBoundingClientRect().top ?? -1,
-        box: box?.getBoundingClientRect().height ?? 0,
-        svg: box?.querySelector("svg") != null,
-      });
+    return new Promise<void>((resolve) => {
+      const channel = new MessageChannel();
+      const after = () => {
+        channel.port2.postMessage(null);
+      };
+      channel.port1.onmessage = () => {
+        const below = [
+          ...document.querySelectorAll(".cm-content > .cm-line"),
+        ].find((el) => el.textContent === wanted);
+        const box = document.querySelector(".cm-diagram");
+        frames.push({
+          top: below?.getBoundingClientRect().top ?? -1,
+          box: box?.getBoundingClientRect().height ?? 0,
+          svg: box?.querySelector("svg") != null,
+        });
+        resolve();
+        requestAnimationFrame(after);
+      };
       requestAnimationFrame(after);
-    };
-    requestAnimationFrame(after);
+    });
   }, text);
 }
 
@@ -783,6 +985,10 @@ test("the flip back with its body unchanged moves the page by the source lines, 
   const panel =
     (await page.locator(".cm-panels-top").boundingBox())?.height ?? 0;
   await sampleFrames(page, "Below marker");
+  // The first sample was taken before Escape and still shows the drawing.
+  const first = (await framesOf(page))[0];
+  expect(first?.box ?? 0).toBeGreaterThan(0);
+  expect(first?.svg).toBe(true);
   await page.keyboard.press("Escape");
   await expect(page.locator(".cm-diagram")).toHaveCount(0);
   await expect(page.locator(".cm-mermaid-preview svg")).toBeVisible();
