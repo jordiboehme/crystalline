@@ -44,10 +44,6 @@ describe("diagramLayerWith", () => {
   it.each([
     ["prose", "just prose\n\nand more"],
     ["a state diagram", "```mermaid\nstateDiagram-v2\n  [*] --> A\n```"],
-    [
-      "a sequence diagram in 4a",
-      "```mermaid\nsequenceDiagram\n  A->>B: hi\n```",
-    ],
     ["an elk flowchart", "```mermaid\nflowchart-elk TD\n  A --> B\n```"],
     ["an unclosed fence", "```mermaid\nflowchart TD\n  A --> B"],
     [
@@ -65,6 +61,19 @@ describe("diagramLayerWith", () => {
     const view = mount(doc, layer.extension());
     await flush();
     expect(load).not.toHaveBeenCalled();
+    view.destroy();
+  });
+
+  it("calls the import for a sequence diagram, which it edits too", async () => {
+    const load = vi.fn(() => Promise.resolve(chunk()));
+    const layer = diagramLayerWith(load);
+    const view = mount(
+      "```mermaid\nsequenceDiagram\n  A->>B: hi\n```",
+      layer.extension(),
+    );
+    await flush();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(view.contentDOM.getAttribute("data-diagram")).toBe("on");
     view.destroy();
   });
 

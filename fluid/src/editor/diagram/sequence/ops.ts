@@ -1010,15 +1010,102 @@ function blockWords(model: SeqModel, block: readonly SeqStatement[]): string {
 }
 
 /**
+ * What is left when the message meant cannot be found: `gone` only when no message
+ * has its ends and none has its text, since either one may be that message after a
+ * peer's rename or a rewrite of its line; otherwise `stale`, and a retry reads what
+ * stands now.
+ */
+function lostMessage(model: SeqModel, target: MessageTarget): "stale" | "gone" {
+  const left = model.messages.some(
+    (m) =>
+      (m.from === target.from && m.to === target.to) ||
+      textOf(model, m) === target.text,
+  );
+  return left ? "stale" : "gone";
+}
+
+/** The message whose source holds `offset`, a position in the body. */
+function messageHolding(
+  model: SeqModel,
+  offset: number,
+): SeqMessage | undefined {
+  return model.messages.find(
+    (m) => m.span.from <= offset && offset < m.span.to,
+  );
+}
+
+/** The number of the block whose first keyword line holds `offset`. */
+function blockHolding(model: SeqModel, offset: number): number {
+  return blocksOf(model).findIndex((block) => {
+    const start = block[0];
+    return (
+      start !== undefined && start.span.from <= offset && offset < start.span.to
+    );
+  });
+}
+
+/**
+ * The message `target` names in `model` now, or why it cannot be told. With
+ * `offset` (a held ticket's place in the body, null when the ticket lost its place)
+ * it is the message holding the ticket, if that still says what was chosen. Without
+ * it, on the body read first it stands as named; on another, or with no first
+ * reading, only a message with no equal holds. `heldSeqOp` explains the answers.
+ */
+export function seqMessageNow(
+  model: SeqModel,
+  target: MessageTarget,
+  offset: number | null | undefined,
+  first: SeqModel | undefined,
+): MessageTarget | "stale" | "gone" {
+  if (offset !== undefined) {
+    const held = offset === null ? undefined : messageHolding(model, offset);
+    if (held === undefined) {
+      return lostMessage(model, target);
+    }
+    if (
+      held.from !== target.from ||
+      held.to !== target.to ||
+      textOf(model, held) !== target.text
+    ) {
+      return "stale";
+    }
+    return { ...target, occurrence: held.occurrence };
+  }
+  if (first !== undefined && model.body === first.body) {
+    return target;
+  }
+  if (equalMessages(model, target) === 0) {
+    return lostMessage(model, target);
+  }
+  if (
+    equalMessages(first ?? model, target) !== 1 ||
+    equalMessages(model, target) !== 1
+  ) {
+    return "stale";
+  }
+  return { ...target, occurrence: 0 };
+}
+
+/**
  * `op` as an `OpResolver` for `runDiagramOp`: the op that is meant on each read of
- * the fence, or `stale` where that cannot be told (R94). A message is named by its
- * occurrence and a block by its number, and a peer's edit moves both, so on a body
- * that is no longer the one read first (`read`, or else the first pass) such an op
- * holds only for a message with no equal in either reading, or a block with no
- * other in the same words: it is then that one wherever it went. Otherwise
- * `stale`, which is true: a retry reads what stands now. A message whose pair has
- * none left is `gone`. An op naming participants by name, or naming nothing,
- * stands as given.
+ * the fence, or a refusal where that cannot be told. A message is named by its
+ * occurrence and a block by its number, and a peer's edit moves both.
+ *
+ * With `place`, the offset in the body of a ticket the caller holds inside the
+ * message's or the block's source: the one that holds the ticket is meant, with its
+ * occurrence or number as it reads now, as long as it still says what was chosen.
+ * A message or block that now reads otherwise is `stale` (a peer rewrote it in
+ * place, so it may be another one now). A ticket that lost its place leaves a
+ * message `gone` only with no message of its ends or its text left, and a block
+ * always `stale`.
+ *
+ * With no `place`, on a body that is no longer the one read first (`read`, or else
+ * the first pass), such an op holds only for a message with no equal in either
+ * reading, or a block with no other in the same words. Otherwise the same answers.
+ *
+ * A block number that was not there in the first reading is `gone`. An op naming
+ * participants by name, or naming nothing, stands as given. One resolver serves one
+ * `runDiagramOp` call: it keeps the first reading.
  *
  * Callers pass this, never a plain op with a message or a block in it: the apply
  * layer compiles a plain op again on a changed body as it is.
@@ -1026,31 +1113,23 @@ function blockWords(model: SeqModel, block: readonly SeqStatement[]): string {
 export function heldSeqOp(
   op: SeqOp,
   read?: SeqModel,
-): (model: SeqModel) => SeqOp | { refused: RefusalCode } {
+  place?: (bodyFrom: number) => number | null,
+): (model: SeqModel, bodyFrom?: number) => SeqOp | { refused: RefusalCode } {
   let first = read;
-  return (model) => {
+  return (model, bodyFrom = 0) => {
     first ??= model;
-    if (model.body === first.body) {
+    const offset = place === undefined ? undefined : place(bodyFrom);
+    if (offset === undefined && model.body === first.body) {
       return op;
     }
     switch (op.op) {
       case "renameMessage":
       case "arrowStyle":
       case "deleteMessage": {
-        const { target } = op;
-        if (equalMessages(model, target) === 0) {
-          const pair = model.messages.some(
-            (m) => m.from === target.from && m.to === target.to,
-          );
-          return { refused: pair ? "stale" : "gone" };
-        }
-        if (
-          equalMessages(first, target) !== 1 ||
-          equalMessages(model, target) !== 1
-        ) {
-          return { refused: "stale" };
-        }
-        return op;
+        const now = seqMessageNow(model, op.target, offset, first);
+        return typeof now === "string"
+          ? { refused: now }
+          : { ...op, target: now };
       }
       case "removeBlock": {
         const was = blocksOf(first);
@@ -1059,6 +1138,13 @@ export function heldSeqOp(
           return { refused: "gone" };
         }
         const words = blockWords(first, own);
+        if (offset !== undefined) {
+          const at = offset === null ? -1 : blockHolding(model, offset);
+          const now = blocksOf(model)[at];
+          return now === undefined || blockWords(model, now) !== words
+            ? { refused: "stale" }
+            : { ...op, block: at };
+        }
         const same = (m: SeqModel, blocks: SeqStatement[][]) =>
           blocks.flatMap((b, i) => (blockWords(m, b) === words ? [i] : []));
         const now = same(model, blocksOf(model));

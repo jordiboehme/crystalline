@@ -158,6 +158,8 @@ describe("NOTICES", () => {
         "A diagram at the end of a page needs a line below it, so nothing was changed.",
       arrowChanged:
         "This arrow changed, so the label was not written. Press Escape and open it again.",
+      messageChanged:
+        "This message changed, so what you typed was not written. Press Escape and open it again.",
       emptiesBlock:
         "That would leave a block with nothing in it, so nothing was changed.",
       leavesActive:

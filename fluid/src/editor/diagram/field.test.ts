@@ -542,3 +542,25 @@ describe("a verdict the cache evicted", () => {
     expect(asks()).toBe(2);
   });
 });
+
+describe("a sequence diagram", () => {
+  const STARTER =
+    "sequenceDiagram\n    participant caller as Caller\n    participant service as Service\n    caller->>service: Request\n    service-->>caller: Reply";
+
+  it("draws the starter once its verdict settles, not before", async () => {
+    const v = mount(fence(STARTER));
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    expect(kit.requested).toEqual([{ body: STARTER, dark: false }]);
+    await settle(STARTER, { ok: true, kind: "sequence", domIds: new Map() });
+    expect(v.state.facet(drawnDiagrams)).toEqual([0]);
+    expect(v.contentDOM.textContent).not.toContain("sequenceDiagram");
+    expect(v.state.field(diagramField).fences[0]?.kind).toBe("sequenceDiagram");
+  });
+
+  it("flips to text when its verdict refuses", async () => {
+    const v = mount(fence(STARTER));
+    await settle(STARTER, NO);
+    expect(v.state.facet(drawnDiagrams)).toEqual([]);
+    expect(v.contentDOM.textContent).toContain("sequenceDiagram");
+  });
+});

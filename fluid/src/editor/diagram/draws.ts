@@ -17,12 +17,15 @@ export const LOST_FIELD_TEXT =
   "The text you were typing in a diagram was not saved. Copy it if you need it:";
 
 /**
- * The diagram kinds the layer draws and edits. Sequence diagrams draw on the page
- * as pictures, and are not edited yet.
+ * The diagram kinds the layer draws and edits: flowcharts and sequence diagrams.
  * `flowchart-elk` stays out: no layout loader is registered for it and no
  * recorded SVG pins its element ids, so nothing proves they map.
  */
-export const EDITABLE_KINDS: readonly string[] = ["flowchart", "graph"];
+export const EDITABLE_KINDS: readonly string[] = [
+  "flowchart",
+  "graph",
+  "sequenceDiagram",
+];
 
 /**
  * The first keyword of a fence body once the frontmatter, the directives, the

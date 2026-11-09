@@ -20,13 +20,15 @@ import {
   typeText,
   undoOnce,
 } from "../../test/markKit";
+import { isSequenceBody, sequenceDrawing } from "../../test/sequenceDrawing";
 import SKELETON from "../fixtures/diagrams/svg/f01-skeleton.svg?raw";
 import { mainSelectionParked } from "../parkedSelection";
 import { drawnFenceLines } from "./draws";
 import { NOTICES } from "./edits";
 import { flowKind, removeFence, runDiagramOp } from "./apply";
 import { parseFlowchart } from "./flowchart/parse";
-import { registerStopAction } from "./focus";
+import { focusTarget, registerStopAction } from "./focus";
+import { openLabelEditor } from "./labelEditor";
 import { diagramIntent, intentStale } from "./intent";
 import { prefetchDiagrams } from "./loader";
 import { requestVerdict } from "./verdict";
@@ -44,6 +46,9 @@ const BODY = "flowchart TD\n    A[First step] --> B[Next step]";
 async function drawingOf(id: string, body: string): Promise<string> {
   if (body === BODY) {
     return SKELETON.replaceAll("rec-f01-skeleton", id);
+  }
+  if (isSequenceBody(body)) {
+    return sequenceDrawing(id, body);
   }
   const verdict = await requestVerdict(body, false);
   const nodes =
@@ -1646,6 +1651,106 @@ describe("for a screen reader (R87)", () => {
           .querySelector('path[data-et="edge"]')
           ?.getAttribute("aria-label"),
       ).toBe("Arrow from Begin to Group");
+    });
+  });
+});
+
+describe("a sequence diagram", () => {
+  const STARTER =
+    "sequenceDiagram\n    participant caller as Caller\n    participant service as Service\n    caller->>service: Request\n    service-->>caller: Reply";
+  const SEQ_DOC = `Above\n${fence(STARTER)}\nBelow\n`;
+  const SEQ_FROM = SEQ_DOC.indexOf("```");
+
+  beforeEach(() => {
+    // What Enter opens is the real field here.
+    registerStopAction("rename", (main, anchor, target) => {
+      openLabelEditor(main, anchor, target, { selectAll: true });
+    });
+  });
+
+  const menus = () => [...document.querySelectorAll('[role="menu"]')];
+  const field = (view: EditorView) =>
+    view.dom.querySelector<HTMLTextAreaElement>(".cm-diagram-overlay textarea");
+
+  it("is one group named Sequence diagram", async () => {
+    const view = await drawn(SEQ_DOC);
+    expect(box(view).getAttribute("aria-label")).toBe("Sequence diagram");
+  });
+
+  it("walks the canvas, the participants and the messages, by their names", async () => {
+    const view = await drawn(SEQ_DOC);
+    focusTarget(view, SEQ_FROM, { kind: "canvas" });
+    const names: (string | null | undefined)[] = [];
+    for (let i = 0; i < 4; i++) {
+      press("ArrowRight");
+      names.push(active()?.getAttribute("aria-label"));
+    }
+    expect(names).toEqual([
+      "Participant: Caller",
+      "Participant: Service",
+      "Message from Caller to Service: Request",
+      "Message from Service to Caller: Reply",
+    ]);
+    press("ArrowRight");
+    expect(active()?.getAttribute("aria-label")).toBe(
+      "Message from Service to Caller: Reply",
+    );
+  });
+
+  it("Shift+F10 on a message opens Message actions", async () => {
+    const view = await drawn(SEQ_DOC);
+    focusTarget(view, SEQ_FROM, {
+      kind: "message",
+      from: "caller",
+      to: "service",
+      text: "Request",
+      occurrence: 0,
+    });
+    press("F10", { shiftKey: true });
+    expect(menus()).toHaveLength(1);
+    expect(menus()[0]?.getAttribute("aria-label")).toBe("Message actions");
+    expect(active()?.textContent).toBe("Edit text");
+  });
+
+  it("Enter on a participant opens Participant name with its label", async () => {
+    const view = await drawn(SEQ_DOC);
+    focusTarget(view, SEQ_FROM, { kind: "participant", name: "service" });
+    press("Enter");
+    await flush();
+    const opened = field(view);
+    expect(opened?.getAttribute("aria-label")).toBe("Participant name");
+    expect(opened?.value).toBe("Service");
+    expect(active()).toBe(opened);
+    expect(text(view)).toBe(SEQ_DOC);
+  });
+
+  it("Delete on a message takes that line as one undo step", async () => {
+    const view = await drawn(SEQ_DOC);
+    focusTarget(view, SEQ_FROM, {
+      kind: "message",
+      from: "service",
+      to: "caller",
+      text: "Reply",
+      occurrence: 0,
+    });
+    press("Delete");
+    const after = SEQ_DOC.replace("\n    service-->>caller: Reply", "");
+    await settled(view, after);
+    undoOnce(view);
+    expect(text(view)).toBe(SEQ_DOC);
+  });
+
+  it("a click on a message's text puts the stop on that message", async () => {
+    const view = await drawn(SEQ_DOC);
+    const texts = [...box(view).querySelectorAll(".messageText")];
+    texts[1]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush();
+    expect(view.state.field(diagramIntent)?.target).toEqual({
+      kind: "message",
+      from: "service",
+      to: "caller",
+      text: "Reply",
+      occurrence: 0,
     });
   });
 });

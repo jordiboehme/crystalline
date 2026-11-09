@@ -39,6 +39,7 @@ export type RefusalCode =
   | "breaksFence"
   | "needsLineBelow"
   | "arrowChanged"
+  | "messageChanged"
   | "emptiesBlock"
   | "leavesActive";
 
@@ -66,6 +67,8 @@ export const NOTICES: Record<RefusalCode, string> = {
     "A diagram at the end of a page needs a line below it, so nothing was changed.",
   arrowChanged:
     "This arrow changed, so the label was not written. Press Escape and open it again.",
+  messageChanged:
+    "This message changed, so what you typed was not written. Press Escape and open it again.",
   emptiesBlock:
     "That would leave a block with nothing in it, so nothing was changed.",
   leavesActive: "That would leave an activation open, so nothing was changed.",

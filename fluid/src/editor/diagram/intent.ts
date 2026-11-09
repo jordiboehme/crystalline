@@ -34,6 +34,7 @@ import { writable } from "../elementEdit";
 import { fenceAt, type MermaidFence } from "./fence";
 import { diagramField, fenceIsBehind } from "./field";
 import type { EdgeKey } from "./flowchart/model";
+import type { SeqTarget } from "./sequence/model";
 import type { DiagramHost } from "./widget";
 import { hostOf, onBoxMounted } from "./widget";
 
@@ -42,8 +43,8 @@ export type FlowTarget =
   | { kind: "node"; id: string }
   | { kind: "edge"; key: EdgeKey };
 
-/** What a stop can stand on; a flowchart's parts are the only kind today. */
-export type TargetKey = FlowTarget;
+/** What a stop can stand on: a flowchart's parts or a sequence diagram's. */
+export type TargetKey = FlowTarget | Exclude<SeqTarget, { kind: "canvas" }>;
 
 export type IntentMode = "focus" | "menu" | "rename" | "connect";
 

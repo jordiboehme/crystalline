@@ -13,6 +13,7 @@ import type { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { bytes, cleanupMarkViews, markView } from "../../test/markKit";
+import { diagramAnchors, trackAnchor } from "../diagramAnchors";
 import S05 from "../fixtures/diagrams/sequence/s05-activation.mmd?raw";
 import { runDiagramOp, seqKind } from "./apply";
 import type { SeqCreated, SeqTarget } from "./sequence/model";
@@ -253,6 +254,27 @@ describe("heldSeqOp (R94)", () => {
     expect(outcome).toEqual({ applied: false, refused: "gone" });
   });
 
+  test("a message whose sender a peer renamed is stale, as its text is left", async () => {
+    const body =
+      "sequenceDiagram\n  participant a as Alice\n  participant b\n  a->>b: hi";
+    const { outcome } = await run(
+      body,
+      { op: "renameMessage", target: message("a", "b", "hi"), text: "yes" },
+      (view) => {
+        const doc = bytes(view.state);
+        const decl = doc.indexOf("participant a ") + "participant ".length;
+        const line = doc.indexOf("  a->>b") + 2;
+        view.dispatch({
+          changes: [
+            { from: decl, to: decl + 1, insert: "al" },
+            { from: line, to: line + 1, insert: "al" },
+          ],
+        });
+      },
+    );
+    expect(outcome).toEqual({ applied: false, refused: "stale" });
+  });
+
   const LOOP =
     "sequenceDiagram\n  participant a\n  participant b\n  loop every minute\n    a->>b: ping\n  end";
 
@@ -350,5 +372,163 @@ describe("heldSeqOp (R94)", () => {
       ),
     );
     expect(outcome).toEqual({ applied: false, refused: "stale" });
+  });
+});
+
+describe("heldSeqOp with a place in the text", () => {
+  const TWINS =
+    "sequenceDiagram\n  participant a\n  participant b\n  a->>b: hi\n  b->>a: ok\n  a->>b: hi";
+
+  /**
+   * Runs `op` held at the arrow of the `nth` line that reads `line` (from 0), a
+   * ticket of `diagramAnchors` standing inside that token as a hold puts it.
+   */
+  async function runAt(
+    body: string,
+    line: string,
+    nth: number,
+    op: SeqOp,
+    peer: (view: EditorView) => void,
+  ) {
+    const doc = fenced(body);
+    const view = markView(doc, { raw: true });
+    let at = -1;
+    for (let i = 0; i <= nth; i++) {
+      at = doc.indexOf(line, at + 1);
+    }
+    const arrow = doc.indexOf("-", at);
+    const ticket = 900_001;
+    view.dispatch({ effects: trackAnchor.of({ ticket, pos: arrow + 1 }) });
+    const place = (bodyFrom: number) => {
+      const pos = view.state.field(diagramAnchors).get(ticket);
+      return pos === undefined ? null : pos - bodyFrom;
+    };
+    const outcome = await runDiagramOp(
+      view,
+      0,
+      withPeer(() => view, peer),
+      heldSeqOp(op, parseSequence(body), place),
+    );
+    return { outcome, text: bytes(view.state) };
+  }
+
+  test("a peer's twin above a twin: the held one is renamed, not stale", async () => {
+    const { outcome, text } = await runAt(
+      TWINS,
+      "  a->>b: hi",
+      1,
+      { op: "renameMessage", target: message("a", "b", "hi", 1), text: "yo" },
+      (view) => insertBefore(view, "  a->>b: hi", "  a->>b: hi\n"),
+    );
+    expect(outcome).toEqual({ applied: true });
+    expect(text).toBe(
+      fenced(
+        "sequenceDiagram\n  participant a\n  participant b\n  a->>b: hi\n  a->>b: hi\n  b->>a: ok\n  a->>b: yo",
+      ),
+    );
+  });
+
+  test("two texts a peer swapped in place are stale, where the words would take the other line", async () => {
+    const body =
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: hi\n  a->>b: hello";
+    const swap = (view: EditorView) => {
+      const doc = bytes(view.state);
+      const first = doc.indexOf(": hi") + 2;
+      const second = doc.indexOf(": hello") + 2;
+      view.dispatch({
+        changes: [
+          { from: first, to: first + 2, insert: "hello" },
+          { from: second, to: second + 5, insert: "hi" },
+        ],
+      });
+    };
+    const op: SeqOp = {
+      op: "deleteMessage",
+      target: message("a", "b", "hi"),
+    };
+    const plain = markView(fenced(body), { raw: true });
+    const words = {
+      outcome: await runDiagramOp(
+        plain,
+        0,
+        withPeer(() => plain, swap),
+        heldSeqOp(op),
+      ),
+    };
+    // By the words alone the line that now reads `hi` goes: the second one.
+    expect(words.outcome).toEqual({ applied: true });
+    const held = await runAt(body, "  a->>b: hi", 0, op, swap);
+    expect(held.outcome).toEqual({ applied: false, refused: "stale" });
+    expect(held.text).toBe(
+      fenced(
+        body
+          .replace(": hello", ": HI")
+          .replace(": hi", ": hello")
+          .replace(": HI", ": hi"),
+      ),
+    );
+  });
+
+  test("a held message a peer deleted is stale while its pair has another", async () => {
+    const { outcome } = await runAt(
+      TWINS,
+      "  a->>b: hi",
+      0,
+      { op: "deleteMessage", target: message("a", "b", "hi") },
+      (view) => deleteText(view, "\n  a->>b: hi"),
+    );
+    expect(outcome).toEqual({ applied: false, refused: "stale" });
+  });
+
+  test("a held message a peer deleted is gone with no pair or text left", async () => {
+    const body =
+      "sequenceDiagram\n  participant a\n  participant b\n  a->>b: hi\n  b->>a: ok";
+    const { outcome } = await runAt(
+      body,
+      "  a->>b: hi",
+      0,
+      { op: "deleteMessage", target: message("a", "b", "hi") },
+      (view) => deleteText(view, "\n  a->>b: hi"),
+    );
+    expect(outcome).toEqual({ applied: false, refused: "gone" });
+  });
+
+  const LOOP =
+    "sequenceDiagram\n  participant a\n  participant b\n  loop every minute\n    a->>b: ping\n  end";
+
+  test("a peer's block above in the same words: the held block is removed, not stale", async () => {
+    const doc = fenced(LOOP);
+    const view = markView(doc, { raw: true });
+    const ticket = 900_002;
+    view.dispatch({
+      effects: trackAnchor.of({ ticket, pos: doc.indexOf("loop") + 1 }),
+    });
+    const outcome = await runDiagramOp(
+      view,
+      0,
+      withPeer(
+        () => view,
+        (v) =>
+          insertBefore(
+            v,
+            "  loop every",
+            "  loop every minute\n    b->>a: x\n  end\n",
+          ),
+      ),
+      heldSeqOp(
+        { op: "removeBlock", block: 0 },
+        parseSequence(LOOP),
+        (from) => {
+          const pos = view.state.field(diagramAnchors).get(ticket);
+          return pos === undefined ? null : pos - from;
+        },
+      ),
+    );
+    expect(outcome).toEqual({ applied: true });
+    expect(bytes(view.state)).toBe(
+      fenced(
+        "sequenceDiagram\n  participant a\n  participant b\n  loop every minute\n    b->>a: x\n  end\n    a->>b: ping",
+      ),
+    );
   });
 });

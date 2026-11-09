@@ -39,7 +39,7 @@ import {
 import { writable } from "../elementEdit";
 import { stepVisible, viewAtoms } from "../marks/caret";
 import { dispatchIsolated, roomUndo } from "../roomUndo";
-import { flowKind, removeFence, runDiagramOp } from "./apply";
+import { flowKind, removeFence, runDiagramOp, seqKind } from "./apply";
 import { drawnFenceLines, stepIntoDrawnFence } from "./draws";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
@@ -50,18 +50,16 @@ import {
   showFenceSource,
   verdictArrived,
 } from "./field";
-import {
-  decorateFlow,
-  flowEdgeSpanOf,
-  flowElementOf,
-  flowStops,
-  flowTargetOf,
-} from "./flowchart/hit";
-import type { ArrowHold } from "./flowchart/heldArrow";
-import { holdArrow, letGoOfArrow, resolveArrow } from "./flowchart/heldArrow";
-import type { EdgeKey, FlowModel } from "./flowchart/model";
 import type { FlowOp } from "./flowchart/ops";
-import { parseFlowchart } from "./flowchart/parse";
+import type { LineHold } from "./held";
+import {
+  followLine,
+  heldMessageOp,
+  heldTargetOf,
+  holdLine,
+  letGoOfLine,
+  resolveHeldTarget,
+} from "./held";
 import type { DiagramIntent, TargetKey } from "./intent";
 import {
   closeDiagramIntent,
@@ -69,6 +67,21 @@ import {
   registerIntentReopen,
   setDiagramIntent,
 } from "./intent";
+import type { DiagramModel } from "./kinds";
+import {
+  connectIdOf,
+  connectable,
+  decorateDrawing,
+  elementOfTarget,
+  isLine,
+  labelOfTarget,
+  parseDiagram,
+  startOf,
+  stopAtOffset,
+  stopsOf as kindStops,
+  targetOfElement,
+} from "./kinds";
+import { heldSeqOp } from "./sequence/ops";
 import type { Verdict } from "./verdict";
 import { verdictFor } from "./verdict";
 import type { DiagramHost } from "./widget";
@@ -133,13 +146,13 @@ export function registerConnectHooks(hooks: ConnectHooks): void {
   connectHooks = hooks;
 }
 
-const models = new Map<string, FlowModel>();
+const models = new Map<string, DiagramModel>();
 
-/** The model of a fence body, kept for the last few bodies. */
-export function modelOf(body: string): FlowModel {
+/** The model of a fence body, of its kind, kept for the last few bodies. */
+export function modelOf(body: string): DiagramModel {
   let model = models.get(body);
   if (model === undefined) {
-    model = parseFlowchart(body);
+    model = parseDiagram(body);
     models.set(body, model);
     if (models.size > MODELS_KEPT) {
       const oldest = models.keys().next().value;
@@ -154,7 +167,7 @@ export function modelOf(body: string): FlowModel {
 interface Reading {
   svg: SVGSVGElement;
   svgId: string;
-  model: FlowModel;
+  model: DiagramModel;
   verdict: Verdict;
 }
 
@@ -175,13 +188,13 @@ function stopsOf(reading: Reading | null): TargetKey[] {
   if (reading === null) {
     return [CANVAS];
   }
-  return flowStops(reading.model).filter(
+  return kindStops(reading.model).filter(
     (stop) => stop.kind === "canvas" || elementOf(reading, stop) !== null,
   );
 }
 
 function elementOf(reading: Reading, target: TargetKey) {
-  return flowElementOf(
+  return elementOfTarget(
     reading.svg,
     reading.svgId,
     target,
@@ -304,9 +317,9 @@ export function prepareStop(
   return el;
 }
 
-/** The stops connect mode walks: only its boxes. */
+/** The stops connect mode walks: only its boxes, or its participants. */
 function boxStops(stops: TargetKey[]): TargetKey[] {
-  return stops.filter((stop) => stop.kind === "node");
+  return stops.filter(connectable);
 }
 
 /** Whether the key now going down is a repeat: a held key crosses nothing (R81). */
@@ -355,6 +368,15 @@ export function backOnStop(
 registerIntentReopen("focus", (main, intent, host) => {
   backOnStop(main, host, intent.target);
 });
+
+/** Whether the drawing on screen is of another body than the fence's text now. */
+function drawingBehind(
+  main: EditorView,
+  host: DiagramHost,
+  from: number,
+): boolean {
+  return fenceAt(main.state, from)?.body !== host.renderedBody();
+}
 
 /** The drawn fence whose box is `container`, by the line the box stands for. */
 function fenceFromOf(main: EditorView, container: HTMLElement): number | null {
@@ -409,29 +431,46 @@ async function deleteStop(
     return;
   }
   const fence = fenceAt(main.state, from);
+  const read = fence === null ? null : modelOf(fence.body);
   // A peer's duplicate landing during the verify must not move the delete (R94).
   const hold =
-    target.kind === "edge" && fence !== null
-      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+    fence !== null && read !== null && isLine(target)
+      ? holdLine(main, read, target, fence.bodyFrom)
       : null;
   try {
-    const outcome = await runDiagramOp(
-      main,
-      from,
-      flowKind,
-      (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
-        if (target.kind === "node") {
-          return { op: "deleteNode", id: target.id };
-        }
-        if (hold === null) {
-          return { refused: "gone" };
-        }
-        const edge = resolveArrow(main, hold, model, bodyFrom);
-        return typeof edge === "string"
-          ? { refused: edge }
-          : { op: "deleteEdge", edge };
-      },
-    );
+    const outcome =
+      read?.kind === "sequence"
+        ? await runDiagramOp(
+            main,
+            from,
+            seqKind,
+            seqDelete(main, target, hold, read),
+          )
+        : await runDiagramOp(
+            main,
+            from,
+            flowKind,
+            (model, bodyFrom): FlowOp | { refused: RefusalCode } => {
+              if (target.kind === "node") {
+                return { op: "deleteNode", id: target.id };
+              }
+              if (hold === null) {
+                return { refused: "gone" };
+              }
+              const edge = resolveHeldTarget(
+                main,
+                target,
+                hold,
+                model,
+                bodyFrom,
+              );
+              return typeof edge === "string"
+                ? { refused: edge }
+                : edge.kind === "edge"
+                  ? { op: "deleteEdge", edge: edge.key }
+                  : { refused: "gone" };
+            },
+          );
     if ("refused" in outcome) {
       sayAt(
         main,
@@ -441,9 +480,32 @@ async function deleteStop(
     }
   } finally {
     if (hold !== null) {
-      letGoOfArrow(main, hold);
+      letGoOfLine(main, hold);
     }
   }
+}
+
+/** A sequence delete by key: a participant by name, a message by its held place. */
+function seqDelete(
+  main: EditorView,
+  target: TargetKey,
+  hold: LineHold | null,
+  read: DiagramModel,
+) {
+  if (target.kind === "message" && read.kind === "sequence") {
+    return heldMessageOp(
+      main,
+      hold,
+      target,
+      (message) => ({ op: "deleteMessage", target: message }),
+      read,
+    );
+  }
+  if (target.kind === "participant") {
+    return heldSeqOp({ op: "deleteParticipant", name: target.name });
+  }
+  // A box or an arrow has no place in a sequence diagram.
+  return () => ({ refused: "gone" as const });
 }
 
 /**
@@ -613,8 +675,9 @@ function onKey(
   if (WALK_KEYS.has(key)) {
     walk(main, host, from, key, connecting);
   } else if (connecting) {
-    if (target.kind === "node") {
-      connectHooks?.choose(main, target.id);
+    const id = connectIdOf(target);
+    if (id !== null) {
+      connectHooks?.choose(main, id);
     } else {
       connectHooks?.remind(main);
     }
@@ -672,12 +735,12 @@ function throughGate(
   const at = where();
   const fence = at === null ? null : fenceAt(main.state, at);
   const hold =
-    target.kind === "edge" && fence !== null
-      ? holdArrow(main, modelOf(fence.body), target.key, fence.bodyFrom)
+    isLine(target) && fence !== null
+      ? holdLine(main, modelOf(fence.body), target, fence.bodyFrom)
       : null;
   const letGo = () => {
     if (hold !== null) {
-      letGoOfArrow(main, hold);
+      letGoOfLine(main, hold);
     }
   };
   const go = () => {
@@ -689,16 +752,22 @@ function throughGate(
     let now = target;
     if (hold !== null) {
       const stands = fenceAt(main.state, anchor);
-      const edge =
+      const line =
         stands === null
           ? "gone"
-          : resolveArrow(main, hold, modelOf(stands.body), stands.bodyFrom);
+          : resolveHeldTarget(
+              main,
+              target,
+              hold,
+              modelOf(stands.body),
+              stands.bodyFrom,
+            );
       letGo();
-      if (typeof edge === "string") {
-        sayAt(main, anchor, edge);
+      if (typeof line === "string") {
+        sayAt(main, anchor, line);
         return;
       }
-      now = { kind: "edge", key: edge };
+      now = line;
     }
     act(anchor, now);
   };
@@ -723,7 +792,7 @@ function settle(main: EditorView, host: DiagramHost): void {
   const reading = readingOf(host);
   if (reading !== null && !decorated.has(reading.svg)) {
     decorated.add(reading.svg);
-    decorateFlow(reading.svg, reading.svgId, reading.model, reading.verdict);
+    decorateDrawing(reading.svg, reading.svgId, reading.model, reading.verdict);
   }
   // Only a page that takes writes has a menu to offer (R87).
   if (reading !== null) {
@@ -752,8 +821,9 @@ function settle(main: EditorView, host: DiagramHost): void {
     intent.mode === "connect" ? boxStops(stopsOf(reading)) : stopsOf(reading);
   if (!stops.some((stop) => sameTarget(stop, target))) {
     // The stop went, by a delete or a peer: the one now in its place, never the
-    // body, and only a drawing that can be read says it went.
-    if (reading === null) {
+    // body, and only a drawing of the text as it stands says it went. A message
+    // renamed a moment ago is not in the old drawing yet.
+    if (reading === null || drawingBehind(main, host, intent.anchor)) {
       return;
     }
     const place = lastPlace.get(host.container) ?? 0;
@@ -779,26 +849,7 @@ const decorated = new WeakSet<SVGSVGElement>();
 /** The stop whose source spans hold `pos`; the canvas otherwise. */
 function stopAtPos(host: DiagramHost, offset: number): TargetKey {
   const reading = readingOf(host);
-  if (reading === null) {
-    return CANVAS;
-  }
-  const { model } = reading;
-  for (const id of model.nodeOrder) {
-    const refs = model.nodes.get(id)?.refs ?? [];
-    if (refs.some((r) => r.span.from <= offset && offset <= r.span.to)) {
-      return { kind: "node", id };
-    }
-  }
-  for (const edge of model.edges) {
-    const gap = model.chains[edge.chain]?.links[edge.link]?.gap;
-    if (gap !== undefined && gap.from <= offset && offset <= gap.to) {
-      return {
-        kind: "edge",
-        key: { start: edge.start, end: edge.end, occurrence: edge.occurrence },
-      };
-    }
-  }
-  return CANVAS;
+  return reading === null ? CANVAS : stopAtOffset(reading.model, offset);
 }
 
 /** Whether a sentence in this box's status line stands inside the window. */
@@ -849,9 +900,6 @@ export function sayAt(
     main.dispatch({ effects: EditorView.announce.of(NOTICES[code]) });
   }
 }
-
-const sameEdgeKey = (a: EdgeKey, b: EdgeKey) =>
-  a.start === b.start && a.end === b.end && a.occurrence === b.occurrence;
 
 /** The views this layer runs in: a filter has only a state to go by. */
 const liveViews = new Set<EditorView>();
@@ -906,8 +954,8 @@ const focusPlugin = ViewPlugin.fromClass(
     lookOn: DiagramHost | null = null;
     /** Takes a refusal's panel away again. */
     panelTimer: ReturnType<typeof setTimeout> | null = null;
-    /** The arrow the keyboard stands on, by its place (R94). */
-    stopHold: ArrowHold | null = null;
+    /** The arrow or message the keyboard stands on, by its place. */
+    stopHold: LineHold | null = null;
     /** The person's own edit came: it may rewrite the token, and it means no harm. */
     ownEdit = false;
     /** This plugin ended, as Raw ends it. A view that comes back gets a new one. */
@@ -1044,7 +1092,7 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null
           ? CANVAS
-          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
+          : targetOfElement(el, reading.svgId, reading.model, reading.verdict);
       const { view } = this;
       // Found again from the box, as a rename field's draft may move it. The intent's
       // own anchor would be the other fence's when the click came from there.
@@ -1094,7 +1142,7 @@ const focusPlugin = ViewPlugin.fromClass(
         () => (box.isConnected ? fenceFromOf(this.view, box) : null),
         reading === null
           ? CANVAS
-          : flowTargetOf(
+          : targetOfElement(
               event.target as Element,
               reading.svgId,
               reading.model,
@@ -1206,18 +1254,19 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null
           ? CANVAS
-          : flowTargetOf(
+          : targetOfElement(
               event.target as Element,
               reading.svgId,
               reading.model,
               reading.verdict,
             );
+      const id = connectIdOf(target);
       if (target.kind === "canvas") {
         connectHooks?.cancel(view);
-      } else if (target.kind === "edge") {
+      } else if (id === null) {
         connectHooks?.remind(view);
       } else if (!staleNow(view, place.host, place.from)) {
-        connectHooks?.choose(view, target.id);
+        connectHooks?.choose(view, id);
       }
       return true;
     }
@@ -1247,19 +1296,28 @@ const focusPlugin = ViewPlugin.fromClass(
       const target =
         reading === null || el === box
           ? CANVAS
-          : flowTargetOf(el, reading.svgId, reading.model, reading.verdict);
+          : targetOfElement(el, reading.svgId, reading.model, reading.verdict);
       const intent = view.state.field(diagramIntent);
+      // The box stands in for a stop the drawing has not caught up with, as a
+      // message just renamed: the stop stays, and the next drawing takes it.
+      if (
+        el === box &&
+        intent !== null &&
+        intent.anchor === from &&
+        intent.target.kind !== "canvas" &&
+        drawingBehind(view, host, from)
+      ) {
+        paint(host, box);
+        return;
+      }
       // Connect mode keeps its mode, and stands only on a box.
       if (intent?.mode === "connect" && intent.anchor === from) {
-        if (target.kind === "node" && !sameTarget(intent.target, target)) {
+        if (connectable(target) && !sameTarget(intent.target, target)) {
           view.dispatch({
             effects: setDiagramIntent.of({ ...intent, target }),
           });
         }
-        paint(
-          host,
-          rove(host, target.kind === "node" ? target : intent.target),
-        );
+        paint(host, rove(host, connectable(target) ? target : intent.target));
         return;
       }
       if (
@@ -1302,24 +1360,24 @@ const focusPlugin = ViewPlugin.fromClass(
     /** Stop holding the stop's arrow. */
     dropStopHold(): void {
       if (this.stopHold !== null) {
-        letGoOfArrow(this.view, this.stopHold);
+        letGoOfLine(this.view, this.stopHold);
         this.stopHold = null;
       }
     }
 
     /**
-     * A stop on an arrow is a choice too: it follows that arrow when a duplicate
-     * moves its occurrence, and leaves when it cannot tell, so the ring never comes
-     * to stand on another arrow that the next key would take.
+     * A stop on an arrow or a message is a choice too: it follows that line when a
+     * duplicate moves its occurrence, and leaves when it cannot tell, so the ring
+     * never comes to stand on another line that the next key would take.
      */
     followStop(): void {
       const { view } = this;
       const intent = view.state.field(diagramIntent, false);
-      const key =
-        intent?.mode === "focus" && intent.target.kind === "edge"
-          ? intent.target.key
+      const target =
+        intent?.mode === "focus" && isLine(intent.target)
+          ? intent.target
           : null;
-      if (intent === null || intent === undefined || key === null) {
+      if (intent === null || intent === undefined || target === null) {
         this.ownEdit = false;
         this.dropStopHold();
         return;
@@ -1336,15 +1394,15 @@ const focusPlugin = ViewPlugin.fromClass(
       this.ownEdit = false;
       const hold = this.stopHold;
       const now =
-        hold === null || !sameEdgeKey(hold.key, key)
+        hold === null || !sameTarget(heldTargetOf(hold), target)
           ? null
-          : resolveArrow(view, hold, model, fence.bodyFrom);
+          : resolveHeldTarget(view, target, hold, model, fence.bodyFrom);
       // A new stop, or the person's own edit took the token, as a Line and its undo
-      // do. That is the same arrow, so the ticket goes back in it.
+      // do. That is the same line, so the ticket goes back in it.
       if (hold === null || now === null || (own && typeof now === "string")) {
         this.dropStopHold();
-        if (flowEdgeSpanOf(model, key) !== null) {
-          this.stopHold = holdArrow(view, model, key, fence.bodyFrom);
+        if (labelOfTarget(model, target) !== null) {
+          this.stopHold = holdLine(view, model, target, fence.bodyFrom);
         }
         return;
       }
@@ -1356,18 +1414,15 @@ const focusPlugin = ViewPlugin.fromClass(
         view.dispatch({
           effects: setDiagramIntent.of({
             ...intent,
-            target: { kind: "node", id: key.start },
+            target: startOf(target) ?? CANVAS,
           }),
         });
         movedStops.add(view);
         sayAt(view, intent.anchor, "stale");
-      } else if (!sameEdgeKey(now, key)) {
-        hold.key = now;
+      } else if (!sameTarget(now, target)) {
+        followLine(hold, now);
         view.dispatch({
-          effects: setDiagramIntent.of({
-            ...intent,
-            target: { kind: "edge", key: now },
-          }),
+          effects: setDiagramIntent.of({ ...intent, target: now }),
         });
       }
     }

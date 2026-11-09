@@ -15,6 +15,7 @@ const FIXTURES = import.meta.glob<string>(
   [
     "../fixtures/diagrams/flowchart/f*.mmd",
     "../fixtures/diagrams/fallback/*.mmd",
+    "../fixtures/diagrams/sequence/s01-*.mmd",
   ],
   { query: "?raw", import: "default", eager: true },
 );
@@ -65,6 +66,24 @@ describe("the diagram field with real verdicts", () => {
       expect(v.dom.querySelector(".cm-diagram")).toBeNull();
     },
   );
+
+  test.each(bodies.filter(([name]) => name.startsWith("y")))(
+    "the sequence fallback fixture %s is never drawn",
+    async (_name, body) => {
+      const v = mount(fence(body));
+      await settled(body);
+      expect(v.state.facet(drawnDiagrams)).toEqual([]);
+      expect(v.dom.querySelector(".cm-diagram")).toBeNull();
+    },
+  );
+
+  test("the sequence starter is drawn once mermaid agrees", async () => {
+    const body = defined(bodies.find(([name]) => name.startsWith("s01-")))[1];
+    const v = mount(`intro\n\n${fence(body)}\n`);
+    await settled(body);
+    expect(v.state.facet(drawnDiagrams)).toEqual([7]);
+    expect(v.dom.querySelector(".cm-diagram")).not.toBeNull();
+  });
 
   test("a flowchart fixture is drawn once mermaid agrees", async () => {
     const body = defined(bodies.find(([name]) => name.startsWith("f01-")))[1];

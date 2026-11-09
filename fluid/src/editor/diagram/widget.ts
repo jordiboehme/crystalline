@@ -50,6 +50,7 @@ import {
   offerPreviewDrawing,
   takePreviewDrawing,
 } from "../fencePreviews";
+import { diagramKindOf } from "./draws";
 import type { RefusalCode } from "./edits";
 import { NOTICES } from "./edits";
 import { diagramField } from "./field";
@@ -160,6 +161,10 @@ function estimateHeight(body: string): number {
     1,
     body.split("\n").filter((line) => line.trim() !== "").length - 1,
   );
+  if (diagramKindOf(body) === "sequenceDiagram") {
+    // Measured on the starter: the boxes above and below, 46 px a statement.
+    return Math.min(TALLEST_ESTIMATE, 120 + 46 * statements);
+  }
   const sideways = /^\s*(?:flowchart|graph)\s+(?:LR|RL|>|<)/m.test(body);
   return Math.min(
     TALLEST_ESTIMATE,
@@ -383,7 +388,15 @@ function cancelRetry(box: Box): void {
 }
 
 /** Brings the box to what it should show, at once when a drawing is at hand. */
+/** The box's name for a screen reader, by the kind its body says. */
+function boxName(body: string): string {
+  return diagramKindOf(body) === "sequenceDiagram"
+    ? "Sequence diagram"
+    : "Flowchart";
+}
+
 function draw(box: Box): void {
+  box.dom.setAttribute("aria-label", boxName(box.body));
   const key = drawKey(box.body, box.dark);
   cancelRetry(box);
   if (box.shown === key) {
@@ -418,7 +431,7 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
   dom.className = "cm-diagram";
   dom.setAttribute("role", "group");
   dom.setAttribute("aria-roledescription", "diagram");
-  dom.setAttribute("aria-label", "Flowchart");
+  dom.setAttribute("aria-label", boxName(widget.body));
   dom.tabIndex = 0;
   const drawing = document.createElement("div");
   drawing.className = "cm-diagram-drawing";
