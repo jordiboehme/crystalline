@@ -129,7 +129,7 @@ fn manifest_sharing_indexes() -> Vec<u8> {
 /// onto the connected branch instead of opening a proposal. The default is
 /// `proposal`, so a scenario whose subject is the direct path has to say so,
 /// the way a real team says it once in the file all of its members hold.
-fn manifest_sharing_direct() -> Vec<u8> {
+pub(super) fn manifest_sharing_direct() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 

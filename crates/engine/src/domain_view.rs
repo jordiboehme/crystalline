@@ -2842,6 +2842,14 @@ impl<'a> DomainView<'a> {
     /// Nothing is cleared: a shared draft is still a draft, and the entries stay
     /// exactly as they stand until the merged work is pulled back and convergence
     /// takes them out.
+    ///
+    /// **A draft is staged in the team's line endings**
+    /// ([`crystalline_core::with_line_endings_of`]), the one exception to "LF
+    /// out" that `line_endings.rs` names: the team's copy where the draft
+    /// started (its record's `from`, or its own path when it has no record)
+    /// decides. A draft of a CRLF file would otherwise share every line as
+    /// changed. A record that cannot be read refuses the share, as every gate
+    /// refuses on one.
     pub(crate) async fn materialise(
         &self,
         state_dir: &Path,
@@ -2918,11 +2926,48 @@ impl<'a> DomainView<'a> {
                     }
                 }
             } else {
-                write_staged_file(staging.root(), &entry.path, entry.content.as_bytes())?;
+                let team = self.team_copy_where_it_started(state_dir, base, &entry.path)?;
+                let text = match &team {
+                    Some(team) => crystalline_core::with_line_endings_of(&entry.content, team),
+                    None => std::borrow::Cow::Borrowed(entry.content.as_str()),
+                };
+                write_staged_file(staging.root(), &entry.path, text.as_bytes())?;
             }
         }
         self.stage_files(&staging)?;
         Ok(staging)
+    }
+
+    /// The team's bytes where this actor's draft at `path` started: at its
+    /// record's `from`, or at `path` when it has no record. `None` for a new
+    /// file, or a path the base snapshot does not hold. Only real keys are read,
+    /// since on a disk that folds case a copy at one spelling answers for
+    /// another.
+    fn team_copy_where_it_started(
+        &self,
+        state_dir: &Path,
+        base: &BTreeMap<String, BaseStamp>,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(None);
+        };
+        let journal_dir = self.engine.journal_state_dir()?;
+        let record =
+            draft_start::load(&journal_dir, &self.domain, actor, path).map_err(|source| {
+                EngineError::Io {
+                    path: format!("the draft start record of '{path}'"),
+                    source,
+                }
+            })?;
+        let key = match &record {
+            Some(record) => record.from.as_deref(),
+            None => Some(path),
+        };
+        match key {
+            Some(key) if base.contains_key(key) => Ok(state::read_base_file(state_dir, key)?),
+            _ => Ok(None),
+        }
     }
 
     /// Lay this actor's files overlay over the staged tree, after the rows: a

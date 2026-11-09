@@ -2121,7 +2121,12 @@ impl Engine {
             .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
         // This pull advances the base like any other, so the same convergence
         // runs on it - and it runs BEFORE the tree is staged, so a draft the
-        // team has already merged is not proposed straight back at them.
+        // team has already merged is not proposed straight back at them. It
+        // runs on every call, whether or not this pull applied anything: an
+        // earlier pull or a direct commit whose pass failed leaves drafts a
+        // pass can still merge. Its failure stays a warning, because the gate
+        // is the conflict list each caller asks next, which reads what stands
+        // and so refuses a stale draft whether or not a pass reached it.
         //
         // The sync in front of it is what makes the two call sites one rule
         // rather than two. A rename finishes through `write_overlay_entry`,
@@ -2131,13 +2136,13 @@ impl Engine {
         // same rename would come out a move here and a divergence there. The
         // scan is incremental, and the share's own tail syncs again after the
         // proposal, where a second pass over unchanged files costs a walk.
-        if !report.up_to_date {
-            if let Err(e) = self.sync(Some(domain)).await {
-                tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
-            }
-            if let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await {
-                tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
-            }
+        if !report.up_to_date
+            && let Err(e) = self.sync(Some(domain)).await
+        {
+            tracing::warn!("indexing what the pull before sharing '{domain}' applied: {e}");
+        }
+        if let Err(e) = self.converge_pulled_overlays(domain, &report.applied).await {
+            tracing::warn!("converging the drafts in '{domain}' before sharing failed: {e}");
         }
         Ok(Some(
             self.stage_overlay_share(domain, who, state_dir).await?,
@@ -2342,6 +2347,21 @@ impl Engine {
             .as_ref()
             .and_then(|plan| plan.files.as_deref())
             .or(files);
+        // The gate of a reviewing domain: a draft of hers that does not fit the
+        // team's text, among what this share carries, refuses it, read after
+        // the pull and the pass above, so only what they could not settle
+        // stands. A list that cannot be read refuses too, and is never read as
+        // empty. In review mode the marker is only staged, so there is nothing
+        // to take back.
+        if let Some(who) = drafting.as_deref() {
+            let blocking =
+                draft_conflicts::conflicts_block(&self.draft_conflicts(domain, who).await?, files);
+            if !blocking.is_empty() {
+                self.index_what_the_share_pull_applied(domain, "sharing")
+                    .await;
+                return Ok(origin::draft_conflicts_pending_json(&blocking));
+            }
+        }
         // Read before the share, whose convergence may end these rows.
         let unshared_spelling = match drafting.as_deref() {
             Some(who) => self.case_only_moves(domain, who, &state_dir).await?,
@@ -2399,7 +2419,7 @@ impl Engine {
                 // indexed, and the convergence pass a merged proposal's pull
                 // would run runs now - the next pull finds head == base and
                 // would never run it.
-                if let (Some(_), ops::ProposeOutcome::Committed(report)) =
+                if let (Some(who), ops::ProposeOutcome::Committed(report)) =
                     (drafting.as_deref(), &outcome)
                 {
                     let paths: Vec<String> = report
@@ -2430,6 +2450,10 @@ impl Engine {
                         // domain, for a command on a shared database).
                         receipt["index_error"] = json!(e.to_string());
                     }
+                    // Before the pass, which would otherwise read a draft whose
+                    // start this commit deleted as the team deleting it.
+                    self.free_drafts_of_shared_deletions(domain, who, &report.deleted)
+                        .await;
                     match self.converge_pulled_overlays(domain, &paths).await {
                         Ok(folded) => receipt["drafts_folded"] = json!(folded.cleared),
                         Err(e) => {
@@ -2480,6 +2504,74 @@ impl Engine {
                     self.take_back_team_marker(domain, &root, plan).await;
                 }
                 Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
+            }
+        }
+    }
+
+    /// After a direct commit that deleted `deleted`: a draft of `actor`'s whose
+    /// record starts at one of those paths starts nowhere now. She shared only
+    /// that half of her move, so the deletion is hers and not the team's, and
+    /// her draft is a new file whose next share adds it. Read against the record
+    /// to the letter, as `from` is everywhere else.
+    ///
+    /// Best effort, like the rest of the commit's tail: the branch has moved and
+    /// nothing here may turn that into an error. A record that cannot be read or
+    /// saved is warned about and stays; the pass then reads that draft as
+    /// `EditDelete`, which refuses its share rather than losing anything.
+    async fn free_drafts_of_shared_deletions(&self, domain: &str, actor: &str, deleted: &[String]) {
+        if deleted.is_empty() {
+            return;
+        }
+        let records = self.journal_state_dir().and_then(|dir| {
+            crate::draft_start::all(&dir, domain, actor)
+                .map(|records| (dir, records))
+                .map_err(|source| EngineError::Io {
+                    path: format!("the draft start records of '{actor}' in '{domain}'"),
+                    source,
+                })
+        });
+        let (dir, records) = match records {
+            Ok(read) => read,
+            Err(e) => {
+                tracing::warn!("reading the drafts a direct commit in '{domain}' freed: {e}");
+                return;
+            }
+        };
+        for record in records {
+            let Some(from) = record.from.as_deref() else {
+                continue;
+            };
+            if from == record.path || !deleted.iter().any(|path| path == from) {
+                continue;
+            }
+            let lock = match self.draft_lock(domain, actor, &record.path) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    tracing::warn!("freeing the draft '{}' in '{domain}': {e}", record.path);
+                    continue;
+                }
+            };
+            let _guard = lock.lock().await;
+            // Read again under the lock: a writer may have moved it since.
+            let freed = match crate::draft_start::load(&dir, domain, actor, &record.path) {
+                Ok(Some(current)) if current.from.as_deref() == Some(from) => {
+                    crate::draft_start::save(
+                        &dir,
+                        domain,
+                        actor,
+                        &crate::draft_start::DraftStart {
+                            from: None,
+                            start: None,
+                            start_sha256: None,
+                            ..current
+                        },
+                    )
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = freed {
+                tracing::warn!("freeing the draft '{}' in '{domain}': {e}", record.path);
             }
         }
     }
@@ -2756,6 +2848,13 @@ impl Engine {
         let detect_in = staging
             .as_ref()
             .map_or(root.as_path(), |prepared| prepared.staging.root());
+        // The share's own gate, read at the same point (see
+        // `Engine::origin_share_with`), and answered in the plan rather than
+        // as an error, so the changes still show beside it.
+        let conflicts = match drafting.as_deref() {
+            Some(who) => self.draft_conflicts(domain, who).await?,
+            None => Vec::new(),
+        };
         let plan = ops::propose_preview(
             preview_provider,
             &spec,
@@ -2807,6 +2906,18 @@ impl Engine {
         if let Some(who) = drafting.as_deref() {
             let moves = self.case_only_moves(domain, who, &state_dir).await?;
             note_unshared_spelling(&mut plan, &moves);
+        }
+        // Named files with a conflict among them: the share would refuse, so
+        // the plan says that. With no files the plan stays the ordinary one and
+        // names her conflicts beside it: Fluid asks with no files and then lets
+        // her tick, and a conflicted file only takes its box away.
+        if files.is_some() {
+            let blocking = draft_conflicts::conflicts_block(&conflicts, files);
+            if !blocking.is_empty() {
+                origin::plan_refused_for_draft_conflicts(&mut plan, &blocking);
+            }
+        } else if !conflicts.is_empty() {
+            plan["draft_conflicts"] = json!(conflicts);
         }
         Ok(plan)
     }
@@ -2975,9 +3086,17 @@ impl Engine {
             // What was proposed, against what this actor holds now. A
             // tombstone proposed a deletion and carries no content of its own,
             // so its digest is the absence the proposal recorded.
+            // A share stages a draft in the team's line endings, and the
+            // proposal records the staged bytes, so a draft of a CRLF file
+            // matches in its CRLF form.
             let unchanged = match file.sha256.as_deref() {
                 Some(proposed) => {
-                    !held.tombstone && sha256_hex(held.content.as_bytes()) == proposed
+                    !held.tombstone
+                        && (sha256_hex(held.content.as_bytes()) == proposed
+                            || sha256_hex(
+                                crystalline_core::with_line_endings_of(&held.content, b"\r\n")
+                                    .as_bytes(),
+                            ) == proposed)
                 }
                 None => held.tombstone,
             };

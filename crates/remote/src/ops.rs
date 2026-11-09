@@ -1783,7 +1783,10 @@ fn folder_of(path: &str) -> &str {
 /// whitespace, a `./` prefix and Windows separators. Anything else is left
 /// alone and simply fails to match, which is a refusal naming the path rather
 /// than a guess about what was meant.
-fn normalize_selected_path(raw: &str) -> String {
+///
+/// Public so a caller that checks a selection before the share (the engine's
+/// draft conflict gate) reads a name exactly as the share will.
+pub fn normalize_selected_path(raw: &str) -> String {
     let trimmed = raw.trim().replace('\\', "/");
     trimmed
         .strip_prefix("./")

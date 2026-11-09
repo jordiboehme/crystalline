@@ -11,13 +11,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::origin::{draft, engram, manifest, mirror, reviewing_domain};
+use super::origin::{draft, engram, manifest, manifest_sharing_direct, mirror, reviewing_domain};
 use crate::support::{MockProvider, sha256_hex};
 use crystalline_core::config::{DomainEntry, GlobalConfig, ReviewMode};
 use crystalline_index::{Store, TursoStore};
+use crystalline_remote::ops::DiscardTarget;
 use crystalline_remote::state::{BaseStamp, OriginState, remove_base_file, write_base_file};
 use crystalline_service::draft_start::{self, DraftStart};
-use crystalline_service::engine::{DraftConflict, DraftConflictKind, EngineError};
+use crystalline_service::engine::{
+    DraftConflict, DraftConflictKind, EngineError, PreviewCredential, ShareActor,
+};
 use crystalline_service::overlay_journal::{self, ConvergenceRecord};
 use crystalline_service::params::{EditParams, MoveParams, ReadParams, WriteParams};
 use crystalline_service::{Engine, Scope};
@@ -105,9 +108,18 @@ struct Team {
 }
 
 async fn team(files: &[(&str, Vec<u8>)]) -> Team {
+    team_with(manifest(), files).await
+}
+
+/// [`team`] whose MANIFEST says `sharing: direct`, so a share is a commit.
+async fn team_direct(files: &[(&str, Vec<u8>)]) -> Team {
+    team_with(manifest_sharing_direct(), files).await
+}
+
+async fn team_with(manifest: Vec<u8>, files: &[(&str, Vec<u8>)]) -> Team {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
-    let mut all = vec![("MANIFEST.md", manifest())];
+    let mut all = vec![("MANIFEST.md", manifest)];
     all.extend(files.iter().cloned());
     let eng = reviewing_domain(tmp.path(), mock.clone(), &all).await;
     Team { tmp, mock, eng }
@@ -145,6 +157,86 @@ impl Team {
     fn forge_file(&self, path: &str) -> Option<String> {
         let head = self.mock.branch_commit("main").unwrap();
         self.mock.commit_file(&head, path).map(|bytes| text(&bytes))
+    }
+
+    /// The team commits these changes, and this machine has not pulled them.
+    fn commit(&self, changes: &[(&str, Option<Vec<u8>>)]) {
+        let mut files = self.tree();
+        for (path, bytes) in changes {
+            match bytes {
+                Some(bytes) => files.insert((*path).to_string(), bytes.clone()),
+                None => files.remove(*path),
+            };
+        }
+        let commit = self.mock.add_commit(files);
+        self.mock.set_branch("main", &commit);
+    }
+
+    /// What the forge holds at `path` on `branch`, as bytes.
+    fn branch_file(&self, branch: &str, path: &str) -> Option<Vec<u8>> {
+        let head = self.mock.branch_commit(branch).unwrap();
+        self.mock.commit_file(&head, path)
+    }
+
+    /// The team commits these changes and this machine pulls them, but the
+    /// convergence pass of that pull fails: the base moved and no pass looked at
+    /// the drafts.
+    async fn push_with_no_pass(&self, changes: &[(&str, Option<Vec<u8>>)]) {
+        self.commit(changes);
+        self.eng.fail_next_convergence();
+        self.eng
+            .origin_update(Some("team"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+
+    /// `actor` shares `files`, or everything they hold.
+    async fn share(&self, actor: &str, files: Option<&[&str]>) -> serde_json::Value {
+        let files: Option<Vec<String>> =
+            files.map(|files| files.iter().map(|path| path.to_string()).collect());
+        self.eng
+            .origin_share(
+                "team",
+                None,
+                None,
+                None,
+                files.as_deref(),
+                ShareActor::Account(actor.to_string()),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// What a share of `files` by `actor` would do.
+    async fn preview(&self, actor: &str, files: Option<&[&str]>) -> serde_json::Value {
+        let files: Option<Vec<String>> =
+            files.map(|files| files.iter().map(|path| path.to_string()).collect());
+        self.eng
+            .origin_share_preview(
+                "team",
+                None,
+                None,
+                files.as_deref(),
+                ShareActor::Account(actor.to_string()),
+                PreviewCredential::ActingIdentity,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// `actor` discards their draft at `path`.
+    async fn discard(&self, actor: &str, path: &str) {
+        self.eng
+            .discard_local_changes(
+                "team",
+                &[DiscardTarget {
+                    path: path.to_string(),
+                    sha256: None,
+                }],
+                &ShareActor::Account(actor.to_string()),
+            )
+            .await
+            .unwrap();
     }
 
     /// The team commits these changes and this machine pulls them.
@@ -2076,4 +2168,511 @@ async fn a_merge_whose_start_could_not_move_merges_again_and_tells_her() {
     assert_eq!(record.merging, None);
     assert!(record.merged_at.is_some(), "she is told: {record:?}");
     assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+// --- Share and preview refuse --------------------------------------------------
+//
+// A share or a preview asks the conflict list after its own pull and pass. A
+// conflict among what would travel refuses the share, and the forge keeps what
+// the team has. Each test asserts the forge, not only the answer.
+
+const ALICE_LINE: &str = "alice's first line";
+
+/// Alice changes the plan's first line, the one bob's change takes too.
+async fn same_line(t: &Team) {
+    t.replace("alice", "plan", "the first line of the plan", ALICE_LINE)
+        .await;
+}
+
+fn crlf(bytes: &[u8]) -> Vec<u8> {
+    text(bytes).replace('\n', "\r\n").into_bytes()
+}
+
+/// Every line of `bytes` ends in CRLF, and there is at least one.
+fn wholly_crlf(bytes: &str) -> bool {
+    bytes.contains('\n') && bytes.matches('\n').count() == bytes.matches("\r\n").count()
+}
+
+fn kinds(answer: &serde_json::Value) -> Vec<(String, String)> {
+    answer["conflicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no conflicts in {answer}"))
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().to_string(),
+                c["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_direct_share_of_a_stale_edit_refuses_and_the_peers_line_stays() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(answer["count"], 1, "{answer}");
+    assert_eq!(answer["conflicts"][0]["kind"], "EditEdit", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(
+        forge.contains(BOB_LINE) && !forge.contains(ALICE_LINE),
+        "{forge}"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_share_that_merges_lands_both_lines() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.push_with_no_pass(&[("plan.md", Some(plan_later()))])
+        .await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(
+        forge.contains(BOB_LINE) && forge.contains(HER_WORD),
+        "{forge}"
+    );
+}
+
+#[tokio::test]
+async fn a_proposal_of_a_stale_edit_holds_the_peers_line_on_the_branch_after_a_clean_merge() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.push_with_no_pass(&[("plan.md", Some(plan_later()))])
+        .await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let branch = answer["branch"].as_str().unwrap();
+    let held = text(&t.branch_file(branch, "plan.md").unwrap());
+    assert!(held.contains(BOB_LINE) && held.contains(HER_WORD), "{held}");
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn a_proposal_of_a_same_line_edit_refuses() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(
+        kinds(&answer),
+        vec![("plan.md".to_string(), "EditEdit".to_string())]
+    );
+    let state = OriginState::load(&t.snapshot_dir()).unwrap().unwrap();
+    assert!(state.proposals.is_empty(), "{:?}", state.proposals);
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn a_stale_delete_refuses_and_the_file_stays() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    t.delete("alice", "plan").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(
+        kinds(&answer),
+        vec![("plan.md".to_string(), "DeleteEdit".to_string())]
+    );
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn a_share_with_no_update_first_brings_the_base_up_and_refuses() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+    let state = OriginState::load(&t.snapshot_dir()).unwrap().unwrap();
+    assert_eq!(
+        state.base_commit,
+        t.mock.branch_commit("main").unwrap(),
+        "the share's pull brought the base up"
+    );
+}
+
+#[tokio::test]
+async fn a_share_refuses_a_mergeable_stale_draft_when_the_pass_failed() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+    t.eng.fail_next_convergence();
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(
+        kinds(&answer),
+        vec![("plan.md".to_string(), "EditEdit".to_string())]
+    );
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+/// A merge written into her row whose start could not move stands under its
+/// mark, and the share refuses until a pass has settled it.
+#[tokio::test]
+async fn a_share_refuses_while_a_merge_has_not_settled_its_start() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.commit(&[("plan.md", Some(plan_later()))]);
+    t.eng.fail_next_merge_start();
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.record("alice", "plan.md").unwrap().merging, Some(true));
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+
+    // The next share's pass settles it, and the merge goes through.
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(
+        forge.contains(BOB_LINE) && forge.contains(HER_WORD),
+        "{forge}"
+    );
+}
+
+/// Two drafts: the plan in conflict, and a new page that is not.
+async fn a_conflict_and_another_file() -> Team {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.write("alice", "Other", "a page only alice has").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    t
+}
+
+#[tokio::test]
+async fn a_preview_names_the_conflicts_beside_the_plan_and_changes_nothing() {
+    let t = a_conflict_and_another_file().await;
+    let hers = t.row("alice", "plan.md").await;
+    let before = t.tree();
+
+    let plan = t.preview("alice", None).await;
+    assert_eq!(plan["action"], "commit", "{plan}");
+    let changed: Vec<&str> = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        changed.contains(&"plan.md") && changed.contains(&"other.md"),
+        "{plan}"
+    );
+    assert_eq!(plan["draft_conflicts"][0]["path"], "plan.md", "{plan}");
+    assert_eq!(plan["draft_conflicts"][0]["kind"], "EditEdit", "{plan}");
+    assert_eq!(t.tree(), before);
+    assert_eq!(t.row("alice", "plan.md").await, hers);
+}
+
+#[tokio::test]
+async fn a_preview_naming_a_conflicted_file_answers_conflicts_pending() {
+    let t = a_conflict_and_another_file().await;
+    let before = t.tree();
+
+    let plan = t.preview("alice", Some(&["plan.md", "other.md"])).await;
+    assert_eq!(plan["action"], "conflicts_pending", "{plan}");
+    assert_eq!(plan["count"], 1, "{plan}");
+    assert_eq!(
+        kinds(&plan),
+        vec![("plan.md".to_string(), "EditEdit".to_string())]
+    );
+    assert_eq!(plan["changes"].as_array().unwrap().len(), 2, "{plan}");
+    assert!(
+        plan.get("branch").is_none(),
+        "no word of the commit: {plan}"
+    );
+    assert_eq!(t.tree(), before);
+
+    // Another file alone plans as usual.
+    let plan = t.preview("alice", Some(&["other.md"])).await;
+    assert_eq!(plan["action"], "commit", "{plan}");
+}
+
+#[tokio::test]
+async fn sharing_one_other_file_goes_through() {
+    let t = a_conflict_and_another_file().await;
+    let answer = t.share("alice", Some(&["other.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(t.forge_file("other.md").is_some());
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn a_conflicted_file_named_in_another_spelling_still_refuses() {
+    let t = a_conflict_and_another_file().await;
+    let answer = t.share("alice", Some(&["./plan.md"])).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn sharing_everything_refuses() {
+    let t = a_conflict_and_another_file().await;
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.forge_file("other.md"), None);
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn a_colleagues_conflict_does_not_block_her_share() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    t.replace(
+        "bob",
+        "plan",
+        "the first line of the plan",
+        "bob's own first line",
+    )
+    .await;
+    t.write("alice", "Other", "a page only alice has").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(t.conflicts("bob").await.len(), 1);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(t.forge_file("other.md").is_some());
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+/// Alice moved the plan and changed its first line; bob changed that line too.
+async fn a_move_in_conflict() -> Team {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            moved_from: Some("plan.md".to_string()),
+            ..conflict("alice", "renamed.md", EditEdit)
+        }]
+    );
+    t
+}
+
+#[tokio::test]
+async fn sharing_the_conflicted_files_move_partner_refuses() {
+    let t = a_move_in_conflict().await;
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+// One half of a move.
+
+#[tokio::test]
+async fn sharing_only_the_deletion_of_a_move_frees_the_draft() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.forge_file("renamed.md"), None);
+    assert_eq!(t.conflicts("alice").await, vec![], "no EditDelete");
+    assert_eq!(
+        t.rows("alice").await,
+        vec![("renamed.md".to_string(), false)]
+    );
+    let record = t.record("alice", "renamed.md").unwrap();
+    assert_eq!((record.from, record.start), (None, None));
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("renamed.md").unwrap();
+    assert!(forge.contains("the first line of the plan"), "{forge}");
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+/// Her draft lands and the team still holds where she started, so her deletion
+/// stands, in step and with no conflict, for the next share to carry.
+#[tokio::test]
+async fn sharing_only_the_draft_of_a_move_leaves_no_row() {
+    let t = team_direct(&[("plan.md", plan())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+
+    let answer = t.share("alice", Some(&["renamed.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert!(t.forge_file("renamed.md").is_some());
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan())));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.forge_file("plan.md"), None);
+    assert_eq!(t.rows("alice").await, vec![]);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+// A second move, and a discard of one half, while the move is in conflict.
+
+#[tokio::test]
+async fn a_second_move_while_in_conflict_is_refused_at_the_share() {
+    let t = a_move_in_conflict().await;
+    t.moved("alice", "plan", "again.md").await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(answer["conflicts"][0]["path"], "again.md", "{answer}");
+    assert_eq!(answer["conflicts"][0]["moved_from"], "plan.md", "{answer}");
+    assert_eq!(t.forge_file("again.md"), None);
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn discarding_only_the_deletion_of_a_move_in_conflict_is_refused_at_the_share() {
+    let t = a_move_in_conflict().await;
+    t.discard("alice", "plan.md").await;
+
+    // The team's page shows through at the old path again and answers to the
+    // address her draft carries, so the draft stands as that clash.
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(
+        kinds(&answer),
+        vec![("renamed.md".to_string(), "AddressTaken".to_string())]
+    );
+    assert_eq!(answer["conflicts"][0]["other"], "plan.md", "{answer}");
+    assert_eq!(t.forge_file("renamed.md"), None);
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+#[tokio::test]
+async fn discarding_only_the_draft_of_a_move_in_conflict_leaves_a_refused_deletion() {
+    let t = a_move_in_conflict().await;
+    t.discard("alice", "renamed.md").await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert_eq!(
+        kinds(&answer),
+        vec![("plan.md".to_string(), "DeleteEdit".to_string())]
+    );
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
+}
+
+// Line endings: a review share keeps the team's.
+
+#[tokio::test]
+async fn a_merged_move_of_a_crlf_file_lands_crlf() {
+    let mut t = team_direct(&[("plan.md", crlf(&plan()))]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    t.append("alice", "plan", HER_WORD).await;
+    t.push(&[("plan.md", Some(crlf(&plan_later())))]).await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("renamed.md").unwrap();
+    assert!(wholly_crlf(&forge), "{forge:?}");
+    assert!(
+        forge.contains(BOB_LINE) && forge.contains(HER_WORD),
+        "{forge}"
+    );
+    assert_eq!(t.forge_file("plan.md"), None);
+}
+
+#[tokio::test]
+async fn an_edit_of_a_crlf_file_lands_crlf() {
+    let t = team_direct(&[("plan.md", crlf(&plan()))]).await;
+    t.append("alice", "plan", HER_WORD).await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let forge = t.forge_file("plan.md").unwrap();
+    assert!(wholly_crlf(&forge), "{forge:?}");
+    assert!(forge.contains(HER_WORD), "{forge}");
+}
+
+#[tokio::test]
+async fn an_unedited_move_of_a_crlf_file_lands_the_teams_bytes() {
+    let t = team_direct(&[("plan.md", crlf(&plan()))]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.forge_file("renamed.md"), Some(text(&crlf(&plan()))));
+    assert_eq!(t.forge_file("plan.md"), None);
+}
+
+#[tokio::test]
+async fn withdrawing_an_unchanged_crlf_draft_restores_it() {
+    let t = team(&[("plan.md", crlf(&plan()))]).await;
+    t.append("alice", "plan", HER_WORD).await;
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    let branch = answer["branch"].as_str().unwrap();
+    let proposed = text(&t.branch_file(branch, "plan.md").unwrap());
+    assert!(wholly_crlf(&proposed), "{proposed:?}");
+
+    let report = t
+        .eng
+        .origin_withdraw("team", None, true, ShareActor::Account("alice".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(
+        report["restored"],
+        serde_json::json!(["plan.md"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["skipped_diverged"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    assert_eq!(t.rows("alice").await, vec![]);
+}
+
+/// A direct commit that deletes another file leaves her unshared move where it
+/// started, so a later team change still merges into it.
+#[tokio::test]
+async fn sharing_another_deletion_keeps_a_move_where_it_started() {
+    let mut t = team_direct(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    t.moved("alice", "plan", "renamed.md").await;
+    t.delete("alice", "gone").await;
+    let answer = t.share("alice", Some(&["gone.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    assert_eq!(t.forge_file("gone.md"), None);
+    let record = t.record("alice", "renamed.md").unwrap();
+    assert_eq!(record.from.as_deref(), Some("plan.md"));
+
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    assert!(t.row("alice", "renamed.md").await.contains(BOB_LINE));
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// A record the share cannot read refuses the share. Her deletion's record is
+/// read by the gate alone, since nothing is staged from a deletion.
+#[tokio::test]
+async fn a_share_refuses_when_her_records_cannot_be_read() {
+    let mut t = team_direct(&[("plan.md", plan())]).await;
+    t.delete("alice", "plan").await;
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let file = draft_start::record_file(&t.state(), "team", "alice", "plan.md").unwrap();
+    std::fs::write(&file, b"{ not a record").unwrap();
+
+    t.eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(t.forge_file("plan.md"), Some(text(&plan_later())));
 }

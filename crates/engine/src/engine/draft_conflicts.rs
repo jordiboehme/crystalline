@@ -785,6 +785,35 @@ impl Engine {
     }
 }
 
+/// The conflicts that block a share of `files`: all of them when no files are
+/// named, since she asked to share everything; otherwise those whose path or
+/// `moved_from` is named. A share is a staged tree filtered by `files`, so a
+/// stale row outside them cannot travel. A name is read as the share reads it
+/// (`normalize_selected_path`), so `./plan.md` names `plan.md` here too.
+pub(super) fn conflicts_block(
+    conflicts: &[DraftConflict],
+    files: Option<&[String]>,
+) -> Vec<DraftConflict> {
+    let Some(files) = files else {
+        return conflicts.to_vec();
+    };
+    let named: HashSet<String> = files
+        .iter()
+        .map(|raw| crystalline_remote::ops::normalize_selected_path(raw))
+        .collect();
+    conflicts
+        .iter()
+        .filter(|conflict| {
+            named.contains(&conflict.path)
+                || conflict
+                    .moved_from
+                    .as_ref()
+                    .is_some_and(|from| named.contains(from))
+        })
+        .cloned()
+        .collect()
+}
+
 /// The address a page's text answers to at `key`, or `None` for bytes that are
 /// no page.
 pub(super) fn address_of(key: &str, bytes: &[u8]) -> Option<String> {
@@ -814,6 +843,60 @@ mod tests {
             merged_at: merged.then(chrono::Utc::now),
             merging: None,
         }
+    }
+
+    fn listed(path: &str, moved_from: Option<&str>) -> DraftConflict {
+        DraftConflict {
+            id: conflict_id("alice", path),
+            path: path.to_string(),
+            kind: DraftConflictKind::EditEdit,
+            moved_from: moved_from.map(str::to_string),
+            file: false,
+            other: None,
+        }
+    }
+
+    fn named(files: &[&str]) -> Vec<String> {
+        files.iter().map(|file| file.to_string()).collect()
+    }
+
+    #[test]
+    fn with_no_files_every_conflict_blocks() {
+        let all = vec![listed("a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(conflicts_block(&all, None), all);
+        assert_eq!(conflicts_block(&[], None), vec![]);
+    }
+
+    #[test]
+    fn named_files_block_by_path_or_by_where_the_move_started() {
+        let all = vec![listed("a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["a.md"]))),
+            vec![all[0].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["c.md"]))),
+            vec![all[1].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["b.md", "z.md"]))),
+            vec![all[1].clone()]
+        );
+        assert_eq!(conflicts_block(&all, Some(&named(&["z.md"]))), vec![]);
+        assert_eq!(conflicts_block(&all, Some(&[])), vec![]);
+    }
+
+    #[test]
+    fn a_name_is_read_as_the_share_reads_it() {
+        let all = vec![listed("notes/a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&[" ./notes\\a.md "]))),
+            vec![all[0].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["./c.md"]))),
+            vec![all[1].clone()]
+        );
     }
 
     #[tokio::test]
