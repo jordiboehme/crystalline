@@ -3692,7 +3692,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                 config.as_deref(),
             )
             .await?;
-            cmd::print_origin_resolve(&path, &data, json);
+            cmd::print_origin_resolve(&domain, &path, &data, json);
             Ok(())
         }
     }

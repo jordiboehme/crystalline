@@ -4084,8 +4084,9 @@ async fn keep_mine_is_refused_for_a_taken_address() {
         assert_eq!(
             said,
             "The team's file bobs.md now uses the same address as your draft of mine.md, so \
-             keeping yours would put two pages at one address. Change the address in Edit \
-             merged, or take theirs.",
+             keeping yours would put two pages at one address. Give it another address in a \
+             merged text (Edit merged in Fluid, --content-file on the command line), or take \
+             theirs.",
             "changed {changed}"
         );
         // A merged text at that address is refused the same way.
@@ -4863,8 +4864,13 @@ async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
         .await
         .unwrap();
     settled(&receipt, DECK, "theirs", true);
-    let kept = receipt["kept_file"].as_str().unwrap();
-    assert_eq!(std::fs::read(kept).unwrap(), HER_DECK);
+    // C24: a path on this server is not hers to use; the receipt says where
+    // the copy is listed instead.
+    assert_eq!(receipt["kept_file"], serde_json::Value::Null, "{receipt}");
+    assert_eq!(
+        receipt["kept_note"], "A copy of your file is kept. Find it in your kept list.",
+        "{receipt}"
+    );
     assert_eq!(t.held_file("alice", DECK), None);
     let root = t.state().join(crystalline_core::kept::KEPT_DIR);
     let listed = crystalline_core::kept::held_by(&root, "alice").unwrap();
@@ -5281,23 +5287,26 @@ async fn a_domain_owner_reads_counts_not_paths() {
 }
 
 /// The Task 5 review's M2: a record that cannot be read names the two ways
-/// out, in status and in the share's refusal, and both ways work.
+/// out, in status and in the share's refusal, and both ways work. An account
+/// reaches this server from elsewhere, so its sentence names no place on the
+/// server's disk (C24).
 #[tokio::test]
 async fn a_broken_record_names_its_ways_out() {
     let mut t = team(&[("plan.md", plan())]).await;
     same_line(&t).await;
     t.push(&[("plan.md", Some(plan_later()))]).await;
     let file = draft_start::record_file(&t.state(), "team", "alice", "plan.md").unwrap();
-    let said = format!(
-        "The record of where your draft of plan.md started cannot be read. Discard that \
-         draft, or remove {} so it is read as a draft from before 0.32.0.",
-        file.display()
-    );
+    let said = "The record of where your draft of plan.md started cannot be read. Discard that \
+                draft, or ask whoever runs this server to remove its record, so it is read as \
+                a draft from before 0.32.0.";
 
     std::fs::write(&file, b"{ not a record").unwrap();
     let domain = status_of(&t, &scope("alice"), false).await;
-    assert_eq!(domain["conflicts_unreadable"], said, "{domain}");
+    assert_eq!(domain["conflicts_unreadable_reason"], said, "{domain}");
+    assert!(domain.get("conflicts_unreadable").is_none(), "{domain}");
     assert_eq!(domain["conflicts"], serde_json::json!([]), "{domain}");
+    let state = t.state().display().to_string();
+    assert!(!domain.to_string().contains(&state), "{domain}");
     let err = t
         .eng
         .origin_share(
@@ -5322,7 +5331,7 @@ async fn a_broken_record_names_its_ways_out() {
     assert!(
         status_of(&t, &scope("alice"), false)
             .await
-            .get("conflicts_unreadable")
+            .get("conflicts_unreadable_reason")
             .is_none()
     );
 
@@ -5330,6 +5339,60 @@ async fn a_broken_record_names_its_ways_out() {
     std::fs::write(&file, b"{ not a record").unwrap();
     t.discard("alice", "plan.md").await;
     assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// The machine owner is on this machine, so her sentence names the record's
+/// file she can remove.
+#[tokio::test]
+async fn the_machine_owner_is_told_which_record_to_remove() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.eng
+        .edit_engram_as(
+            &{
+                let mut p = edit_append("plan", ALICE_LINE);
+                p.operation = "find_replace".to_string();
+                p.find_text = Some("the first line of the plan".to_string());
+                p
+            },
+            None,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let file = draft_start::record_file(&t.state(), "team", "owner", "plan.md").unwrap();
+    std::fs::write(&file, b"{ not a record").unwrap();
+
+    let domain = status_of(&t, &Scope::Unrestricted, false).await;
+    assert_eq!(
+        domain["conflicts_unreadable_reason"],
+        format!(
+            "The record of where your draft of plan.md started cannot be read. Discard that \
+             draft, or remove {} so it is read as a draft from before 0.32.0.",
+            file.display()
+        ),
+        "{domain}"
+    );
+}
+
+/// C24, I-3: a colleague's draft file whose record cannot be read is his, not
+/// the sharer's. Her direct share lands, and its receipt names neither his
+/// path nor "your draft".
+#[tokio::test]
+async fn a_colleagues_broken_file_record_stays_out_of_a_direct_share() {
+    let t = team_direct(&[("plan.md", plan()), (DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("bob", DECK, HER_DECK).await;
+    let file = draft_start::file_record_file(&t.state(), "team", "bob", DECK).unwrap();
+    std::fs::write(&file, b"").unwrap();
+    t.append("alice", "plan", HER_WORD).await;
+
+    let answer = t.share("alice", Some(&["plan.md"])).await;
+    assert_eq!(answer["outcome"], "committed", "{answer}");
+    let said = answer.to_string();
+    assert!(!said.contains(DECK), "{said}");
+    assert!(!said.contains("your draft"), "{said}");
+    assert!(answer.get("fold_error").is_none(), "{answer}");
+    assert_eq!(t.held_file("bob", DECK), Some(Some(HER_DECK.to_vec())));
 }
 
 /// [`a_broken_record_names_its_ways_out`] for a file beside the pages.
@@ -5345,8 +5408,31 @@ async fn a_broken_file_record_names_its_ways_out() {
         err.to_string(),
         format!(
             "The record of where your draft of {DECK} started cannot be read. Discard that \
-             draft, or remove {} so it is read as a draft from before 0.32.0.",
-            file.display()
+             draft, or ask whoever runs this server to remove its record, so it is read as a \
+             draft from before 0.32.0."
         )
     );
+}
+
+/// C24, I-2: the machine owner is on this machine, so her receipt names where
+/// her kept file is.
+#[tokio::test]
+async fn the_owners_kept_file_is_named_in_her_receipt() {
+    let t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.eng
+        .attachment_write_as("team", DECK, HER_DECK.to_vec(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    draft_start::clear_file(&t.state(), "team", "owner", DECK).unwrap();
+
+    let receipt = t
+        .eng
+        .origin_resolve("team", DECK, Some("theirs"), None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(receipt["kept_copy"], true, "{receipt}");
+    let kept = receipt["kept_file"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{receipt}"));
+    assert_eq!(std::fs::read(kept).unwrap(), HER_DECK);
 }

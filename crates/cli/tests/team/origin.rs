@@ -1952,6 +1952,8 @@ mod chain {
 
     #[test]
     fn origin_status_prints_the_unresolved_draft() {
+        let mut deck = draft_conflict("assets/deck.png", "EditEdit");
+        deck["file"] = json!(true);
         let mut payload = status_payload(vec![], vec![], false, false);
         payload["domains"][0]["conflicts"] = json!([
             {
@@ -1960,8 +1962,11 @@ mod chain {
                 "detected_at": "2026-11-09T10:00:00Z",
             },
             draft_conflict("notes/plan.md", "EditEdit"),
+            deck,
         ]);
         payload["domains"][0]["drafts_merged"] = json!(["notes/other.md"]);
+        payload["domains"][0]["conflicts_unreadable_reason"] =
+            json!("The record of where your draft of x.md started cannot be read.");
         let daemon = Daemon::answering("status-draft", payload);
         let out = daemon.run(&["origin", "status"]);
         assert!(out.contains("  unresolved conflict: folder.md\n"), "{out}");
@@ -1974,6 +1979,17 @@ mod chain {
         );
         assert!(
             out.contains("  merged into your draft: notes/other.md"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "  unresolved conflict in your draft: assets/deck.png (you and the team both \
+                 changed this file)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  The record of where your draft of x.md started cannot be read."),
             "{out}"
         );
     }
@@ -1999,7 +2015,11 @@ mod chain {
             "update-conflict",
             update_payload(
                 false,
-                vec![draft_conflict("notes/plan.md", "EditEdit")],
+                vec![draft_conflict("notes/plan.md", "EditEdit"), {
+                    let mut taken = draft_conflict("notes/mine.md", "AddressTaken");
+                    taken["other"] = json!("notes/bobs.md");
+                    taken
+                }],
                 vec![],
             ),
         );
@@ -2014,6 +2034,15 @@ mod chain {
         );
         assert!(
             out.contains("you and the team changed the same lines"),
+            "{out}"
+        );
+        // Keep mine is refused for a taken address, so it is not offered.
+        assert!(
+            out.contains(
+                "  conflict: notes/mine.md (compare: crystalline origin diff brand --path \
+                 notes/mine.md; resolve: crystalline origin resolve brand notes/mine.md --keep \
+                 theirs, or --content-file <f> with another address)"
+            ),
             "{out}"
         );
     }
@@ -2132,14 +2161,19 @@ mod chain {
             "theirs",
         ]);
         assert!(
-            out.contains(
-                "Your draft of notes/plan.md is gone. You now read the team's text. A copy is \
-                 in crystalline kept list."
-            ),
+            out.contains("Your draft of notes/plan.md ended. You now read the team's text.\n"),
             "{out}"
         );
         assert!(
-            out.contains("The number of conflicts left could not be read."),
+            out.contains("A copy is kept: see crystalline kept list."),
+            "{out}"
+        );
+        assert!(!out.contains("is gone"), "{out}");
+        assert!(
+            out.contains(
+                "The number of conflicts left could not be read. Run: crystalline origin status \
+                 --domain brand to see them."
+            ),
             "{out}"
         );
 
@@ -2165,14 +2199,14 @@ mod chain {
             "theirs",
         ]);
         assert!(
-            out.contains(
-                "Your draft of assets/deck.png is gone. You now read the team's file. A copy is \
-                 in crystalline kept list."
-            ),
+            out.contains("Your draft of assets/deck.png ended. You now read the team's file."),
             "{out}"
         );
         assert!(
-            out.contains("Your file is kept at /home/me/kept/team/assets/deck.png.md."),
+            out.contains(
+                "A copy is kept at /home/me/kept/team/assets/deck.png.md: see crystalline kept \
+                 list."
+            ),
             "{out}"
         );
     }

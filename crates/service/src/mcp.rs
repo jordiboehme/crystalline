@@ -4534,7 +4534,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. In a domain that reviews changes this settles your own draft; a path at either end of a move settles the whole move. theirs ends your draft and your text is gone. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. In a domain that reviews changes this settles your own draft; a path at either end of a move settles the whole move. theirs ends your draft and your text is gone, except an old draft's, which is kept first (kept_copy says so). Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -8417,7 +8417,7 @@ mod tests {
                 },
             ],
             "drafts_merged": [],
-            "conflicts_unreadable": "a sentence",
+            "conflicts_unreadable_reason": "a sentence",
         });
         let leaned = lean_origin_status(json!({ "domains": [domain.clone()] }));
         assert_eq!(leaned["domains"][0], domain);

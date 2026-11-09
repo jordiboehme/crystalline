@@ -77,8 +77,6 @@ fn note_unshared_spelling(answer: &mut Value, moves: &[Value]) {
     }
 }
 
-/// The text of an error a list answer carries in a row, in the words of who reads
-/// it: the same list as [`plain_refusal_text`], here where the caller is known.
 /// What status and update say about the caller's own drafts in a domain
 /// whose drafts stay open: her conflicts, the drafts a merge changed, and the
 /// sentence that says why her conflicts could not be listed. Nobody else's.
@@ -91,7 +89,8 @@ pub(super) struct OwnDrafts {
 impl OwnDrafts {
     /// Appends her conflicts after the folder's in `conflicts`, and sets
     /// `drafts_merged` and, when the list could not be read,
-    /// `conflicts_unreadable`.
+    /// `conflicts_unreadable_reason`. Not `conflicts_unreadable`: the fold plan
+    /// uses that name for a boolean per actor.
     fn add_to(&self, value: &mut Value) {
         let Some(object) = value.as_object_mut() else {
             return;
@@ -104,11 +103,13 @@ impl OwnDrafts {
         }
         object.insert("drafts_merged".to_string(), json!(self.merged));
         if let Some(sentence) = &self.unreadable {
-            object.insert("conflicts_unreadable".to_string(), json!(sentence));
+            object.insert("conflicts_unreadable_reason".to_string(), json!(sentence));
         }
     }
 }
 
+/// The text of an error a list answer carries in a row, in the words of who reads
+/// it: the same list as [`plain_refusal_text`], here where the caller is known.
 fn row_error(scope: &crate::scope::Scope, e: &EngineError) -> String {
     let text = e.to_string();
     let admin = matches!(
@@ -1693,7 +1694,11 @@ impl Engine {
         };
         let (conflicts, unreadable) = match listed {
             Ok(conflicts) => (conflicts, None),
-            Err(EngineError::Conflict(sentence)) => (Vec::new(), Some(sentence)),
+            Err(EngineError::Conflict(sentence))
+                if sentence.starts_with(super::draft_conflicts::RECORD_UNREADABLE) =>
+            {
+                (Vec::new(), Some(sentence))
+            }
             Err(e) => {
                 tracing::warn!(
                     domain,
@@ -1704,7 +1709,8 @@ impl Engine {
                     Vec::new(),
                     Some(
                         "Your conflicts in this domain cannot be read, so none are listed, and \
-                         a share of this domain refuses until they can."
+                         a share of this domain refuses until they can. Try again, and if it \
+                         stays, ask whoever runs this server."
                             .to_string(),
                     ),
                 )
@@ -4566,7 +4572,12 @@ impl Engine {
             "file": true,
             "kept": kept,
             "kept_copy": kept_file.is_some(),
-            "kept_file": kept_file,
+            // A path on this server's disk, so only for the machine owner, who
+            // is on it. Anybody else is told where the copy is listed.
+            "kept_file": kept_file.as_ref().filter(|_| actor == crate::scope::OWNER_IDENTITY_NAME),
+            "kept_note": kept_file
+                .as_ref()
+                .map(|_| "A copy of your file is kept. Find it in your kept list."),
         }))
     }
 
@@ -4741,8 +4752,9 @@ impl Engine {
                     if let Some(other) = other {
                         return Err(EngineError::Conflict(format!(
                             "The team's file {other} now uses the same address as your draft \
-                             of {}, so keeping yours would put two pages at one address. Change \
-                             the address in Edit merged, or take theirs.",
+                             of {}, so keeping yours would put two pages at one address. Give it \
+                             another address in a merged text (Edit merged in Fluid, \
+                             --content-file on the command line), or take theirs.",
                             row.path
                         )));
                     }

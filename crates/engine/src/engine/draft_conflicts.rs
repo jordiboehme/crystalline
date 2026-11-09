@@ -167,10 +167,17 @@ struct Kind {
     upstream_at: String,
 }
 
+/// How the refusal of a draft whose record cannot be read starts, so a caller
+/// tells it from any other conflict.
+pub(crate) const RECORD_UNREADABLE: &str = "The record of where your draft of ";
+
 /// The refusal of a draft whose record cannot be read (C1, the Task 5
-/// review's M2): it names the two ways out. Discard ends the draft without
-/// reading the record, and a removed record reads as a draft from before
-/// 0.32.0, which is `UnknownStart`. The cause goes to the log.
+/// review's M2): it names the ways out. Discard ends the draft without reading
+/// the record, and a removed record reads as a draft from before 0.32.0, which
+/// is `UnknownStart`. The record's place on disk is named only to the machine
+/// owner, whose drafts these are only on this machine (C24); anybody else
+/// reaches this server from elsewhere and is told to ask whoever runs it. The
+/// cause goes to the log.
 fn unreadable_record(
     domain: &str,
     actor: &str,
@@ -184,13 +191,15 @@ fn unreadable_record(
         path,
         "the record of where a draft started cannot be read: {source}"
     );
-    let file = match file {
-        Ok(file) => file.display().to_string(),
-        Err(_) => "its record".to_string(),
+    let way = match file {
+        Ok(file) if actor == crate::scope::OWNER_IDENTITY_NAME => {
+            format!("remove {}", file.display())
+        }
+        _ => "ask whoever runs this server to remove its record,".to_string(),
     };
     EngineError::Conflict(format!(
-        "The record of where your draft of {path} started cannot be read. Discard that \
-         draft, or remove {file} so it is read as a draft from before 0.32.0."
+        "{RECORD_UNREADABLE}{path} started cannot be read. Discard that draft, or {way} so it \
+         is read as a draft from before 0.32.0."
     ))
 }
 

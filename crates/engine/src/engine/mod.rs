@@ -7029,11 +7029,20 @@ impl Engine {
             // deletion the team made too, has landed and ends. Everything else
             // stands, in step or a conflict the gates read; a file never merges.
             for file in files {
-                if self
+                match self
                     .settle_overlay_file(&journal_dir, &root, domain, actor, file, &state)
-                    .await?
+                    .await
                 {
-                    cleared += 1;
+                    Ok(true) => cleared += 1,
+                    Ok(false) => {}
+                    // As for a page: nothing of hers is decided on a record
+                    // that cannot be read, and the error is hers, not the
+                    // caller's whose pull or share ran this pass.
+                    Err(e) => tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        "a draft file of '{actor}' was not converged: {e}"
+                    ),
                 }
             }
             // Once this actor's entries have settled, their references are read

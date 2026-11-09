@@ -912,34 +912,26 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 
 // --- origin share, withdraw and resolve ---------------------------------------
 
-/// Print `origin share`'s result: the proposal URL and change summary when
-/// one was opened or an already-open one was updated in place, the friendly
-/// "nothing to share" line when the team already has everything the domain
-/// knows, the refusal when a reviewer amended the proposal's branch, or
-/// (when conflicts are still pending) every conflicting path plus a pointer
-/// at `origin resolve`. A proposal that stands in a chain of two or more open
-/// layers also says where it sits, through [`stack_line`]; a share that also
-/// carried refreshed folder listings says so in one line of its own, through
-/// [`change_count_lines`]. A direct domain's commit is reported with its
-/// branch and page (`committed`). A share that fell back to a proposal, or a
-/// direct commit that works again, adds the receipt's `note` under its first
-/// line. The three direct refusals are reported too: a proposal still open
-/// (the sharer's own, or another person's), a branch whose rules refuse the
-/// commit, a branch that moved twice.
 /// What a draft's conflict is, in plain words, for a line about it: `None`
 /// for a conflict of the folder, which carries no `draft: true`.
 pub(crate) fn draft_kind_words(conflict: &serde_json::Value) -> Option<String> {
     if conflict["draft"] != true {
         return None;
     }
+    let file = conflict["file"] == true;
     let words = match conflict["kind"].as_str().unwrap_or("") {
+        "EditEdit" if file => "you and the team both changed this file".to_string(),
         "EditEdit" => match conflict["moved_from"].as_str() {
             Some(from) => format!("you moved it from {from}, and the team changed it"),
             None => "you and the team changed the same lines".to_string(),
         },
         "EditDelete" => "you changed it, the team deleted it".to_string(),
         "DeleteEdit" => "you deleted it, the team changed it".to_string(),
+        "AddAdd" if file => "you and the team both have a file here".to_string(),
         "AddAdd" => "you and the team both have a file here, with different text".to_string(),
+        "UnknownStart" if file => {
+            "an older draft of this file; keep yours or take the team's".to_string()
+        }
         "UnknownStart" => "a draft from an older version; compare the two texts".to_string(),
         "AddressTaken" => format!(
             "the team's file {} now uses the same address",
@@ -961,7 +953,7 @@ pub(crate) fn own_draft_lines(domain: &serde_json::Value) -> Vec<String> {
             path.as_str().unwrap_or("")
         ));
     }
-    if let Some(sentence) = domain["conflicts_unreadable"].as_str() {
+    if let Some(sentence) = domain["conflicts_unreadable_reason"].as_str() {
         lines.push(format!("  {sentence}"));
     }
     lines
@@ -976,7 +968,12 @@ pub(crate) fn update_conflict_lines(name: &str, conflict: &serde_json::Value) ->
             "  conflict: {path} (resolve with: crystalline origin resolve {name} {path} --keep mine|theirs)"
         )];
     };
-    let first = if conflict["file"] == true {
+    let first = if conflict["kind"] == "AddressTaken" {
+        // Keep mine is refused here: two pages cannot share one address.
+        format!(
+            "  conflict: {path} (compare: crystalline origin diff {name} --path {path}; resolve: crystalline origin resolve {name} {path} --keep theirs, or --content-file <f> with another address)"
+        )
+    } else if conflict["file"] == true {
         format!(
             "  conflict: {path} (a file: resolve: crystalline origin resolve {name} {path} --keep mine|theirs)"
         )
@@ -988,6 +985,20 @@ pub(crate) fn update_conflict_lines(name: &str, conflict: &serde_json::Value) ->
     vec![first, format!("    {words}")]
 }
 
+/// Print `origin share`'s result: the proposal URL and change summary when
+/// one was opened or an already-open one was updated in place, the friendly
+/// "nothing to share" line when the team already has everything the domain
+/// knows, the refusal when a reviewer amended the proposal's branch, or
+/// (when conflicts are still pending) every conflicting path plus a pointer
+/// at `origin resolve`. A proposal that stands in a chain of two or more open
+/// layers also says where it sits, through [`stack_line`]; a share that also
+/// carried refreshed folder listings says so in one line of its own, through
+/// [`change_count_lines`]. A direct domain's commit is reported with its
+/// branch and page (`committed`). A share that fell back to a proposal, or a
+/// direct commit that works again, adds the receipt's `note` under its first
+/// line. The three direct refusals are reported too: a proposal still open
+/// (the sharer's own, or another person's), a branch whose rules refuse the
+/// commit, a branch that moved twice.
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -1445,37 +1456,48 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
 
 /// Print `origin resolve`'s result: the resolved path and how many
 /// conflicts remain open.
-pub(crate) fn print_origin_resolve(asked: &str, data: &serde_json::Value, json: bool) {
+pub(crate) fn print_origin_resolve(
+    domain: &str,
+    asked: &str,
+    data: &serde_json::Value,
+    json: bool,
+) {
     if json {
         println!("{data}");
         return;
     }
-    for line in origin_resolve_lines(asked, data) {
+    for line in origin_resolve_lines(domain, asked, data) {
         println!("{line}");
     }
 }
 
-/// The lines [`print_origin_resolve`] prints for a resolve of `asked`. A
+/// The lines [`print_origin_resolve`] prints for a resolve of `asked` in
+/// `domain`. A
 /// draft's receipt (`draft: true`) says what each choice did: theirs ends the
 /// draft and says where a kept copy is, and a path at the other end of a move
 /// names where the draft is. A count the engine could not read
 /// (`remaining: null`) is said so, never printed as 0.
-fn origin_resolve_lines(asked: &str, data: &serde_json::Value) -> Vec<String> {
+fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> Vec<String> {
     let resolved = data["resolved"].as_str().unwrap_or("");
     let file = data["file"] == true;
     let mut lines = Vec::new();
     if data["draft"] == true && data["kept"] == "theirs" {
         let theirs = if file { "file" } else { "text" };
-        let mut line =
-            format!("Your draft of {resolved} is gone. You now read the team's {theirs}.");
         if data["kept_copy"] == true {
-            line.push_str(" A copy is in crystalline kept list.");
-        }
-        lines.push(line);
-        // A kept file is not text, so `kept show` cannot print it: its place
-        // on this machine's disk is how it is found.
-        if let Some(kept) = data["kept_file"].as_str() {
-            lines.push(format!("Your file is kept at {kept}."));
+            // An old draft: it ended, and nothing of hers is gone.
+            lines.push(format!(
+                "Your draft of {resolved} ended. You now read the team's {theirs}."
+            ));
+            lines.push(match data["kept_file"].as_str() {
+                // A kept file is not text, so `kept show` cannot print it: its
+                // place on this machine's disk is how it is found.
+                Some(kept) => format!("A copy is kept at {kept}: see crystalline kept list."),
+                None => "A copy is kept: see crystalline kept list.".to_string(),
+            });
+        } else {
+            lines.push(format!(
+                "Your draft of {resolved} is gone. You now read the team's {theirs}."
+            ));
         }
     } else {
         lines.push(format!("Resolved: {resolved}"));
@@ -1499,7 +1521,10 @@ fn origin_resolve_lines(asked: &str, data: &serde_json::Value) -> Vec<String> {
     }
     lines.push(match data["remaining"].as_u64() {
         Some(n) => format!("Remaining conflicts: {n}"),
-        None => "The number of conflicts left could not be read.".to_string(),
+        None => format!(
+            "The number of conflicts left could not be read. Run: crystalline origin status \
+             --domain {domain} to see them."
+        ),
     });
     if let Some(warning) = data["draft_warning"].as_str() {
         lines.push(format!("Note: {warning}"));
@@ -1514,6 +1539,7 @@ mod origin_resolve_tests {
     #[test]
     fn a_count_that_could_not_be_read_is_not_printed_as_zero() {
         let lines = origin_resolve_lines(
+            "team",
             "plan.md",
             &serde_json::json!({
                 "resolved": "plan.md",
@@ -1524,10 +1550,13 @@ mod origin_resolve_tests {
             lines,
             vec![
                 "Resolved: plan.md".to_string(),
-                "The number of conflicts left could not be read.".to_string(),
+                "The number of conflicts left could not be read. Run: crystalline origin status \
+                 --domain team to see them."
+                    .to_string(),
             ]
         );
         let lines = origin_resolve_lines(
+            "team",
             "plan.md",
             &serde_json::json!({
                 "resolved": "plan.md",
