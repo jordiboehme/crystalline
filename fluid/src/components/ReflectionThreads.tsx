@@ -107,6 +107,7 @@ import {
   IconButton,
   RAIL_LABEL,
 } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const ALERT = "text-red-800 dark:text-red-200";
 
@@ -673,7 +674,7 @@ export function ReflectionThreads({
   const { user, capabilities } = useAuth();
   const { hash } = useLocation();
   const refresh = () =>
-    queryClient.invalidateQueries({ queryKey: reflectionKey(domain) });
+    refreshAfterWrite(queryClient, { queryKey: reflectionKey(domain) });
   // Reading and commenting are one level; the anonymous viewer of a public
   // domain is the one reader who never comments (spec B5). A server that
   // serves read-only refuses every thread write, so it gets no controls.

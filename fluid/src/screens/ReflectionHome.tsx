@@ -62,6 +62,7 @@ import {
   withoutHtmlComments,
 } from "../markdown/htmlComments";
 import { stripIdLines } from "../reflectionText";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The refusal face, the one `DomainPoliciesCard` announces a problem in. */
 const ALERT =
@@ -662,8 +663,8 @@ function LeaveDomain({ domain }: { domain: string }): ReactElement {
   const leave = useMutation({
     mutationFn: () => removeMember(domain, user?.name ?? ""),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: REFLECTION_DOMAINS_KEY });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: REFLECTION_DOMAINS_KEY });
+      void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
       void navigate("/");
     },
   });

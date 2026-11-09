@@ -845,6 +845,72 @@ describe("the agent access card", () => {
       "cmt_deadbeef",
     );
   });
+
+  // The race behind a red `mcp-tokens.spec.ts` in CI: the list's first read
+  // is slow, the person issues a token before it answers, and that read,
+  // taken before the insert, answers last with no rows. A bare invalidate
+  // joined it and the list said "No tokens issued yet" until focus came back.
+  it("lists a token issued while the first read of the list is still on the wire", async () => {
+    let rows: Record<string, unknown>[] = [];
+    let reads = 0;
+    let answerFirstRead!: () => void;
+    apiMock.mockImplementation(
+      answersFor({
+        "/me/mcp-tokens": (_path, init) => {
+          if (init?.method === "POST") {
+            rows = [
+              {
+                id: 9,
+                label: "laptop",
+                created_at: "2026-09-07T00:00:00Z",
+                last_used: null,
+              },
+            ];
+            return { id: 9, label: "laptop", token: "cmt_deadbeef" };
+          }
+          reads += 1;
+          const snapshot = [...rows];
+          if (reads > 1) {
+            return snapshot;
+          }
+          return new Promise((resolve) => {
+            answerFirstRead = () => resolve(snapshot);
+          });
+        },
+      }),
+    );
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <Tooltips>
+          <AgentAccessCard />
+        </Tooltips>
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByText("Reading your tokens")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Label"), "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+    const dialog = await screen.findByRole("dialog", { name: "laptop" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    // Only now does the first read answer, with the list as it stood
+    // before the insert.
+    answerFirstRead();
+
+    // The dialog is gone, so this is the row in the list and not the
+    // dialog's own title.
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+    expect(screen.queryByText(/no tokens issued yet/i)).not.toBeInTheDocument();
+    expect(reads).toBe(2);
+  });
 });
 
 describe("the connected clients card", () => {

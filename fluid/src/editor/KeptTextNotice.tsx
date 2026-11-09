@@ -41,6 +41,7 @@ import type { KeptTextEntry } from "../api/kept";
 import { useAuth } from "../auth/AuthContext";
 import { KeptTextDialog } from "../components/KeptTextDialog";
 import { FOCUS_RING } from "../components/primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const NOTICE =
   "flex flex-wrap items-center gap-x-3 gap-y-2 rounded border border-hair bg-sunken px-3 py-2 text-sm text-ink-2";
@@ -124,7 +125,7 @@ export function KeptTextNotice({
   });
 
   const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: keptKey(domain) });
+    void refreshAfterWrite(queryClient, { queryKey: keptKey(domain) });
   };
 
   /** Delete the kept copy. `used`: its text was saved from the editor. */

@@ -17,6 +17,7 @@ import { renameReportKey } from "../api/admin";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import type { DomainListing } from "../api/domains";
 import { engramsRoute } from "../paths";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** Patch the listing, park the report, land on the renamed domain's engram view. */
 export function followRename(
@@ -60,5 +61,5 @@ export function landOnRenamed(
   // The engram view, not the domain's address: only the engram view shows the
   // report, and the domain's address may open on the Reflection.
   void navigate(engramsRoute(report.domain), { replace: true });
-  void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+  void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
 }

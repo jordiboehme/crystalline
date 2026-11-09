@@ -45,6 +45,7 @@ import { isRetired } from "../lifecycle";
 import { engramsRoute } from "../paths";
 import { RETIREMENT_STATUSES } from "../retirement";
 import type { RetireDialogProps } from "./RetireDialog";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -154,12 +155,12 @@ export default function RetireDialogBody({
       });
       // The neighborhood is different: the retire endpoint wires the
       // supersedes pair itself, so the graph is worth reading again now.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
       });
       // So is the tree: a browse row carries its engram's status, which is
       // what fades a retired one in the sidebar, and that status just moved.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(engram.domain),
       });
       // And so are the listings, for the same reason and none of the same
@@ -168,7 +169,7 @@ export default function RetireDialogBody({
       // here would ever notice them going stale. Marked rather than refetched
       // by that alone, which is exactly what is wanted - the next mount of one
       // reads the retired status instead of the row it cached before.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(engram.domain),
       });
     },
@@ -186,10 +187,10 @@ export default function RetireDialogBody({
       // is about to land in front of - and from every listing of that domain,
       // which is the half of that screen a deleted engram would otherwise
       // still be sitting in.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(engram.domain),
       });
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainEngramsRoot(engram.domain),
       });
       // The engram view the reader was browsing, not the domain's address,

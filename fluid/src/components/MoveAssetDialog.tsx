@@ -19,6 +19,7 @@ import { moveReflectionAsset, reflectionAssetsKey } from "../api/reflection";
 import { invalidateReflection } from "../api/reflectionDomains";
 import { focusPageHeading } from "../focusHeading";
 import { BUTTON, FIELD } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** "Moved. 2 links updated.", with one link said as one. */
 function movedText(links: number): string {
@@ -85,7 +86,7 @@ export function MoveAssetDialog({
       // The listing's key sits under the Reflection's prefix already; it is
       // named as well so this stays right if the keys are ever split.
       invalidateReflection(queryClient, domain);
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: reflectionAssetsKey(domain),
       });
       setReceipt(answer);

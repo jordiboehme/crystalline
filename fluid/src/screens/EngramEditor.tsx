@@ -112,6 +112,7 @@ import { useTheme } from "../theme/context";
 import type { WikilinkResolver } from "../wikilinks";
 import { buildWikilinkResolver } from "../wikilinks";
 import NotFound from "./NotFound";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** The buffer's accessible name - shared with the state a conflict rebuilds. */
 const ARIA_LABEL = "Engram source";
@@ -787,7 +788,7 @@ function Surface({
       // fresh for a minute (`TREE_STALE_TIME`), and the sidebar stays mounted
       // for as long as a reader is inside a domain, so without this a renamed
       // engram leaves a row in the frame that 404s when it is clicked.
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(saved.domain),
       });
       /*
@@ -985,7 +986,7 @@ function Surface({
   // drawn from changed: one refetch per rename rather than one per save.
   useEffect(() => {
     if (inRoom && collab.permalink !== engram.permalink) {
-      void queryClient.invalidateQueries({
+      void refreshAfterWrite(queryClient, {
         queryKey: domainTreeKey(engram.domain),
       });
       void navigate(editRoute(engram.domain, collab.permalink), {

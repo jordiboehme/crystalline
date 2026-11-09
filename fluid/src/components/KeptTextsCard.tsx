@@ -29,6 +29,7 @@ import { formatInstant } from "../format";
 import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
 import { KeptTextDialog } from "./KeptTextDialog";
 import { BUTTON } from "./primitives";
+import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 export function KeptTextsCard({
   domain,
@@ -51,7 +52,7 @@ export function KeptTextsCard({
       setProblem(problemDetail(error));
     },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keptKey(domain) });
+      void refreshAfterWrite(queryClient, { queryKey: keptKey(domain) });
     },
   });
   const readOnly = capabilities.readOnly ? READ_ONLY_REASON : undefined;
