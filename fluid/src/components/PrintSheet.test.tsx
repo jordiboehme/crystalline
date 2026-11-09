@@ -102,4 +102,19 @@ describe("the printed page's sheet", () => {
     expect(svg.getAttribute("width")).toBe("22mm");
     expect(svg.closest("figure")).toHaveTextContent("Open in Fluid");
   });
+
+  it("makes the QR code and its caption a link to the page, for a PDF reader", async () => {
+    const { container } = page();
+    const svg = await waitFor(() => {
+      const found = container.querySelector<SVGElement>("svg[data-qr-text]");
+      expect(found).not.toBeNull();
+      return found as SVGElement;
+    });
+    const link = svg.closest("a");
+    expect(link).not.toBeNull();
+    expect(link?.getAttribute("href")).toBe(
+      "https://fluid.example/d/eng/e/alpha",
+    );
+    expect(link).toHaveTextContent("Open in Fluid");
+  });
 });

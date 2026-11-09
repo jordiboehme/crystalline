@@ -886,3 +886,19 @@ for (const theme of ["light", "dark"] as const) {
     });
   }
 }
+
+test("a PDF of a printed page carries the QR stamp as a link to the page", async ({
+  page,
+  browserName,
+}) => {
+  test.skip(browserName !== "chromium", "only Chromium makes a PDF here");
+  await signIn(page);
+  await page.goto(SCREENS[0]?.path ?? "/");
+  const stamp = page.locator("svg[data-qr-text]");
+  await expect(stamp).toHaveCount(1);
+  const address = await stamp.getAttribute("data-qr-text");
+  expect(address).toMatch(/^https?:\/\//);
+  const pdf = (await page.pdf({ format: "A4" })).toString("latin1");
+  // A link in a PDF is an annotation naming its address as a URI.
+  expect(pdf).toContain(`/URI (${address ?? ""})`);
+});
