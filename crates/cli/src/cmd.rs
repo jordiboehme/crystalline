@@ -1379,11 +1379,59 @@ pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {
         println!("{data}");
         return;
     }
-    println!("Resolved: {}", data["resolved"].as_str().unwrap_or(""));
-    println!(
-        "Remaining conflicts: {}",
-        data["remaining"].as_u64().unwrap_or(0)
-    );
+    for line in origin_resolve_lines(data) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_origin_resolve`] prints. A count the engine could not
+/// read (`remaining: null`) is said so, never printed as 0.
+fn origin_resolve_lines(data: &serde_json::Value) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Resolved: {}",
+        data["resolved"].as_str().unwrap_or("")
+    )];
+    lines.push(match data["remaining"].as_u64() {
+        Some(n) => format!("Remaining conflicts: {n}"),
+        None => "The number of conflicts left could not be read.".to_string(),
+    });
+    if let Some(warning) = data["draft_warning"].as_str() {
+        lines.push(format!("Note: {warning}"));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod origin_resolve_tests {
+    use super::origin_resolve_lines;
+
+    #[test]
+    fn a_count_that_could_not_be_read_is_not_printed_as_zero() {
+        let lines = origin_resolve_lines(&serde_json::json!({
+            "resolved": "plan.md",
+            "remaining": null,
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: plan.md".to_string(),
+                "The number of conflicts left could not be read.".to_string(),
+            ]
+        );
+        let lines = origin_resolve_lines(&serde_json::json!({
+            "resolved": "plan.md",
+            "remaining": 2,
+            "draft_warning": "a note from the writer",
+        }));
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: plan.md".to_string(),
+                "Remaining conflicts: 2".to_string(),
+                "Note: a note from the writer".to_string(),
+            ]
+        );
+    }
 }
 
 /// Reads `--content-file`'s bytes for `origin resolve --content-file`, as raw

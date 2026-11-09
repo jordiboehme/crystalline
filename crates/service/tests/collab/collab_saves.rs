@@ -4772,47 +4772,27 @@ async fn merged_with_a_room_open_lands_through_the_rooms_own_merge() {
     );
 }
 
-/// A merged text that changes the draft's address while a room is open over it:
-/// the room follows the new address at its next save, keeps its typing, and
-/// she still holds one draft.
+/// A merged text that changes the draft's address is refused while a room is
+/// open over the draft, since a room is keyed by its address. The pass's merge
+/// is refused the same way.
 #[tokio::test]
-async fn merged_with_a_new_address_while_a_room_is_open_keeps_one_draft() {
+async fn merged_with_a_new_address_while_a_room_is_open_is_refused() {
     let (_tmp, engine, _scratch) = review_origin_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     engine.set_collab_sessions(&sessions);
-    let (joined, doc) = alices_saved_room(&engine, &sessions).await;
-    append_line(&joined, &doc, "alice typed this and did not save").await;
-    let merged = alices_row(&engine)
-        .await
-        .replace("permalink: alpha", "permalink: alpha-two");
+    let (joined, _doc) = alices_saved_room(&engine, &sessions).await;
+    let before = alices_row(&engine).await;
+    let merged = before.replace("permalink: alpha", "permalink: alpha-two");
 
-    let receipt = alice_resolves(&engine, None, Some(&merged)).await.unwrap();
-    assert_eq!(receipt["kept"], "merged", "{receipt}");
-    joined
-        .session
-        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 100))
-        .await;
-    let rows: Vec<(String, String)> = {
-        let store = engine.store();
-        let store = store.lock().await;
-        let id = store.domain_id("team").await.unwrap().unwrap();
-        store
-            .overlay_entries(id, "alice")
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| (row.path, row.permalink))
-            .collect()
-    };
-    let (live, _) = joined.session.snapshot().await;
+    let err = alice_resolves(&engine, None, Some(&merged))
+        .await
+        .unwrap_err();
     assert_eq!(
-        rows,
-        vec![("alpha.md".to_string(), "alpha-two".to_string())]
+        err.to_string(),
+        "'alpha.md' is open in an editor, and the merged text gives it a new address. Close \
+         it, then save the merged text."
     );
-    assert!(
-        live.contains("alice typed this and did not save") && live.contains("permalink: alpha-two"),
-        "{live}"
-    );
-    let row = alices_row(&engine).await;
-    assert!(row.contains("alice typed this and did not save"), "{row}");
+    assert_eq!(alices_row(&engine).await, before, "the draft stands");
+    assert!(sessions.has_live_room("team", "alpha", Some("alice")).await);
+    drop(joined);
 }

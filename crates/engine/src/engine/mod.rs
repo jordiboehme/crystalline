@@ -1071,6 +1071,10 @@ pub struct Engine {
     // once. See `Engine::fail_next_merge_start`.
     #[cfg(any(test, feature = "testing"))]
     fail_next_merge_start: std::sync::atomic::AtomicBool,
+    // When armed, a resolve's next settle of the deletion half of a move
+    // fails once. See `Engine::fail_next_half_settle`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_half_settle: std::sync::atomic::AtomicBool,
     // When armed, the next resolution of a share's credential answers that the
     // caller connected no personal identity, once. See
     // `Engine::refuse_next_personal_credential`.
@@ -2556,6 +2560,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_merge_start: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            fail_next_half_settle: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
             refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
@@ -2782,13 +2788,36 @@ impl Engine {
         }
     }
 
-    /// Make the convergence pass's next save of a moved start, after it wrote a
-    /// merge, fail once, as a full disk would. Nothing in the daemon, the CLI or
-    /// the MCP surface calls this.
+    /// Make the next save of a moved start after a merge was written fail once,
+    /// as a full disk would: the convergence pass's, or a merged resolve's.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
     #[cfg(any(test, feature = "testing"))]
     pub fn fail_next_merge_start(&self) {
         self.fail_next_merge_start
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make a resolve's next settle of the deletion half of a move fail once,
+    /// after its draft settled, as a change to that half in the meantime would.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_half_settle(&self) {
+        self.fail_next_half_settle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::fail_next_half_settle`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    fn take_failed_half_settle(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_half_settle
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
     }
 
     /// Whether [`Engine::fail_next_merge_start`] is armed, consuming the arming.

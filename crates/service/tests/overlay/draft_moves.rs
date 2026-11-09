@@ -2279,3 +2279,115 @@ async fn keep_mine_on_a_case_move_starts_at_the_teams_spelling() {
     assert_eq!(f.start("Plan.md").unwrap().start, Some(later));
     assert_eq!(f.conflicts().await, vec![]);
 }
+
+/// m-1: a merged resolve takes the pass's three steps. Its start could not move
+/// after the row was written, so the record still marks the merge, and the
+/// next pass merges again rather than reading her case move as landed: both
+/// halves stand, on either disk.
+#[tokio::test]
+async fn a_merged_resolve_whose_start_could_not_move_keeps_the_case_move() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    eprintln!("the temp folder folds case: {}", folds_case(&f.root));
+    f.a_move_in_conflict("Plan.md").await;
+    let before = f.start("Plan.md").unwrap();
+
+    f.engine.fail_next_merge_start();
+    f.engine
+        .origin_resolve(
+            "team",
+            "Plan.md",
+            None,
+            Some(bobs(LONG).as_bytes()),
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(f.row("Plan.md").await, bobs(LONG));
+    assert_eq!(
+        f.start("Plan.md"),
+        Some(DraftStart {
+            merging: Some(false),
+            ..before
+        }),
+        "the mark stands over the old start"
+    );
+
+    f.engine.converge_overlays("team").await.unwrap();
+    assert_eq!(
+        f.rows().await,
+        vec![
+            ("Plan.md".to_string(), false),
+            ("plan.md".to_string(), true)
+        ]
+    );
+    let record = f.start("Plan.md").unwrap();
+    assert_eq!(record.merging, None);
+    assert_eq!(record.start.as_deref(), Some(bobs(LONG).as_str()));
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+/// m-3: Keep mine on a move whose deletion half changed meanwhile settles the
+/// draft and says the half is not settled, so she settles it again.
+#[tokio::test]
+async fn a_move_settled_half_way_says_so_and_a_second_press_finishes_it() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_move_in_conflict("renamed.md").await;
+
+    f.engine.fail_next_half_settle();
+    let err = f
+        .engine
+        .origin_resolve(
+            "team",
+            "renamed.md",
+            Some("mine"),
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Your draft of renamed.md is settled, but plan.md, where you moved it from, changed \
+         while it was being settled and is not. Settle plan.md again."
+    );
+    assert_eq!(
+        f.start("renamed.md").unwrap().start.as_deref(),
+        Some(bobs(LONG).as_str())
+    );
+
+    let receipt = f.resolve("plan.md", "mine").await;
+    assert_eq!(receipt["resolved"], "renamed.md", "{receipt}");
+    assert_eq!(
+        f.start("plan.md").unwrap().start.as_deref(),
+        Some(bobs(LONG).as_str())
+    );
+    assert_eq!(f.conflicts().await, vec![]);
+}
+
+/// m-7: a merged text whose mirror could not be written still lands, and the
+/// receipt says so, as every draft write does.
+#[tokio::test]
+async fn a_merged_resolve_tells_the_caller_when_its_mirror_failed() {
+    let f = fixture(&[("plan.md", LONG)]).await;
+    f.a_move_in_conflict("renamed.md").await;
+    // A folder where the mirror's file goes, so the copy cannot be written.
+    let mirror = f.state.join("overlays/team/alice/renamed.md");
+    std::fs::remove_file(&mirror).unwrap();
+    std::fs::create_dir_all(mirror.join("in-the-way")).unwrap();
+
+    let merged = bobs(LONG).replace("the last line", "alice's last line");
+    let receipt = f
+        .engine
+        .origin_resolve(
+            "team",
+            "renamed.md",
+            None,
+            Some(merged.as_bytes()),
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["kept"], "merged", "{receipt}");
+    assert!(receipt["draft_warning"].is_string(), "{receipt}");
+    assert_eq!(f.row("renamed.md").await, merged);
+}

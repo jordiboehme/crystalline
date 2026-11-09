@@ -4307,6 +4307,7 @@ impl Engine {
             .find(|conflict| conflict.path == row.path)
             .map(|conflict| conflict.kind);
         let mut kept_copy = false;
+        let mut warning: Option<String> = None;
         let kept = match resolution {
             ops::Resolution::Mine => {
                 if !row.tombstone {
@@ -4326,7 +4327,8 @@ impl Engine {
                     if let Some(other) = other {
                         return Err(EngineError::Conflict(format!(
                             "The team's file {other} now uses the same address as your draft \
-                             of {}. Change the address in Edit merged, or take theirs.",
+                             of {}, so keeping yours would put two pages at one address. Change \
+                             the address in Edit merged, or take theirs.",
                             row.path
                         )));
                     }
@@ -4344,17 +4346,8 @@ impl Engine {
                 )
                 .await?;
                 if let Some(t) = half {
-                    self.settle_row(
-                        &view,
-                        domain,
-                        domain_id,
-                        actor,
-                        &reading,
-                        t,
-                        Settle::Keep,
-                        half_start,
-                    )
-                    .await?;
+                    self.settle_half(&view, domain, domain_id, actor, &reading, d, t, half_start)
+                        .await?;
                 }
                 "mine"
             }
@@ -4421,6 +4414,22 @@ impl Engine {
                     )
                 })?;
                 let address = Engine::overlay_record(&row.path, text)?.permalink;
+                // A room is keyed by its draft's address, so a merged text that
+                // changes it is refused while a room is open, as the pass's merge
+                // is. Asked before any draft lock.
+                if !row.tombstone
+                    && address != row.permalink
+                    && let Some(rooms) = self.collab_rooms()
+                    && rooms
+                        .has_live_room(domain, &row.permalink, Some(actor))
+                        .await
+                {
+                    return Err(EngineError::Conflict(format!(
+                        "'{}' is open in an editor, and the merged text gives it a new address. \
+                         Close it, then save the merged text.",
+                        row.path
+                    )));
+                }
                 if let Some(other) = reading.team_file_at_address(&address)? {
                     return Err(EngineError::Conflict(format!(
                         "The team's file {other} now uses the same address as your merged text \
@@ -4429,29 +4438,21 @@ impl Engine {
                     )));
                 }
                 let (start, half_start) = settled_starts(&mut reading, d, half, can_record)?;
-                self.settle_row(
-                    &view,
-                    domain,
-                    domain_id,
-                    actor,
-                    &reading,
-                    d,
-                    Settle::Write(text),
-                    start,
-                )
-                .await?;
-                if let Some(t) = half {
-                    self.settle_row(
+                warning = self
+                    .settle_row(
                         &view,
                         domain,
                         domain_id,
                         actor,
                         &reading,
-                        t,
-                        Settle::Keep,
-                        half_start,
+                        d,
+                        Settle::Write(text),
+                        start,
                     )
                     .await?;
+                if let Some(t) = half {
+                    self.settle_half(&view, domain, domain_id, actor, &reading, d, t, half_start)
+                        .await?;
                 }
                 "merged"
             }
@@ -4473,21 +4474,81 @@ impl Engine {
                 Value::Null
             }
         };
-        Ok(json!({
+        let mut receipt = json!({
             "resolved": row.path,
+            // `null` when the count could not be read.
             "remaining": remaining,
             // The receipt says where the resolution landed: in this actor's
             // draft, not in the folder the team reviewed.
             "draft": true,
             "kept": kept,
             "kept_copy": kept_copy,
-        }))
+        });
+        // What the draft writer says beside a write that landed, under the key
+        // every draft write tells its caller with.
+        note_unmirrored(&mut receipt, warning);
+        Ok(receipt)
+    }
+
+    /// [`Engine::settle_row`] for the deletion half `t` of draft `d`'s move,
+    /// after the draft settled. A half that changed meanwhile is refused with
+    /// a sentence that says the draft is settled and the half is not, so she
+    /// knows to settle it again; nothing of hers is lost either way.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_half(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        d: usize,
+        t: usize,
+        start: Option<crate::draft_start::DraftStart>,
+    ) -> Result<()> {
+        let settled = if self.take_failed_half_settle() {
+            Err(EngineError::Internal(
+                "the armed failure of a test".to_string(),
+            ))
+        } else {
+            self.settle_row(
+                view,
+                domain,
+                domain_id,
+                actor,
+                reading,
+                t,
+                Settle::Keep,
+                start,
+            )
+            .await
+            .map(|_| ())
+        };
+        settled.map_err(|e| {
+            tracing::warn!(
+                domain,
+                actor,
+                path = reading.rows[t].path.as_str(),
+                "the deletion half of a settled move was not settled: {e}"
+            );
+            EngineError::Conflict(format!(
+                "Your draft of {} is settled, but {}, where you moved it from, changed while it \
+                 was being settled and is not. Settle {} again.",
+                reading.rows[d].path, reading.rows[t].path, reading.rows[t].path
+            ))
+        })
     }
 
     /// Row `i` of `reading`, under its draft lock and only while it and its
     /// record are still what was read: `settle` it, then save `start` when
     /// there is one. A row or record that changed meanwhile is refused, with
-    /// nothing written.
+    /// nothing written. Answers the draft writer's warning, if it gave one.
+    ///
+    /// A write takes the pass's three steps (`Engine::take_merge`): the record
+    /// is marked `merging`, the row is written, and the start moves with the
+    /// mark cleared. A failure after the row leaves the mark, so the next pass
+    /// merges again rather than reading the row as her case move landed. A row
+    /// that could not be written takes the mark back off.
     #[allow(clippy::too_many_arguments)]
     async fn settle_row(
         &self,
@@ -4499,7 +4560,7 @@ impl Engine {
         i: usize,
         settle: Settle<'_>,
         start: Option<crate::draft_start::DraftStart>,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let row = &reading.rows[i];
         let lock = self.draft_lock(domain, actor, &row.path)?;
         let _guard = lock.lock().await;
@@ -4513,19 +4574,51 @@ impl Engine {
                 row.path
             )));
         }
+        let mut warning = None;
+        let mut wrote = false;
         match settle {
             Settle::Keep => {}
             Settle::Write(text) => {
-                if let Some(warning) = view.write(domain_id, &row.path, text).await? {
-                    tracing::warn!(domain, actor, path = row.path.as_str(), "{warning}");
+                // Her own choice, so the replay of a mark left behind tells her
+                // of no merge.
+                let read = reading.records[i].as_ref().filter(|_| start.is_some());
+                if let Some(read) = read {
+                    let marked = crate::draft_start::DraftStart {
+                        merging: Some(false),
+                        ..read.clone()
+                    };
+                    self.save_start(domain, actor, &marked)?;
                 }
+                match view.write(domain_id, &row.path, text).await {
+                    Ok(said) => warning = said,
+                    Err(e) => {
+                        if let Some(read) = read
+                            && let Err(undo) = self.save_start(domain, actor, read)
+                        {
+                            tracing::warn!(
+                                domain,
+                                actor,
+                                path = row.path.as_str(),
+                                "the merge mark could not be taken off a draft whose merged text \
+                                 was not written; the next pass merges it again: {undo}"
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+                wrote = true;
             }
             Settle::Drop => view.drop(domain_id, &row.path).await?,
         }
         if let Some(start) = start {
+            if wrote && self.take_failed_merge_start() {
+                return Err(EngineError::Internal(
+                    "the armed failure of a test".to_string(),
+                ));
+            }
             self.save_start(domain, actor, &start)?;
         }
-        Ok(())
+        Ok(warning)
     }
 
     /// Keep a copy of `row`'s text for its owner, the way a room keeps a text

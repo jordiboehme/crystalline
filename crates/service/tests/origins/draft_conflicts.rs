@@ -4079,9 +4079,14 @@ async fn keep_mine_is_refused_for_a_taken_address() {
             .await
             .unwrap_err();
         let said = err.to_string();
-        assert!(
-            said.contains("bobs.md") && said.contains("mine.md") && said.contains("take theirs"),
-            "changed {changed}: {said}"
+        // The list may say the page is gone (the index's reading of a pure
+        // rename), so the sentence says why Keep mine is refused.
+        assert_eq!(
+            said,
+            "The team's file bobs.md now uses the same address as your draft of mine.md, so \
+             keeping yours would put two pages at one address. Change the address in Edit \
+             merged, or take theirs.",
+            "changed {changed}"
         );
         // A merged text at that address is refused the same way.
         let same = t.row("alice", "mine.md").await;
@@ -4351,4 +4356,49 @@ async fn the_receipt_counts_her_conflicts_left() {
         t.conflicts("alice").await,
         vec![conflict("alice", "gone.md", EditDelete)]
     );
+}
+
+/// m-2: a folder conflict in a reviewing domain is the folder's, and settling
+/// it writes the team's folder, so it still needs GitHub on. Only a draft
+/// settles with GitHub off.
+#[tokio::test]
+async fn a_folder_conflict_in_a_reviewing_domain_still_needs_github() {
+    let t = team(&[("plan.md", plan())]).await;
+    t.state_edit(|state| {
+        state.conflicts.push(crystalline_remote::state::Conflict {
+            id: "abcdef01".to_string(),
+            path: "plan.md".to_string(),
+            kind: crystalline_remote::merge::ConflictKind::EditEdit,
+            base_commit: "base".to_string(),
+            upstream_commit: "upstream".to_string(),
+            detected_at: chrono::Utc::now(),
+        });
+    });
+    let off = t.engine_over(t.eng.store(), |config| {
+        config.github = Some(crystalline_core::config::GitHubConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+    });
+
+    for keep in ["mine", "theirs"] {
+        let err = off
+            .origin_resolve(
+                "team",
+                "plan.md",
+                Some(keep),
+                None,
+                ShareActor::Account("alice".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Remote(crystalline_remote::RemoteError::NotEnabled)
+            ),
+            "{keep}: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(t.root().join("plan.md")).unwrap(), plan());
 }
