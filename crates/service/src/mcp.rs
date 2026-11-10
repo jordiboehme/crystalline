@@ -258,6 +258,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::future::BoxFuture;
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::tool::{InputResponses, RequestState};
 use rmcp::handler::server::wrapper::Parameters;
@@ -3206,15 +3207,30 @@ impl McpServer {
     /// anything else, and so does the last arm here. This never reaches the
     /// engine's sources: a remote call is answered from this server's own
     /// domains (decision D8).
-    pub(crate) async fn remote_tool(
-        &self,
+    ///
+    /// Not an `async fn`: each arm is its own boxed future, so polling a call
+    /// costs only that verb's stack frame. One state machine over all the
+    /// verbs gave its poll a frame of about 190 KB in a debug build, every
+    /// verb's temporaries side by side, and with the SQL parser's recursion
+    /// under it that ran past a 2 MiB thread stack.
+    pub(crate) fn remote_tool<'a>(
+        &'a self,
         tool: &str,
         args: Value,
-        caller: &Caller,
-    ) -> Result<Value, RemoteToolError> {
+        caller: &'a Caller,
+    ) -> BoxFuture<'a, Result<Value, RemoteToolError>> {
+        fn boxed<'a>(
+            verb: impl Future<Output = Result<Value, RemoteToolError>> + Send + 'a,
+        ) -> BoxFuture<'a, Result<Value, RemoteToolError>> {
+            Box::pin(verb)
+        }
         match tool {
-            "write_engram" => remote_verdict(self.write_core(remote_args(args)?, caller).await),
-            "read_engram" => {
+            "write_engram" => {
+                boxed(
+                    async move { remote_verdict(self.write_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "read_engram" => boxed(async move {
                 let p: ReadParams = remote_args(args)?;
                 let is_file = crate::engine::attachment_identifier(&p.identifier).is_some();
                 let mut value = self.read_core(p, caller).await.map_err(remote_failed)?;
@@ -3233,48 +3249,73 @@ impl McpServer {
                     .await;
                 with_files(&mut value, files);
                 Ok(value)
+            }),
+            "edit_engram" => {
+                boxed(
+                    async move { remote_verdict(self.edit_core(remote_args(args)?, caller).await) },
+                )
             }
-            "edit_engram" => remote_verdict(self.edit_core(remote_args(args)?, caller).await),
-            "move_engram" => remote_verdict(self.move_core(remote_args(args)?, caller).await),
-            "split_engram" => remote_verdict(self.split_core(remote_args(args)?, caller).await),
-            "delete_engram" => remote_verdict(self.delete_core(remote_args(args)?, caller).await),
-            "search_engrams" => self
-                .search_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "build_context" => self
-                .build_context_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "recent_activity" => self
-                .recent_activity_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "list_domains" => self
-                .list_domains_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "browse_domain" => self
-                .browse_domain_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "validate_engrams" => self
-                .validate_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "infer_schema" => self
-                .infer_schema_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "vocabulary" => self
-                .vocabulary_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            t if t == crate::EVOLVE_TOOL_NAME => self
-                .evolve_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "reflect" => {
+            "move_engram" => {
+                boxed(
+                    async move { remote_verdict(self.move_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "split_engram" => {
+                boxed(
+                    async move { remote_verdict(self.split_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "delete_engram" => {
+                boxed(
+                    async move { remote_verdict(self.delete_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "search_engrams" => boxed(async move {
+                self.search_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "build_context" => boxed(async move {
+                self.build_context_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "recent_activity" => boxed(async move {
+                self.recent_activity_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "list_domains" => boxed(async move {
+                self.list_domains_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "browse_domain" => boxed(async move {
+                self.browse_domain_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "validate_engrams" => boxed(async move {
+                self.validate_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "infer_schema" => boxed(async move {
+                self.infer_schema_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "vocabulary" => boxed(async move {
+                self.vocabulary_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            t if t == crate::EVOLVE_TOOL_NAME => boxed(async move {
+                self.evolve_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "reflect" => boxed(async move {
                 let p: ReflectParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3285,8 +3326,8 @@ impl McpServer {
                     .reflect(&p, &remote_reflection_caller(caller))
                     .await
                     .map_err(remote_engine)
-            }
-            "read_reflection" => {
+            }),
+            "read_reflection" => boxed(async move {
                 let p: ReadReflectionParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3311,8 +3352,8 @@ impl McpServer {
                     with_files(&mut value, files);
                 }
                 Ok(value)
-            }
-            "write_reflection" => {
+            }),
+            "write_reflection" => boxed(async move {
                 let p: WriteReflectionParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3322,8 +3363,8 @@ impl McpServer {
                 self.write_reflection_core(&p, &remote_reflection_caller(caller), caller)
                     .await
                     .map_err(remote_engine)
-            }
-            "discuss" => {
+            }),
+            "discuss" => boxed(async move {
                 let p: DiscussParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3334,11 +3375,14 @@ impl McpServer {
                     .discuss(&p, &remote_reflection_caller(caller))
                     .await
                     .map_err(remote_engine)
+            }),
+            other => {
+                let refused = RemoteToolError::Refused(format!(
+                    "the tool '{other}' {}",
+                    crate::remote_ctl::NOT_REMOTE
+                ));
+                boxed(std::future::ready(Err(refused)))
             }
-            other => Err(RemoteToolError::Refused(format!(
-                "the tool '{other}' {}",
-                crate::remote_ctl::NOT_REMOTE
-            ))),
         }
     }
 
@@ -4394,7 +4438,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; while one of your proposals is open, a share that names it with proposal amends it, a share with as_proposal: true stacks on it or amends it, and after a refusal a share does that on its own; any other direct share refuses while one of your proposals is open (merge or withdraw it first); another person's open proposal does not stop your direct commit, and files that only that proposal changed stay out of your commit. Another person's proposal is never yours to amend or extend: as_proposal: true or a proposal number naming it is refused while it is open. A direct share answers branch_protected when the branch's rules do not accept your direct commits. When that answer carries fallback, it offers the same changes as a proposal: offer it to the user and call again with as_proposal: true. Without fallback (another person's proposal is open), relay its guidance as given. After such a refusal, later shares try the direct commit and fall back to a proposal on their own, and a receipt with fell_back says so; as_proposal: false tries the direct commit only. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance shares with personal identities (github.share_identity personal, the default with a GitHub App), the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries, and the domain takes one open proposal at a time on every forge: while another member's proposal is open the share answers proposal_open with own: false and a guidance sentence naming whose it is; nothing was shared, so relay it and share again once that proposal is merged or closed. Your own open proposal is updated in place where stacks are off; when that receipt carries a note, the team merged the proposal while your change was on its way, so relay the note: a change the merge did not hold stays a draft to share again. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; while one of your proposals is open, a share that names it with proposal amends it, a share with as_proposal: true stacks on it or amends it, and after a refusal a share does that on its own; any other direct share refuses while one of your proposals is open (merge or withdraw it first); another person's open proposal does not stop your direct commit, and files that only that proposal changed stay out of your commit. Another person's proposal is never yours to amend or extend: as_proposal: true or a proposal number naming it is refused while it is open. A direct share answers branch_protected when the branch's rules do not accept your direct commits. When that answer carries fallback, it offers the same changes as a proposal: offer it to the user and call again with as_proposal: true. Without fallback (another person's proposal is open), relay its guidance as given. After such a refusal, later shares try the direct commit and fall back to a proposal on their own, and a receipt with fell_back says so; as_proposal: false tries the direct commit only. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance shares with personal identities (github.share_identity personal, the default with a GitHub App), the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -4463,7 +4507,7 @@ impl McpServer {
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then call share_changes with proposal set to the number the feedback is on, which amends that layer and re-bases the layers above it. On forges without stacks that same call updates the one open proposal in place. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. drafts_merged names your drafts that took the team's change. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then call share_changes with proposal set to the number the feedback is on, which amends that layer and re-bases the layers above it. On forges without stacks that same call updates the one open proposal in place. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -4502,7 +4546,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). When the branch refused a direct commit made under the GitHub login your shares go out on, direct_refused names the branch, the forge's message and the date, and its line says that your shares now go as proposals; relay that line as given. It is null otherwise, and another person's refusal never shows here. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). A conflict with draft: true is your own draft against the team's text; pass detail: true for both texts. An AddressTaken conflict with a page_kind means the team also changed or deleted the page you drafted: page_upstream (with detail) is the team's text of that page, and a merged text with a new address settles the address only, so that conflict is listed again after it. When the branch refused a direct commit made under the GitHub login your shares go out on, direct_refused names the branch, the forge's message and the date, and its line says that your shares now go as proposals; relay that line as given. It is null otherwise, and another person's refusal never shows here. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -4534,7 +4578,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. In a domain that reviews changes this settles your own draft; a path at either end of a move settles the whole move. theirs ends your draft and your text is gone, except an old draft's, which is kept first (kept_copy says so). A file under assets/ never merges: pass mine or theirs. Taking theirs over the folder's own file keeps a copy of it first (kept_copy and kept_note say so). Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that shares with personal identities (github.share_identity personal, the default with a GitHub App) needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). Pass resolution on every call, and content with merged: nobody is asked to choose a side, and a call without a resolution is refused with text that names the three values. Read the local side with read_engram before you choose. For your own draft conflict, pass expected_upstream_sha256 with the upstream_sha256 origin_status (detail true) gave for the team side you read (for an AddressTaken conflict with a page_kind it covers both team texts, upstream and page_upstream): if a pull changed the team's text since, the resolve is refused, nothing changes, and you read the new team text and decide again, so a stale merge never overwrites a teammate's newer change. On a read-only domain a resolution of MANIFEST.md is refused, because it could switch read_only off, and only a person does that.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -4596,7 +4640,14 @@ impl McpServer {
         // identity is told how to get one rather than handed a protocol error.
         match self
             .engine
-            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor(&ctx))
+            .origin_resolve_expecting(
+                &p.domain,
+                &p.path,
+                keep,
+                content,
+                p.expected_upstream_sha256.as_deref(),
+                self.share_actor(&ctx),
+            )
             .await
         {
             Ok(settled) => ok(settled),
@@ -7079,6 +7130,11 @@ fn overlay_refusal(e: EngineError) -> Result<String, ErrorData> {
         // A read-only domain refuses everybody, and the sentence names the
         // way back: text the model relays, not a protocol error.
         EngineError::DomainReadOnly(sentence) => Ok(sentence),
+        // A resolve against a team side the caller did not read: the
+        // sentence says to read it again, which the model has to act on.
+        EngineError::Conflict(sentence) if sentence.contains(crate::engine::TEAM_CHANGED_SINCE) => {
+            Ok(sentence)
+        }
         other => Err(to_error(other)),
     }
 }
@@ -8399,6 +8455,28 @@ mod tests {
                 .is_none(),
             "{leaned}"
         );
+    }
+
+    /// Her own draft conflicts, with both texts, and `drafts_merged` reach the
+    /// agent whole: the trim leaves them as the engine gave them, an empty
+    /// `drafts_merged` included, since its presence says the domain reviews.
+    #[test]
+    fn lean_origin_status_keeps_her_draft_conflicts_and_merges() {
+        let domain = json!({
+            "domain": "team",
+            "conflicts": [
+                { "id": "0a1b2c3d", "path": "folder.md", "kind": "EditEdit" },
+                {
+                    "id": "d1234567", "path": "plan.md", "kind": "EditEdit", "draft": true,
+                    "moved_from": null, "other": null, "file": false,
+                    "base": "start", "local": "hers", "upstream": "the team's",
+                },
+            ],
+            "drafts_merged": [],
+            "conflicts_unreadable_reason": "a sentence",
+        });
+        let leaned = lean_origin_status(json!({ "domains": [domain.clone()] }));
+        assert_eq!(leaned["domains"][0], domain);
     }
 
     /// A payload with no `domains` array, and one whose entries carry no

@@ -108,15 +108,28 @@ pub fn run(command: KeptCommand, json: bool) -> Result<()> {
                     crate::cmd::human_size(k.bytes)
                 );
                 println!("    {}", k.file.display());
+                if kept::is_file_copy(k) {
+                    println!("    A file, not text. Upload it again where it belongs.");
+                }
             }
             println!();
-            println!(
-                "Show one with: crystalline kept show <id>. Copy the text back into its page or engram, then: crystalline kept drop <id>"
-            );
+            if found.iter().any(|k| !kept::is_file_copy(k)) {
+                println!(
+                    "Show one with: crystalline kept show <id>. Copy the text back into its page or engram, then: crystalline kept drop <id>"
+                );
+            } else {
+                println!("Once a file is back where it belongs: crystalline kept drop <id>");
+            }
         }
         KeptCommand::Show { id } => {
             let k = find(&root, &id)?;
-            let text = kept::read(&k)?;
+            let text = match kept::read(&k) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    bail!("{}", kept::not_text(&k))
+                }
+                Err(e) => return Err(e.into()),
+            };
             if json {
                 let mut row = to_json(&k);
                 row["text"] = json!(text);

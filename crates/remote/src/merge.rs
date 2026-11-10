@@ -409,6 +409,205 @@ mod tests {
         );
     }
 
+    const GEN_BASE: &str = "---\ntype: note\ntitle: Harbor\ngenerated: { by: x, at: \"2026-11-01T10:00:00+00:00\" }\nstatus: stable\n---\n\n# Harbor\n\nline a\n\nfiller one\n\nfiller two\n\nfiller three\n\nline b\n";
+
+    fn generated(by: &str, at: &str) -> String {
+        format!("generated: {{ by: {by}, at: \"{at}\" }}\n")
+    }
+
+    fn gen_side(by: &str, at: &str, a: &str, b: &str) -> String {
+        GEN_BASE
+            .replacen(
+                "generated: { by: x, at: \"2026-11-01T10:00:00+00:00\" }\n",
+                &generated(by, at),
+                1,
+            )
+            .replacen("line a", a, 1)
+            .replacen("line b", b, 1)
+    }
+
+    #[test]
+    fn a_generated_line_both_sides_touched_takes_the_newer_and_the_bodies_merge() {
+        let local = gen_side("alice", "2026-11-01T11:00:00+00:00", "a2", "line b");
+        let upstream = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let FileMerge::Apply(bytes) = merge(Some(GEN_BASE), &local, &upstream) else {
+            panic!("expected a clean merge");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("by: bob") && !text.contains("by: alice"),
+            "{text}"
+        );
+        assert!(text.contains("a2") && text.contains("b2"), "{text}");
+    }
+
+    #[test]
+    fn a_newer_local_generated_line_wins_over_an_older_upstream_one() {
+        let local = gen_side("alice", "2026-11-01T13:00:00+00:00", "a2", "line b");
+        let upstream = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let FileMerge::Apply(bytes) = merge(Some(GEN_BASE), &local, &upstream) else {
+            panic!("expected a clean merge");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("by: alice") && !text.contains("by: bob"),
+            "{text}"
+        );
+        assert!(text.contains("a2") && text.contains("b2"), "{text}");
+    }
+
+    #[test]
+    fn a_generated_line_with_no_readable_time_takes_upstream() {
+        let local = gen_side("alice", "garbage", "a2", "line b");
+        let upstream = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let FileMerge::Apply(bytes) = merge(Some(GEN_BASE), &local, &upstream) else {
+            panic!("expected a clean merge");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("by: bob") && !text.contains("by: alice"),
+            "{text}"
+        );
+        assert!(text.contains("a2") && text.contains("b2"), "{text}");
+    }
+
+    fn applied(base: &str, local: &str, upstream: &str) -> String {
+        let FileMerge::Apply(bytes) = merge(Some(base), local, upstream) else {
+            panic!("expected a clean merge");
+        };
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// Both orders give the same text, so two clones merging each other agree.
+    fn both_orders(base: &str, one: &str, other: &str) -> String {
+        let a = applied(base, one, other);
+        let b = applied(base, other, one);
+        assert_eq!(a, b);
+        a
+    }
+
+    #[test]
+    fn an_equal_generated_time_gives_the_same_line_in_both_orders() {
+        let one = gen_side("alice", "2026-11-01T12:00:00+00:00", "a2", "line b");
+        let other = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let text = both_orders(GEN_BASE, &one, &other);
+        assert!(
+            text.contains("by: bob") && !text.contains("by: alice"),
+            "{text}"
+        );
+        assert!(text.contains("a2") && text.contains("b2"), "{text}");
+    }
+
+    #[test]
+    fn a_readable_generated_time_beats_an_unreadable_one_in_both_orders() {
+        let one = gen_side("alice", "2026-11-01T11:00:00+00:00", "a2", "line b");
+        let other = gen_side("bob", "garbage", "line a", "b2");
+        let text = both_orders(GEN_BASE, &one, &other);
+        assert!(
+            text.contains("by: alice") && !text.contains("by: bob"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn two_unreadable_generated_times_give_the_same_line_in_both_orders() {
+        let one = gen_side("alice", "nope", "a2", "line b");
+        let other = gen_side("bob", "garbage", "line a", "b2");
+        let text = both_orders(GEN_BASE, &one, &other);
+        assert!(
+            text.contains("by: bob") && !text.contains("by: alice"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_newer_generated_line_wins_in_both_orders() {
+        let one = gen_side("alice", "2026-11-01T13:00:00+00:00", "a2", "line b");
+        let other = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let text = both_orders(GEN_BASE, &one, &other);
+        assert!(
+            text.contains("by: alice") && !text.contains("by: bob"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn generated_removed_on_one_side_and_changed_on_the_other_still_conflicts() {
+        let removed = GEN_BASE
+            .replacen(
+                "generated: { by: x, at: \"2026-11-01T10:00:00+00:00\" }\n",
+                "",
+                1,
+            )
+            .replacen("line a", "a2", 1);
+        let changed = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        assert_eq!(
+            merge(Some(GEN_BASE), &removed, &changed),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+        assert_eq!(
+            merge(Some(GEN_BASE), &changed, &removed),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn a_block_form_generated_line_takes_the_newer_in_both_orders() {
+        let block = |by: &str, at: &str| format!("generated:\n  by: {by}\n  at: \"{at}\"\n");
+        let base = GEN_BASE.replacen(
+            "generated: { by: x, at: \"2026-11-01T10:00:00+00:00\" }\n",
+            &block("x", "2026-11-01T10:00:00+00:00"),
+            1,
+        );
+        let side = |by: &str, at: &str, a: &str, b: &str| {
+            base.replacen(&block("x", "2026-11-01T10:00:00+00:00"), &block(by, at), 1)
+                .replacen("line a", a, 1)
+                .replacen("line b", b, 1)
+        };
+        let one = side("alice", "2026-11-01T11:00:00+00:00", "a2", "line b");
+        let other = side("bob", "2026-11-01T12:00:00+00:00", "line a", "b2");
+        let text = both_orders(&base, &one, &other);
+        assert!(
+            text.contains("by: bob") && !text.contains("by: alice"),
+            "{text}"
+        );
+        assert!(text.contains("a2") && text.contains("b2"), "{text}");
+    }
+
+    #[test]
+    fn a_nested_or_body_generated_look_alike_is_not_the_key() {
+        let base =
+            "---\ntype: note\nmeta:\n  generated: one\nstatus: stable\n---\n\ngenerated: one\n";
+        let one = base.replacen("generated: one", "generated: two", 2);
+        let other = base.replacen("generated: one", "generated: three", 2);
+        assert_eq!(
+            merge(Some(base), &one, &other),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+        assert_eq!(
+            merge(Some(base), &other, &one),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
+    #[test]
+    fn another_key_changed_on_both_sides_still_conflicts() {
+        let local = gen_side("alice", "2026-11-01T11:00:00+00:00", "line a", "line b").replacen(
+            "title: Harbor",
+            "title: Dock",
+            1,
+        );
+        let upstream = gen_side("bob", "2026-11-01T12:00:00+00:00", "line a", "line b").replacen(
+            "title: Harbor",
+            "title: Pier",
+            1,
+        );
+        assert_eq!(
+            merge(Some(GEN_BASE), &local, &upstream),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
+
     #[test]
     fn a_key_both_sides_added_with_different_values_conflicts_edit_edit() {
         let local = with(HARBOR, "status: stable\n", "domain_name: harbor\n");

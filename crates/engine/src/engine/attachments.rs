@@ -190,23 +190,14 @@ impl Engine {
                 bytes.len() as u64,
             )));
         }
-        if let Some(actor) = view.actor() {
+        if view.actor().is_some() {
             let put = if create_only {
                 view.put_file_if_absent(path, &bytes).await?
             } else {
                 view.put_file(path, &bytes).await?
             };
-            // The write IS the resolution, for a file. A conflict resolution
-            // settles an engram's markdown and `origin_resolve` says so to
-            // anybody who names an attachment path; what settles a file is
-            // uploading it again to keep your version or deleting it to take
-            // the team's, so both of those take the path out of the recorded
-            // conflicts on the way out.
-            //
-            // That holds for the same bytes again too: uploading your own
-            // version unchanged is still how you keep it.
-            self.settle_file_convergence(view.domain(), actor, path)
-                .await;
+            // An upload settles no conflict: the record keeps where the file
+            // started, and only her choice in `origin_resolve` moves it.
             if !put.unchanged {
                 crate::maintenance::record_pending(view.domain());
             }
@@ -334,12 +325,8 @@ impl Engine {
         self.refuse_read_only_domain(view.domain(), &crate::scope::Scope::Unrestricted)
             .await?;
         validate_attachment_path(path)?;
-        if let Some(actor) = view.actor() {
+        if view.actor().is_some() {
             view.tombstone_file(path).await?;
-            // The other half of what settles a diverged file: see
-            // [`Engine::attachment_write_in`].
-            self.settle_file_convergence(view.domain(), actor, path)
-                .await;
             crate::maintenance::record_pending(view.domain());
             return Ok(true);
         }

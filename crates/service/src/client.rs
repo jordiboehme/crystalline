@@ -2323,11 +2323,14 @@ pub async fn origin_discard(
 /// caller-supplied merge) travels over the ctl socket base64-encoded, since
 /// the JSON envelope carries text only and a resolved asset may be binary;
 /// the in-process fallback passes the bytes straight through.
+/// `expected_upstream` is the team side's `upstream_sha256` the caller read,
+/// checked as [`crate::engine::Engine::origin_resolve_expecting`] checks it.
 pub async fn origin_resolve(
     domain: &str,
     path: &str,
     keep: Option<&str>,
     content: Option<&[u8]>,
+    expected_upstream: Option<&str>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -2339,6 +2342,7 @@ pub async fn origin_resolve(
         && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
             "keep": keep, "content_b64": content_b64,
+            "expected_upstream_sha256": expected_upstream,
         }))
         .await?
     {
@@ -2349,7 +2353,14 @@ pub async fn origin_resolve(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_resolve(&domain, path, keep, content, ShareActor::Owner)
+        .origin_resolve_expecting(
+            &domain,
+            path,
+            keep,
+            content,
+            expected_upstream,
+            ShareActor::Owner,
+        )
         .await?)
 }
 

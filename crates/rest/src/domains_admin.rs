@@ -1211,7 +1211,11 @@ pub async fn sync_status(
                            is nobody to ask about - the pairing a picker row \
                            draws. `open_proposals`, `declined_proposals` and \
                            `conflicts` are counts here rather than the \
-                           records the per-domain route returns. `errors` \
+                           records the per-domain route returns, and \
+                           `conflicts` counts the folder's conflicts only: \
+                           your own draft conflicts in a domain that reviews \
+                           changes are listed by `GET \
+                           /domains/{domain}/drafts/conflicts`. `errors` \
                            holds one entry per domain that could not be read \
                            at all, so a single broken domain never blanks the \
                            summary.\n\nThree chain-health keys ride along, \
@@ -1392,7 +1396,19 @@ fn summarize_origin_domain(entry: &Value, owned: Value) -> Value {
         "last_checked": field("last_checked"),
         "open_proposals": count("open_proposals"),
         "declined_proposals": count("declined_proposals"),
-        "conflicts": count("conflicts"),
+        // The folder's conflicts only. In a reviewing domain the status also
+        // lists the caller's own draft conflicts (`draft: true`); those are
+        // settled from the domain page through the draft routes, and a count
+        // here would offer a row whose conflict the sync card does not show.
+        "conflicts": entry
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .map(|all| {
+                all.iter()
+                    .filter(|c| c.get("draft").and_then(Value::as_bool) != Some(true))
+                    .count()
+            })
+            .unwrap_or(0),
         "local_changes": field("local_changes"),
         // Not the engine's, but the route's own, computed for the session that
         // asked: how much of this domain's waiting work that account last
@@ -1540,7 +1556,9 @@ pub async fn sync_now(
                    `nothing_to_share`, `conflicts_pending`, \
                    `proposal_diverged`, `commit` with the branch a direct \
                    domain would commit onto, `proposal_open` with the number, \
-                   url and title of the proposal that blocks a direct share), \
+                   url and title of the proposal that blocks a direct share, \
+                   or, on a domain that reviews changes, of another member's \
+                   open proposal, with `own: false` and `guidance`), \
                    the effective title and the changed \
                    files. The plan also carries `sharing` (`proposal` or \
                    `direct`, the domain's MANIFEST policy) and `repo`, so a \
@@ -1585,7 +1603,15 @@ pub async fn sync_now(
                            lands on and how many layers the amend would \
                            rebuild), `count` for \
                            `conflicts_pending`, and nothing extra for a \
-                           `create` or a `nothing_to_share`.",
+                           `create` or a `nothing_to_share`. On a domain \
+                           that reviews changes, a preview naming `files` \
+                           answers `conflicts_pending` with `count` and \
+                           `conflicts` (each `{ id, path, kind, moved_from, \
+                           file, other, draft: true }`) when one of the \
+                           caller's own drafts among them does not fit the \
+                           team's text, and `changes` stays filled. A preview \
+                           with no `files` keeps its action and names those \
+                           drafts in `draft_conflicts`, in the same shape.",
             body = Object,
             examples(
                 ("update" = (
@@ -1810,11 +1836,28 @@ pub struct ShareBody {
             description = "The engine's own share outcome: `proposed` with the \
                            new proposal's number and url, `updated` carrying \
                            the proposal it refreshed, `nothing_to_share`, \
-                           `conflicts_pending` with the conflicts, or \
-                           `proposal_diverged` with guidance.\n\nA domain \
+                           `conflicts_pending` with the conflicts (on a \
+                           domain that reviews changes, the sharer's own \
+                           drafts that do not fit the team's text, each \
+                           with `draft: true`), or \
+                           `proposal_diverged` with guidance. On a domain \
+                           that reviews changes, while another member's \
+                           proposal is open, on every forge, the answer is \
+                           `proposal_open` with its number, url and title, \
+                           `own: false` and `guidance`, a sentence to show \
+                           as given that names whose proposal it is: share \
+                           again once it is merged or closed. Nothing was \
+                           written. An `updated` outcome on such a domain \
+                           may carry `note`, a sentence to show in place of \
+                           the headline, when the team merged the proposal \
+                           while the update was on its way: a change the \
+                           merge did not hold stays a draft.\n\nA domain \
                            that shares directly answers one of four outcomes \
                            instead: `committed` with the commit's sha, url \
-                           and branch beside the three file lists, \
+                           and branch beside the three file lists (on a \
+                           domain that reviews changes, with `free_error`, a \
+                           sentence to show as given, when a draft the \
+                           commit's deletion freed could not be updated), \
                            `proposal_open` with the number, url and title of \
                            another person's proposal that is still open; \
                            share again once it is merged or closed, \
@@ -2208,6 +2251,14 @@ pub struct ResolveBody {
     #[serde(default)]
     #[schema(example = "---\ntitle: A\n---\n\nboth points, one file\n")]
     pub content: Option<String>,
+    /// For a draft conflict: the `upstream_sha256` its sides answered when
+    /// they were shown. When the team's side changed since, the resolve is
+    /// refused with 409 and nothing changes, so nobody settles against team
+    /// text they did not see. Left out, nothing is checked. The folder's
+    /// conflict route ignores it.
+    #[serde(default)]
+    #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
+    pub expected_upstream_sha256: Option<String>,
 }
 
 /// `POST /domains/{domain}/sync/conflicts/{id}/resolve` - settle one recorded
@@ -2220,7 +2271,10 @@ pub struct ResolveBody {
 /// naming a conflict at the CLI has. A browser has the id the status listed,
 /// which is the stabler handle: this route looks the path up through
 /// [`crate::engine::Engine::origin_conflict_detail`] first, so a resolve can
-/// never land on some other conflict that happens to share a path.
+/// never land on some other conflict that happens to share a path. It settles
+/// the folder's conflict only, through
+/// [`crate::engine::Engine::origin_resolve_folder`]: a draft of the caller's
+/// at that path is settled on [`resolve_draft_conflict`], by its own id.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/sync/conflicts/{id}/resolve",
@@ -2232,7 +2286,12 @@ pub struct ResolveBody {
                    `personal`, the default with a GitHub App). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
-                   re-indexes the domain. Entirely local - no GitHub \
+                   re-indexes the domain. A file under `assets/` never \
+                   merges: taking the team's file first keeps a copy of the \
+                   folder's, and the receipt says so (`file`, `kept_copy`, \
+                   `kept_note`). This settles only a conflict the pull \
+                   recorded in the folder. A draft's conflict is settled \
+                   through `resolve_draft_conflict`. Entirely local - no GitHub \
                    connection is needed - but it writes, so a read-only \
                    instance refuses it.",
     params(
@@ -2288,8 +2347,9 @@ pub struct ResolveBody {
         ),
         (
             status = 422,
-            description = "An unknown `resolution`, or `merged` with no \
-                           `content` to write.",
+            description = "An unknown `resolution`, `merged` with no \
+                           `content` to write, or `merged` for a file under \
+                           `assets/`, which never merges.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -2322,27 +2382,13 @@ pub async fn resolve_conflict(
         .as_str()
         .ok_or_else(|| ApiError::not_found(format!("no open conflict {id}")))?
         .to_string();
-    let (keep, content): (Option<&str>, Option<Vec<u8>>) = match body.resolution.as_str() {
-        "mine" => (Some("mine"), None),
-        "theirs" => (Some("theirs"), None),
-        "merged" => match &body.content {
-            Some(text) => (None, Some(text.clone().into_bytes())),
-            None => {
-                return Err(ApiError::unprocessable(
-                    "resolution merged requires content",
-                ));
-            }
-        },
-        other => {
-            return Err(ApiError::unprocessable(format!(
-                "resolution must be mine, theirs or merged, got '{other}'"
-            )));
-        }
-    };
+    let (keep, content) = resolution_of(&body)?;
+    // The folder's conflict and nothing else: a draft of the caller's at the
+    // same path is settled on the draft routes, by its own id.
     Ok(Json(
         state
             .engine
-            .origin_resolve(
+            .origin_resolve_folder(
                 &domain,
                 &path,
                 keep,
@@ -2351,6 +2397,438 @@ pub async fn resolve_conflict(
             )
             .await?,
     ))
+}
+
+/// What a resolve whose write failed answers: a server fault, in words that
+/// name no place on this server's disk and say that nothing changed.
+const NOT_SETTLED: &str = "The conflict could not be settled, so nothing was \
+     changed. Try again, or ask whoever runs this server to look at its log.";
+
+/// Which half of a draft conflict route failed, for [`draft_conflict_error`].
+#[derive(Clone, Copy)]
+enum Step {
+    /// Reading the caller's conflicts: the list, the sides.
+    Read,
+    /// Settling one: the resolve. A read that fails there comes back from the
+    /// engine already as the read sentence, a refusal and not a fault.
+    Write,
+}
+
+/// An engine error on a draft conflict route, as the caller is told it. A
+/// failure on the server's side (anything REST would answer 500: a read or
+/// write that failed, a team state file that cannot be parsed) is logged with
+/// its cause and answered in a sentence that names no place on this server's
+/// disk: on a read, 422 with the sentence the list and the status give; on a
+/// write, 500 with [`NOT_SETTLED`]. Every other refusal is answered as the
+/// engine words it.
+fn draft_conflict_error(domain: &str, step: Step, e: EngineError) -> ApiError {
+    let cause = e.to_string();
+    let api: ApiError = e.into();
+    if api.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return api;
+    }
+    tracing::warn!(domain, "a draft conflict route failed: {cause}");
+    match step {
+        Step::Read => ApiError::unprocessable(crate::engine::CONFLICTS_UNREADABLE),
+        Step::Write => ApiError::internal(NOT_SETTLED),
+    }
+}
+
+/// `GET /domains/{domain}/drafts/conflicts` - the caller's own draft conflicts.
+///
+/// Any account that may read the domain: a draft is its author's, so nobody
+/// needs the share role to see their own. Never pulls, so it is served on a
+/// read-only instance and with no connection. A domain whose drafts do not
+/// stay open lists nothing here, whatever rows are left.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/drafts/conflicts",
+    tag = "domains",
+    operation_id = "list_draft_conflicts",
+    summary = "List your own draft conflicts in a domain that reviews changes.",
+    description = "Any signed-in account that may read the domain. Lists \
+                   the caller's own drafts that do not fit the team's text, \
+                   and the drafts an update merged team changes into. Never \
+                   anybody else's. A domain that does not review changes \
+                   lists nothing. Entirely local, so a read-only instance \
+                   serves it.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    responses(
+        (
+            status = 200,
+            description = "Your conflicts and merged drafts.",
+            body = super::schemas::DraftConflictsResponse,
+            example = json!({
+                "conflicts": [{
+                    "id": "d3f9a1c2",
+                    "path": "notes/plan.md",
+                    "kind": "EditEdit",
+                    "draft": true,
+                    "moved_from": null,
+                    "file": false,
+                    "other": null,
+                    "page_kind": null
+                }],
+                "merged": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer, which holds no draft.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or one the caller may not see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "Your conflicts cannot be read, so none are listed; \
+                           the detail says why and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn list_draft_conflicts(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    if !state.engine.drafts_stay_open(&domain) {
+        return Ok(Json(
+            serde_json::json!({ "conflicts": [], "merged": [], "settle_note": null }),
+        ));
+    }
+    let mut answer = state
+        .engine
+        .own_draft_conflicts(&domain, user.name.as_str())
+        .await
+        .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?;
+    let held = answer["conflicts"]
+        .as_array()
+        .is_some_and(|conflicts| !conflicts.is_empty());
+    let note = match held {
+        true => settle_note(&state, &identity, &domain).await,
+        false => None,
+    };
+    answer["settle_note"] = serde_json::json!(note);
+    Ok(Json(answer))
+}
+
+/// What a person told about their draft conflicts may not do with them here,
+/// in plain words, or `None` when every choice is open. The resolve route
+/// refuses each of these; this says so before anybody presses.
+async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Option<String> {
+    if refuse_read_only(state).is_err() {
+        return Some(
+            "This server is read-only, so these drafts cannot be settled here.".to_string(),
+        );
+    }
+    if let Err(refused) = require_domain_write(state, identity, domain).await {
+        return Some(not_writable_note(state.access.governs(domain), &refused));
+    }
+    // Taking the team's text is what a pull does, so it stays open on a
+    // locked domain and on an archived repository; the other two do not.
+    if state.engine.domain_is_read_only(domain).await {
+        return Some(
+            "This domain is read-only. Until its owner turns read-only off, you can only take \
+             the team's text for these drafts."
+                .to_string(),
+        );
+    }
+    if state.engine.github_archived_repo(domain).is_some() {
+        return Some(
+            "This domain's repository is archived, so you can only take the team's text for \
+             these drafts."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// The note for a person the write gate refuses. On a domain GitHub governs,
+/// the gate's own sentence is the way out (link GitHub, or why the link
+/// cannot help yet), and the domain's owner cannot grant what GitHub decides.
+/// Anywhere else write access is the owner's to give.
+fn not_writable_note(governed: bool, refused: &ApiError) -> String {
+    // Anything but a refusal (an access layer that could not be read) is a
+    // fault of the server's: its detail holds a cause chain, which is for the
+    // log, not for the person.
+    if refused.status != axum::http::StatusCode::FORBIDDEN {
+        return "These drafts cannot be settled here right now. Try again later.".to_string();
+    }
+    if governed {
+        let mut said = refused.detail.chars();
+        let sentence = match said.next() {
+            Some(first) => first.to_uppercase().chain(said).collect::<String>(),
+            None => String::new(),
+        };
+        return format!("These drafts cannot be settled here yet. {sentence}");
+    }
+    "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for \
+     write access."
+        .to_string()
+}
+
+/// `GET /domains/{domain}/drafts/conflicts/{id}` - one of the caller's own
+/// draft conflicts with its three sides.
+///
+/// Gated as the list beside it. An id that is not the caller's is not found,
+/// in the words an id nobody holds is, so it says nothing about somebody
+/// else's draft.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/drafts/conflicts/{id}",
+    tag = "domains",
+    operation_id = "get_draft_conflict",
+    summary = "One of your draft conflicts, with every side.",
+    description = "Any signed-in account that may read the domain, for its \
+                   own conflict only. `base` is the text the draft started \
+                   from, `local` the draft and `upstream` the team's text. \
+                   A side with no text is null and `note` says why. \
+                   Entirely local, so a read-only instance serves it.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("id" = String, Path, description = "The conflict id from the list."),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The conflict and its sides.",
+            body = super::schemas::DraftConflictSides,
+            example = json!({
+                "id": "d3f9a1c2",
+                "path": "notes/plan.md",
+                "kind": "EditEdit",
+                "draft": true,
+                "detected_at": null,
+                "base": "---\ntitle: Plan\n---\n\nthe shared start\n",
+                "local": "---\ntitle: Plan\n---\n\nmy version\n",
+                "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n",
+                "moved_from": null,
+                "other": null,
+                "page_kind": null,
+                "page_upstream": null,
+                "old_draft": false,
+                "moved_to": null,
+                "note": null
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, one the caller may not see, a \
+                           domain that does not review changes, or no \
+                           conflict with that id among the caller's drafts.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "Your conflicts cannot be read; the detail says why \
+                           and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn get_draft_conflict(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    if !state.engine.drafts_stay_open(&domain) {
+        return Err(crate::engine::not_among_drafts(&domain, &id).into());
+    }
+    Ok(Json(
+        state
+            .engine
+            .draft_conflict_sides(&domain, user.name.as_str(), &id)
+            .await
+            .map_err(|e| draft_conflict_error(&domain, Step::Read, e))?,
+    ))
+}
+
+/// `POST /domains/{domain}/drafts/conflicts/{id}/resolve` - settle one of the
+/// caller's own draft conflicts.
+///
+/// Gated as every write: the domain write right, a refusal on a read-only
+/// instance, the CSRF token the router asks of every write, and on an
+/// archived repository a refusal for anything but taking the team's text.
+/// The share role is not asked: settling a draft writes only the author's
+/// draft. The id is looked up among the caller's own conflicts by the engine
+/// under the origin lock, so somebody else's id, or the folder's, is not
+/// found.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve",
+    tag = "domains",
+    operation_id = "resolve_draft_conflict",
+    summary = "Settle one of your draft conflicts.",
+    description = "Any account that may write the domain, for its own \
+                   conflict only. Keep your draft (`mine`), take the team's \
+                   text and end the draft (`theirs`), or write `merged` \
+                   content into the draft. A file is never merged. Entirely \
+                   local, but it writes, so a read-only instance refuses it.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("id" = String, Path, description = "The conflict id from the list."),
+    ),
+    request_body = ResolveBody,
+    responses(
+        (
+            status = 200,
+            description = "Where the resolution landed and how many of your \
+                           conflicts are left.",
+            body = super::schemas::DraftResolveReceipt,
+            example = json!({
+                "resolved": "notes/plan.md",
+                "remaining": 0,
+                "draft": true,
+                "kept": "mine",
+                "deletion": false,
+                "kept_copy": false
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or the anonymous viewer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may not write this domain, the request \
+                           did not echo its CSRF token, this instance is \
+                           read-only, the domain's repository is archived \
+                           or its MANIFEST says `read_only: on` (both except \
+                           for `theirs`), the result would switch \
+                           `read_only` on (the owner's step), or the \
+                           trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, one the caller may not see, a \
+                           domain that does not review changes, or no \
+                           conflict with that id among the caller's drafts.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The team's side changed since the sides named \
+                           in `expected_upstream_sha256` were read, so \
+                           nothing was settled: read the sides again. Or \
+                           another instance on this shared database hosts \
+                           this file domain, so it is written there.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An unknown `resolution`, `merged` with no \
+                           `content`, a merge of a file, a resolution the \
+                           draft refuses, or your conflicts cannot be read, \
+                           which blocks every resolve until they can; the \
+                           detail says why and what to do.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The conflict could not be settled for a reason on \
+                           the server's side, so nothing was changed. The \
+                           detail says so and names no place on the server's \
+                           disk; the cause is in the server's log.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn resolve_draft_conflict(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<ResolveBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_domain_write(&state, &identity, &domain).await?;
+    let user = identity.require_account()?;
+    refuse_read_only(&state)?;
+    // Taking the team's text is what a pull does, and a pull still applies on
+    // an archived domain, as on the share surface.
+    if body.resolution != "theirs" {
+        refuse_archived_share(&state, &identity, &domain).await?;
+    }
+    let (keep, content) = resolution_of(&body)?;
+    let receipt = state
+        .engine
+        .resolve_own_draft_conflict(
+            &domain,
+            &id,
+            keep,
+            content.as_deref(),
+            body.expected_upstream_sha256.as_deref(),
+            ShareActor::Account(user.name.clone()),
+        )
+        .await
+        .map_err(|e| draft_conflict_error(&domain, Step::Write, e))?;
+    Ok(Json(warning_for_the_reader(&domain, receipt)))
+}
+
+/// What a person reads when her settled draft landed but this server could
+/// not keep its copy on disk. The engine's own sentence names a command and a
+/// folder of the server's, which only whoever runs it can act on; it goes to
+/// the log, and she reads what is true for her.
+const DRAFT_NOT_BACKED_UP: &str = "Your choice is saved, but this server could not keep a \
+     backup copy of it. Ask whoever runs this server to look at its log.";
+
+/// A resolve receipt with its `draft_warning` worded for the person reading
+/// it, as [`DRAFT_NOT_BACKED_UP`] says why.
+fn warning_for_the_reader(domain: &str, mut receipt: Value) -> Value {
+    if let Some(warning) = receipt.get("draft_warning").and_then(Value::as_str) {
+        tracing::warn!(domain, "a settled draft was not mirrored: {warning}");
+        receipt["draft_warning"] = Value::String(DRAFT_NOT_BACKED_UP.to_string());
+    }
+    receipt
+}
+
+/// A [`ResolveBody`] as the engine's resolve verbs take it: `keep` for
+/// `mine` or `theirs`, `content` for `merged`.
+fn resolution_of(body: &ResolveBody) -> Result<(Option<&'static str>, Option<Vec<u8>>), ApiError> {
+    match body.resolution.as_str() {
+        "mine" => Ok((Some("mine"), None)),
+        "theirs" => Ok((Some("theirs"), None)),
+        "merged" => match &body.content {
+            Some(text) => Ok((None, Some(text.clone().into_bytes()))),
+            None => Err(ApiError::unprocessable(
+                "resolution merged requires content",
+            )),
+        },
+        other => Err(ApiError::unprocessable(format!(
+            "resolution must be mine, theirs or merged, got '{other}'"
+        ))),
+    }
 }
 
 /// `GET /domains/{domain}/changes` - every unshared change, offline.
@@ -2710,9 +3188,11 @@ pub struct ReviewBody {
                    unshared in it already - each refused 409 naming what is in \
                    the way.\n\nmode `direct` takes review mode off and ends \
                    every private draft in the domain. WITHOUT a `folds` key \
-                   this answers the plan and writes nothing: each actor, their \
+                   this answers the plan and folds nothing: each actor, their \
                    drafts, which are deletions, which paths more than one of \
-                   them is drafting and which drafts have nowhere to land. \
+                   them is drafting, which drafts have nowhere to land and \
+                   which do not fit the team's text. Both ways first merge \
+                   each draft the team's change merges into, as a pull does. \
                    WITH a `folds` map it makes the change, and the map has to \
                    name every actor the plan named and nobody else - `fold` \
                    writes that actor's drafts into the folder, `discard` ends \
@@ -2721,7 +3201,8 @@ pub struct ReviewBody {
                    saying it has none, which is the question. Two \
                    folded actors at one path, or a folded draft whose address \
                    another engram already holds, refuse before anything is \
-                   written.\n\nAsking for a mode the domain already has changes \
+                   written, and so does a folded draft that does not fit the \
+                   team's text: its author settles it, or discard ends it.\n\nAsking for a mode the domain already has changes \
                    nothing and answers the same way.",
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = ReviewBody,
@@ -2778,8 +3259,10 @@ pub struct ReviewBody {
             description = "The domain cannot take the mode asked for: no \
                            GitHub origin, a virtual domain, unshared work in \
                            the folder, an answer that does not cover every \
-                           actor holding drafts, or a fold two engrams would \
-                           come out of.",
+                           actor holding drafts, a fold two engrams would \
+                           come out of, or a folded draft that does not fit \
+                           the team's text or whose conflicts could not be \
+                           read. Each names the actor; discard always works.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -3566,6 +4049,60 @@ pub async fn github_domain_name(
 mod tests {
     use super::*;
 
+    /// A person on a governed domain is pointed at what the write gate says,
+    /// which is linking GitHub, never at an owner who cannot grant it.
+    #[test]
+    fn the_settle_note_on_a_governed_domain_says_what_the_gate_says() {
+        let refused = ApiError::forbidden(crate::LINK_GITHUB_TO_WRITE);
+        let note = not_writable_note(true, &refused);
+        assert!(note.ends_with(crate::LINK_GITHUB_TO_WRITE), "{note}");
+        assert!(!note.contains("owner"), "{note}");
+        let note = not_writable_note(false, &refused);
+        assert!(note.contains("Ask its owner for write access."), "{note}");
+    }
+
+    /// Only a 403's own sentence is passed on, starting with a capital; a
+    /// refusal of any other kind carries a cause chain from inside the server,
+    /// and gets a plain sentence instead.
+    #[test]
+    fn the_settle_note_passes_on_only_a_refusal_and_never_a_cause_chain() {
+        let below = ApiError::forbidden(
+            "your membership on this domain is reader, and editor access is required",
+        );
+        assert_eq!(
+            not_writable_note(true, &below),
+            "These drafts cannot be settled here yet. Your membership on this domain is \
+             reader, and editor access is required"
+        );
+        let broken = ApiError::internal("this domain's membership is unreadable: disk: io error");
+        for governed in [true, false] {
+            let note = not_writable_note(governed, &broken);
+            assert!(!note.contains("io error"), "{note}");
+            assert!(!note.contains("membership"), "{note}");
+            assert_eq!(
+                note,
+                "These drafts cannot be settled here right now. Try again later."
+            );
+        }
+    }
+
+    /// The machine owner's sentence about a draft not mirrored never reaches
+    /// a person over this API; a sentence for her does.
+    #[test]
+    fn a_draft_warning_is_worded_for_the_reader() {
+        let receipt = serde_json::json!({
+            "resolved": "plan.md",
+            "draft_warning": "the draft of 'plan.md' landed in the index, but this machine \
+                              could not mirror it under its state directory (/srv/x), so a \
+                              'crystalline reindex --wipe' would lose it",
+        });
+        let read = warning_for_the_reader("team", receipt);
+        assert_eq!(read["draft_warning"], DRAFT_NOT_BACKED_UP);
+        assert_eq!(read["resolved"], "plan.md");
+        let quiet = warning_for_the_reader("team", serde_json::json!({"resolved": "plan.md"}));
+        assert_eq!(quiet.get("draft_warning"), None);
+    }
+
     /// The example's kept entry is a real one: its message is the sentence
     /// `kept_message` words for the same entry, so the document can never
     /// show a sentence no surface prints.
@@ -3676,6 +4213,25 @@ mod tests {
             unknown["owned_changes"].is_null(),
             "the key is present and null: {unknown}"
         );
+    }
+
+    /// A reviewing domain's status lists the caller's own draft conflicts after
+    /// the folder's, each with `draft: true`. The overview's count is the
+    /// folder's alone: a draft conflict is settled from the domain page, and
+    /// counting it here would offer a row whose conflict the sync card does not
+    /// show.
+    #[test]
+    fn a_summary_row_counts_only_the_folders_conflicts() {
+        let entry = serde_json::json!({
+            "domain": "eng",
+            "conflicts": [
+                { "id": "c1", "path": "a.md" },
+                { "id": "d0000001", "path": "b.md", "draft": true },
+                { "id": "d0000002", "path": "c.md", "draft": true },
+            ],
+        });
+        let row = summarize_origin_domain(&entry, Value::Null);
+        assert_eq!(row["conflicts"], 1, "{row}");
     }
 
     /// The anonymous viewer has no account, so there is nothing to attribute

@@ -2245,6 +2245,303 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/drafts/conflicts": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "List your own draft conflicts in a domain that reviews changes.",
+        "description": "Any signed-in account that may read the domain. Lists the caller's own drafts that do not fit the team's text, and the drafts an update merged team changes into. Never anybody else's. A domain that does not review changes lists nothing. Entirely local, so a read-only instance serves it.",
+        "operationId": "list_draft_conflicts",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Your conflicts and merged drafts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftConflictsResponse"
+                },
+                "example": {
+                  "conflicts": [
+                    {
+                      "draft": true,
+                      "file": false,
+                      "id": "d3f9a1c2",
+                      "kind": "EditEdit",
+                      "moved_from": null,
+                      "other": null,
+                      "page_kind": null,
+                      "path": "notes/plan.md"
+                    }
+                  ],
+                  "merged": []
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer, which holds no draft.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or one the caller may not see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Your conflicts cannot be read, so none are listed; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/drafts/conflicts/{id}": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "One of your draft conflicts, with every side.",
+        "description": "Any signed-in account that may read the domain, for its own conflict only. `base` is the text the draft started from, `local` the draft and `upstream` the team's text. A side with no text is null and `note` says why. Entirely local, so a read-only instance serves it.",
+        "operationId": "get_draft_conflict",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The conflict id from the list.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The conflict and its sides.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftConflictSides"
+                },
+                "example": {
+                  "base": "---\ntitle: Plan\n---\n\nthe shared start\n",
+                  "detected_at": null,
+                  "draft": true,
+                  "id": "d3f9a1c2",
+                  "kind": "EditEdit",
+                  "local": "---\ntitle: Plan\n---\n\nmy version\n",
+                  "moved_from": null,
+                  "moved_to": null,
+                  "note": null,
+                  "old_draft": false,
+                  "other": null,
+                  "page_kind": null,
+                  "page_upstream": null,
+                  "path": "notes/plan.md",
+                  "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Your conflicts cannot be read; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve": {
+      "post": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Settle one of your draft conflicts.",
+        "description": "Any account that may write the domain, for its own conflict only. Keep your draft (`mine`), take the team's text and end the draft (`theirs`), or write `merged` content into the draft. A file is never merged. Entirely local, but it writes, so a read-only instance refuses it.",
+        "operationId": "resolve_draft_conflict",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The conflict id from the list.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Where the resolution landed and how many of your conflicts are left.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DraftResolveReceipt"
+                },
+                "example": {
+                  "deletion": false,
+                  "draft": true,
+                  "kept": "mine",
+                  "kept_copy": false,
+                  "remaining": 0,
+                  "resolved": "notes/plan.md"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or the anonymous viewer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived or its MANIFEST says `read_only: on` (both except for `theirs`), the result would switch `read_only` on (the owner's step), or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The team's side changed since the sides named in `expected_upstream_sha256` were read, so nothing was settled: read the sides again. Or another instance on this shared database hosts this file domain, so it is written there.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An unknown `resolution`, `merged` with no `content`, a merge of a file, a resolution the draft refuses, or your conflicts cannot be read, which blocks every resolve until they can; the detail says why and what to do.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The conflict could not be settled for a reason on the server's side, so nothing was changed. The detail says so and names no place on the server's disk; the cause is in the server's log.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/engrams": {
       "get": {
         "tags": [
@@ -3852,6 +4149,26 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "The kept copy is a file, not text. The detail says so in a sentence to show.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           }
         }
       },
@@ -3908,6 +4225,93 @@
           },
           "404": {
             "description": "No such domain or kept text for this caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/kept/{id}/file": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "One kept copy as its bytes, to download.",
+        "description": "The same rights as reading it. The answer is the kept copy as it was kept, always as a download named for the file (`Content-Disposition: attachment`) and never rendered in place, with `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`. This is how a draft file kept as its bytes (`file: true` in the listing) is had back; a text comes back as its text.",
+        "operationId": "download_kept_copy",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The id from the listing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The kept copy's bytes.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The anonymous viewer of a domain it reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Neither write access to the engrams nor edit access to the Reflection.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or kept copy for this caller.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7399,7 +7803,7 @@
           "domains"
         ],
         "summary": "Whether this domain reviews changes before they land.",
-        "description": "An instance admin, or a private domain's owner.\n\nmode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.\n\nmode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and writes nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting and which drafts have nowhere to land. WITH a `folds` map it makes the change, and the map has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. An explicit `\"folds\": null` is the absent key, not an empty answer: a client holding the field as nullable is saying it has none, which is the question. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written.\n\nAsking for a mode the domain already has changes nothing and answers the same way.",
+        "description": "An instance admin, or a private domain's owner.\n\nmode `overlay` turns REVIEW MODE on: every write joins its author's own draft and the folder the team shares changes only through a reviewed proposal. It needs a GitHub origin (a reviewed change has to have somewhere to be proposed), a folder (so not a virtual domain) and a folder with nothing unshared in it already - each refused 409 naming what is in the way.\n\nmode `direct` takes review mode off and ends every private draft in the domain. WITHOUT a `folds` key this answers the plan and folds nothing: each actor, their drafts, which are deletions, which paths more than one of them is drafting, which drafts have nowhere to land and which do not fit the team's text. Both ways first merge each draft the team's change merges into, as a pull does. WITH a `folds` map it makes the change, and the map has to name every actor the plan named and nobody else - `fold` writes that actor's drafts into the folder, `discard` ends them. An explicit `\"folds\": null` is the absent key, not an empty answer: a client holding the field as nullable is saying it has none, which is the question. Two folded actors at one path, or a folded draft whose address another engram already holds, refuse before anything is written, and so does a folded draft that does not fit the team's text: its author settles it, or discard ends it.\n\nAsking for a mode the domain already has changes nothing and answers the same way.",
         "operationId": "set_domain_review_mode",
         "parameters": [
           {
@@ -7498,7 +7902,7 @@
             }
           },
           "409": {
-            "description": "The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, or a fold two engrams would come out of.",
+            "description": "The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, a fold two engrams would come out of, or a folded draft that does not fit the team's text or whose conflicts could not be read. Each names the actor; discard always works.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7719,7 +8123,7 @@
           "domains"
         ],
         "summary": "Preview what sharing this team domain would do.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`, `commit` with the branch a direct domain would commit onto, `proposal_open` with the number, url and title of the proposal that blocks a direct share), the effective title and the changed files. The plan also carries `sharing` (`proposal` or `direct`, the domain's MANIFEST policy) and `repo`, so a client knows what kind of domain it is looking at before the action is read. On a direct domain the plan may also carry `note`, one or two sentences to show as given that say how the share will go: it opens a proposal if the branch refuses it again, or it opens a proposal because your proposal is still open. When the share would add the team marker (`team: github`) to the MANIFEST, the plan carries `team_marker`, `{ path, reason }`, beside the change list. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`, `commit` with the branch a direct domain would commit onto, `proposal_open` with the number, url and title of the proposal that blocks a direct share, or, on a domain that reviews changes, of another member's open proposal, with `own: false` and `guidance`), the effective title and the changed files. The plan also carries `sharing` (`proposal` or `direct`, the domain's MANIFEST policy) and `repo`, so a client knows what kind of domain it is looking at before the action is read. On a direct domain the plan may also carry `note`, one or two sentences to show as given that say how the share will go: it opens a proposal if the branch refuses it again, or it opens a proposal because your proposal is still open. When the share would add the team marker (`team: github`) to the MANIFEST, the plan carries `team_marker`, `{ path, reason }`, beside the change list. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.",
         "operationId": "get_domain_share_changes",
         "parameters": [
           {
@@ -7734,7 +8138,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`.",
+            "description": "The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. On a domain that reviews changes, a preview naming `files` answers `conflicts_pending` with `count` and `conflicts` (each `{ id, path, kind, moved_from, file, other, draft: true }`) when one of the caller's own drafts among them does not fit the team's text, and `changes` stays filled. A preview with no `files` keeps its action and names those drafts in `draft_conflicts`, in the same shape.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7936,7 +8340,7 @@
           "domains"
         ],
         "summary": "Resolve one recorded conflict by id.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. A file under `assets/` never merges: taking the team's file first keeps a copy of the folder's, and the receipt says so (`file`, `kept_copy`, `kept_note`). This settles only a conflict the pull recorded in the folder. A draft's conflict is settled through `resolve_draft_conflict`. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
         "operationId": "resolve_domain_conflict",
         "parameters": [
           {
@@ -8034,7 +8438,7 @@
             }
           },
           "422": {
-            "description": "An unknown `resolution`, or `merged` with no `content` to write.",
+            "description": "An unknown `resolution`, `merged` with no `content` to write, or `merged` for a file under `assets/`, which never merges.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8195,7 +8599,7 @@
         },
         "responses": {
           "200": {
-            "description": "The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.\n\nA domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists, `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.\n\nA `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.",
+            "description": "The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts (on a domain that reviews changes, the sharer's own drafts that do not fit the team's text, each with `draft: true`), or `proposal_diverged` with guidance. On a domain that reviews changes, while another member's proposal is open, on every forge, the answer is `proposal_open` with its number, url and title, `own: false` and `guidance`, a sentence to show as given that names whose proposal it is: share again once it is merged or closed. Nothing was written. An `updated` outcome on such a domain may carry `note`, a sentence to show in place of the headline, when the team merged the proposal while the update was on its way: a change the merge did not hold stays a draft.\n\nA domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists (on a domain that reviews changes, with `free_error`, a sentence to show as given, when a draft the commit's deletion freed could not be updated), `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.\n\nA `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.",
             "content": {
               "application/json": {
                 "schema": {
@@ -11575,7 +11979,7 @@
         "operationId": "get_sync_summary",
         "responses": {
           "200": {
-            "description": "The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.\n\nThree chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.",
+            "description": "The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns, and `conflicts` counts the folder's conflicts only: your own draft conflicts in a domain that reviews changes are listed by `GET /domains/{domain}/drafts/conflicts`. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.\n\nThree chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.",
             "content": {
               "application/json": {
                 "schema": {
@@ -13187,6 +13591,318 @@
           }
         }
       },
+      "DraftConflictEntry": {
+        "type": "object",
+        "description": "One of your drafts that does not fit the team's text.",
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "draft",
+          "moved_from",
+          "file",
+          "other",
+          "page_kind"
+        ],
+        "properties": {
+          "draft": {
+            "type": "boolean",
+            "description": "Always true: the entry is a draft's, never the folder's."
+          },
+          "file": {
+            "type": "boolean",
+            "description": "A file beside the pages rather than a page."
+          },
+          "id": {
+            "type": "string",
+            "description": "`d` and seven hex digits, stable while the draft stands.",
+            "example": "d3f9a1c2"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DraftConflictKind"
+          },
+          "moved_from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The path a moved draft left."
+          },
+          "other": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `AddressTaken`: the team's path that holds the address."
+          },
+          "page_kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DraftConflictKind",
+                "description": "For `AddressTaken`: the page's own conflict, when the team also\nchanged or deleted the page you drafted. Null otherwise. A merged text\nwith a new address settles the address only; this one is still to\nsettle after it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "path": {
+            "type": "string",
+            "description": "The draft's path, or the deletion's when it stands alone.",
+            "example": "notes/plan.md"
+          }
+        }
+      },
+      "DraftConflictKind": {
+        "type": "string",
+        "description": "Why a draft does not fit the team's text: `EditEdit` both changed the same lines, `EditDelete` the team deleted a page you drafted, `DeleteEdit` you deleted a page the team changed, `AddAdd` the team has a file where you did not start from one, `UnknownStart` a draft from before 0.32.0 with no record of its start, `AddressTaken` another team page holds your draft's address.",
+        "enum": [
+          "EditEdit",
+          "EditDelete",
+          "DeleteEdit",
+          "AddAdd",
+          "UnknownStart",
+          "AddressTaken"
+        ]
+      },
+      "DraftConflictSides": {
+        "type": "object",
+        "description": "One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. For `AddressTaken` `upstream` is the page that holds your address, and `page_upstream` the team's text of your own page when `page_kind` says it changed too. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.",
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "draft",
+          "detected_at",
+          "base",
+          "local",
+          "upstream",
+          "upstream_sha256",
+          "moved_from",
+          "other",
+          "page_kind",
+          "page_upstream",
+          "old_draft",
+          "moved_to",
+          "note"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detected_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Always null: a draft conflict is read from what stands, never stored."
+          },
+          "draft": {
+            "type": "boolean",
+            "description": "Always true."
+          },
+          "file": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and true, only for a file."
+          },
+          "id": {
+            "type": "string",
+            "example": "d3f9a1c2"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DraftConflictKind"
+          },
+          "local": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moved_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moved_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For your deletion of a page or file the team moved: where it went.\nKeeping your side then removes nothing, since the team's copy stands\nthere."
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "old_draft": {
+            "type": "boolean",
+            "description": "A draft from before 0.32.0, with no record of its start: taking the\nteam's side keeps a copy of it first."
+          },
+          "other": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page_kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DraftConflictKind",
+                "description": "For `AddressTaken`: the page's own conflict, as in the list."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "page_upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `AddressTaken` with a `page_kind`: the team's text of your own\npage. Null when the team deleted it, or when there is no `page_kind`."
+          },
+          "path": {
+            "type": "string",
+            "example": "notes/plan.md"
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "upstream_sha256": {
+            "type": "string",
+            "description": "What the team's side is: the SHA-256 of its bytes (a page's text or a\nfile's), `absent` when the team holds nothing there, `unreadable` when\nits copy cannot be read. With a `page_kind` it is one token for both\nteam sides. Pass it back as `expected_upstream_sha256` when settling,\nso a team change made since is not overwritten.",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+          }
+        }
+      },
+      "DraftConflictsResponse": {
+        "type": "object",
+        "description": "Your own draft conflicts in this domain, and the drafts an update merged team changes into since they last settled.",
+        "required": [
+          "conflicts",
+          "merged",
+          "settle_note"
+        ],
+        "properties": {
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DraftConflictEntry"
+            },
+            "description": "Ordered by path."
+          },
+          "merged": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths of your drafts a merge changed, sorted.",
+            "example": [
+              "notes/plan.md"
+            ]
+          },
+          "settle_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What you may not do with these conflicts here, in a sentence to show:\non a read-only server or without write access none can be settled,\nand on a read-only domain or an archived repository only the team's\ntext can be taken. Null when every choice is open or nothing is listed."
+          }
+        }
+      },
+      "DraftResolveReceipt": {
+        "type": "object",
+        "description": "Where the resolution landed: in your draft.",
+        "required": [
+          "resolved",
+          "remaining",
+          "draft",
+          "kept",
+          "deletion",
+          "kept_copy"
+        ],
+        "properties": {
+          "deletion": {
+            "type": "boolean",
+            "description": "Your side was a deletion: keeping it removes the team's page or file\nwhen you share, unless `moved_to` is set."
+          },
+          "draft": {
+            "type": "boolean",
+            "description": "Always true."
+          },
+          "draft_warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Present when the draft landed but its copy on this server's disk did\nnot."
+          },
+          "file": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Present, and true, only for a file."
+          },
+          "kept": {
+            "type": "string",
+            "description": "`mine`, `theirs` or `merged`.",
+            "example": "mine"
+          },
+          "kept_copy": {
+            "type": "boolean",
+            "description": "Whether a copy of your text or file was kept before taking the\nteam's."
+          },
+          "kept_file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Always null over this API: a place on the server's disk is named only\nto the machine owner."
+          },
+          "kept_note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a file that was kept: where to find it."
+          },
+          "moved_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a kept deletion of a page or file the team moved: where it went.\nYour deletion then removes nothing, and it ends."
+          },
+          "remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many of your conflicts in this domain are left, or null when they\ncould not be counted.",
+            "minimum": 0
+          },
+          "resolved": {
+            "type": "string",
+            "description": "The draft's path. A move is settled whole, at its draft.",
+            "example": "notes/plan.md"
+          }
+        }
+      },
       "EngramChanged": {
         "type": "object",
         "description": "One engram changed, as every subscriber hears it.",
@@ -13825,6 +14541,7 @@
           "draft",
           "kind",
           "path",
+          "file",
           "kept_at",
           "bytes"
         ],
@@ -13839,6 +14556,10 @@
           "draft": {
             "type": "boolean",
             "description": "Whether it was kept from the caller's own review draft rather than\nfrom the domain's own text. A draft's kept text is only ever listed\nfor its owner."
+          },
+          "file": {
+            "type": "boolean",
+            "description": "Whether it is a draft file beside the pages, kept as its bytes rather\nthan a text: it has no text to read, and is had through\n`GET /domains/{domain}/kept/{id}/file`."
           },
           "id": {
             "type": "string",
@@ -15392,6 +16113,14 @@
             ],
             "description": "The merged markdown. Required for `merged`, meaningless otherwise.",
             "example": "---\ntitle: A\n---\n\nboth points, one file\n"
+          },
+          "expected_upstream_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a draft conflict: the `upstream_sha256` its sides answered when\nthey were shown. When the team's side changed since, the resolve is\nrefused with 409 and nothing changes, so nobody settles against team\ntext they did not see. Left out, nothing is checked. The folder's\nconflict route ignores it.",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           },
           "resolution": {
             "type": "string",

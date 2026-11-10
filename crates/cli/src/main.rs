@@ -2035,6 +2035,11 @@ enum OriginCommand {
         /// required.
         #[arg(long)]
         content_file: Option<PathBuf>,
+        /// For your own draft: the upstream_sha256 that `origin status
+        /// --json` gave for the team's side you read. If the team changed it
+        /// since, the resolve is refused and nothing changes.
+        #[arg(long, value_name = "SHA256")]
+        expect_upstream: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -3670,6 +3675,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             path,
             keep,
             content_file,
+            expect_upstream,
             config,
         } => {
             if keep.is_some() == content_file.is_some() {
@@ -3688,11 +3694,12 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                 &path,
                 keep_str,
                 content.as_deref(),
+                expect_upstream.as_deref(),
                 db.as_deref(),
                 config.as_deref(),
             )
             .await?;
-            cmd::print_origin_resolve(&data, json);
+            cmd::print_origin_resolve(&domain, &path, &data, json);
             Ok(())
         }
     }
@@ -3702,7 +3709,9 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
 /// freshly bootstrapped env-defined domain, up to date or the
 /// applied/merged counts with conflicts and proposal transitions called
 /// out), then one line per domain that failed to update. Each conflict names
-/// the path and the `origin resolve` command that settles it.
+/// the path and the `origin resolve` command that settles it; a conflict of
+/// the caller's own draft also names how to compare the two texts, and each
+/// draft a merge changed is named, also when the pull was up to date.
 fn print_origin_update(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -3727,22 +3736,28 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
             );
             continue;
         }
+        // Her own drafts are named whether or not this pull moved anything:
+        // a merge the poller did reaches her here too.
         if d["up_to_date"].as_bool().unwrap_or(false) {
             println!("{name}: up to date");
-            continue;
-        }
-        let applied = d["applied"].as_array().map(Vec::len).unwrap_or(0);
-        let merged = d["merged"].as_array().map(Vec::len).unwrap_or(0);
-        println!(
-            "{name}: {} applied ({merged} merged)",
-            plural(applied, "file", "files")
-        );
-        for c in d["conflicts"].as_array().unwrap_or(&empty) {
+        } else {
+            let applied = d["applied"].as_array().map(Vec::len).unwrap_or(0);
+            let merged = d["merged"].as_array().map(Vec::len).unwrap_or(0);
             println!(
-                "  conflict: {} (resolve with: crystalline origin resolve {name} {} --keep mine|theirs)",
-                c["path"].as_str().unwrap_or(""),
-                c["path"].as_str().unwrap_or("")
+                "{name}: {} applied ({merged} merged)",
+                plural(applied, "file", "files")
             );
+        }
+        for line in cmd::own_draft_lines(d) {
+            println!("{line}");
+        }
+        for c in d["conflicts"].as_array().unwrap_or(&empty) {
+            for line in cmd::update_conflict_lines(name, c) {
+                println!("{line}");
+            }
+        }
+        if d["up_to_date"].as_bool().unwrap_or(false) {
+            continue;
         }
         for p in d["proposals"].as_array().unwrap_or(&empty) {
             let number = p["number"].as_u64().unwrap_or(0);
@@ -4156,10 +4171,14 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
             println!("{line}");
         }
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
-            println!(
-                "  unresolved conflict: {}",
-                c["path"].as_str().unwrap_or("")
-            );
+            let path = c["path"].as_str().unwrap_or("");
+            match cmd::draft_kind_words(c) {
+                Some(words) => println!("  unresolved conflict in your draft: {path} ({words})"),
+                None => println!("  unresolved conflict: {path}"),
+            }
+        }
+        for line in cmd::own_draft_lines(d) {
+            println!("{line}");
         }
         let last_checked = d["last_checked"].as_str().map(cmd::relative_time);
         println!(

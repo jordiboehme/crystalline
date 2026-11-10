@@ -19,6 +19,7 @@ import { problemDetail } from "../api/client";
 import type { KeptTextEntry } from "../api/kept";
 import {
   dropKeptText,
+  keptDownloadUrl,
   keptFrom,
   keptKey,
   keptKindLabel,
@@ -85,6 +86,14 @@ export function KeptTextsCard({
         >
           {rows.map((entry) => {
             const from = keptFrom(entry);
+            // A draft file kept as its bytes has no text to show: it is
+            // downloaded instead, and named a file wherever it is named.
+            const what =
+              entry.file === true
+                ? "file"
+                : entry.kind === "comment"
+                  ? "comment"
+                  : "text";
             return (
               <li
                 key={entry.id}
@@ -105,19 +114,30 @@ export function KeptTextsCard({
                   </span>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    aria-label={`Show the kept ${entry.kind === "comment" ? "comment" : "text"} for ${entry.path}`}
-                    onClick={() => {
-                      setShowing(entry);
-                    }}
-                    className={BUTTON.secondary}
-                  >
-                    Show
-                  </button>
+                  {entry.file === true ? (
+                    <a
+                      href={keptDownloadUrl(domain, entry.id)}
+                      download
+                      aria-label={`Download the kept file for ${entry.path}`}
+                      className={BUTTON.secondary}
+                    >
+                      Download
+                    </a>
+                  ) : (
+                    <button
+                      type="button"
+                      aria-label={`Show the kept ${what} for ${entry.path}`}
+                      onClick={() => {
+                        setShowing(entry);
+                      }}
+                      className={BUTTON.secondary}
+                    >
+                      Show
+                    </button>
+                  )}
                   <DestructiveAction
                     label="Drop"
-                    ariaLabel={`Drop the kept ${entry.kind === "comment" ? "comment" : "text"} for ${entry.path}`}
+                    ariaLabel={`Drop the kept ${what} for ${entry.path}`}
                     confirmLabel="Drop it"
                     pending={drop.isPending && drop.variables === entry.id}
                     disabledReason={readOnly}

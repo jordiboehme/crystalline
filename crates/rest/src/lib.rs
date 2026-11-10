@@ -170,6 +170,7 @@ use crate::scope::{DomainAccess, DomainRight};
         automation::read,
         kept::list,
         kept::read,
+        kept::download,
         kept::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
@@ -179,6 +180,9 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::withdraw_proposal,
         domains_admin::conflict_detail,
         domains_admin::resolve_conflict,
+        domains_admin::list_draft_conflicts,
+        domains_admin::get_draft_conflict,
+        domains_admin::resolve_draft_conflict,
         domains_admin::list_domain_changes,
         domains_admin::get_domain_change,
         domains_admin::discard_domain_changes,
@@ -319,6 +323,11 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
+        schemas::DraftConflictKind,
+        schemas::DraftConflictEntry,
+        schemas::DraftConflictsResponse,
+        schemas::DraftConflictSides,
+        schemas::DraftResolveReceipt,
         archive::ArchiveEntryReport,
         archive::ArchiveReport,
         archive::ArchiveNotTaken,
@@ -886,6 +895,7 @@ fn routes(state: RestState) -> Router {
             "/domains/{domain}/kept/{id}",
             get(kept::read).delete(kept::remove),
         )
+        .route("/domains/{domain}/kept/{id}/file", get(kept::download))
         // Admin only as well. The GET is a pure read and stays served on a
         // read-only instance; the POST is a pull that writes, and does not.
         .route(
@@ -923,6 +933,22 @@ fn routes(state: RestState) -> Router {
         .route(
             "/domains/{domain}/sync/conflicts/{id}/resolve",
             post(domains_admin::resolve_conflict),
+        )
+        // The caller's own draft conflicts, which any account that may write
+        // the domain settles: a draft is its author's, so the share role is
+        // not asked. The reads need domain read alone and are served
+        // read-only; the resolve is a write and is not.
+        .route(
+            "/domains/{domain}/drafts/conflicts",
+            get(domains_admin::list_draft_conflicts),
+        )
+        .route(
+            "/domains/{domain}/drafts/conflicts/{id}",
+            get(domains_admin::get_draft_conflict),
+        )
+        .route(
+            "/domains/{domain}/drafts/conflicts/{id}/resolve",
+            post(domains_admin::resolve_draft_conflict),
         )
         // The offline change surface: the list and the detail need domain
         // read alone and never pull, so they are served read-only; the

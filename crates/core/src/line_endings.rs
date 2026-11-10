@@ -6,6 +6,14 @@
 //! parameter - and [`to_lf`] is the single conversion every such boundary
 //! calls. A file Crystalline only reads is never rewritten: a CRLF file turns
 //! into LF on the next write that lands on it, and then as a whole.
+//!
+//! **One exception: a share from a domain that reviews changes keeps the
+//! team's line endings.** A draft is stored as LF like everything else, but
+//! its share is staged with [`with_line_endings_of`] against the team's own
+//! copy, so a wholly CRLF team file comes back CRLF and the proposal or commit
+//! shows only the lines she changed, not every line. Everything else stays LF:
+//! a share of a domain that takes changes directly, and a fold of the drafts
+//! into the folder, land LF as above.
 
 use std::borrow::Cow;
 
@@ -44,6 +52,23 @@ pub fn to_lf(text: &str) -> Cow<'_, str> {
         out.push('\r');
     }
     Cow::Owned(out)
+}
+
+/// `text` in the line endings of `team`: CRLF when every line ending of `team`
+/// is CRLF and it has at least one, otherwise `text` as it is.
+///
+/// The one place a text Crystalline writes out is not LF (see the module doc).
+/// `text` goes through [`to_lf`] first, so a mixed text cannot come out with
+/// some lines doubled, and `to_lf` of the result is always `to_lf(text)`. A
+/// team file with mixed endings, or with no line ending at all, says nothing
+/// clear, so the text keeps the stored form.
+pub fn with_line_endings_of<'t>(text: &'t str, team: &[u8]) -> Cow<'t, str> {
+    let lines = team.iter().filter(|&&byte| byte == b'\n').count();
+    let crlf = team.windows(2).filter(|pair| pair == b"\r\n").count();
+    if lines == 0 || lines != crlf {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(to_lf(text).replace('\n', "\r\n"))
 }
 
 /// [`to_lf`] over raw bytes, refusing anything that is not UTF-8.
@@ -119,6 +144,46 @@ mod tests {
                 "line count kept for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_wholly_crlf_team_file_gives_its_endings() {
+        let out = with_line_endings_of("a\nb\n", b"x\r\ny\r\n");
+        assert_eq!(out, "a\r\nb\r\n");
+        // A text already in CRLF, or mixed, is not doubled.
+        assert_eq!(with_line_endings_of("a\r\nb\nc", b"x\r\n"), "a\r\nb\r\nc");
+    }
+
+    #[test]
+    fn any_other_team_file_leaves_the_text_as_it_is() {
+        for team in [
+            &b"x\ny\n"[..],
+            b"x\r\ny\n",
+            b"no line ending",
+            b"",
+            b"a lone \r only",
+        ] {
+            assert!(
+                matches!(
+                    with_line_endings_of("a\nb\n", team),
+                    Cow::Borrowed("a\nb\n")
+                ),
+                "{team:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_team_endings_round_trip_to_the_stored_text() {
+        for text in ["a\nb\n", "a\r\nb", "x\r\ny\rz\n", "", "\n\n"] {
+            let out = with_line_endings_of(text, b"t\r\n");
+            assert_eq!(to_lf(&out), to_lf(text), "{text:?}");
+            assert!(wholly_crlf_or_empty(&out), "{text:?} -> {out:?}");
+        }
+    }
+
+    fn wholly_crlf_or_empty(text: &str) -> bool {
+        text.matches('\n').count() == text.matches("\r\n").count()
     }
 
     #[test]

@@ -1216,6 +1216,9 @@ function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
   const connection = asObject(record?.connection);
   const connected = connection?.connected;
+  const folderConflicts = asArray(record?.conflicts).filter(
+    (entry) => asObject(entry)?.draft !== true,
+  );
   return {
     repo: asString(record?.repo) ?? "",
     branch: asString(record?.branch),
@@ -1227,7 +1230,12 @@ function readSyncStatus(payload: unknown): SyncStatus {
     ownedChanges: asNumber(record?.owned_changes),
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
-    conflicts: asCount(record?.conflicts),
+    // The folder's conflicts only. A reviewing domain's status also lists
+    // this session's own draft conflicts (`draft: true`); those are settled
+    // from the domain page through the draft routes, so the sync card neither
+    // counts them nor opens them, and one conflict is never drawn twice. A
+    // number is a count already (the poll overview counts the folder's).
+    conflicts: asNumber(record?.conflicts) ?? folderConflicts.length,
     // The key's presence is what says the domain reviews at all: the server
     // leaves both draft keys out of a domain that takes changes directly,
     // where `0 drafts` would read as "you could have some".
@@ -1255,7 +1263,7 @@ function readSyncStatus(payload: unknown): SyncStatus {
     ]
       .map(readProposal)
       .filter((proposal): proposal is SyncProposal => proposal !== null),
-    conflictList: asArray(record?.conflicts)
+    conflictList: folderConflicts
       .map(readConflict)
       .filter((conflict): conflict is SyncConflict => conflict !== null),
     // The four chain keys, which the route always sends and an older report
@@ -1437,6 +1445,12 @@ export interface SharePlan {
    */
   own: boolean;
   /**
+   * On a `proposal_open` plan of a domain that reviews changes: the server's
+   * sentence that says whose proposal is open and what to do, shown as given.
+   * Absent elsewhere, and from an older server.
+   */
+  guidance?: string | null;
+  /**
    * How a direct domain's share will go when it is not the plain commit:
    * the server's own sentences, shown as given, for example that it opens a
    * proposal if the branch refuses it again. Null otherwise, and from an
@@ -1455,6 +1469,14 @@ export interface SharePlan {
    * what a person ticks and discards.
    */
   teamMarker: TeamMarker | null;
+  /**
+   * This session's own drafts that do not fit the team's text, in a domain
+   * that reviews changes: the plan's `draft_conflicts` (a plan of every file)
+   * or its `conflicts` (a `conflicts_pending` plan of named files). Empty
+   * elsewhere, and from an older server. A file among them cannot travel
+   * until it is settled.
+   */
+  draftConflicts: DraftConflict[];
 }
 
 /** A file a share adds on its own, and why: the team marker in the MANIFEST. */
@@ -1545,9 +1567,17 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     branch: asString(record?.branch),
     title: asString(record?.title),
     own: record?.own !== false,
+    guidance: asString(record?.guidance),
     note: asString(record?.note),
     spellingNote: asString(record?.spelling_note),
     teamMarker: readTeamMarker(record?.team_marker),
+    // A plan of every file names them beside its action; a plan of named
+    // files that one of them blocks names them as its `conflicts`.
+    draftConflicts: readDraftConflicts(
+      asArray(record?.draft_conflicts ?? record?.conflicts).filter(
+        (entry) => asObject(entry)?.draft === true,
+      ),
+    ),
   };
 }
 
@@ -1691,17 +1721,242 @@ export async function fetchConflict(
   };
 }
 
-/** Settle one conflict by id: `mine`, `theirs`, or `merged` with content. */
+/**
+ * Settle one conflict of the folder by id: `mine`, `theirs`, or `merged` with
+ * content. For a file beside the pages, taking the team's keeps a copy of the
+ * folder's, and the receipt says so.
+ */
 export async function resolveConflict(
   domain: string,
   id: string,
   resolution: string,
   content?: string,
-): Promise<unknown> {
-  return api<unknown>(
-    `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
-    { method: "POST", body: JSON.stringify({ resolution, content }) },
+): Promise<DraftResolveReceipt> {
+  return resolveReceipt(
+    await api<unknown>(
+      `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
+      { method: "POST", body: JSON.stringify({ resolution, content }) },
+    ),
+    resolution,
   );
+}
+
+/**
+ * Why one of your drafts does not fit the team's text, in the server's word:
+ * `EditEdit`, `EditDelete`, `DeleteEdit`, `AddAdd`, `UnknownStart` or
+ * `AddressTaken`. Kept as a string, so a word this side has not been taught
+ * still opens the dialog rather than vanishing.
+ */
+export type DraftConflictKind = string;
+
+/** One of this session's own drafts that does not fit the team's text. */
+export interface DraftConflict {
+  /** `d` and seven hex digits; what the draft routes are addressed by. */
+  id: string;
+  /** The draft's path, or the deletion's when it stands alone. */
+  path: string;
+  kind: DraftConflictKind;
+  /** The path a moved draft left, or null. */
+  movedFrom: string | null;
+  /** For `AddressTaken`: the team's path that holds the address, or null. */
+  other: string | null;
+  /**
+   * For `AddressTaken`: the page's own conflict when the team also changed or
+   * deleted the page, or null. A new address does not settle that one.
+   */
+  pageKind: DraftConflictKind | null;
+  /** A file beside the pages rather than a page. */
+  file: boolean;
+}
+
+/** This session's own draft conflicts in one domain, and its merged drafts. */
+export interface DraftConflicts {
+  conflicts: DraftConflict[];
+  /** Paths of drafts a merge changed since they last settled, sorted. */
+  merged: string[];
+  /**
+   * What cannot be done with these conflicts here, in the server's own
+   * sentence: none can be settled on a read-only server or without write
+   * access, only the team's text can be taken on a locked domain or an
+   * archived repository. Null when every choice is open.
+   */
+  settleNote: string | null;
+}
+
+/** One draft conflict with its sides, for the dialog that settles it. */
+export interface DraftConflictDetail extends DraftConflict {
+  base: string | null;
+  local: string | null;
+  upstream: string | null;
+  /**
+   * What the team's side is (the SHA-256 of its bytes, `absent` or
+   * `unreadable`), handed back with a resolve so a team change made since it
+   * was shown is refused rather than overwritten. Null from an older server.
+   */
+  upstreamSha256: string | null;
+  /** With a `pageKind`: the team's text of her own page, null when deleted. */
+  pageUpstream: string | null;
+  /**
+   * A draft from before 0.32.0, whose copy Take theirs keeps first. Null from
+   * an older server, which does not say.
+   */
+  oldDraft: boolean | null;
+  /** For her deletion of a page or file the team moved: where it went. */
+  movedTo: string | null;
+  note: string | null;
+}
+
+/** What settling one conflict did, a draft's or the folder's. */
+export interface DraftResolveReceipt {
+  /** `mine`, `theirs` or `merged`. */
+  kept: string;
+  /** Whether a copy of the text or file was kept before taking the team's. */
+  keptCopy: boolean;
+  /** For a kept file: where to find it, in the server's words. */
+  keptNote: string | null;
+  /** The draft landed but its copy on the server's disk did not. */
+  draftWarning: string | null;
+  /** How many conflicts are left, or null when they could not be counted. */
+  remaining: number | null;
+}
+
+/**
+ * The cache key of one domain's own draft conflicts.
+ *
+ * Under the `["domains", ...]` family on purpose: the list is a plain GET that
+ * pulls nothing, so a bulk invalidation re-reading it costs one round trip,
+ * and a Sync now that merged a team change into a draft is then shown at once.
+ */
+export function draftConflictsKey(domain: string): readonly unknown[] {
+  return ["domains", domain, "draft-conflicts"];
+}
+
+/** The cache key of one draft conflict with its sides. */
+export function draftConflictKey(
+  domain: string,
+  id: string,
+): readonly unknown[] {
+  return ["domains", domain, "draft-conflicts", id];
+}
+
+/** One draft conflict entry, or nothing when it has no id or path. */
+export function readDraftConflict(value: unknown): DraftConflict | null {
+  const record = asObject(value);
+  const id = asString(record?.id);
+  const path = asString(record?.path);
+  if (id === null || path === null) {
+    return null;
+  }
+  return {
+    id,
+    path,
+    kind: asString(record?.kind) ?? "",
+    movedFrom: asString(record?.moved_from),
+    other: asString(record?.other),
+    pageKind: asString(record?.page_kind),
+    file: record?.file === true,
+  };
+}
+
+/** Every entry of a list that reads as a draft conflict. */
+function readDraftConflicts(value: unknown): DraftConflict[] {
+  return asArray(value)
+    .map(readDraftConflict)
+    .filter((conflict): conflict is DraftConflict => conflict !== null);
+}
+
+function draftConflictsPath(domain: string, id?: string): string {
+  const base = `/domains/${encodeSegment(domain)}/drafts/conflicts`;
+  return id === undefined ? base : `${base}/${encodeSegment(id)}`;
+}
+
+/**
+ * This session's own draft conflicts and merged drafts in `domain`.
+ *
+ * Any writer may ask, the editor with no share role included: the route is
+ * the draft's author's, where `/sync` is the folder's and needs that role. A
+ * list that cannot be read is refused with the server's sentence (422), never
+ * answered as empty.
+ */
+export async function fetchDraftConflicts(
+  domain: string,
+): Promise<DraftConflicts> {
+  const record = asObject(await api<unknown>(draftConflictsPath(domain)));
+  return {
+    conflicts: readDraftConflicts(record?.conflicts),
+    merged: asStrings(record?.merged),
+    settleNote: asString(record?.settle_note),
+  };
+}
+
+/** One of this session's draft conflicts, with its sides. */
+export async function fetchDraftConflict(
+  domain: string,
+  id: string,
+): Promise<DraftConflictDetail> {
+  const record = asObject(await api<unknown>(draftConflictsPath(domain, id)));
+  return {
+    // The id that was asked for, when the answer did not repeat it: the
+    // resolve is addressed by it.
+    ...(readDraftConflict({ id, ...record }) ?? {
+      id,
+      path: "",
+      kind: "",
+      movedFrom: null,
+      other: null,
+      pageKind: null,
+      file: false,
+    }),
+    base: asString(record?.base),
+    local: asString(record?.local),
+    upstream: asString(record?.upstream),
+    upstreamSha256: asString(record?.upstream_sha256),
+    pageUpstream: asString(record?.page_upstream),
+    oldDraft: typeof record?.old_draft === "boolean" ? record.old_draft : null,
+    movedTo: asString(record?.moved_to),
+    note: asString(record?.note),
+  };
+}
+
+/**
+ * Settle one draft conflict: `mine`, `theirs`, or `merged` with content.
+ *
+ * `expectedUpstream` is the `upstreamSha256` of the sides that were shown:
+ * the server refuses the resolve (409) when the team's side changed since,
+ * so nobody settles against team text they did not see.
+ */
+export async function resolveDraftConflict(
+  domain: string,
+  id: string,
+  resolution: string,
+  content?: string,
+  expectedUpstream?: string | null,
+): Promise<DraftResolveReceipt> {
+  return resolveReceipt(
+    await api<unknown>(`${draftConflictsPath(domain, id)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({
+        resolution,
+        content,
+        ...(expectedUpstream == null
+          ? {}
+          : { expected_upstream_sha256: expectedUpstream }),
+      }),
+    }),
+    resolution,
+  );
+}
+
+/** What a resolve answered, as a receipt; `resolution` is what was asked. */
+function resolveReceipt(raw: unknown, resolution: string): DraftResolveReceipt {
+  const record = asObject(raw);
+  return {
+    kept: asString(record?.kept) ?? resolution,
+    keptCopy: record?.kept_copy === true,
+    keptNote: asString(record?.kept_note),
+    draftWarning: asString(record?.draft_warning),
+    remaining: asNumber(record?.remaining),
+  };
 }
 
 /** The engram a changed file holds, when it holds one and it parses. */

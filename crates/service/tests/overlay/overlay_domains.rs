@@ -314,9 +314,10 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Write one actor's draft the way Task 4's write verbs will: the row and
-    /// its mirror, in that order.
+    /// Write one actor's draft the way the write verbs do: the record of
+    /// where it started, the row and its mirror, in that order.
     async fn draft(&self, domain: &str, actor: &str, path: &str, text: &str) {
+        self.record_start(domain, actor, path, false);
         let store = self.store.lock().await;
         let id = self.domain_id(&*store, domain).await;
         store
@@ -326,8 +327,52 @@ impl Fixture {
         overlay_journal::journal_write(&self.state, domain, actor, path, text).unwrap();
     }
 
+    /// The record of where `actor`'s row at `path` starts, as a write verb
+    /// leaves it for a new row: the team's text there, as LF, when the base snapshot
+    /// holds the path, else a new file; a tombstone names its own path either
+    /// way. Left alone when a record stands, as a second write leaves it, and
+    /// when the domain has no snapshot, where no verb writes one.
+    fn record_start(&self, domain: &str, actor: &str, path: &str, tombstone: bool) {
+        let snapshot = self.origins.join(domain);
+        let Some(state) = crystalline_remote::state::OriginState::load(&snapshot).unwrap() else {
+            return;
+        };
+        if crystalline_service::draft_start::load(&self.state, domain, actor, path)
+            .unwrap()
+            .is_some()
+        {
+            return;
+        }
+        let start = if state.files.contains_key(path) {
+            crystalline_remote::state::read_base_file(&snapshot, path)
+                .unwrap()
+                .map(|bytes| {
+                    crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned()
+                })
+        } else {
+            None
+        };
+        crystalline_service::draft_start::save(
+            &self.state,
+            domain,
+            actor,
+            &crystalline_service::draft_start::DraftStart {
+                path: path.to_string(),
+                from: (tombstone || start.is_some()).then(|| path.to_string()),
+                start,
+                start_sha256: None,
+                shared: None,
+                merged_at: None,
+                merging: None,
+                settling: None,
+            },
+        )
+        .unwrap();
+    }
+
     /// Write one actor's deletion of a base path the same way.
     async fn tombstone(&self, domain: &str, actor: &str, path: &str) {
+        self.record_start(domain, actor, path, true);
         let store = self.store.lock().await;
         let id = self.domain_id(&*store, domain).await;
         let mut rec = record(PLAN, path);
@@ -8023,8 +8068,9 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
     let allowed = [
         // The constructor itself.
         ("domain_view.rs", "for_actor"),
-        // The convergence pass a pull runs, which walks every actor's entries.
-        ("engine.rs", "converge_pulled_overlays"),
+        // The convergence pass a pull runs, which walks every actor's entries
+        // (or, for a preview, only the caller's own).
+        ("engine.rs", "converge_overlays_of"),
         // ...and the rename it performs when the base carried the draft along.
         ("engine.rs", "move_draft_with_the_base"),
         // The fold, which ends every actor's drafts on the way out.

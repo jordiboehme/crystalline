@@ -90,7 +90,7 @@ pub use kind::ContentKind;
 pub use layout::{
     DomainLayout, EngramRow, PathClass, ReflectionMode, is_pending_engram, slash_rel,
 };
-pub use line_endings::{NotUtf8, to_lf, utf8_to_lf};
+pub use line_endings::{NotUtf8, to_lf, utf8_to_lf, with_line_endings_of};
 pub use manifest::{
     ArtifactType, DOMAIN_NAME_KEY, EVOLVE_HOME_KEY, EVOLVE_TRIGGER_KEY, GENERATED_INDEXES_KEY,
     GeneratedIndexes, Manifest, PolicyKey, PolicyKind, PolicyRole, ProblemKind, ProvisioningDecl,

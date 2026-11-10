@@ -181,8 +181,14 @@ impl Engine {
                     // wipe, and the two have to be one shape or a restored
                     // deletion says something different from a written one.
                     let base_text = self.load_content(&source, &desc).await?;
+                    // The text she was looking at, unless a room's live text
+                    // stood in front of it, which is nobody's start.
+                    let read = match (&live, &visible) {
+                        (None, Some(read)) => read.as_str(),
+                        _ => base_text.as_str(),
+                    };
                     warning = self
-                        .write_overlay_tombstone(&desc.domain, who, &desc, &base_text)
+                        .write_overlay_tombstone(&desc.domain, who, &desc, &base_text, read)
                         .await?;
                 }
             }

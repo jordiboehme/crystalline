@@ -27,6 +27,7 @@ function comment(over: Partial<KeptTextEntry> = {}): KeptTextEntry {
     draft: false,
     kind: "comment",
     path: "guides/a.md",
+    file: false,
     kept_at: "2026-10-15T08:00:00Z",
     bytes: 20,
     sender: "Ada Lovelace",

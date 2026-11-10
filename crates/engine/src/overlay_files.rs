@@ -182,17 +182,29 @@ pub(crate) fn tombstone(state_dir: &Path, domain: &str, actor: &str, path: &str)
     save(&tombstone_of(&abs), b"")
 }
 
-/// Drop whatever one actor holds at `path`, bytes or sidecar.
+/// Drop whatever one actor holds at `path`, bytes or sidecar, and then the
+/// record of where it started.
 ///
 /// The folders it stood in are pruned while they are empty, up to and including
 /// `files/` - and no further: the actor's own folder belongs to the journal and
 /// outlives a cleared file.
+///
+/// A record that cannot be removed is only logged: it is read only beside an
+/// entry, and the next new entry at the path writes its own.
 pub(crate) fn clear(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<()> {
     let abs = file(state_dir, domain, actor, path)?;
     remove_if_present(&tombstone_of(&abs))?;
     remove_if_present(&abs)?;
     let stop = files_dir(state_dir, domain, actor)?;
     prune_empty(abs.parent(), &stop);
+    if let Err(e) = crate::draft_start::clear_file(state_dir, domain, actor, path) {
+        tracing::warn!(
+            domain,
+            actor,
+            path,
+            "the record of a cleared draft file could not be removed: {e}"
+        );
+    }
     Ok(())
 }
 
@@ -435,11 +447,21 @@ pub(crate) fn by_actor(state_dir: &Path, domain: &str) -> DomainFiles {
 pub(crate) fn remove_actor(state_dir: &Path, domain: &str, actor: &str) -> io::Result<u64> {
     let dir = files_dir(state_dir, domain, actor)?;
     let held = entries(state_dir, domain, actor).entries.len() as u64;
-    match crystalline_core::tree::remove_tree(&dir) {
-        Ok(true) => Ok(held),
-        Ok(false) => Ok(0),
-        Err(e) => Err(e.into()),
+    let removed = match crystalline_core::tree::remove_tree(&dir) {
+        Ok(true) => held,
+        Ok(false) => 0,
+        Err(e) => return Err(e.into()),
+    };
+    // Their records go with them; one left behind is only logged, as in
+    // [`clear`].
+    if let Err(e) = crate::draft_start::clear_files(state_dir, domain, actor) {
+        tracing::warn!(
+            domain,
+            actor,
+            "the records of removed draft files could not be removed: {e}"
+        );
     }
+    Ok(removed)
 }
 
 /// Walk one actor's files folder, appending every entry under it. Answers

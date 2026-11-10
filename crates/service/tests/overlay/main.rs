@@ -8,4 +8,5 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod draft_moves;
 mod overlay_domains;
