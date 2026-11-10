@@ -1366,9 +1366,9 @@ mod chain {
         }
     }
 
-    /// Task 14 re-review N-3: comparing a draft in conflict with `origin
-    /// diff --path` ends with the resolve line, which carries the team
-    /// side's digest so the resolve is checked against what she compared.
+    /// Comparing a draft in conflict with `origin diff --path` ends with the
+    /// resolve line, which carries the team side's digest so the resolve is
+    /// checked against what she compared.
     #[test]
     fn origin_diff_of_a_draft_conflict_names_the_team_side_to_resolve_against() {
         let daemon = Daemon::answering(
@@ -1949,7 +1949,7 @@ mod chain {
         assert!(err.contains(refusal), "{err}");
     }
 
-    // --- a draft's conflict, as the engine answers it (Task 12) ---------------
+    // --- a draft's conflict, as the engine answers it ----------------------------
 
     /// One draft conflict as status, update and the share list it: the engine's
     /// `draft_conflicts_json` shape.
@@ -2211,7 +2211,8 @@ mod chain {
             "{out}"
         );
 
-        // C25: the team side she read travels with the resolve.
+        // The team side she read travels with the resolve, so a newer one is
+        // refused.
         let daemon = Daemon::answering(
             "resolve-expect-upstream",
             json!({ "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine" }),

@@ -6882,7 +6882,7 @@ export type ResolveDomainConflictErrors = {
      */
     415: ProblemDetail;
     /**
-     * An unknown `resolution`, or `merged` with no `content` to write.
+     * An unknown `resolution`, `merged` with no `content` to write, or `merged` for a file under `assets/`, which never merges.
      */
     422: ProblemDetail;
 };

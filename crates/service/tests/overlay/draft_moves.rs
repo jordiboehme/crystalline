@@ -751,7 +751,7 @@ async fn a_tombstone_over_a_draft_from_elsewhere_does_not_read_as_in_step() {
     assert_eq!(f.start("b.md"), Some(before), "the row did not land");
 }
 
-/// C1: asking a held row's record whether it names this path can meet a broken
+/// Asking a held row's record whether it names this path can meet a broken
 /// one, and the deletion refuses with nothing changed. A discard is the way out.
 #[tokio::test]
 async fn a_delete_of_a_draft_with_a_broken_record_refuses_and_changes_nothing() {
@@ -1423,7 +1423,7 @@ async fn a_state_file_that_does_not_parse_refuses_a_new_draft_and_leaves_nothing
     assert_eq!(f.start("plan.md"), None);
 }
 
-/// C1: a broken record is an error and never a missing one. The move refuses
+/// A broken record is an error and never a missing one. The move refuses
 /// while nothing has changed, so no destination can read as an old draft.
 #[tokio::test]
 async fn a_move_of_a_draft_with_a_broken_record_refuses_and_changes_nothing() {
@@ -1682,7 +1682,7 @@ async fn a_failed_follow_of_a_team_rename_restores_the_source_record() {
     assert_eq!(f.start("plan.md"), None);
 }
 
-/// C1 on the pass's side: a broken record stops the follow before anything is
+/// On the pass's side, a broken record stops the follow before anything is
 /// dropped, so the draft stands where it was and never reads as an old draft.
 #[tokio::test]
 async fn a_follow_of_a_draft_with_a_broken_record_leaves_it_where_it_was() {
@@ -1923,7 +1923,7 @@ async fn an_edited_move_on_the_same_line_is_a_conflict_at_the_new_path() {
     );
 }
 
-/// N1, direct: her own share of an edited move ends both halves, and a later
+/// On a direct domain her own share of an edited move ends both halves, and a later
 /// colleague's edit of the new path is his, with nothing of hers to share.
 #[tokio::test]
 async fn an_edited_move_ends_when_it_lands_and_a_later_peer_edit_stays() {
@@ -2020,7 +2020,7 @@ async fn a_crlf_team_file_clears_her_landed_draft() {
 }
 
 /// A plain move back onto the path she moved from: her own deletion there is no
-/// obstacle (C3).
+/// obstacle.
 #[tokio::test]
 async fn a_plain_move_back_lands_on_her_own_deletion_and_survives_a_rebuild() {
     let f = fixture(&[("plan.md", LONG)]).await;
@@ -2063,7 +2063,8 @@ async fn a_merge_equal_to_the_teams_text_ends_the_draft() {
 
 /// An edited case move whose edit the team took, with a line of his own: her
 /// draft takes his text and is an unedited case move from there, which stays in
-/// step on either disk, as C10 has it. Nobody's change ends her case move.
+/// step on either disk, since no text is at stake. Nobody's change ends her
+/// case move.
 #[tokio::test]
 async fn an_edited_case_move_whose_edit_the_team_took_stays_on_either_disk() {
     let f = fixture(&[("plan.md", LONG)]).await;
@@ -2202,7 +2203,7 @@ impl Fixture {
     }
 }
 
-/// N4: Take theirs at the path she moved from settles the whole move, for a
+/// Take theirs at the path she moved from settles the whole move, for a
 /// rename and for a case move, on either disk.
 #[tokio::test]
 async fn resolving_a_move_at_the_old_path_settles_the_whole_move() {
@@ -2223,7 +2224,7 @@ async fn resolving_a_move_at_the_old_path_settles_the_whole_move() {
     }
 }
 
-/// N1 after a resolve: Keep mine on an edited move in conflict, then her direct
+/// After a resolve: Keep mine on an edited move in conflict, then her direct
 /// share, ends both halves with no row left.
 #[tokio::test]
 async fn keep_mine_on_an_edited_move_ends_when_shared_with_no_row_left() {
@@ -2280,7 +2281,7 @@ async fn keep_mine_on_a_case_move_starts_at_the_teams_spelling() {
     assert_eq!(f.conflicts().await, vec![]);
 }
 
-/// m-1: a merged resolve takes the pass's three steps. Its start could not move
+/// A merged resolve takes the pass's three steps. Its start could not move
 /// after the row was written, so the record still marks the merge, and the
 /// next pass merges again rather than reading her case move as landed: both
 /// halves stand, on either disk.
@@ -2326,7 +2327,7 @@ async fn a_merged_resolve_whose_start_could_not_move_keeps_the_case_move() {
     assert_eq!(f.conflicts().await, vec![]);
 }
 
-/// m-3: Keep mine on a move whose deletion half changed meanwhile settles the
+/// Keep mine on a move whose deletion half changed meanwhile settles the
 /// draft and says the half is not settled, so she settles it again.
 #[tokio::test]
 async fn a_move_settled_half_way_says_so_and_a_second_press_finishes_it() {
@@ -2364,7 +2365,7 @@ async fn a_move_settled_half_way_says_so_and_a_second_press_finishes_it() {
     assert_eq!(f.conflicts().await, vec![]);
 }
 
-/// m-7: a merged text whose mirror could not be written still lands, and the
+/// A merged text whose mirror could not be written still lands, and the
 /// receipt says so, as every draft write does.
 #[tokio::test]
 async fn a_merged_resolve_tells_the_caller_when_its_mirror_failed() {
@@ -2860,7 +2861,7 @@ async fn a_colleagues_conflict_with_her_choice_discard_lets_the_others_fold() {
     assert_eq!(f.folder("plan.md"), Some(bobs(LONG)));
 }
 
-/// C1: a record that cannot be read refuses the fold and changes nothing. The
+/// A record that cannot be read refuses the fold and changes nothing. The
 /// plan still answers, and says her conflicts could not be read.
 #[tokio::test]
 async fn a_fold_with_a_broken_record_refuses_and_changes_nothing() {
@@ -2932,7 +2933,7 @@ async fn the_machine_owners_conflict_is_never_a_removed_names() {
     );
 }
 
-/// C1 at the second check: a record that breaks while the rooms close refuses
+/// At the second check, a record that breaks while the rooms close refuses
 /// the fold, and the key goes back on with nothing folded.
 #[tokio::test]
 async fn a_record_broken_during_the_fold_puts_the_key_back() {
@@ -3147,7 +3148,7 @@ async fn a_pull_during_a_repeated_fold_leaves_the_key_off() {
     assert_eq!(f.rows().await.len(), 2);
 }
 
-/// N-1: a mark left with no drafts (a crash after the last drop, or an admin
+/// A mark left with no drafts (a crash after the last drop, or an admin
 /// who ended the drafts) is taken away by the next `direct`, which has nothing
 /// else to do.
 #[tokio::test]
@@ -3163,7 +3164,7 @@ async fn a_fold_with_nothing_left_takes_a_stale_mark_away() {
     assert!(!mark.exists(), "the mark is gone");
 }
 
-/// N-2: in a fold that stopped part way, status still tells her which of
+/// In a fold that stopped part way, status still tells her which of
 /// her drafts stand, so she knows what to settle.
 #[tokio::test]
 async fn status_names_her_conflicts_while_a_fold_is_unfinished() {
@@ -3199,8 +3200,9 @@ async fn status_names_her_conflicts_while_a_fold_is_unfinished() {
     );
 }
 
-/// N-3 (C22): in a repeated fold, the second address check leaves the domain as
-/// it found it, as the conflict check does: the key stays off, the mark stays.
+/// In a repeated fold, the second address check leaves the domain as it found
+/// it, as the conflict check does: the key stays off, the mark stays. One rule
+/// holds while a fold is being repeated.
 #[tokio::test]
 async fn a_repeated_folds_address_refusal_leaves_the_key_off() {
     let f = Arc::new(fixture(&[("plan.md", PLAN)]).await);
@@ -3250,7 +3252,7 @@ async fn a_repeated_folds_address_refusal_leaves_the_key_off() {
     assert_eq!(f.rows().await.len(), 2);
 }
 
-/// A file stopped part way through a fold is settled as a page is (C21): the
+/// A file stopped part way through a fold is settled as a page is: the
 /// team's change to it refuses the repeat, Keep mine works with the key off, and
 /// the repeat then lands her bytes.
 #[tokio::test]

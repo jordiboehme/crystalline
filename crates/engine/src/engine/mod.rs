@@ -7241,7 +7241,8 @@ impl Engine {
                     ..record.clone()
                 },
                 SharedFate::Merged => {
-                    // C11: a folder that cannot say does not fold here.
+                    // A folder that cannot say does not fold here, so a case
+                    // move is never read as landed on a guess.
                     let folds_case =
                         root_is_there && folder_folds_case(root, &entry.path) == Some(true);
                     let key = merged_key(

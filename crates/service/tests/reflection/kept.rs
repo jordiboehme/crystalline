@@ -481,7 +481,7 @@ async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
 
 /// A draft file kept before kept files took their own extension is named
 /// `.md`. It is still listed as a file, downloads as its bytes and can be
-/// dropped (Task 14 review I-2).
+/// dropped.
 #[tokio::test]
 async fn an_old_md_named_kept_file_lists_downloads_and_drops() {
     let s = serve().await;
@@ -518,7 +518,7 @@ async fn an_old_md_named_kept_file_lists_downloads_and_drops() {
 
 /// A kept copy the server cannot read is a fault on the server's side: the
 /// read and the download answer 500 in a sentence that names no place on the
-/// server's disk (C24); the cause goes to the log.
+/// server's disk; the cause goes to the log.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_kept_copy_that_cannot_be_read_names_no_server_path() {

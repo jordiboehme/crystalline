@@ -5953,6 +5953,51 @@ pub fn resolve(
     })
 }
 
+/// The two sides of the open conflict at `path` as bytes: what the folder
+/// holds there and what the team holds, each `None` where that side has no
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictSides {
+    /// The folder's file, read at its spelling on disk.
+    pub folder: Option<Vec<u8>>,
+    /// The team's file, as the pull recorded it.
+    pub team: Option<Vec<u8>>,
+}
+
+/// Reads [`ConflictSides`] for the open conflict at `path`, so a caller can
+/// keep a copy of the folder's file before [`Resolution::Theirs`] replaces it.
+/// The folder's side is read where [`resolve`] writes, at the file's spelling
+/// on disk, so the copy is of the very file the resolve overwrites.
+///
+/// Errors with [`RemoteError::ConflictNotFound`] as [`resolve`] does when no
+/// conflict is open at `path`. Offline.
+pub fn conflict_sides(
+    domain_root: &Path,
+    state_dir: &Path,
+    path: &str,
+) -> Result<ConflictSides, RemoteError> {
+    let state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::Refused(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+    let conflict = state
+        .conflicts
+        .iter()
+        .find(|c| c.path == path)
+        .ok_or_else(|| RemoteError::ConflictNotFound {
+            path: path.to_string(),
+            open: state.conflicts.iter().map(|c| c.path.clone()).collect(),
+        })?;
+    let (_, team) = state::read_conflict_files(state_dir, &conflict.id)?;
+    let local = detect_local_changes(domain_root, &state.files)?;
+    let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
+    Ok(ConflictSides {
+        folder: read_optional_file(&wt_path)?,
+        team,
+    })
+}
+
 /// Handles the "nothing new upstream" outcome of a pull: refresh open
 /// proposals (a proposal can still be declined without the branch moving),
 /// consume any merged record, persist the result and report up to date.

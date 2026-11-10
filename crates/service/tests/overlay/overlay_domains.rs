@@ -314,7 +314,7 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Write one actor's draft the way Task 4's write verbs will: the record of
+    /// Write one actor's draft the way the write verbs do: the record of
     /// where it started, the row and its mirror, in that order.
     async fn draft(&self, domain: &str, actor: &str, path: &str, text: &str) {
         self.record_start(domain, actor, path, false);

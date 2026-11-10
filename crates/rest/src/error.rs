@@ -742,7 +742,7 @@ impl From<EngineError> for ApiError {
                 ApiError::conflict(detail)
             }
             // And an eighth: a resolve made against a team side the person
-            // was not shown (C25). The request is fine; the team's text moved
+            // was not shown. The request is fine; the team's text moved
             // since it was read, so the client reads the sides again.
             EngineError::Conflict(ref text) if text.contains(TEAM_CHANGED_SINCE) => {
                 ApiError::conflict(detail)

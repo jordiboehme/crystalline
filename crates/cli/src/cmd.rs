@@ -1380,8 +1380,8 @@ pub(crate) fn print_origin_diff(domain: &str, data: &serde_json::Value, json: bo
 
 /// The resolve line `origin diff --path` ends with for a draft in conflict:
 /// the ways out its kind leaves, with `--expect-upstream` and the team side's
-/// digest, so the resolve is refused if the team's text moves before it runs
-/// (C25). `None` for anything that is not a draft conflict.
+/// digest, so the resolve is refused if the team's text moves before it runs:
+/// nobody settles against a team text they were not shown. `None` for anything that is not a draft conflict.
 fn draft_conflict_resolve_line(domain: &str, conflict: &serde_json::Value) -> Option<String> {
     let path = conflict["path"].as_str()?;
     let digest = conflict["upstream_sha256"].as_str()?;
@@ -1499,7 +1499,9 @@ pub(crate) fn print_origin_resolve(
 /// `domain`. A
 /// draft's receipt (`draft: true`) says what each choice did: theirs ends the
 /// draft and says where a kept copy is, and a path at the other end of a move
-/// names where the draft is. A count the engine could not read
+/// names where the draft is. The folder's own conflict at a file says what
+/// the folder holds now and where a copy of its file is. A count the engine
+/// could not read
 /// (`remaining: null`) is said so, never printed as 0.
 fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> Vec<String> {
     let resolved = data["resolved"].as_str().unwrap_or("");
@@ -1535,6 +1537,21 @@ fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> 
                 }
                 Some("merged") => lines.push("Your draft now holds the merged text.".to_string()),
                 _ => {}
+            }
+        } else if file {
+            // The folder's own conflict at a file: what the folder holds now,
+            // and where the copy of its own file went.
+            if let Some(note) = data["note"].as_str() {
+                lines.push(note.to_string());
+            }
+            if data["kept_copy"] == true {
+                lines.push(match data["kept_file"].as_str() {
+                    Some(kept) => format!(
+                        "A copy of the folder's file is kept at {kept}: see crystalline kept list."
+                    ),
+                    None => "A copy of the folder's file is kept: see crystalline kept list."
+                        .to_string(),
+                });
             }
         }
     }
@@ -1594,6 +1611,56 @@ mod origin_resolve_tests {
                 "Resolved: plan.md".to_string(),
                 "Remaining conflicts: 2".to_string(),
                 "Note: a note from the writer".to_string(),
+            ]
+        );
+    }
+
+    /// The folder's own conflict at a file says what the folder holds now,
+    /// and where the copy of its file is when one was kept.
+    #[test]
+    fn a_folder_file_says_what_the_folder_holds_and_where_its_copy_is() {
+        let lines = origin_resolve_lines(
+            "team",
+            "assets/deck.png",
+            &serde_json::json!({
+                "resolved": "assets/deck.png",
+                "remaining": 0,
+                "file": true,
+                "kept": "theirs",
+                "note": "The folder now holds the team's file.",
+                "kept_copy": true,
+                "kept_file": "/state/kept/team/engram/assets/deck.2026.png",
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: assets/deck.png".to_string(),
+                "The folder now holds the team's file.".to_string(),
+                "A copy of the folder's file is kept at \
+                 /state/kept/team/engram/assets/deck.2026.png: see crystalline kept list."
+                    .to_string(),
+                "Remaining conflicts: 0".to_string(),
+            ]
+        );
+        let lines = origin_resolve_lines(
+            "team",
+            "assets/deck.png",
+            &serde_json::json!({
+                "resolved": "assets/deck.png",
+                "remaining": 0,
+                "file": true,
+                "kept": "mine",
+                "note": "The folder keeps its own file.",
+                "kept_copy": false,
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: assets/deck.png".to_string(),
+                "The folder keeps its own file.".to_string(),
+                "Remaining conflicts: 0".to_string(),
             ]
         );
     }

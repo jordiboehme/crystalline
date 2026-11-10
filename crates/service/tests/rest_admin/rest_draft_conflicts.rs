@@ -786,7 +786,7 @@ async fn a_merged_resolve_lands_in_her_draft() {
     );
 }
 
-/// C25: a resolve that names the team side it was shown is refused with 409
+/// A resolve that names the team side it was shown is refused with 409
 /// when a pull has brought newer team text since, and nothing changes; with
 /// the side read again it settles.
 #[tokio::test]
@@ -832,7 +832,7 @@ async fn a_resolve_against_team_text_she_was_not_shown_is_a_409() {
     assert_eq!(status, 200, "{receipt}");
 }
 
-/// Task 14 re-review N-1: an account that lost its write right still lists
+/// An account that lost its write right still lists
 /// its conflicts, and is told before it presses that none can be settled.
 #[tokio::test]
 async fn a_session_without_the_write_right_is_told_it_cannot_settle() {
@@ -922,4 +922,116 @@ async fn a_failed_write_says_nothing_was_changed() {
     let (status, list) = alice.get(LIST).await;
     assert_eq!(status, 200, "{list}");
     assert_eq!(list["conflicts"][0]["id"], json!(hers));
+}
+
+// --- The folder's own conflict at a file beside the pages --------------------
+
+const DECK: &str = "assets/deck.png";
+const FOLDER_DECK: &[u8] = b"\x89PNG\r\n\x1a\n\x00the deck edited in the folder";
+const NEWER_DECK: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's newer deck";
+
+/// The team holds a deck, the folder's copy is edited out of band, and the
+/// team then changes it: the pull records the folder's conflict at the file,
+/// and its id is returned.
+async fn a_folder_file_conflict(t: &Team) -> String {
+    t.push(&[(DECK, b"\x89PNG\r\n\x1a\n\x00the team's deck".to_vec())])
+        .await;
+    std::fs::write(t.root().join(DECK), FOLDER_DECK).unwrap();
+    t.push(&[(DECK, NEWER_DECK.to_vec())]).await;
+    let state = OriginState::load(&t.tmp.path().join("origins").join("team"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.conflicts.len(), 1, "the pull recorded the folder's");
+    assert_eq!(state.conflicts[0].path, DECK);
+    state.conflicts[0].id.clone()
+}
+
+/// The folder's conflict at a file settles by its id, each way, and the
+/// domain shares again afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_folder_route_settles_a_file_each_way_and_the_domain_shares_again() {
+    for (keep, on_disk, kept_copy) in [("mine", FOLDER_DECK, false), ("theirs", NEWER_DECK, true)] {
+        let t = team().await;
+        t.write("root", "Other", "root's draft of the other page", true)
+            .await;
+        let folders = a_folder_file_conflict(&t).await;
+        let pending = t
+            .engine
+            .origin_share(
+                "team",
+                None,
+                None,
+                None,
+                None,
+                crystalline_service::engine::ShareActor::Account("root".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending["outcome"], "conflicts_pending", "{keep}: {pending}");
+
+        let served = t.serve().await;
+        let root = served.login("root").await;
+        let resp = root
+            .request(
+                reqwest::Method::POST,
+                &format!("/domains/team/sync/conflicts/{folders}/resolve"),
+            )
+            .json(&json!({"resolution": keep}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{keep}");
+        let receipt: Value = resp.json().await.unwrap();
+        assert_eq!(receipt["resolved"], DECK, "{keep}: {receipt}");
+        assert_eq!(receipt["remaining"], json!(0), "{keep}: {receipt}");
+        assert_eq!(receipt["file"], json!(true), "{keep}: {receipt}");
+        assert_eq!(receipt["kept"], keep, "{keep}: {receipt}");
+        assert_eq!(receipt["kept_copy"], json!(kept_copy), "{keep}: {receipt}");
+        // An account is never told a place on this server's disk.
+        assert!(receipt["kept_file"].is_null(), "{keep}: {receipt}");
+        assert_eq!(
+            std::fs::read(t.root().join(DECK)).unwrap(),
+            on_disk,
+            "{keep}"
+        );
+
+        let shared = t
+            .engine
+            .origin_share(
+                "team",
+                None,
+                None,
+                None,
+                None,
+                crystalline_service::engine::ShareActor::Account("root".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shared["outcome"], "proposed", "{keep}: {shared}");
+    }
+}
+
+/// A file has no text to merge, and the route says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_folder_route_refuses_to_merge_a_file() {
+    let t = team().await;
+    let folders = a_folder_file_conflict(&t).await;
+    let served = t.serve().await;
+    let root = served.login("root").await;
+    let resp = root
+        .request(
+            reqwest::Method::POST,
+            &format!("/domains/team/sync/conflicts/{folders}/resolve"),
+        )
+        .json(&json!({"resolution": "merged", "content": "some text"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["detail"], "A file cannot be merged here. Keep one of the two.",
+        "{body}"
+    );
+    assert_eq!(std::fs::read(t.root().join(DECK)).unwrap(), FOLDER_DECK);
 }

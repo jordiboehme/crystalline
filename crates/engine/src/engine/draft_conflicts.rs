@@ -86,7 +86,7 @@ impl Held {
 ///
 /// On a disk that folds case `read_base_file("Plan.md")` also answers
 /// `plan.md`'s bytes, so a path that is not a key is absent without a read. A
-/// key with no readable copy is unreadable with its stamp, never absent (C5),
+/// key with no readable copy is unreadable with its stamp, never absent,
 /// and so is a key whose folded spelling another key shares on a disk that
 /// folds case, since the two have one copy between them.
 struct Base<'s> {
@@ -168,8 +168,8 @@ pub const TEAM_SIDE_ABSENT: &str = "absent";
 pub const TEAM_SIDE_UNREADABLE: &str = "unreadable";
 
 /// What the team's side of a conflict is, as the sides answer it in
-/// `upstream_sha256` and a resolve hands it back (C25): the SHA-256 of its
-/// bytes, or [`TEAM_SIDE_ABSENT`] when the team holds nothing there, or
+/// `upstream_sha256` and a resolve hands it back, so nobody settles against a
+/// team side they were not shown: the SHA-256 of its bytes, or [`TEAM_SIDE_ABSENT`] when the team holds nothing there, or
 /// [`TEAM_SIDE_UNREADABLE`].
 fn team_side_digest(held: &Held) -> String {
     match held {
@@ -179,8 +179,8 @@ fn team_side_digest(held: &Held) -> String {
     }
 }
 
-/// How a resolve against a team side the person was not shown is refused
-/// (C25): the sentence ends the same way for a page and a file, so a surface
+/// How a resolve against a team side the person was not shown is refused:
+/// the sentence ends the same way for a page and a file, so a surface
 /// tells it apart from every other refusal.
 pub const TEAM_CHANGED_SINCE: &str =
     " since you looked at it. Look at it again before you settle it.";
@@ -197,11 +197,11 @@ struct Kind {
 /// tells it from any other conflict.
 pub(crate) const RECORD_UNREADABLE: &str = "The record of where your draft of ";
 
-/// The refusal of a draft whose record cannot be read (C1, the Task 5
-/// review's M2): it names the ways out. Discard ends the draft without reading
+/// The refusal of a draft whose record cannot be read. A broken record is
+/// never read as no record, so the refusal names the ways out. Discard ends the draft without reading
 /// the record, and a removed record reads as a draft from before 0.32.0, which
 /// is `UnknownStart`. The record's place on disk is named only to the machine
-/// owner, whose drafts these are only on this machine (C24); anybody else
+/// owner, whose drafts these are only on this machine; anybody else
 /// reaches this server from elsewhere and is told to ask whoever runs it. The
 /// cause goes to the log.
 fn unreadable_record(
@@ -303,7 +303,8 @@ fn conflict_id(actor: &str, path: &str) -> String {
     format!("d{}", &hash[..7])
 }
 
-/// What a row with a record is, from the one decision (C7).
+/// What a row with a record is, from the one decision (`next_step`), so the
+/// gate and the pass cannot read a row two ways.
 fn from_next_step(step: DraftStep) -> Option<DraftConflictKind> {
     match step {
         DraftStep::Landed | DraftStep::InStep => None,
@@ -420,7 +421,7 @@ pub(super) enum FileStep {
 ///    changed what she edited (`EditEdit`) or deleted (`DeleteEdit`).
 ///
 /// Her own shared proposal, merged with what she shared, moves her start to
-/// that version first ([`FileDraft::read`]), as a merged page's does (C19). Her
+/// that version first ([`FileDraft::read`]), as a merged page's does. Her
 /// bytes then equal her start and end, and a team change since is the team's
 /// own. A merged proposal that was not hers decides nothing.
 ///
@@ -505,7 +506,7 @@ pub(super) fn team_key<'s>(
 impl FileDraft {
     /// Read one of `actor`'s draft files against `state`. `folds` says the
     /// domain's folder may fold case at its path. A record that cannot be read
-    /// is an error (C1).
+    /// is an error, never a file with no record.
     pub(super) fn read(
         journal_dir: &Path,
         domain: &str,
@@ -528,7 +529,7 @@ impl FileDraft {
         // A file held under several spellings has no digest to name; an empty
         // one equals no start, so it reads as a conflict.
         let team = held.then(|| stamp.map_or_else(String::new, |stamp| stamp.sha256.clone()));
-        // C19: her own proposal, merged, holding exactly what she shared there.
+        // Her own proposal, merged, holding exactly what she shared there.
         // The team had her version then, so her start is that version; a team
         // change since is the team's own, and a proposal that was not hers
         // decides nothing about her draft.
@@ -728,7 +729,8 @@ impl Reading<'_> {
     }
 
     /// The team's page whose base copy answers to `permalink`, among the pages
-    /// of the snapshot she holds no row at (C13).
+    /// of the snapshot she holds no row at. Where she holds one, her own row
+    /// answers for that path, as it does in the pass.
     ///
     /// Read from the copies and never from the index: after a rename that
     /// changed no byte the index reads the new file's address from its path,
@@ -766,7 +768,7 @@ impl Reading<'_> {
             shared: record
                 .and_then(|record| record.shared.as_ref())
                 .and_then(|shared| shared.text.as_deref()),
-            // C11: a folder that cannot say does not fold here, so a case move
+            // A folder that cannot say does not fold here, so a case move
             // is never read as landed on a guess.
             folds_case: self.root_is_there
                 && folder_folds_case(&self.root, &row.path) == Some(true),
@@ -815,7 +817,7 @@ impl Reading<'_> {
             };
             return Ok((Decision::Step(DraftStep::Conflict(kind)), team));
         }
-        // C9: branch on the record before the decision.
+        // Branch on whether a record exists before the decision is asked.
         let decision = match self.records[i] {
             Some(_) => Decision::Step(next_step(&sides)),
             None => Decision::NoRecord,
@@ -855,7 +857,7 @@ impl Reading<'_> {
 
 impl Engine {
     /// Read `actor`'s `rows` against the base snapshot. A record that cannot be
-    /// read is an error, never a row with no record (C1).
+    /// read is an error, never a row with no record.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn read_drafts<'s>(
         &self,
@@ -923,7 +925,7 @@ impl Engine {
 
     /// The drafts of `actor` in `domain` that do not fit the team's text, ordered
     /// by path. Empty for a domain with no origin or no origin state. A record
-    /// that cannot be read is an error, never a clean row (C1).
+    /// that cannot be read is an error, never a clean row.
     pub async fn draft_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<DraftConflict>> {
         Ok(self
             .found_conflicts(domain, actor)
@@ -954,7 +956,8 @@ impl Engine {
     /// them, or `None` when she holds none there, when the domain's drafts do
     /// not stay open, or when the caller has no draft identity. The CLI's
     /// `origin diff --path` prints the resolve line from it, with the team
-    /// side's `upstream_sha256` (C25).
+    /// side's `upstream_sha256`, so the resolve is refused if the team's text
+    /// moves first.
     pub async fn draft_conflict_at(
         &self,
         domain: &str,
@@ -981,8 +984,8 @@ impl Engine {
         Ok(found.map(sides_json))
     }
 
-    /// Refuses a resolve made against a team side the person was not shown
-    /// (C25). `expected` is the `upstream_sha256` the sides answered when they
+    /// Refuses a resolve made against a team side the person was not shown.
+    /// `expected` is the `upstream_sha256` the sides answered when they
     /// were read; the conflict `settles` names is read again now, and when its
     /// team side is another one the resolve is refused with a sentence that
     /// ends in [`TEAM_CHANGED_SINCE`]. No `expected` checks nothing, as before,
@@ -1143,7 +1146,7 @@ impl Engine {
 
     /// The draft files of `actor` that do not fit the team's bytes, by
     /// [`file_step`]. A files folder or a record that cannot be read is an
-    /// error, never a clean answer (C1).
+    /// error, never a clean answer.
     fn found_file_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
         if self.domain_entry(domain)?.origin.is_none() {
             return Ok(Vec::new());
@@ -1225,7 +1228,7 @@ impl Engine {
         let count = reading.rows.len();
         let mut frozen: Option<HashSet<String>> = None;
         let mut kinds: Vec<Option<Kind>> = vec![None; count];
-        // For an old move whose source the team deleted (M1): which rows landed
+        // For an old move whose source the team deleted: which rows landed
         // by the team holding nothing at their path, and which were asked and
         // stand open.
         let mut landed_by_absence = vec![false; count];

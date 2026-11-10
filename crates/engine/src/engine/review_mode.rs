@@ -838,7 +838,7 @@ impl Engine {
         let choices = match &confirm {
             ReviewModeConfirm::Preview => {
                 // A list that cannot be read is reported on its actor, never
-                // read as clean (C1): the fold of that actor refuses.
+                // read as clean: the fold of that actor refuses.
                 let mut conflicts = HashMap::new();
                 let mut unreadable = HashSet::new();
                 for held in &drafts {
@@ -1241,7 +1241,7 @@ impl Engine {
 
     /// The fold's refusal while a folding actor holds drafts that do not fit
     /// the team's text, read fresh from what stands. A list that cannot be read
-    /// is an error, never a clean answer (C1).
+    /// is an error, never a clean answer.
     ///
     /// A name is removed when the accounts store holds no account under it and
     /// it is not the machine owner's. With no accounts store, as on the CLI or
@@ -2118,7 +2118,8 @@ pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
 /// it as folding ([`folder_may_fold_case`]). Whether a draft has landed, in the
 /// conflict list and in the pass alike, reads it as keeping apart: a case move
 /// read as landed would end with its rename dropped, and one read as not landed
-/// stays a draft she can settle (ruling C11).
+/// stays a draft she can settle. So where it cannot tell, the safe answer is
+/// that it does not fold.
 pub(crate) fn folder_folds_case(root: &Path, rel: &str) -> Option<bool> {
     let landing = join_rel(root, rel);
     let dir = landing.ancestors().skip(1).find(|dir| dir.is_dir())?;

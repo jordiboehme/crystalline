@@ -257,6 +257,41 @@ describe("the conflict dialog", () => {
     });
   });
 
+  it("says where the folder's own file went before it closes", async () => {
+    // The folder's conflict at a file beside the pages: taking the team's
+    // file keeps a copy of the folder's, and the receipt is the only place
+    // that says so.
+    const note =
+      "A copy of the folder's file is kept. Find it in your kept list.";
+    serve({
+      "/domains/eng/sync/conflicts/abc12345/resolve": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              resolved: "notes/a.md",
+              remaining: 0,
+              file: true,
+              kept: "theirs",
+              kept_copy: true,
+              kept_note: note,
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openConflictDialog();
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: "Take theirs" }),
+    );
+
+    expect(await within(dialog).findByText(note)).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /conflict/i })).toBeNull();
+    });
+  });
+
   it("keeps mine on the other button", async () => {
     const resolve = resolveRoute();
     serve({ "/domains/eng/sync/conflicts/abc12345/resolve": resolve.route });
@@ -566,7 +601,7 @@ describe("the conflict dialog for a draft", () => {
       within(dialog).getByRole("button", { name: "Keep mine" }),
     );
     await waitFor(() => {
-      // With the team side it was shown, so a newer one is refused (C25).
+      // With the team side it was shown, so a newer one is refused.
       expect(resolved).toEqual([
         {
           resolution: "mine",

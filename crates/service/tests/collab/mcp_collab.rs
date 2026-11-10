@@ -2903,6 +2903,90 @@ async fn resolve_conflict_tool_wires_through_to_origin_resolve() {
     assert!(content.contains("line one UPSTREAM"), "{content}");
 }
 
+/// The folder's own conflict at a file beside the pages settles through the
+/// tool each way, and the domain shares again afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolve_conflict_settles_a_file_in_the_folder_each_way() {
+    const DECK: &str = "assets/deck.png";
+    let folder_deck = b"\x89PNG\r\n\x1a\n\x00the deck edited in the folder".to_vec();
+    let newer_deck = b"\x89PNG\r\n\x1a\n\x00the team's newer deck".to_vec();
+    for (keep, on_disk, kept_copy) in [
+        ("mine", folder_deck.clone(), false),
+        ("theirs", newer_deck.clone(), true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProvider::new());
+        let c1 = mock.add_commit(commit_files(&[
+            ("MANIFEST.md", manifest()),
+            ("notes/a.md", engram("A", "a", "line one")),
+            (DECK, b"\x89PNG\r\n\x1a\n\x00the team's deck".to_vec()),
+        ]));
+        mock.set_branch("main", &c1);
+        let root = tmp.path().join("brand-knowledge");
+        let eng = Arc::new(
+            engine_with_provider(
+                &tmp.path().join("config.yaml"),
+                &tmp.path().join("origins"),
+                mock.clone(),
+            )
+            .await,
+        );
+        eng.origin_add(
+            "acme/brand-knowledge",
+            Some("brand"),
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The folder's file is edited, and then the team changes it. A page
+        // edit beside it is what the share carries once it is settled.
+        std::fs::write(root.join(DECK), &folder_deck).unwrap();
+        std::fs::write(
+            root.join("notes/a.md"),
+            engram("A", "a", "line one, changed"),
+        )
+        .unwrap();
+        let c2 = mock.add_commit(commit_files(&[
+            ("MANIFEST.md", manifest()),
+            ("notes/a.md", engram("A", "a", "line one")),
+            (DECK, newer_deck.clone()),
+        ]));
+        mock.set_branch("main", &c2);
+        eng.origin_update(Some("brand"), &crystalline_service::Scope::Unrestricted)
+            .await
+            .unwrap();
+
+        let (client, _server) = connect(eng.clone()).await;
+        let peer = client.peer();
+        let pending = call(peer, "share_changes", json!({ "domain": "brand" }))
+            .await
+            .unwrap();
+        assert_eq!(pending["outcome"], "conflicts_pending", "{keep}: {pending}");
+
+        let out = call(
+            peer,
+            "resolve_conflict",
+            json!({ "domain": "brand", "path": DECK, "resolution": keep }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{keep}: {e}"));
+        assert_eq!(out["remaining"], json!(0), "{keep}: {out}");
+        assert_eq!(out["file"], json!(true), "{keep}: {out}");
+        assert_eq!(out["kept"], keep, "{keep}: {out}");
+        assert_eq!(out["kept_copy"], json!(kept_copy), "{keep}: {out}");
+        assert_eq!(std::fs::read(root.join(DECK)).unwrap(), on_disk, "{keep}");
+
+        let shared = call(peer, "share_changes", json!({ "domain": "brand" }))
+            .await
+            .unwrap_or_else(|e| panic!("{keep}: {e}"));
+        assert_eq!(shared["outcome"], "proposed", "{keep}: {shared}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_conflict_merged_without_content_is_a_clean_invalid_params_error() {
     let tmp = tempfile::tempdir().unwrap();

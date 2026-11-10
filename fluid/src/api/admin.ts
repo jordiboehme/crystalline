@@ -1721,16 +1721,23 @@ export async function fetchConflict(
   };
 }
 
-/** Settle one conflict by id: `mine`, `theirs`, or `merged` with content. */
+/**
+ * Settle one conflict of the folder by id: `mine`, `theirs`, or `merged` with
+ * content. For a file beside the pages, taking the team's keeps a copy of the
+ * folder's, and the receipt says so.
+ */
 export async function resolveConflict(
   domain: string,
   id: string,
   resolution: string,
   content?: string,
-): Promise<unknown> {
-  return api<unknown>(
-    `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
-    { method: "POST", body: JSON.stringify({ resolution, content }) },
+): Promise<DraftResolveReceipt> {
+  return resolveReceipt(
+    await api<unknown>(
+      `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
+      { method: "POST", body: JSON.stringify({ resolution, content }) },
+    ),
+    resolution,
   );
 }
 
@@ -1785,7 +1792,7 @@ export interface DraftConflictDetail extends DraftConflict {
   note: string | null;
 }
 
-/** What settling one draft conflict did. */
+/** What settling one conflict did, a draft's or the folder's. */
 export interface DraftResolveReceipt {
   /** `mine`, `theirs` or `merged`. */
   kept: string;
@@ -1906,7 +1913,7 @@ export async function resolveDraftConflict(
   content?: string,
   expectedUpstream?: string | null,
 ): Promise<DraftResolveReceipt> {
-  const record = asObject(
+  return resolveReceipt(
     await api<unknown>(`${draftConflictsPath(domain, id)}/resolve`, {
       method: "POST",
       body: JSON.stringify({
@@ -1917,7 +1924,13 @@ export async function resolveDraftConflict(
           : { expected_upstream_sha256: expectedUpstream }),
       }),
     }),
+    resolution,
   );
+}
+
+/** What a resolve answered, as a receipt; `resolution` is what was asked. */
+function resolveReceipt(raw: unknown, resolution: string): DraftResolveReceipt {
+  const record = asObject(raw);
   return {
     kept: asString(record?.kept) ?? resolution,
     keptCopy: record?.kept_copy === true,

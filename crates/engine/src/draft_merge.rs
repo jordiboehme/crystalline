@@ -250,7 +250,8 @@ fn in_draft_coordinates<'t>(text: &'t str, from: Option<&str>, path: &str) -> Co
 /// - A case move can also land at the team's spelling, on a disk that folds case
 ///   (see below).
 pub fn has_landed(sides: &DraftSides<'_>) -> bool {
-    // C5: a key with no readable copy on either side, and nothing has landed.
+    // A key with no readable copy is never read as absent: with one on either
+    // side, nothing has landed.
     let unreadable = matches!(sides.team_at_path, TeamText::Unreadable { .. })
         || matches!(sides.team_at_from, TeamText::Unreadable { .. });
     if unreadable || !can_tell(sides) {
@@ -1231,8 +1232,8 @@ mod tests {
         ]);
     }
 
-    /// C5, and what the struct allows and the record rules forbid: we cannot
-    /// tell, and it reads so, ahead of every rule.
+    /// A key with no readable copy, and what the struct allows and the record
+    /// rules forbid: we cannot tell, and it reads so, ahead of every rule.
     #[test]
     fn what_cannot_be_told_is_unknown_start() {
         let unknown = || conflict(UnknownStart);
@@ -1326,8 +1327,8 @@ mod tests {
         ]);
     }
 
-    /// C5's check: a tombstone answers for the path it deletes, whatever a
-    /// record says it started from.
+    /// A tombstone answers for the path it deletes, whatever a record says it
+    /// started from.
     #[test]
     fn a_tombstone_that_names_another_start_still_answers_for_its_own_path() {
         check(vec![
@@ -1520,8 +1521,8 @@ mod tests {
         assert_eq!(next_step(&row), DraftStep::InStep);
     }
 
-    /// F5 and C8: a colleague's touch of the line that is no one's words is no
-    /// change. It neither ends her case move nor moves her start.
+    /// A colleague's touch of the `generated` line, which is no one's words, is
+    /// no change. It neither ends her case move nor moves her start.
     #[test]
     fn a_peers_touch_of_generated_does_not_end_an_unedited_case_move() {
         let team = stamped(START, "2026-11-06T12:00:00Z");
@@ -1544,7 +1545,7 @@ mod tests {
         }
     }
 
-    /// M6: an unedited case move whose share changed only her stamp is no change
+    /// An unedited case move whose share changed only her stamp is no change
     /// either, so it stays in step, as an unedited case move does, on both disks.
     #[test]
     fn a_case_move_whose_only_change_is_generated_stays_in_step_when_it_lands() {
@@ -2063,7 +2064,7 @@ mod tests {
         }
     }
 
-    /// C8 (review M1, N1): a team change of only `generated` is no change. A
+    /// A team change of only `generated` is no change. A
     /// tombstone against it is no conflict, an edit against it is in step and gets
     /// no notice, on both disks.
     #[test]
@@ -2075,12 +2076,12 @@ mod tests {
                 folds_case,
                 ..sides(path, from, Some(START), local, team, team)
             };
-            // P1: her deletion.
+            // Her deletion.
             assert_eq!(
                 next_step(&at("plan.md", Some("plan.md"), None)),
                 DraftStep::InStep
             );
-            // P2: her edit at its own path, and moved.
+            // Her edit at its own path, and moved.
             assert_eq!(
                 next_step(&at("plan.md", Some("plan.md"), Some(HERS))),
                 DraftStep::InStep
@@ -2107,7 +2108,7 @@ mod tests {
         );
     }
 
-    /// C8 (review N1): `edited` says whether her words changed, so a merge that
+    /// `edited` says whether her words changed, so a merge that
     /// leaves her text as it was sends no notice.
     #[test]
     fn a_merge_that_changes_nothing_of_hers_is_not_edited() {
@@ -2136,7 +2137,7 @@ mod tests {
         assert_eq!(next_step(&row), take(&mine, false));
     }
 
-    /// C8 (review M2): her text at her new path ends the move only when the team
+    /// Her text at her new path ends the move only when the team
     /// has let go of where she started, or, on a folding disk, keeps her case
     /// move's text at the old spelling. Otherwise her deletion of `from` is still
     /// to come and must not vanish with the draft.
@@ -2146,28 +2147,28 @@ mod tests {
             Box::leak(stamped(HERS, "2026-11-06T12:00:00Z").into_boxed_str());
         check(vec![
             renamed(
-                "P3: edited, a peer wrote her text at her path, from held at the start",
+                "edited, a peer wrote her text at her path, from held at the start",
                 HERS,
                 held(HERS),
                 held(START),
                 DraftStep::InStep,
             ),
             renamed(
-                "P3: same, his copy with another stamp",
+                "edited, his copy of her text with another stamp",
                 HERS,
                 held(stamped_hers),
                 held(START),
                 DraftStep::InStep,
             ),
             renamed(
-                "P3b: unedited, the team holds her text at both paths",
+                "unedited, the team holds her text at both paths",
                 START,
                 held(START),
                 held(START),
                 DraftStep::InStep,
             ),
             renamed(
-                "P3, the team also changed from: merged in her coordinates",
+                "edited, the team also changed from: merged in her coordinates",
                 HERS,
                 held(HERS),
                 held(HIS),
@@ -2181,7 +2182,7 @@ mod tests {
                 DraftStep::Landed,
             ),
             case_moved(
-                "[folding] P4's sides are her own landing at the old spelling",
+                "[folding] a peer's copy at the old spelling is her own landing",
                 HERS,
                 Absent,
                 held(HERS),
@@ -2189,7 +2190,7 @@ mod tests {
             )
             .on(Disk::Folding),
             case_moved(
-                "[case-sensitive] P4: a peer wrote her edit at plan.md, Plan.md absent",
+                "[case-sensitive] a peer wrote her edit at plan.md, Plan.md absent",
                 HERS,
                 Absent,
                 held(HERS),
@@ -2209,7 +2210,7 @@ mod tests {
 
     const AGAIN: &str = "---\ntitle: Plan\nstatus: draft\n---\nalpha hers\nbeta\ngamma again\ndelta\nepsilon\nzeta\neta\n";
 
-    /// C8 (review M3): her own share, edited again before a pass got to it, reads
+    /// Her own share, edited again before a pass got to it, reads
     /// her newer edit against what she shared, not as a conflict with herself.
     #[test]
     fn her_own_share_edited_again_after_a_failed_pass_is_in_step() {
@@ -2219,8 +2220,8 @@ mod tests {
         };
         for folds_case in [true, false] {
             let on = |row: DraftSides<'static>| DraftSides { folds_case, ..row };
-            // P9: a move shared directly, then edited again.
-            let p9 = shared(on(sides(
+            // A move shared directly, then edited again.
+            let moved = shared(on(sides(
                 "renamed.md",
                 Some("plan.md"),
                 Some(START),
@@ -2228,10 +2229,10 @@ mod tests {
                 held(HERS),
                 Absent,
             )));
-            assert!(!has_landed(&p9));
-            assert_eq!(next_step(&p9), DraftStep::InStep);
-            // P10: the same at its own path.
-            let p10 = shared(on(sides(
+            assert!(!has_landed(&moved));
+            assert_eq!(next_step(&moved), DraftStep::InStep);
+            // The same at its own path.
+            let in_place = shared(on(sides(
                 "plan.md",
                 Some("plan.md"),
                 Some(START),
@@ -2239,16 +2240,16 @@ mod tests {
                 held(HERS),
                 held(HERS),
             )));
-            assert_eq!(next_step(&p10), DraftStep::InStep);
+            assert_eq!(next_step(&in_place), DraftStep::InStep);
             // The team's copy of her share carries another stamp: still hers.
             let stamped_share: &'static str =
                 Box::leak(stamped(HERS, "2026-11-06T12:00:00Z").into_boxed_str());
-            let p10 = DraftSides {
+            let in_place = DraftSides {
                 team_at_path: held(stamped_share),
                 team_at_from: held(stamped_share),
-                ..p10
+                ..in_place
             };
-            assert_eq!(next_step(&p10), DraftStep::InStep);
+            assert_eq!(next_step(&in_place), DraftStep::InStep);
             // Unedited since the share: landed, as without the record of it.
             let landed = shared(on(sides(
                 "plan.md",
@@ -2261,7 +2262,7 @@ mod tests {
             assert_eq!(next_step(&landed), DraftStep::Landed);
         }
         // Without the record of her share these are the false conflicts.
-        let p9 = sides(
+        let moved = sides(
             "renamed.md",
             Some("plan.md"),
             Some(START),
@@ -2269,7 +2270,7 @@ mod tests {
             held(HERS),
             Absent,
         );
-        assert_eq!(next_step(&p9), conflict(AddAdd));
+        assert_eq!(next_step(&moved), conflict(AddAdd));
         // The team went on after her share: nothing says it holds her share, so
         // the start she had answers, and his line and her newer one both stay.
         let on_top = "---\ntitle: Plan\nstatus: draft\n---\nalpha hers\nbeta\ngamma\ndelta\nepsilon\nzeta\neta his\n";
@@ -2302,7 +2303,7 @@ mod tests {
         assert_ne!(next_step(&row), DraftStep::InStep);
     }
 
-    /// C8 (review M4, M5): Keep mine on a team file with no text writes the
+    /// Keep mine on a team file with no text writes the
     /// file's digest as the start, and that settles it: in step until the team's
     /// bytes change again.
     #[test]
@@ -2369,7 +2370,7 @@ mod tests {
         assert_eq!(next_step(&new_file), conflict(UnknownStart));
     }
 
-    /// C5 with N2: a key with no readable copy is never read as absent, also where
+    /// A key with no readable copy is never read as absent, also where
     /// she never saw the file.
     #[test]
     fn a_key_with_no_copy_is_never_absent() {

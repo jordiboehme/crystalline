@@ -43,7 +43,7 @@ fn config(github_enabled: bool) -> GlobalConfig {
     cfg
 }
 
-async fn engine_with(
+pub(super) async fn engine_with(
     config_path: &Path,
     origins_dir: &Path,
     provider: Arc<MockProvider>,
@@ -293,38 +293,6 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     assert!(
         matches!(resolve_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{resolve_err}"
-    );
-}
-
-/// In a domain that takes changes directly a resolution settles only a page,
-/// and naming a file there says what settles one instead.
-#[tokio::test]
-async fn a_direct_domain_still_refuses_to_resolve_a_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mock = Arc::new(MockProvider::new());
-    let eng = engine_with(
-        &tmp.path().join("config.yaml"),
-        &tmp.path().join("origins"),
-        mock,
-        true,
-        false,
-    )
-    .await;
-    let err = eng
-        .origin_resolve(
-            "brand",
-            "assets/deck.png",
-            Some("mine"),
-            None,
-            ShareActor::Owner,
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
-    let text = err.to_string();
-    assert!(
-        text.contains("upload the file again") && text.contains("delete it"),
-        "{text}"
     );
 }
 

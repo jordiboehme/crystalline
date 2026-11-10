@@ -2286,7 +2286,10 @@ pub struct ResolveBody {
                    `personal`, the default with a GitHub App). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
-                   re-indexes the domain. A conflict the pull recorded in \
+                   re-indexes the domain. A file under `assets/` never \
+                   merges: taking the team's file first keeps a copy of the \
+                   folder's, and the receipt says so (`file`, `kept_copy`, \
+                   `kept_note`). A conflict the pull recorded in \
                    the folder only: a draft's conflict is settled through \
                    `resolve_draft_conflict`. Entirely local - no GitHub \
                    connection is needed - but it writes, so a read-only \
@@ -2344,8 +2347,9 @@ pub struct ResolveBody {
         ),
         (
             status = 422,
-            description = "An unknown `resolution`, or `merged` with no \
-                           `content` to write.",
+            description = "An unknown `resolution`, `merged` with no \
+                           `content` to write, or `merged` for a file under \
+                           `assets/`, which never merges.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),

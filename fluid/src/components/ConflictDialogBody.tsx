@@ -34,7 +34,8 @@
  * would land a second page at that address), and Edit merged for a file, which
  * has no text to merge. A receipt that carries a sentence of the server's (a
  * kept copy, a draft that landed but not on disk) is shown before the dialog
- * goes, since it is the only place that says it.
+ * goes, since it is the only place that says it. The folder's own conflict at
+ * a file shows its kept copy the same way.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -139,8 +140,8 @@ export default function ConflictDialogBody({
   // that deletes everything is a decision, not an unseeded editor.
   const [merged, setMerged] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
-  // A draft's receipt that carried a sentence of the server's, held so the
-  // dialog can say it before it goes. Null while nothing is settled.
+  // A receipt that carried a sentence of the server's, held so the dialog can
+  // say it before it goes. Null while nothing is settled.
   const [receipt, setReceipt] = useState<DraftResolveReceipt | null>(null);
 
   // Filed under this domain's own prefix, which is safe here for a reason
@@ -157,7 +158,7 @@ export default function ConflictDialogBody({
   // is settled: the invalidations below reach this key too, and a read of a
   // conflict that is no longer one would put a 404 over the receipt.
   //
-  // And a draft's sides hold still while the merge editor is open (C25): the
+  // And a draft's sides hold still while the merge editor is open: the
   // merge is written against the team text on the screen, so neither a
   // window coming back nor a bulk invalidation may swap that text under it.
   // The resolve names the team side that was shown; when the server says it
@@ -183,13 +184,7 @@ export default function ConflictDialogBody({
       expectedUpstream?: string | null;
     }) =>
       draft === undefined
-        ? (await resolveConflict(
-            domain,
-            conflictId,
-            choice.resolution,
-            choice.content,
-          ),
-          null)
+        ? resolveConflict(domain, conflictId, choice.resolution, choice.content)
         : resolveDraftConflict(
             domain,
             conflictId,
@@ -200,11 +195,8 @@ export default function ConflictDialogBody({
     onSuccess: (settled) => {
       onSettled?.();
       // A receipt with a sentence of its own stays up until it is read; any
-      // other settle leaves at once, as the folder's always did.
-      if (
-        settled !== null &&
-        (settled.keptNote !== null || settled.draftWarning !== null)
-      ) {
+      // other settle leaves at once.
+      if (settled.keptNote !== null || settled.draftWarning !== null) {
         setReceipt(settled);
       } else {
         onClose();
@@ -220,15 +212,17 @@ export default function ConflictDialogBody({
       });
       void refreshAfterWrite(queryClient, { queryKey: DOMAINS_QUERY_KEY });
       if (draft !== undefined) {
-        // A draft's own list, the share plan that took the file's box away,
-        // and the kept texts when a copy was kept there.
+        // A draft's own list, and the share plan that took the file's box
+        // away.
         void refreshAfterWrite(queryClient, {
           queryKey: draftConflictsKey(domain),
         });
         void refreshAfterWrite(queryClient, { queryKey: sharePlanKey(domain) });
-        if (settled?.keptCopy === true) {
-          void refreshAfterWrite(queryClient, { queryKey: keptKey(domain) });
-        }
+      }
+      // The kept texts, when a copy was kept: of a draft, or of the folder's
+      // own file.
+      if (settled.keptCopy) {
+        void refreshAfterWrite(queryClient, { queryKey: keptKey(domain) });
       }
     },
     onError: (error: Error) => {

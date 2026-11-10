@@ -274,7 +274,7 @@ async fn an_agent_settles_with_resolve_conflict_merged_from_the_status_sides() {
     assert!(read.contains(BOB_LINE) && read.contains(HER_LINE), "{read}");
 }
 
-/// C25: an agent that passes back the team side it read is refused, in plain
+/// An agent that passes back the team side it read is refused, in plain
 /// text, when a pull changed that side since; read again, it settles.
 #[tokio::test]
 async fn a_resolve_names_the_team_side_it_read_and_a_newer_one_refuses() {

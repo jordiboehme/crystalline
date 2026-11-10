@@ -1668,7 +1668,7 @@ impl Engine {
     /// stands and outside the origin lock. With `sides`, each conflict carries
     /// its `base`, `local` and `upstream` text. No actor, as for an agent with
     /// no identity, holds no draft. A list that cannot be read lists nothing
-    /// and says why in one sentence, never reads as clean (C1).
+    /// and says why in one sentence, never reads as clean.
     pub(super) async fn own_drafts(
         &self,
         domain: &str,
@@ -1720,7 +1720,7 @@ impl Engine {
     /// `actor`'s own conflicts and merged drafts in `domain`, for a surface
     /// that lists them alone: `{ conflicts, merged }`, each conflict in the
     /// shape `origin_status` lists it. A list that cannot be read is an error
-    /// carrying the sentence `origin_status` gives it, never an empty list (C1),
+    /// carrying the sentence `origin_status` gives it, never an empty list,
     /// and that sentence names no place on this server's disk to anybody but
     /// the machine owner.
     pub async fn own_draft_conflicts(&self, domain: &str, actor: &str) -> Result<Value> {
@@ -4357,7 +4357,7 @@ impl Engine {
     }
 
     /// [`Engine::origin_resolve`] for a draft that was read before it is
-    /// settled (C25): `expected_upstream` is the `upstream_sha256` its sides
+    /// settled: `expected_upstream` is the `upstream_sha256` its sides
     /// answered. When the team's side is another one now, the resolve is
     /// refused (409 on REST) and nothing changes, so nobody settles against
     /// team text they were not shown. `None` checks nothing. A folder conflict
@@ -4466,32 +4466,53 @@ impl Engine {
             Reach::Path(path) => (path, false),
             Reach::Folder(path) => (path, true),
         };
-        // A draft file is settled here as a page is, from its own record. It
-        // is never merged. Under the origin lock, as a page is, so a resolve
-        // waits out a fold's locked window.
-        if is_assets_reserved(path) && drafts_open && !folder_only {
-            let who = share_staging::overlay_share_actor(&actor)?;
+        // A file beside the pages is settled here, before the path below would
+        // be normalized to `<path>.md` and miss it. It is never merged. Under
+        // the origin lock, as a page is, so a resolve waits out a fold's
+        // locked window.
+        if is_assets_reserved(path) {
             let resolution = origin::resolution_from(keep, content)?;
             let lock = self.origin_lock_registered(domain)?;
             let _guard = lock.lock().await;
-            self.refuse_unseen_team_side(domain, &who, |c| c.path == path, expected_upstream)
-                .await?;
+            // In a reviewing domain a resolve by path settles the caller's own
+            // draft of the file first, from its own record, as for a page. With
+            // no draft of hers there, the folder's conflict at that path is the
+            // one it settles.
+            if drafts_open && !folder_only {
+                let who = share_staging::overlay_share_actor(&actor)?;
+                let journal_dir = self.journal_state_dir()?;
+                let held = crate::overlay_files::held(&journal_dir, domain, &who, path).map_err(
+                    |source| EngineError::Io {
+                        path: format!("your draft file '{path}' in '{domain}'"),
+                        source,
+                    },
+                )?;
+                let (_, _, state_dir) = self.origin_spec_for_domain(domain)?;
+                if held == crate::overlay_files::Held::Nothing
+                    && !self.folder_conflict_at(&state_dir, path)?
+                {
+                    return Err(EngineError::NotFound(format!(
+                        "you are not drafting the file '{path}' in domain '{domain}', and no \
+                         conflict stands there either. This domain reviews changes, so what a \
+                         resolution settles is your own draft"
+                    )));
+                }
+                if held != crate::overlay_files::Held::Nothing {
+                    self.refuse_unseen_team_side(
+                        domain,
+                        &who,
+                        |c| c.path == path,
+                        expected_upstream,
+                    )
+                    .await?;
+                    return self
+                        .resolve_file_in_overlay(domain, &who, path, resolution)
+                        .await;
+                }
+            }
             return self
-                .resolve_file_in_overlay(domain, &who, path, resolution)
+                .resolve_folder_file(domain, path, resolution, &actor)
                 .await;
-        }
-        // An attachment is not an engram, and in a domain that takes changes
-        // directly this verb settles engrams. The path would be normalized to
-        // `<path>.md` on the next line and then miss everything, so the
-        // refusal comes first and says what to do instead: the bytes are
-        // settled by writing them again or by deleting them, which is the same
-        // pair of verbs that put them there.
-        if is_assets_reserved(path) {
-            return Err(EngineError::Invalid(format!(
-                "'{path}' is an attachment, and a conflict resolution settles an engram's \
-                 markdown; upload the file again to keep your version or delete it to take the \
-                 one the team has"
-            )));
         }
         let resolution = origin::resolution_from(keep, content)?;
         let lock = self.origin_lock_registered(domain)?;
@@ -4526,8 +4547,9 @@ impl Engine {
             };
             match held {
                 Some((domain_id, Some(_))) => {
-                    // C25, as for a draft settled by its id: the conflict at
-                    // this path, from either end of a move.
+                    // Never against a team side she was not shown, as for a
+                    // draft settled by its id: the conflict at this path, from
+                    // either end of a move.
                     self.refuse_unseen_team_side(
                         domain,
                         &who,
@@ -4563,17 +4585,102 @@ impl Engine {
             return Err(RemoteError::NotEnabled.into());
         }
         let report = ops::resolve(&root, &state_dir, path, resolution)?;
+        self.index_after_folder_resolve(domain).await?;
+        Ok(json!({
+            "resolved": report.resolved,
+            "remaining": report.remaining,
+        }))
+    }
 
+    /// What every settled folder conflict ends with: the resolve wrote the
+    /// folder, so the domain is synced and embedded again.
+    async fn index_after_folder_resolve(&self, domain: &str) -> Result<()> {
         self.sync(Some(domain)).await?;
         if !self.request_embed()
             && let Err(e) = self.embed_pending().await
         {
             tracing::warn!("embedding after resolving a conflict for '{domain}' failed: {e}");
         }
+        Ok(())
+    }
 
+    /// Settles the folder's own conflict at a file beside the pages. A file
+    /// never merges, so there are two ways out:
+    ///
+    /// - **Keep mine** leaves the folder's file as it is, and the next share
+    ///   carries it in place of the team's.
+    /// - **Take theirs** writes the team's file over it, or removes it when
+    ///   the team deleted it. The folder's bytes exist nowhere else, so a
+    ///   copy is kept first, as bytes under the file's own extension. A copy
+    ///   that cannot be kept refuses, and nothing changes.
+    /// - **Merged** is refused: there is no text to merge.
+    ///
+    /// The path is not held to the upload rules: the folder's file came from
+    /// outside, and settling it must not depend on its name. Only a path the
+    /// pull recorded is settled. The caller holds the origin lock. The file's
+    /// own write lock is held from the copy to the write, so a write of the
+    /// file cannot land between them.
+    async fn resolve_folder_file(
+        &self,
+        domain: &str,
+        path: &str,
+        resolution: ops::Resolution<'_>,
+        actor: &ShareActor,
+    ) -> Result<Value> {
+        if matches!(resolution, ops::Resolution::Merged(_)) {
+            return Err(EngineError::Invalid(FILE_NOT_MERGED.to_string()));
+        }
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let lock = self.write_lock(&root.join(path));
+        let guard = lock.lock().await;
+        let theirs = matches!(resolution, ops::Resolution::Theirs);
+        let mut kept_file: Option<String> = None;
+        if theirs {
+            let sides = ops::conflict_sides(&root, &state_dir, path)?;
+            if let Some(bytes) = sides
+                .folder
+                .filter(|folder| Some(folder) != sides.team.as_ref())
+            {
+                let what = format!("a kept copy of the folder's file '{path}'");
+                let kept = self
+                    .kept_dir()
+                    .ok_or_else(|| EngineError::Internal(format!("{what}: no state folder")))?;
+                let file = crystalline_core::kept::write_bytes(
+                    &kept,
+                    domain,
+                    None,
+                    crystalline_core::kept::KeptKind::Engram,
+                    path,
+                    chrono::Utc::now(),
+                    &bytes,
+                )
+                .map_err(|source| EngineError::Io { path: what, source })?;
+                kept_file = Some(file.display().to_string());
+            }
+        }
+        let report = ops::resolve(&root, &state_dir, path, resolution)?;
+        drop(guard);
+        self.index_after_folder_resolve(domain).await?;
         Ok(json!({
             "resolved": report.resolved,
             "remaining": report.remaining,
+            "file": true,
+            "kept": if theirs { "theirs" } else { "mine" },
+            "note": if theirs {
+                "The folder now holds the team's file."
+            } else {
+                "The folder keeps its own file."
+            },
+            "kept_copy": kept_file.is_some(),
+            // A path on this server's disk, so only for the machine owner, who
+            // is on it. Anybody else is told where the copy is listed.
+            "kept_file": kept_file.as_ref().filter(|_| *actor == ShareActor::Owner),
+            "kept_note": kept_file
+                .as_ref()
+                .map(|_| "A copy of the folder's file is kept. Find it in your kept list."),
         }))
     }
 
@@ -4609,7 +4716,7 @@ impl Engine {
             .into_iter()
             .find(|conflict| conflict.id == id)
             .ok_or_else(|| not_among_drafts(domain, id))?;
-        // C25: never settle against a team side she was not shown. Read under
+        // Never settle against a team side she was not shown. Read under
         // the origin lock, which a pull also takes, so the side cannot move
         // between this check and the write.
         self.refuse_unseen_team_side(domain, &who, |c| c.id == id, expected_upstream)
@@ -4646,7 +4753,7 @@ impl Engine {
     }
 
     /// Keeping your own MANIFEST text or a merge may switch read_only on,
-    /// which is the owner's (decision D10). The machine owner may; a resolve
+    /// which only the owner decides. The machine owner may; a resolve
     /// carries no scope for anybody else, so for them an off-to-on result is
     /// refused and the owner switches it in the domain policies once the
     /// conflict is settled. Taking the team's side is a pull and is never
@@ -4694,9 +4801,7 @@ impl Engine {
     ) -> Result<Value> {
         super::validate_attachment_path(path)?;
         if matches!(resolution, ops::Resolution::Merged(_)) {
-            return Err(EngineError::Invalid(
-                "A file cannot be merged here. Keep one of the two.".to_string(),
-            ));
+            return Err(EngineError::Invalid(FILE_NOT_MERGED.to_string()));
         }
         let journal_dir = self.journal_state_dir()?;
         let io = |source| EngineError::Io {
@@ -6343,6 +6448,10 @@ enum Reach<'a> {
     /// Only the caller's own draft conflict with this id.
     OwnDraft(&'a str),
 }
+
+/// The refusal of a merge of a file beside the pages, a draft's or the
+/// folder's: a file has no text to merge.
+const FILE_NOT_MERGED: &str = "A file cannot be merged here. Keep one of the two.";
 
 /// The refusal for a draft conflict id the caller does not hold, in one
 /// wording for the sides and the resolve, so a reader cannot tell somebody

@@ -662,7 +662,7 @@ async fn the_conflict_sides_are_start_mine_and_the_teams() {
             "base": text(&plan()),
             "local": t.row("alice", "plan.md").await,
             "upstream": text(&plan_later()),
-            // C25: the team side named, so a resolve can hand it back.
+            // The team side named, so a resolve can hand it back.
             "upstream_sha256": sha256_hex(&plan_later()),
             "moved_from": null,
             "other": null,
@@ -900,7 +900,7 @@ async fn a_domain_with_no_origin_has_no_conflicts_and_no_error() {
     assert!(eng.draft_conflicts("nowhere", "alice").await.is_err());
 }
 
-/// C1: a record that cannot be read refuses, and is never read as "no record".
+/// A record that cannot be read refuses, and is never read as "no record".
 #[tokio::test]
 async fn a_broken_record_refuses() {
     let t = team(&[("plan.md", plan())]).await;
@@ -916,7 +916,7 @@ async fn a_broken_record_refuses() {
     );
 }
 
-/// C5: a key with no readable copy is a file of the team's, never absent.
+/// A key with no readable copy is a file of the team's, never absent.
 #[tokio::test]
 async fn a_key_with_no_copy_is_unknown_start() {
     let t = team(&[
@@ -1187,10 +1187,9 @@ async fn an_old_move_lists_once_at_the_draft() {
 
 // --- Review round ------------------------------------------------------------
 
-/// C11: a landing folder that cannot say whether it folds case is not read as
+/// A landing folder that cannot say whether it folds case is not read as
 /// folding. Her edited case move whose text the team holds at the old spelling
-/// is then not landed, on either disk: from Task 6 on a landed move drops both
-/// halves, and on a disk that keeps the two apart that drops her rename.
+/// is then not landed, on either disk: a landed move drops both halves, and on a disk that keeps the two apart that drops her rename.
 #[tokio::test]
 async fn a_case_move_into_a_folder_that_cannot_say_has_not_landed() {
     let t = team(&[(
@@ -1239,7 +1238,7 @@ async fn a_case_move_into_a_folder_that_cannot_say_has_not_landed() {
     }
 }
 
-/// I2: a file a direct commit deleted, whose sync failed, holds no address,
+/// A file a direct commit deleted, whose sync failed, holds no address,
 /// though the index still has its row.
 #[tokio::test]
 async fn a_deleted_team_file_the_index_still_lists_holds_no_address() {
@@ -1259,7 +1258,7 @@ async fn a_deleted_team_file_the_index_still_lists_holds_no_address() {
     );
 }
 
-/// I2: a team file in the snapshot that no sync has indexed yet holds its
+/// A team file in the snapshot that no sync has indexed yet holds its
 /// address. Nothing on the share path checks addresses.
 #[tokio::test]
 async fn a_team_file_the_index_does_not_list_yet_holds_its_address() {
@@ -1303,7 +1302,7 @@ async fn a_team_file_the_index_does_not_list_yet_holds_its_address() {
     );
 }
 
-/// I3: an old move whose draft lands on a team file shows that file, which Keep
+/// An old move whose draft lands on a team file shows that file, which Keep
 /// mine would overwrite, and not the source.
 #[tokio::test]
 async fn an_old_move_onto_a_team_file_shows_that_file() {
@@ -1329,7 +1328,7 @@ async fn an_old_move_onto_a_team_file_shows_that_file() {
     );
 }
 
-/// I3, with a record: the start cannot be read, the team holds a file where she
+/// The same with a record: the start cannot be read, the team holds a file where she
 /// moved to, and that file is what the conflict shows.
 #[tokio::test]
 async fn a_move_with_an_unreadable_start_onto_a_team_file_shows_that_file() {
@@ -1351,7 +1350,7 @@ async fn a_move_with_an_unreadable_start_onto_a_team_file_shows_that_file() {
     );
 }
 
-/// M1: an old move whose source the team deleted is a deletion she has to see,
+/// An old move whose source the team deleted is a deletion she has to see,
 /// not a page that comes back under her new name.
 #[tokio::test]
 async fn an_old_move_whose_source_the_team_deleted_is_edit_delete() {
@@ -1373,7 +1372,7 @@ async fn an_old_move_whose_source_the_team_deleted_is_edit_delete() {
     );
 }
 
-/// M5: two sides that need a note keep both.
+/// Two sides that need a note keep both.
 #[tokio::test]
 async fn two_sides_with_no_text_keep_both_notes() {
     let t = team(&[("plan.md", plan())]).await;
@@ -1389,7 +1388,7 @@ async fn two_sides_with_no_text_keep_both_notes() {
     assert!(note.contains("upstream"), "{note}");
 }
 
-/// M6: a row with a record reads `AddAdd` when the team adds a file where she
+/// A row with a record reads `AddAdd` when the team adds a file where she
 /// holds a new one, and the sides show the team's file.
 #[tokio::test]
 async fn a_team_file_at_her_new_files_path_is_add_add() {
@@ -1406,7 +1405,7 @@ async fn a_team_file_at_her_new_files_path_is_add_add() {
     assert_eq!(sides["base"], serde_json::Value::Null, "{sides}");
 }
 
-/// M6: the same where she moved to, which reads the team's file there, not the
+/// The same where she moved to, which reads the team's file there, not the
 /// text where she started.
 #[tokio::test]
 async fn a_team_file_at_the_path_she_moved_to_is_add_add_with_its_text() {
@@ -1429,7 +1428,7 @@ async fn a_team_file_at_the_path_she_moved_to_is_add_add_with_its_text() {
 
 // --- Fix round 2 ---------------------------------------------------------------
 
-/// N1: her share of the new path landed and the old one stands, and bob changed
+/// Her share of the new path landed and the old one stands, and bob changed
 /// the old one. The conflict is about bob's text where she started, not about her
 /// own text at her new path.
 #[tokio::test]
@@ -1453,7 +1452,7 @@ async fn a_moved_draft_whose_new_path_landed_shows_the_teams_text_where_she_star
     assert_eq!(sides["local"], hers, "{sides}");
 }
 
-/// N1, where she started cannot be read: `UnknownStart`, and the side says so
+/// The same where she started cannot be read: `UnknownStart`, and the side says so
 /// rather than showing her own text as the team's.
 #[tokio::test]
 async fn a_moved_draft_whose_new_path_landed_with_an_unreadable_start_says_so() {
@@ -1480,7 +1479,7 @@ async fn a_moved_draft_whose_new_path_landed_with_an_unreadable_start_says_so() 
     );
 }
 
-/// I2: a file the index never holds as a page (a log, a listing, a dotfile) holds
+/// A file the index never holds as a page (a log, a listing, a dotfile) holds
 /// no address, whatever its frontmatter says.
 #[tokio::test]
 async fn a_file_that_takes_no_part_holds_no_address() {
@@ -1837,7 +1836,7 @@ async fn an_armed_failure_stops_the_pass_before_it_changes_anything() {
     assert!(t.row("alice", "plan.md").await.contains(BOB_LINE));
 }
 
-/// M1 through a pull: the team deleted the old pair's source, and the pass does
+/// Through a pull: the team deleted the old pair's source, and the pass does
 /// not take the tombstone alone, which would leave the draft reading as a new
 /// file whose share brings the page back.
 #[tokio::test]
@@ -1941,7 +1940,8 @@ async fn a_pass_racing_an_edit_never_loses_the_edit() {
 }
 
 /// A page that takes no part in a share holds no address, so a team rename onto
-/// a dotfile never takes her draft along (C12).
+/// a dotfile never takes her draft along: one rule decides where the team
+/// answers at her path, for the gate and the pass alike.
 #[tokio::test]
 async fn a_rename_onto_a_dotfile_does_not_take_her_draft_along() {
     let mut t = team(&[("plan.md", plan())]).await;
@@ -1956,7 +1956,7 @@ async fn a_rename_onto_a_dotfile_does_not_take_her_draft_along() {
     );
 }
 
-/// C1 in the pass: a record that cannot be read leaves that person's rows as
+/// In the pass, a record that cannot be read leaves that person's rows as
 /// they are, and the pass goes on for everybody else.
 #[tokio::test]
 async fn a_broken_record_leaves_her_rows_and_the_pass_goes_on_for_others() {
@@ -1974,7 +1974,7 @@ async fn a_broken_record_leaves_her_rows_and_the_pass_goes_on_for_others() {
     assert!(t.row("bob", "plan.md").await.contains(BOB_LINE));
 }
 
-/// C1 in the status: a person whose conflicts cannot be read makes the domain's
+/// In the status, a person whose conflicts cannot be read makes the domain's
 /// count unknown, and an unknown count is left out rather than shown too low.
 #[tokio::test]
 async fn a_status_with_an_unreadable_record_leaves_the_count_out() {
@@ -2946,7 +2946,7 @@ fn holds(proposal: u64, text: Option<String>) -> Option<SharedText> {
     Some(SharedText { proposal, text })
 }
 
-/// N1 by the proposal road: her edited move merges, both rows end, and a later
+/// By the proposal road: her edited move merges, both rows end, and a later
 /// peer edit of the moved page is what she reads.
 #[tokio::test]
 async fn a_merged_proposal_of_an_edited_move_ends_both_rows() {
@@ -3806,7 +3806,7 @@ fn plan_with_a_paragraph() -> Vec<u8> {
     )
 }
 
-/// C25 (Task 14 review I-1): she merges against the team text she was shown
+/// She merges against the team text she was shown
 /// (T1); a pull brings newer team text (T2); her save names T1, so it is
 /// refused, nothing changes, and T2 stays the team's. With T2's digest, read
 /// again, the same save settles.
@@ -3878,7 +3878,7 @@ async fn a_resolve_against_team_text_she_was_not_shown_is_refused() {
     assert_eq!(t.row("alice", "plan.md").await, merged);
 }
 
-/// Re-review N-3: `origin diff --path` reads her conflict at a path with the
+/// `origin diff --path` reads her conflict at a path with the
 /// team side's digest, by the path or its permalink spelling; a path with no
 /// conflict of hers is none.
 #[tokio::test]
@@ -3917,7 +3917,7 @@ async fn her_conflict_at_a_path_carries_the_team_side() {
 async fn keep_mine_lands_her_text_and_the_second_share_has_nothing() {
     let mut t = team_direct(&[("plan.md", plan())]).await;
     let hers = a_same_line_conflict(&mut t).await;
-    // A merge mark a pass left behind (N-2) goes with the settled conflict.
+    // A merge mark a pass left behind goes with the settled conflict.
     let marked = DraftStart {
         merging: Some(true),
         ..t.record("alice", "plan.md").unwrap()
@@ -4177,7 +4177,7 @@ async fn keep_mine_on_an_old_move_settles_both_halves_with_one_press() {
     assert_eq!(t.rows("alice").await, vec![]);
 }
 
-/// I-1: bob renames the page she moved and changes no byte. The index then
+/// Bob renames the page she moved and changes no byte. The index then
 /// reads the renamed page's address from its path, so the gate sees the page
 /// gone. Keep mine reads the team's copy, finds her address taken and refuses,
 /// as it does when the gate says so.
@@ -4296,7 +4296,7 @@ async fn a_draft_settles_with_github_off() {
     assert_eq!(off.draft_conflicts("team", "alice").await.unwrap(), vec![]);
 }
 
-/// M-2: a direct commit of only the deletion half of her move could not free
+/// A direct commit of only the deletion half of her move could not free
 /// the draft. It reads `EditDelete`, and Keep mine keeps the page as a new file.
 #[tokio::test]
 async fn keep_mine_after_a_failed_freeing_keeps_the_page() {
@@ -4337,7 +4337,7 @@ async fn keep_mine_after_a_failed_freeing_keeps_the_page() {
     assert_eq!(t.rows("alice").await, vec![]);
 }
 
-/// M-1: Keep mine forgets the proposal, so a later pass does not settle a merged
+/// Keep mine forgets the proposal, so a later pass does not settle a merged
 /// proposal over the start she chose and take the reviewer's text into her row.
 #[tokio::test]
 async fn keep_mine_after_a_merged_proposal_is_not_undone_by_the_next_pass() {
@@ -4371,7 +4371,7 @@ async fn keep_mine_after_a_merged_proposal_is_not_undone_by_the_next_pass() {
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
-/// M18: Keep mine over a team file with no text writes a digest and no text.
+/// Keep mine over a team file with no text writes a digest and no text.
 /// The merge of her proposal then settles a text start alone, so the draft ends
 /// rather than reading `UnknownStart` for good.
 #[tokio::test]
@@ -4478,7 +4478,7 @@ async fn the_receipt_counts_her_conflicts_left() {
     );
 }
 
-/// m-2: a folder conflict in a reviewing domain is the folder's, and settling
+/// A folder conflict in a reviewing domain is the folder's, and settling
 /// it writes the team's folder, so it still needs GitHub on. Only a draft
 /// settles with GitHub off.
 #[tokio::test]
@@ -4876,7 +4876,7 @@ async fn an_old_uploaded_file_the_team_deleted_is_edit_delete() {
 }
 
 /// A file's record that cannot be read refuses the list and the share, and is
-/// never read as a file with no record (C1).
+/// never read as a file with no record.
 #[tokio::test]
 async fn a_broken_file_record_refuses_the_list_and_the_share() {
     let t = team_direct(&[(DECK, TEAM_DECK.to_vec())]).await;
@@ -4903,7 +4903,7 @@ async fn a_broken_file_record_refuses_the_list_and_the_share() {
 
 const DECK_TWIN: &str = "assets/Deck.png";
 
-/// I-1: a spelling that differs from a team file only by case is one file on
+/// A spelling that differs from a team file only by case is one file on
 /// a disk that folds case, so it is refused there and names the team's
 /// spelling. A case-sensitive disk keeps the two apart, and both land.
 #[tokio::test]
@@ -4940,7 +4940,7 @@ async fn a_case_twin_of_a_team_file_is_refused_where_the_disk_folds_case() {
     }
 }
 
-/// I-1: the team renames her file by case and changes it. On a folding disk the
+/// The team renames her file by case and changes it. On a folding disk the
 /// team's file is the one her share would overwrite, so it is EditEdit; on a
 /// case-sensitive disk her path is gone, EditDelete.
 #[tokio::test]
@@ -4966,7 +4966,7 @@ async fn a_team_case_rename_under_her_file_reads_per_disk() {
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
-/// I-2: Take theirs on a file from before the record keeps her bytes as a
+/// Take theirs on a file from before the record keeps her bytes as a
 /// copy, since they exist nowhere else.
 #[tokio::test]
 async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
@@ -4983,7 +4983,7 @@ async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
         .await
         .unwrap();
     settled(&receipt, DECK, "theirs", true);
-    // C24: a path on this server is not hers to use; the receipt says where
+    // A path on this server is not hers to use; the receipt says where
     // the copy is listed instead.
     assert_eq!(receipt["kept_file"], serde_json::Value::Null, "{receipt}");
     assert_eq!(
@@ -5010,7 +5010,7 @@ async fn take_theirs_on_an_old_file_keeps_a_copy_of_her_bytes() {
     );
 }
 
-/// I-2: a new conflict is not the last copy, so Take theirs keeps none.
+/// A new conflict is not the last copy, so Take theirs keeps none.
 #[tokio::test]
 async fn take_theirs_on_a_new_file_conflict_keeps_no_copy() {
     let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
@@ -5028,7 +5028,7 @@ async fn take_theirs_on_a_new_file_conflict_keeps_no_copy() {
     );
 }
 
-/// M-1: her proposal merged her bytes and the team changed the file after.
+/// Her proposal merged her bytes and the team changed the file after.
 /// Her file has landed, so it ends and the team's newer file stands.
 #[tokio::test]
 async fn a_merged_proposal_that_held_her_file_ends_it_when_the_team_changes_it_after() {
@@ -5043,7 +5043,7 @@ async fn a_merged_proposal_that_held_her_file_ends_it_when_the_team_changes_it_a
     assert_eq!(t.reads_file("alice", DECK).await.unwrap(), BOBS_DECK);
 }
 
-/// M-1: bytes she uploaded after sharing were not in the merged proposal, so
+/// Bytes she uploaded after sharing were not in the merged proposal, so
 /// a team change after the merge is asked about, as a page's newer edit is.
 #[tokio::test]
 async fn a_newer_upload_than_her_merged_proposal_is_asked_about() {
@@ -5062,7 +5062,7 @@ async fn a_newer_upload_than_her_merged_proposal_is_asked_about() {
     assert_eq!(t.held_file("alice", DECK), Some(Some(newer.to_vec())));
 }
 
-/// M-3: the team moved the file she deleted. Her deletion does not end in
+/// The team moved the file she deleted. Her deletion does not end in
 /// silence: it is DeleteEdit, and her deletion stands.
 #[tokio::test]
 async fn a_deletion_of_a_file_the_team_moved_is_delete_edit() {
@@ -5084,7 +5084,7 @@ async fn a_deletion_of_a_file_the_team_moved_is_delete_edit() {
     assert_eq!(t.held_file("alice", DECK), None);
 }
 
-/// M-4: a name that cannot address a folder holds no files, so its list is
+/// A name that cannot address a folder holds no files, so its list is
 /// empty and not an error.
 #[tokio::test]
 async fn a_name_that_cannot_hold_files_has_no_conflicts() {
@@ -5092,7 +5092,7 @@ async fn a_name_that_cannot_hold_files_has_no_conflicts() {
     assert_eq!(t.eng.draft_conflicts("team", "..").await.unwrap(), vec![]);
 }
 
-/// M-4: the pass decides a file has landed, and her new upload lands before it
+/// The pass decides a file has landed, and her new upload lands before it
 /// takes the file's lock. The second look under the lock sees the new bytes,
 /// so they stay.
 #[tokio::test]
@@ -5110,7 +5110,7 @@ async fn an_upload_between_the_pass_deciding_and_clearing_stays() {
     assert_eq!(t.held_file("alice", DECK), Some(Some(later)));
 }
 
-/// N-2: a deletion she makes again after a merged proposal of hers deleted the
+/// A deletion she makes again after a merged proposal of hers deleted the
 /// file once is a new draft. It stays, and its share deletes the team's file.
 #[tokio::test]
 async fn a_deletion_again_after_an_old_merged_deletion_stays() {
@@ -5128,7 +5128,7 @@ async fn a_deletion_again_after_an_old_merged_deletion_stays() {
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
-/// N-2: putting back the bytes an old merged proposal held, over a newer team
+/// Putting back the bytes an old merged proposal held, over a newer team
 /// file, is a new draft. It stays.
 #[tokio::test]
 async fn a_revert_to_an_old_merged_version_stays() {
@@ -5182,7 +5182,7 @@ async fn her_own_case_twin_is_refused_where_the_disk_folds_case() {
     }
 }
 
-/// N-2: a file her open proposal holds is not settled by that proposal until
+/// A file her open proposal holds is not settled by that proposal until
 /// it merges. A pull meanwhile leaves it as it is.
 #[tokio::test]
 async fn a_file_in_an_open_proposal_stays_until_it_merges() {
@@ -5201,7 +5201,7 @@ async fn a_file_in_an_open_proposal_stays_until_it_merges() {
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
-// --- Task 12: status and update name her own conflicts ------------------------
+// --- Status and update name her own conflicts --------------------------------
 
 /// Her own conflict as status and update list it, with `draft: true`.
 fn listed(actor: &str, path: &str, kind: &str) -> serde_json::Value {
@@ -5349,7 +5349,7 @@ async fn status_detail_carries_both_texts_and_only_her_own() {
     expected["base"] = serde_json::json!(text(&plan()));
     expected["local"] = serde_json::json!(hers);
     expected["upstream"] = serde_json::json!(text(&plan_later()));
-    // C25: what an agent hands back to settle against this team side.
+    // What an agent hands back to settle against this team side.
     expected["upstream_sha256"] = serde_json::json!(sha256_hex(&plan_later()));
     assert_eq!(
         domain["conflicts"],
@@ -5407,10 +5407,10 @@ async fn a_domain_owner_reads_counts_not_paths() {
     assert!(!said.contains(HER_WORD), "{said}");
 }
 
-/// The Task 5 review's M2: a record that cannot be read names the two ways
+/// A record that cannot be read names the two ways
 /// out, in status and in the share's refusal, and both ways work. An account
 /// reaches this server from elsewhere, so its sentence names no place on the
-/// server's disk (C24).
+/// server's disk.
 #[tokio::test]
 async fn a_broken_record_names_its_ways_out() {
     let mut t = team(&[("plan.md", plan())]).await;
@@ -5496,7 +5496,7 @@ async fn the_machine_owner_is_told_which_record_to_remove() {
     );
 }
 
-/// C24, I-3: a colleague's draft file whose record cannot be read is his, not
+/// A colleague's draft file whose record cannot be read is his, not
 /// the sharer's. Her direct share lands, and its receipt names neither his
 /// path nor "your draft".
 #[tokio::test]
@@ -5535,7 +5535,7 @@ async fn a_broken_file_record_names_its_ways_out() {
     );
 }
 
-/// C24, I-2: the machine owner is on this machine, so her receipt names where
+/// The machine owner is on this machine, so her receipt names where
 /// her kept file is.
 #[tokio::test]
 async fn the_owners_kept_file_is_named_in_her_receipt() {
@@ -5558,7 +5558,7 @@ async fn the_owners_kept_file_is_named_in_her_receipt() {
     assert_eq!(std::fs::read(kept).unwrap(), HER_DECK);
 }
 
-/// Re-review N-1: her own draft file that a direct commit landed but the pass
+/// Her own draft file that a direct commit landed but the pass
 /// could not end is named in `fold_error`, in plain words about her draft and
 /// with no place on the server's disk.
 #[tokio::test]
