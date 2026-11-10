@@ -473,9 +473,13 @@ mod tests {
         let paused = pausing.await.unwrap();
         assert!(ran < paused, "another task waited for the pause to end");
     }
+    // Only the Unix race tests clear a draft, so on Windows this import would
+    // be unused and fail `-D warnings`.
+    #[cfg(unix)]
+    use crate::overlay_journal::journal_clear;
     use crate::overlay_journal::{
-        JournalEntry, journal_actor_count, journal_clear, journal_counts, journal_entries,
-        journal_remove_actor, journal_write,
+        JournalEntry, journal_actor_count, journal_counts, journal_entries, journal_remove_actor,
+        journal_write,
     };
 
     #[cfg(unix)]

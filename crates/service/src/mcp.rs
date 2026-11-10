@@ -258,6 +258,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::future::BoxFuture;
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::tool::{InputResponses, RequestState};
 use rmcp::handler::server::wrapper::Parameters;
@@ -3206,15 +3207,30 @@ impl McpServer {
     /// anything else, and so does the last arm here. This never reaches the
     /// engine's sources: a remote call is answered from this server's own
     /// domains (decision D8).
-    pub(crate) async fn remote_tool(
-        &self,
+    ///
+    /// Not an `async fn`: each arm is its own boxed future, so polling a call
+    /// costs only that verb's stack frame. One state machine over all the
+    /// verbs gave its poll a frame of about 190 KB in a debug build, every
+    /// verb's temporaries side by side, and with the SQL parser's recursion
+    /// under it that ran past a 2 MiB thread stack.
+    pub(crate) fn remote_tool<'a>(
+        &'a self,
         tool: &str,
         args: Value,
-        caller: &Caller,
-    ) -> Result<Value, RemoteToolError> {
+        caller: &'a Caller,
+    ) -> BoxFuture<'a, Result<Value, RemoteToolError>> {
+        fn boxed<'a>(
+            verb: impl Future<Output = Result<Value, RemoteToolError>> + Send + 'a,
+        ) -> BoxFuture<'a, Result<Value, RemoteToolError>> {
+            Box::pin(verb)
+        }
         match tool {
-            "write_engram" => remote_verdict(self.write_core(remote_args(args)?, caller).await),
-            "read_engram" => {
+            "write_engram" => {
+                boxed(
+                    async move { remote_verdict(self.write_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "read_engram" => boxed(async move {
                 let p: ReadParams = remote_args(args)?;
                 let is_file = crate::engine::attachment_identifier(&p.identifier).is_some();
                 let mut value = self.read_core(p, caller).await.map_err(remote_failed)?;
@@ -3233,48 +3249,73 @@ impl McpServer {
                     .await;
                 with_files(&mut value, files);
                 Ok(value)
+            }),
+            "edit_engram" => {
+                boxed(
+                    async move { remote_verdict(self.edit_core(remote_args(args)?, caller).await) },
+                )
             }
-            "edit_engram" => remote_verdict(self.edit_core(remote_args(args)?, caller).await),
-            "move_engram" => remote_verdict(self.move_core(remote_args(args)?, caller).await),
-            "split_engram" => remote_verdict(self.split_core(remote_args(args)?, caller).await),
-            "delete_engram" => remote_verdict(self.delete_core(remote_args(args)?, caller).await),
-            "search_engrams" => self
-                .search_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "build_context" => self
-                .build_context_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "recent_activity" => self
-                .recent_activity_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "list_domains" => self
-                .list_domains_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "browse_domain" => self
-                .browse_domain_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "validate_engrams" => self
-                .validate_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "infer_schema" => self
-                .infer_schema_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "vocabulary" => self
-                .vocabulary_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            t if t == crate::EVOLVE_TOOL_NAME => self
-                .evolve_engrams_core(remote_args(args)?, caller)
-                .await
-                .map_err(remote_failed),
-            "reflect" => {
+            "move_engram" => {
+                boxed(
+                    async move { remote_verdict(self.move_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "split_engram" => {
+                boxed(
+                    async move { remote_verdict(self.split_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "delete_engram" => {
+                boxed(
+                    async move { remote_verdict(self.delete_core(remote_args(args)?, caller).await) },
+                )
+            }
+            "search_engrams" => boxed(async move {
+                self.search_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "build_context" => boxed(async move {
+                self.build_context_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "recent_activity" => boxed(async move {
+                self.recent_activity_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "list_domains" => boxed(async move {
+                self.list_domains_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "browse_domain" => boxed(async move {
+                self.browse_domain_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "validate_engrams" => boxed(async move {
+                self.validate_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "infer_schema" => boxed(async move {
+                self.infer_schema_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "vocabulary" => boxed(async move {
+                self.vocabulary_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            t if t == crate::EVOLVE_TOOL_NAME => boxed(async move {
+                self.evolve_engrams_core(remote_args(args)?, caller)
+                    .await
+                    .map_err(remote_failed)
+            }),
+            "reflect" => boxed(async move {
                 let p: ReflectParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3285,8 +3326,8 @@ impl McpServer {
                     .reflect(&p, &remote_reflection_caller(caller))
                     .await
                     .map_err(remote_engine)
-            }
-            "read_reflection" => {
+            }),
+            "read_reflection" => boxed(async move {
                 let p: ReadReflectionParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3311,8 +3352,8 @@ impl McpServer {
                     with_files(&mut value, files);
                 }
                 Ok(value)
-            }
-            "write_reflection" => {
+            }),
+            "write_reflection" => boxed(async move {
                 let p: WriteReflectionParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3322,8 +3363,8 @@ impl McpServer {
                 self.write_reflection_core(&p, &remote_reflection_caller(caller), caller)
                     .await
                     .map_err(remote_engine)
-            }
-            "discuss" => {
+            }),
+            "discuss" => boxed(async move {
                 let p: DiscussParams = remote_args(args)?;
                 let p = self
                     .engine
@@ -3334,11 +3375,14 @@ impl McpServer {
                     .discuss(&p, &remote_reflection_caller(caller))
                     .await
                     .map_err(remote_engine)
+            }),
+            other => {
+                let refused = RemoteToolError::Refused(format!(
+                    "the tool '{other}' {}",
+                    crate::remote_ctl::NOT_REMOTE
+                ));
+                boxed(std::future::ready(Err(refused)))
             }
-            other => Err(RemoteToolError::Refused(format!(
-                "the tool '{other}' {}",
-                crate::remote_ctl::NOT_REMOTE
-            ))),
         }
     }
 

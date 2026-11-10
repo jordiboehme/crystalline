@@ -888,6 +888,8 @@ async fn a_corrupt_state_file_names_no_server_path() {
 }
 
 /// What a resolve whose write failed answers: nothing changed, and what to do.
+/// Unix only like the one test that reads it, or Windows fails on dead code.
+#[cfg(unix)]
 const NOT_SETTLED: &str = "The conflict could not be settled, so nothing was changed. Try again, or ask whoever runs this server to look at its log.";
 
 /// A resolve that read her conflicts and then could not write is told so in
