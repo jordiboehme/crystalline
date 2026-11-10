@@ -17,7 +17,10 @@
 //! [`scan`] reads as [`KeptText::sender`]. A second text kept under the same
 //! name in the same second gets `-2`, `-3` and so on after the time. A room over somebody's
 //! review draft keeps its text under `<domain>/draft/<owner>/` instead of
-//! `<domain>/`, because a draft is private to its owner.
+//! `<domain>/`, because a draft is private to its owner. A draft file beside
+//! the pages, kept as its bytes ([`write_bytes`]), ends in its own extension
+//! instead of `.md` (`.bin` when it has none), so `deck.pdf` is kept as
+//! `deck.pdf.<YYYYMMDDTHHMMSSZ>.pdf`.
 //!
 //! A kept text is the last copy of somebody's work, so nothing here deletes
 //! one on its own: [`remove`] runs only when a person asks for it. This
@@ -197,7 +200,7 @@ pub fn record_sender(file: &Path, sender: &Sender) -> std::io::Result<()> {
     ));
     let temp = PathBuf::from(temp);
     let json = serde_json::to_string(sender).map_err(std::io::Error::other)?;
-    let written = write_new(&temp, &json).and_then(|()| std::fs::rename(&temp, &target));
+    let written = write_new(&temp, json.as_bytes()).and_then(|()| std::fs::rename(&temp, &target));
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -228,6 +231,23 @@ pub fn write(
     path: &str,
     at: DateTime<Utc>,
     text: &str,
+) -> std::io::Result<PathBuf> {
+    write_bytes(root, domain, owner, kind, path, at, text.as_bytes())
+}
+
+/// [`write`](fn@write) for bytes that need not be text: a draft file beside
+/// the pages, kept when it is the last copy. The layout is a text's, so a
+/// listing finds it under its path, and the name ends in the file's own
+/// extension rather than `.md`; [`read`] of it fails when the bytes are not
+/// UTF-8, and the file itself holds them as they were.
+pub fn write_bytes(
+    root: &Path,
+    domain: &str,
+    owner: Option<&str>,
+    kind: KeptKind,
+    path: &str,
+    at: DateTime<Utc>,
+    text: &[u8],
 ) -> std::io::Result<PathBuf> {
     let mut base = root.join(domain);
     if let Some(owner) = owner {
@@ -297,12 +317,12 @@ pub const UNFINISHED_AFTER: std::time::Duration = std::time::Duration::from_secs
 static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Write `text` to a new file at `file`; fails when something is there.
-fn write_new(file: &Path, text: &str) -> std::io::Result<()> {
+fn write_new(file: &Path, text: &[u8]) -> std::io::Result<()> {
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(file)?;
-    out.write_all(text.as_bytes())?;
+    out.write_all(text)?;
     out.sync_all()
 }
 
@@ -315,12 +335,13 @@ fn place(
     base: &Path,
     name: &str,
     stamp: &str,
-    text: &str,
+    text: &[u8],
 ) -> std::io::Result<PathBuf> {
     for n in 1u32.. {
+        let ext = kept_extension(name);
         let file = base.with_file_name(match n {
-            1 => format!("{name}.{stamp}.md"),
-            n => format!("{name}.{stamp}-{n}.md"),
+            1 => format!("{name}.{stamp}.{ext}"),
+            n => format!("{name}.{stamp}-{n}.{ext}"),
         });
         match std::fs::hard_link(temp, &file) {
             Ok(()) => return Ok(file),
@@ -410,9 +431,27 @@ pub fn find(root: &Path, id: &str) -> Option<KeptText> {
     scan(root).into_iter().find(|kept| kept.id == id)
 }
 
-/// The text of `kept`.
+/// The text of `kept`. A copy that is not text (a draft file kept as its
+/// bytes) is an error of kind [`std::io::ErrorKind::InvalidData`] whose
+/// message says so and where the file is, so a reader can tell a person.
 pub fn read(kept: &KeptText) -> std::io::Result<String> {
-    std::fs::read_to_string(&kept.file)
+    String::from_utf8(std::fs::read(&kept.file)?)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, not_text(kept)))
+}
+
+/// What a person is told of a kept copy that is a file, not a text.
+pub fn not_text(kept: &KeptText) -> String {
+    format!(
+        "This kept copy is a file, not text. It is at {}.",
+        kept.file.display()
+    )
+}
+
+/// Whether `kept` is a draft file kept as its bytes rather than a text. A
+/// text is kept for a page, an engram or a comment, whose path is markdown; a
+/// file beside the pages never is.
+pub fn is_file_copy(kept: &KeptText) -> bool {
+    !kept.path.ends_with(".md")
 }
 
 /// Delete `kept`'s file, then every folder it leaves empty up to (not
@@ -559,12 +598,27 @@ fn parse_temp_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
     (!name.is_empty()).then(|| (name, at.and_utc()))
 }
 
-/// `<name>.<stamp>.md` or `<name>.<stamp>-<n>.md`: the original file name
-/// and the time.
+/// The extension a kept copy of the file `name` is named with: the file's
+/// own, so a page's text ends in `.md` and a kept draft file in its own kind
+/// (`deck.pdf` keeps as `.pdf`). A file with none of its own keeps as `.bin`,
+/// and so does a name that ends in a dot: its extension is empty, and a kept
+/// name ending in a dot loses that dot on Windows and would never list.
+fn kept_extension(name: &str) -> &str {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or("bin")
+}
+
+/// `<name>.<stamp>.<ext>` or `<name>.<stamp>-<n>.<ext>`, where `<ext>` is the
+/// original file's own ([`kept_extension`]), or `md`: a draft file kept before
+/// kept files took their own extension was named `.md`, and it may be the
+/// last copy of somebody's bytes. Answers the original file name and the time.
 fn parse_name(file: &str) -> Option<(&str, DateTime<Utc>)> {
-    let stem = file.strip_suffix(".md")?;
+    let (stem, ext) = file.rsplit_once('.')?;
     let (name, tail) = stem.rsplit_once('.')?;
-    if name.is_empty() {
+    if name.is_empty() || (ext != kept_extension(name) && ext != "md") {
         return None;
     }
     let (stamp, counter) = match tail.split_once('-') {
@@ -1113,5 +1167,117 @@ mod tests {
         remove(root, &left[0]).unwrap();
         assert!(root.is_dir(), "the kept folder stays");
         assert!(!root.join("eng").exists());
+    }
+
+    /// A draft file kept as its bytes is named for its own extension, not
+    /// `.md`, so no copy that is not markdown is named as one; a second keep
+    /// in the same second takes the next `-N`. The listing finds both under
+    /// the file's own path, as file copies.
+    #[test]
+    fn a_kept_file_is_named_for_its_own_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x41];
+        let owner = Some("ada");
+        let kind = KeptKind::Engram;
+        let first =
+            write_bytes(root, "eng", owner, kind, "assets/deck.pdf", at(8), &bytes).unwrap();
+        let second =
+            write_bytes(root, "eng", owner, kind, "assets/deck.pdf", at(8), &bytes).unwrap();
+        assert_eq!(first.file_name().unwrap(), "deck.pdf.20261015T080000Z.pdf");
+        assert_eq!(
+            second.file_name().unwrap(),
+            "deck.pdf.20261015T080000Z-2.pdf"
+        );
+        let found = scan(root);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for kept in &found {
+            assert_eq!(kept.path, "assets/deck.pdf");
+            assert_eq!(kept.owner.as_deref(), Some("ada"));
+            assert!(is_file_copy(kept));
+            assert_eq!(std::fs::read(&kept.file).unwrap(), bytes);
+        }
+    }
+
+    /// A file with no extension of its own is kept as `.bin`, and the file
+    /// beside it that names its sender is still no kept copy.
+    #[test]
+    fn a_kept_file_with_no_extension_is_named_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = write_bytes(
+            root,
+            "eng",
+            None,
+            KeptKind::Engram,
+            "assets/LICENSE",
+            at(8),
+            b"\xff",
+        )
+        .unwrap();
+        assert_eq!(file.file_name().unwrap(), "LICENSE.20261015T080000Z.bin");
+        let ada = Sender {
+            account: "ada".to_string(),
+            name: "Ada".to_string(),
+        };
+        record_sender(&file, &ada).unwrap();
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/LICENSE");
+        assert_eq!(found[0].sender.as_ref(), Some(&ada));
+    }
+
+    /// A name that ends in a dot keeps as `.bin`, never as a name that ends in
+    /// a dot itself, which Windows would strip so the copy never listed.
+    #[test]
+    fn a_kept_file_whose_name_ends_in_a_dot_is_named_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let file = write_bytes(
+            root,
+            "eng",
+            None,
+            KeptKind::Engram,
+            "assets/deck.",
+            at(8),
+            b"x",
+        )
+        .unwrap();
+        assert_eq!(file.file_name().unwrap(), "deck..20261015T080000Z.bin");
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/deck.");
+    }
+
+    /// The extension after the stamp must be the file's own or `md`: a name
+    /// that ends in another one does not follow the layout and is not listed.
+    #[test]
+    fn a_kept_name_with_another_extension_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let folder = root.join("eng/engram/assets");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("a.md.20261015T080000Z.pdf"), b"x").unwrap();
+        std::fs::write(folder.join("deck.pdf.20261015T080000Z.png"), b"x").unwrap();
+        assert_eq!(scan(root), vec![]);
+    }
+
+    /// A draft file kept before kept files took their own extension was named
+    /// `.md` (`deck.pdf.<stamp>.md`). It is the last copy of her bytes, so it
+    /// still lists under the file's path, as a file, and its bytes read back.
+    #[test]
+    fn an_old_md_named_kept_file_still_lists_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let folder = root.join("eng/draft/ada/engram/assets");
+        std::fs::create_dir_all(&folder).unwrap();
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x41];
+        std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), bytes).unwrap();
+        let found = scan(root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "assets/deck.pdf");
+        assert_eq!(found[0].owner.as_deref(), Some("ada"));
+        assert!(is_file_copy(&found[0]));
+        assert_eq!(std::fs::read(&found[0].file).unwrap(), bytes);
     }
 }

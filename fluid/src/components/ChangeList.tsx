@@ -39,6 +39,11 @@
  * Generated folder listings are the one thing kept out of the groups and never
  * drawn: an `index.md` is rebuilt from the engrams beside it and follows the
  * domain's own configuration, so the list says nothing about it at all.
+ *
+ * In a domain that reviews changes a row can be one of this session's drafts
+ * that does not fit the team's text. Its box is off and stays unticked, a
+ * group's box leaves it out, and its path opens the dialog that settles it
+ * rather than the diff: it cannot travel until it is settled.
  */
 
 import { MoreHorizontal } from "lucide-react";
@@ -163,11 +168,14 @@ function GroupCheckbox({
   label,
   checked,
   indeterminate,
+  disabled,
   onChange,
 }: {
   label: string;
   checked: boolean;
   indeterminate: boolean;
+  /** A group with nothing it could take in or out. */
+  disabled: boolean;
   onChange: (next: boolean) => void;
 }): ReactElement {
   const box = useRef<HTMLInputElement>(null);
@@ -185,6 +193,7 @@ function GroupCheckbox({
       type="checkbox"
       aria-label={label}
       checked={checked}
+      disabled={disabled}
       onChange={(event) => {
         onChange(event.target.checked);
       }}
@@ -212,6 +221,8 @@ function ChangeRow({
   onToggle,
   onOpen,
   onDiscard,
+  onSettle,
+  settleReasonId,
 }: {
   path: string;
   kind: string;
@@ -220,6 +231,10 @@ function ChangeRow({
   onToggle: (path: string, next: boolean) => void;
   onOpen: (path: string) => void;
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
+  /** Set for a draft that does not fit the team's text: opens its dialog. */
+  onSettle?: (() => void) | undefined;
+  /** The element that says why a conflicted row's box is off. */
+  settleReasonId?: string | undefined;
 }): ReactElement {
   const trigger = useRef<HTMLButtonElement>(null);
   // The row's own refusal, named so the tick box can point at it: a reason
@@ -232,12 +247,25 @@ function ChangeRow({
         <input
           type="checkbox"
           aria-label={path}
-          aria-describedby={refusal !== null ? refusalId : undefined}
-          checked={checked}
+          aria-describedby={
+            [
+              onSettle !== undefined ? settleReasonId : undefined,
+              refusal !== null ? refusalId : undefined,
+            ]
+              .filter((id) => id !== undefined)
+              .join(" ") || undefined
+          }
+          checked={checked && onSettle === undefined}
+          // Off for a draft in conflict, but still reachable, so a screen
+          // reader hears the reason it points at; a press changes nothing.
+          aria-disabled={onSettle !== undefined ? true : undefined}
           onChange={(event) => {
+            if (onSettle !== undefined) {
+              return;
+            }
             onToggle(path, event.target.checked);
           }}
-          className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
+          className="size-3.5 shrink-0 accent-accent-600 aria-disabled:opacity-50 dark:accent-accent-400"
         />
         <ChangeKindBadge kind={kind} />
         {/* The path is the way into the diff: a button named by it, in
@@ -246,9 +274,13 @@ function ChangeRow({
         <button
           type="button"
           onClick={() => {
-            onOpen(path);
+            if (onSettle !== undefined) {
+              onSettle();
+            } else {
+              onOpen(path);
+            }
           }}
-          className={`min-w-0 truncate rounded px-0.5 text-left font-mono text-xs break-all underline-offset-2 hover:underline ${FOCUS_RING}`}
+          className={`min-w-0 truncate rounded px-0.5 text-left font-mono text-xs break-all underline-offset-2 hover:underline ${onSettle !== undefined ? "underline" : ""} ${FOCUS_RING}`}
         >
           {path}
         </button>
@@ -314,6 +346,8 @@ function ChangeGroup({
   onOpen,
   onDiscard,
   refusals,
+  onSettle,
+  settleReasonId,
 }: {
   kind: string;
   paths: string[];
@@ -323,12 +357,17 @@ function ChangeGroup({
   onOpen: (path: string) => void;
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
   refusals: ReadonlyMap<string, string>;
+  onSettle?: ((path: string) => (() => void) | undefined) | undefined;
+  settleReasonId?: string | undefined;
 }): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const face = faceFor(kind);
   const shown = expanded ? paths : paths.slice(0, SHOWN_PER_GROUP);
   const rest = paths.length - SHOWN_PER_GROUP;
-  const ticked = paths.filter((path) => selected.has(path)).length;
+  // The group's box speaks for the files that can go: a conflicted one is
+  // never ticked, so counting it would leave the box forever half full.
+  const open = paths.filter((path) => onSettle?.(path) === undefined);
+  const ticked = open.filter((path) => selected.has(path)).length;
   return (
     <div className="flex flex-col gap-1">
       {/* The shape of the share, before any of its detail: what happened, and
@@ -337,10 +376,11 @@ function ChangeGroup({
       <p className="flex items-center gap-2 text-caption font-medium text-slate-600 dark:text-slate-300">
         <GroupCheckbox
           label={`Share all ${face.word.toLowerCase()}`}
-          checked={ticked === paths.length}
-          indeterminate={ticked > 0 && ticked < paths.length}
+          checked={open.length > 0 && ticked === open.length}
+          indeterminate={ticked > 0 && ticked < open.length}
+          disabled={open.length === 0}
           onChange={(next) => {
-            onToggleGroup(paths, next);
+            onToggleGroup(open, next);
           }}
         />
         {`${face.word} ${String(paths.length)}`}
@@ -356,6 +396,8 @@ function ChangeGroup({
             onToggle={onToggle}
             onOpen={onOpen}
             onDiscard={onDiscard}
+            onSettle={onSettle?.(path)}
+            settleReasonId={settleReasonId}
           />
         ))}
       </ul>
@@ -403,6 +445,8 @@ export function ChangeList({
   onOpen,
   onDiscard,
   refusals,
+  onSettle,
+  settleReasonId,
 }: {
   changes: ShareChange[];
   selected: ReadonlySet<string>;
@@ -416,6 +460,14 @@ export function ChangeList({
   onDiscard?: ((path: string, from: HTMLElement | null) => void) | undefined;
   /** The reason a path's last discard was refused, drawn under it. */
   refusals: ReadonlyMap<string, string>;
+  /**
+   * For a path that is one of this session's drafts in conflict, what opens
+   * the dialog that settles it; undefined for every other path. A path with
+   * one has its box off.
+   */
+  onSettle?: ((path: string) => (() => void) | undefined) | undefined;
+  /** The element that says why a conflicted row's box is off. */
+  settleReasonId?: string | undefined;
 }): ReactElement | null {
   const groups = groupChanges(substantive(changes));
   if (groups.length === 0) {
@@ -437,6 +489,8 @@ export function ChangeList({
           onOpen={onOpen}
           onDiscard={onDiscard}
           refusals={refusals}
+          onSettle={onSettle}
+          settleReasonId={settleReasonId}
         />
       ))}
       {(hint ?? null) !== null && (

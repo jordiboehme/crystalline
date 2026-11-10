@@ -138,6 +138,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "PUT /api/v1/domains/{domain}/owner",
     "GET /api/v1/domains/{domain}/kept",
     "GET /api/v1/domains/{domain}/kept/{id}",
+    "GET /api/v1/domains/{domain}/kept/{id}/file",
     "DELETE /api/v1/domains/{domain}/kept/{id}",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
@@ -146,6 +147,9 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/domains/{domain}/sync/proposals/{number}/withdraw",
     "GET /api/v1/domains/{domain}/sync/conflicts/{id}",
     "POST /api/v1/domains/{domain}/sync/conflicts/{id}/resolve",
+    "GET /api/v1/domains/{domain}/drafts/conflicts",
+    "GET /api/v1/domains/{domain}/drafts/conflicts/{id}",
+    "POST /api/v1/domains/{domain}/drafts/conflicts/{id}/resolve",
     "GET /api/v1/domains/{domain}/changes",
     "POST /api/v1/domains/{domain}/changes/discard",
     "GET /api/v1/domains/{domain}/changes/{path}",
@@ -331,6 +335,9 @@ struct Inner {
     /// can put an upstream advance in the middle of one engine call - which is
     /// the window a share of a reviewing domain has to be safe across.
     branch_move_after_probe: Option<(usize, String, String)>,
+    /// A proposal the armed move above merges as it fires, set through
+    /// `MockProvider::merge_after_head_probes`.
+    merge_with_the_move: Option<u64>,
     /// How many times `tarball` has been called, for the connect-race test:
     /// a first connect parks mid-download while an identical retry queues on
     /// the origin lock, so a count of exactly one proves the retry answered
@@ -632,6 +639,16 @@ impl MockProvider {
         inner.branch_move_after_probe = Some((probe, branch.to_string(), commit.to_string()));
     }
 
+    /// [`MockProvider::move_branch_after_head_probes`] that also marks proposal
+    /// `number` merged as the move fires: the team merges it in the middle of
+    /// one engine call, after that call read the head. The proposal's branch
+    /// stays, as a forge keeps a merged branch unless told to delete it.
+    pub fn merge_after_head_probes(&self, probe: usize, number: u64, branch: &str, commit: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.branch_move_after_probe = Some((probe, branch.to_string(), commit.to_string()));
+        inner.merge_with_the_move = Some(number);
+    }
+
     /// Arms a gate that blocks every `tarball` download until the returned
     /// sender flips it open, and starts counting `tarball` calls. The
     /// connect-race test uses it to park a first connect mid-download while
@@ -881,6 +898,9 @@ impl Provider for MockProvider {
             let etag = format!("etag{}", inner.etag_counter);
             inner.branches.insert(branch.clone(), target);
             inner.etags.insert(branch, etag);
+            if let Some(number) = inner.merge_with_the_move.take() {
+                inner.proposal_states.insert(number, ProposalState::Merged);
+            }
         }
         Ok(answer)
     }

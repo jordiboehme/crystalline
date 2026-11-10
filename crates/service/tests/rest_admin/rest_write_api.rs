@@ -3259,6 +3259,16 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // A draft conflict is its author's, so any writer reaches the route
+        // with no share role. `eng` does not review changes, so the allowed
+        // leg is a 404: no such conflict among the caller's drafts.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/drafts/conflicts/abc12345/resolve",
+            body: Some(serde_json::json!({"resolution": "mine"})),
+            min_role: Role::Editor,
+            read_only_exempt: false,
+        },
         // `eng` has no origin either, so the allowed leg is a 409 the same
         // way the sync/withdraw/resolve rows above are: "anything but
         // 401/403", proving the gate without a team fixture.

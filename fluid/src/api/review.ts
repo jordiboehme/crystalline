@@ -61,6 +61,18 @@ export interface PlannedActor {
    * `entries` here counts only what could be read.
    */
   files_unreadable?: boolean;
+  /**
+   * Whether this actor's draft conflicts could not be read, absent when they
+   * could. A fold of them is refused, because nobody can tell whether their
+   * drafts still fit the team's text; ending them is the way that is left.
+   */
+  conflicts_unreadable?: boolean;
+  /**
+   * Why, in the server's own sentence for the person reading the plan: whose
+   * records, and the way out they can take. Present with
+   * `conflicts_unreadable`, and shown as it is.
+   */
+  conflicts_unreadable_reason?: string;
 }
 
 /** A path more than one actor is drafting: at most one of them may be folded. */

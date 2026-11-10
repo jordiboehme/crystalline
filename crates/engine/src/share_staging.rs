@@ -91,6 +91,11 @@ pub(crate) struct PreparedShare {
     pub(crate) staging: OverlayStaging,
     /// The commit the folder stands at, for [`PinnedHead::new`].
     pub(crate) pinned: String,
+    /// The acting person's drafts that do not fit the team's text, read after
+    /// the pull and its pass and before the tree was staged, so nothing that
+    /// settles a conflict in between can make the gate read clean over a tree
+    /// staged from the stale row.
+    pub(crate) conflicts: Vec<crate::engine::DraftConflict>,
 }
 
 /// A staged tree, owned by the share that built it.

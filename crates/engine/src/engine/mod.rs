@@ -897,8 +897,9 @@ fn manifest_stamp(root: &Path) -> Option<(u64, i64)> {
     Some((meta.len(), i64::try_from(nanos).unwrap_or(i64::MAX)))
 }
 
-/// The two signals of `Engine::hold_next_room_screen_until` and
-/// `Engine::hold_next_apply_until`.
+/// The two signals of `Engine::hold_next_room_screen_until`,
+/// `Engine::hold_next_apply_until` and
+/// `Engine::hold_next_proposal_record_until`.
 #[cfg(any(test, feature = "testing"))]
 struct RoomScreenGate {
     entered: std::sync::Arc<tokio::sync::Notify>,
@@ -1050,6 +1051,43 @@ pub struct Engine {
     detection_walks: std::sync::atomic::AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
+    // When armed, the next put-back of a draft start record fails once. See
+    // `Engine::fail_next_start_restore`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_start_restore: std::sync::atomic::AtomicBool,
+    // When armed, the next convergence pass fails at its start, once. See
+    // `Engine::fail_next_convergence`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_convergence: std::sync::atomic::AtomicBool,
+    // A stopwatch: when armed, the pass's next drop of a draft sleeps this many
+    // milliseconds before it takes the draft lock. See
+    // `Engine::hold_next_convergence_drop`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_convergence_drop: std::sync::atomic::AtomicU64,
+    // How many drops the hold above lets pass before the one it holds.
+    #[cfg(any(test, feature = "testing"))]
+    hold_convergence_drop_skip: std::sync::atomic::AtomicU64,
+    // When armed, the pass's next save of a moved start after a merge fails
+    // once. See `Engine::fail_next_merge_start`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_merge_start: std::sync::atomic::AtomicBool,
+    // When armed, a resolve's next settle of the deletion half of a move
+    // fails once. See `Engine::fail_next_half_settle`.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_half_settle: std::sync::atomic::AtomicBool,
+    // When armed, a fold runs each of these once at the step it names. See
+    // `Engine::at_next_fold_step`.
+    #[cfg(any(test, feature = "testing"))]
+    fold_hooks: std::sync::Mutex<Vec<(FoldStep, FoldHook)>>,
+    // When armed, the pass runs this once between deciding that a draft file
+    // has landed and taking its lock. See `Engine::before_next_file_settle`.
+    #[cfg(any(test, feature = "testing"))]
+    file_settle_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    // When armed, the next resolution of a share's credential answers that the
+    // caller connected no personal identity, once. See
+    // `Engine::refuse_next_personal_credential`.
+    #[cfg(any(test, feature = "testing"))]
+    refuse_next_personal_credential: std::sync::atomic::AtomicBool,
     // When armed, the next rename-question scan fails once. See
     // `Engine::fail_next_rename_scan`.
     #[cfg(any(test, feature = "testing"))]
@@ -1065,6 +1103,11 @@ pub struct Engine {
     // `Engine::hold_next_draft_edit`, and the same compile-out applies.
     #[cfg(any(test, feature = "testing"))]
     hold_next_draft_edit: std::sync::atomic::AtomicU64,
+    // When armed, a discard of a draft waits this many milliseconds between
+    // its first look at the draft and its draft lock, once. See
+    // `Engine::hold_next_discard`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_discard: std::sync::atomic::AtomicU64,
     // A clock rather than a gate: when set, the automation verbs read this
     // time as now, so a test moves a lease past its stale time or a status
     // read to the next day. See `Engine::set_automation_now`.
@@ -1087,6 +1130,12 @@ pub struct Engine {
     // `release`. See `Engine::hold_next_apply_until`.
     #[cfg(any(test, feature = "testing"))]
     hold_next_apply: std::sync::Mutex<Option<RoomScreenGate>>,
+    // A gate: when armed, the next share that opened or amended a proposal
+    // signals `entered` before it records what the proposal holds of each
+    // draft, then waits for `release`. See
+    // `Engine::hold_next_proposal_record_until`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_proposal_record: std::sync::Mutex<Option<RoomScreenGate>>,
     // A gate: when armed, the next try of an edit's live arm, or an
     // overwrite's, signals `entered` after it looked at the room and computed
     // its target, then waits for `release` before it composes. See
@@ -1828,14 +1877,26 @@ pub fn joined_draft_is_gone(owner: &str, draft: &str) -> String {
 pub const REVIEW_NO_STACKING: &str = "this domain reviews changes; stacking on an open layer is not supported while it does - withdraw it and share again";
 
 /// What a share hears when SOMEBODY ELSE's proposal is open in a domain that
-/// reviews changes: a `{actor}` slot and the wait.
+/// reviews changes: whose it is and what to do.
 ///
-/// A separate string from [`REVIEW_NO_STACKING`] because the way forward is
+/// A separate answer from [`REVIEW_NO_STACKING`] because the way forward is
 /// different in kind. This actor cannot withdraw a proposal that is not theirs,
-/// so telling them to would be telling them to do something they may not do -
-/// and telling them to "share a fresh proposal instead" would be telling them
-/// to do the very thing being refused.
-const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and this domain takes one proposal at a time while it reviews changes - wait for theirs to merge, or ask them to withdraw it, then share again";
+/// so telling them to would be telling them to do something they may not do,
+/// and telling them to share a fresh proposal would be telling them to do the
+/// very thing being refused. A proposal with no owner on record may be the
+/// asker's own, so its sentence is true for everyone and names withdrawing it
+/// as the way out for its opener.
+pub(crate) fn review_proposal_is_anothers(owner: Option<&str>, number: u64) -> String {
+    match owner {
+        Some(owner) => format!(
+            "{owner}'s proposal #{number} is still open. Share again when it is merged or closed."
+        ),
+        None => format!(
+            "Proposal #{number} is still open, and Crystalline does not know who opened it. Share \
+             again when it is merged or closed, or withdraw it if it is yours."
+        ),
+    }
+}
 
 /// The refusal a write verb answers with in personal mode when the acting
 /// identity has connected no GitHub account of its own (spec section 6, and the
@@ -2502,11 +2563,31 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
+            fail_next_start_restore: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_convergence: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            hold_next_convergence_drop: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            hold_convergence_drop_skip: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_merge_start: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_half_settle: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            fold_hooks: std::sync::Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "testing"))]
+            file_settle_hook: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            refuse_next_personal_credential: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
             fail_next_rename_scan: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             lose_next_relink_swap: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             hold_next_draft_edit: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            hold_next_discard: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             automation_now: std::sync::Mutex::new(None),
             automation_deliveries: std::sync::Mutex::new(HashMap::new()),
@@ -2514,6 +2595,8 @@ impl Engine {
             hold_next_room_screen: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             hold_next_apply: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            hold_next_proposal_record: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             hold_next_live_compose: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
@@ -2643,6 +2726,221 @@ impl Engine {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Make the next put-back of a draft start record fail, once, as a full disk
+    /// would, leaving the clear that follows it to work. The other way to get
+    /// there, a folder that refuses writes, fails the clear as well. Nothing in
+    /// the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_start_restore(&self) {
+        self.fail_next_start_restore
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::fail_next_start_restore`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    pub(crate) fn take_failed_start_restore(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_start_restore
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Make the next convergence pass fail at its start, once, as a pass that
+    /// could not read what it needs would. Nothing in the daemon, the CLI or the
+    /// MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_convergence(&self) {
+        self.fail_next_convergence
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::fail_next_convergence`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    fn take_failed_convergence(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_convergence
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Hold one of the convergence pass's drops of a draft for `millis` before it
+    /// takes the draft's lock, once: the drop after the next `skip` ones. A test
+    /// writes the draft in that window, and the drop must then see the new text
+    /// and leave the row. Nothing in the daemon, the CLI or the MCP surface calls
+    /// this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_convergence_drop(&self, skip: u64, millis: u64) {
+        self.hold_convergence_drop_skip
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
+        self.hold_next_convergence_drop
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming when its drop comes. Does nothing
+    /// outside a test build.
+    async fn take_convergence_drop_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.hold_next_convergence_drop.load(Relaxed) == 0 {
+                return;
+            }
+            let skip = self.hold_convergence_drop_skip.load(Relaxed);
+            if skip > 0 {
+                self.hold_convergence_drop_skip.store(skip - 1, Relaxed);
+                return;
+            }
+            let millis = self.hold_next_convergence_drop.swap(0, Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
+        }
+    }
+
+    /// Make the next save of a moved start after a merge was written fail once,
+    /// as a full disk would: the convergence pass's, or a merged resolve's.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_merge_start(&self) {
+        self.fail_next_merge_start
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make a resolve's next settle of the deletion half of a move fail once,
+    /// after its draft settled, as a change to that half in the meantime would.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_half_settle(&self) {
+        self.fail_next_half_settle
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run `hook` once in the next fold, at `step`: the moments a pull can
+    /// land while a fold runs. Nothing in the daemon, the CLI or the MCP
+    /// surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn at_next_fold_step(&self, step: FoldStep, hook: FoldHook) {
+        self.fold_hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((step, hook));
+    }
+
+    /// Run `hook` once in the pass, after it decided that a draft file has
+    /// landed and before it takes the file's lock: the moment an upload can
+    /// land in between. Nothing in the daemon, the CLI or the MCP surface calls
+    /// this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn before_next_file_settle(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .file_settle_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Run what [`Engine::before_next_file_settle`] armed, once. Does nothing
+    /// outside a test build.
+    fn run_file_settle_hook(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let hook = self
+                .file_settle_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// Run what [`Engine::at_next_fold_step`] armed for `step`, once. Does
+    /// nothing outside a test build.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        allow(clippy::unused_async, unused_variables)
+    )]
+    pub(super) async fn run_fold_hook(&self, step: FoldStep) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let hook = {
+                let mut hooks = self
+                    .fold_hooks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                hooks
+                    .iter()
+                    .position(|(at, _)| *at == step)
+                    .map(|i| hooks.remove(i).1)
+            };
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+    }
+
+    /// Whether [`Engine::fail_next_half_settle`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    fn take_failed_half_settle(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_half_settle
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Whether [`Engine::fail_next_merge_start`] is armed, consuming the arming.
+    /// Constant `false` outside a test build.
+    fn take_failed_merge_start(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_merge_start
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Make the next resolution of a share's credential refuse as one for a
+    /// caller who connected no personal GitHub identity does, once, even under
+    /// a test's provider override, so the read-scope preview can be reached.
+    /// Nothing in the daemon, the CLI or the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn refuse_next_personal_credential(&self) {
+        self.refuse_next_personal_credential
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Engine::refuse_next_personal_credential`] is armed, consuming
+    /// the arming. Constant `false` outside a test build.
+    pub(super) fn take_refused_personal_credential(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.refuse_next_personal_credential
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
     /// Make the next scan for a rename question's old spellings fail, once,
     /// as a store error would. Nothing in the daemon, the CLI or the MCP
     /// surface calls this.
@@ -2669,6 +2967,29 @@ impl Engine {
     pub fn hold_next_draft_edit(&self, millis: u64) {
         self.hold_next_draft_edit
             .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hold the next discard of a draft for `millis` between its first look at
+    /// the draft and the draft lock it drops it under, once, so a test can
+    /// edit the draft inside that window. Nothing in the daemon, the CLI or
+    /// the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_discard(&self, millis: u64) {
+        self.hold_next_discard
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming. Does nothing outside a test build.
+    pub(super) async fn take_discard_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let millis = self
+                .hold_next_discard
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
+        }
     }
 
     /// The hold above, consuming the arming. Does nothing at all outside a test
@@ -2813,6 +3134,41 @@ impl Engine {
         #[cfg(any(test, feature = "testing"))]
         {
             let gate = self.hold_next_live_compose.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+    }
+
+    /// Hold the next share that opened or amended a proposal after the forge
+    /// took it and before it records what the proposal holds of each draft: it
+    /// signals `entered` there and waits for `release`. Lets a test edit a
+    /// draft inside that window, which a person's typing cannot be timed to
+    /// hit. Armed for one share and consumed by it, and compiled out of a
+    /// released binary like the seams above.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_proposal_record_until(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let gate = RoomScreenGate {
+            entered: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        };
+        let handles = (gate.entered.clone(), gate.release.clone());
+        *self.hold_next_proposal_record.lock().unwrap() = Some(gate);
+        handles
+    }
+
+    /// The gate above, consuming the arming; returns at once when none is
+    /// armed. Does nothing at all outside a test build.
+    async fn take_proposal_record_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let gate = self.hold_next_proposal_record.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
@@ -5503,6 +5859,20 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    /// Whether `name`'s drafts still merge and settle: it reviews changes, or
+    /// a fold of it began and did not finish
+    /// ([`crate::overlay_journal::fold_unfinished`]). The pass and resolve ask
+    /// this, so a fold that stopped part way still has a way to settle each
+    /// draft before it is repeated. The draft conflict routes ask it too, and
+    /// list nothing where it is false.
+    #[doc(hidden)]
+    pub fn drafts_stay_open(&self, name: &str) -> bool {
+        self.reviews_changes(name)
+            || self
+                .journal_state_dir()
+                .is_ok_and(|dir| crate::overlay_journal::fold_unfinished(&dir, name))
+    }
+
     /// Whether `name` is a read-only domain: its MANIFEST as the team has it
     /// (the folder for a file domain, the base row for a virtual one, never a
     /// draft) says `read_only: on`. A name nobody registers is not read-only;
@@ -5937,12 +6307,26 @@ impl Engine {
     ///
     /// Answers `Some(warning)` for a mirror that failed after the row landed,
     /// for the reason [`Engine::write_overlay_entry`] gives at length.
+    ///
+    /// **A held row keeps its record, or keeps having none.** The deletion stands
+    /// on what the draft it replaces started from, and an old draft's deletion
+    /// stays unknown: today's team text would make a stale delete read as in step.
+    /// With no row held the record is new, with `read` as its start, and it goes
+    /// down before the row, as in [`DomainView::put`].
+    ///
+    /// **Except a held record of another path.** The draft came from elsewhere or
+    /// was new, and the team has since added a file here. She never saw that file,
+    /// and a record comparing against the other path would read its deletion as in
+    /// step. So the record names this path and no start, and the team's text
+    /// differs from it. The draft's own record is the mover's to carry, read before
+    /// this runs.
     pub(crate) async fn write_overlay_tombstone(
         &self,
         domain: &str,
         actor: &str,
         desc: &EngramDescriptor,
         base_text: &str,
+        read: &str,
     ) -> Result<Option<String>> {
         let state_dir = self.journal_state_dir()?;
         let record = EngramRecord {
@@ -5975,8 +6359,63 @@ impl Engine {
             actor: String::new(),
             tombstone: true,
         };
-        self.commit_overlay_row(desc.domain_id, actor, &record)
-            .await?;
+        let held = {
+            let store = self.store.lock().await;
+            store
+                .overlay_entry(desc.domain_id, actor, &desc.path)
+                .await?
+                .is_some()
+        };
+        // `Some` is a change to the record, with what to put back if the row fails.
+        let io = |source| EngineError::Io {
+            path: format!("the draft start record of '{}'", desc.path),
+            source,
+        };
+        let way_back = if held {
+            let before =
+                crate::draft_start::load(&state_dir, domain, actor, &desc.path).map_err(io)?;
+            match before {
+                Some(before) if before.from.as_deref() != Some(desc.path.as_str()) => {
+                    let elsewhere = crate::draft_start::DraftStart {
+                        from: Some(desc.path.clone()),
+                        start: None,
+                        start_sha256: None,
+                        ..before.clone()
+                    };
+                    crate::draft_start::save(&state_dir, domain, actor, &elsewhere).map_err(io)?;
+                    Some(Some(before))
+                }
+                _ => None,
+            }
+        } else {
+            let start = self.fresh_tombstone_start(domain, &desc.path, read)?;
+            match &start {
+                Some(start) => crate::draft_start::save(&state_dir, domain, actor, start),
+                None => crate::draft_start::clear(&state_dir, domain, actor, &desc.path),
+            }
+            .map_err(io)?;
+            Some(None)
+        };
+        if let Err(e) = self
+            .commit_overlay_row(desc.domain_id, actor, &record)
+            .await
+        {
+            let put_back = match way_back {
+                Some(Some(before)) => crate::draft_start::save(&state_dir, domain, actor, &before),
+                Some(None) => crate::draft_start::clear(&state_dir, domain, actor, &desc.path),
+                None => Ok(()),
+            };
+            if let Err(left) = put_back {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = desc.path.as_str(),
+                    "a deletion failed and the record of where it started could not be put \
+                     back: {left}"
+                );
+            }
+            return Err(e);
+        }
         self.announce(Change::Engram(EngramChanged {
             domain: domain.to_string(),
             permalink: desc.permalink.clone(),
@@ -6006,6 +6445,243 @@ impl Engine {
             tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
         }
         Ok(warning)
+    }
+
+    /// The team's text at `path` for a new record: `Some(None)` when the snapshot
+    /// does not hold the path, else the text as LF. `None` when nothing can be
+    /// said, which is a domain with no base snapshot, or a key whose copy is
+    /// missing or is not text. The caller then writes no record, which reads as
+    /// "we cannot tell", where calling either of them absent would record a file
+    /// the team has as a new file. A state file that does not parse is an error.
+    ///
+    /// **The path has to be a key of [`OriginState::files`]**, since on a disk that
+    /// folds case [`read_base_file`] answers `Note.md` with `note.md`'s bytes. Asking
+    /// only for a real key gives one answer on both disks.
+    ///
+    /// [`OriginState::files`]: crystalline_remote::state::OriginState::files
+    /// [`read_base_file`]: crystalline_remote::state::read_base_file
+    fn team_text_for_a_start(&self, domain: &str, path: &str) -> Result<Option<Option<String>>> {
+        let dir = self.origin_state_dir(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&dir)? else {
+            return Ok(None);
+        };
+        if !state.files.contains_key(path) {
+            return Ok(Some(None));
+        }
+        let Some(bytes) = crystalline_remote::state::read_base_file(&dir, path)? else {
+            tracing::warn!(
+                domain,
+                path,
+                "the base snapshot has no copy of this file, so a draft of it has no known start"
+            );
+            return Ok(None);
+        };
+        match crystalline_core::utf8_to_lf(&bytes) {
+            Ok(text) => Ok(Some(Some(text))),
+            Err(_) => {
+                tracing::warn!(
+                    domain,
+                    path,
+                    "the base snapshot's copy of this file is not text, so a draft of it has no \
+                     known start"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// The record of a new row at `path`: the team's text there, or a new file if
+    /// the team has none. `None` where the snapshot cannot say, and no record is
+    /// the honest answer, since `from: None` would call a file the team has a new
+    /// one.
+    pub(crate) fn fresh_start(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        Ok(self
+            .team_text_for_a_start(domain, path)?
+            .map(|text| crate::draft_start::DraftStart {
+                path: path.to_string(),
+                from: text.is_some().then(|| path.to_string()),
+                start: text,
+                start_sha256: None,
+                shared: None,
+                merged_at: None,
+                merging: None,
+                settling: None,
+            }))
+    }
+
+    /// The record of a new row at `path` for a verb that read what it builds on.
+    /// `from` and `start` come from that read, and the snapshot says only whether
+    /// anything can be told and whether the team holds this path. The two can
+    /// disagree in the moment a pull or a direct commit moves them, and for good
+    /// after a folder write that failed, and the draft holds what she read.
+    ///
+    /// A read of a path the snapshot does not hold is one of two things, and the
+    /// folder tells them apart: still there, it is a file nobody shared, so a new
+    /// file. Gone, the team deleted what she read since she read it, and it stays a
+    /// known start. On a case rename in that moment the folder's answer can differ
+    /// by disk; one that keeps the address is refused by the address check anyway.
+    pub(crate) fn start_from_read(
+        &self,
+        domain: &str,
+        path: &str,
+        read: Option<&str>,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        let Some(team) = self.team_text_for_a_start(domain, path)? else {
+            return Ok(None);
+        };
+        let start = read.filter(|_| {
+            team.is_some()
+                || match self.content_source(domain) {
+                    Ok(ContentSource::File { root }) => !join_rel(&root, path).exists(),
+                    _ => false,
+                }
+        });
+        Ok(Some(crate::draft_start::DraftStart {
+            path: path.to_string(),
+            from: start.map(|_| path.to_string()),
+            start: start.map(|text| crystalline_core::to_lf(text).into_owned()),
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+            merging: None,
+            settling: None,
+        }))
+    }
+
+    /// The record of a new draft file at `path`, upload or deletion. `shown` is
+    /// the digest of the folder's bytes the writer's view showed there, and the
+    /// start is those bytes: what she replaced or deleted. The snapshot says only
+    /// whether the team holds the path; a path it does not hold starts from no
+    /// file, which a file in the folder nobody shared is too. `None` with no
+    /// snapshot, where no record is the honest answer.
+    ///
+    /// The shown bytes and not the snapshot's digest: a pull or a commit can move
+    /// the snapshot ahead of the folder, and a start taken from the snapshot then
+    /// reads as in step over a file she never saw.
+    ///
+    /// An accepted cost: in the moment a pull has taken a deleted file out of the
+    /// snapshot while the folder still shows it, an upload there reads as a new
+    /// file, and its share puts the deleted file back. The snapshot alone cannot
+    /// tell that from a file in the folder nobody shared. Nothing of a
+    /// colleague's is overwritten.
+    pub(crate) fn fresh_file_start(
+        &self,
+        domain: &str,
+        path: &str,
+        shown: Option<&str>,
+    ) -> Result<Option<crate::draft_start::DraftFileStart>> {
+        let dir = self.origin_state_dir(domain)?;
+        let Some(state) = crystalline_remote::state::OriginState::load(&dir)? else {
+            return Ok(None);
+        };
+        let start_sha = shown
+            .filter(|_| state.files.contains_key(path))
+            .map(str::to_string);
+        Ok(Some(crate::draft_start::DraftFileStart {
+            path: path.to_string(),
+            start_sha,
+            shared: None,
+        }))
+    }
+
+    /// The team's spelling of the file `path` when it differs from `path` only
+    /// by case, on a disk that may fold case: a key of the base snapshot, or a
+    /// file in the folder beside it. There the two spellings are one file, and a
+    /// share would write her bytes into the team's. `None` on a disk that keeps
+    /// them apart, which [`folder_may_fold_case`] answers, and for a domain
+    /// with no folder.
+    pub(crate) fn team_case_twin(&self, domain: &str, path: &str) -> Result<Option<String>> {
+        let Ok(ContentSource::File { root }) = self.content_source(domain) else {
+            return Ok(None);
+        };
+        if !self.file_may_fold_case(domain, &root, path) {
+            return Ok(None);
+        }
+        let folded = crystalline_core::fold_path_case(path);
+        let twin = |name: &str| name != path && crystalline_core::fold_path_case(name) == folded;
+        if let Some(state) =
+            crystalline_remote::state::OriginState::load(&self.origin_state_dir(domain)?)?
+            && let Some(key) = state.files.keys().find(|key| twin(key))
+        {
+            return Ok(Some(key.clone()));
+        }
+        let (parent, _) = path.rsplit_once('/').unwrap_or(("", path));
+        let Ok(listed) = std::fs::read_dir(join_rel(&root, parent)) else {
+            return Ok(None);
+        };
+        Ok(listed
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .map(|name| match parent {
+                "" => name,
+                parent => format!("{parent}/{name}"),
+            })
+            .find(|name| twin(name)))
+    }
+
+    /// Another spelling of the file `path` that `actor` drafts herself, differing
+    /// only by case, where a disk a share writes to may fold case. On a state
+    /// disk that folds case the two are one file of hers already; on one that
+    /// keeps them apart both would stage, and one would land over the other.
+    pub(crate) fn own_case_twin(
+        &self,
+        domain: &str,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        let folded = crystalline_core::fold_path_case(path);
+        let read = crate::overlay_files::actor_entries(state_dir, domain, actor);
+        let Some(own) = read
+            .entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .find(|other| other != path && crystalline_core::fold_path_case(other) == folded)
+        else {
+            return Ok(None);
+        };
+        let may_fold = match self.content_source(domain) {
+            Ok(ContentSource::File { root }) => self.file_may_fold_case(domain, &root, path),
+            _ => true,
+        };
+        Ok(may_fold.then_some(own))
+    }
+
+    /// Whether two spellings of the file `path` may be one file somewhere a
+    /// share writes it: the domain's folder `root`, or the folder a share stages
+    /// its tree in under the origin state. Either one folding is enough for a
+    /// share to write one spelling over the other. A folder that cannot say
+    /// counts as folding ([`folder_may_fold_case`]).
+    pub(crate) fn file_may_fold_case(&self, domain: &str, root: &Path, path: &str) -> bool {
+        if folder_may_fold_case(root, path) {
+            return true;
+        }
+        match self.origin_state_dir(domain) {
+            Ok(state_dir) => folder_may_fold_case(
+                &state_dir,
+                &format!("{}/{path}", crate::share_staging::OVERLAY_STAGING_DIR),
+            ),
+            Err(_) => true,
+        }
+    }
+
+    /// The record of a new tombstone at `path`, whose `from` is always its path.
+    fn fresh_tombstone_start(
+        &self,
+        domain: &str,
+        path: &str,
+        read: &str,
+    ) -> Result<Option<crate::draft_start::DraftStart>> {
+        Ok(self
+            .start_from_read(domain, path, Some(read))?
+            .map(|start| crate::draft_start::DraftStart {
+                from: Some(path.to_string()),
+                ..start
+            }))
     }
 
     /// Whether this actor's deletion at `path` stands beside a draft of theirs at
@@ -6085,18 +6761,10 @@ impl Engine {
         }
     }
 
-    /// Take every draft the team's folder has caught up with out of the
-    /// overlay, and count what is left standing against a base that moved.
-    ///
-    /// The clear-only pass: with no pull to attribute a divergence to, this
-    /// ends what has landed and finds no new conflicts. The pull paths run the
-    /// same walk with what the pull applied, which is what switches the
-    /// conflicts on.
-    ///
-    /// **It settles nothing it did not clear.** Every conflict standing in the
-    /// domain's record is left exactly as it was, and only the paths this pass
-    /// took out of the overlay leave it: a maintenance sweep that ended landed
-    /// drafts must never be the reason an actor's surfaced conflict disappears.
+    /// Run the convergence pass over every draft of a domain, with no pull in
+    /// front of it: end what has landed, merge what merges, and leave the rest
+    /// standing (see `Engine::converge_pulled_overlays`). A conflict is not
+    /// stored, so this changes none by itself: it is read from what stands.
     ///
     /// Takes the domain's origin lock, which the inner pass deliberately does
     /// not: every other writer of the convergence record - the two pull paths,
@@ -6125,88 +6793,153 @@ impl Engine {
     /// base itself, so no later pull would run this, and the actor's drafts
     /// have to become the folder the moment the commit lands.
     ///
-    /// **What converges.** A draft whose bytes are now the base's own bytes has
-    /// become the folder, and a tombstone converges when the path it deletes is
-    /// no longer in the base. Both are read against the base SNAPSHOT under the
-    /// state directory rather than the files beside it, for the reason
-    /// [`crate::share_staging::build`] reads the same copies: a stray direct
-    /// edit of the reviewed folder is nobody's draft and must not be mistaken
-    /// for what the team reviewed. Neither test needs to know what the pull
-    /// did, so both are asked of every entry.
+    /// **What it asks.** Every row of every person, whatever the pull applied,
+    /// through the one decision ([`crate::draft_merge::next_step`]) and the same
+    /// reading of rows, records and the base SNAPSHOT the conflict list uses
+    /// ([`Engine::draft_conflicts`]), so the pass and the gates never answer one
+    /// row two ways. The snapshot under the state directory, not the files
+    /// beside it, for the reason [`crate::share_staging::build`] reads the same
+    /// copies: a stray direct edit of the reviewed folder is nobody's draft.
     ///
-    /// **What diverges.** An entry at a path this pull applied that did not
-    /// converge: the team's answer at that path moved and the author's draft
-    /// still says the older thing. Scoped to the applied paths on purpose - a
-    /// draft that simply has not been shared yet is unshared work, not a
-    /// conflict, and calling every one of them a conflict after every unrelated
-    /// pull would make the count say nothing.
+    /// - A row that has landed ends, with the tombstone half of its move first.
+    /// - A row that merges takes the merge, and then its start moves to the
+    ///   team's text (`Engine::take_merge` says what leaves it instead).
+    /// - Everything else stands as it is: in step, or a conflict, which is read
+    ///   from what stands and never stored. A row with no record is a draft from
+    ///   before the record: it ends when it has landed, and is otherwise left.
     ///
-    /// **An address the pull brings in.** A base file this pull applied whose
-    /// permalink a live draft holds at another path is that author's
-    /// divergence too - recorded and surfaced, never a silent drop of the draft
-    /// and never a rewrite of what the team reviewed. It has to surface because
-    /// nothing downstream can carry both rows: a search merges its hits by
-    /// permalink and would drop one of the two without a word, and a draft
-    /// holding an address the reviewed folder already spends could never be
-    /// folded back into that folder. It is the read-side twin of
-    /// [`Engine::refuse_permalink_held_elsewhere`] and deliberately not that
-    /// function: this one asks the base snapshot, which is current the moment
-    /// the pull lands, while the index rows behind `find_engram` are only
-    /// current once the sync after it has run.
-    ///
-    /// **A base path the pull RENAMED takes the draft with it** (ruling: the
+    /// **A base path the pull RENAMED takes a plain draft with it** (ruling: the
     /// draft moves with the base rather than clearing, because the draft's
-    /// content still applies - the team filed the same page under a new name,
-    /// and ending the draft would throw away work nobody asked to end). The
-    /// signal is the address plus the deletion: the pull removed the base at
-    /// the draft's path and a base it applied now answers to the address that
-    /// draft holds. Row and mirror move as ONE, through
-    /// [`Engine::drop_overlay_entry`] and [`Engine::write_overlay_entry`] - a
-    /// move that took the row and left the mirror would put the draft back at
-    /// the old path on the next `reindex --wipe`. A destination this actor is
-    /// already drafting at is a divergence instead: two drafts are never merged
-    /// behind their author's back. A local `move_engram` cannot produce this
-    /// case at all, because in review mode it moves within the acting actor's
-    /// own overlay and never renames a base path, which is why upstream is the
-    /// only way in and why this is where the answer lives.
+    /// content still applies - the team filed the same page under a new name).
+    /// The signal is the address plus the deletion: the pull removed the base at
+    /// the draft's path and a page it applied now answers to the address that
+    /// draft holds ([`pulled_addresses`], by the address rule the conflict list
+    /// reads). Row and mirror move as ONE, through
+    /// [`Engine::move_draft_with_the_base`], and the draft is then decided at its
+    /// new path like any other. A destination this actor is already drafting at
+    /// is never written over, and a draft she moved herself does not follow:
+    /// the team renaming her source reads as its address taken.
     ///
-    /// **A tombstone at a renamed path clears**, and that is the honest answer
-    /// rather than a better one: a tombstone's permalink is its own path by
-    /// design ([`Engine::write_overlay_tombstone`] says why), so it carries no
-    /// address for a rename to be recognized by, and the base it deleted is
-    /// gone. The page reappears for that actor under its new name.
-    ///
-    /// **The record is MERGED, never rebuilt.** A conflict is a fact about one
-    /// actor's draft, not about the pull that happened to notice it, so a path
-    /// this pass did not touch keeps whatever it was: a path that converged
-    /// leaves the record, a path this pass found diverged goes in (replacing
-    /// only its own entry), and a path standing from an earlier pull stays
-    /// standing. Rebuilding it would mean the next pull about an unrelated file
-    /// silently dropping a conflict the machinery had already surfaced, which
-    /// on a ticking poller is a window one tick wide. The only other ways out
-    /// of the record are the entry itself going away - an actor who no longer
-    /// holds a row at a path has no conflict there - and a resolution
-    /// (`Engine::settle_convergence`).
-    ///
-    /// A recorded conflict cannot go stale while it stands. Byte-equality is
-    /// asked of EVERY entry on every pass, whatever the pull touched (see
-    /// `settle_overlay_entry`'s first arm), so an author who edits their draft
-    /// until it says what the folder says has it cleared by the next pass
-    /// rather than left listed. What a merge preserves is only the case that is
-    /// still true: a draft that still differs from the base that moved under
-    /// it.
+    /// **The record beside the journal** keeps `cleared`, the proposal owners
+    /// and the file conflicts. Row conflicts are no longer written there; the
+    /// row paths it still lists are drafts from before the record, a frozen list
+    /// the conflict list reads, so a record this pass cannot read is left as it
+    /// is rather than saved over.
     ///
     /// A domain that takes changes directly returns at the first line and
-    /// touches nothing - no store read, no base file, no journal.
+    /// touches nothing - no store read, no base file, no journal beyond the
+    /// one mark that says a fold of it stopped part way. While that mark
+    /// stands the pass runs as in review mode, so the drafts the fold left
+    /// can still merge ([`Engine::drafts_stay_open`]).
     async fn converge_pulled_overlays(
         &self,
         domain: &str,
         touched: &[String],
     ) -> Result<ConvergenceReport> {
-        if !self.reviews_changes(domain) {
+        self.converge_overlays_of(domain, touched, None).await
+    }
+
+    /// Add to the frozen list every draft from before the record, row or file,
+    /// whose team file the pull that applied `touched` deleted
+    /// ([`deleted_under_old_drafts`]). Nothing else will ever say the team held
+    /// it, and its share would bring the file back.
+    ///
+    /// Asked straight after the pull, under the origin lock its caller holds,
+    /// before the sync and before the pass: a sync that fails, or a pass that
+    /// stops at an earlier person's drafts, must not let the deletion go
+    /// unlearned, since the next pull no longer names it. A list that cannot
+    /// be read is left as it is; the gate then refuses those drafts. Nothing
+    /// here fails the pull.
+    pub(super) async fn learn_old_draft_deletions(&self, domain: &str, touched: &[String]) {
+        if touched.is_empty() || !self.drafts_stay_open(domain) {
+            return;
+        }
+        let (Ok(journal_dir), Ok(state_dir)) =
+            (self.journal_state_dir(), self.origin_state_dir(domain))
+        else {
+            return;
+        };
+        let Ok(Some(state)) = crystalline_remote::state::OriginState::load(&state_dir) else {
+            return;
+        };
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return;
+        };
+        let rows: Vec<(String, Vec<StoredEngram>)> = {
+            let store = self.store.lock().await;
+            let Ok(Some(domain_id)) = store.domain_id(domain).await else {
+                return;
+            };
+            let mut rows = Vec::new();
+            for (actor, _) in store.overlay_counts(domain_id).await.unwrap_or_default() {
+                let entries = store
+                    .overlay_entries(domain_id, &actor)
+                    .await
+                    .unwrap_or_default();
+                rows.push((actor, entries));
+            }
+            rows
+        };
+        let files = self.overlay_domain_files(domain);
+        let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
+        let mut actors: BTreeSet<String> = rows.iter().map(|(actor, _)| actor.clone()).collect();
+        actors.extend(files.per_actor.keys().cloned());
+        let mut added = false;
+        for actor in actors {
+            let entries = rows
+                .iter()
+                .find(|(held, _)| *held == actor)
+                .map(|(_, entries)| entries.as_slice())
+                .unwrap_or_default();
+            let own_files = files
+                .per_actor
+                .get(&actor)
+                .map(|read| read.entries.as_slice())
+                .unwrap_or_default();
+            let deleted = deleted_under_old_drafts(
+                &journal_dir,
+                domain,
+                &actor,
+                entries,
+                own_files,
+                &touched,
+                &state,
+            );
+            if deleted.is_empty() {
+                continue;
+            }
+            let listed = record.conflicts.entry(actor).or_default();
+            for path in deleted {
+                if !listed.contains(&path) {
+                    listed.push(path);
+                    added = true;
+                }
+            }
+        }
+        if added {
+            self.save_convergence(&journal_dir, domain, &record);
+        }
+    }
+
+    /// [`Engine::converge_pulled_overlays`] for one actor's drafts and files
+    /// only, when `only` names them, so a caller who asked about their own
+    /// drafts writes nobody else's. The convergence record keeps the other
+    /// actors' entries and its `cleared` count as they stand.
+    pub(super) async fn converge_overlays_of(
+        &self,
+        domain: &str,
+        touched: &[String],
+        only: Option<&str>,
+    ) -> Result<ConvergenceReport> {
+        if !self.drafts_stay_open(domain) {
             return Ok(ConvergenceReport::default());
         }
-        let Ok((_, _, state_dir)) = self.origin_spec_for_domain(domain) else {
+        if self.take_failed_convergence() {
+            return Err(EngineError::Internal(
+                "the convergence pass failed (test seam)".to_string(),
+            ));
+        }
+        let Ok((_, root, state_dir)) = self.origin_spec_for_domain(domain) else {
             // A reviewing domain with no origin has no base snapshot to
             // converge against. Nothing to do and nothing to report.
             return Ok(ConvergenceReport::default());
@@ -6268,30 +7001,55 @@ impl Engine {
         // overlay root, which is where the drafts and their files live. A read
         // of one under the other finds nothing and says so quietly.
         let journal_dir = self.journal_state_dir()?;
-        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
-        // A conflict in a draft nobody holds any more is not a conflict. The
-        // prune runs whatever the pass then decides, so an actor whose rows all
-        // went away leaves no entry behind either.
-        prune_settled_conflicts(&mut record, &held);
+        // Read strictly: its old row conflicts are a frozen list a gate reads for
+        // drafts from before the record, and a lenient read of a broken file
+        // saved back whole would empty it. A record that cannot be read is left
+        // as it is, and this pass reports without saving.
+        let mut record = match crate::overlay_journal::journal_record_strict(&journal_dir, domain) {
+            Ok(record) => Some(record),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    "the convergence record could not be read, so this pass leaves it as it \
+                     is: {e}"
+                );
+                None
+            }
+        };
+        // A file conflict nobody holds any more is not a conflict. Row paths are
+        // no longer written here: what stands at them is read from the rows.
+        if let Some(record) = record.as_mut() {
+            prune_settled_file_conflicts(record, &held);
+        }
+        // Narrowed only now, so the prune above still sees every actor's files.
+        if let Some(only) = only {
+            held.retain(|holding| holding.actor == only);
+        }
+        let state = crystalline_remote::state::OriginState::load(&state_dir)?;
         if held
             .iter()
             .all(|holding| holding.entries.is_empty() && holding.files.is_empty())
+            || state.is_none()
         {
-            record.cleared = 0;
             let report = ConvergenceReport {
                 cleared: 0,
-                diverged: record.diverged(),
+                diverged: 0,
+                merged: 0,
             };
-            self.save_convergence(&journal_dir, domain, &record);
+            if let Some(mut record) = record {
+                if only.is_none() {
+                    record.cleared = 0;
+                }
+                self.save_convergence(&journal_dir, domain, &record);
+            }
             return Ok(report);
         }
+        let state = state.expect("a pass with no snapshot returned above");
         let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
         let addresses = pulled_addresses(&state_dir, &touched)?;
-        let base_paths: HashSet<String> = crystalline_remote::state::OriginState::load(&state_dir)?
-            .map(|state| state.files.into_keys().collect())
-            .unwrap_or_default();
 
         let mut cleared = 0u64;
+        let mut merged = 0u64;
         // The drafts this pass ended, announced when it ends or stops, collapsed.
         let mut pending = PendingAnnouncements::new(self);
         for ActorHolding {
@@ -6303,90 +7061,108 @@ impl Engine {
             // Named here because convergence answers to nobody: it is a
             // comparison of the base snapshot against each actor's entries, so
             // it reads BOTH sides raw and never through a projection of one
-            // over the other. The view is used only as the writer that ends a
-            // converged draft, which is why it screens nothing.
+            // over the other. The view is the writer that ends, moves and merges
+            // a draft, which is why it screens nothing.
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
+            // A merged text of hers a crash left half saved takes the start
+            // that goes with what her row holds, before anything reads it.
+            self.finish_settling(domain, domain_id, actor, entries)
+                .await;
+            // What her proposals hold, settled before anything reads her
+            // records: a merged one moves the start of every row it carried.
+            let ends = self
+                .settle_shared_texts(domain, actor, entries, &state, &root)
+                .await;
             let own: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-            let ended = tombstones_of_settled_case_moves(entries, &state_dir, &base_paths);
+            // First the renames the pull brought in: a plain draft follows its
+            // file to where the team moved it, and is decided there below.
+            let mut followed = false;
             for entry in entries {
-                let base = crystalline_remote::state::read_base_file(&state_dir, &entry.path)?;
-                let settled = if ended.contains(entry.path.as_str()) {
-                    Settle::Clear
-                } else {
-                    settle_overlay_entry(entry, base.as_deref(), &touched, &addresses, &own)
+                let start = match crate::draft_start::load(&journal_dir, domain, actor, &entry.path)
+                {
+                    Ok(start) => start,
+                    // A broken record is never read as none. The decision
+                    // below refuses this actor's rows for the same reason.
+                    Err(_) => continue,
                 };
-                match settled {
-                    Settle::Leave => {}
-                    Settle::Clear => {
-                        view.drop(domain_id, &entry.path).await?;
-                        pending.push_drops_from(domain, &view);
-                        record.settle(actor, &entry.path);
-                        cleared += 1;
-                    }
-                    Settle::Diverge => record.diverge(actor, &entry.path),
-                    Settle::MoveTo(dest) => {
-                        match self
-                            .move_draft_with_the_base(
-                                domain, domain_id, actor, &state_dir, entry, &dest,
-                            )
-                            .await
-                        {
-                            // The draft stands somewhere else now, or it has
-                            // become the folder: either way nothing is left at
-                            // the old path for a conflict to be about.
-                            Ok(landed) => {
-                                record.settle(actor, &entry.path);
-                                if landed {
-                                    cleared += 1;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    domain,
-                                    actor = actor.as_str(),
-                                    path = entry.path.as_str(),
-                                    "the base moved to '{dest}' and this draft could not follow \
-                                     it, so it stands where it was: {e}"
-                                );
-                                record.diverge(actor, &entry.path);
-                            }
-                        }
-                    }
+                let Some(dest) = settle_overlay_entry(
+                    entry,
+                    start.as_ref(),
+                    state.files.contains_key(&entry.path),
+                    &touched,
+                    &addresses,
+                    &own,
+                ) else {
+                    continue;
+                };
+                followed = true;
+                match self
+                    .move_draft_with_the_base(domain, domain_id, actor, &state_dir, entry, &dest)
+                    .await
+                {
+                    // The rename carried her own words: the draft is the folder.
+                    Ok(true) => cleared += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        path = entry.path.as_str(),
+                        "the base moved to '{dest}' and this draft could not follow it, so it \
+                         stands where it was: {e}"
+                    ),
                 }
             }
             pending.push_drops_from(domain, &view);
-            // And their files, in the same pass and into the same record: a
-            // conflict is one actor's conflict at one path, whatever kind of
-            // thing stands there.
-            for file in files {
-                let base = crystalline_remote::state::read_base_file(&state_dir, &file.path)?;
-                let bytes = if file.tombstone {
-                    None
-                } else {
-                    crate::overlay_files::read(&journal_dir, domain, actor, &file.path).map_err(
-                        |source| EngineError::Io {
-                            path: format!("the files overlay of '{domain}' at '{}'", file.path),
-                            source,
-                        },
-                    )?
-                };
-                match settle_overlay_file(file, base.as_deref(), bytes.as_deref(), &touched) {
-                    Settle::Clear => {
-                        crate::overlay_files::clear(&journal_dir, domain, actor, &file.path)
-                            .map_err(|source| EngineError::Io {
-                                path: format!("the files overlay of '{domain}' at '{}'", file.path),
-                                source,
-                            })?;
-                        record.settle(actor, &file.path);
-                        cleared += 1;
+            let rows = if followed {
+                let store = self.store.lock().await;
+                store.overlay_entries(domain_id, actor).await?
+            } else {
+                entries.clone()
+            };
+            if !entries.is_empty() {
+                let reading = self
+                    .read_drafts(domain, domain_id, actor, rows, &root, &state_dir, &state)
+                    .await;
+                match reading {
+                    Ok(mut reading) => {
+                        let settled = self
+                            .settle_drafts(&view, domain, domain_id, actor, &mut reading, &ends)
+                            .await;
+                        // What ended before an error is announced all the same.
+                        pending.push_drops_from(domain, &view);
+                        let settled = settled?;
+                        cleared += settled.cleared;
+                        merged += settled.merged;
                     }
-                    Settle::Diverge => record.diverge(actor, &file.path),
-                    // A file answers to no address, so no rename can carry one:
-                    // `settle_overlay_file` never answers `MoveTo`, and if it
-                    // ever did the honest thing would be to leave the bytes
-                    // where their author put them.
-                    Settle::Leave | Settle::MoveTo(_) => {}
+                    // Nothing of hers is decided on a record that cannot be
+                    // read. Her rows stand, and the gates refuse the same way.
+                    Err(e) => tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        "the drafts of '{actor}' were not converged: {e}"
+                    ),
+                }
+            }
+            pending.push_drops_from(domain, &view);
+            // And their files: one whose bytes the team now holds, or whose
+            // deletion the team made too, has landed and ends. Everything else
+            // stands, in step or a conflict the gates read; a file never merges.
+            for file in files {
+                match self
+                    .settle_overlay_file(&journal_dir, &root, domain, actor, file, &state)
+                    .await
+                {
+                    Ok(true) => cleared += 1,
+                    Ok(false) => {}
+                    // As for a page: nothing of hers is decided on a record
+                    // that cannot be read, and the error is hers, not the
+                    // caller's whose pull or share ran this pass.
+                    Err(e) => tracing::warn!(
+                        domain,
+                        actor = actor.as_str(),
+                        "a draft file of '{actor}' was not converged: {e}"
+                    ),
                 }
             }
             // Once this actor's entries have settled, their references are read
@@ -6401,13 +7177,746 @@ impl Engine {
             }
         }
         drop(pending);
-        record.cleared = cleared;
-        let report = ConvergenceReport {
+        // What stands now, read the way the gates read it.
+        let mut diverged = 0u64;
+        for holding in held
+            .iter()
+            .filter(|holding| !holding.entries.is_empty() || !holding.files.is_empty())
+        {
+            match self.draft_conflicts(domain, &holding.actor).await {
+                Ok(conflicts) => diverged += conflicts.len() as u64,
+                Err(e) => tracing::warn!(
+                    domain,
+                    actor = holding.actor.as_str(),
+                    "the conflicts of '{}' could not be counted: {e}",
+                    holding.actor
+                ),
+            }
+        }
+        if let Some(mut record) = record {
+            if only.is_none() {
+                record.cleared = cleared;
+            }
+            self.save_convergence(&journal_dir, domain, &record);
+        }
+        Ok(ConvergenceReport {
             cleared,
-            diverged: record.diverged(),
+            diverged,
+            merged,
+        })
+    }
+
+    /// Decide each of one actor's rows and act on it: a landed draft ends with
+    /// the tombstone half of its move, and a draft that merges takes the merge.
+    /// Everything else stands as it is: in step, or a conflict the gates read.
+    ///
+    /// A tombstone half is never decided alone: its draft stands for both, and
+    /// an old pair's tombstone the team deleted would otherwise go and leave a
+    /// draft that reads as a new file.
+    ///
+    /// The decision is made on the rows as this pass read them, with no lock;
+    /// every write and every drop that acts on it re-reads its row under that
+    /// row's draft lock and leaves a row that changed in between for the next
+    /// pass, so a writer that came in meanwhile never loses its text.
+    ///
+    /// `ends` names the drafts whose case move a merged proposal of hers landed
+    /// (`Engine::settle_shared_texts`): each ends with its tombstone, by the
+    /// same locked re-read as any landed draft.
+    async fn settle_drafts(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &mut draft_conflicts::Reading<'_>,
+        ends: &HashSet<String>,
+    ) -> Result<Settled> {
+        let mut settled = Settled::default();
+        for i in 0..reading.rows.len() {
+            if reading.is_old_half(i) {
+                continue;
+            }
+            if !reading.rows[i].tombstone && ends.contains(&reading.rows[i].path) {
+                settled.cleared += self
+                    .end_draft(view, domain, domain_id, actor, reading, i)
+                    .await?;
+                continue;
+            }
+            let (decision, team) = reading.decide(i)?;
+            match decision {
+                draft_conflicts::Decision::Landed
+                | draft_conflicts::Decision::Step(DraftStep::Landed) => {
+                    settled.cleared += self
+                        .end_draft(view, domain, domain_id, actor, reading, i)
+                        .await?;
+                }
+                draft_conflicts::Decision::Step(DraftStep::Take { text, edited }) => {
+                    let taken = self
+                        .take_merge(
+                            view, domain, domain_id, actor, reading, i, &team, text, edited,
+                        )
+                        .await?;
+                    if taken == Taken::Left {
+                        continue;
+                    }
+                    if taken == Taken::Wrote {
+                        settled.merged += 1;
+                    }
+                    // A merge equal to the team's text has landed.
+                    let team = reading.team(i)?;
+                    if has_landed(&reading.sides(i, &team)) {
+                        settled.cleared += self
+                            .end_draft(view, domain, domain_id, actor, reading, i)
+                            .await?;
+                    }
+                }
+                draft_conflicts::Decision::NotAsked
+                | draft_conflicts::Decision::AddressTaken { .. }
+                | draft_conflicts::Decision::NoRecord
+                | draft_conflicts::Decision::Step(DraftStep::InStep | DraftStep::Conflict(_)) => {}
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Save each of `actor`'s records that still carries the mark of a merged
+    /// text of hers ([`crate::draft_start::DraftStart::as_settled`]) as it
+    /// reads over the row, under the row's draft lock, so the mark does not
+    /// outlive the crash that left it. Nothing here fails the pass: a record
+    /// that cannot be read or saved keeps its mark, which reads the same.
+    async fn finish_settling(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        entries: &[StoredEngram],
+    ) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
         };
-        self.save_convergence(&journal_dir, domain, &record);
-        Ok(report)
+        for entry in entries.iter().filter(|entry| !entry.tombstone) {
+            let marked = crate::draft_start::load(&journal_dir, domain, actor, &entry.path)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.settling.is_some());
+            if !marked {
+                continue;
+            }
+            let finished = async {
+                let lock = self.draft_lock(domain, actor, &entry.path)?;
+                let _guard = lock.lock().await;
+                let row = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &entry.path).await?
+                };
+                let record = crate::draft_start::load(&journal_dir, domain, actor, &entry.path)
+                    .map_err(|source| EngineError::Io {
+                        path: format!("the draft start record of '{}'", entry.path),
+                        source,
+                    })?;
+                if let (Some(row), Some(record)) = (row, record)
+                    && record.settling.is_some()
+                {
+                    self.save_start(domain, actor, &record.as_settled(&row.content))?;
+                }
+                Ok::<(), EngineError>(())
+            };
+            if let Err(e) = finished.await {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = entry.path.as_str(),
+                    "a merged text's start could not be saved; it reads the same until it is: {e}"
+                );
+            }
+        }
+    }
+
+    /// Settle each of `actor`'s records that names a proposal by what became of
+    /// it ([`settle_shared`]), before her rows are read for the decision, so
+    /// the decision, the move pairs and the renames all read the settled
+    /// records.
+    ///
+    /// - A proposal still in the chain, in any status: left as it is.
+    /// - Merged: a draft starts from what the proposal held, at the key of the
+    ///   snapshot that holds the team's text for it ([`merged_key`]), so a
+    ///   reviewer's change merges as theirs and a later edit of hers merges
+    ///   against what the branch held. A tombstone starts from nothing at its
+    ///   own path, and a draft of hers that started there and that the
+    ///   proposal did not carry starts nowhere: the deletion that merged was
+    ///   hers, as after a direct commit of only that half.
+    /// - Anything else: the record forgets the proposal and keeps its start.
+    ///
+    /// **Her case move on a disk that folds case** lands at the spelling the
+    /// team has, so the snapshot holds no key at her path, and the start moved
+    /// to the shared text would leave the move in step for good. When her row
+    /// is still what the proposal held, the merge carried all of it: the record
+    /// is left as it is and the draft is answered, to end with its tombstone
+    /// under the same locked re-read as any landed draft. Should that end not
+    /// happen, the next pass settles it again. A row she edited since merges
+    /// from the key the team holds.
+    ///
+    /// Each record is saved under its draft lock, and only when it is still the
+    /// one read. Nothing here fails the pass: a record that cannot be read or
+    /// saved stays, and the next pass settles it.
+    async fn settle_shared_texts(
+        &self,
+        domain: &str,
+        actor: &str,
+        entries: &[StoredEngram],
+        state: &crystalline_remote::state::OriginState,
+        root: &Path,
+    ) -> HashSet<String> {
+        let mut ends = HashSet::new();
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return ends;
+        };
+        let load = |path: &str| {
+            crate::draft_start::load(&journal_dir, domain, actor, path)
+                .ok()
+                .flatten()
+        };
+        // A broken record is never read as none: the decision refuses it.
+        let mut held: Vec<(&StoredEngram, crate::draft_start::DraftStart)> = entries
+            .iter()
+            .filter_map(|entry| Some((entry, load(&entry.path)?)))
+            .filter(|(_, record)| record.shared.is_some())
+            .collect();
+        // Drafts first, and which proposal carried each, read before any is
+        // settled: a tombstone's rule leaves the drafts of its own proposal be.
+        held.sort_by_key(|(entry, _)| entry.tombstone);
+        let carried: HashSet<(String, u64)> = held
+            .iter()
+            .filter(|(entry, _)| !entry.tombstone)
+            .filter_map(|(entry, record)| {
+                Some((entry.path.clone(), record.shared.as_ref()?.proposal))
+            })
+            .collect();
+        for (entry, record) in &held {
+            let Some(shared) = record.shared.clone() else {
+                continue;
+            };
+            let fate = settle_shared(record, entry.tombstone, state);
+            let settled = match fate {
+                SharedFate::Open => continue,
+                SharedFate::Ended => crate::draft_start::DraftStart {
+                    shared: None,
+                    ..record.clone()
+                },
+                SharedFate::Merged if entry.tombstone => crate::draft_start::DraftStart {
+                    from: Some(entry.path.clone()),
+                    start: shared.text.clone(),
+                    start_sha256: None,
+                    shared: None,
+                    ..record.clone()
+                },
+                SharedFate::Merged => {
+                    // A folder that cannot say does not fold here, so a case
+                    // move is never read as landed on a guess.
+                    let folds_case = page_folds_case(root, &entry.path);
+                    let key = merged_key(
+                        &entry.path,
+                        record.from.as_deref(),
+                        &state.files,
+                        folds_case,
+                    );
+                    let hers = shared.text.as_deref().is_some_and(|text| {
+                        crystalline_core::frontmatter::same_but_generated(
+                            text,
+                            &crystalline_core::to_lf(&entry.content),
+                        )
+                    });
+                    if folds_case && key != entry.path && hers {
+                        ends.insert(entry.path.clone());
+                        continue;
+                    }
+                    crate::draft_start::DraftStart {
+                        from: Some(key.to_string()),
+                        start: shared.text.clone(),
+                        start_sha256: None,
+                        shared: None,
+                        ..record.clone()
+                    }
+                }
+            };
+            let saved = self
+                .save_start_as_read(domain, actor, record, &settled)
+                .await;
+            if !(saved && entry.tombstone && fate == SharedFate::Merged) {
+                continue;
+            }
+            // Her deletion merged: a draft that started there and that the
+            // proposal did not carry starts nowhere now.
+            for draft in entries.iter().filter(|draft| !draft.tombstone) {
+                // A guard for a race: drafts are settled first, so a draft its
+                // own proposal carried no longer starts here unless its save was
+                // skipped this pass, and then the next pass settles it again.
+                if carried.contains(&(draft.path.clone(), shared.proposal)) {
+                    continue;
+                }
+                let Some(start) = load(&draft.path) else {
+                    continue;
+                };
+                if start.from.as_deref() != Some(entry.path.as_str()) {
+                    continue;
+                }
+                let freed = crate::draft_start::DraftStart {
+                    from: None,
+                    start: None,
+                    start_sha256: None,
+                    ..start.clone()
+                };
+                self.save_start_as_read(domain, actor, &start, &freed).await;
+            }
+        }
+        ends
+    }
+
+    /// Save `settled` over `actor`'s record `read`, under that row's draft lock
+    /// and only when the record is still `read`. Answers whether it was saved; a
+    /// record somebody changed since is left for the next pass, and a failure
+    /// is warned about.
+    async fn save_start_as_read(
+        &self,
+        domain: &str,
+        actor: &str,
+        read: &crate::draft_start::DraftStart,
+        settled: &crate::draft_start::DraftStart,
+    ) -> bool {
+        let saved = async {
+            let lock = self.draft_lock(domain, actor, &read.path)?;
+            let _guard = lock.lock().await;
+            let journal_dir = self.journal_state_dir()?;
+            let now = crate::draft_start::load(&journal_dir, domain, actor, &read.path).map_err(
+                |source| EngineError::Io {
+                    path: format!("the draft start record of '{}'", read.path),
+                    source,
+                },
+            )?;
+            if now.as_ref() != Some(read) {
+                return Ok(false);
+            }
+            self.save_start(domain, actor, settled)?;
+            Ok::<bool, EngineError>(true)
+        };
+        match saved.await {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = read.path.as_str(),
+                    "what a proposal held of this draft could not be settled; the next pass \
+                     tries again: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// End row `i` of a reading, and the tombstone half of its move first, so
+    /// a crash between the two never leaves a tombstone standing alone over a
+    /// move that landed. Answers how many rows went. Each goes only if it is
+    /// still what the pass read ([`Engine::drop_as_read`]).
+    ///
+    /// A half by record ends with its draft: the decision that landed the draft
+    /// asked where it started. An old pair was paired by a guess and its draft
+    /// landed with no word about where it started, so while the team still
+    /// holds the tombstone's path the pair stands together, as the one conflict
+    /// the conflict list names at the draft.
+    async fn end_draft(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &mut draft_conflicts::Reading<'_>,
+        i: usize,
+    ) -> Result<u64> {
+        let half = if reading.rows[i].tombstone {
+            None
+        } else {
+            reading.half_of(i)
+        };
+        if let Some(t) = half
+            && reading.is_old_half(t)
+            && !matches!(reading.team(t)?.at_path, draft_conflicts::Held::Absent)
+        {
+            return Ok(0);
+        }
+        let half_dropped = match half {
+            Some(t) => self
+                .drop_as_read(view, domain, domain_id, actor, reading, t)
+                .await?
+                .then_some(t),
+            None => None,
+        };
+        if self
+            .drop_as_read(view, domain, domain_id, actor, reading, i)
+            .await?
+        {
+            return Ok(1 + u64::from(half_dropped.is_some()));
+        }
+        // The draft changed after its half went, so the move stands: the half
+        // comes back as it was read. Left gone, her old path would read as a
+        // team file holding her address on a disk that folds case.
+        if let Some(t) = half_dropped {
+            self.put_half_back(domain, domain_id, actor, reading, t)
+                .await;
+        }
+        Ok(0)
+    }
+
+    /// Write tombstone `t` of a reading back, row, mirror and record, under its
+    /// draft lock, when nothing of hers stands at its path. A failure is warned
+    /// about and leaves the draft standing alone, which the next pass decides
+    /// again with nothing lost.
+    async fn put_half_back(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        t: usize,
+    ) {
+        let row = &reading.rows[t];
+        let put = async {
+            let lock = self.draft_lock(domain, actor, &row.path)?;
+            let _guard = lock.lock().await;
+            let held = {
+                let store = self.store.lock().await;
+                store.overlay_entry(domain_id, actor, &row.path).await?
+            };
+            if held.is_some() {
+                return Ok(());
+            }
+            let engram = parse_engram(&row.content)
+                .map_err(|e| EngineError::Invalid(format!("the deleted text: {e}")))?;
+            let mut record =
+                EngramRecord::from_engram(&engram, &row.path, virtual_stamp(&row.content));
+            record.permalink = row.path.clone();
+            record.content = row.content.clone();
+            record.tags = Vec::new();
+            record.observations = Vec::new();
+            record.relations = Vec::new();
+            record.links = Vec::new();
+            record.tombstone = true;
+            if let Some(start) = &reading.records[t] {
+                self.save_start(domain, actor, start)?;
+            }
+            self.commit_overlay_row(domain_id, actor, &record).await?;
+            let state_dir = self.journal_state_dir()?;
+            let mirrored = if self
+                .deletion_shares_a_mirror(domain_id, actor, &row.path)
+                .await?
+            {
+                crate::overlay_journal::journal_tombstone_beside_a_draft(
+                    &state_dir, domain, actor, &row.path,
+                )
+            } else {
+                crate::overlay_journal::journal_tombstone(&state_dir, domain, actor, &row.path)
+            };
+            if let Err(e) = mirrored {
+                let text = unmirrored(domain, actor, &row.path, &e, true);
+                tracing::warn!(domain, actor, path = row.path.as_str(), "{text}");
+            }
+            self.announce(Change::Engram(EngramChanged {
+                domain: domain.to_string(),
+                permalink: row.path.clone(),
+                path: row.path.clone(),
+                kind: ChangeKind::Deleted,
+                from: None,
+                checksum: None,
+                actor: Some(actor.to_string()),
+                draft_of: Some(actor.to_string()),
+                audience: None,
+            }));
+            Ok::<(), EngineError>(())
+        };
+        if let Err(e) = put.await {
+            tracing::warn!(
+                domain,
+                actor,
+                path = row.path.as_str(),
+                "the deletion half of a move that did not end could not be put back; the \
+                 draft stands alone until the next pass: {e}"
+            );
+        }
+    }
+
+    /// Drop row `i` of a reading under its draft lock, and only when the row and
+    /// its record are still what the pass decided on. A row somebody wrote in
+    /// the meantime is left, and the next pass decides it again. Answers
+    /// whether it went.
+    async fn drop_as_read(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &draft_conflicts::Reading<'_>,
+        i: usize,
+    ) -> Result<bool> {
+        self.take_convergence_drop_hold().await;
+        let row = &reading.rows[i];
+        let lock = self.draft_lock(domain, actor, &row.path)?;
+        let _guard = lock.lock().await;
+        if !self
+            .still_as_read(view, domain_id, actor, row, reading.records[i].as_ref())
+            .await?
+        {
+            tracing::warn!(
+                domain,
+                actor,
+                path = row.path.as_str(),
+                "a draft that had landed changed while the pass ran, so it stands; the next \
+                 pass looks again"
+            );
+            return Ok(false);
+        }
+        view.drop(domain_id, &row.path).await?;
+        Ok(true)
+    }
+
+    /// Whether `actor`'s row at `row.path` and its record still say what this
+    /// pass read. Asked under the row's draft lock. A record that cannot be
+    /// read is not the record the pass read.
+    async fn still_as_read(
+        &self,
+        view: &DomainView<'_>,
+        domain_id: DomainId,
+        actor: &str,
+        row: &StoredEngram,
+        record: Option<&crate::draft_start::DraftStart>,
+    ) -> Result<bool> {
+        let now = {
+            let store = self.store.lock().await;
+            store.overlay_entry(domain_id, actor, &row.path).await?
+        };
+        let same_row = now
+            .as_ref()
+            .is_some_and(|now| now.tombstone == row.tombstone && now.content == row.content);
+        // Read as the reading read it: a merged text of hers that a crash left
+        // half saved reads with the start that goes with the row.
+        let same_record = view
+            .start_of(&row.path)
+            .ok()
+            .map(|start| start.map(|start| start.as_settled(&row.content)))
+            == Some(record.cloned());
+        Ok(same_row && same_record)
+    }
+
+    /// Write a merge into row `i`, then move its start to the team's text, and
+    /// the start of the tombstone half of its move with it. Every refusal leaves
+    /// the row as it was, so it stands as a conflict until a later pass merges
+    /// it:
+    ///
+    /// - a merge that would change the row's address while a room is open over
+    ///   it, since a room is keyed by its address. Asked before the draft lock,
+    ///   never under it: a room's save holds its state while it waits for that
+    ///   lock. A room that opens between the question and the write meets the
+    ///   change at its next save, as an external change, and keeps its text;
+    /// - a row or record that changed since the decision;
+    /// - a write the view refuses: text that is no page, an address held.
+    ///
+    /// **Three writes, in this order.** The record is marked `merging`, the row
+    /// is written, and the start moves with the mark cleared. A crash after the
+    /// first leaves the old row under a mark, which decides as before. A crash
+    /// after the second leaves the merged row over the old start, and the mark
+    /// is what keeps the next pass from reading that as her case move landed:
+    /// it merges again, to the same text, and tells her if the first merge
+    /// changed her words. The start never moves first, which would read the old
+    /// row as in step and share it over the team's change.
+    ///
+    /// A merge whose text is what the row already holds writes no row: only the
+    /// start moves on.
+    #[allow(clippy::too_many_arguments)]
+    async fn take_merge(
+        &self,
+        view: &DomainView<'_>,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        reading: &mut draft_conflicts::Reading<'_>,
+        i: usize,
+        team: &draft_conflicts::RowTeam,
+        text: String,
+        edited: bool,
+    ) -> Result<Taken> {
+        let row = reading.rows[i].clone();
+        let Some(record) = reading.records[i].clone() else {
+            return Ok(Taken::Left);
+        };
+        let leave = |why: &str| -> Result<Taken> {
+            tracing::warn!(
+                domain,
+                actor,
+                path = row.path.as_str(),
+                "a merge of the team's change into this draft was left: {why}"
+            );
+            Ok(Taken::Left)
+        };
+        let merged_address = match Engine::overlay_record(&row.path, &text) {
+            Ok(merged) => merged.permalink,
+            Err(e) => return leave(&e.to_string()),
+        };
+        if merged_address != row.permalink
+            && let Some(rooms) = self.collab_rooms()
+            && rooms
+                .has_live_room(domain, &row.permalink, Some(actor))
+                .await
+        {
+            return leave("it would change the address of a draft open in an editor");
+        }
+        // Where the decision read the team's text, which is where she now
+        // starts from: her own path when the team holds her share there, else
+        // where she started.
+        let at_path = answers_at_path(&reading.sides(i, team));
+        let (from, held) = if at_path {
+            (row.path.clone(), &team.at_path)
+        } else {
+            (
+                record.from.clone().unwrap_or_else(|| row.path.clone()),
+                &team.at_from,
+            )
+        };
+        let Some(start) = held.text() else {
+            return leave("the team's text there is not text");
+        };
+        let start = crystalline_core::to_lf(&start).into_owned();
+        // A merge an earlier pass wrote and could not finish counts as this one.
+        let edited = edited || record.merging == Some(true);
+        let unchanged = text == row.content;
+        let moved = {
+            let lock = self.draft_lock(domain, actor, &row.path)?;
+            let _guard = lock.lock().await;
+            if !self
+                .still_as_read(view, domain_id, actor, &row, Some(&record))
+                .await?
+            {
+                return leave("it changed since this pass read it; the next pass looks again");
+            }
+            if !unchanged {
+                let marked = crate::draft_start::DraftStart {
+                    merging: Some(edited),
+                    ..record.clone()
+                };
+                if let Err(e) = self.save_start(domain, actor, &marked) {
+                    return leave(&e.to_string());
+                }
+                match view.write(domain_id, &row.path, &text).await {
+                    Ok(None) => {}
+                    Ok(Some(warning)) => {
+                        tracing::warn!(domain, actor, path = row.path.as_str(), "{warning}")
+                    }
+                    Err(e) => {
+                        if let Err(undo) = self.save_start(domain, actor, &record) {
+                            tracing::warn!(
+                                domain,
+                                actor,
+                                path = row.path.as_str(),
+                                "the merge mark could not be taken off a draft whose merge was \
+                                 not written; the next pass merges it again: {undo}"
+                            );
+                            reading.records[i] = Some(marked);
+                        }
+                        return leave(&e.to_string());
+                    }
+                }
+                reading.rows[i].content = text;
+                reading.records[i] = Some(marked);
+            }
+            let moved = crate::draft_start::DraftStart {
+                from: Some(from),
+                start: Some(start.clone()),
+                start_sha256: None,
+                merged_at: if edited {
+                    Some(chrono::Utc::now())
+                } else {
+                    record.merged_at
+                },
+                merging: None,
+                ..record
+            };
+            let saved = if self.take_failed_merge_start() {
+                Err(EngineError::Internal(
+                    "the armed failure of a test".to_string(),
+                ))
+            } else {
+                self.save_start(domain, actor, &moved)
+            };
+            match saved {
+                Ok(()) => {
+                    reading.records[i] = Some(moved);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        actor,
+                        path = row.path.as_str(),
+                        "a draft took the team's change and its start could not move with it; \
+                         the next pass merges it again: {e}"
+                    );
+                    false
+                }
+            }
+        };
+        if !moved {
+            return Ok(if unchanged { Taken::Left } else { Taken::Wrote });
+        }
+        // The tombstone half of the same move starts from the same text, under
+        // its own lock, taken after the draft's is let go.
+        if !at_path && let Some(t) = reading.half_of(i) {
+            let path = reading.rows[t].path.clone();
+            let lock = self.draft_lock(domain, actor, &path)?;
+            let _guard = lock.lock().await;
+            match view.start_of(&path) {
+                Ok(Some(half)) if Some(half.clone()) == reading.records[t] => {
+                    let moved = crate::draft_start::DraftStart {
+                        start: Some(start),
+                        start_sha256: None,
+                        ..half
+                    };
+                    match self.save_start(domain, actor, &moved) {
+                        Ok(()) => reading.records[t] = Some(moved),
+                        Err(e) => tracing::warn!(
+                            domain,
+                            actor,
+                            path = path.as_str(),
+                            "the deletion half of a merged move kept its old start: {e}"
+                        ),
+                    }
+                }
+                _ => tracing::warn!(
+                    domain,
+                    actor,
+                    path = path.as_str(),
+                    "the deletion half of a merged move changed since this pass read it"
+                ),
+            }
+        }
+        Ok(if unchanged {
+            Taken::StartOnly
+        } else {
+            Taken::Wrote
+        })
+    }
+
+    /// Save one of `actor`'s draft start records.
+    fn save_start(
+        &self,
+        domain: &str,
+        actor: &str,
+        start: &crate::draft_start::DraftStart,
+    ) -> Result<()> {
+        let journal_dir = self.journal_state_dir()?;
+        crate::draft_start::save(&journal_dir, domain, actor, start).map_err(|source| {
+            EngineError::Io {
+                path: format!("the draft start record of '{}'", start.path),
+                source,
+            }
+        })
     }
 
     /// Write one domain's convergence record, and never fail a pull over it.
@@ -6479,6 +7988,7 @@ impl Engine {
         let landed = crystalline_remote::state::read_base_file(state_dir, dest)?
             .is_some_and(|base| base == entry.content.as_bytes());
         let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
+        let source_start = view.start_of(&entry.path)?;
         // The removal defers the ending of this draft's share-links and joins,
         // because a move that could not write its destination puts the source
         // back and did not happen - and a move that did not happen must not
@@ -6493,7 +8003,17 @@ impl Engine {
             self.end_draft_grants(domain, actor, &entry.path).await;
             return Ok(true);
         }
-        match view.write(domain_id, dest, &entry.content).await {
+        let followed = source_start.clone().map(|start| {
+            let from = match start.from {
+                Some(from) if from == entry.path => Some(dest.to_string()),
+                from => from,
+            };
+            crate::draft_start::DraftStart { from, ..start }
+        });
+        match view
+            .write_moved(domain_id, dest, &entry.content, followed)
+            .await
+        {
             Ok(None) => {}
             // The row landed and its mirror did not. Logged rather than
             // swallowed: the index serves the row either way, and it is the
@@ -6501,7 +8021,12 @@ impl Engine {
             Ok(Some(warning)) => tracing::warn!(domain, actor, path = dest, "{warning}"),
             Err(e) => {
                 if let Err(undo) = view
-                    .write_unchecked(domain_id, &entry.path, &entry.content)
+                    .write_unchecked(
+                        domain_id,
+                        &entry.path,
+                        &entry.content,
+                        source_start.as_ref(),
+                    )
                     .await
                 {
                     tracing::error!(
@@ -6525,48 +8050,165 @@ impl Engine {
     /// What the last convergence has to say to one caller, or `None` when
     /// nothing has ever converged this domain.
     ///
-    /// Read off the record beside the journal rather than out of memory, which
-    /// is what makes a conflict survive a restart: the pass that found it may
-    /// have run in a process that is long gone.
+    /// `cleared` is read off the record beside the journal, a fact about the
+    /// last pass. The conflicts are not stored: they are read from what stands,
+    /// through [`Engine::draft_conflicts`], the rule the gates read, with the
+    /// file conflicts the record still keeps beside them. So a conflict survives
+    /// a restart, and one a pass failed to look at is still counted.
     ///
     /// The counts are the domain's; the paths are the caller's own and nobody
     /// else's. Whoever holds the domain additionally sees how many each actor
-    /// is holding open - the same split, and the same shape, Task 8's `drafts`
-    /// key already reports counts in, and for the same reason: a count of
+    /// is holding open - the same split, and the same shape, the `drafts` key
+    /// already reports counts in, and for the same reason: a count of
     /// somebody's unsettled work is a coordination fact, and what the draft
     /// says is theirs alone.
-    fn converged_json(&self, domain: &str, actor: Option<&str>, everyone: bool) -> Option<Value> {
+    ///
+    /// A conflict list that cannot be read answers `None` with a warning
+    /// rather than a count that would read as clean.
+    async fn converged_json(
+        &self,
+        domain: &str,
+        actor: Option<&str>,
+        everyone: bool,
+    ) -> Option<Value> {
         let journal_dir = self.journal_state_dir().ok()?;
         let record = crate::overlay_journal::journal_record(&journal_dir, domain);
-        // Absent until a convergence pass has actually run here. The record can
-        // exist for another reason - it also remembers whose open proposal is
-        // whose - and a key that appeared the moment somebody shared would say
-        // "a pull converged nothing" where nothing had looked yet, which is the
-        // distinction this key's absence is FOR. It cannot always keep that
-        // promise, though: a pass that ran and genuinely cleared nothing,
-        // raising no conflict, leaves `cleared == 0` with `conflicts` empty
-        // exactly like a domain nobody has ever pulled - this check answers
-        // `None` for either, and the two conflate here.
-        if record.cleared == 0 && record.conflicts.is_empty() {
+        // Everyone holding rows or files: an actor with only files is in no
+        // `overlay_counts` answer.
+        let mut drafting: BTreeSet<String> = {
+            let store = self.store.lock().await;
+            let domain_id = store.domain_id(domain).await.ok().flatten()?;
+            store
+                .overlay_counts(domain_id)
+                .await
+                .ok()?
+                .into_iter()
+                .map(|(actor, _)| actor)
+                .collect()
+        };
+        let files = self.overlay_domain_files(domain);
+        if files.unreadable {
+            tracing::warn!(
+                domain,
+                "the draft files could not be listed, so the status says nothing about the \
+                 conflicts of pages or files"
+            );
+            return None;
+        }
+        drafting.extend(files.per_actor.into_keys());
+        let mut per_actor: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for who in drafting {
+            match self.draft_conflicts(domain, &who).await {
+                Ok(conflicts) => per_actor
+                    .entry(who)
+                    .or_default()
+                    .extend(conflicts.into_iter().map(|conflict| conflict.path)),
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        actor = who.as_str(),
+                        "the conflicts of '{who}' could not be read, so the status says nothing \
+                         about them: {e}"
+                    );
+                    return None;
+                }
+            }
+        }
+        per_actor.retain(|_, paths| !paths.is_empty());
+        for paths in per_actor.values_mut() {
+            paths.sort();
+            paths.dedup();
+        }
+        let diverged: u64 = per_actor.values().map(|paths| paths.len() as u64).sum();
+        // Absent until a convergence pass has actually run here and found
+        // something to say: a pass that cleared nothing, with nothing standing,
+        // reads as a domain nobody has pulled.
+        if record.cleared == 0 && diverged == 0 {
             return None;
         }
         let mine: &[String] = actor
-            .and_then(|who| record.conflicts.get(who))
+            .and_then(|who| per_actor.get(who))
             .map_or(&[], Vec::as_slice);
         let mut value = json!({
             "cleared": record.cleared,
-            "diverged": record.diverged(),
+            "diverged": diverged,
             "mine": mine,
         });
         if everyone && let Some(object) = value.as_object_mut() {
-            let counts: Vec<(String, u64)> = record
-                .conflicts
+            let counts: Vec<(String, u64)> = per_actor
                 .iter()
                 .map(|(actor, paths)| (actor.clone(), paths.len() as u64))
                 .collect();
             object.insert("actors".to_string(), json!(review::counts_json(&counts)));
         }
         Some(value)
+    }
+
+    /// End one of `actor`'s draft files when it has landed: the team holds her
+    /// bytes, or holds nothing where she deleted. Answers whether it ended.
+    ///
+    /// Decided on what the pass read, then asked again under the file's write
+    /// lock, so an upload in between is never cleared for the bytes it replaced.
+    async fn settle_overlay_file(
+        &self,
+        journal_dir: &Path,
+        root: &Path,
+        domain: &str,
+        actor: &str,
+        file: &crate::overlay_files::FileEntry,
+        state: &crystalline_remote::state::OriginState,
+    ) -> Result<bool> {
+        let io = |source| EngineError::Io {
+            path: format!("the files overlay of '{domain}' at '{}'", file.path),
+            source,
+        };
+        let read = |file: &crate::overlay_files::FileEntry| {
+            let folds = self.file_may_fold_case(domain, root, &file.path);
+            draft_conflicts::FileDraft::read(journal_dir, domain, actor, file, state, folds)
+        };
+        // The frozen list decides nothing about a file that has landed.
+        let landed = |file: &crate::overlay_files::FileEntry| -> Result<bool> {
+            let step = draft_conflicts::file_step(&read(file)?, || Ok(false))?;
+            Ok(step == draft_conflicts::FileStep::Landed)
+        };
+        if !landed(file)? {
+            // Her merged proposal moved her start: saved under the lock from a
+            // fresh read, so a later pass reads it once the proposal is gone
+            // from the history.
+            if read(file)?.settled_shared {
+                let abs = crate::overlay_files::file(journal_dir, domain, actor, &file.path)
+                    .map_err(io)?;
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                let draft = read(file)?;
+                if draft.settled_shared
+                    && let Some(record) = draft.record
+                {
+                    crate::draft_start::save_file(journal_dir, domain, actor, &record)
+                        .map_err(io)?;
+                }
+            }
+            return Ok(false);
+        }
+        self.run_file_settle_hook();
+        let abs = crate::overlay_files::file(journal_dir, domain, actor, &file.path).map_err(io)?;
+        let lock = self.write_lock(&abs);
+        let _guard = lock.lock().await;
+        let now =
+            match crate::overlay_files::held(journal_dir, domain, actor, &file.path).map_err(io)? {
+                crate::overlay_files::Held::Nothing => return Ok(false),
+                crate::overlay_files::Held::Bytes => false,
+                crate::overlay_files::Held::Tombstone => true,
+            };
+        let again = crate::overlay_files::FileEntry {
+            tombstone: now,
+            ..file.clone()
+        };
+        if !landed(&again)? {
+            return Ok(false);
+        }
+        crate::overlay_files::clear(journal_dir, domain, actor, &file.path).map_err(io)?;
+        Ok(true)
     }
 
     /// Take one path out of one actor's recorded conflicts, and answer how
@@ -6581,63 +8223,33 @@ impl Engine {
         let Ok(journal_dir) = self.journal_state_dir() else {
             return 0;
         };
-        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return 0;
+        };
         let left = record.settle(actor, path);
         self.save_convergence(&journal_dir, domain, &record);
         left
     }
 
-    /// Settle one actor's recorded conflict at one FILE path, under the
-    /// domain's origin lock, and only when there is one to settle.
-    ///
-    /// **The lock is the point.** [`Engine::save_convergence`] writes the whole
-    /// record at once - the conflicts and the proposal owners beside them - so
-    /// two writers that both loaded before either saved lose one of the two
-    /// edits, and its doc states that every caller holds the domain's origin
-    /// lock. [`Engine::origin_resolve`] earns its place on that list by taking
-    /// one; an upload is not an origin verb and holds nothing of its own, so it
-    /// takes the lock here. Without it a draft upload racing a poller tick's
-    /// pull would drop another actor's conflicts, or the record of whose open
-    /// proposal is whose.
-    ///
-    /// **The read in front of it is not an optimization alone.** Every draft
-    /// upload would otherwise do a full read-modify-write of the record and
-    /// queue behind the domain's origin lock to do it, for a path that is not in
-    /// conflict at all - which is every upload but the rare one. A record this
-    /// read finds nothing in is a record this call has nothing to say about, and
-    /// a conflict that appears between the read and the lock is recorded by a
-    /// pull that has not finished yet, so the next write of the same path
-    /// settles it.
-    ///
-    /// **A lock that cannot be taken skips the settle rather than failing the
-    /// write.** A reviewing domain always has an origin (the mode requires one),
-    /// so this is the domain being unregistered underneath; losing somebody's
-    /// upload over a bookkeeping write would be the wrong way round.
-    async fn settle_file_convergence(&self, domain: &str, actor: &str, path: &str) {
-        let Ok(journal_dir) = self.journal_state_dir() else {
-            return;
-        };
-        let record = crate::overlay_journal::journal_record(&journal_dir, domain);
-        if !record
-            .conflicts
-            .get(actor)
-            .is_some_and(|paths| paths.iter().any(|held| held == path))
-        {
-            return;
+    /// The convergence record, read strictly for a writer that saves it whole.
+    /// A record that cannot be read answers `None` with a warning and is left
+    /// as it is: saved back from a lenient read it would be empty, and its
+    /// frozen list is what keeps an old draft's deletion in view.
+    fn convergence_to_change(
+        &self,
+        journal_dir: &Path,
+        domain: &str,
+    ) -> Option<crate::overlay_journal::ConvergenceRecord> {
+        match crate::overlay_journal::journal_record_strict(journal_dir, domain) {
+            Ok(record) => Some(record),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    "the convergence record could not be read, so it is left as it is: {e}"
+                );
+                None
+            }
         }
-        let Ok(lock) = self.origin_lock_registered(domain) else {
-            tracing::warn!(
-                domain,
-                actor,
-                path,
-                "a draft file was written at a path recorded as a conflict, and the domain's \
-                 origin lock could not be taken to settle it; the record is behind until the \
-                 next write of this path"
-            );
-            return;
-        };
-        let _guard = lock.lock().await;
-        self.settle_convergence(domain, actor, path);
     }
 
     /// Record which overlay actor a proposal belongs to, or forget one that has
@@ -6649,7 +8261,7 @@ impl Engine {
     /// one actor to withdraw a proposal that is not theirs.
     ///
     /// **Last writer wins, not first**, which matters only once more than one
-    /// actor can touch one open proposal: while `REVIEW_NO_STACKING` refuses a
+    /// actor can touch one open proposal: while a reviewing domain refuses a
     /// second actor's share against an open proposal, this is never called
     /// twice for the same number by two different actors, so the map's one
     /// entry is always the opener's. If a later design serves stacked
@@ -6664,7 +8276,9 @@ impl Engine {
         let Ok(journal_dir) = self.journal_state_dir() else {
             return;
         };
-        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return;
+        };
         match actor {
             Some(actor) => {
                 record
@@ -7613,11 +9227,39 @@ pub use contradictions::run_contradiction_worker;
 mod delete;
 mod disclosure;
 mod doc_file;
+mod draft_conflicts;
+pub use crate::draft_merge::DraftConflictKind;
+use crate::draft_merge::{
+    DraftStep, SharedFate, answers_at_path, has_landed, merged_key, settle_shared,
+};
 #[allow(unused_imports)] // the Reflection verbs (Task 12) use the rest
 use doc_file::{
     FileLock, Swap, SwapRefused, check_swap, is_case_only_rename, read_opt, read_stamped,
     remove_if_there,
 };
+pub use draft_conflicts::{
+    DraftConflict, TEAM_CHANGED_SINCE, TEAM_SIDE_ABSENT, TEAM_SIDE_UNREADABLE,
+};
+pub use origins::{CONFLICTS_UNREADABLE, not_among_drafts};
+
+/// The moments in a fold a test can step into with `Engine::at_next_fold_step`.
+/// The type is in every build, since the fold names its steps wherever it
+/// runs; only a test build has the hook that acts on them, and elsewhere
+/// each step is a call that does nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldStep {
+    /// Just before the review key comes off.
+    KeyOff,
+    /// After the rooms closed with the key off, before the second checks.
+    RoomsClosed,
+    /// After the second checks, before the first fold is written.
+    Checked,
+}
+
+/// What a test runs at a [`FoldStep`].
+#[cfg(any(test, feature = "testing"))]
+pub type FoldHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 mod domain_add;
 mod domain_settings;
 mod domains;
@@ -7664,7 +9306,7 @@ pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
 mod review_mode;
-pub(crate) use review_mode::folder_may_fold_case;
+pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
 mod schemas;
 mod search;
 mod sources;
@@ -10394,15 +12036,18 @@ pub(crate) fn overwrite_from_draft(
 /// What one pull's convergence pass did to the drafts standing over a domain
 /// that reviews changes before they land.
 ///
-/// How many drafts ended because the folder now says what they said, and how
-/// many stand unsettled against a base that moved under them.
+/// How many drafts ended because the folder now says what they said, how many
+/// took the team's change, and how many stand as their author's conflict.
 /// `Engine::converge_pulled_overlays` is where each of the two is decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConvergenceReport {
     /// Entries taken out of the overlay, row and mirror together.
     pub cleared: u64,
-    /// Entries left standing as their author's conflict.
+    /// Entries standing as their author's conflict after the pass, read as the
+    /// gates read them.
     pub diverged: u64,
+    /// Drafts this pass rewrote with the team's change.
+    pub merged: u64,
 }
 
 /// The proposal number a share receipt names, whichever outcome it carried: a
@@ -10414,29 +12059,85 @@ fn proposal_number_of(receipt: &Value) -> Option<u64> {
         .or_else(|| receipt["proposal"]["number"].as_u64())
 }
 
-/// Drop every recorded conflict whose entry is no longer there: an actor who
-/// stopped holding a row at a path has no conflict at it, and an actor holding
-/// nothing at all has none anywhere.
+/// Drop every recorded FILE conflict whose file is no longer held. A row's
+/// conflict is read from the rows and no longer recorded here; the row paths
+/// the record still lists are drafts from before that, a frozen list the
+/// conflict table reads for an old draft, so they are left exactly as they are.
+/// A file path never ends in `.md`, so the two cannot be mistaken for each
+/// other.
 ///
-/// `held` is every actor with rows in this domain, and their rows.
-fn prune_settled_conflicts(
+/// `held` is every actor with rows or files in this domain.
+fn prune_settled_file_conflicts(
     record: &mut crate::overlay_journal::ConvergenceRecord,
     held: &[ActorHolding],
 ) {
     record.conflicts.retain(|actor, paths| {
-        let Some(holding) = held.iter().find(|holding| &holding.actor == actor) else {
-            return false;
-        };
-        // Both lists, or a file conflict this pass recorded would be pruned by
-        // the next pull about something else: the entry IS still held, it is
-        // simply not a row. That is the window one tick wide this function's
-        // doc warns about, on the other kind of entry.
+        let holding = held.iter().find(|holding| &holding.actor == actor);
         paths.retain(|at| {
-            holding.entries.iter().any(|entry| &entry.path == at)
-                || holding.files.iter().any(|file| &file.path == at)
+            at.ends_with(".md")
+                || holding.is_some_and(|holding| holding.files.iter().any(|file| &file.path == at))
         });
         !paths.is_empty()
     });
+}
+
+/// The paths of `actor`'s drafts from before the record, rows and files, whose
+/// team file the pull that applied `touched` deleted: each is a path the pull
+/// wrote and the snapshot no longer holds. A tombstone is not one: the team
+/// deleting what she deleted takes nothing from anybody. A record that cannot
+/// be read is skipped here; the gate refuses that draft on its own.
+fn deleted_under_old_drafts(
+    journal_dir: &Path,
+    domain: &str,
+    actor: &str,
+    rows: &[StoredEngram],
+    files: &[crate::overlay_files::FileEntry],
+    touched: &HashSet<&str>,
+    state: &crystalline_remote::state::OriginState,
+) -> Vec<String> {
+    let deleted = |path: &str| touched.contains(path) && !state.files.contains_key(path);
+    let mut paths = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| !row.tombstone && deleted(&row.path))
+    {
+        if matches!(
+            crate::draft_start::load(journal_dir, domain, actor, &row.path),
+            Ok(None)
+        ) {
+            paths.push(row.path.clone());
+        }
+    }
+    for file in files
+        .iter()
+        .filter(|file| !file.tombstone && deleted(&file.path))
+    {
+        if matches!(
+            crate::draft_start::load_file(journal_dir, domain, actor, &file.path),
+            Ok(None)
+        ) {
+            paths.push(file.path.clone());
+        }
+    }
+    paths
+}
+
+/// What [`Engine::take_merge`] did with a merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Taken {
+    /// Nothing: the row stands as it was, and so does its start.
+    Left,
+    /// The row took the merge.
+    Wrote,
+    /// The row already held the merge, so only its start moved on.
+    StartOnly,
+}
+
+/// What [`Engine::settle_drafts`] did to one actor's rows.
+#[derive(Debug, Default)]
+struct Settled {
+    cleared: u64,
+    merged: u64,
 }
 
 /// Everything one actor holds in a domain's overlay: the rows they drafted and
@@ -10450,153 +12151,33 @@ struct ActorHolding {
     files: Vec<crate::overlay_files::FileEntry>,
 }
 
-/// What a pull leaves one overlay entry to be.
-enum Settle {
-    /// Untouched by this pull and still its author's draft.
-    Leave,
-    /// The folder has caught up with it: take it out, row and mirror.
-    Clear,
-    /// Its author has a conflict to settle.
-    Diverge,
-    /// The base it drafts moved to this path, so the draft goes with it.
-    MoveTo(String),
-}
-
-/// What one pull leaves one entry to be. Pure, so the rule is readable in one
-/// place and the engine above it only does the writing.
+/// Where the team moved the file of this plain draft, if a pull did: the one
+/// question the pass asks before it decides a row. Pure.
 ///
-/// `base` is the entry path's own bytes in the base snapshot AFTER the pull,
-/// `touched` the paths the pull applied, `addresses` the permalinks those
-/// applied paths now answer to, and `own` every path this same actor is
-/// holding, which is what keeps a rename from writing over a second draft.
+/// A plain draft is one that started at its own path, or an old draft with no
+/// record; a draft she moved herself is her move, and the team renaming its
+/// source reads as the address taken. The signal is the address plus the
+/// deletion: the pull took the team's file away at `entry`'s path (`touched`,
+/// and no longer a key of the snapshot), and a page it applied answers to the
+/// address the draft holds (`addresses`). Never a path this same actor holds a
+/// row at (`own`): no rename may write over a second draft.
 fn settle_overlay_entry(
     entry: &StoredEngram,
-    base: Option<&[u8]>,
+    start: Option<&crate::draft_start::DraftStart>,
+    team_holds_it: bool,
     touched: &HashSet<&str>,
     addresses: &HashMap<String, String>,
     own: &HashSet<&str>,
-) -> Settle {
+) -> Option<String> {
     let at = entry.path.as_str();
-    let pulled = touched.contains(at);
-    if entry.tombstone {
-        return match base {
-            None => Settle::Clear,
-            Some(_) if pulled => Settle::Diverge,
-            Some(_) => Settle::Leave,
-        };
+    let plain = start.is_none_or(|start| start.from.as_deref() == Some(at));
+    if entry.tombstone || !plain || team_holds_it || !touched.contains(at) {
+        return None;
     }
-    // The address this draft holds, standing at a path the pull brought in -
-    // and never at a path this actor is drafting at themselves, since no
-    // rename may write over a second draft and no collision is invented
-    // between two rows one person already holds apart.
-    let elsewhere = addresses
+    addresses
         .get(&entry.permalink)
-        .filter(|held| held.as_str() != at && !own.contains(held.as_str()));
-    match base {
-        Some(bytes) if bytes == entry.content.as_bytes() => Settle::Clear,
-        Some(_) if pulled => Settle::Diverge,
-        Some(_) => match elsewhere {
-            Some(_) => Settle::Diverge,
-            None => Settle::Leave,
-        },
-        None => match (pulled, elsewhere) {
-            // The pull took the base away and the address it carried stands
-            // somewhere else now: the page was renamed, and the draft applies
-            // to it still.
-            (true, Some(dest)) => Settle::MoveTo(dest.clone()),
-            // The pull took the base away and nothing carries its address: the
-            // team retired the page this draft is a draft of.
-            (true, None) => Settle::Diverge,
-            // Nothing happened at this path, but the address this draft holds
-            // was just spent by a file the team has.
-            (false, Some(_)) => Settle::Diverge,
-            (false, None) => Settle::Leave,
-        },
-    }
-}
-
-/// The tombstones that end with their draft: the deletion half of a case-only
-/// move whose text the base has caught up with.
-///
-/// On a disk that folds case the base copy of `plan.md` also answers to
-/// `Plan.md`, so a draft at `Plan.md` is found equal once a share has landed its
-/// text, and its row is cleared. The tombstone at `plan.md` was half of the same
-/// move, and left standing alone it says the opposite of what the person did:
-/// it hides the file from them and their next share proposes the deletion.
-///
-/// `base_paths` is what tells this from two real files: the draft's own spelling
-/// must not be in the snapshot, and the tombstone's must. On a disk that keeps
-/// `Note.md` and `note.md` apart this finds nothing.
-fn tombstones_of_settled_case_moves<'a>(
-    entries: &'a [StoredEngram],
-    state_dir: &Path,
-    base_paths: &HashSet<String>,
-) -> HashSet<&'a str> {
-    // A base copy that cannot be read settles nothing here. This look runs ahead
-    // of the pass, so failing here would stop it before it ended a single draft;
-    // the pass reaches that copy in its own turn and stops there, with what it
-    // already ended announced.
-    let mut settled = HashSet::new();
-    for draft in entries.iter().filter(|entry| !entry.tombstone) {
-        if !base_paths.contains(&draft.path)
-            && crystalline_remote::state::read_base_file(state_dir, &draft.path)
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(draft.content.as_bytes())
-        {
-            settled.insert(crystalline_core::fold_path_case(&draft.path));
-        }
-    }
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.tombstone
-                && base_paths.contains(&entry.path)
-                && settled.contains(&crystalline_core::fold_path_case(&entry.path))
-        })
-        .map(|entry| entry.path.as_str())
-        .collect()
-}
-
-/// What one pull leaves one overlay FILE to be. Pure, beside
-/// [`settle_overlay_entry`] and answering the same four-way question with the
-/// two arms that cannot apply to a file left out.
-///
-/// `base` is the path's own bytes in the base snapshot AFTER the pull, `bytes`
-/// what this actor holds there (`None` for a deletion), and `touched` the paths
-/// the pull applied.
-///
-/// A file answers to no address, so there is no rename for it to follow and no
-/// address for another file to spend: the `MoveTo` and `elsewhere` arms of the
-/// row rule have nothing to read here. What is left is the pair that matters -
-/// the folder has caught up, or it has moved somewhere else.
-fn settle_overlay_file(
-    entry: &crate::overlay_files::FileEntry,
-    base: Option<&[u8]>,
-    bytes: Option<&[u8]>,
-    touched: &HashSet<&str>,
-) -> Settle {
-    let pulled = touched.contains(entry.path.as_str());
-    if entry.tombstone {
-        return match base {
-            // The team deleted it too, so the marker has nothing left to hide.
-            None => Settle::Clear,
-            Some(_) if pulled => Settle::Diverge,
-            Some(_) => Settle::Leave,
-        };
-    }
-    match (base, bytes) {
-        // The folder holds exactly these bytes now: the draft is the team's
-        // file, under any pull or none. Asked of every entry on every pass, so
-        // an author who uploads the team's own version again has it cleared by
-        // the next pass rather than left listed.
-        (Some(base), Some(bytes)) if base == bytes => Settle::Clear,
-        // The pull changed or removed what stood under this file, and what the
-        // actor holds is not it.
-        (_, _) if pulled => Settle::Diverge,
-        _ => Settle::Leave,
-    }
+        .filter(|held| held.as_str() != at && !own.contains(held.as_str()))
+        .cloned()
 }
 
 /// The addresses the base files a pull applied answer to, permalink to path.
@@ -10607,7 +12188,12 @@ fn settle_overlay_file(
 /// question about the folder as it was.
 fn pulled_addresses(state_dir: &Path, touched: &HashSet<&str>) -> Result<HashMap<String, String>> {
     let mut addresses = HashMap::new();
-    for at in touched {
+    // The key rule the conflict table reads: a log, a listing or a dotfile
+    // holds no address, so it never moves a draft.
+    for at in touched
+        .iter()
+        .filter(|at| draft_conflicts::holds_an_address(at))
+    {
         let Some(bytes) = crystalline_remote::state::read_base_file(state_dir, at)? else {
             continue;
         };

@@ -113,7 +113,8 @@ async fn an_editor_lists_reads_and_drops_the_kept_texts() {
     assert_eq!(first["id"], page_id.as_str());
     assert_eq!(first["kept_at"], "2026-10-15T08:00:00Z");
     assert_eq!(first["bytes"], 19);
-    assert!(first.get("file").is_none(), "no server path: {first}");
+    // A text, and no server path: `file` is a flag, never the file's place.
+    assert_eq!(first["file"], false, "{first}");
     assert_eq!(first["draft"], false);
 
     let (status, one) = ed.get(&format!("/api/v1/domains/eng/kept/{page_id}")).await;
@@ -409,6 +410,153 @@ async fn a_drafts_kept_text_goes_to_its_owner_only() {
         .await;
     assert_eq!(status, 204);
     assert!(kept::scan(&root).is_empty());
+}
+
+/// A draft file kept as its bytes is listed as a file, is no text to read,
+/// and downloads as its bytes, named for the file, never rendered in place;
+/// another person meets it as if it were not there.
+#[tokio::test]
+async fn a_kept_file_is_listed_as_a_file_and_downloads_as_its_bytes() {
+    let s = serve().await;
+    let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
+    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let bytes = b"%PDF-1.7\n\xff\xfe her deck".to_vec();
+    kept::write_bytes(
+        &root,
+        "eng",
+        Some("ed"),
+        KeptKind::Engram,
+        "assets/deck.pdf",
+        at,
+        &bytes,
+    )
+    .unwrap();
+    let id = kept::scan(&root)[0].id.clone();
+
+    let ed = Session::login(s.addr, "ed").await;
+    let (status, body) = ed.get("/api/v1/domains/eng/kept").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kept"][0]["path"], "assets/deck.pdf", "{body}");
+    assert_eq!(body["kept"][0]["file"], true, "{body}");
+
+    let (status, one) = ed.get(&format!("/api/v1/domains/eng/kept/{id}")).await;
+    assert_eq!(status, 422, "{one}");
+    assert_eq!(
+        one["detail"],
+        "This kept copy is a file, not text. Download it from the kept list."
+    );
+
+    let (status, headers, got) = ed
+        .get_raw(&format!("/api/v1/domains/eng/kept/{id}/file"))
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&got));
+    assert_eq!(got, bytes);
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    };
+    assert_eq!(header("content-type"), "application/octet-stream");
+    assert_eq!(
+        header("content-disposition"),
+        "attachment; filename=\"deck.pdf\""
+    );
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(
+        header("content-security-policy"),
+        "default-src 'none'; sandbox"
+    );
+
+    let keeper = Session::login(s.addr, "keeper").await;
+    let (status, _, _) = keeper
+        .get_raw(&format!("/api/v1/domains/eng/kept/{id}/file"))
+        .await;
+    assert_eq!(status, 404, "a draft's copy is its owner's alone");
+    let (status, _, _) = ed
+        .get_raw("/api/v1/domains/eng/kept/000000000000/file")
+        .await;
+    assert_eq!(status, 404);
+}
+
+/// A draft file kept before kept files took their own extension is named
+/// `.md`. It is still listed as a file, downloads as its bytes and can be
+/// dropped.
+#[tokio::test]
+async fn an_old_md_named_kept_file_lists_downloads_and_drops() {
+    let s = serve().await;
+    let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
+    let folder = root.join("eng/draft/ed/engram/assets");
+    std::fs::create_dir_all(&folder).unwrap();
+    let bytes = b"%PDF-1.7\n\xff\xfe her old deck".to_vec();
+    std::fs::write(folder.join("deck.pdf.20261015T080000Z.md"), &bytes).unwrap();
+    let id = kept::scan(&root)[0].id.clone();
+
+    let ed = Session::login(s.addr, "ed").await;
+    let (_, body) = ed.get("/api/v1/domains/eng/kept").await;
+    assert_eq!(body["kept"][0]["path"], "assets/deck.pdf", "{body}");
+    assert_eq!(body["kept"][0]["file"], true, "{body}");
+    let (status, headers, got) = ed
+        .get_raw(&format!("/api/v1/domains/eng/kept/{id}/file"))
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(got, bytes);
+    assert_eq!(
+        headers.get("content-disposition").unwrap(),
+        "attachment; filename=\"deck.pdf\""
+    );
+    let (status, _) = ed
+        .send(
+            Method::DELETE,
+            &format!("/api/v1/domains/eng/kept/{id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(kept::scan(&root).is_empty());
+}
+
+/// A kept copy the server cannot read is a fault on the server's side: the
+/// read and the download answer 500 in a sentence that names no place on the
+/// server's disk; the cause goes to the log.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_kept_copy_that_cannot_be_read_names_no_server_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = serve().await;
+    let root = s.fx.tmp.path().join("state").join(kept::KEPT_DIR);
+    let at = chrono::Utc.with_ymd_and_hms(2026, 10, 15, 9, 0, 0).unwrap();
+    let file = kept::write_bytes(
+        &root,
+        "eng",
+        Some("ed"),
+        KeptKind::Engram,
+        "assets/deck.pdf",
+        at,
+        b"her deck",
+    )
+    .unwrap();
+    let id = kept::scan(&root)[0].id.clone();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let ed = Session::login(s.addr, "ed").await;
+    let tmp = s.fx.tmp.path().display().to_string();
+    for path in [
+        format!("/api/v1/domains/eng/kept/{id}"),
+        format!("/api/v1/domains/eng/kept/{id}/file"),
+    ] {
+        let (status, _, body) = ed.get_raw(&path).await;
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(status, 500, "{path}: {body}");
+        assert!(!body.contains(&tmp), "{path}: {body}");
+        assert!(!body.contains("kept/"), "{path}: {body}");
+        assert!(
+            body.contains("This kept copy could not be read."),
+            "{path}: {body}"
+        );
+    }
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 /// A removed domain's kept texts are set aside, never deleted: a new domain

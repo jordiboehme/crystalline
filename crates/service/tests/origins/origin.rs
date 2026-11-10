@@ -43,7 +43,7 @@ fn config(github_enabled: bool) -> GlobalConfig {
     cfg
 }
 
-async fn engine_with(
+pub(super) async fn engine_with(
     config_path: &Path,
     origins_dir: &Path,
     provider: Arc<MockProvider>,
@@ -105,7 +105,7 @@ async fn engine_with_env(
 /// after its first share from 0.30.0 on, so a share here carries exactly the
 /// changes a scenario makes. [`manifest_unmarked`] is the repository from
 /// before.
-fn manifest() -> Vec<u8> {
+pub(super) fn manifest() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
@@ -129,18 +129,18 @@ fn manifest_sharing_indexes() -> Vec<u8> {
 /// onto the connected branch instead of opening a proposal. The default is
 /// `proposal`, so a scenario whose subject is the direct path has to say so,
 /// the way a real team says it once in the file all of its members hold.
-fn manifest_sharing_direct() -> Vec<u8> {
+pub(super) fn manifest_sharing_direct() -> Vec<u8> {
     b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
-fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
+pub(super) fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
     )
     .into_bytes()
 }
 
-fn commit_files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+pub(super) fn commit_files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
     pairs
         .iter()
         .map(|(p, c)| (p.to_string(), c.clone()))
@@ -4415,7 +4415,7 @@ fn overlay_record(text: &str, path: &str) -> crystalline_index::EngramRecord {
 ///
 /// Returns the engine, the working tree root and the origins directory. The
 /// temp directory is the caller's to hold: everything here lives under it.
-async fn reviewing_domain(
+pub(super) async fn reviewing_domain(
     tmp: &Path,
     mock: Arc<MockProvider>,
     files: &[(&str, Vec<u8>)],
@@ -4455,7 +4455,7 @@ async fn reviewing_domain(
 /// Write one actor's draft of `path` straight into the index, the way a write
 /// verb in review mode does: a row in that actor's dimension, and nothing on
 /// disk.
-async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
+pub(super) async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
     let store = eng.store();
     let store = store.lock().await;
     let id = store
@@ -4467,6 +4467,50 @@ async fn draft(eng: &Engine, actor: &str, path: &str, text: &str) {
         .upsert_overlay(id, actor, &overlay_record(text, path))
         .await
         .unwrap();
+}
+
+/// [`draft`] for a draft written since drafts keep a record of where they
+/// started: the row, and the record a write verb leaves, read from the base
+/// snapshot as it stands now. Call it before the team moves on. `tmp` is the
+/// fixture's state directory, as [`mirror`] takes it.
+pub(super) async fn drafted(eng: &Engine, tmp: &Path, actor: &str, path: &str, text: &str) {
+    // A second write of a row keeps the record the first one left.
+    if crystalline_service::draft_start::load(tmp, "team", actor, path)
+        .unwrap()
+        .is_some()
+    {
+        draft(eng, actor, path, text).await;
+        return;
+    }
+    let snapshot = tmp.join("origins").join("team");
+    let state = crystalline_remote::state::OriginState::load(&snapshot)
+        .unwrap()
+        .expect("the domain has a base snapshot");
+    let start = if state.files.contains_key(path) {
+        crystalline_remote::state::read_base_file(&snapshot, path)
+            .unwrap()
+            .map(|bytes| crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned())
+    } else {
+        None
+    };
+    let from = start.is_some().then(|| path.to_string());
+    crystalline_service::draft_start::save(
+        tmp,
+        "team",
+        actor,
+        &crystalline_service::draft_start::DraftStart {
+            path: path.to_string(),
+            from,
+            start,
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+            merging: None,
+            settling: None,
+        },
+    )
+    .unwrap();
+    draft(eng, actor, path, text).await;
 }
 
 /// Write one actor's deletion of a base path: a tombstone row standing at that
@@ -4484,6 +4528,32 @@ async fn tombstone(eng: &Engine, actor: &str, path: &str) {
     record.tombstone = true;
     record.permalink = path.to_string();
     store.upsert_overlay(id, actor, &record).await.unwrap();
+}
+
+/// [`tombstone`] for a deletion made since drafts keep a record: the record the
+/// delete verb leaves, starting from the team's text at that path.
+async fn tombstoned(eng: &Engine, tmp: &Path, actor: &str, path: &str) {
+    tombstone(eng, actor, path).await;
+    let snapshot = tmp.join("origins").join("team");
+    let start = crystalline_remote::state::read_base_file(&snapshot, path)
+        .unwrap()
+        .map(|bytes| crystalline_core::to_lf(&String::from_utf8(bytes).unwrap()).into_owned());
+    crystalline_service::draft_start::save(
+        tmp,
+        "team",
+        actor,
+        &crystalline_service::draft_start::DraftStart {
+            path: path.to_string(),
+            from: Some(path.to_string()),
+            start,
+            start_sha256: None,
+            shared: None,
+            merged_at: None,
+            merging: None,
+            settling: None,
+        },
+    )
+    .unwrap();
 }
 
 /// The scope one actor name means, as an authenticated surface resolves it.
@@ -4547,7 +4617,7 @@ async fn a_review_mode_share_carries_the_marker_through_the_proposal() {
     )
     .await;
     let root = tmp.path().join("team-knowledge");
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     let preview = eng
         .origin_share_preview(
             "team",
@@ -4611,7 +4681,7 @@ async fn an_overlay_share_stages_the_actors_files_and_the_proposal_carries_the_b
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     file(&eng, "owner", "assets/deck.png", DECK_PNG).await;
     delete_file(&eng, "owner", "assets/old.png").await;
 
@@ -4703,9 +4773,9 @@ async fn an_overlay_share_proposes_exactly_the_actors_entries() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    tombstone(&eng, "owner", "notes/old.md").await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    tombstoned(&eng, tmp.path(), "owner", "notes/old.md").await;
     // A stray direct edit of the reviewed folder. Nobody reviewed it, so no
     // share carries it: a walk of the tree would, and this is how the test
     // says the plan is not a walk.
@@ -4747,8 +4817,8 @@ async fn files_naming_another_actors_path_refuses() {
     )
     .await;
 
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let err = eng
         .origin_share(
@@ -4788,13 +4858,13 @@ async fn the_owner_cli_shares_the_owner_overlay() {
     let mock = Arc::new(MockProvider::new());
     let eng = reviewing_domain(
         tmp.path(),
-        mock,
+        mock.clone(),
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
 
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4807,7 +4877,24 @@ async fn the_owner_cli_shares_the_owner_overlay() {
         "alice's draft is hers to share: {result}"
     );
 
-    // And the same engine, asked as alice, carries hers and not the owner's.
+    // Alice waits while the owner's proposal is open, and once it is closed
+    // the same engine, asked as alice, carries hers and not the owner's.
+    let waits = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(waits["outcome"], "proposal_open", "{waits}");
+    mock.set_proposal_state(
+        result["number"].as_u64().unwrap(),
+        crystalline_remote::provider::ProposalState::Declined,
+    );
     let hers = eng
         .origin_share(
             "team",
@@ -4819,8 +4906,9 @@ async fn the_owner_cli_shares_the_owner_overlay() {
         )
         .await
         .unwrap();
+    assert_eq!(hers["outcome"], "proposed", "{hers}");
     assert!(
-        hers.to_string().contains("notes/alice.md"),
+        hers.to_string().contains("notes/alice.md") && !hers.to_string().contains("fresh"),
         "alice shares her own draft: {hers}"
     );
 }
@@ -4838,7 +4926,7 @@ async fn an_http_agent_without_identity_cannot_share_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let err = eng
         .origin_share("team", None, None, None, None, ShareActor::HttpAgent)
@@ -4885,8 +4973,8 @@ async fn an_overlay_share_respects_the_domains_generated_index_policy_on_both_si
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/index.md", DRAFT_INDEX).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4912,8 +5000,8 @@ async fn an_overlay_share_respects_the_domains_generated_index_policy_on_both_si
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
-    draft(&eng, "owner", "notes/index.md", DRAFT_INDEX).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/index.md", DRAFT_INDEX).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -4946,7 +5034,7 @@ async fn a_review_mode_share_pulls_the_teams_folder_not_the_staged_tree() {
     )
     .await;
     let root = tmp.path().join("team-knowledge");
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     // The team merged somebody else's work while this draft was being written.
     let moved = mock.add_commit(commit_files(&[
@@ -5011,7 +5099,7 @@ async fn an_upstream_move_after_the_share_pulled_refuses_instead_of_merging_into
     .await;
     let root = tmp.path().join("team-knowledge");
     let state_dir = tmp.path().join("origins").join("team");
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let settled = crystalline_remote::state::OriginState::load(&state_dir)
         .unwrap()
@@ -5078,7 +5166,7 @@ async fn an_actor_with_no_drafts_has_nothing_to_share() {
     )
     .await;
     // Somebody else is drafting; this actor is not.
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -5104,8 +5192,8 @@ async fn a_shared_draft_is_still_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     let before = {
         let store = eng.store();
@@ -5171,9 +5259,9 @@ async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/authored.md", AUTHORED).await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
-    draft(&eng, "alice", "notes/alice.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "owner", "notes/authored.md", AUTHORED).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/alice.md", DRAFT_ALICE).await;
 
     let plan = eng
         .origin_share_preview(
@@ -5268,7 +5356,7 @@ async fn a_base_path_with_no_recorded_copy_asks_for_a_resync() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
 
     // The recorded copy goes missing while the path stays in the snapshot.
     let copy = tmp
@@ -5320,7 +5408,7 @@ async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan: v2.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan: v2.md", DRAFT_FRESH).await;
 
     let drafted = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
@@ -5394,7 +5482,7 @@ fn journal_file(tmp: &Path, actor: &str, path: &str) -> std::path::PathBuf {
 /// `draft` helper above writes the row alone on purpose; a scenario about
 /// convergence needs both halves, because clearing exactly one of them is the
 /// bug it exists to catch.
-fn mirror(tmp: &Path, actor: &str, path: &str, text: &str) {
+pub(super) fn mirror(tmp: &Path, actor: &str, path: &str, text: &str) {
     let file = journal_file(tmp, actor, path);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(file, text).unwrap();
@@ -5437,9 +5525,9 @@ async fn a_merged_and_pulled_draft_converges_out_of_the_overlay() {
     )
     .await;
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     // The team reviewed the rewrite and merged it.
@@ -5565,7 +5653,8 @@ async fn a_pull_converges_a_byte_equal_file_and_a_sidecar_of_a_gone_base_file() 
 }
 
 /// The team changes a file under the actor drafting it, and that is their
-/// conflict and nobody else's - settled by the next write of the same path.
+/// conflict and nobody else's. Writing the path again does not settle it; her
+/// choice in a resolution does.
 #[tokio::test]
 async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5618,8 +5707,7 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
         "and nobody else's: {his}"
     );
 
-    // A conflict resolution settles an engram, so it says what to do with a
-    // file instead of normalizing the path into a miss.
+    // Somebody with no draft at the path has nothing to settle there.
     let refused = eng
         .origin_resolve(
             "team",
@@ -5629,25 +5717,37 @@ async fn a_file_the_team_changed_under_the_actor_is_that_actors_divergence() {
             ShareActor::Owner,
         )
         .await
-        .expect_err("a resolution settles an engram's markdown");
-    let text = refused.to_string();
-    assert!(
-        text.contains("upload the file again") && text.contains("delete it"),
-        "and it teaches the pair of verbs that do settle one: {text}"
-    );
+        .expect_err("the owner holds no draft of this file");
+    assert!(matches!(refused, EngineError::NotFound(_)), "{refused}");
 
-    // Her next write of the same path is what settles it.
+    // Her next write of the same path does not settle it.
     file(&eng, "alice", "assets/deck.png", b"a third deck").await;
     let hers = eng
         .origin_status(Some("team"), false, false, &scope_of("alice"))
         .await
         .unwrap();
-    // Nothing converged on that pass and nothing conflicts any more, which is
-    // exactly what this key's absence means.
-    assert!(
-        hers["domains"][0]["converged"].is_null(),
-        "writing the path again is the answer, and it leaves the conflict list: {hers}"
+    assert_eq!(
+        hers["domains"][0]["converged"]["mine"],
+        serde_json::json!(["assets/deck.png"]),
+        "an upload is not a choice: {hers}"
     );
+
+    // Keep mine is.
+    let settled = eng
+        .origin_resolve(
+            "team",
+            "assets/deck.png",
+            Some("mine"),
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled["kept"], "mine", "{settled}");
+    let hers = eng
+        .origin_status(Some("team"), false, false, &scope_of("alice"))
+        .await
+        .unwrap();
     assert!(
         !hers.to_string().contains("assets/deck.png"),
         "her conflict is named nowhere now: {hers}"
@@ -5669,10 +5769,10 @@ async fn a_diverged_draft_is_its_authors_conflict_only() {
     )
     .await;
 
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     // A draft at a path this pull never touches: not merged, not in conflict.
-    draft(&eng, "alice", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "alice", "notes/fresh.md", DRAFT_FRESH);
 
     // Somebody else's change to the same page landed instead.
@@ -5775,7 +5875,7 @@ async fn a_renamed_base_path_takes_the_draft_with_it() {
     )
     .await;
 
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
 
     // The team filed the same page under a new name.
@@ -5817,7 +5917,7 @@ async fn a_pulled_address_collision_is_the_drafters_divergence() {
     let root = tmp.path().join("team-knowledge");
 
     // A page only this actor has, answering to `plan`.
-    draft(&eng, "owner", "notes/mine.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/mine.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/mine.md", DRAFT_PLAN);
 
     // The team adds a page of its own at that address, under another name.
@@ -5866,9 +5966,9 @@ async fn withdraw_revert_lands_in_the_overlay_while_the_tree_stays() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     let shared = eng
@@ -5917,7 +6017,7 @@ async fn a_resolution_in_a_reviewing_domain_is_a_draft() {
     .await;
     let root = tmp.path().join("team-knowledge");
 
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
 
     let merged = eng
@@ -5968,7 +6068,7 @@ async fn an_http_agent_without_identity_cannot_resolve_or_withdraw_a_draft() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
 
     let err = eng
         .origin_resolve(
@@ -6063,11 +6163,11 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
 
     // A draft the folder already says, a draft it does not, and a deletion of
     // a page the folder still has.
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
-    tombstone(&eng, "owner", "notes/old.md").await;
+    tombstoned(&eng, tmp.path(), "owner", "notes/old.md").await;
 
     let report = eng.converge_overlays("team").await.unwrap();
     assert_eq!(report.cleared, 1, "the draft the folder caught up with");
@@ -6086,7 +6186,8 @@ async fn the_clear_only_pass_ends_what_has_landed_and_flags_nothing() {
 /// A convergence pass that stops on an error still announces the drafts it
 /// already ended: the batch guard is pushed each drop right after it lands, so
 /// a later entry failing does not swallow the event for an earlier one. The
-/// second draft's base copy is a directory, which no read turns into bytes.
+/// second draft's base copy is a directory, which no read turns into bytes, at
+/// a key of the snapshot.
 #[tokio::test]
 async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6100,13 +6201,27 @@ async fn a_convergence_pass_that_stops_halfway_announces_what_it_cleared() {
         ],
     )
     .await;
-    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "owner", "notes/plan.md", DRAFT_PLAN);
-    draft(&eng, "owner", "notes/zz.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/zz.md", DRAFT_FRESH);
     let base = base_copy_of(&tmp.path().join("origins"), "notes/plan.md")
         .expect("the first pull wrote the base snapshot");
     std::fs::create_dir_all(base.join("notes/zz.md")).unwrap();
+    // A key of the snapshot, so the pass reads its copy: a path that is no key
+    // is absent without a read.
+    let state_dir = base.parent().unwrap();
+    let mut state = crystalline_remote::state::OriginState::load(state_dir)
+        .unwrap()
+        .unwrap();
+    state.files.insert(
+        "notes/zz.md".to_string(),
+        crystalline_remote::state::BaseStamp {
+            sha256: crate::support::sha256_hex(DRAFT_FRESH.as_bytes()),
+            size: DRAFT_FRESH.len() as u64,
+        },
+    );
+    state.save(state_dir).unwrap();
 
     let mut rx = eng.changes().subscribe();
     eng.converge_overlays("team")
@@ -6163,7 +6278,7 @@ async fn an_out_of_band_conflict_is_still_settled_against_the_folder() {
     let root = tmp.path().join("team-knowledge");
 
     // Somebody's draft, which takes no part in this at all.
-    draft(&eng, "owner", "notes/fresh.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "owner", "notes/fresh.md", DRAFT_FRESH);
 
     // A direct edit of the reviewed folder, and an upstream change to the same
@@ -6257,7 +6372,7 @@ async fn an_unrelated_pull_leaves_a_standing_conflict_alone() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
 
     // Pull A moves the page ada is drafting: her draft is a conflict.
@@ -6331,7 +6446,7 @@ async fn the_clear_only_pass_leaves_the_conflicts_it_did_not_settle() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
 
     let moved = mock.add_commit(commit_files(&[
@@ -6395,7 +6510,7 @@ async fn a_restart_still_names_the_conflicts_the_last_pull_found() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/plan.md", DRAFT_PLAN);
     let moved = mock.add_commit(commit_files(&[
         ("MANIFEST.md", manifest()),
@@ -6458,7 +6573,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     )
     .await;
 
-    draft(&eng, "ada", "notes/ada.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "ada", "notes/ada.md", DRAFT_FRESH).await;
     mirror(tmp.path(), "ada", "notes/ada.md", DRAFT_FRESH);
     let first = eng
         .origin_share(
@@ -6475,9 +6590,9 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
 
     // Bo has never shared anything. The refusal must not tell him to do the
     // thing he is doing.
-    draft(&eng, "bo", "notes/bo.md", DRAFT_ALICE).await;
+    drafted(&eng, tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE).await;
     mirror(tmp.path(), "bo", "notes/bo.md", DRAFT_ALICE);
-    let err = eng
+    let his = eng
         .origin_share(
             "team",
             None,
@@ -6487,11 +6602,13 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
             ShareActor::Account("bo".to_string()),
         )
         .await
-        .expect_err("somebody else's proposal is open");
-    let text = err.to_string();
+        .unwrap();
+    assert_eq!(his["outcome"], "proposal_open", "{his}");
+    assert_eq!(his["own"], false, "{his}");
+    let text = his["guidance"].as_str().unwrap().to_string();
     assert!(
-        text.contains("ada") && text.contains("one proposal at a time"),
-        "the refusal names whose it is and what to wait for: {text}"
+        text.starts_with("ada's proposal #") && text.contains("merged or closed"),
+        "the answer names whose it is and what to wait for: {text}"
     );
     assert!(
         !text.contains("share a fresh proposal instead"),
@@ -6499,7 +6616,7 @@ async fn an_open_proposal_refuses_the_next_share_in_the_words_of_whose_it_is() {
     );
 
     // Ada's own second share is the one that may withdraw and share again.
-    draft(&eng, "ada", "notes/more.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "ada", "notes/more.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "ada", "notes/more.md", DRAFT_PLAN);
     let err = eng
         .origin_share(
@@ -6584,7 +6701,7 @@ async fn a_pulled_convergence_ends_the_links_on_the_draft_it_cleared() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
     assert_eq!(
@@ -6612,7 +6729,7 @@ async fn a_pulled_convergence_ends_the_links_on_the_draft_it_cleared() {
     );
 
     // And a later draft at the same path revives nothing.
-    draft(&eng, "alice", "notes/plan.md", DRAFT_FRESH).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_FRESH).await;
     assert!(
         auth.overlay_grants_held("bob", "team")
             .await
@@ -6638,7 +6755,7 @@ async fn convergences_rename_ends_the_links_on_the_path_it_left() {
         &[("MANIFEST.md", manifest()), ("notes/plan.md", team_plan())],
     )
     .await;
-    draft(&eng, "alice", "notes/plan.md", DRAFT_PLAN).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN).await;
     mirror(tmp.path(), "alice", "notes/plan.md", DRAFT_PLAN);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
 
@@ -6690,7 +6807,7 @@ async fn a_convergence_that_makes_the_draft_the_folder_ends_its_links() {
     // Her draft says exactly what the team's page says, which is what makes the
     // rename below land rather than move.
     let agreed = String::from_utf8(team_plan()).unwrap();
-    draft(&eng, "alice", "notes/plan.md", &agreed).await;
+    drafted(&eng, tmp.path(), "alice", "notes/plan.md", &agreed).await;
     mirror(tmp.path(), "alice", "notes/plan.md", &agreed);
     let auth = granted(&eng, tmp.path(), "alice", "notes/plan.md").await;
 
@@ -7568,6 +7685,162 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         );
     }
     other.drop_schema().await.unwrap();
+}
+
+/// The review pass reads and writes drafts through `Store`, so it is pinned on
+/// Postgres too: a colleague's change on another line merges into her draft and
+/// she reads both lines, and a change of the line she changed stays her text
+/// and refuses her share as a conflict.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_stale_draft_merges_and_refuses_on_postgres() {
+    let _scratch = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let plan = |first: &str, last: &str| {
+        engram(
+            "Plan",
+            "plan",
+            &format!("{first}\n\nthe middle of the plan\n\n{last}"),
+        )
+    };
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "plan.md",
+            plan("the first line of the plan", "the last line of the plan"),
+        ),
+        (
+            "note.md",
+            engram("Note", "note", "the note as the team has it"),
+        ),
+    ]));
+    mock.set_branch("main", &c1);
+    let Some((eng, _url, _schema)) = standalone_on_postgres(tmp.path(), mock.clone()).await else {
+        return;
+    };
+    let root = tmp.path().join("team-knowledge");
+    eng.origin_add(
+        "acme/team",
+        Some("team"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "team",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let alice = Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    };
+    let edit = |identifier: &str, find: &str, with: &str| crystalline_service::params::EditParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        operation: "find_replace".to_string(),
+        content: Some(with.to_string()),
+        key: None,
+        value: None,
+        values: None,
+        find_text: Some(find.to_string()),
+        expected_replacements: None,
+        section: None,
+        include_subsections: false,
+        expected_checksum: None,
+        ack_scope: None,
+        share_link: None,
+        model: None,
+    };
+    eng.edit_engram_as(
+        &edit("plan", "the last line of the plan", "alice's own last word"),
+        None,
+        &alice,
+    )
+    .await
+    .unwrap();
+    eng.edit_engram_as(
+        &edit(
+            "note",
+            "the note as the team has it",
+            "the note as alice has it",
+        ),
+        None,
+        &alice,
+    )
+    .await
+    .unwrap();
+
+    // Bob changes the plan's first line, and the note's only line.
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "plan.md",
+            plan("bob's first line", "the last line of the plan"),
+        ),
+        ("note.md", engram("Note", "note", "the note as bob has it")),
+    ]));
+    mock.set_branch("main", &c2);
+    let result = eng
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(result["errors"].as_array().unwrap().len(), 0, "{result}");
+
+    let read = |identifier: &'static str| {
+        let eng = &eng;
+        let alice = &alice;
+        async move {
+            eng.read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("team".to_string()),
+                    share_link: None,
+                    include_images: None,
+                },
+                alice,
+            )
+            .await
+            .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let plan_read = read("plan").await;
+    assert!(
+        plan_read.contains("bob's first line") && plan_read.contains("alice's own last word"),
+        "a clean merge reads both lines: {plan_read}"
+    );
+    let note_read = read("note").await;
+    assert!(
+        note_read.contains("the note as alice has it"),
+        "her text stays: {note_read}"
+    );
+
+    let answer = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert!(
+        answer.to_string().contains("note.md") && !answer.to_string().contains("plan.md"),
+        "only the same-line edit is a conflict: {answer}"
+    );
 }
 
 // --- who may read, chosen at connect ----------------------------------------

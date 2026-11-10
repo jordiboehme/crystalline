@@ -104,6 +104,7 @@ import type { PaletteCommand } from "../commands";
 import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { RENAMING_REASON } from "../components/DestructiveAction";
 import { DomainRail } from "../components/DomainRail";
+import { DraftConflictsNotice } from "../components/DraftConflictsNotice";
 import { EngramList } from "../components/EngramList";
 import { EngramsOrderMenu } from "../components/EngramsOrderMenu";
 import { FilterFields, TagChips } from "../components/FilterControls";
@@ -704,6 +705,23 @@ function DomainPage({
           with no origin.
         */}
         {canShare && <TeamBanners domain={domain} />}
+
+        {/*
+          This session's own drafts that do not fit the team's text. Outside
+          the banners on purpose: an editor whose role cannot share must
+          still see and settle her own conflict, and a warning must never
+          fold away on a phone. For any signed-in session, and not only where
+          the listing says the domain reviews or that it may write: a fold
+          that stopped part way has taken the review key off while her drafts
+          still stand, and on a locked domain, a read-only server or without
+          the write right her drafts still do not fit. What she can still do
+          there is the server's to say (`settle_note`); this side cannot tell
+          it from the listing, whose read-only mark folds all of them in. The
+          list answers empty, and cheaply, wherever she holds nothing.
+        */}
+        {capabilities.role !== null && !capabilities.anonymous && (
+          <DraftConflictsNotice domain={domain} />
+        )}
 
         <ManifestProsePanel
           domain={domain}

@@ -252,6 +252,47 @@ describe("ReviewModeCard", () => {
     ).toBeInTheDocument();
   });
 
+  it("names an actor whose conflicts could not be read, in the server's sentence", async () => {
+    serve({
+      "/domains/eng/review": (_path, init) =>
+        sent(init).folds === undefined
+          ? planResponse({
+              actors: [
+                {
+                  actor: "ada",
+                  entries: 1,
+                  conflicts_unreadable: true,
+                  conflicts_unreadable_reason:
+                    "The draft records of 'ada' could not be read, so their drafts cannot be folded safely. Choose discard for 'ada', which ends their text, or ask an admin to repair the records and fold again.",
+                  drafts: [
+                    {
+                      path: "notes/a.md",
+                      permalink: "notes/a",
+                      tombstone: false,
+                      conflict: null,
+                    },
+                  ],
+                },
+              ],
+            })
+          : {},
+    });
+    renderApp("/d/eng/settings");
+
+    const region = await screen.findByRole("region", { name: "Review mode" });
+    await userEvent.click(
+      within(region).getByRole("button", { name: "Take review mode off" }),
+    );
+
+    // Why writing her drafts into the folder is refused, said before anybody
+    // answers, on her own row, in the server's own sentence.
+    expect(
+      await within(region).findByText(
+        "The draft records of 'ada' could not be read, so their drafts cannot be folded safely. Choose discard for 'ada', which ends their text, or ask an admin to repair the records and fold again.",
+      ),
+    ).toBeVisible();
+  });
+
   it("says which of the draft changes is a file", async () => {
     serve({
       "/domains/eng/review": (_path, init) =>

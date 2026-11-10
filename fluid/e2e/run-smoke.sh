@@ -124,6 +124,12 @@ FLUID_E2E_REFLECTION_DOMAIN="${FLUID_E2E_REFLECTION_DOMAIN:-smoke-pages}"
 # the domain page has a rename question to ask. Its name starts with none of
 # the names above.
 FLUID_E2E_RENAMED_DOMAIN="${FLUID_E2E_RENAMED_DOMAIN:-smoke-rename}"
+# The domain that reviews changes, where the draft-conflict journey settles a
+# person's drafts against the team's text through the real draft routes. It has
+# an origin that is never reached: collaboration stays off, so nothing pulls,
+# and the journey writes the team's side into its base snapshot the way a pull
+# would. Its name starts with none of the names above.
+FLUID_E2E_REVIEW_DOMAIN="${FLUID_E2E_REVIEW_DOMAIN:-drafting-desk}"
 # The fourth account: knowledge level none, a Reflection contributor in that
 # domain and nothing else.
 FLUID_E2E_CONTRIBUTOR="${FLUID_E2E_CONTRIBUTOR:-contrib}"
@@ -139,7 +145,7 @@ export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
 export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
 export FLUID_E2E_OUTSIDER FLUID_E2E_OUTSIDER_PASSWORD
 export FLUID_E2E_PRIVATE_DOMAIN FLUID_E2E_OWNED_DOMAIN FLUID_E2E_LOCKED_DOMAIN
-export FLUID_E2E_RENAMED_DOMAIN
+export FLUID_E2E_RENAMED_DOMAIN FLUID_E2E_REVIEW_DOMAIN
 export FLUID_E2E_REFLECTION_DOMAIN FLUID_E2E_CONTRIBUTOR FLUID_E2E_CONTRIBUTOR_PASSWORD
 
 # A second run serves the daemon under a path prefix: its public_url names
@@ -241,6 +247,45 @@ reflection_root="$run_dir/reflection-domain"
 cp -R "$here/fixtures/reflection-domain" "$reflection_root"
 renamed_root="$run_dir/renamed-domain"
 cp -R "$here/fixtures/renamed-domain" "$renamed_root"
+# The reviewing domain and its base snapshot: the team's copies equal the
+# folder's, as after a first pull, so every draft starts from them. The spec
+# changes a copy and its stamp when it plays the team.
+review_root="$run_dir/review-domain"
+cp -R "$here/fixtures/review-domain" "$review_root"
+review_state="$run_dir/state/crystalline/origins/$FLUID_E2E_REVIEW_DOMAIN"
+mkdir -p "$review_state/base"
+cp -R "$review_root/." "$review_state/base/"
+node -e '
+const { createHash } = require("node:crypto");
+const { readFileSync, readdirSync, statSync, writeFileSync } = require("node:fs");
+const { join, relative } = require("node:path");
+const [base, out] = process.argv.slice(1);
+const files = {};
+const walk = (dir) => {
+  for (const name of readdirSync(dir)) {
+    const at = join(dir, name);
+    if (statSync(at).isDirectory()) { walk(at); continue; }
+    const bytes = readFileSync(at);
+    files[relative(base, at).split("\\").join("/")] = {
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      size: bytes.length,
+    };
+  }
+};
+walk(base);
+writeFileSync(out, JSON.stringify({
+  version: 1, repo: "acme/drafting-desk", branch: "main", base_commit: "seed",
+  ref_etag: null, last_checked: null, files, proposals: [], history: [],
+  conflicts: [],
+}, null, 2));
+' "$review_state/base" "$review_state/state.json"
+export FLUID_E2E_REVIEW_STATE="$review_state" FLUID_E2E_REVIEW_ROOT="$review_root"
+review_var="CRYSTALLINE_DOMAIN_$(printf '%s' "$FLUID_E2E_REVIEW_DOMAIN" | tr 'a-z-' 'A-Z_')"
+review_env=(
+    "$review_var=$review_root"
+    "${review_var}_ORIGIN=acme/$FLUID_E2E_REVIEW_DOMAIN"
+    "${review_var}_REVIEW=overlay"
+)
 # The Reflection journeys write one threads file on disk, the way another
 # process or a pull would, to see the open page follow it.
 export FLUID_E2E_REFLECTION_ROOT="$reflection_root"
@@ -307,7 +352,7 @@ oidc_env=(
 )
 
 echo "smoke: starting the daemon on $DAEMON_ADDR"
-"${isolated[@]}" "${oidc_env[@]}" ${base_env[@]+"${base_env[@]}"} "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
+"${isolated[@]}" "${oidc_env[@]}" "${review_env[@]}" ${base_env[@]+"${base_env[@]}"} "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 
 # The same probe an external monitor makes, so a daemon that answers here is a

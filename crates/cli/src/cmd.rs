@@ -912,6 +912,91 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 
 // --- origin share, withdraw and resolve ---------------------------------------
 
+/// What a draft's conflict is, in plain words, for a line about it: `None`
+/// for a conflict of the folder, which carries no `draft: true`.
+pub(crate) fn draft_kind_words(conflict: &serde_json::Value) -> Option<String> {
+    if conflict["draft"] != true {
+        return None;
+    }
+    let file = conflict["file"] == true;
+    let words = match conflict["kind"].as_str().unwrap_or("") {
+        "EditEdit" if file => "you and the team both changed this file".to_string(),
+        "EditEdit" => match conflict["moved_from"].as_str() {
+            Some(from) => format!("you moved it from {from}, and the team changed it"),
+            None => "you and the team changed the same lines".to_string(),
+        },
+        "EditDelete" => "you changed it, the team deleted it".to_string(),
+        "DeleteEdit" => "you deleted it, the team changed it".to_string(),
+        "AddAdd" if file => "you and the team both have a file here".to_string(),
+        "AddAdd" => "you and the team both have a file here, with different text".to_string(),
+        "UnknownStart" if file => {
+            "an older draft of this file; keep yours or take the team's".to_string()
+        }
+        "UnknownStart" => "a draft from an older version; compare the two texts".to_string(),
+        "AddressTaken" => format!(
+            "the team's file {} now uses the same address",
+            conflict["other"].as_str().unwrap_or("")
+        ),
+        other => other.to_string(),
+    };
+    // Under an address clash the page itself may have changed on the team's
+    // side too, which a new address does not settle.
+    let page = match conflict["page_kind"].as_str() {
+        None => "",
+        Some("EditDelete") => {
+            "; the team also deleted the page, which a new address does not settle"
+        }
+        Some("UnknownStart") => {
+            "; we cannot tell what the team changed in the page since your draft started"
+        }
+        Some(_) => "; the team also changed the page itself, which a new address does not settle",
+    };
+    Some(format!("{words}{page}"))
+}
+
+/// The lines `origin update` and `origin status` print about the caller's own
+/// drafts in one domain: each draft that took the team's change, and why her
+/// conflicts could not be listed when they could not.
+pub(crate) fn own_draft_lines(domain: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for path in domain["drafts_merged"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "  merged into your draft: {}",
+            path.as_str().unwrap_or("")
+        ));
+    }
+    if let Some(sentence) = domain["conflicts_unreadable_reason"].as_str() {
+        lines.push(format!("  {sentence}"));
+    }
+    lines
+}
+
+/// The line `origin update` prints for one conflict of `name`: how to compare
+/// and the ways out for a draft, the resolve command for the folder's own.
+pub(crate) fn update_conflict_lines(name: &str, conflict: &serde_json::Value) -> Vec<String> {
+    let path = conflict["path"].as_str().unwrap_or("");
+    let Some(words) = draft_kind_words(conflict) else {
+        return vec![format!(
+            "  conflict: {path} (resolve with: crystalline origin resolve {name} {path} --keep mine|theirs)"
+        )];
+    };
+    let first = if conflict["kind"] == "AddressTaken" {
+        // Keep mine is refused here: two pages cannot share one address.
+        format!(
+            "  conflict: {path} (compare: crystalline origin diff {name} --path {path}; resolve: crystalline origin resolve {name} {path} --keep theirs, or --content-file <f> with another address)"
+        )
+    } else if conflict["file"] == true {
+        format!(
+            "  conflict: {path} (a file: resolve: crystalline origin resolve {name} {path} --keep mine|theirs)"
+        )
+    } else {
+        format!(
+            "  conflict: {path} (compare: crystalline origin diff {name} --path {path}; resolve: crystalline origin resolve {name} {path} --keep mine|theirs, or --content-file <f>)"
+        )
+    };
+    vec![first, format!("    {words}")]
+}
+
 /// Print `origin share`'s result: the proposal URL and change summary when
 /// one was opened or an already-open one was updated in place, the friendly
 /// "nothing to share" line when the team already has everything the domain
@@ -961,11 +1046,23 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "updated" => {
             let prop = &data["proposal"];
-            lines.push(format!(
-                "Updated proposal #{}: {}",
-                prop["number"].as_u64().unwrap_or(0),
-                prop["url"].as_str().unwrap_or("")
-            ));
+            // A note on an update says the team merged the proposal while the
+            // change was on its way: that is the headline, not "Updated".
+            match data["note"].as_str() {
+                Some(note) => {
+                    lines.push(note.to_string());
+                    lines.push(format!(
+                        "  Proposal #{}: {}",
+                        prop["number"].as_u64().unwrap_or(0),
+                        prop["url"].as_str().unwrap_or("")
+                    ));
+                }
+                None => lines.push(format!(
+                    "Updated proposal #{}: {}",
+                    prop["number"].as_u64().unwrap_or(0),
+                    prop["url"].as_str().unwrap_or("")
+                )),
+            }
             if let Some(summary) = prop["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -998,7 +1095,13 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
             let url = prop["url"].as_str().unwrap_or("");
             // An older daemon sends no `own`; its proposal_open was always
             // the sharer's own.
-            if data["own"].as_bool() == Some(false) {
+            // The server's own sentence when it sends one: it says whose the
+            // proposal is, which this side cannot know.
+            if data["own"].as_bool() == Some(false)
+                && let Some(guidance) = data["guidance"].as_str()
+            {
+                lines.push(format!("Cannot share '{domain}': {guidance}"));
+            } else if data["own"].as_bool() == Some(false) {
                 lines.push(format!(
                     "Cannot share '{domain}': proposal #{number} ({url}) is another person's and is still open. Share again once it is merged or closed."
                 ));
@@ -1053,12 +1156,33 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                     "conflicts need"
                 )
             ));
-            for c in data["conflicts"].as_array().unwrap_or(&empty) {
-                lines.push(format!("  conflict: {}", c["path"].as_str().unwrap_or("")));
+            let conflicts = data["conflicts"].as_array().unwrap_or(&empty);
+            for c in conflicts {
+                let path = c["path"].as_str().unwrap_or("");
+                // A draft's line names only the ways out its kind leaves: a
+                // file merges no text, a taken address cannot keep its own.
+                match draft_kind_words(c) {
+                    Some(_) => lines.extend(update_conflict_lines(domain, c)),
+                    None => lines.push(format!("  conflict: {path}")),
+                }
             }
-            lines.push(format!(
-                "Run: crystalline origin resolve {domain} <path> --keep mine|theirs"
-            ));
+            // A draft's conflict is settled on her draft, and her other files
+            // can still be shared meanwhile.
+            if conflicts.iter().any(|c| c["draft"] == true) {
+                lines.push(
+                    "These drafts of yours do not fit the team's text. Settle each one as its \
+                     line says."
+                        .to_string(),
+                );
+                lines.push(format!(
+                    "You can still share your other files: crystalline origin share {domain} \
+                     --file <path>"
+                ));
+            } else {
+                lines.push(format!(
+                    "Run: crystalline origin resolve {domain} <path> --keep mine|theirs"
+                ));
+            }
         }
         other => lines.push(format!(
             "origin share '{domain}': unexpected outcome '{other}'"
@@ -1262,6 +1386,30 @@ pub(crate) fn print_origin_diff(domain: &str, data: &serde_json::Value, json: bo
                 .header(&format!("a/{path} (team)"), &format!("b/{path} (mine)"))
         );
     }
+    if let Some(line) = draft_conflict_resolve_line(domain, &data["draft_conflict"]) {
+        println!();
+        println!("{line}");
+    }
+}
+
+/// The resolve line `origin diff --path` ends with for a draft in conflict:
+/// the ways out its kind leaves, with `--expect-upstream` and the team side's
+/// digest, so the resolve is refused if the team's text moves before it runs:
+/// nobody settles against a team text they were not shown. `None` for anything that is not a draft conflict.
+fn draft_conflict_resolve_line(domain: &str, conflict: &serde_json::Value) -> Option<String> {
+    let path = conflict["path"].as_str()?;
+    let digest = conflict["upstream_sha256"].as_str()?;
+    let ways = if conflict["kind"] == "AddressTaken" {
+        "--keep theirs, or --content-file <f> with another address"
+    } else if conflict["file"] == true {
+        "--keep mine|theirs"
+    } else {
+        "--keep mine|theirs, or --content-file <f>"
+    };
+    Some(format!(
+        "Your draft does not fit the team's text. To settle it against the team's text as it is \
+         now: crystalline origin resolve {domain} {path} {ways}, with --expect-upstream {digest}"
+    ))
 }
 
 /// `origin discard`'s preview: one line per named path saying what the
@@ -1346,16 +1494,244 @@ pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) -> bool
 
 /// Print `origin resolve`'s result: the resolved path and how many
 /// conflicts remain open.
-pub(crate) fn print_origin_resolve(data: &serde_json::Value, json: bool) {
+pub(crate) fn print_origin_resolve(
+    domain: &str,
+    asked: &str,
+    data: &serde_json::Value,
+    json: bool,
+) {
     if json {
         println!("{data}");
         return;
     }
-    println!("Resolved: {}", data["resolved"].as_str().unwrap_or(""));
-    println!(
-        "Remaining conflicts: {}",
-        data["remaining"].as_u64().unwrap_or(0)
-    );
+    for line in origin_resolve_lines(domain, asked, data) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_origin_resolve`] prints for a resolve of `asked` in
+/// `domain`. A
+/// draft's receipt (`draft: true`) says what each choice did: theirs ends the
+/// draft and says where a kept copy is, and a path at the other end of a move
+/// names where the draft is. The folder's own conflict at a file says what
+/// the folder holds now and where a copy of its file is. A count the engine
+/// could not read
+/// (`remaining: null`) is said so, never printed as 0.
+fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> Vec<String> {
+    let resolved = data["resolved"].as_str().unwrap_or("");
+    let file = data["file"] == true;
+    let mut lines = Vec::new();
+    if data["draft"] == true && data["kept"] == "theirs" {
+        let theirs = if file { "file" } else { "text" };
+        if data["kept_copy"] == true {
+            // An old draft: it ended, and nothing of hers is gone.
+            lines.push(format!(
+                "Your draft of {resolved} ended. You now read the team's {theirs}."
+            ));
+            lines.push(match data["kept_file"].as_str() {
+                // A kept file is not text, so `kept show` cannot print it: its
+                // place on this machine's disk is how it is found.
+                Some(kept) => format!("A copy is kept at {kept}: see crystalline kept list."),
+                None => "A copy is kept: see crystalline kept list.".to_string(),
+            });
+        } else {
+            lines.push(format!(
+                "Your draft of {resolved} is gone. You now read the team's {theirs}."
+            ));
+        }
+    } else {
+        lines.push(format!("Resolved: {resolved}"));
+        if data["draft"] == true {
+            let what = if file { "file" } else { "page" };
+            match data["kept"].as_str() {
+                Some("mine") if data["deletion"] == true && data["moved_to"].is_string() => lines
+                    .push(format!(
+                        "The team moved this {what} to {}, so your deletion removes nothing and \
+                         ends.",
+                        data["moved_to"].as_str().unwrap_or("")
+                    )),
+                Some("mine") if data["deletion"] == true => lines.push(format!(
+                    "Your deletion removes the team's {what} when you share."
+                )),
+                Some("mine") if file => {
+                    lines.push("Your file replaces the team's when you share.".to_string())
+                }
+                Some("mine") => {
+                    lines.push("Your text replaces the team's when you share.".to_string())
+                }
+                Some("merged") => lines.push("Your draft now holds the merged text.".to_string()),
+                _ => {}
+            }
+        } else if file {
+            // The folder's own conflict at a file: what the folder holds now,
+            // and where the copy of its own file went.
+            if let Some(note) = data["note"].as_str() {
+                lines.push(note.to_string());
+            }
+            if data["kept_copy"] == true {
+                lines.push(match data["kept_file"].as_str() {
+                    Some(kept) => format!(
+                        "A copy of the folder's file is kept at {kept}: see crystalline kept list."
+                    ),
+                    None => "A copy of the folder's file is kept: see crystalline kept list."
+                        .to_string(),
+                });
+            }
+        }
+    }
+    if data["draft"] == true && !asked.is_empty() && !resolved.is_empty() && asked != resolved {
+        lines.push(format!(
+            "You named {asked}. Your draft is at {resolved}, and this settles the whole move."
+        ));
+    }
+    lines.push(match data["remaining"].as_u64() {
+        Some(n) => format!("Remaining conflicts: {n}"),
+        None => format!(
+            "The number of conflicts left could not be read. Run: crystalline origin status \
+             --domain {domain} to see them."
+        ),
+    });
+    if let Some(warning) = data["draft_warning"].as_str() {
+        lines.push(format!("Note: {warning}"));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod origin_resolve_tests {
+    use super::origin_resolve_lines;
+
+    /// Keep mine says what her side does on a share: a deletion removes the
+    /// team's page or file, a file replaces the team's file.
+    #[test]
+    fn keep_mine_says_what_a_deletion_and_a_file_do() {
+        let said = |receipt: serde_json::Value| origin_resolve_lines("team", "x", &receipt);
+        let deletion = said(serde_json::json!({
+            "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine",
+            "deletion": true,
+        }));
+        assert!(
+            deletion.contains(&"Your deletion removes the team's page when you share.".to_string()),
+            "{deletion:?}"
+        );
+        let file_deletion = said(serde_json::json!({
+            "resolved": "assets/deck.png", "remaining": 0, "draft": true, "file": true,
+            "kept": "mine", "deletion": true,
+        }));
+        assert!(
+            file_deletion
+                .contains(&"Your deletion removes the team's file when you share.".to_string()),
+            "{file_deletion:?}"
+        );
+        let moved = said(serde_json::json!({
+            "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine",
+            "deletion": true, "moved_to": "archive/plan.md",
+        }));
+        assert!(
+            moved.contains(
+                &"The team moved this page to archive/plan.md, so your deletion removes nothing \
+                  and ends."
+                    .to_string()
+            ),
+            "{moved:?}"
+        );
+        let file = said(serde_json::json!({
+            "resolved": "assets/deck.png", "remaining": 0, "draft": true, "file": true,
+            "kept": "mine",
+        }));
+        assert!(
+            file.contains(&"Your file replaces the team's when you share.".to_string()),
+            "{file:?}"
+        );
+    }
+
+    #[test]
+    fn a_count_that_could_not_be_read_is_not_printed_as_zero() {
+        let lines = origin_resolve_lines(
+            "team",
+            "plan.md",
+            &serde_json::json!({
+                "resolved": "plan.md",
+                "remaining": null,
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: plan.md".to_string(),
+                "The number of conflicts left could not be read. Run: crystalline origin status \
+                 --domain team to see them."
+                    .to_string(),
+            ]
+        );
+        let lines = origin_resolve_lines(
+            "team",
+            "plan.md",
+            &serde_json::json!({
+                "resolved": "plan.md",
+                "remaining": 2,
+                "draft_warning": "a note from the writer",
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: plan.md".to_string(),
+                "Remaining conflicts: 2".to_string(),
+                "Note: a note from the writer".to_string(),
+            ]
+        );
+    }
+
+    /// The folder's own conflict at a file says what the folder holds now,
+    /// and where the copy of its file is when one was kept.
+    #[test]
+    fn a_folder_file_says_what_the_folder_holds_and_where_its_copy_is() {
+        let lines = origin_resolve_lines(
+            "team",
+            "assets/deck.png",
+            &serde_json::json!({
+                "resolved": "assets/deck.png",
+                "remaining": 0,
+                "file": true,
+                "kept": "theirs",
+                "note": "The folder now holds the team's file.",
+                "kept_copy": true,
+                "kept_file": "/state/kept/team/engram/assets/deck.2026.png",
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: assets/deck.png".to_string(),
+                "The folder now holds the team's file.".to_string(),
+                "A copy of the folder's file is kept at \
+                 /state/kept/team/engram/assets/deck.2026.png: see crystalline kept list."
+                    .to_string(),
+                "Remaining conflicts: 0".to_string(),
+            ]
+        );
+        let lines = origin_resolve_lines(
+            "team",
+            "assets/deck.png",
+            &serde_json::json!({
+                "resolved": "assets/deck.png",
+                "remaining": 0,
+                "file": true,
+                "kept": "mine",
+                "note": "The folder keeps its own file.",
+                "kept_copy": false,
+            }),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Resolved: assets/deck.png".to_string(),
+                "The folder keeps its own file.".to_string(),
+                "Remaining conflicts: 0".to_string(),
+            ]
+        );
+    }
 }
 
 /// Reads `--content-file`'s bytes for `origin resolve --content-file`, as raw
@@ -4607,6 +4983,121 @@ fn print_report(r: &crystalline_index::SyncReport) {
 mod origin_share_tests {
     use super::origin_share_lines;
 
+    /// Each draft conflict is offered only the ways out that work for it: a
+    /// file has no merged text, a taken address no Keep mine.
+    #[test]
+    fn a_refusal_offers_each_draft_the_ways_out_its_kind_leaves() {
+        let lines = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 3,
+                "conflicts": [
+                    { "path": "assets/deck.png", "kind": "EditEdit", "draft": true, "file": true },
+                    { "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true },
+                    { "path": "plan.md", "kind": "EditEdit", "draft": true },
+                ],
+            }),
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains(
+                "  conflict: assets/deck.png (a file: resolve: crystalline origin resolve team \
+                 assets/deck.png --keep mine|theirs)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "resolve team mine.md --keep theirs, or --content-file <f> with another address"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("resolve team plan.md --keep mine|theirs, or --content-file <f>)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("<path> --keep mine|theirs, or --content-file"),
+            "{text}"
+        );
+    }
+
+    /// An old draft under an address clash: nobody can tell what the team
+    /// changed in the page, and the line says so rather than claim a change.
+    #[test]
+    fn a_taken_address_over_an_old_draft_says_it_cannot_tell() {
+        let lines = super::update_conflict_lines(
+            "team",
+            &serde_json::json!({
+                "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true,
+                "page_kind": "UnknownStart",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "    the team's file z.md now uses the same address; we cannot tell what the team \
+             changed in the page since your draft started"
+        );
+    }
+
+    /// An address clash over a page the team also changed says both.
+    #[test]
+    fn a_taken_address_says_the_page_changed_too() {
+        let lines = super::update_conflict_lines(
+            "team",
+            &serde_json::json!({
+                "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true,
+                "page_kind": "EditEdit",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "    the team's file z.md now uses the same address; the team also changed the page \
+             itself, which a new address does not settle"
+        );
+    }
+
+    #[test]
+    fn a_refusal_for_drafts_names_the_resolve_verb_and_the_other_files() {
+        let drafts = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 1,
+                "conflicts": [{ "path": "plan.md", "kind": "EditEdit", "draft": true }],
+            }),
+        );
+        assert!(
+            drafts.contains(&"    you and the team changed the same lines".to_string()),
+            "{drafts:?}"
+        );
+        assert!(
+            drafts
+                .iter()
+                .any(|line| line.contains("crystalline origin resolve team plan.md")),
+            "{drafts:?}"
+        );
+        assert!(
+            drafts
+                .last()
+                .is_some_and(|line| line.contains("crystalline origin share team --file")),
+            "{drafts:?}"
+        );
+
+        let folder = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 1,
+                "conflicts": [{ "path": "plan.md" }],
+            }),
+        );
+        assert!(
+            folder
+                .last()
+                .is_some_and(|line| line.contains("origin resolve team")),
+            "{folder:?}"
+        );
+    }
+
     #[test]
     fn a_share_says_when_a_spelling_did_not_travel() {
         let note = "A share does not carry a change of letter case.";
@@ -4675,13 +5166,36 @@ mod origin_share_tests {
             open[0],
             "Cannot share 'kb': proposal #4 (https://github.com/acme/knowledge/pull/4) is still open; merge or withdraw it first."
         );
+        // An older daemon sends no guidance, and the line says what it can.
         let foreign = origin_share_lines(
             "kb",
-            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 5, "url": "https://github.com/acme/knowledge/pull/5", "title": "Theirs" }, "guidance": "g" }),
+            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 5, "url": "https://github.com/acme/knowledge/pull/5", "title": "Theirs" } }),
         );
         assert_eq!(
             foreign[0],
             "Cannot share 'kb': proposal #5 (https://github.com/acme/knowledge/pull/5) is another person's and is still open. Share again once it is merged or closed."
+        );
+        // The server's sentence says whose it is, which may be the sharer's own.
+        let unowned = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposal_open", "own": false, "proposal": { "number": 6, "url": "https://github.com/acme/knowledge/pull/6", "title": "Somebody's" }, "guidance": "Proposal #6 is still open, and Crystalline does not know who opened it. Share again when it is merged or closed, or withdraw it if it is yours." }),
+        );
+        assert_eq!(
+            unowned[0],
+            "Cannot share 'kb': Proposal #6 is still open, and Crystalline does not know who opened it. Share again when it is merged or closed, or withdraw it if it is yours."
+        );
+        // An update that met the team's merge leads with what happened.
+        let raced = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "updated", "proposal": { "number": 4, "url": "https://github.com/acme/knowledge/pull/4" }, "note": "The team merged proposal #4 while this change was on its way. If your change is not in it, it stays in your drafts and you can share it again." }),
+        );
+        assert_eq!(
+            raced[0],
+            "The team merged proposal #4 while this change was on its way. If your change is not in it, it stays in your drafts and you can share it again."
+        );
+        assert!(
+            raced.iter().all(|line| !line.starts_with("Updated")),
+            "{raced:?}"
         );
         let protected = origin_share_lines(
             "kb",

@@ -32,6 +32,7 @@ function entry(over: Partial<KeptTextEntry> = {}): KeptTextEntry {
     draft: false,
     kind: "engram",
     path: "a.md",
+    file: false,
     kept_at: "2026-10-15T08:00:00Z",
     bytes: KEPT.length,
     sender: null,

@@ -1313,6 +1313,204 @@ describe("the domain screen", () => {
     expect(screen.queryByRole("region", { name: "Team sync" })).toBeNull();
   });
 
+  it("shows an editor with no share role her own draft conflict, outside the team banners", async () => {
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            review: "overlay",
+            my_drafts: 1,
+            when_to_use: ["Route here for eng questions."],
+          },
+        ],
+      }),
+      "/domains/eng/drafts/conflicts": () => ({
+        conflicts: [
+          {
+            id: "d1234567",
+            path: "notes/a.md",
+            kind: "EditEdit",
+            moved_from: null,
+            other: null,
+            file: false,
+            draft: true,
+          },
+        ],
+        merged: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(
+      within(notice).getByRole("button", { name: "notes/a.md" }),
+    ).toBeVisible();
+    // She may not share, so no sync card, and the status it reads is never
+    // asked for: the notice is her warning.
+    expect(screen.queryByRole("region", { name: "Team sync" })).toBeNull();
+    expect(requested()).not.toContain("/domains/eng/sync");
+  });
+
+  it("lists a draft conflict once, in the notice, beside the sync card", async () => {
+    // An admin, so the sync card draws too. The status lists her draft
+    // conflict after the folder's (it has none here); the card leaves it to
+    // the notice, which opens it through the draft routes.
+    const entry = {
+      id: "d1234567",
+      path: "notes/a.md",
+      kind: "EditEdit",
+      moved_from: null,
+      other: null,
+      file: false,
+      draft: true,
+    };
+    serve(
+      {
+        "/domains/eng/sync": () => syncResponse({ conflicts: [entry] }),
+        "/domains/eng/drafts/conflicts": () => ({
+          conflicts: [entry],
+          merged: [],
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+
+    const card = await screen.findByRole("region", { name: "Team sync" });
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    const buttons = screen.getAllByRole("button", { name: "notes/a.md" });
+    expect(buttons).toHaveLength(1);
+    expect(notice).toContainElement(buttons[0] ?? null);
+    expect(within(card).queryByText(/conflicts? to settle/)).toBeNull();
+  });
+
+  it("shows her draft conflict on a read-only domain, with what is left to her", async () => {
+    serve({
+      "/domains": () => ({
+        ...domainsResponse(),
+        domains: [{ ...domainsResponse().domains[0], read_only: true }],
+      }),
+      "/domains/eng/manifest": () => ({
+        domain: "eng",
+        markdown: "# eng",
+        sections: manifestSectionsResponse({
+          policies: defaultPolicyRows().map((row) =>
+            row.key === "read_only"
+              ? { ...row, declared: "on", effective: "on" }
+              : row,
+          ),
+        }),
+      }),
+      "/domains/eng/drafts/conflicts": () => ({
+        conflicts: [
+          {
+            id: "d1234567",
+            path: "notes/a.md",
+            kind: "EditEdit",
+            moved_from: null,
+            other: null,
+            file: false,
+            draft: true,
+          },
+        ],
+        merged: [],
+        settle_note:
+          "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(notice).toHaveTextContent(
+      "This domain is read-only. Until its owner turns read-only off, you can only take the team's text for these drafts.",
+    );
+  });
+
+  it("shows her draft conflict while a fold that stopped part way is unfinished", async () => {
+    // The listing says the domain takes changes directly - the fold took the
+    // review key off - but her drafts still stand and must be settled, and
+    // the list route still serves them.
+    serve({
+      "/domains/eng/drafts/conflicts": () => ({
+        conflicts: [
+          {
+            id: "d1234567",
+            path: "notes/a.md",
+            kind: "EditEdit",
+            moved_from: null,
+            other: null,
+            file: false,
+            draft: true,
+          },
+        ],
+        merged: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(
+      within(notice).getByRole("button", { name: "notes/a.md" }),
+    ).toBeVisible();
+  });
+
+  it("shows nothing about draft conflicts on a domain that takes changes directly", async () => {
+    serve({
+      "/domains/eng/drafts/conflicts": () => ({ conflicts: [], merged: [] }),
+    });
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
+    await waitFor(() => {
+      expect(requested()).toContain("/domains/eng/drafts/conflicts");
+    });
+    expect(screen.queryByRole("region", { name: "Your drafts" })).toBeNull();
+  });
+
+  it("tells a session that may not write that its drafts cannot be settled here", async () => {
+    // A viewer now, who still holds a draft in conflict: the listing says
+    // she may not write, and the server says what that leaves her.
+    serve(
+      {
+        "/domains/eng/drafts/conflicts": () => ({
+          conflicts: [
+            {
+              id: "d1234567",
+              path: "notes/a.md",
+              kind: "EditEdit",
+              moved_from: null,
+              other: null,
+              file: false,
+              draft: true,
+            },
+          ],
+          merged: [],
+          settle_note:
+            "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for write access.",
+        }),
+      },
+      "editor",
+      () => meResponse({ user: userFixture({ role: "viewer" }) }),
+    );
+
+    renderApp("/d/eng");
+
+    const notice = await screen.findByRole("region", { name: "Your drafts" });
+    expect(notice).toHaveTextContent(
+      "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for write access.",
+    );
+    expect(notice).not.toHaveTextContent("take the team's text");
+  });
+
   it("says nothing about drafts on a domain that takes changes directly", async () => {
     serve();
 

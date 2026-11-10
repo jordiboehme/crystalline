@@ -59,6 +59,7 @@ use crystalline_remote::state::{self, BaseStamp};
 use serde_json::{Value, json};
 
 use crate::changes::{Change, ChangeKind, EngramChanged};
+use crate::draft_start::{self, DraftStart};
 use crate::engine::{
     ContentSource, Engine, EngineError, EngramText, OVERLAY_NEEDS_IDENTITY, Result, asset_claim,
     folder_slash_lower, is_within_domain, join_rel, note_unmirrored, overlay_descriptor,
@@ -130,6 +131,30 @@ pub struct DomainView<'a> {
     /// than moving the domain's stores out from under it. `None` on every
     /// read view.
     _writing: Option<crate::rename::WriteTicket<'a>>,
+}
+
+/// What [`DomainView::put`] does with the record of where the draft started.
+///
+/// **Whether a row is new is asked of the row, never of the record.** A record
+/// can outlive its row, since a write that failed or a crash leaves one, so every
+/// write at a path with no row writes the record or clears it. That is what keeps
+/// a record left behind from ever being read as a later row's.
+pub(crate) enum StartRule<'a> {
+    /// A write built on nothing it read. A row already held keeps the record it
+    /// has, or keeps having none. A new row gets a fresh one from the base snapshot.
+    IfNew,
+    /// A write built on what the verb read under the draft lock (`None`: nothing
+    /// stood there). A held row is left as under [`StartRule::IfNew`]. A new row's
+    /// start is that text and not what the snapshot says by now, or a pull in
+    /// between would read as in step.
+    IfNewFrom(Option<&'a str>),
+    /// One of the two movers: this is the record, under whatever path it names.
+    /// `None` is a draft with no known start, and no record stands afterwards.
+    Carried(Option<DraftStart>),
+    /// A settle that wrote the record itself, just before this row: a held
+    /// row's record is left exactly as it stands. A new row is as under
+    /// [`StartRule::IfNew`].
+    Settling,
 }
 
 /// What one write into this actor's files overlay landed as
@@ -556,7 +581,109 @@ impl<'a> DomainView<'a> {
         let record = Engine::overlay_record(path, text)?;
         self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
             .await?;
-        self.put(domain_id, path, record).await
+        self.put(domain_id, path, record, StartRule::IfNew).await
+    }
+
+    /// [`DomainView::write`] for a settle that has just written the row's
+    /// record itself, with the mark that says which start goes with this text:
+    /// the record is left as it stands.
+    pub(crate) async fn write_settling(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        text: &str,
+    ) -> Result<Option<String>> {
+        let record = Engine::overlay_record(path, text)?;
+        self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
+            .await?;
+        self.put(domain_id, path, record, StartRule::Settling).await
+    }
+
+    /// [`DomainView::write`] for a verb that read the text it builds on.
+    pub(crate) async fn write_from(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        text: &str,
+        read: Option<&str>,
+    ) -> Result<Option<String>> {
+        let record = Engine::overlay_record(path, text)?;
+        self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
+            .await?;
+        self.put(domain_id, path, record, StartRule::IfNewFrom(read))
+            .await
+    }
+
+    /// [`DomainView::write`] for the destination of a move: the same address
+    /// check, and the record the source held instead of a fresh look at the base
+    /// snapshot, so the draft goes on knowing what it started from.
+    pub(crate) async fn write_moved(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        text: &str,
+        start: Option<DraftStart>,
+    ) -> Result<Option<String>> {
+        let record = Engine::overlay_record(path, text)?;
+        self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
+            .await?;
+        self.put(domain_id, path, record, StartRule::Carried(start))
+            .await
+    }
+
+    /// The record of where this actor's row at `path` started. `Ok(None)` is no
+    /// record, which reads as "we cannot tell". A broken one is an error, and a
+    /// caller refuses on it rather than reading it as no record.
+    pub(crate) fn start_of(&self, path: &str) -> Result<Option<DraftStart>> {
+        let state_dir = self.engine.journal_state_dir()?;
+        draft_start::load(&state_dir, &self.domain, self.writing_actor()?, path).map_err(|source| {
+            EngineError::Io {
+                path: state_dir.display().to_string(),
+                source,
+            }
+        })
+    }
+
+    /// Make the record of `path` say `start`, where `None` is no record.
+    fn set_start(&self, path: &str, start: Option<&DraftStart>) -> std::io::Result<()> {
+        let state_dir = self
+            .engine
+            .journal_state_dir()
+            .map_err(std::io::Error::other)?;
+        let (domain, actor) = (
+            self.domain.as_str(),
+            self.writing_actor().map_err(std::io::Error::other)?,
+        );
+        match start {
+            Some(start) => draft_start::save(&state_dir, domain, actor, start),
+            None => draft_start::clear(&state_dir, domain, actor, path),
+        }
+    }
+
+    /// [`DomainView::set_start`] on the way back from a write that did not
+    /// happen, where nobody is left to refuse. If the record cannot be put back
+    /// it goes, since no record reads as "we cannot tell" and a wrong one would
+    /// read as a known start.
+    fn put_start_back(&self, path: &str, start: Option<&DraftStart>) {
+        let restored = if self.engine.take_failed_start_restore() {
+            Err(std::io::Error::other("the armed failure of a test"))
+        } else {
+            self.set_start(path, start)
+        };
+        if let Err(e) = restored {
+            tracing::error!(
+                domain = self.domain.as_str(),
+                path,
+                "the record of where a draft started could not be put back: {e}"
+            );
+            if let Err(e) = self.set_start(path, None) {
+                tracing::error!(
+                    domain = self.domain.as_str(),
+                    path,
+                    "and it could not be cleared either: {e}"
+                );
+            }
+        }
     }
 
     /// [`Engine::write_overlay_entry`] without the address check, for the one
@@ -568,14 +695,23 @@ impl<'a> DomainView<'a> {
     /// there would be the move losing the draft rather than not making it.
     /// [`Engine::move_within_overlay`] asks the check its own question before
     /// it writes anything at all, so the rule still holds for the move.
+    ///
+    /// `start` is the record the source held, and it goes back after the row, so
+    /// a record that cannot be written costs the draft its known start and never
+    /// its text. A fresh look at the base snapshot would be wrong here twice: a
+    /// damaged snapshot would refuse, and an old draft would come back with a
+    /// start it never had.
     pub(crate) async fn write_unchecked(
         &self,
         domain_id: DomainId,
         path: &str,
         text: &str,
+        start: Option<&DraftStart>,
     ) -> Result<Option<String>> {
         let record = Engine::overlay_record(path, text)?;
-        self.put(domain_id, path, record).await
+        let warning = self.put_row(domain_id, path, record).await?;
+        self.put_start_back(path, start);
+        Ok(warning)
     }
 
     /// Refuse a draft that would answer to an address another path already
@@ -760,8 +896,81 @@ impl<'a> DomainView<'a> {
         })
     }
 
-    /// The row and the mirror of a draft, once the address has been settled.
+    /// The record, the row and the mirror of a draft, once the address has been
+    /// settled.
+    ///
+    /// **The record goes down before the row**, so a crash between them leaves a
+    /// record with no row, which nothing reads, where the other order would leave
+    /// a new row with no record, which reads as an old draft. A record that cannot
+    /// be written refuses the write with nothing changed. A row that then fails
+    /// takes the record back to what it was.
     pub(crate) async fn put(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        record: EngramRecord,
+        start: StartRule<'_>,
+    ) -> Result<Option<String>> {
+        let actor = self.writing_actor()?;
+        let now = {
+            let store = self.engine.store();
+            let store = store.lock().await;
+            store.overlay_entry(domain_id, actor, path).await?
+        };
+        let held = now.is_some();
+        let wanted = match start {
+            StartRule::Settling if held => return self.put_row(domain_id, path, record).await,
+            StartRule::IfNew | StartRule::IfNewFrom(_) if held => {
+                // A merged text of hers that a crash left half saved is
+                // settled against the row it was written to before the row
+                // changes, or the new text would read with the wrong start.
+                if let Some(now) = &now
+                    && let Some(read) = self.start_of(path)?
+                    && read.settling.is_some()
+                {
+                    self.set_start(path, Some(&read.as_settled(&now.content)))
+                        .map_err(|source| EngineError::Io {
+                            path: format!("the draft start record of '{path}'"),
+                            source,
+                        })?;
+                }
+                return self.put_row(domain_id, path, record).await;
+            }
+            StartRule::IfNew | StartRule::Settling => {
+                self.engine.fresh_start(self.domain.as_str(), path)?
+            }
+            StartRule::IfNewFrom(read) => {
+                self.engine
+                    .start_from_read(self.domain.as_str(), path, read)?
+            }
+            // A row that moves to another path leaves what an open proposal
+            // holds behind: the proposal holds her text at the old path, which
+            // her row no longer stands for, and a start moved there on its merge
+            // would read a key the snapshot does not hold as the team deleting
+            // her page. The row merges against the start it carries.
+            StartRule::Carried(start) => start.map(|start| DraftStart {
+                path: path.to_string(),
+                shared: start.shared.filter(|_| start.path == path),
+                ..start
+            }),
+        };
+        // Only a held row's record is worth keeping for the way back: with no
+        // row, whatever stands there is left over from a write that failed.
+        let before = if held { self.start_of(path)? } else { None };
+        self.set_start(path, wanted.as_ref())
+            .map_err(|source| EngineError::Io {
+                path: format!("the draft start record of '{path}'"),
+                source,
+            })?;
+        let written = self.put_row(domain_id, path, record).await;
+        if written.is_err() {
+            self.put_start_back(path, before.as_ref());
+        }
+        written
+    }
+
+    /// The row and the mirror of a draft.
+    async fn put_row(
         &self,
         domain_id: DomainId,
         path: &str,
@@ -909,7 +1118,8 @@ impl<'a> DomainView<'a> {
         self.writer.clone().unwrap_or_else(|| actor.to_string())
     }
 
-    /// The removal itself: the mirror, the row and this actor's edges onto it.
+    /// The removal itself: the mirror, the row, this actor's edges onto it and the
+    /// record of where the row started.
     ///
     /// Private, and the only place [`Store::clear_overlay_entry`] is called
     /// from, so "an overlay row goes away" is one piece of code with two
@@ -964,6 +1174,21 @@ impl<'a> DomainView<'a> {
         match done {
             Ok(permalink) => {
                 store.commit().await?;
+                // Let go first: this waits for the journal's lock, which a large
+                // upload can hold, and every store user would wait with it.
+                drop(store);
+                // After the row, and it fails nothing: the row is what a draft
+                // is, a move's source half cannot be undone from an error here,
+                // and a record with no row is written over by the next row at
+                // this path and read by nothing until then.
+                if let Err(e) = draft_start::clear(&state_dir, domain, actor, path) {
+                    tracing::warn!(
+                        domain,
+                        actor,
+                        path,
+                        "a draft ended and the record of where it started stays behind: {e}"
+                    );
+                }
                 Ok(EngramChanged {
                     domain: domain.to_string(),
                     permalink: permalink.unwrap_or_else(|| crystalline_core::path_permalink(path)),
@@ -1282,6 +1507,18 @@ impl<'a> DomainView<'a> {
         let store = store.lock().await;
         let drafts = store.overlay_entries(src.domain_id, actor).await?;
         let team = store.list_engrams(&p.domain, None, None).await?;
+        // Where the draft being moved started, from its record: a move back onto
+        // that path lands on her own deletion of it, which is no obstacle. Only
+        // a draft she holds has a record to ask, and one that cannot be read
+        // refuses here, as the move would.
+        let started_at = if drafts
+            .iter()
+            .any(|entry| !entry.tombstone && entry.path == src.path)
+        {
+            self.start_of(&src.path)?.and_then(|start| start.from)
+        } else {
+            None
+        };
         // The team's file this very draft was moved from is not in the way: a
         // draft with no team file of its own, and this actor's deletion on another
         // spelling of it, are one case-only move. It can move to a third spelling
@@ -1300,7 +1537,15 @@ impl<'a> DomainView<'a> {
             .iter()
             .any(|entry| !entry.tombstone && entry.path == dest_rel)
             || team.iter().any(|found| found.path == dest_rel);
-        if exact && !moved_from(dest_rel) {
+        // The plain way back: the team's file at the destination is the one this
+        // draft was moved from, and her tombstone stands over it. Only that
+        // tombstone: another deletion of hers is a different team file, which a
+        // move must not replace.
+        let way_back = started_at.as_deref() == Some(dest_rel)
+            && drafts
+                .iter()
+                .any(|entry| entry.tombstone && entry.path == dest_rel);
+        if exact && !moved_from(dest_rel) && !way_back {
             return Err(EngineError::Conflict(format!(
                 "'{dest_rel}' already holds an engram in domain '{}'",
                 p.domain
@@ -1399,6 +1644,9 @@ impl<'a> DomainView<'a> {
                 p.identifier, p.domain
             ))
         })?;
+        // What this verb read, before the steps below rewrite it for its new
+        // place: a first touch of the team's file starts from this.
+        let read = text.clone();
         // Where the engram would answer from once it has moved: the document
         // travels verbatim, so the address travels with it unless the
         // frontmatter never carried one and the path's own slug is it - and
@@ -1455,7 +1703,9 @@ impl<'a> DomainView<'a> {
         // already has, answering to its new name. Nothing is tombstoned and no
         // grant ends, since a grant was minted on the path and the path stays.
         if in_place {
-            let warning = self.write(src.domain_id, &src.path, &text).await?;
+            let warning = self
+                .write_from(src.domain_id, &src.path, &text, Some(&read))
+                .await?;
             let mut receipt = json!({
                 "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
                 "to": { "domain": p.domain, "permalink": dest_permalink, "path": src.path },
@@ -1485,8 +1735,20 @@ impl<'a> DomainView<'a> {
             store
                 .overlay_entry(src.domain_id, actor, &src.path)
                 .await?
-                .is_some_and(|entry| !entry.tombstone)
+                .filter(|entry| !entry.tombstone)
         };
+        // Read before anything is dropped, and a broken record refuses here,
+        // while nothing has changed. No draft means no record to read: the
+        // tombstone written below starts one, and the destination carries that.
+        // A merged text a crash left half saved is settled against the row it
+        // was written to, since the move may change the text.
+        let source_start = match &held_draft {
+            Some(entry) => self
+                .start_of(&src.path)?
+                .map(|start| start.as_settled(&entry.content)),
+            None => None,
+        };
+        let held_draft = held_draft.is_some();
         let base = {
             let store = self.engine.store();
             let store = store.lock().await;
@@ -1510,12 +1772,24 @@ impl<'a> DomainView<'a> {
                 let base_text = self.engine.load_content(src_source, base).await?;
                 warnings.extend(
                     self.engine
-                        .write_overlay_tombstone(&p.domain, actor, base, &base_text)
+                        .write_overlay_tombstone(&p.domain, actor, base, &base_text, &read)
                         .await?,
                 );
             }
         }
-        match self.write(src.domain_id, dest_rel, &text).await {
+        let dest_start = if held_draft {
+            Ok(source_start.clone())
+        } else {
+            self.start_of(&src.path)
+        };
+        let written = match dest_start {
+            Ok(start) => {
+                self.write_moved(src.domain_id, dest_rel, &text, start)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        match written {
             Ok(warning) => warnings.extend(warning),
             Err(e) => {
                 // The destination's ROW did not land - a mirror that failed
@@ -1525,7 +1799,7 @@ impl<'a> DomainView<'a> {
                 // had one, and otherwise nothing of their own at all, which is
                 // the base row showing through again.
                 let undo = if held_draft {
-                    self.write_unchecked(src.domain_id, &src.path, &text)
+                    self.write_unchecked(src.domain_id, &src.path, &text, source_start.as_ref())
                         .await
                         .map(|_| ())
                 } else {
@@ -2392,6 +2666,11 @@ impl<'a> DomainView<'a> {
     /// the answer says `unchanged` and whether those bytes are this actor's
     /// own (`in_overlay`) or the folder's. A retry after a timeout is safe
     /// that way.
+    ///
+    /// **A new entry gets the record of where it started**, written before the
+    /// bytes: the folder's bytes it replaces, as its view showed them. An upload
+    /// over this actor's own bytes or deletion leaves the record alone, so a
+    /// second upload does not move the start and does not settle a conflict.
     async fn put_file_ruled(&self, path: &str, bytes: &[u8], create_only: bool) -> Result<PutFile> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
@@ -2399,7 +2678,16 @@ impl<'a> DomainView<'a> {
             .map_err(|e| self.files_io(path, e))?;
         let lock = self.engine.write_lock(&abs);
         let _guard = lock.lock().await;
+        let before = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        self.refuse_case_twin(
+            &state_dir,
+            actor,
+            path,
+            before == crate::overlay_files::Held::Nothing,
+        )?;
         let shown = self.shows_file(path).await?;
+        let mut shown_sha = None;
         if shown {
             // What this actor's view shows, read the way a read of it reads
             // it. A folder half with no file (a row a hand edit left) shows
@@ -2413,15 +2701,16 @@ impl<'a> DomainView<'a> {
                 Err(EngineError::NotFound(_)) => None,
                 Err(e) => return Err(e),
             };
-            if let Some(row) = held
-                && crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)?
-            {
-                return Ok(PutFile {
-                    row,
-                    created: false,
-                    unchanged: true,
-                    in_overlay,
-                });
+            if let Some(row) = held {
+                if crate::engine::same_bytes(row.size, || Ok(row.sha256.clone()), bytes)? {
+                    return Ok(PutFile {
+                        row,
+                        created: false,
+                        unchanged: true,
+                        in_overlay,
+                    });
+                }
+                shown_sha = Some(row.sha256);
             }
         }
         if create_only && shown {
@@ -2430,8 +2719,16 @@ impl<'a> DomainView<'a> {
                 crate::engine::ASSET_EXISTS
             )));
         }
-        crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
-            .map_err(|e| self.files_io(path, e))?;
+        let new_entry = before == crate::overlay_files::Held::Nothing;
+        if new_entry {
+            self.start_file(&state_dir, actor, path, shown_sha.as_deref())?;
+        }
+        if let Err(e) = crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes) {
+            if new_entry {
+                self.forget_file_start(&state_dir, actor, path);
+            }
+            return Err(self.files_io(path, e));
+        }
         let row = crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))?;
         Ok(PutFile {
             row,
@@ -2481,9 +2778,17 @@ impl<'a> DomainView<'a> {
     ///
     /// [`EngineError::NotFound`] when neither the overlay nor the folder holds
     /// the path, which is the miss [`Engine::attachment_delete`] reports.
+    ///
+    /// A new deletion of a reviewed file gets the record of where it started,
+    /// written before the marker: the folder's bytes it deletes. A deletion of
+    /// this actor's own bytes keeps the record those bytes started from.
     pub(crate) async fn tombstone_file(&self, path: &str) -> Result<()> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
+        let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
+            .map_err(|e| self.files_io(path, e))?;
+        let lock = self.engine.write_lock(&abs);
+        let _guard = lock.lock().await;
         let held = crate::overlay_files::held(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
         // **A path this actor has already deleted is a miss**, not a second
@@ -2498,6 +2803,12 @@ impl<'a> DomainView<'a> {
                 path,
             )));
         }
+        self.refuse_case_twin(
+            &state_dir,
+            actor,
+            path,
+            held == crate::overlay_files::Held::Nothing,
+        )?;
         let base_holds = match self.engine.attachment_delete_size(&self.domain, path).await {
             Ok(_) => true,
             Err(EngineError::NotFound(_)) => false,
@@ -2509,12 +2820,96 @@ impl<'a> DomainView<'a> {
                 path,
             )));
         }
-        let done = if base_holds {
-            crate::overlay_files::tombstone(&state_dir, &self.domain, actor, path)
-        } else {
-            crate::overlay_files::clear(&state_dir, &self.domain, actor, path)
+        if !base_holds {
+            return crate::overlay_files::clear(&state_dir, &self.domain, actor, path)
+                .map_err(|e| self.files_io(path, e));
+        }
+        let new_entry = held == crate::overlay_files::Held::Nothing;
+        if new_entry {
+            // What she deletes, as her view shows it: the folder's bytes.
+            let shown = match self.engine.attachment_read(&self.domain, path).await {
+                Ok((_, row)) => Some(row.sha256),
+                Err(EngineError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+            self.start_file(&state_dir, actor, path, shown.as_deref())?;
+        }
+        if let Err(e) = crate::overlay_files::tombstone(&state_dir, &self.domain, actor, path) {
+            if new_entry {
+                self.forget_file_start(&state_dir, actor, path);
+            }
+            return Err(self.files_io(path, e));
+        }
+        Ok(())
+    }
+
+    /// Refuse a draft file whose spelling differs only by case from another
+    /// file where a disk may keep one file for the two, so a share would write
+    /// one over the other without a word:
+    ///
+    /// - another spelling she drafts herself, asked for every write;
+    /// - the team's file, asked only for a new entry (`new_entry`), so her own
+    ///   draft at a spelling can still be changed or deleted.
+    fn refuse_case_twin(
+        &self,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+        new_entry: bool,
+    ) -> Result<()> {
+        if let Some(own) = self
+            .engine
+            .own_case_twin(&self.domain, state_dir, actor, path)?
+        {
+            return Err(EngineError::Conflict(format!(
+                "You already draft '{own}', and on this disk the two names may be one file. \
+                 Use '{own}'."
+            )));
+        }
+        if !new_entry {
+            return Ok(());
+        }
+        match self.engine.team_case_twin(&self.domain, path)? {
+            Some(team) => Err(EngineError::Conflict(format!(
+                "'{path}' and the team's file '{team}' differ only by case, and this disk may \
+                 keep only one of them. Use the name '{team}'."
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Write the record of a new draft file at `path`, from the folder's bytes
+    /// its view showed (`shown`). With no snapshot no record is written, and one
+    /// an earlier entry left behind goes, since it would read as a known start.
+    fn start_file(
+        &self,
+        state_dir: &Path,
+        actor: &str,
+        path: &str,
+        shown: Option<&str>,
+    ) -> Result<()> {
+        let saved = match self.engine.fresh_file_start(&self.domain, path, shown)? {
+            Some(start) => draft_start::save_file(state_dir, &self.domain, actor, &start),
+            None => draft_start::clear_file(state_dir, &self.domain, actor, path),
         };
-        done.map_err(|e| self.files_io(path, e))
+        saved.map_err(|source| EngineError::Io {
+            path: format!("the draft start record of the file '{path}'"),
+            source,
+        })
+    }
+
+    /// Take back the record [`DomainView::start_file`] wrote for an entry that
+    /// was not written. A record left behind is harmless, since the next new
+    /// entry at the path writes its own, so a failure is only logged.
+    fn forget_file_start(&self, state_dir: &Path, actor: &str, path: &str) {
+        if let Err(e) = draft_start::clear_file(state_dir, &self.domain, actor, path) {
+            tracing::warn!(
+                domain = self.domain.as_str(),
+                actor,
+                path,
+                "the record of a draft file that was not written could not be removed: {e}"
+            );
+        }
     }
 
     /// Whose files overlay a write on this view lands in.
@@ -2614,6 +3009,14 @@ impl<'a> DomainView<'a> {
     /// Nothing is cleared: a shared draft is still a draft, and the entries stay
     /// exactly as they stand until the merged work is pulled back and convergence
     /// takes them out.
+    ///
+    /// **A draft is staged in the team's line endings**
+    /// ([`crystalline_core::with_line_endings_of`]), the one exception to "LF
+    /// out" that `line_endings.rs` names: the team's copy where the draft
+    /// started (its record's `from`, or its own path when it has no record)
+    /// decides. A draft of a CRLF file would otherwise share every line as
+    /// changed. A record that cannot be read refuses the share, as every gate
+    /// refuses on one.
     pub(crate) async fn materialise(
         &self,
         state_dir: &Path,
@@ -2690,11 +3093,48 @@ impl<'a> DomainView<'a> {
                     }
                 }
             } else {
-                write_staged_file(staging.root(), &entry.path, entry.content.as_bytes())?;
+                let team = self.team_copy_where_it_started(state_dir, base, &entry.path)?;
+                let text = match &team {
+                    Some(team) => crystalline_core::with_line_endings_of(&entry.content, team),
+                    None => std::borrow::Cow::Borrowed(entry.content.as_str()),
+                };
+                write_staged_file(staging.root(), &entry.path, text.as_bytes())?;
             }
         }
         self.stage_files(&staging)?;
         Ok(staging)
+    }
+
+    /// The team's bytes where this actor's draft at `path` started: at its
+    /// record's `from`, or at `path` when it has no record. `None` for a new
+    /// file, or a path the base snapshot does not hold. Only real keys are read,
+    /// since on a disk that folds case a copy at one spelling answers for
+    /// another.
+    fn team_copy_where_it_started(
+        &self,
+        state_dir: &Path,
+        base: &BTreeMap<String, BaseStamp>,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(actor) = self.actor.as_deref() else {
+            return Ok(None);
+        };
+        let journal_dir = self.engine.journal_state_dir()?;
+        let record =
+            draft_start::load(&journal_dir, &self.domain, actor, path).map_err(|source| {
+                EngineError::Io {
+                    path: format!("the draft start record of '{path}'"),
+                    source,
+                }
+            })?;
+        let key = match &record {
+            Some(record) => record.from.as_deref(),
+            None => Some(path),
+        };
+        match key {
+            Some(key) if base.contains_key(key) => Ok(state::read_base_file(state_dir, key)?),
+            _ => Ok(None),
+        }
     }
 
     /// Lay this actor's files overlay over the staged tree, after the rows: a

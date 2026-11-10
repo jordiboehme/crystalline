@@ -7,9 +7,10 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use crystalline_core::kept::KeptText;
+use crystalline_core::kept::{self, KeptText};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -18,6 +19,25 @@ use super::{ApiError, ApiPath, ProblemDetail, RestState, refuse_read_only};
 
 /// The anonymous viewer's answer: kept texts belong to people who write.
 const ANONYMOUS_KEPT: &str = "kept texts are for signed-in people who may write this domain";
+
+/// What a caller is told when the server cannot read a kept copy: a fault on
+/// the server's side, said without the server's own path, which a caller over
+/// the API cannot open and should not learn.
+const KEPT_UNREADABLE: &str = "This kept copy could not be read. Try again, or ask whoever \
+                               runs this server to look at its log.";
+
+/// An engine error on a kept route, as the caller is told it: a failure on
+/// the server's side (what REST answers 500) is logged with its cause and
+/// answered with [`KEPT_UNREADABLE`]; every refusal keeps its own words.
+fn kept_error(domain: &str, e: crate::engine::EngineError) -> ApiError {
+    let cause = e.to_string();
+    let api: ApiError = e.into();
+    if api.status != StatusCode::INTERNAL_SERVER_ERROR {
+        return api;
+    }
+    tracing::warn!(domain, "a kept copy could not be read: {cause}");
+    ApiError::internal(KEPT_UNREADABLE)
+}
 
 /// One kept text, without its text.
 #[derive(Debug, Serialize, ToSchema)]
@@ -37,6 +57,10 @@ pub struct KeptTextEntry {
     /// `reflections/`.
     #[schema(example = "guides/deploying.md")]
     pub path: String,
+    /// Whether it is a draft file beside the pages, kept as its bytes rather
+    /// than a text: it has no text to read, and is had through
+    /// `GET /domains/{domain}/kept/{id}/file`.
+    pub file: bool,
     /// When it was kept.
     #[schema(value_type = String, format = DateTime, example = "2026-10-15T08:00:00Z")]
     pub kept_at: DateTime<Utc>,
@@ -82,6 +106,7 @@ pub struct KeptTextResponse {
 
 fn entry(kept: KeptText) -> KeptTextEntry {
     KeptTextEntry {
+        file: kept::is_file_copy(&kept),
         id: kept.id,
         draft: kept.owner.is_some(),
         kind: kept.kind.as_str().to_string(),
@@ -200,6 +225,21 @@ pub async fn list(
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 422,
+            description = "The kept copy is a file, not text. The detail says \
+                           so in a sentence to show.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The server could not read the kept copy. The \
+                           detail names no place on the server's disk; the \
+                           cause is in the server's log.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn read(
@@ -211,12 +251,101 @@ pub async fn read(
     let (kept, text) = state
         .engine
         .kept_text(&domain, &id, &identity.scope())
-        .await?;
+        .await
+        .map_err(|e| kept_error(&domain, e))?;
     Ok(Json(KeptTextResponse {
         domain,
         entry: entry(kept),
         text,
     }))
+}
+
+/// `GET /domains/{domain}/kept/{id}/file`
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/kept/{id}/file",
+    tag = "domains",
+    operation_id = "download_kept_copy",
+    summary = "One kept copy as its bytes, to download.",
+    description = "The same rights as reading it. The answer is the kept \
+                   copy as it was kept, always as a download named for the \
+                   file (`Content-Disposition: attachment`) and never \
+                   rendered in place, with `X-Content-Type-Options: nosniff` \
+                   and a sandboxing `Content-Security-Policy`. This is how a \
+                   draft file kept as its bytes (`file: true` in the \
+                   listing) is had back; a text comes back as its text.",
+    params(
+        ("domain" = String, Path, description = "The domain."),
+        ("id" = String, Path, description = "The id from the listing."),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The kept copy's bytes.",
+            content_type = "application/octet-stream",
+            body = Vec<u8>,
+        ),
+        (
+            status = 401,
+            description = "The anonymous viewer of a domain it reads.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "Neither write access to the engrams nor edit \
+                           access to the Reflection.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or kept copy for this caller.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The server could not read the kept copy. The \
+                           detail names no place on the server's disk; the \
+                           cause is in the server's log.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn download(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+) -> Result<Response, ApiError> {
+    refuse_anonymous(&state, &identity, &domain).await?;
+    let (kept, bytes) = state
+        .engine
+        .kept_bytes(&domain, &id, &identity.scope())
+        .await
+        .map_err(|e| kept_error(&domain, e))?;
+    // A person's own bytes from the state folder: never sniffed, never
+    // rendered in this origin, always saved as a file named for its path.
+    let name = crate::files::download_filename(&kept.path);
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CACHE_CONTROL, "private, no-store".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                crate::files::ATTACHMENT_CSP.to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// `DELETE /domains/{domain}/kept/{id}`

@@ -17,14 +17,14 @@
 //! one `DomainView::address_map` rather than by two call sites agreeing to
 //! agree.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crystalline_core::config::DomainEntry;
 use crystalline_index::EngramDescriptor;
 use serde_json::{Value, json};
 
 use crate::domain_view::DomainView;
-use crate::engine::EngineError;
+use crate::engine::{DraftConflict, EngineError};
 
 /// What one actor's drafts become when their domain stops reviewing changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,8 @@ pub enum FoldChoice {
 /// for anybody to decide about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewModeConfirm {
-    /// Answer what this would do, and write nothing.
+    /// Answer what this would do, and fold nothing. The convergence pass runs
+    /// first, so a draft the team's change merges into is merged.
     Preview,
     /// Make the change, with one [`FoldChoice`] per actor holding drafts.
     Confirmed {
@@ -108,11 +109,43 @@ pub(crate) fn left_json(
     })
 }
 
+/// What each actor's drafts in a fold plan stand against: the conflicts read
+/// for each of them, the actors whose conflicts could not be read, and who is
+/// asking, so a row of their own is said to them as theirs.
+pub(crate) struct PlanConflicts<'a> {
+    pub(crate) conflicts: &'a HashMap<String, Vec<DraftConflict>>,
+    pub(crate) unreadable: &'a HashSet<String>,
+    /// The names with no account any more, among those with conflicts.
+    pub(crate) removed: &'a HashSet<String>,
+    pub(crate) reader: Reader<'a>,
+}
+
+/// Who reads a plan or a refusal: their own drafts are said to them as theirs,
+/// and the way out for a removed name depends on whether they are an admin.
+#[derive(Clone, Copy)]
+pub(crate) struct Reader<'a> {
+    pub(crate) viewer: Option<&'a str>,
+    pub(crate) admin: bool,
+}
+
+impl Reader<'_> {
+    /// The way out of a removed name's conflicts that this reader can take.
+    fn removed_way_out(&self) -> &'static str {
+        if self.admin {
+            "Choose discard, or end their drafts on the Users screen."
+        } else {
+            "Choose discard, or ask an admin to end their drafts on the Users screen."
+        }
+    }
+}
+
 /// The plan a preview answers with, and the shape Task 8's removal gate
 /// reads the same rows through.
 ///
-/// `conflict` on a draft is the choice-independent half: an address another
-/// path already answers to, which no fold of that draft alone can avoid.
+/// `conflict` on a draft is the choice-independent half: a draft that does
+/// not fit the team's text, which only its author can settle, or an address
+/// another path already answers to, which no fold of that draft alone can
+/// avoid. A move's deletion half carries its draft's sentence too.
 /// `contested_paths` is the other half, which depends on the answers: a path
 /// two actors are drafting refuses only if both of them fold.
 pub(crate) fn plan_json(
@@ -120,6 +153,7 @@ pub(crate) fn plan_json(
     entry: &DomainEntry,
     drafts: &[ActorDrafts],
     base: &[EngramDescriptor],
+    standing: &PlanConflicts<'_>,
 ) -> Value {
     let mut by_path: HashMap<&str, Vec<&str>> = HashMap::new();
     for held in drafts {
@@ -142,13 +176,35 @@ pub(crate) fn plan_json(
             // else did, which is the only address question a plan can
             // answer before the answers are in.
             let surviving = DomainView::address_map(&[held], base);
+            let unsettled: HashSet<&str> = standing
+                .conflicts
+                .get(&held.actor)
+                .into_iter()
+                .flatten()
+                .flat_map(|c| std::iter::once(c.path.as_str()).chain(c.moved_from.as_deref()))
+                .collect();
+            let actor = held.actor.as_str();
+            let sentence = if standing.reader.viewer == Some(actor) {
+                "You have a conflict here. Settle it first.".to_string()
+            } else if standing.removed.contains(actor) {
+                format!(
+                    "'{actor}' has no account any more, so nobody can settle this. {}",
+                    standing.reader.removed_way_out()
+                )
+            } else {
+                format!("'{actor}' has a conflict here. Ask them to settle it, or choose discard.")
+            };
             let mut rows: Vec<Value> = held
                 .entries
                 .iter()
                 .map(|draft| {
-                    let conflict = (!draft.tombstone)
-                        .then(|| address_held_elsewhere(draft, &surviving))
-                        .flatten();
+                    let conflict = if unsettled.contains(draft.path.as_str()) {
+                        Some(sentence.clone())
+                    } else {
+                        (!draft.tombstone)
+                            .then(|| address_held_elsewhere(draft, &surviving))
+                            .flatten()
+                    };
                     json!({
                         "path": draft.path,
                         "permalink": draft.permalink,
@@ -168,7 +224,9 @@ pub(crate) fn plan_json(
                     "path": file.path,
                     "kind": "file",
                     "tombstone": file.tombstone,
-                    "conflict": Value::Null,
+                    "conflict": unsettled
+                        .contains(file.path.as_str())
+                        .then(|| sentence.clone()),
                 })
             }));
             let mut actor = json!({
@@ -187,6 +245,18 @@ pub(crate) fn plan_json(
                 && let Some(object) = actor.as_object_mut()
             {
                 object.insert("files_unreadable".to_string(), json!(true));
+            }
+            // The same for an actor whose conflicts could not be read: a fold
+            // of them refuses, and the plan says why before anyone answers,
+            // in the refusal's own sentence for this reader.
+            if standing.unreadable.contains(&held.actor)
+                && let Some(object) = actor.as_object_mut()
+            {
+                object.insert("conflicts_unreadable".to_string(), json!(true));
+                object.insert(
+                    "conflicts_unreadable_reason".to_string(),
+                    json!(unreadable_reason(&held.actor, standing.reader)),
+                );
             }
             actor
         })
@@ -262,6 +332,100 @@ pub(crate) fn contested_addresses(drafts: &[ActorDrafts]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// The refusal of a fold while drafts that do not fit the team's text stand,
+/// or `None` when every folding actor's drafts are settled.
+///
+/// Only the actors in `folding` are asked: discard ends a draft whatever it
+/// holds, so a colleague's conflict never blocks the others once discard is
+/// chosen for them. A name in `removed` has no account, so nobody can settle
+/// its conflicts and the sentence names the ways out `reader` can take.
+/// `recovering` is a fold repeated after one that stopped part way: part of
+/// the domain is folded already, and what it wrote stays in the folder.
+pub(crate) fn unsettled(
+    domain: &str,
+    folding: &[&ActorDrafts],
+    conflicts: &HashMap<String, Vec<DraftConflict>>,
+    removed: &HashSet<String>,
+    reader: Reader<'_>,
+    recovering: bool,
+) -> Option<String> {
+    let mut sentences = Vec::new();
+    for held in folding {
+        let Some(standing) = conflicts.get(&held.actor).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let actor = held.actor.as_str();
+        let paths: Vec<&str> = standing.iter().map(|c| c.path.as_str()).collect();
+        let paths = paths.join(", ");
+        sentences.push(if reader.viewer == Some(actor) {
+            format!(
+                "You have conflicts in {paths}. Settle them first, or choose discard, which \
+                 ends your text."
+            )
+        } else if removed.contains(actor) {
+            format!(
+                "'{actor}' has conflicts in {paths} and no account any more, so nobody can \
+                 settle them. {}",
+                reader.removed_way_out()
+            )
+        } else {
+            format!(
+                "'{actor}' has conflicts in {paths}. They can settle them, or you can choose \
+                 discard, which ends their text."
+            )
+        });
+    }
+    if sentences.is_empty() {
+        return None;
+    }
+    Some(match recovering {
+        false => format!("Nothing in '{domain}' was folded. {}", sentences.join(" ")),
+        true => format!(
+            "Nothing more in '{domain}' was folded. {} An earlier fold stopped part way, and \
+             what it wrote stays in the folder whatever you choose.",
+            sentences.join(" ")
+        ),
+    })
+}
+
+/// The refusal of a fold when `actor`'s conflicts could not be read: their
+/// drafts cannot be folded safely, and discard is the way that is left.
+pub(crate) fn unreadable(
+    domain: &str,
+    actor: &str,
+    reader: Reader<'_>,
+    recovering: bool,
+) -> String {
+    let lead = match recovering {
+        false => format!("Nothing in '{domain}' was folded."),
+        true => format!("Nothing more in '{domain}' was folded."),
+    };
+    format!("{lead} {}", unreadable_reason(actor, reader))
+}
+
+/// Why `actor`'s drafts cannot be folded when their conflicts could not be
+/// read, and the way out `reader` can take: the refusal's sentence without
+/// its lead, which a plan carries on that actor before anybody answers.
+pub(crate) fn unreadable_reason(actor: &str, reader: Reader<'_>) -> String {
+    // Only an admin can read the daemon log the cause went to, or repair the
+    // records under the state folder.
+    let repair = match reader.admin {
+        true => "repair the records the daemon log names and fold again",
+        false => "ask an admin to repair the records and fold again",
+    };
+    if reader.viewer == Some(actor) {
+        format!(
+            "Your draft records could not be read, so your drafts cannot be folded safely. \
+             Choose discard, which ends your text, or {repair}."
+        )
+    } else {
+        format!(
+            "The draft records of '{actor}' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for '{actor}', which ends their text, or {repair}."
+        )
+    }
 }
 
 /// One choice per actor holding drafts, refusing an actor left out and an
@@ -564,6 +728,116 @@ pub(crate) fn removal_choices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held_by(actor: &str) -> ActorDrafts {
+        ActorDrafts {
+            actor: actor.to_string(),
+            entries: Vec::new(),
+            files: Vec::new(),
+            files_unreadable: false,
+        }
+    }
+
+    fn conflict_at(path: &str) -> DraftConflict {
+        DraftConflict {
+            id: "d0000000".to_string(),
+            path: path.to_string(),
+            kind: crate::draft_merge::DraftConflictKind::EditEdit,
+            moved_from: None,
+            file: false,
+            other: None,
+            page_kind: None,
+        }
+    }
+
+    /// A person who cannot read the daemon log is pointed at an admin, never
+    /// at the log.
+    #[test]
+    fn an_unreadable_list_points_a_non_admin_at_an_admin() {
+        let reader = Reader {
+            viewer: Some("jo"),
+            admin: false,
+        };
+        assert_eq!(
+            unreadable("eng", "ada", reader, false),
+            "Nothing in 'eng' was folded. The draft records of 'ada' could not be read, so \
+             their drafts cannot be folded safely. Choose discard for 'ada', which ends their \
+             text, or ask an admin to repair the records and fold again."
+        );
+        let own = unreadable("eng", "jo", reader, false);
+        assert!(!own.contains("log"), "{own}");
+        assert!(own.contains("ask an admin"), "{own}");
+    }
+
+    /// The plan's sentence for an actor whose conflicts could not be read is
+    /// the refusal's without its lead: their own to the actor, a colleague's
+    /// to anyone else, and the repair the reader can do.
+    #[test]
+    fn an_unreadable_actor_reason_is_the_refusal_without_its_lead() {
+        let as_jo = |admin| Reader {
+            viewer: Some("jo"),
+            admin,
+        };
+        assert_eq!(
+            unreadable_reason("ada", as_jo(false)),
+            "The draft records of 'ada' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for 'ada', which ends their text, or ask an admin to repair \
+             the records and fold again."
+        );
+        assert_eq!(
+            unreadable_reason("jo", as_jo(false)),
+            "Your draft records could not be read, so your drafts cannot be folded safely. \
+             Choose discard, which ends your text, or ask an admin to repair the records and \
+             fold again."
+        );
+        assert_eq!(
+            unreadable_reason("ada", as_jo(true)),
+            "The draft records of 'ada' could not be read, so their drafts cannot be folded \
+             safely. Choose discard for 'ada', which ends their text, or repair the records the \
+             daemon log names and fold again."
+        );
+        assert_eq!(
+            unreadable("eng", "ada", as_jo(true), false),
+            format!(
+                "Nothing in 'eng' was folded. {}",
+                unreadable_reason("ada", as_jo(true))
+            )
+        );
+    }
+
+    /// A domain owner who is not an admin cannot end a removed name's drafts,
+    /// so their refusal names the admin; an admin reads the way they can take.
+    #[test]
+    fn a_removed_names_way_out_is_one_the_reader_can_take() {
+        let ada = held_by("ada");
+        let conflicts = HashMap::from([("ada".to_string(), vec![conflict_at("plan.md")])]);
+        let removed = HashSet::from(["ada".to_string()]);
+        let said = |admin| {
+            unsettled(
+                "eng",
+                &[&ada],
+                &conflicts,
+                &removed,
+                Reader {
+                    viewer: Some("jo"),
+                    admin,
+                },
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            said(false),
+            "Nothing in 'eng' was folded. 'ada' has conflicts in plan.md and no account any \
+             more, so nobody can settle them. Choose discard, or ask an admin to end their \
+             drafts on the Users screen."
+        );
+        assert!(
+            said(true).ends_with("Choose discard, or end their drafts on the Users screen."),
+            "{}",
+            said(true)
+        );
+    }
 
     fn counts(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
         pairs

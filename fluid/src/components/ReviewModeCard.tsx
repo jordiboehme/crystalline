@@ -173,6 +173,13 @@ export function ReviewModeCard({
                             so review mode cannot be taken off until they can.
                           </p>
                         )}
+                        {/* The server's own sentence, said before anybody
+                            answers, on the row it is about. */}
+                        {row.conflicts_unreadable_reason != null && (
+                          <p className="text-sm text-red-700 dark:text-red-300">
+                            {row.conflicts_unreadable_reason}
+                          </p>
+                        )}
                         <ul className="ml-4 list-disc text-sm text-slate-600 dark:text-slate-400">
                           {row.drafts.map((draft) => (
                             <li key={draft.path}>

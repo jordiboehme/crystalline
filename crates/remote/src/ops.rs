@@ -671,6 +671,15 @@ pub async fn pull_with(
     // refresh: `status` can flip a record to Merged between pulls, and such a
     // record is un-consumed work this pull has to finish.
     let (transitions, _) = refresh_proposals(provider, spec, &mut state).await?;
+    let transitions = hold_back_late_merges(
+        provider,
+        spec,
+        &mut state,
+        transitions,
+        new_etag.as_deref(),
+        &head,
+    )
+    .await;
     let merged_to_consume: Vec<Proposal> = state
         .proposals
         .iter()
@@ -907,6 +916,57 @@ pub async fn pull_with(
         skipped_large,
         re_baselined: false,
     })
+}
+
+/// Keep a proposal this refresh found merged in the chain, as open, when
+/// `main` may have taken the merge after this pull read it at `head`.
+///
+/// The head is read before the proposal states, so a merge that lands between
+/// the two reads is a Merged record over a base that does not hold it, and
+/// every reader of history takes a merged record's files to be in the base:
+/// the convergence pass would settle a draft against the team's text from
+/// before the merge. So `main` is read once more, only when this refresh found
+/// a merge. Still at `head`, the merge is in it. Moved, or unreadable, the
+/// record stays open and out of the transitions, and the next pull finds it
+/// merged again with a head read after the merge.
+async fn hold_back_late_merges(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    transitions: Vec<(u64, ProposalStatus)>,
+    etag: Option<&str>,
+    head: &str,
+) -> Vec<(u64, ProposalStatus)> {
+    let merged: Vec<u64> = transitions
+        .iter()
+        .filter(|(_, status)| *status == ProposalStatus::Merged)
+        .map(|(number, _)| *number)
+        .collect();
+    if merged.is_empty() {
+        return transitions;
+    }
+    let still = match provider.branch_head(spec, etag).await {
+        Ok(HeadProbe::Unchanged) => true,
+        Ok(HeadProbe::Changed { head: now, .. }) => now == head,
+        Err(e) => {
+            tracing::debug!("reading the head again after a merge failed: {e}");
+            false
+        }
+    };
+    if still {
+        return transitions;
+    }
+    for prop in state
+        .proposals
+        .iter_mut()
+        .filter(|prop| merged.contains(&prop.number))
+    {
+        prop.status = ProposalStatus::Open;
+    }
+    transitions
+        .into_iter()
+        .filter(|(number, _)| !merged.contains(number))
+        .collect()
 }
 
 /// Moves every Merged record out of the chain and into history, queues its
@@ -1783,7 +1843,10 @@ fn folder_of(path: &str) -> &str {
 /// whitespace, a `./` prefix and Windows separators. Anything else is left
 /// alone and simply fails to match, which is a refusal naming the path rather
 /// than a guess about what was meant.
-fn normalize_selected_path(raw: &str) -> String {
+///
+/// Public so a caller that checks a selection before the share (the engine's
+/// draft conflict gate) reads a name exactly as the share will.
+pub fn normalize_selected_path(raw: &str) -> String {
     let trimmed = raw.trim().replace('\\', "/");
     trimmed
         .strip_prefix("./")
@@ -5890,6 +5953,51 @@ pub fn resolve(
     })
 }
 
+/// The two sides of the open conflict at `path` as bytes: what the folder
+/// holds there and what the team holds, each `None` where that side has no
+/// file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictSides {
+    /// The folder's file, read at its spelling on disk.
+    pub folder: Option<Vec<u8>>,
+    /// The team's file, as the pull recorded it.
+    pub team: Option<Vec<u8>>,
+}
+
+/// Reads [`ConflictSides`] for the open conflict at `path`, so a caller can
+/// keep a copy of the folder's file before [`Resolution::Theirs`] replaces it.
+/// The folder's side is read where [`resolve`] writes, at the file's spelling
+/// on disk, so the copy is of the very file the resolve overwrites.
+///
+/// Errors with [`RemoteError::ConflictNotFound`] as [`resolve`] does when no
+/// conflict is open at `path`. Offline.
+pub fn conflict_sides(
+    domain_root: &Path,
+    state_dir: &Path,
+    path: &str,
+) -> Result<ConflictSides, RemoteError> {
+    let state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::Refused(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+    let conflict = state
+        .conflicts
+        .iter()
+        .find(|c| c.path == path)
+        .ok_or_else(|| RemoteError::ConflictNotFound {
+            path: path.to_string(),
+            open: state.conflicts.iter().map(|c| c.path.clone()).collect(),
+        })?;
+    let (_, team) = state::read_conflict_files(state_dir, &conflict.id)?;
+    let local = detect_local_changes(domain_root, &state.files)?;
+    let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
+    Ok(ConflictSides {
+        folder: read_optional_file(&wt_path)?,
+        team,
+    })
+}
+
 /// Handles the "nothing new upstream" outcome of a pull: refresh open
 /// proposals (a proposal can still be declined without the branch moving),
 /// consume any merged record, persist the result and report up to date.
@@ -5924,6 +6032,20 @@ async fn settle_up_to_date(
     cleanup: BranchCleanup,
 ) -> Result<PullReport, RemoteError> {
     let (transitions, _touched) = refresh_proposals(provider, spec, &mut state).await?;
+    let etag = match &new_etag {
+        Some(etag) => etag.clone(),
+        None => state.ref_etag.clone(),
+    };
+    let base = state.base_commit.clone();
+    let transitions = hold_back_late_merges(
+        provider,
+        spec,
+        &mut state,
+        transitions,
+        etag.as_deref(),
+        &base,
+    )
+    .await;
     consume_merged(&mut state);
     if let Some(etag) = new_etag {
         state.ref_etag = etag;
@@ -7027,6 +7149,135 @@ fn settled_manifest(
     let local = std::str::from_utf8(local?).ok()?;
     let upstream = std::str::from_utf8(upstream?).ok()?;
     crystalline_core::settle_evolve_home_claim(base, local, upstream).map(String::into_bytes)
+}
+
+/// [`merge_file`] with the one thing a pull does around it for the MANIFEST at a
+/// domain's root: the evolve home is the engine's line, so when the team's copy
+/// names a home and `local` holds an unshared claim of its own, the team's wins
+/// without a conflict (`settled_manifest`). Any other path is plain
+/// [`merge_file`]. The answer says what to do with `local`, so a settled text
+/// that equals the team's is an `Apply` and not "nothing to do": the file still
+/// holds the claim.
+///
+/// For a merge with no folder behind it, as a review draft has. The pull's own
+/// loop keeps its branches, since it also has to record what it applied.
+pub fn merge_with_manifest_rule(
+    rel: &str,
+    base: Option<&[u8]>,
+    local: Option<&[u8]>,
+    upstream: Option<&[u8]>,
+) -> FileMerge {
+    let settled = if rel == "MANIFEST.md" {
+        settled_manifest(base, local, upstream)
+    } else {
+        None
+    };
+    match merge_file(base, settled.as_deref().or(local), upstream) {
+        FileMerge::Converged => match settled {
+            Some(bytes) if Some(bytes.as_slice()) != local => FileMerge::Apply(bytes),
+            _ => FileMerge::Converged,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod manifest_rule_tests {
+    use super::*;
+    use crate::merge::ConflictKind;
+
+    const BASE: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\n---\nAbout the team.\n";
+    const HERS: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://hers.example\n---\nAbout the team.\n";
+    const HERS_EDITED: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://hers.example\n---\nAbout the team, by her.\n";
+    const TEAM: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://team.example\n---\nAbout the team.\n";
+    const TEAM_SETTLED_HERS: &str = "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://team.example\n---\nAbout the team, by her.\n";
+
+    fn rule(rel: &str, base: &str, local: &str, upstream: &str) -> FileMerge {
+        merge_with_manifest_rule(
+            rel,
+            Some(base.as_bytes()),
+            Some(local.as_bytes()),
+            Some(upstream.as_bytes()),
+        )
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_lets_the_teams_evolve_home_win() {
+        // The claim is all she changed: the team's MANIFEST as it is.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, HERS, TEAM),
+            FileMerge::Apply(TEAM.as_bytes().to_vec())
+        );
+        // She also changed the words: those stay, the home is the team's.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, HERS_EDITED, TEAM),
+            FileMerge::Apply(TEAM_SETTLED_HERS.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_applies_a_settled_text_that_equals_the_teams() {
+        // With no base the settled text is hers with the team's home, which is
+        // the team's text. Her file still holds the claim, so "nothing to do"
+        // would be wrong: the answer says to write it.
+        let answer = merge_with_manifest_rule(
+            "MANIFEST.md",
+            None,
+            Some(HERS.as_bytes()),
+            Some(TEAM.as_bytes()),
+        );
+        assert_eq!(answer, FileMerge::Apply(TEAM.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_answers_as_merge_file_for_any_other_path() {
+        for rel in ["notes/MANIFEST.md", "manifest.md", "plan.md"] {
+            assert_eq!(
+                rule(rel, BASE, HERS, TEAM),
+                merge_file(
+                    Some(BASE.as_bytes()),
+                    Some(HERS.as_bytes()),
+                    Some(TEAM.as_bytes())
+                ),
+                "{rel}"
+            );
+            assert_eq!(
+                rule(rel, BASE, HERS, TEAM),
+                FileMerge::Conflict(ConflictKind::EditEdit),
+                "{rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_with_manifest_rule_keeps_a_deliberate_move_and_the_ordinary_answers() {
+        // A base that names a home: her line is a move on purpose, not a race.
+        // The team moved it too, so it is an ordinary conflict.
+        assert_eq!(
+            rule(
+                "MANIFEST.md",
+                TEAM,
+                HERS,
+                "---\ntitle: Team\ntype: manifest\nstatus: active\nevolve_home: https://third.example\n---\nAbout the team.\n"
+            ),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+        // No claim at all: the merge as it is.
+        assert_eq!(
+            rule("MANIFEST.md", BASE, BASE, TEAM),
+            FileMerge::Apply(TEAM.as_bytes().to_vec())
+        );
+        // Not text: left to the merge, and never decoded with a loss.
+        assert_eq!(
+            merge_with_manifest_rule(
+                "MANIFEST.md",
+                Some(BASE.as_bytes()),
+                Some(HERS.as_bytes()),
+                Some(&[0xff, 0xfe])
+            ),
+            FileMerge::Conflict(ConflictKind::EditEdit)
+        );
+    }
 }
 
 #[cfg(test)]

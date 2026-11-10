@@ -1,0 +1,1626 @@
+//! A draft's conflict, read from what stands: her row, her record of where it
+//! started and the base snapshot. Nothing is stored, so there is nothing to
+//! rebuild and nothing to go stale, and a pass that failed leaves a stale draft
+//! listed rather than clean.
+//!
+//! Rows with a record take their answer from [`next_step`], so the gates and
+//! the pass read one rule: `Landed` or `InStep` is none, `Conflict(k)` is `k`,
+//! and `Take` is `EditEdit`, since a stale row that would merge cleanly still
+//! holds the old text until a pass has merged it. A row with no record never
+//! reaches [`next_step`], which would read it as her own new file: it gets
+//! [`has_landed`] and then the old-draft rows (below).
+//!
+//! A file beside the pages never merges and answers to no address, so it has a
+//! table of its own ([`file_step`]): its bytes against the digest its record
+//! started from and the team's digest now.
+//!
+//! Nothing here asks whether the domain reviews changes, because a fold's
+//! second check runs with the key off, and nothing here takes the origin lock:
+//! status asks it outside the per-domain lock.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use crystalline_index::{EngramRecord, FileStamp, StoredEngram};
+use crystalline_remote::state::{OriginState, base_path, read_base_file};
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use super::{
+    Engine, EngineError, Result, folder_may_fold_case, is_within_domain, page_folds_case,
+    sha256_hex, utf8_side,
+};
+use crate::draft_merge::{
+    DraftConflictKind, DraftSides, DraftStep, SharedFate, TeamText, answers_at_path, has_landed,
+    next_step, settle_shared,
+};
+use crate::draft_start::{self, DraftFileStart, DraftStart};
+use crate::origin::takes_part_in_local_change;
+
+/// One draft of one person that does not fit the team's text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DraftConflict {
+    /// `d` and the first seven hex digits of the sha-256 of
+    /// `"{actor}\0{path}"`: stable while the draft stands, and nobody else's.
+    pub id: String,
+    /// The draft's path, or the tombstone's when it stands alone.
+    pub path: String,
+    pub kind: DraftConflictKind,
+    /// The path a moved draft left, where her tombstone stands.
+    pub moved_from: Option<String>,
+    /// A file beside the pages rather than a page.
+    pub file: bool,
+    /// For `AddressTaken`: the team's path that holds the draft's address.
+    pub other: Option<String>,
+    /// For `AddressTaken`: the page's own conflict under the clash, when the
+    /// team also changed or deleted the page she drafted. A new address alone
+    /// does not settle that one, so she is told it from the start.
+    pub page_kind: Option<DraftConflictKind>,
+}
+
+/// What the team holds at one path, owned, for [`TeamText`] to borrow.
+#[derive(Clone, Debug)]
+pub(super) enum Held {
+    Absent,
+    Bytes(Vec<u8>),
+    Unreadable(String),
+}
+
+impl Held {
+    /// The team's text, when the bytes are UTF-8.
+    pub(super) fn text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Held::Bytes(bytes) => std::str::from_utf8(bytes)
+                .ok()
+                .map(std::borrow::Cow::Borrowed),
+            Held::Absent | Held::Unreadable(_) => None,
+        }
+    }
+
+    fn team(&self) -> TeamText<'_> {
+        match self {
+            Held::Absent => TeamText::Absent,
+            Held::Bytes(bytes) => TeamText::Held(bytes),
+            Held::Unreadable(sha256) => TeamText::Unreadable { sha256 },
+        }
+    }
+}
+
+/// The base snapshot, asked only for its real keys.
+///
+/// On a disk that folds case `read_base_file("Plan.md")` also answers
+/// `plan.md`'s bytes, so a path that is not a key is absent without a read. A
+/// key with no readable copy is unreadable with its stamp, never absent,
+/// and so is a key whose folded spelling another key shares on a disk that
+/// folds case, since the two have one copy between them.
+struct Base<'s> {
+    state_dir: &'s Path,
+    state: &'s OriginState,
+    shared_spelling: HashSet<String>,
+    read: HashMap<String, Held>,
+}
+
+impl<'s> Base<'s> {
+    fn new(state_dir: &'s Path, state: &'s OriginState) -> Result<Self> {
+        let mut spellings: HashMap<String, Vec<&str>> = HashMap::new();
+        for key in state.files.keys() {
+            spellings
+                .entry(crystalline_core::fold_path_case(key))
+                .or_default()
+                .push(key);
+        }
+        let mut shared_spelling = HashSet::new();
+        for keys in spellings.values().filter(|keys| keys.len() > 1) {
+            for key in keys {
+                if copy_may_fold_case(state_dir, key)? {
+                    shared_spelling.insert((*key).to_string());
+                }
+            }
+        }
+        Ok(Base {
+            state_dir,
+            state,
+            shared_spelling,
+            read: HashMap::new(),
+        })
+    }
+
+    fn at(&mut self, path: &str) -> Result<Held> {
+        if let Some(held) = self.read.get(path) {
+            return Ok(held.clone());
+        }
+        let held = match self.state.files.get(path) {
+            None => Held::Absent,
+            Some(stamp) if self.shared_spelling.contains(path) => {
+                Held::Unreadable(stamp.sha256.clone())
+            }
+            Some(stamp) => match read_base_file(self.state_dir, path)? {
+                Some(bytes) => Held::Bytes(bytes),
+                None => Held::Unreadable(stamp.sha256.clone()),
+            },
+        };
+        self.read.insert(path.to_string(), held.clone());
+        Ok(held)
+    }
+}
+
+/// Whether the folder the base copy of `key` stands in may take two spellings
+/// for one name. Asked where the copies live, which is what decides whether two
+/// keys can have a copy each.
+fn copy_may_fold_case(state_dir: &Path, key: &str) -> Result<bool> {
+    let copy = base_path(state_dir, key)?;
+    let (Some(folder), Some(name)) = (copy.parent(), copy.file_name()) else {
+        return Ok(true);
+    };
+    Ok(folder_may_fold_case(folder, &name.to_string_lossy()))
+}
+
+/// One row found in conflict, with what its sides need.
+struct Found {
+    conflict: DraftConflict,
+    record: Option<DraftStart>,
+    local: Option<String>,
+    upstream: Held,
+    /// For `AddressTaken` with a `page_kind`: the team's side of her own page.
+    page_upstream: Option<Held>,
+    /// A draft from before the record: Take theirs keeps a copy of it first.
+    old_draft: bool,
+    /// For a deletion of hers whose page or file the team moved: where it went.
+    /// Keep mine then removes nothing, since the team's copy stands there.
+    moved_to: Option<String>,
+    /// What the team's side is, as [`team_side_digest`] names it. With a
+    /// `page_kind` it covers both team sides, so a resolve refuses a change
+    /// to either one since she looked.
+    team_digest: String,
+}
+
+/// The token for a team side that holds nothing, in `upstream_sha256`.
+pub const TEAM_SIDE_ABSENT: &str = "absent";
+
+/// The token for a team side whose copy cannot be read, in `upstream_sha256`.
+pub const TEAM_SIDE_UNREADABLE: &str = "unreadable";
+
+/// What the team's side of a conflict is, as the sides answer it in
+/// `upstream_sha256` and a resolve hands it back, so nobody settles against a
+/// team side they were not shown: the SHA-256 of its bytes, or [`TEAM_SIDE_ABSENT`] when the team holds nothing there, or
+/// [`TEAM_SIDE_UNREADABLE`].
+fn team_side_digest(held: &Held) -> String {
+    match held {
+        Held::Absent => TEAM_SIDE_ABSENT.to_string(),
+        Held::Bytes(bytes) => sha256_hex(bytes),
+        Held::Unreadable(_) => TEAM_SIDE_UNREADABLE.to_string(),
+    }
+}
+
+/// The one token for the two team sides of an address clash over a page the
+/// team changed too: the other page's and her own page's. Surfaces hand the
+/// token back as they got it, so both sides are checked with no new field.
+fn both_sides_digest(other: &Held, page: &Held) -> String {
+    sha256_hex(format!("{}\n{}", team_side_digest(other), team_side_digest(page)).as_bytes())
+}
+
+/// How a resolve against a team side the person was not shown is refused:
+/// the sentence ends the same way for a page and a file, so a surface
+/// tells it apart from every other refusal.
+pub const TEAM_CHANGED_SINCE: &str =
+    " since you looked at it. Look at it again before you settle it.";
+
+/// A row's kind, with the path whose team text it is about.
+#[derive(Clone, Debug)]
+struct Kind {
+    kind: DraftConflictKind,
+    other: Option<String>,
+    upstream_at: String,
+    /// For `AddressTaken`: the page's own kind and where its team text is.
+    page: Option<(DraftConflictKind, String)>,
+}
+
+/// How the refusal of a draft whose record cannot be read starts, so a caller
+/// tells it from any other conflict.
+pub(crate) const RECORD_UNREADABLE: &str = "The record of where your draft of ";
+
+/// The refusal of a draft whose record cannot be read. A broken record is
+/// never read as no record, so the refusal names the ways out. Discard ends the draft without reading
+/// the record, and a removed record reads as a draft from before 0.32.0, which
+/// is `UnknownStart`. The record's place on disk is named only to the machine
+/// owner, whose drafts these are only on this machine; anybody else
+/// reaches this server from elsewhere and is told to ask whoever runs it. The
+/// cause goes to the log.
+fn unreadable_record(
+    domain: &str,
+    actor: &str,
+    path: &str,
+    file: std::io::Result<PathBuf>,
+    source: &std::io::Error,
+) -> EngineError {
+    tracing::warn!(
+        domain,
+        actor,
+        path,
+        "the record of where a draft started cannot be read: {source}"
+    );
+    let way = match file {
+        Ok(file) if actor == crate::scope::OWNER_IDENTITY_NAME => {
+            format!("remove {}", file.display())
+        }
+        _ => "ask whoever runs this server to remove its record,".to_string(),
+    };
+    EngineError::Conflict(format!(
+        "{RECORD_UNREADABLE}{path} started cannot be read. Discard that draft, or {way} so it \
+         is read as a draft from before 0.32.0."
+    ))
+}
+
+/// One conflict's sides, in the shape `origin_conflict_detail` answers, so
+/// Fluid reads one shape. A file has no text and says so.
+fn sides_json(found: Found) -> Value {
+    if found.conflict.file {
+        let conflict = found.conflict;
+        return json!({
+            "upstream_sha256": found.team_digest,
+            "id": conflict.id,
+            "path": conflict.path,
+            "kind": conflict.kind,
+            "draft": true,
+            "detected_at": null,
+            "base": null,
+            "local": null,
+            "upstream": null,
+            "moved_from": null,
+            "other": null,
+            "page_kind": null,
+            "page_upstream": null,
+            "old_draft": found.old_draft,
+            "moved_to": found.moved_to,
+            "file": true,
+            "note": "a file has no text to compare; keep yours or take the team's",
+        });
+    }
+    // One note per side that needs one, kept together: a start with no text
+    // and a team file that is not text are two facts.
+    let mut notes: Vec<String> = Vec::new();
+    let base = match &found.record {
+        Some(DraftStart {
+            start: Some(start), ..
+        }) => Value::String(start.clone()),
+        Some(DraftStart {
+            start_sha256: Some(_),
+            ..
+        }) => {
+            notes.push("the base side has no text and is omitted".to_string());
+            Value::Null
+        }
+        _ => Value::Null,
+    };
+    let local = found.local.clone().map_or(Value::Null, Value::String);
+    let upstream = match found.upstream {
+        Held::Absent => Value::Null,
+        Held::Bytes(bytes) => {
+            let mut note = None;
+            let side = utf8_side(Some(bytes), "upstream", &mut note);
+            notes.extend(note);
+            side
+        }
+        Held::Unreadable(_) => {
+            notes.push("the upstream side has no readable copy and is omitted".to_string());
+            Value::Null
+        }
+    };
+    let page_upstream = match found.page_upstream {
+        Some(Held::Bytes(bytes)) => {
+            let mut note = None;
+            let side = utf8_side(Some(bytes), "page_upstream", &mut note);
+            notes.extend(note);
+            side
+        }
+        Some(Held::Unreadable(_)) => {
+            notes.push("the page_upstream side has no readable copy and is omitted".to_string());
+            Value::Null
+        }
+        Some(Held::Absent) | None => Value::Null,
+    };
+    let note = (!notes.is_empty()).then(|| notes.join("; "));
+    let conflict = found.conflict;
+    json!({
+        "upstream_sha256": found.team_digest,
+        "id": conflict.id,
+        "path": conflict.path,
+        "kind": conflict.kind,
+        "draft": true,
+        "detected_at": null,
+        "base": base,
+        "local": local,
+        "upstream": upstream,
+        "moved_from": conflict.moved_from,
+        "other": conflict.other,
+        "page_kind": conflict.page_kind,
+        "page_upstream": page_upstream,
+        "old_draft": found.old_draft,
+        "moved_to": found.moved_to,
+        "note": note,
+    })
+}
+
+fn conflict_id(actor: &str, path: &str) -> String {
+    let hash = sha256_hex(format!("{actor}\0{path}").as_bytes());
+    format!("d{}", &hash[..7])
+}
+
+/// What a row with a record is, from the one decision (`next_step`), so the
+/// gate and the pass cannot read a row two ways.
+fn from_next_step(step: DraftStep) -> Option<DraftConflictKind> {
+    match step {
+        DraftStep::Landed | DraftStep::InStep => None,
+        // Not merged yet: what she would share still lacks the team's change.
+        DraftStep::Take { .. } => Some(DraftConflictKind::EditEdit),
+        DraftStep::Conflict(kind) => Some(kind),
+    }
+}
+
+// --- Drafts from before the record ------------------------------------------
+//
+// Reversible: this section and its tests in `origins/draft_conflicts.rs`
+// (`an_old_*`). A row with no record is an old draft, or a draft from another
+// machine on a shared database. We cannot tell what the team changed since, so
+// nothing is merged: she compares the two texts and chooses.
+
+/// The two "no record" rows of the design's table, asked after [`has_landed`]:
+///
+/// - The team holds the path, or a key with no readable copy stands there:
+///   `UnknownStart`, for a draft and a tombstone alike. Never `AddAdd`: we
+///   cannot tell she did not start from the team's file.
+/// - A draft over a path the team does not hold is a new file and needs
+///   nothing, unless the frozen convergence record lists it, which means a pull
+///   from before saw the team delete it: `EditDelete`.
+///
+/// `listed_in_record` is asked only for that last row, so a broken record file
+/// refuses only where it decides something.
+fn old_draft_conflict(
+    row: &StoredEngram,
+    team_at_path: TeamText<'_>,
+    listed_in_record: impl FnOnce() -> Result<bool>,
+) -> Result<Option<DraftConflictKind>> {
+    Ok(match team_at_path {
+        TeamText::Held(_) | TeamText::Unreadable { .. } => Some(DraftConflictKind::UnknownStart),
+        TeamText::Absent if row.tombstone => None,
+        TeamText::Absent => listed_in_record()?.then_some(DraftConflictKind::EditDelete),
+    })
+}
+
+/// The address a tombstone's row answers to as a page: its row holds the text it
+/// deleted, and a tombstone's own permalink is its path.
+fn deleted_address(tombstone: &StoredEngram) -> Option<String> {
+    let engram = crystalline_core::parse_engram(&tombstone.content).ok()?;
+    Some(EngramRecord::from_engram(&engram, &tombstone.path, no_stamp()).permalink)
+}
+
+/// A stamp for a record built only to read its permalink.
+fn no_stamp() -> FileStamp {
+    FileStamp {
+        mtime: 0,
+        size: 0,
+        sha256: String::new(),
+    }
+}
+
+/// Old move pairs: a tombstone and a draft, neither with a record, with equal
+/// text or equal address, are one move. Answers tombstone index to draft index.
+fn old_moves(rows: &[StoredEngram], records: &[Option<DraftStart>]) -> HashMap<usize, usize> {
+    let mut pairs = HashMap::new();
+    let mut taken = HashSet::new();
+    for (t, tombstone) in rows.iter().enumerate() {
+        if !tombstone.tombstone || records[t].is_some() {
+            continue;
+        }
+        let address = deleted_address(tombstone);
+        let draft = rows.iter().enumerate().find(|(d, draft)| {
+            !draft.tombstone
+                && records[*d].is_none()
+                && draft.path != tombstone.path
+                && !taken.contains(d)
+                && (draft.content == tombstone.content
+                    || address.as_deref() == Some(draft.permalink.as_str()))
+        });
+        if let Some((d, _)) = draft {
+            taken.insert(d);
+            pairs.insert(t, d);
+        }
+    }
+    pairs
+}
+
+// --- end of the drafts from before the record --------------------------------
+
+/// What one draft file is, against the team's bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileStep {
+    /// The team holds exactly what she holds: her bytes, or nothing where she
+    /// deleted. The draft has nothing left to say.
+    Landed,
+    /// The team's file is the one she started from.
+    InStep,
+    /// The team changed it since she started, or we cannot tell.
+    Conflict(DraftConflictKind),
+}
+
+/// The table for a file, first match wins. `landed` says her bytes have
+/// nothing left to say: they are the team's at the path now, or the very bytes
+/// she started from. `team` is the team's digest
+/// at the path, `record` where she started, and `start_elsewhere` that the
+/// bytes her deletion started from stand at another key of the snapshot.
+///
+/// 1. Landed: `landed`, or her deletion stands where the team holds nothing
+///    and the bytes she deleted are nowhere else in the snapshot. Bytes that
+///    moved to another path are the team's rename, which a file cannot follow
+///    since it answers to no address: `DeleteEdit`, so her deletion does not
+///    end in silence.
+/// 2. No record (a file from before the record): the team holds a file there,
+///    so `UnknownStart`. A file over nothing is a new file, unless the frozen
+///    convergence record lists it, which means a pull from before saw the team
+///    delete it: `EditDelete`.
+/// 3. The team's digest is the one she started from: in step.
+/// 4. Otherwise a conflict, by what changed: the team deleted what she edited
+///    (`EditDelete`), added a file where she started from none (`AddAdd`), or
+///    changed what she edited (`EditEdit`) or deleted (`DeleteEdit`).
+///
+/// Her own shared proposal, merged with what she shared, moves her start to
+/// that version first ([`FileDraft::read`]), as a merged page's does. Her
+/// bytes then equal her start and end, and a team change since is the team's
+/// own. A merged proposal that was not hers decides nothing.
+///
+/// `listed_in_record` is asked only for rule 2's last case, so a broken record
+/// file refuses only where it decides something.
+pub(super) fn file_step(
+    draft: &FileDraft,
+    listed_in_record: impl FnOnce() -> Result<bool>,
+) -> Result<FileStep> {
+    if draft.landed {
+        return Ok(FileStep::Landed);
+    }
+    let team = draft.team.as_deref();
+    if draft.tombstone && team.is_none() {
+        return Ok(match draft.start_elsewhere {
+            true => FileStep::Conflict(DraftConflictKind::DeleteEdit),
+            false => FileStep::Landed,
+        });
+    }
+    let Some(record) = draft.record.as_ref() else {
+        return Ok(match team {
+            Some(_) => FileStep::Conflict(DraftConflictKind::UnknownStart),
+            None if listed_in_record()? => FileStep::Conflict(DraftConflictKind::EditDelete),
+            None => FileStep::InStep,
+        });
+    };
+    if record.start_sha.as_deref() == team {
+        return Ok(FileStep::InStep);
+    }
+    Ok(FileStep::Conflict(match (draft.tombstone, team) {
+        (true, _) => DraftConflictKind::DeleteEdit,
+        (false, None) => DraftConflictKind::EditDelete,
+        (false, Some(_)) if record.start_sha.is_none() => DraftConflictKind::AddAdd,
+        (false, Some(_)) => DraftConflictKind::EditEdit,
+    }))
+}
+
+/// One draft file of one actor, with what its decision needs.
+pub(super) struct FileDraft {
+    pub(super) path: String,
+    pub(super) tombstone: bool,
+    pub(super) record: Option<DraftFileStart>,
+    /// The team's digest at the path (see [`team_key`]).
+    pub(super) team: Option<String>,
+    /// Her version reached the team: see [`file_step`].
+    pub(super) landed: bool,
+    /// For a deletion: the bytes it started from stand at another key.
+    pub(super) start_elsewhere: bool,
+    /// Her shared proposal merged with what she shared, so `record` already
+    /// starts there; the pass saves that.
+    pub(super) settled_shared: bool,
+}
+
+/// The key of the snapshot that holds the team's file at `path`: the exact key,
+/// or on a disk that may fold case (`folds`) the one key spelled the same but
+/// for case, since the folder holds one file for the two and a share writes
+/// her bytes into it. Several such keys answer with no key and `true`: the
+/// team holds a file there whose digest cannot be named.
+pub(super) fn team_key<'s>(
+    state: &'s OriginState,
+    path: &str,
+    folds: bool,
+) -> (Option<&'s str>, bool) {
+    if let Some((key, _)) = state.files.get_key_value(path) {
+        return (Some(key.as_str()), true);
+    }
+    if !folds {
+        return (None, false);
+    }
+    let folded = crystalline_core::fold_path_case(path);
+    let mut twins = state
+        .files
+        .keys()
+        .filter(|key| crystalline_core::fold_path_case(key) == folded);
+    match (twins.next(), twins.next()) {
+        (Some(key), None) => (Some(key.as_str()), true),
+        (Some(_), Some(_)) => (None, true),
+        (None, _) => (None, false),
+    }
+}
+
+impl FileDraft {
+    /// Read one of `actor`'s draft files against `state`. `folds` says the
+    /// domain's folder may fold case at its path. A record that cannot be read
+    /// is an error, never a file with no record.
+    pub(super) fn read(
+        journal_dir: &Path,
+        domain: &str,
+        actor: &str,
+        entry: &crate::overlay_files::FileEntry,
+        state: &OriginState,
+        folds: bool,
+    ) -> Result<FileDraft> {
+        let io = |source| EngineError::Io {
+            path: format!("the draft file '{}' in '{domain}'", entry.path),
+            source,
+        };
+        let record =
+            draft_start::load_file(journal_dir, domain, actor, &entry.path).map_err(|source| {
+                let file = draft_start::file_record_file(journal_dir, domain, actor, &entry.path);
+                unreadable_record(domain, actor, &entry.path, file, &source)
+            })?;
+        let (key, held) = team_key(state, &entry.path, folds);
+        let stamp = key.and_then(|key| state.files.get(key));
+        // A file held under several spellings has no digest to name; an empty
+        // one equals no start, so it reads as a conflict.
+        let team = held.then(|| stamp.map_or_else(String::new, |stamp| stamp.sha256.clone()));
+        // Her own proposal, merged, holding exactly what she shared there.
+        // The team had her version then, so her start is that version; a team
+        // change since is the team's own, and a proposal that was not hers
+        // decides nothing about her draft.
+        let merged_shared = record
+            .as_ref()
+            .and_then(|record| record.shared.as_ref())
+            .filter(|shared| merged_holds(state, shared, &entry.path, key))
+            .cloned();
+        let settled_shared = merged_shared.is_some();
+        let record = match merged_shared {
+            Some(shared) => record.map(|record| DraftFileStart {
+                start_sha: shared.sha,
+                shared: None,
+                ..record
+            }),
+            None => record,
+        };
+        // Her bytes are the team's now, or the very bytes she started from:
+        // either way her draft has nothing left to say.
+        let landed = !entry.tombstone && {
+            let now = match stamp {
+                Some(stamp) => {
+                    same_bytes_as(journal_dir, domain, actor, &entry.path, stamp).map_err(io)?
+                }
+                None => false,
+            };
+            now || match record
+                .as_ref()
+                .and_then(|record| record.start_sha.as_deref())
+            {
+                Some(start) => crate::overlay_files::read(journal_dir, domain, actor, &entry.path)
+                    .map_err(io)?
+                    .is_some_and(|bytes| sha256_hex(&bytes) == start),
+                None => false,
+            }
+        };
+        let start_elsewhere = entry.tombstone
+            && team.is_none()
+            && record
+                .as_ref()
+                .and_then(|record| record.start_sha.as_deref())
+                .is_some_and(|start| state.files.values().any(|stamp| stamp.sha256 == start));
+        Ok(FileDraft {
+            path: entry.path.clone(),
+            tombstone: entry.tombstone,
+            record,
+            team,
+            landed,
+            start_elsewhere,
+            settled_shared,
+        })
+    }
+}
+
+/// For a deletion of hers whose bytes stand at another key of the snapshot:
+/// that key, which is where the team moved the file ([`file_step`] rule 1).
+pub(super) fn moved_file(state: &OriginState, draft: &FileDraft) -> Option<String> {
+    if !draft.start_elsewhere {
+        return None;
+    }
+    let start = draft.record.as_ref()?.start_sha.as_deref()?;
+    state
+        .files
+        .iter()
+        .find(|(key, stamp)| stamp.sha256 == start && key.as_str() != draft.path)
+        .map(|(key, _)| key.clone())
+}
+
+/// Whether the merged proposal `shared` names still lists her file at `path`
+/// (or the team's key for it) with exactly what she shared, as
+/// `draft_merge::settle_shared` asks it of a page. A proposal still open, or one
+/// that ended any other way, settles nothing.
+fn merged_holds(
+    state: &OriginState,
+    shared: &draft_start::SharedFile,
+    path: &str,
+    key: Option<&str>,
+) -> bool {
+    use crystalline_remote::state::{ProposalStatus, ProposedChange};
+    if state.proposals.iter().any(|p| p.number == shared.proposal) {
+        return false;
+    }
+    state
+        .history
+        .iter()
+        .find(|p| p.number == shared.proposal && p.status == ProposalStatus::Merged)
+        .is_some_and(|merged| {
+            merged.files.iter().any(|file| {
+                let at_her_key = file.path == path || Some(file.path.as_str()) == key;
+                let same = match (&shared.sha, file.change, file.sha256.as_deref()) {
+                    (None, ProposedChange::Deleted, _) => true,
+                    (Some(_), ProposedChange::Deleted, _) => false,
+                    (Some(sha), _, Some(digest)) => sha == digest,
+                    _ => false,
+                };
+                at_her_key && same
+            })
+        })
+}
+
+/// Whether `actor`'s bytes at `path` are the bytes `stamp` describes. The size
+/// is asked first, so a file of another size is never read.
+pub(super) fn same_bytes_as(
+    journal_dir: &Path,
+    domain: &str,
+    actor: &str,
+    path: &str,
+    stamp: &crystalline_remote::state::BaseStamp,
+) -> std::io::Result<bool> {
+    let abs = crate::overlay_files::file(journal_dir, domain, actor, path)?;
+    match std::fs::metadata(&abs) {
+        Ok(meta) if meta.len() != stamp.size => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    Ok(
+        crate::overlay_files::read(journal_dir, domain, actor, path)?
+            .is_some_and(|bytes| sha256_hex(&bytes) == stamp.sha256),
+    )
+}
+
+/// The paths the frozen convergence record lists for `actor`: conflicts a pull
+/// from before the record saw. Read strictly, so a broken file refuses.
+fn frozen_list(journal_dir: &Path, domain: &str, actor: &str) -> Result<HashSet<String>> {
+    let read =
+        crate::overlay_journal::journal_record_strict(journal_dir, domain).map_err(|source| {
+            EngineError::Io {
+                path: format!("the convergence record of '{domain}'"),
+                source,
+            }
+        })?;
+    Ok(read
+        .conflicts
+        .get(actor)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect())
+}
+
+/// Whether a key of the base snapshot can hold an address: a page inside the
+/// domain that takes part in a share. A log, a listing or a dotfile is never
+/// indexed, so it holds no address whatever its frontmatter says. The pass's
+/// rename test and the address map read this one rule.
+pub(super) fn holds_an_address(key: &str) -> bool {
+    key.ends_with(".md") && is_within_domain(key) && takes_part_in_local_change(key)
+}
+
+/// What the team holds for one row: at its path, and where it started.
+pub(super) struct RowTeam {
+    pub(super) at_path: Held,
+    pub(super) at_from: Held,
+}
+
+/// What one row is, by the rule the gates and the pass share. First match
+/// wins, in this order.
+pub(super) enum Decision {
+    /// A path that takes no part in a share, or the tombstone half of a move,
+    /// for which her draft stands.
+    NotAsked,
+    /// It has landed ([`has_landed`]).
+    Landed,
+    /// A draft whose address another team file holds in her view: that path,
+    /// and what the row would be without the clash (never `NotAsked`,
+    /// `Landed` or another `AddressTaken`). The pass leaves the row either
+    /// way; the list and a resolve read the decision underneath, so a new
+    /// address never hides a team change to the page itself.
+    AddressTaken { other: String, under: Box<Decision> },
+    /// A row with no record, which never reaches [`next_step`].
+    NoRecord,
+    /// A row with a record: the one decision.
+    Step(DraftStep),
+}
+
+/// One actor's rows read against the base snapshot: her records, the team's
+/// addresses in her view and which rows are two halves of one move. The
+/// conflict list and the convergence pass both decide from this, so the two
+/// cannot answer one row two ways.
+pub(super) struct Reading<'s> {
+    pub(super) rows: Vec<StoredEngram>,
+    pub(super) records: Vec<Option<DraftStart>>,
+    base: Base<'s>,
+    addresses: HashMap<String, String>,
+    root: PathBuf,
+    /// A moved draft names where it started, whether or not its tombstone still
+    /// stands there; an old pair names its tombstone's path.
+    pub(super) moved_from: HashMap<usize, String>,
+    /// Tombstones standing where a draft of hers started, compared exactly.
+    halves: HashSet<usize>,
+    /// Old move pairs, tombstone index to draft index.
+    pub(super) old_pairs: HashMap<usize, usize>,
+}
+
+impl Reading<'_> {
+    /// The team's text at the row's path and where it started.
+    pub(super) fn team(&mut self, i: usize) -> Result<RowTeam> {
+        let path = self.rows[i].path.clone();
+        let from = self.records[i]
+            .as_ref()
+            .and_then(|record| record.from.clone());
+        let at_path = self.base.at(&path)?;
+        let at_from = match from {
+            Some(from) if from != path => self.base.at(&from)?,
+            Some(_) => at_path.clone(),
+            None => Held::Absent,
+        };
+        Ok(RowTeam { at_path, at_from })
+    }
+
+    /// What the team holds at `path`, read from a real key of the snapshot.
+    pub(super) fn team_at(&mut self, path: &str) -> Result<Held> {
+        self.base.at(path)
+    }
+
+    /// The team's page whose base copy answers to `permalink`, among the pages
+    /// of the snapshot she holds no row at. Where she holds one, her own row
+    /// answers for that path, as it does in the pass.
+    ///
+    /// Read from the copies and never from the index: after a rename that
+    /// changed no byte the index reads the new file's address from its path,
+    /// though its frontmatter names another. A copy that two spellings share
+    /// on a disk that folds case cannot say whose bytes it holds, so it answers
+    /// to nothing, as the conflict list reads it.
+    pub(super) fn team_file_at_address(&self, permalink: &str) -> Result<Option<String>> {
+        let own: HashSet<&str> = self.rows.iter().map(|row| row.path.as_str()).collect();
+        for key in self.base.state.files.keys() {
+            if !holds_an_address(key)
+                || own.contains(key.as_str())
+                || self.base.shared_spelling.contains(key)
+            {
+                continue;
+            }
+            let Some(bytes) = read_base_file(self.base.state_dir, key)? else {
+                continue;
+            };
+            if address_of(key, &bytes).as_deref() == Some(permalink) {
+                return Ok(Some(key.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// For a deletion of hers where the team holds nothing at its path: the
+    /// key the page she deleted moved to, if the team moved it rather than
+    /// deleted it. The bytes she started from stand at that key, or the page
+    /// she deleted answers to its address there. A page answers to no
+    /// address, so this is the rule [`file_step`] has for a file plus the
+    /// address: a move that changed the page keeps it.
+    pub(super) fn moved_away(&self, i: usize) -> Option<String> {
+        let row = &self.rows[i];
+        let record = self.records[i].as_ref()?;
+        if !row.tombstone || self.base.state.files.contains_key(&row.path) {
+            return None;
+        }
+        let mut digests: Vec<String> = record.start_sha256.iter().cloned().collect();
+        if let Some(start) = &record.start {
+            digests.push(sha256_hex(start.as_bytes()));
+            digests.push(sha256_hex(
+                crystalline_core::with_line_endings_of(start, b"\r\n").as_bytes(),
+            ));
+        }
+        if digests.is_empty() {
+            return None;
+        }
+        // Where she holds a row, her row answers for that path, as it does
+        // for an address: her own move's draft landing there is no team move.
+        let own: HashSet<&str> = self.rows.iter().map(|row| row.path.as_str()).collect();
+        let state = self.base.state;
+        let by_bytes = state.files.iter().find(|(key, stamp)| {
+            !own.contains(key.as_str())
+                && (digests.contains(&stamp.sha256)
+                    || state
+                        .lf_digests
+                        .get(*key)
+                        .is_some_and(|lf| digests.contains(lf)))
+        });
+        if let Some((key, _)) = by_bytes {
+            return Some(key.clone());
+        }
+        deleted_address(row)
+            .and_then(|address| self.addresses.get(&address))
+            .filter(|key| **key != row.path)
+            .cloned()
+    }
+
+    /// The row's sides for the decision, with `team` from [`Reading::team`].
+    pub(super) fn sides<'a>(&'a self, i: usize, team: &'a RowTeam) -> DraftSides<'a> {
+        let row = &self.rows[i];
+        let record = self.records[i].as_ref();
+        DraftSides {
+            path: &row.path,
+            from: record.and_then(|record| record.from.as_deref()),
+            start: record.and_then(|record| record.start.as_deref()),
+            start_sha256: record.and_then(|record| record.start_sha256.as_deref()),
+            shared: record
+                .and_then(|record| record.shared.as_ref())
+                .and_then(|shared| shared.text.as_deref()),
+            // A folder that cannot say does not fold here, so a case move
+            // is never read as landed on a guess.
+            folds_case: page_folds_case(&self.root, &row.path),
+            merging: record.is_some_and(|record| record.merging.is_some()),
+            local: (!row.tombstone).then_some(row.content.as_str()),
+            team_at_path: team.at_path.team(),
+            team_at_from: team.at_from.team(),
+        }
+    }
+
+    /// The decision for row `i`, with the team texts it was made from.
+    pub(super) fn decide(&mut self, i: usize) -> Result<(Decision, RowTeam)> {
+        if !takes_part_in_local_change(&self.rows[i].path) || self.halves.contains(&i) {
+            let unread = RowTeam {
+                at_path: Held::Absent,
+                at_from: Held::Absent,
+            };
+            return Ok((Decision::NotAsked, unread));
+        }
+        let team = self.team(i)?;
+        // Her deletion of a page the team moved has not landed: the page
+        // stands under another name, and her deletion must not end in silence.
+        if self.moved_away(i).is_some() {
+            let kind = DraftStep::Conflict(DraftConflictKind::DeleteEdit);
+            return Ok((Decision::Step(kind), team));
+        }
+        let row = &self.rows[i];
+        let sides = self.sides(i, &team);
+        if has_landed(&sides) {
+            return Ok((Decision::Landed, team));
+        }
+        let taken = (!row.tombstone)
+            .then(|| {
+                self.addresses
+                    .get(row.permalink.as_str())
+                    .filter(|other| **other != row.path)
+                    .cloned()
+            })
+            .flatten();
+        // A proposal of hers merged and no pass has settled what it held: her
+        // start is from before the merge, so the team's text cannot be read
+        // against it. A reviewer who took her change back out would read as in
+        // step, and a share would carry her change again. It stands refused
+        // until a pass settles it, as a merge whose start has not moved does.
+        let decision = if let Some(record) = &self.records[i]
+            && settle_shared(record, row.tombstone, self.base.state) == SharedFate::Merged
+        {
+            let kind = if row.tombstone {
+                DraftConflictKind::DeleteEdit
+            } else {
+                DraftConflictKind::EditEdit
+            };
+            Decision::Step(DraftStep::Conflict(kind))
+        } else {
+            // Branch on whether a record exists before the decision is asked.
+            match self.records[i] {
+                Some(_) => Decision::Step(next_step(&sides)),
+                None => Decision::NoRecord,
+            }
+        };
+        let decision = match taken {
+            Some(other) => Decision::AddressTaken {
+                other,
+                under: Box::new(decision),
+            },
+            None => decision,
+        };
+        Ok((decision, team))
+    }
+
+    /// Her tombstone at exactly `path`, if she holds one.
+    pub(super) fn tombstone_at(&self, path: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| row.tombstone && row.path == path)
+    }
+
+    /// The tombstone half of draft `d`'s move: at its record's `from`, or its
+    /// old pair's.
+    pub(super) fn half_of(&self, d: usize) -> Option<usize> {
+        let from = self.records[d]
+            .as_ref()
+            .and_then(|record| record.from.as_deref())
+            .filter(|from| *from != self.rows[d].path);
+        if let Some(from) = from {
+            return self.tombstone_at(from);
+        }
+        self.old_pairs
+            .iter()
+            .find(|(_, draft)| **draft == d)
+            .map(|(tombstone, _)| *tombstone)
+    }
+
+    /// Whether row `i` is the tombstone of an old move pair, which is decided
+    /// with its draft and never alone.
+    pub(super) fn is_old_half(&self, i: usize) -> bool {
+        self.old_pairs.contains_key(&i)
+    }
+}
+
+impl Engine {
+    /// Read `actor`'s `rows` against the base snapshot. A record that cannot be
+    /// read is an error, never a row with no record.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn read_drafts<'s>(
+        &self,
+        domain: &str,
+        domain_id: crystalline_index::DomainId,
+        actor: &str,
+        rows: Vec<StoredEngram>,
+        root: &Path,
+        state_dir: &'s Path,
+        state: &'s OriginState,
+    ) -> Result<Reading<'s>> {
+        let journal_dir = self.journal_state_dir()?;
+        let records = rows
+            .iter()
+            .map(|row| {
+                draft_start::load(&journal_dir, domain, actor, &row.path)
+                    .map(|record| record.map(|record| record.as_settled(&row.content)))
+                    .map_err(|source| {
+                        let file = draft_start::record_file(&journal_dir, domain, actor, &row.path);
+                        unreadable_record(domain, actor, &row.path, file, &source)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut base = Base::new(state_dir, state)?;
+        // A draft's address may be taken, and a deletion's page may have moved
+        // to another address: either one asks for the team's addresses.
+        let addresses = if rows.is_empty() {
+            HashMap::new()
+        } else {
+            self.team_addresses(domain, domain_id, &rows, &mut base)
+                .await?
+        };
+
+        let mut moved_from: HashMap<usize, String> = HashMap::new();
+        let mut halves: HashSet<usize> = HashSet::new();
+        let tombstones: HashMap<&str, usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.tombstone)
+            .map(|(i, row)| (row.path.as_str(), i))
+            .collect();
+        for (d, row) in rows.iter().enumerate().filter(|(_, row)| !row.tombstone) {
+            let from = records[d]
+                .as_ref()
+                .and_then(|record| record.from.as_deref());
+            if let Some(from) = from.filter(|from| *from != row.path) {
+                moved_from.insert(d, from.to_string());
+                if let Some(&t) = tombstones.get(from) {
+                    halves.insert(t);
+                }
+            }
+        }
+        let old_pairs = old_moves(&rows, &records);
+        for (&t, &d) in &old_pairs {
+            moved_from.insert(d, rows[t].path.clone());
+        }
+        Ok(Reading {
+            rows,
+            records,
+            base,
+            addresses,
+            root: root.to_path_buf(),
+            moved_from,
+            halves,
+            old_pairs,
+        })
+    }
+
+    /// The drafts of `actor` in `domain` that do not fit the team's text, ordered
+    /// by path. Empty for a domain with no origin or no origin state. A record
+    /// that cannot be read is an error, never a clean row.
+    pub async fn draft_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<DraftConflict>> {
+        Ok(self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .map(|found| found.conflict)
+            .collect())
+    }
+
+    /// One of `actor`'s conflicts by id, in the shape `origin_conflict_detail`
+    /// answers, so Fluid reads one shape: `base` is her start, `local` her draft
+    /// and `upstream` the team's text at the path the kind came from: her own
+    /// path when the team holds a file there she did not start from (what Keep
+    /// mine would overwrite), `other` for `AddressTaken`, else where she started.
+    /// An id of somebody else's is not found.
+    pub async fn draft_conflict_sides(&self, domain: &str, actor: &str, id: &str) -> Result<Value> {
+        let found = self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .find(|found| found.conflict.id == id)
+            .ok_or_else(|| super::origins::not_among_drafts(domain, id))?;
+        Ok(sides_json(found))
+    }
+
+    /// `actor`'s draft conflict at `path` (her draft's path or the path a
+    /// move left), with its sides as [`Engine::draft_conflict_sides`] answers
+    /// them, or `None` when she holds none there, when the domain's drafts do
+    /// not stay open, or when the caller has no draft identity. The CLI's
+    /// `origin diff --path` prints the resolve line from it, with the team
+    /// side's `upstream_sha256`, so the resolve is refused if the team's text
+    /// moves first.
+    pub async fn draft_conflict_at(
+        &self,
+        domain: &str,
+        actor: &super::ShareActor,
+        path: &str,
+    ) -> Result<Option<Value>> {
+        if !self.drafts_stay_open(domain) {
+            return Ok(None);
+        }
+        let Ok(who) = crate::share_staging::overlay_share_actor(actor) else {
+            return Ok(None);
+        };
+        let page = super::normalize_md(path);
+        let found = self
+            .found_conflicts(domain, &who)
+            .await?
+            .into_iter()
+            .find(|found| {
+                let c = &found.conflict;
+                [path, page.as_str()]
+                    .iter()
+                    .any(|p| c.path == *p || c.moved_from.as_deref() == Some(*p))
+            });
+        Ok(found.map(sides_json))
+    }
+
+    /// Refuses a resolve made against a team side the person was not shown.
+    /// `expected` is the `upstream_sha256` the sides answered when they
+    /// were read; the conflict `settles` names is read again now, and when its
+    /// team side is another one the resolve is refused with a sentence that
+    /// ends in [`TEAM_CHANGED_SINCE`]. No `expected` checks nothing, as before,
+    /// and a conflict no longer found is left to the resolve to answer.
+    pub(crate) async fn refuse_unseen_team_side(
+        &self,
+        domain: &str,
+        actor: &str,
+        settles: impl Fn(&DraftConflict) -> bool,
+        expected: Option<&str>,
+    ) -> Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let Some(found) = self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .find(|found| settles(&found.conflict))
+        else {
+            return Ok(());
+        };
+        if found.team_digest == expected {
+            return Ok(());
+        }
+        let what = if found.conflict.file { "file" } else { "page" };
+        Err(EngineError::Conflict(format!(
+            "The team changed this {what}{TEAM_CHANGED_SINCE}"
+        )))
+    }
+
+    /// `actor`'s conflicts as status lists them with `detail`: each as
+    /// [`crate::origin::draft_conflicts_json`] has it, plus its `base`, `local`
+    /// and `upstream` text as [`Engine::draft_conflict_sides`] answers them, and
+    /// that answer's `note` when it has one. The list is read once.
+    pub(crate) async fn draft_conflicts_with_sides(
+        &self,
+        domain: &str,
+        actor: &str,
+    ) -> Result<Vec<Value>> {
+        Ok(self
+            .found_conflicts(domain, actor)
+            .await?
+            .into_iter()
+            .map(|found| {
+                let mut entry =
+                    crate::origin::draft_conflicts_json(std::slice::from_ref(&found.conflict))[0]
+                        .take();
+                let sides = sides_json(found);
+                for key in [
+                    "base",
+                    "local",
+                    "upstream",
+                    "upstream_sha256",
+                    "page_upstream",
+                ] {
+                    entry[key] = sides[key].clone();
+                }
+                if !sides["note"].is_null() {
+                    entry["note"] = sides["note"].clone();
+                }
+                entry
+            })
+            .collect())
+    }
+
+    /// The paths of `actor`'s drafts a merge changed since they last settled:
+    /// the records with `merged_at`. A notice, not a gate, so a records folder
+    /// that cannot be read answers empty with a warning.
+    pub(crate) fn drafts_merged(&self, domain: &str, actor: &str) -> Vec<String> {
+        let read = self
+            .journal_state_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|dir| draft_start::all(&dir, domain, actor).map_err(|e| e.to_string()));
+        match read {
+            Ok(records) => records
+                .into_iter()
+                .filter(|record| record.merged_at.is_some())
+                .map(|record| record.path)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    "the drafts a merge changed could not be listed: {e}"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// The team's addresses in her view, permalink to path: the base snapshot's
+    /// pages ([`holds_an_address`]) less every path she holds a row at, which is
+    /// what the pass reads. The index is asked only for a page whose row matches
+    /// the snapshot's stamp; a page it does not list, or lists with other bytes,
+    /// is read from its base copy. So a page a direct commit deleted holds no
+    /// address while its row lingers, and a page no sync has indexed yet holds
+    /// its own. A key with no readable copy, or bytes that are no page, answers
+    /// to nothing we can name.
+    async fn team_addresses(
+        &self,
+        domain: &str,
+        domain_id: crystalline_index::DomainId,
+        rows: &[StoredEngram],
+        base: &mut Base<'_>,
+    ) -> Result<HashMap<String, String>> {
+        let (indexed_rows, stamps) = {
+            let store = self.store.lock().await;
+            (
+                store.list_engrams(domain, None, None).await?,
+                store.file_stamps(domain_id).await?,
+            )
+        };
+        let indexed: HashMap<&str, &str> = indexed_rows
+            .iter()
+            .map(|row| (row.path.as_str(), row.permalink.as_str()))
+            .collect();
+        // Every path she holds a row at, as the pass reads it: a tombstone takes
+        // the page away, and a draft says in her view what that path answers to,
+        // so the base copy's address there is not the team's to hold.
+        let own: HashSet<&str> = rows.iter().map(|row| row.path.as_str()).collect();
+        let keys: Vec<(String, String)> = base
+            .state
+            .files
+            .iter()
+            .filter(|(key, _)| holds_an_address(key) && !own.contains(key.as_str()))
+            .map(|(key, stamp)| (key.clone(), stamp.sha256.clone()))
+            .collect();
+        let mut addresses = HashMap::new();
+        for (key, sha256) in keys {
+            let current = stamps.get(&key).is_some_and(|stamp| stamp.sha256 == sha256);
+            let permalink = match indexed.get(key.as_str()) {
+                Some(permalink) if current => Some((*permalink).to_string()),
+                _ => match base.at(&key)? {
+                    Held::Bytes(bytes) => address_of(&key, &bytes),
+                    Held::Absent | Held::Unreadable(_) => None,
+                },
+            };
+            if let Some(permalink) = permalink {
+                addresses.insert(permalink, key);
+            }
+        }
+        Ok(addresses)
+    }
+
+    /// The table of the design, first match wins:
+    ///
+    /// 1. It has landed ([`has_landed`]): none.
+    /// 2. A path that takes no part in a share: none.
+    /// 3. The tombstone half of a move: none; the draft stands for both and
+    ///    names it in `moved_from`.
+    /// 4. A draft whose address another team file holds in her view:
+    ///    `AddressTaken`, since Keep mine cannot clear it, with the row's own
+    ///    answer by rule 5 beside it as `page_kind` when that is a conflict.
+    /// 5. No record: the old-draft rows. With a record: [`next_step`].
+    ///
+    /// A deletion of hers whose page the team moved to another key is
+    /// `DeleteEdit` before rule 1, as [`file_step`] has it for a file
+    /// ([`Reading::moved_away`]).
+    ///
+    /// Rows 2 and 3 are asked before row 1 in [`Reading::decide`]; a row they
+    /// silence has no answer of its own either way.
+    async fn found_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
+        let mut found = self.found_row_conflicts(domain, actor).await?;
+        found.extend(self.found_file_conflicts(domain, actor)?);
+        found.sort_by(|a, b| a.conflict.path.cmp(&b.conflict.path));
+        Ok(found)
+    }
+
+    /// The draft files of `actor` that do not fit the team's bytes, by
+    /// [`file_step`]. A files folder or a record that cannot be read is an
+    /// error, never a clean answer.
+    fn found_file_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
+        if self.domain_entry(domain)?.origin.is_none() {
+            return Ok(Vec::new());
+        }
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let Some(state) = OriginState::load(&state_dir)? else {
+            return Ok(Vec::new());
+        };
+        let journal_dir = self.journal_state_dir()?;
+        // A name that cannot address a folder holds no files: every write
+        // screens the name the same way, so nothing is left unread.
+        let read = crate::overlay_files::actor_entries(&journal_dir, domain, actor);
+        if read.unreadable {
+            return Err(EngineError::Io {
+                path: format!("the draft files of '{actor}' in '{domain}'"),
+                source: std::io::Error::other("the files folder could not be read in full"),
+            });
+        }
+        let mut frozen: Option<HashSet<String>> = None;
+        let mut found = Vec::new();
+        for entry in &read.entries {
+            let folds = self.file_may_fold_case(domain, &root, &entry.path);
+            let draft = FileDraft::read(&journal_dir, domain, actor, entry, &state, folds)?;
+            let step = file_step(&draft, || {
+                let listed = match &frozen {
+                    Some(listed) => listed,
+                    None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
+                };
+                Ok(listed.contains(&draft.path))
+            })?;
+            if let FileStep::Conflict(kind) = step {
+                found.push(Found {
+                    conflict: DraftConflict {
+                        id: conflict_id(actor, &draft.path),
+                        path: draft.path.clone(),
+                        kind,
+                        moved_from: None,
+                        file: true,
+                        other: None,
+                        page_kind: None,
+                    },
+                    record: None,
+                    local: None,
+                    upstream: Held::Absent,
+                    page_upstream: None,
+                    old_draft: draft.record.is_none() && !draft.tombstone,
+                    moved_to: moved_file(&state, &draft),
+                    team_digest: draft
+                        .team
+                        .clone()
+                        .unwrap_or_else(|| TEAM_SIDE_ABSENT.to_string()),
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`Engine::found_conflicts`] for the rows, the pages and their deletions.
+    async fn found_row_conflicts(&self, domain: &str, actor: &str) -> Result<Vec<Found>> {
+        if self.domain_entry(domain)?.origin.is_none() {
+            return Ok(Vec::new());
+        }
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let Some(state) = OriginState::load(&state_dir)? else {
+            return Ok(Vec::new());
+        };
+        // The read-only id lookup: asking must not register a domain.
+        let (domain_id, rows) = {
+            let store = self.store.lock().await;
+            match store.domain_id(domain).await? {
+                Some(id) => (id, store.overlay_entries(id, actor).await?),
+                None => return Ok(Vec::new()),
+            }
+        };
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let journal_dir = self.journal_state_dir()?;
+        let mut reading = self
+            .read_drafts(domain, domain_id, actor, rows, &root, &state_dir, &state)
+            .await?;
+
+        let count = reading.rows.len();
+        let mut frozen: Option<HashSet<String>> = None;
+        let mut kinds: Vec<Option<Kind>> = vec![None; count];
+        // For an old move whose source the team deleted: which rows landed
+        // by the team holding nothing at their path, and which were asked and
+        // stand open.
+        let mut landed_by_absence = vec![false; count];
+        let mut open = vec![false; count];
+        for i in 0..count {
+            let (decision, team) = reading.decide(i)?;
+            let (decision, taken) = match decision {
+                Decision::NotAsked => continue,
+                Decision::Landed => {
+                    landed_by_absence[i] = matches!(team.at_path, Held::Absent);
+                    continue;
+                }
+                Decision::AddressTaken { other, under } => (*under, Some(other)),
+                decision => (decision, None),
+            };
+            let kind = match decision {
+                Decision::NoRecord => {
+                    let row = &reading.rows[i];
+                    old_draft_conflict(row, team.at_path.team(), || {
+                        let listed = match &frozen {
+                            Some(listed) => listed,
+                            None => frozen.insert(frozen_list(&journal_dir, domain, actor)?),
+                        };
+                        Ok(listed.contains(&row.path))
+                    })?
+                }
+                Decision::Step(step) => from_next_step(step),
+                Decision::NotAsked | Decision::Landed | Decision::AddressTaken { .. } => None,
+            };
+            open[i] = true;
+            // Where the kind came from, by the decision's own rule: what Keep
+            // mine would overwrite when a file of the team's stands at her path,
+            // otherwise the text where she started.
+            let row = &reading.rows[i];
+            let sides = reading.sides(i, &team);
+            let upstream_at = if let Some(moved) = reading.moved_away(i) {
+                moved
+            } else if answers_at_path(&sides) {
+                row.path.clone()
+            } else {
+                sides.from.unwrap_or(&row.path).to_string()
+            };
+            kinds[i] = match taken {
+                // The clash is what she is told first, since Keep mine cannot
+                // clear it, and the page's own kind beside it.
+                Some(other) => Some(Kind {
+                    kind: DraftConflictKind::AddressTaken,
+                    other: Some(other.clone()),
+                    upstream_at: other,
+                    page: kind.map(|kind| (kind, upstream_at)),
+                }),
+                None => kind.map(|kind| Kind {
+                    kind,
+                    other: None,
+                    upstream_at,
+                    page: None,
+                }),
+            };
+        }
+        // An old move lists once, at the draft: the tombstone's answer is the
+        // draft's when the draft has none of its own, and it still reads at the
+        // tombstone's path. A source the team deleted under a draft that has not
+        // landed is a deletion she has to see, as `EditDelete` is with a record:
+        // a share would otherwise bring the page back under her new name.
+        for (&t, &d) in &reading.old_pairs {
+            let half = kinds[t].take();
+            if kinds[d].is_none() {
+                kinds[d] = half;
+            }
+            if kinds[d].is_none() && landed_by_absence[t] && open[d] {
+                kinds[d] = Some(Kind {
+                    kind: DraftConflictKind::EditDelete,
+                    other: None,
+                    upstream_at: reading.rows[t].path.clone(),
+                    page: None,
+                });
+            }
+        }
+
+        let mut found = Vec::new();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let Some(Kind {
+                kind,
+                other,
+                upstream_at,
+                page,
+            }) = kind
+            else {
+                continue;
+            };
+            let row = &reading.rows[i];
+            let upstream = reading.base.at(&upstream_at)?;
+            let page_upstream = match &page {
+                Some((_, at)) => Some(reading.base.at(at)?),
+                None => None,
+            };
+            let team_digest = match &page_upstream {
+                Some(page) => both_sides_digest(&upstream, page),
+                None => team_side_digest(&upstream),
+            };
+            found.push(Found {
+                conflict: DraftConflict {
+                    id: conflict_id(actor, &row.path),
+                    path: row.path.clone(),
+                    kind,
+                    moved_from: reading.moved_from.get(&i).cloned(),
+                    file: false,
+                    other,
+                    page_kind: page.map(|(kind, _)| kind),
+                },
+                record: reading.records[i].clone(),
+                local: (!row.tombstone).then(|| row.content.clone()),
+                team_digest,
+                upstream,
+                page_upstream,
+                old_draft: reading.records[i].is_none() && !row.tombstone,
+                moved_to: reading.moved_away(i),
+            });
+        }
+        found.sort_by(|a, b| a.conflict.path.cmp(&b.conflict.path));
+        Ok(found)
+    }
+}
+
+/// The conflicts that block a share of `files`: all of them when no files are
+/// named, since she asked to share everything; otherwise those whose path or
+/// `moved_from` is named. A share is a staged tree filtered by `files`, so a
+/// stale row outside them cannot travel. A name is read as the share reads it
+/// (`normalize_selected_path`), so `./plan.md` names `plan.md` here too.
+pub(super) fn conflicts_block(
+    conflicts: &[DraftConflict],
+    files: Option<&[String]>,
+) -> Vec<DraftConflict> {
+    let Some(files) = files else {
+        return conflicts.to_vec();
+    };
+    let named: HashSet<String> = files
+        .iter()
+        .map(|raw| crystalline_remote::ops::normalize_selected_path(raw))
+        .collect();
+    conflicts
+        .iter()
+        .filter(|conflict| {
+            named.contains(&conflict.path)
+                || conflict
+                    .moved_from
+                    .as_ref()
+                    .is_some_and(|from| named.contains(from))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The address a page's text answers to at `key`, or `None` for bytes that are
+/// no page.
+pub(super) fn address_of(key: &str, bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| crystalline_core::parse_engram(text).ok())
+        .map(|engram| EngramRecord::from_engram(&engram, key, no_stamp()).permalink)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crystalline_core::config::GlobalConfig;
+    use crystalline_index::TursoStore;
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    fn record(path: &str, merged: bool) -> DraftStart {
+        DraftStart {
+            path: path.to_string(),
+            from: Some(path.to_string()),
+            start: Some("start\n".to_string()),
+            start_sha256: None,
+            shared: None,
+            merged_at: merged.then(chrono::Utc::now),
+            merging: None,
+            settling: None,
+        }
+    }
+
+    fn listed(path: &str, moved_from: Option<&str>) -> DraftConflict {
+        DraftConflict {
+            id: conflict_id("alice", path),
+            path: path.to_string(),
+            kind: DraftConflictKind::EditEdit,
+            moved_from: moved_from.map(str::to_string),
+            file: false,
+            other: None,
+            page_kind: None,
+        }
+    }
+
+    fn named(files: &[&str]) -> Vec<String> {
+        files.iter().map(|file| file.to_string()).collect()
+    }
+
+    #[test]
+    fn with_no_files_every_conflict_blocks() {
+        let all = vec![listed("a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(conflicts_block(&all, None), all);
+        assert_eq!(conflicts_block(&[], None), vec![]);
+    }
+
+    #[test]
+    fn named_files_block_by_path_or_by_where_the_move_started() {
+        let all = vec![listed("a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["a.md"]))),
+            vec![all[0].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["c.md"]))),
+            vec![all[1].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["b.md", "z.md"]))),
+            vec![all[1].clone()]
+        );
+        assert_eq!(conflicts_block(&all, Some(&named(&["z.md"]))), vec![]);
+        assert_eq!(conflicts_block(&all, Some(&[])), vec![]);
+    }
+
+    #[test]
+    fn a_name_is_read_as_the_share_reads_it() {
+        let all = vec![listed("notes/a.md", None), listed("b.md", Some("c.md"))];
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&[" ./notes\\a.md "]))),
+            vec![all[0].clone()]
+        );
+        assert_eq!(
+            conflicts_block(&all, Some(&named(&["./c.md"]))),
+            vec![all[1].clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn drafts_merged_lists_the_records_a_merge_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Engine::new(
+            Arc::new(Mutex::new(store)),
+            GlobalConfig::default(),
+            None,
+            None,
+        )
+        .with_state_dir(tmp.path().to_path_buf());
+        assert_eq!(engine.drafts_merged("team", "alice"), Vec::<String>::new());
+        for (path, merged) in [("a.md", false), ("b.md", true), ("c/d.md", true)] {
+            draft_start::save(tmp.path(), "team", "alice", &record(path, merged)).unwrap();
+        }
+        draft_start::save(tmp.path(), "team", "bob", &record("e.md", true)).unwrap();
+        let mut merged = engine.drafts_merged("team", "alice");
+        merged.sort();
+        assert_eq!(merged, vec!["b.md".to_string(), "c/d.md".to_string()]);
+    }
+}

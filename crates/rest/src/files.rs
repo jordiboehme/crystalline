@@ -47,7 +47,7 @@ use crate::engine::{ASSET_EXISTS, EngineError};
 /// may be reached for anything, and the response is sandboxed into a unique
 /// opaque origin so a scriptable payload cannot touch the instance it came
 /// from.
-const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
+pub(crate) const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
 
 /// One attachment's metadata, the row a file browser draws.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -689,7 +689,7 @@ fn disposition(row: &AttachmentRow) -> String {
 /// already validated against backslashes, colons, `#` and control characters,
 /// but not against quotes or non-ASCII, and a header value is the wrong place to
 /// discover that.
-fn download_filename(path: &str) -> String {
+pub(crate) fn download_filename(path: &str) -> String {
     let last = path.rsplit('/').next().unwrap_or(path);
     let safe: String = last
         .chars()

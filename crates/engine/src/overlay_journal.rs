@@ -49,6 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crystalline_core::{config, parse_engram};
 use crystalline_index::{ChunkParams, DomainId, EngramRecord, Store, chunk_engram};
@@ -97,7 +98,10 @@ const RECORD_FILE: &str = ".convergence.json";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergenceRecord {
     /// Every path still standing as a conflict, per actor, each list ordered
-    /// and free of duplicates.
+    /// and free of duplicates. Nothing adds to it any more: a conflict is now
+    /// read from what stands. What older pulls wrote here is a frozen list the
+    /// conflict table reads for a draft from before the records, page or file,
+    /// and a resolution takes its path out.
     #[serde(default)]
     pub conflicts: BTreeMap<String, Vec<String>>,
     /// How many entries the last convergence pass took out of the overlay.
@@ -120,14 +124,6 @@ pub struct ConvergenceRecord {
 }
 
 impl ConvergenceRecord {
-    /// Record that `actor` has a conflict at `path`, once.
-    pub fn diverge(&mut self, actor: &str, path: &str) {
-        let paths = self.conflicts.entry(actor.to_string()).or_default();
-        if let Err(at) = paths.binary_search(&path.to_string()) {
-            paths.insert(at, path.to_string());
-        }
-    }
-
     /// Take `path` out of `actor`'s conflicts, answering how many they have
     /// left. An actor with none left leaves no entry behind.
     pub fn settle(&mut self, actor: &str, path: &str) -> u64 {
@@ -140,14 +136,6 @@ impl ConvergenceRecord {
             self.conflicts.remove(actor);
         }
         left
-    }
-
-    /// Every conflict standing, across every actor.
-    pub fn diverged(&self) -> u64 {
-        self.conflicts
-            .values()
-            .map(|paths| paths.len() as u64)
-            .sum()
     }
 }
 
@@ -263,10 +251,27 @@ pub(crate) fn tombstone_of(file: &Path) -> PathBuf {
     file.with_file_name(name)
 }
 
+/// Held across [`save`]'s make-the-folders-and-write and all of [`prune_empty`],
+/// so a prune can never take a folder a write has just made and not yet put a
+/// file into. A draft, a tombstone, a file in the overlay and a draft start
+/// record all go through those two, and they share the actor's folder, so the
+/// draft lock, which is per path, does not keep them apart.
+///
+/// One lock for the process, held for a few blocking file calls and never across
+/// an await. It does not reach another process: see `draft_start::save` for what
+/// covers that.
+static TREE_LOCK: Mutex<()> = Mutex::new(());
+
+/// A panic under the lock leaves no state in it to distrust, only folders.
+fn tree_lock() -> MutexGuard<'static, ()> {
+    TREE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Write atomically through [`config::save_bytes`], so a reader never sees a
 /// half-written draft and a crash never truncates one. Shared with
 /// [`crate::overlay_files`], whose bytes arrive the same way.
 pub(crate) fn save(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let _tree = tree_lock();
     config::save_bytes(file, bytes).map_err(io::Error::other)
 }
 
@@ -409,6 +414,7 @@ pub fn journal_clear_tombstone(
 /// folder rather than to the actor's - the actor's folder is this module's and
 /// outlives a cleared file.
 pub(crate) fn prune_empty(from: Option<&Path>, stop: &Path) {
+    let _tree = tree_lock();
     let mut cur = from.map(Path::to_path_buf);
     while let Some(dir) = cur {
         if !dir.starts_with(stop) || std::fs::remove_dir(&dir).is_err() {
@@ -692,6 +698,33 @@ pub fn journal_record(state_dir: &Path, domain: &str) -> ConvergenceRecord {
     }
 }
 
+/// The convergence record one domain's journal holds, read strictly: no file is
+/// an empty record, and a file that cannot be read or parsed is an error.
+///
+/// For the readers that decide with it, and for every writer that saves it
+/// whole: an old draft whose file the team no longer holds is a deletion she
+/// has to see only when this record lists it, so an unreadable record read as
+/// empty would let her share add back what the team deleted, and one saved
+/// back from such a read would lose the list for good. A reader that only
+/// reports keeps [`journal_record`].
+pub fn journal_record_strict(state_dir: &Path, domain: &str) -> io::Result<ConvergenceRecord> {
+    let file = record_path(state_dir, domain)?;
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ConvergenceRecord::default()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the convergence record {} could not be parsed: {e}",
+                file.display()
+            ),
+        )
+    })
+}
+
 /// Write one domain's convergence record, creating the journal folder for it.
 ///
 /// A record with nothing in it removes the file instead of writing an empty
@@ -708,6 +741,30 @@ pub fn journal_save_record(
     }
     let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     save(&file, &bytes)
+}
+
+/// The mark a fold leaves while it runs, beside the convergence record. It
+/// stands from just before the review key comes off until every row is
+/// dropped, so a fold that stopped part way leaves it: while it stands, the
+/// drafts still merge and settle as they do in review mode.
+const FOLD_MARK: &str = ".fold-unfinished";
+
+/// Whether a fold of `domain` began and did not finish. A name that cannot
+/// address a journal folder holds no mark.
+pub(crate) fn fold_unfinished(state_dir: &Path, domain: &str) -> bool {
+    domain_dir(state_dir, domain).is_ok_and(|dir| dir.join(FOLD_MARK).is_file())
+}
+
+/// Leave the mark of a fold that has begun.
+pub(crate) fn mark_fold_unfinished(state_dir: &Path, domain: &str) -> io::Result<()> {
+    let dir = domain_dir(state_dir, domain)?;
+    std::fs::create_dir_all(&dir)?;
+    save(&dir.join(FOLD_MARK), b"")
+}
+
+/// Take the mark away once the fold finished, or the domain reviews again.
+pub(crate) fn clear_fold_unfinished(state_dir: &Path, domain: &str) -> io::Result<()> {
+    remove_if_present(&domain_dir(state_dir, domain)?.join(FOLD_MARK))
 }
 
 /// The file one domain's convergence record lives in.

@@ -604,7 +604,11 @@ impl Engine {
     /// **Taking it off** ends every actor's private drafts, so it is never
     /// decided by omission. [`ReviewModeConfirm::Preview`] answers the plan -
     /// who holds what, which drafts are deletions, which paths more than one
-    /// actor is drafting and which drafts could not land - and writes nothing.
+    /// actor is drafting, which drafts could not land and which do not fit the
+    /// team's text - and folds nothing. Both ways first run the convergence
+    /// pass, so a draft the team's change merges into is merged before anyone
+    /// reads the plan or folds; a draft that still does not fit refuses its
+    /// actor's fold, which discard does not need.
     /// [`ReviewModeConfirm::Confirmed`] carries one [`FoldChoice`] per actor
     /// holding drafts: an actor left out refuses naming them, and an actor named
     /// who holds nothing refuses too, because both are somebody meaning a
@@ -796,6 +800,35 @@ impl Engine {
                 )
                 .await?
         };
+        // A fold that stopped part way left the key off and drafts behind. The
+        // mark says so, so the pass below and resolve treat those drafts as in
+        // review mode until the fold finishes. A fold from before the mark
+        // existed gets it here.
+        let recovering = !entry.is_overlay();
+        if recovering
+            && !self
+                .overlay_actor_drafts(domain, domain_id)
+                .await?
+                .is_empty()
+        {
+            self.mark_fold(domain, true)?;
+        }
+        let viewer = crate::scope::overlay_actor(scope);
+        let reader = review::Reader {
+            viewer: viewer.as_deref(),
+            admin: matches!(
+                scope,
+                crate::scope::Scope::Unrestricted | crate::scope::Scope::User { admin: true, .. }
+            ),
+        };
+        // The pass first, for the plan and the fold alike: a stale draft that
+        // merges is merged now, so the fold lands the team's line beside hers
+        // rather than over it. A failed pass stays a warning, as it does before
+        // a share: the check below reads what stands, so a stale draft still
+        // refuses.
+        if let Err(e) = self.converge_overlays(domain).await {
+            tracing::warn!("converging the drafts in '{domain}' before leaving review failed: {e}");
+        }
         let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
         let base = {
             let store = self.store.lock().await;
@@ -804,7 +837,46 @@ impl Engine {
 
         let choices = match &confirm {
             ReviewModeConfirm::Preview => {
-                return Ok(review::plan_json(domain, entry, &drafts, &base));
+                // A list that cannot be read is reported on its actor, never
+                // read as clean: the fold of that actor refuses.
+                let mut conflicts = HashMap::new();
+                let mut unreadable = HashSet::new();
+                for held in &drafts {
+                    match self.draft_conflicts(domain, &held.actor).await {
+                        Ok(found) => {
+                            conflicts.insert(held.actor.clone(), found);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                domain,
+                                actor = held.actor.as_str(),
+                                "the conflicts of '{}' could not be read: {e}",
+                                held.actor
+                            );
+                            unreadable.insert(held.actor.clone());
+                        }
+                    }
+                }
+                let removed = self
+                    .removed_names(
+                        conflicts
+                            .iter()
+                            .filter(|(_, found)| !found.is_empty())
+                            .map(|(actor, _)| actor),
+                    )
+                    .await?;
+                return Ok(review::plan_json(
+                    domain,
+                    entry,
+                    &drafts,
+                    &base,
+                    &review::PlanConflicts {
+                        conflicts: &conflicts,
+                        unreadable: &unreadable,
+                        removed: &removed,
+                        reader,
+                    },
+                ));
             }
             ReviewModeConfirm::Confirmed { folds } => folds,
         };
@@ -826,6 +898,12 @@ impl Engine {
         if let Some(refusal) = review::collision(domain, &folding, &base, root.as_deref()) {
             return Err(EngineError::Conflict(refusal));
         }
+        if let Some(refusal) = self
+            .unsettled_folds(domain, &folding, reader, recovering)
+            .await?
+        {
+            return Err(EngineError::Conflict(refusal));
+        }
 
         // Nothing to do, said as nothing done. The conjunction is the point:
         // a domain that is not reviewing AND holds no drafts is a `PUT
@@ -835,7 +913,17 @@ impl Engine {
         // already come off but whose overlay is not empty is the mid-fold
         // recovery [`Engine::set_review_mode`] documents, and that one has to
         // run.
+        //
+        // A fold mark left with no drafts behind it (a crash after the last
+        // drop, or an admin who ended the drafts) goes here, since nothing
+        // else is left to clear it. Only a mark that is there is cleared, and a
+        // failure is a warning: the statement still holds without it.
         if !entry.is_overlay() && drafts.is_empty() {
+            if self.drafts_stay_open(domain)
+                && let Err(e) = self.mark_fold(domain, false)
+            {
+                tracing::warn!("the fold mark of '{domain}' could not be taken away: {e}");
+            }
             return Ok(review::left_json(domain, Vec::new(), Vec::new(), 0));
         }
 
@@ -885,6 +973,12 @@ impl Engine {
         // drafts but missing from the map would fall through this filter
         // unnamed, and their room would save into the tree rather than close
         // discarding - the publish this call exists to prevent.
+        // The mark goes down before the key comes off, so a fold that stops
+        // anywhere after this leaves drafts that can still be settled.
+        self.run_fold_hook(FoldStep::KeyOff).await;
+        if !drafts.is_empty() {
+            self.mark_fold(domain, true)?;
+        }
         self.write_review_key(domain, None)?;
         let discarded: HashSet<String> = choices
             .iter()
@@ -909,6 +1003,56 @@ impl Engine {
         // their sockets and nothing else: the key goes back on, no file is
         // written and no row is dropped, so the same call works once one of the
         // two engrams has an address of its own.
+        self.run_fold_hook(FoldStep::RoomsClosed).await;
+        // **From here until every row is dropped, the origin lock is held**, so
+        // no pull lands between the checks below and the writes they approve.
+        // The order is the house order: admin, fence, then origin, as a domain
+        // rename takes them. Nothing below takes the origin lock again.
+        let origin = self.origin_lock_registered(domain)?;
+        let origin_guard = origin.lock().await;
+        // The drafts again, as they stand now: a pull before the key came off
+        // merged into them through its pass, and the fold lands that text, not
+        // the text this call read at its start. An actor not in `choices` wrote
+        // a draft in that window; step 4 drops it.
+        let drafts = self.overlay_actor_drafts(domain, domain_id).await?;
+        let folding: Vec<&ActorDrafts> = drafts
+            .iter()
+            .filter(|d| choices.get(&d.actor) == Some(&FoldChoice::Fold))
+            .collect();
+        // A refusal below puts the domain back as it was when this call began:
+        // reviewing, or, in a repeat of a fold that stopped part way, still
+        // folding with its mark.
+        let put_back = |this: &Self| -> Result<()> {
+            if !recovering {
+                this.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
+                this.mark_fold(domain, false)?;
+            }
+            Ok(())
+        };
+        let rooms_saved = match rooms_closed {
+            0 => String::new(),
+            _ => " What those rooms saved is in the folder now, which `origin status` lists as \
+                  out-of-band work."
+                .to_string(),
+        };
+        let reviews_again = match recovering {
+            false => ", and the domain reviews changes again",
+            true => "",
+        };
+
+        // **And the same question again, of the folder the folded rooms just
+        // wrote into.** The key is off, so every swept room that saved wrote
+        // into the folder,
+        // and a participant who edited the frontmatter's permalink line has
+        // moved a base engram's address between the check above and this line; a fold validated
+        // against the older folder would write a second engram at that address
+        // and the first thing to notice would be the `sync` at the end - by
+        // which time the files are written, every actor's rows are dropped and
+        // every later sync of this domain fails the same way, with nothing left
+        // to undo it from. Asked here instead, the refusal costs the rooms
+        // their sockets and nothing else: the key goes back on, no file is
+        // written and no row is dropped, so the same call works once one of the
+        // two engrams has an address of its own.
         let base = {
             let store = self.store.lock().await;
             store.list_engrams(domain, None, None).await?
@@ -918,13 +1062,48 @@ impl Engine {
             // with `switched_off` already, and nothing was folded. That is
             // harmless: each of those rooms saved its text first, and its
             // editors can open the page again.
-            self.write_review_key(domain, Some(crystalline_core::config::ReviewMode::Overlay))?;
-            return Err(EngineError::Conflict(format!(
-                "{refusal}. The folder changed while this domain's co-editing rooms were being \
-                 closed, so nothing was folded and the domain reviews changes again; what those \
-                 rooms saved is in the folder now, which `origin status` lists as out-of-band work"
-            )));
+            //
+            // A repeated fold is left as it was found, as the conflict check
+            // below leaves it: the key stays off and the mark stays.
+            put_back(self)?;
+            return Err(EngineError::Conflict(match recovering {
+                false => format!(
+                    "{refusal}. The folder changed while this domain's co-editing rooms were \
+                     being closed, so nothing was folded and the domain reviews changes again; \
+                     what those rooms saved is in the folder now, which `origin status` lists as \
+                     out-of-band work"
+                ),
+                true => format!(
+                    "{refusal}. The folder changed while the fold was under way, so nothing more \
+                     was folded.{rooms_saved}"
+                ),
+            }));
         }
+        // And her drafts asked again, of the snapshot as it stands now. This
+        // list does not ask the key. Its refusal, or a list that cannot be
+        // read, puts the domain back as the address check does.
+        let unsettled = match self
+            .unsettled_folds(domain, &folding, reader, recovering)
+            .await
+        {
+            Ok(None) => None,
+            Ok(Some(refusal)) => Some(EngineError::Conflict(format!(
+                "{refusal} This changed while the fold was under way{reviews_again}.{rooms_saved}"
+            ))),
+            Err(EngineError::Conflict(refusal)) => Some(EngineError::Conflict(format!(
+                "{refusal}{}{rooms_saved}",
+                match recovering {
+                    false => " The domain reviews changes again.",
+                    true => "",
+                }
+            ))),
+            Err(e) => Some(e),
+        };
+        if let Some(refusal) = unsettled {
+            put_back(self)?;
+            return Err(refusal);
+        }
+        self.run_fold_hook(FoldStep::Checked).await;
 
         // A folded MANIFEST draft may move the switch.
         let switch_before = self.reflection_switch(domain);
@@ -1010,6 +1189,13 @@ impl Engine {
             }
         }
         drop(pending);
+        // Every row is gone, so the fold is done: the mark goes, and a pull may
+        // land again. A mark that stays is logged; it only keeps a pass
+        // running over a domain with no drafts left.
+        if let Err(e) = self.mark_fold(domain, false) {
+            tracing::warn!("the fold mark of '{domain}' could not be taken away: {e}");
+        }
+        drop(origin_guard);
         // The files go with the rows, folded and discarded alike: whichever
         // answer each actor gave, drafting in this domain is over, and a files
         // overlay left behind would be bytes belonging to nobody in a domain
@@ -1051,6 +1237,97 @@ impl Engine {
         synced?;
 
         Ok(review::left_json(domain, folded, discarded, rooms_closed))
+    }
+
+    /// The fold's refusal while a folding actor holds drafts that do not fit
+    /// the team's text, read fresh from what stands. A list that cannot be read
+    /// is an error, never a clean answer.
+    ///
+    /// A name is removed when the accounts store holds no account under it and
+    /// it is not the machine owner's. With no accounts store, as on the CLI or
+    /// a test engine, no name is removed.
+    ///
+    /// A list that cannot be read refuses as a conflict (409) that names the
+    /// actor and says discard is the way left; the cause goes to the log.
+    async fn unsettled_folds(
+        &self,
+        domain: &str,
+        folding: &[&ActorDrafts],
+        reader: review::Reader<'_>,
+        recovering: bool,
+    ) -> Result<Option<String>> {
+        let mut conflicts = HashMap::new();
+        for held in folding {
+            let found = match self.draft_conflicts(domain, &held.actor).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(
+                        domain,
+                        actor = held.actor.as_str(),
+                        "the conflicts of '{}' could not be read, so the fold refused: {e}",
+                        held.actor
+                    );
+                    return Err(EngineError::Conflict(review::unreadable(
+                        domain,
+                        &held.actor,
+                        reader,
+                        recovering,
+                    )));
+                }
+            };
+            if !found.is_empty() {
+                conflicts.insert(held.actor.clone(), found);
+            }
+        }
+        let removed = self.removed_names(conflicts.keys()).await?;
+        Ok(review::unsettled(
+            domain, folding, &conflicts, &removed, reader, recovering,
+        ))
+    }
+
+    /// The names among `actors` with no account any more: the accounts store
+    /// holds none under them and they are not the machine owner's. With no
+    /// accounts store, as on the CLI or a test engine, no name is removed.
+    async fn removed_names(
+        &self,
+        actors: impl Iterator<Item = &String>,
+    ) -> Result<HashSet<String>> {
+        let mut removed = HashSet::new();
+        let Some(access) = self.domain_access.get() else {
+            return Ok(removed);
+        };
+        for actor in actors {
+            if actor != OWNER_IDENTITY_NAME
+                && access
+                    .account_born(actor)
+                    .await
+                    .map_err(|e| EngineError::Internal(e.to_string()))?
+                    .is_none()
+            {
+                removed.insert(actor.clone());
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Leave or take away the mark of an unfinished fold
+    /// ([`crate::overlay_journal::fold_unfinished`]).
+    /// A process with no state folder holds no drafts, so it has no mark to
+    /// take away.
+    fn mark_fold(&self, domain: &str, unfinished: bool) -> Result<()> {
+        let state_dir = match self.journal_state_dir() {
+            Ok(state_dir) => state_dir,
+            Err(_) if !unfinished => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let written = match unfinished {
+            true => crate::overlay_journal::mark_fold_unfinished(&state_dir, domain),
+            false => crate::overlay_journal::clear_fold_unfinished(&state_dir, domain),
+        };
+        written.map_err(|source| EngineError::Io {
+            path: format!("the fold mark of '{domain}'"),
+            source,
+        })
     }
 
     /// Land one folding actor's files in the folder the team shares, answering
@@ -1819,36 +2096,51 @@ impl Engine {
     }
 }
 
-/// Whether folding `folding` (in fold order, the last MANIFEST draft wins)
-/// switches the Reflection of the domain at `root` off: the MANIFEST in the
-/// folder says `reflection: on` and the one the fold leaves does not (a
-/// deleted MANIFEST says nothing, so it is off too).
 /// Whether the folder a file at `rel` would land in may treat two spellings as
-/// one name: the nearest folder that exists, since a symlink or a mount inside a
-/// domain can stand on another disk from its root.
+/// one name. **A folder that cannot say counts as folding**: for a fold and a
+/// share a wrong "folds" costs a refusal with a way out, and a wrong "keeps
+/// apart" costs somebody's text with no warning. See [`folder_folds_case`].
+pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+    folder_folds_case(root, rel) != Some(false)
+}
+
+/// Whether a page at `rel` lands where two spellings are one name: asked of
+/// the domain's folder `root` only, and only a folder that says it folds
+/// counts. A folder that cannot say does not fold, so a case move is never
+/// read as landed on a guess and no rename is lost. The folder a share stages
+/// its tree in is not asked, unlike for files (`Engine::file_may_fold_case`):
+/// where it folds and the domain folder does not, a case move stays a draft.
+pub(crate) fn page_folds_case(root: &Path, rel: &str) -> bool {
+    root.is_dir() && folder_folds_case(root, rel) == Some(true)
+}
+
+/// Whether the folder a file at `rel` would land in treats two spellings as one
+/// name: `Some(true)` it folds, `Some(false)` it keeps them apart, `None` it
+/// cannot say. The folder asked is the nearest one that exists, since a symlink
+/// or a mount inside a domain can stand on another disk from its root.
 ///
 /// Nothing is written. A name the folder lists is looked up in the other case:
 /// not there means it keeps them apart, and there without being listed means it
-/// folds. **A folder that cannot say counts as folding**, an empty one included:
-/// a wrong "folds" costs a refusal with a way out, and a wrong "keeps apart"
-/// costs somebody's text with no warning.
-pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
+/// folds. A folder outside `root`, one that cannot be listed, an empty one or
+/// one whose names hold no letter cannot say.
+///
+/// The caller picks the safe side of `None` for what it decides. A fold reads
+/// it as folding ([`folder_may_fold_case`]). Whether a draft has landed, in the
+/// conflict list and in the pass alike, reads it as keeping apart: a case move
+/// read as landed would end with its rename dropped, and one read as not landed
+/// stays a draft she can settle. So where it cannot tell, the safe answer is
+/// that it does not fold.
+pub(crate) fn folder_folds_case(root: &Path, rel: &str) -> Option<bool> {
     let landing = join_rel(root, rel);
-    let Some(dir) = landing.ancestors().skip(1).find(|dir| dir.is_dir()) else {
-        return true;
-    };
+    let dir = landing.ancestors().skip(1).find(|dir| dir.is_dir())?;
     if !dir.starts_with(root) {
-        return true;
+        return None;
     }
-    let Ok(listing) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    let Ok(names) = listing
+    let names = std::fs::read_dir(dir)
+        .ok()?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<Vec<_>>>()
-    else {
-        return true;
-    };
+        .ok()?;
     let other_case = |name: &str| -> String {
         name.chars()
             .map(|c| {
@@ -1860,22 +2152,24 @@ pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
             })
             .collect()
     };
-    let Some(swapped) = names
+    let swapped = names
         .iter()
         .filter_map(|name| name.to_str())
-        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))
-    else {
-        return true;
-    };
+        .find_map(|name| Some(other_case(name)).filter(|swapped| swapped != name))?;
     if names.iter().any(|listed| listed.to_str() == Some(&swapped)) {
-        return false;
+        return Some(false);
     }
     match dir.join(&swapped).symlink_metadata() {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
+/// Whether folding `folding` (in fold order, the last MANIFEST draft wins)
+/// switches the Reflection of the domain at `root` off: the MANIFEST in the
+/// folder says `reflection: on` and the one the fold leaves does not (a
+/// deleted MANIFEST says nothing, so it is off too).
 fn folds_switch_off(root: &Path, folding: &[&ActorDrafts]) -> bool {
     let landing = folding
         .iter()
@@ -1908,7 +2202,44 @@ fn folds_switch_on(root: &Path, folding: &[&ActorDrafts]) -> bool {
 
 #[cfg(test)]
 mod folder_case_tests {
-    use super::folder_may_fold_case;
+    use super::{folder_folds_case, folder_may_fold_case};
+
+    /// The three answers: a folder that lists a name says, and one with nothing
+    /// to ask, or that cannot be listed, cannot.
+    #[test]
+    fn a_folder_that_cannot_say_answers_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        assert_eq!(folder_folds_case(root, "empty/Zed.md"), None);
+        assert_eq!(folder_folds_case(&root.join("gone"), "Zed.md"), None);
+        std::fs::create_dir(root.join("digits")).unwrap();
+        std::fs::write(root.join("digits").join("123"), "x").unwrap();
+        assert_eq!(
+            folder_folds_case(root, "digits/Zed.md"),
+            None,
+            "no letter to swap"
+        );
+
+        std::fs::write(root.join("Probe.md"), "x").unwrap();
+        let folds = root.join("probe.md").exists();
+        assert_eq!(folder_folds_case(root, "Zed.md"), Some(folds));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shut = root.join("shut");
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("Name.md"), "x").unwrap();
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let listable = std::fs::read_dir(&shut).is_ok();
+            let answer = folder_folds_case(root, "shut/Zed.md");
+            std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if !listable {
+                assert_eq!(answer, None, "a folder that cannot be listed");
+            }
+        }
+    }
 
     /// A folder that lists a name answers for itself. Nothing to compare with is
     /// no answer, and no answer counts as folding, since a refusal beats a lost

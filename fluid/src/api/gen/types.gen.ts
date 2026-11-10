@@ -562,6 +562,172 @@ export type DomainMember = {
 };
 
 /**
+ * One of your drafts that does not fit the team's text.
+ */
+export type DraftConflictEntry = {
+    /**
+     * Always true: the entry is a draft's, never the folder's.
+     */
+    draft: boolean;
+    /**
+     * A file beside the pages rather than a page.
+     */
+    file: boolean;
+    /**
+     * `d` and seven hex digits, stable while the draft stands.
+     */
+    id: string;
+    kind: DraftConflictKind;
+    /**
+     * The path a moved draft left.
+     */
+    moved_from: string | null;
+    /**
+     * For `AddressTaken`: the team's path that holds the address.
+     */
+    other: string | null;
+    page_kind: DraftConflictKind | null;
+    /**
+     * The draft's path, or the deletion's when it stands alone.
+     */
+    path: string;
+};
+
+/**
+ * Why a draft does not fit the team's text: `EditEdit` both changed the same lines, `EditDelete` the team deleted a page you drafted, `DeleteEdit` you deleted a page the team changed, `AddAdd` the team has a file where you did not start from one, `UnknownStart` a draft from before 0.32.0 with no record of its start, `AddressTaken` another team page holds your draft's address.
+ */
+export type DraftConflictKind = 'EditEdit' | 'EditDelete' | 'DeleteEdit' | 'AddAdd' | 'UnknownStart' | 'AddressTaken';
+
+/**
+ * One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. For `AddressTaken` `upstream` is the page that holds your address, and `page_upstream` the team's text of your own page when `page_kind` says it changed too. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.
+ */
+export type DraftConflictSides = {
+    base: string | null;
+    /**
+     * Always null: a draft conflict is read from what stands, never stored.
+     */
+    detected_at: string | null;
+    /**
+     * Always true.
+     */
+    draft: boolean;
+    /**
+     * Present, and true, only for a file.
+     */
+    file?: boolean | null;
+    id: string;
+    kind: DraftConflictKind;
+    local: string | null;
+    moved_from: string | null;
+    /**
+     * For your deletion of a page or file the team moved: where it went.
+     * Keeping your side then removes nothing, since the team's copy stands
+     * there.
+     */
+    moved_to: string | null;
+    note: string | null;
+    /**
+     * A draft from before 0.32.0, with no record of its start: taking the
+     * team's side keeps a copy of it first.
+     */
+    old_draft: boolean;
+    other: string | null;
+    page_kind: DraftConflictKind | null;
+    /**
+     * For `AddressTaken` with a `page_kind`: the team's text of your own
+     * page. Null when the team deleted it, or when there is no `page_kind`.
+     */
+    page_upstream: string | null;
+    path: string;
+    upstream: string | null;
+    /**
+     * What the team's side is: the SHA-256 of its bytes (a page's text or a
+     * file's), `absent` when the team holds nothing there, `unreadable` when
+     * its copy cannot be read. With a `page_kind` it is one token for both
+     * team sides. Pass it back as `expected_upstream_sha256` when settling,
+     * so a team change made since is not overwritten.
+     */
+    upstream_sha256: string;
+};
+
+/**
+ * Your own draft conflicts in this domain, and the drafts an update merged team changes into since they last settled.
+ */
+export type DraftConflictsResponse = {
+    /**
+     * Ordered by path.
+     */
+    conflicts: Array<DraftConflictEntry>;
+    /**
+     * Paths of your drafts a merge changed, sorted.
+     */
+    merged: Array<string>;
+    /**
+     * What you may not do with these conflicts here, in a sentence to show:
+     * on a read-only server or without write access none can be settled,
+     * and on a read-only domain or an archived repository only the team's
+     * text can be taken. Null when every choice is open or nothing is listed.
+     */
+    settle_note: string | null;
+};
+
+/**
+ * Where the resolution landed: in your draft.
+ */
+export type DraftResolveReceipt = {
+    /**
+     * Your side was a deletion: keeping it removes the team's page or file
+     * when you share, unless `moved_to` is set.
+     */
+    deletion: boolean;
+    /**
+     * Always true.
+     */
+    draft: boolean;
+    /**
+     * Present when the draft landed but its copy on this server's disk did
+     * not.
+     */
+    draft_warning?: string | null;
+    /**
+     * Present, and true, only for a file.
+     */
+    file?: boolean | null;
+    /**
+     * `mine`, `theirs` or `merged`.
+     */
+    kept: string;
+    /**
+     * Whether a copy of your text or file was kept before taking the
+     * team's.
+     */
+    kept_copy: boolean;
+    /**
+     * Always null over this API: a place on the server's disk is named only
+     * to the machine owner.
+     */
+    kept_file?: string | null;
+    /**
+     * For a file that was kept: where to find it.
+     */
+    kept_note?: string | null;
+    /**
+     * For a kept deletion of a page or file the team moved: where it went.
+     * Your deletion then removes nothing, and it ends.
+     */
+    moved_to?: string | null;
+    /**
+     * How many of your conflicts in this domain are left, or null when they
+     * could not be counted.
+     */
+    remaining: number | null;
+    /**
+     * The draft's path. A move is settled whole, at its draft.
+     */
+    resolved: string;
+};
+
+/**
  * One engram changed, as every subscriber hears it.
  */
 export type EngramChanged = {
@@ -982,6 +1148,12 @@ export type KeptTextEntry = {
      * for its owner.
      */
     draft: boolean;
+    /**
+     * Whether it is a draft file beside the pages, kept as its bytes rather
+     * than a text: it has no text to read, and is had through
+     * `GET /domains/{domain}/kept/{id}/file`.
+     */
+    file: boolean;
     /**
      * A short, stable id for the routes below.
      */
@@ -2130,6 +2302,14 @@ export type ResolveBody = {
      * The merged markdown. Required for `merged`, meaningless otherwise.
      */
     content?: string | null;
+    /**
+     * For a draft conflict: the `upstream_sha256` its sides answered when
+     * they were shown. When the team's side changed since, the resolve is
+     * refused with 409 and nothing changes, so nobody settles against team
+     * text they did not see. Left out, nothing is checked. The folder's
+     * conflict route ignores it.
+     */
+    expected_upstream_sha256?: string | null;
     /**
      * mine | theirs | merged
      */
@@ -3841,6 +4021,144 @@ export type GetDomainDraftsResponses = {
 
 export type GetDomainDraftsResponse = GetDomainDraftsResponses[keyof GetDomainDraftsResponses];
 
+export type ListDraftConflictsData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts';
+};
+
+export type ListDraftConflictsErrors = {
+    /**
+     * No identity, or the anonymous viewer, which holds no draft.
+     */
+    401: ProblemDetail;
+    /**
+     * No such domain, or one the caller may not see.
+     */
+    404: ProblemDetail;
+    /**
+     * Your conflicts cannot be read, so none are listed; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+};
+
+export type ListDraftConflictsError = ListDraftConflictsErrors[keyof ListDraftConflictsErrors];
+
+export type ListDraftConflictsResponses = {
+    /**
+     * Your conflicts and merged drafts.
+     */
+    200: DraftConflictsResponse;
+};
+
+export type ListDraftConflictsResponse = ListDraftConflictsResponses[keyof ListDraftConflictsResponses];
+
+export type GetDraftConflictData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The conflict id from the list.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts/{id}';
+};
+
+export type GetDraftConflictErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.
+     */
+    404: ProblemDetail;
+    /**
+     * Your conflicts cannot be read; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+};
+
+export type GetDraftConflictError = GetDraftConflictErrors[keyof GetDraftConflictErrors];
+
+export type GetDraftConflictResponses = {
+    /**
+     * The conflict and its sides.
+     */
+    200: DraftConflictSides;
+};
+
+export type GetDraftConflictResponse = GetDraftConflictResponses[keyof GetDraftConflictResponses];
+
+export type ResolveDraftConflictData = {
+    body: ResolveBody;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The conflict id from the list.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/drafts/conflicts/{id}/resolve';
+};
+
+export type ResolveDraftConflictErrors = {
+    /**
+     * No identity, or the anonymous viewer.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller may not write this domain, the request did not echo its CSRF token, this instance is read-only, the domain's repository is archived or its MANIFEST says `read_only: on` (both except for `theirs`), the result would switch `read_only` on (the owner's step), or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, one the caller may not see, a domain that does not review changes, or no conflict with that id among the caller's drafts.
+     */
+    404: ProblemDetail;
+    /**
+     * The team's side changed since the sides named in `expected_upstream_sha256` were read, so nothing was settled: read the sides again. Or another instance on this shared database hosts this file domain, so it is written there.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * An unknown `resolution`, `merged` with no `content`, a merge of a file, a resolution the draft refuses, or your conflicts cannot be read, which blocks every resolve until they can; the detail says why and what to do.
+     */
+    422: ProblemDetail;
+    /**
+     * The conflict could not be settled for a reason on the server's side, so nothing was changed. The detail says so and names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
+};
+
+export type ResolveDraftConflictError = ResolveDraftConflictErrors[keyof ResolveDraftConflictErrors];
+
+export type ResolveDraftConflictResponses = {
+    /**
+     * Where the resolution landed and how many of your conflicts are left.
+     */
+    200: DraftResolveReceipt;
+};
+
+export type ResolveDraftConflictResponse = ResolveDraftConflictResponses[keyof ResolveDraftConflictResponses];
+
 export type ListEngramsData = {
     body?: never;
     path: {
@@ -4650,6 +4968,14 @@ export type ReadKeptTextErrors = {
      * No such domain or kept text for this caller.
      */
     404: ProblemDetail;
+    /**
+     * The kept copy is a file, not text. The detail says so in a sentence to show.
+     */
+    422: ProblemDetail;
+    /**
+     * The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
 };
 
 export type ReadKeptTextError = ReadKeptTextErrors[keyof ReadKeptTextErrors];
@@ -4662,6 +4988,52 @@ export type ReadKeptTextResponses = {
 };
 
 export type ReadKeptTextResponse = ReadKeptTextResponses[keyof ReadKeptTextResponses];
+
+export type DownloadKeptCopyData = {
+    body?: never;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+        /**
+         * The id from the listing.
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/kept/{id}/file';
+};
+
+export type DownloadKeptCopyErrors = {
+    /**
+     * The anonymous viewer of a domain it reads.
+     */
+    401: ProblemDetail;
+    /**
+     * Neither write access to the engrams nor edit access to the Reflection.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain or kept copy for this caller.
+     */
+    404: ProblemDetail;
+    /**
+     * The server could not read the kept copy. The detail names no place on the server's disk; the cause is in the server's log.
+     */
+    500: ProblemDetail;
+};
+
+export type DownloadKeptCopyError = DownloadKeptCopyErrors[keyof DownloadKeptCopyErrors];
+
+export type DownloadKeptCopyResponses = {
+    /**
+     * The kept copy's bytes.
+     */
+    200: Array<number>;
+};
+
+export type DownloadKeptCopyResponse = DownloadKeptCopyResponses[keyof DownloadKeptCopyResponses];
 
 export type GetDomainManifestData = {
     body?: never;
@@ -6293,7 +6665,7 @@ export type SetDomainReviewModeErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, or a fold two engrams would come out of.
+     * The domain cannot take the mode asked for: no GitHub origin, a virtual domain, unshared work in the folder, an answer that does not cover every actor holding drafts, a fold two engrams would come out of, or a folded draft that does not fit the team's text or whose conflicts could not be read. Each names the actor; discard always works.
      */
     409: ProblemDetail;
     /**
@@ -6444,7 +6816,7 @@ export type GetDomainShareChangesError = GetDomainShareChangesErrors[keyof GetDo
 
 export type GetDomainShareChangesResponses = {
     /**
-     * The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`.
+     * The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. On a domain that reviews changes, a preview naming `files` answers `conflicts_pending` with `count` and `conflicts` (each `{ id, path, kind, moved_from, file, other, draft: true }`) when one of the caller's own drafts among them does not fit the team's text, and `changes` stays filled. A preview with no `files` keeps its action and names those drafts in `draft_conflicts`, in the same shape.
      */
     200: {
         [key: string]: unknown;
@@ -6539,7 +6911,7 @@ export type ResolveDomainConflictErrors = {
      */
     415: ProblemDetail;
     /**
-     * An unknown `resolution`, or `merged` with no `content` to write.
+     * An unknown `resolution`, `merged` with no `content` to write, or `merged` for a file under `assets/`, which never merges.
      */
     422: ProblemDetail;
 };
@@ -6652,9 +7024,9 @@ export type ShareDomainError = ShareDomainErrors[keyof ShareDomainErrors];
 
 export type ShareDomainResponses = {
     /**
-     * The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.
+     * The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts (on a domain that reviews changes, the sharer's own drafts that do not fit the team's text, each with `draft: true`), or `proposal_diverged` with guidance. On a domain that reviews changes, while another member's proposal is open, on every forge, the answer is `proposal_open` with its number, url and title, `own: false` and `guidance`, a sentence to show as given that names whose proposal it is: share again once it is merged or closed. Nothing was written. An `updated` outcome on such a domain may carry `note`, a sentence to show in place of the headline, when the team merged the proposal while the update was on its way: a change the merge did not hold stays a draft.
      *
-     * A domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists, `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.
+     * A domain that shares directly answers one of four outcomes instead: `committed` with the commit's sha, url and branch beside the three file lists (on a domain that reviews changes, with `free_error`, a sentence to show as given, when a draft the commit's deletion freed could not be updated), `proposal_open` with the number, url and title of another person's proposal that is still open; share again once it is merged or closed, `branch_protected` when the branch's own rules refuse a direct commit, and `branch_moved` when somebody else moved the branch while this share was prepared. Each of the three refusals carries guidance and nothing was written.
      *
      * A `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.
      */
@@ -8460,7 +8832,7 @@ export type GetSyncSummaryError = GetSyncSummaryErrors[keyof GetSyncSummaryError
 
 export type GetSyncSummaryResponses = {
     /**
-     * The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+     * The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) never makes a share worth offering, and rides along with one only where the domain shares its listings. On a stacked chain the count is taken against the chain tip, so work an open proposal already carries is not counted as unshared and the count agrees with the share plan. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns, and `conflicts` counts the folder's conflicts only: your own draft conflicts in a domain that reviews changes are listed by `GET /domains/{domain}/drafts/conflicts`. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
      *
      * Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
      */

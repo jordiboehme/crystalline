@@ -548,6 +548,27 @@ mod tests {
     }
 
     #[test]
+    fn a_room_merge_where_both_touched_generated_is_clean() {
+        let doc = |g: &str, a: &str, b: &str| {
+            format!(
+                "---\ntype: note\ntitle: T\n{g}status: stable\n---\n\n{a}\n\nf1\n\nf2\n\nf3\n\n{b}\n"
+            )
+        };
+        let line = |by: &str, at: &str| format!("generated: {{ by: {by}, at: \"{at}\" }}\n");
+        let base = doc(&line("x", "2026-11-01T10:00:00+00:00"), "line a", "line b");
+        let mine = doc(&line("alice", "2026-11-01T11:00:00+00:00"), "a2", "line b");
+        let theirs = doc(&line("bob", "2026-11-01T12:00:00+00:00"), "line a", "b2");
+        let MergeOutcome::Clean(merged) = three_way(&base, &mine, &theirs) else {
+            panic!("a generated line both sides touched is not a conflict");
+        };
+        assert!(
+            merged.contains("by: bob") && !merged.contains("by: alice"),
+            "{merged}"
+        );
+        assert!(merged.contains("a2") && merged.contains("b2"), "{merged}");
+    }
+
+    #[test]
     fn disjoint_edits_merge_clean_across_spaces() {
         let base = "# T\r\n\r\nSection A: original\r\n\r\nSection B: original\r\n";
         let mine = "# T\n\nSection A: mine\n\nSection B: original\n"; // the room's LF text

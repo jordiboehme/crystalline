@@ -386,6 +386,171 @@ pub struct ReflectionChanged {
     pub actor: Option<String>,
 }
 
+/// The kind of a draft conflict: a copy of the engine's `DraftConflictKind`,
+/// which carries no `utoipa`. The draft conflict routes answer the engine's
+/// JSON as it is; these copies only describe it.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Why a draft does not fit the team's text: `EditEdit` \
+                        both changed the same lines, `EditDelete` the team \
+                        deleted a page you drafted, `DeleteEdit` you deleted a \
+                        page the team changed, `AddAdd` the team has a file \
+                        where you did not start from one, `UnknownStart` a \
+                        draft from before 0.32.0 with no record of its start, \
+                        `AddressTaken` another team page holds your draft's \
+                        address.")]
+pub enum DraftConflictKind {
+    EditEdit,
+    EditDelete,
+    DeleteEdit,
+    AddAdd,
+    UnknownStart,
+    AddressTaken,
+}
+
+/// One of the caller's draft conflicts, as `GET .../drafts/conflicts` lists it.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "One of your drafts that does not fit the team's text.")]
+pub struct DraftConflictEntry {
+    /// `d` and seven hex digits, stable while the draft stands.
+    #[schema(example = "d3f9a1c2")]
+    pub id: String,
+    /// The draft's path, or the deletion's when it stands alone.
+    #[schema(example = "notes/plan.md")]
+    pub path: String,
+    pub kind: DraftConflictKind,
+    /// Always true: the entry is a draft's, never the folder's.
+    pub draft: bool,
+    /// The path a moved draft left.
+    #[schema(required = true)]
+    pub moved_from: Option<String>,
+    /// A file beside the pages rather than a page.
+    pub file: bool,
+    /// For `AddressTaken`: the team's path that holds the address.
+    #[schema(required = true)]
+    pub other: Option<String>,
+    /// For `AddressTaken`: the page's own conflict, when the team also
+    /// changed or deleted the page you drafted. Null otherwise. A merged text
+    /// with a new address settles the address only; this one is still to
+    /// settle after it.
+    #[schema(required = true)]
+    pub page_kind: Option<DraftConflictKind>,
+}
+
+/// What `GET /domains/{domain}/drafts/conflicts` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Your own draft conflicts in this domain, and the \
+                        drafts an update merged team changes into since they \
+                        last settled.")]
+pub struct DraftConflictsResponse {
+    /// Ordered by path.
+    pub conflicts: Vec<DraftConflictEntry>,
+    /// Paths of your drafts a merge changed, sorted.
+    #[schema(example = json!(["notes/plan.md"]))]
+    pub merged: Vec<String>,
+    /// What you may not do with these conflicts here, in a sentence to show:
+    /// on a read-only server or without write access none can be settled,
+    /// and on a read-only domain or an archived repository only the team's
+    /// text can be taken. Null when every choice is open or nothing is listed.
+    #[schema(required = true)]
+    pub settle_note: Option<String>,
+}
+
+/// What `GET /domains/{domain}/drafts/conflicts/{id}` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "One of your draft conflicts with its three sides: \
+                        `base` is the text your draft started from, `local` \
+                        your draft and `upstream` the team's text. For \
+                        `AddressTaken` `upstream` is the page that holds your \
+                        address, and `page_upstream` the team's text of your \
+                        own page when `page_kind` says it changed too. A side \
+                        with no text is null and `note` says why. A file has \
+                        no text sides, and carries `file: true`.")]
+pub struct DraftConflictSides {
+    #[schema(example = "d3f9a1c2")]
+    pub id: String,
+    #[schema(example = "notes/plan.md")]
+    pub path: String,
+    pub kind: DraftConflictKind,
+    /// Always true.
+    pub draft: bool,
+    /// Always null: a draft conflict is read from what stands, never stored.
+    #[schema(required = true)]
+    pub detected_at: Option<String>,
+    #[schema(required = true)]
+    pub base: Option<String>,
+    #[schema(required = true)]
+    pub local: Option<String>,
+    #[schema(required = true)]
+    pub upstream: Option<String>,
+    /// What the team's side is: the SHA-256 of its bytes (a page's text or a
+    /// file's), `absent` when the team holds nothing there, `unreadable` when
+    /// its copy cannot be read. With a `page_kind` it is one token for both
+    /// team sides. Pass it back as `expected_upstream_sha256` when settling,
+    /// so a team change made since is not overwritten.
+    #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
+    pub upstream_sha256: String,
+    #[schema(required = true)]
+    pub moved_from: Option<String>,
+    #[schema(required = true)]
+    pub other: Option<String>,
+    /// For `AddressTaken`: the page's own conflict, as in the list.
+    #[schema(required = true)]
+    pub page_kind: Option<DraftConflictKind>,
+    /// For `AddressTaken` with a `page_kind`: the team's text of your own
+    /// page. Null when the team deleted it, or when there is no `page_kind`.
+    #[schema(required = true)]
+    pub page_upstream: Option<String>,
+    /// A draft from before 0.32.0, with no record of its start: taking the
+    /// team's side keeps a copy of it first.
+    pub old_draft: bool,
+    /// For your deletion of a page or file the team moved: where it went.
+    /// Keeping your side then removes nothing, since the team's copy stands
+    /// there.
+    #[schema(required = true)]
+    pub moved_to: Option<String>,
+    #[schema(required = true)]
+    pub note: Option<String>,
+    /// Present, and true, only for a file.
+    pub file: Option<bool>,
+}
+
+/// What `POST /domains/{domain}/drafts/conflicts/{id}/resolve` answers.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Where the resolution landed: in your draft.")]
+pub struct DraftResolveReceipt {
+    /// The draft's path. A move is settled whole, at its draft.
+    #[schema(example = "notes/plan.md")]
+    pub resolved: String,
+    /// How many of your conflicts in this domain are left, or null when they
+    /// could not be counted.
+    #[schema(required = true)]
+    pub remaining: Option<u64>,
+    /// Always true.
+    pub draft: bool,
+    /// Present, and true, only for a file.
+    pub file: Option<bool>,
+    /// `mine`, `theirs` or `merged`.
+    #[schema(example = "mine")]
+    pub kept: String,
+    /// Your side was a deletion: keeping it removes the team's page or file
+    /// when you share, unless `moved_to` is set.
+    pub deletion: bool,
+    /// For a kept deletion of a page or file the team moved: where it went.
+    /// Your deletion then removes nothing, and it ends.
+    pub moved_to: Option<String>,
+    /// Whether a copy of your text or file was kept before taking the
+    /// team's.
+    pub kept_copy: bool,
+    /// For a file that was kept: where to find it.
+    pub kept_note: Option<String>,
+    /// Always null over this API: a place on the server's disk is named only
+    /// to the machine owner.
+    pub kept_file: Option<String>,
+    /// Present when the draft landed but its copy on this server's disk did
+    /// not.
+    pub draft_warning: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::auth_store;
@@ -543,6 +708,31 @@ mod tests {
             }]),
             published::<super::ClosedDomain>()
         );
+        use crystalline_engine::engine::{DraftConflict, DraftConflictKind as Kind};
+        assert_eq!(
+            keys([
+                Kind::EditEdit,
+                Kind::EditDelete,
+                Kind::DeleteEdit,
+                Kind::AddAdd,
+                Kind::UnknownStart,
+                Kind::AddressTaken
+            ]),
+            published::<super::DraftConflictKind>()
+        );
+        // The list adds `draft` to each conflict, as the status does.
+        let mut listed = keys([DraftConflict {
+            id: s(),
+            path: s(),
+            kind: Kind::EditEdit,
+            moved_from: None,
+            file: false,
+            other: None,
+            page_kind: None,
+        }]);
+        listed.push("draft".to_string());
+        listed.sort();
+        assert_eq!(listed, published::<super::DraftConflictEntry>());
         use crystalline_engine::changes as bus;
         assert_eq!(
             keys([

@@ -1086,6 +1086,14 @@ pub struct ResolveConflictParams {
     /// The merged markdown content. Required when `resolution` is merged.
     #[serde(default)]
     pub content: Option<String>,
+    /// For your own draft conflict: the `upstream_sha256` that
+    /// origin_status with detail gave for it when you read the team's side.
+    /// If the team changed that side since, the call is refused and nothing
+    /// changes, so you never settle against team text you did not read;
+    /// read origin_status with detail again and decide on the new text.
+    /// Omit it and nothing is checked.
+    #[serde(default)]
+    pub expected_upstream_sha256: Option<String>,
 }
 
 /// Parameters for `withdraw_proposal`.

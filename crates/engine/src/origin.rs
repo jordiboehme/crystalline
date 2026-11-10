@@ -35,7 +35,7 @@ use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullRepo
 use crystalline_remote::state::{DirectRefusal, OriginState, ProposalStatus};
 use serde_json::{Value, json};
 
-use crate::engine::EngineError;
+use crate::engine::{DraftConflict, EngineError};
 use crate::poller::DomainPollOutcome;
 
 /// The domain name `origin_add` uses when the caller does not supply one: the
@@ -591,7 +591,8 @@ fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
 /// The further outcome a caller may see, `conflicts_pending`, is not shaped
 /// here: `Engine::origin_share` builds it directly from the reloaded conflict
 /// list when `ops::propose` itself refuses, since
-/// `RemoteError::ConflictsPending` alone carries only a count.
+/// `RemoteError::ConflictsPending` alone carries only a count. A reviewing
+/// domain's own refusal is [`draft_conflicts_pending_json`].
 pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
     match outcome {
         ProposeOutcome::Proposed(report) => json!({
@@ -988,6 +989,50 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
         }
     }
     v
+}
+
+/// A share of a reviewing domain that waits for somebody else's open proposal:
+/// `{ outcome: "proposal_open", proposal, own: false, guidance }`, the shape a
+/// direct domain's share answers with when another person's proposal is open,
+/// with `guidance` the sentence to show as given.
+pub(crate) fn another_members_proposal_json(
+    open: &crystalline_remote::state::Proposal,
+    guidance: &str,
+) -> Value {
+    json!({
+        "outcome": "proposal_open",
+        "proposal": { "number": open.number, "url": open.url, "title": open.title },
+        "own": false,
+        "guidance": guidance,
+    })
+}
+
+/// A share refused because drafts it would carry do not fit the team's text:
+/// `{ outcome: "conflicts_pending", count, conflicts }`, the shape the
+/// non-review refusal has, with each conflict as [`draft_conflicts_json`] gives
+/// it.
+pub(crate) fn draft_conflicts_pending_json(conflicts: &[DraftConflict]) -> Value {
+    json!({
+        "outcome": "conflicts_pending",
+        "count": conflicts.len(),
+        "conflicts": draft_conflicts_json(conflicts),
+    })
+}
+
+/// Draft conflicts as a share or a preview names them: each as the conflict
+/// list has it, with `draft: true`, as the status detail marks one, so a reader
+/// tells it from a conflict of a domain that takes changes directly.
+pub(crate) fn draft_conflicts_json(conflicts: &[DraftConflict]) -> Value {
+    Value::Array(
+        conflicts
+            .iter()
+            .map(|conflict| {
+                let mut entry = json!(conflict);
+                entry["draft"] = json!(true);
+                entry
+            })
+            .collect(),
+    )
 }
 
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
@@ -2432,6 +2477,25 @@ mod tests {
         assert_eq!(diverged["action"], "proposal_diverged");
         assert_eq!(diverged["number"], 9);
         assert_eq!(diverged["branch"], "crystalline/share-brand");
+    }
+
+    #[test]
+    fn a_draft_conflicts_refusal_marks_each_conflict_as_a_draft() {
+        let conflict = DraftConflict {
+            id: "d0000000".to_string(),
+            path: "plan.md".to_string(),
+            kind: crate::draft_merge::DraftConflictKind::EditEdit,
+            moved_from: None,
+            file: false,
+            other: None,
+            page_kind: None,
+        };
+        let refused = draft_conflicts_pending_json(&[conflict]);
+        assert_eq!(refused["outcome"], "conflicts_pending");
+        assert_eq!(refused["count"], 1);
+        assert_eq!(refused["conflicts"][0]["id"], "d0000000");
+        assert_eq!(refused["conflicts"][0]["kind"], "EditEdit");
+        assert_eq!(refused["conflicts"][0]["draft"], true);
     }
 
     #[test]

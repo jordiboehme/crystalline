@@ -4401,3 +4401,398 @@ async fn undone_edit_names_nobody(flush: bool) {
         "{saved}"
     );
 }
+
+// --- A pull that merges into a draft a room is open over -----------------------
+
+/// [`review_fixture`] with an origin and a base snapshot holding the folder, so a
+/// convergence pass has the team's text to merge. The team's changes are written
+/// into the snapshot straight, as a pull leaves them, and the pass is run by hand.
+async fn review_origin_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    crate::support::ScratchStateDir,
+) {
+    let scratch = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let dir = root.join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_manifest(&dir, "team");
+    std::fs::write(dir.join("alpha.md"), ALPHA).unwrap();
+    let mut entry = DomainEntry::file(dir.clone());
+    entry.review = Some(crystalline_core::config::ReviewMode::Overlay);
+    entry.origin = Some(crystalline_core::config::OriginConfig {
+        repo: "acme/team".to_string(),
+        path: None,
+        branch: Some("main".to_string()),
+        poll_secs: None,
+    });
+    cfg.domains.insert("team".to_string(), entry);
+    cfg.github = Some(crystalline_core::config::GitHubConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let origins = root.join("origins");
+    let snapshot = origins.join("team");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let mut state = crystalline_remote::state::OriginState::new("acme/team", "main");
+    for name in ["MANIFEST.md", "alpha.md"] {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        state.files.insert(
+            name.to_string(),
+            crystalline_remote::state::BaseStamp {
+                sha256: crate::support::sha256_hex(&bytes),
+                size: bytes.len() as u64,
+            },
+        );
+        crystalline_remote::state::write_base_file(&snapshot, name, &bytes).unwrap();
+    }
+    state.save(&snapshot).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            .with_state_dir(root.join("state"))
+            .with_origins_dir(origins),
+    );
+    engine.sync(None).await.unwrap();
+    (tmp, engine, scratch)
+}
+
+/// The team's `alpha.md` now says `text`, in the folder and the base snapshot.
+fn team_now_has(tmp: &tempfile::TempDir, text: &str) {
+    let snapshot = tmp.path().join("origins/team");
+    let mut state = crystalline_remote::state::OriginState::load(&snapshot)
+        .unwrap()
+        .unwrap();
+    state.files.insert(
+        "alpha.md".to_string(),
+        crystalline_remote::state::BaseStamp {
+            sha256: crate::support::sha256_hex(text.as_bytes()),
+            size: text.len() as u64,
+        },
+    );
+    crystalline_remote::state::write_base_file(&snapshot, "alpha.md", text.as_bytes()).unwrap();
+    state.save(&snapshot).unwrap();
+    std::fs::write(tmp.path().join("team/alpha.md"), text).unwrap();
+}
+
+/// Alice's room over her draft of alpha, with one saved line, so her draft
+/// stands and knows where it started.
+async fn alices_saved_room(engine: &Arc<Engine>, sessions: &Arc<CollabSessions>) -> (Joined, Doc) {
+    let mut joined = sessions.join("team", "alpha", Some("alice")).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "alice saved this").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 1))
+        .await;
+    until_saved(&mut joined.rx).await;
+    assert!(
+        alices_row(engine).await.contains("alice saved this"),
+        "her draft holds the saved line"
+    );
+    (joined, doc)
+}
+
+async fn alices_row(engine: &Engine) -> String {
+    engine
+        .overlay_draft_at("team", "alice", "alpha.md")
+        .await
+        .unwrap()
+        .expect("alice holds a draft of alpha")
+        .content
+}
+
+#[tokio::test]
+async fn a_room_keeps_unsaved_text_when_a_merge_rewrites_the_draft() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (mut joined, doc) = alices_saved_room(&engine, &sessions).await;
+    append_line(&joined, &doc, "alice typed this and did not save").await;
+
+    team_now_has(&tmp, &ALPHA.replace("status: stable", "status: draft"));
+    engine.converge_overlays("team").await.unwrap();
+    let row = alices_row(&engine).await;
+    assert!(
+        row.contains("status: draft") && row.contains("alice saved this"),
+        "the pass merged the team's change into her row: {row}"
+    );
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 100))
+        .await;
+    until_saved(&mut joined.rx).await;
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.contains("alice typed this and did not save") && live.contains("status: draft"),
+        "{live}"
+    );
+    let row = alices_row(&engine).await;
+    assert!(
+        row.contains("alice typed this and did not save") && row.contains("status: draft"),
+        "{row}"
+    );
+}
+
+#[tokio::test]
+async fn a_room_raises_its_own_conflict_when_typing_collides_with_a_merge() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (mut joined, doc) = alices_saved_room(&engine, &sessions).await;
+    let typed = doc
+        .get_or_insert_text("content")
+        .get_string(&doc.transact())
+        .replace("# Alpha\n", "# Alpha, typed in the room\n");
+    replace_all(&joined, &doc, &typed).await;
+
+    team_now_has(
+        &tmp,
+        &ALPHA.replace("# Alpha\n", "# Alpha, from the team\n"),
+    );
+    engine.converge_overlays("team").await.unwrap();
+    assert!(
+        alices_row(&engine).await.contains("# Alpha, from the team"),
+        "her saved row did not touch that line, so it merged"
+    );
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 100))
+        .await;
+    match next_control(&mut joined.rx).await {
+        Control::Conflict {
+            conflict_kind,
+            theirs,
+            ..
+        } => {
+            assert_eq!(conflict_kind, "edit");
+            assert!(theirs.unwrap().contains("# Alpha, from the team"));
+        }
+        other => panic!("the room's edit conflict, not {other:?}"),
+    }
+    let (live, _) = joined.session.snapshot().await;
+    assert!(live.contains("# Alpha, typed in the room"), "{live}");
+}
+
+#[tokio::test]
+async fn a_merge_that_would_change_the_address_leaves_a_room_alone_and_stands_as_a_conflict() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (joined, _doc) = alices_saved_room(&engine, &sessions).await;
+    let before = alices_row(&engine).await;
+
+    team_now_has(
+        &tmp,
+        &ALPHA.replace("permalink: alpha", "permalink: alpha-two"),
+    );
+    engine.converge_overlays("team").await.unwrap();
+
+    assert_eq!(alices_row(&engine).await, before, "the row is left");
+    let conflicts = engine.draft_conflicts("team", "alice").await.unwrap();
+    assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+    assert_eq!(conflicts[0].path, "alpha.md");
+    assert_eq!(
+        conflicts[0].kind,
+        crystalline_service::engine::DraftConflictKind::EditEdit
+    );
+    assert!(
+        sessions.has_live_room("team", "alpha", Some("alice")).await,
+        "and the room is still open"
+    );
+    drop(joined);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pass_does_not_hang_on_a_room_save_held_at_the_draft_lock() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (joined, doc) = alices_saved_room(&engine, &sessions).await;
+    append_line(&joined, &doc, "typed while the draft is held").await;
+
+    // An edit holds the draft lock for a while.
+    engine.hold_next_draft_edit(1500);
+    let edit = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let p = crystalline_service::params::EditParams {
+                identifier: "alpha".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("an agent's line".to_string()),
+                key: None,
+                value: None,
+                values: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+                share_link: None,
+                model: None,
+            };
+            let alice = crystalline_service::Scope::User {
+                account: "alice".to_string(),
+                admin: false,
+            };
+            engine.edit_engram_as(&p, None, &alice).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The room's save waits at that lock, holding its own state.
+    let save = {
+        let session = joined.session.clone();
+        tokio::spawn(async move {
+            session
+                .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 100))
+                .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    team_now_has(
+        &tmp,
+        &ALPHA.replace("permalink: alpha", "permalink: alpha-two"),
+    );
+    let pass = tokio::time::timeout(Duration::from_secs(20), engine.converge_overlays("team"))
+        .await
+        .expect("the pass finishes");
+    pass.unwrap();
+    edit.await.unwrap().unwrap();
+    save.await.unwrap();
+}
+
+// --- Settling a draft a room is open over ---------------------------------------
+
+/// Alice settles her draft of alpha with `keep` or the `merged` text.
+async fn alice_resolves(
+    engine: &Engine,
+    keep: Option<&str>,
+    merged: Option<&str>,
+) -> Result<serde_json::Value, crystalline_service::engine::EngineError> {
+    engine
+        .origin_resolve(
+            "team",
+            "alpha.md",
+            keep,
+            merged.map(str::as_bytes),
+            crystalline_service::engine::ShareActor::Account("alice".to_string()),
+        )
+        .await
+}
+
+/// Take theirs would end the draft under the room, whose next save writes it
+/// straight back, so it is refused as a discard is.
+#[tokio::test]
+async fn take_theirs_refuses_while_a_room_is_open() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (joined, _doc) = alices_saved_room(&engine, &sessions).await;
+    team_now_has(
+        &tmp,
+        &ALPHA.replace("A rule about alpha.", "The team's rule."),
+    );
+    let before = alices_row(&engine).await;
+
+    let err = alice_resolves(&engine, Some("theirs"), None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "'alpha.md' is open in an editor. Close it, then take the team's text."
+    );
+    assert_eq!(alices_row(&engine).await, before, "the draft stands");
+    drop(joined);
+}
+
+/// A merged text written while the room holds unsaved typing: the room's next
+/// save meets it as an external change and keeps both.
+#[tokio::test]
+async fn merged_with_a_room_open_lands_through_the_rooms_own_merge() {
+    let (tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (mut joined, doc) = alices_saved_room(&engine, &sessions).await;
+    append_line(&joined, &doc, "alice typed this and did not save").await;
+    let team = ALPHA.replace("A rule about alpha.", "The team's rule.");
+    team_now_has(&tmp, &team);
+    let merged = alices_row(&engine)
+        .await
+        .replace("A rule about alpha.", "The team's rule, merged.");
+
+    let receipt = alice_resolves(&engine, None, Some(&merged)).await.unwrap();
+    assert_eq!(receipt["kept"], "merged", "{receipt}");
+    assert_eq!(alices_row(&engine).await, merged);
+    let record = crystalline_service::draft_start::load(
+        &tmp.path().join("state"),
+        "team",
+        "alice",
+        "alpha.md",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(record.start.as_deref(), Some(team.as_str()));
+
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(2 * SAVE_DEBOUNCE_MS + 100))
+        .await;
+    until_saved(&mut joined.rx).await;
+    let (live, _) = joined.session.snapshot().await;
+    assert!(
+        live.contains("alice typed this and did not save")
+            && live.contains("The team's rule, merged."),
+        "{live}"
+    );
+    let row = alices_row(&engine).await;
+    assert!(
+        row.contains("alice typed this and did not save")
+            && row.contains("The team's rule, merged."),
+        "{row}"
+    );
+    assert!(
+        engine
+            .draft_conflicts("team", "alice")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A merged text that changes the draft's address is refused while a room is
+/// open over the draft, since a room is keyed by its address. The pass's merge
+/// is refused the same way.
+#[tokio::test]
+async fn merged_with_a_new_address_while_a_room_is_open_is_refused() {
+    let (_tmp, engine, _scratch) = review_origin_fixture().await;
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let (joined, _doc) = alices_saved_room(&engine, &sessions).await;
+    let before = alices_row(&engine).await;
+    let merged = before.replace("permalink: alpha", "permalink: alpha-two");
+
+    let err = alice_resolves(&engine, None, Some(&merged))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "'alpha.md' is open in an editor, and the merged text gives it a new address. Close \
+         it, then save the merged text."
+    );
+    assert_eq!(alices_row(&engine).await, before, "the draft stands");
+    assert!(sessions.has_live_room("team", "alpha", Some("alice")).await);
+    drop(joined);
+}
