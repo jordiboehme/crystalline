@@ -1344,7 +1344,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1407,7 +1407,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-engine"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-identity"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-index"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-remote"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-rest"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-service"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "async-trait",

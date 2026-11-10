@@ -919,9 +919,11 @@ export const keepPartnerMarks: Extension = State.transactionFilter.of((tr) => {
   // Judged on a tree that reaches what it takes: a filter cannot publish, and
   // a short one shows no marks to keep, so a typed, pasted or cut stretch would
   // leave a lone `**` (D35). Every event alike, as nothing before a filter need
-  // have parsed. Short of time it goes as the page draws it, and the deletion
-  // check, on the same deadline, refuses a delete. Caret typing has returned
-  // above and never pays this.
+  // have parsed. Short of time it goes as the page draws it. A plain delete (a
+  // cut, Delete on a selection) then meets the deletion check, which shares
+  // this deadline and refuses it with the loading sentence. A stretch replaced
+  // by typing, a paste or a drop is no deletion that check judges, so it goes
+  // through as drawn. Caret typing has returned above and never pays this.
   const reach = Math.max(...deleted.map((d) => d.to));
   const judged =
     parsedTo(
