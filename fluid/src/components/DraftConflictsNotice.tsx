@@ -136,6 +136,7 @@ export function DraftConflictsNotice({
             kind: open.kind,
             movedFrom: open.movedFrom,
             other: open.other,
+            pageKind: open.pageKind,
             file: open.file,
           }}
           onClose={() => {

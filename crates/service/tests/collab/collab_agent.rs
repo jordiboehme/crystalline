@@ -3540,6 +3540,141 @@ fn no_engine_function_composes_into_a_room_under_a_file_write_lock() {
     );
 }
 
+/// The domain's origin lock comes before every draft lock and every room:
+/// the pass and a resolve hold it while they ask a room and take draft locks.
+/// So no room path may wait on it, and no function may take it while it holds
+/// a per-path write or draft lock, or the two orders meet in a cycle nobody
+/// breaks.
+///
+/// A source scan, for the reason the scan above gives. Each function body
+/// under the engine is read once; the functions a room calls into are
+/// followed through every `self.`, `engine.` or `Engine::` call whose name
+/// has a body here, and none of them may name `origin_lock`. A name shared by
+/// two functions follows both, which can only make the scan stricter.
+#[test]
+fn no_room_path_or_draft_lock_holder_waits_on_the_origin_lock() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/src");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(src.join("engine"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.push(src.join("domain_view.rs"));
+    files.sort();
+    assert!(
+        files.len() > 10,
+        "the scan found only {} files",
+        files.len()
+    );
+    let collab: Vec<std::path::PathBuf> = std::fs::read_dir(src.join("collab"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    assert!(!collab.is_empty(), "no room code under {}", src.display());
+
+    let code_lines = |file: &std::path::Path| -> Vec<String> {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(str::to_string)
+            .collect()
+    };
+    for file in &collab {
+        for line in code_lines(file) {
+            assert!(
+                !line.contains("origin_lock"),
+                "{} takes the origin lock: {line}",
+                file.display()
+            );
+        }
+    }
+
+    let mut bodies: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut held_then_taken: Vec<String> = Vec::new();
+    for file in &files {
+        let mut current = "<file scope>".to_string();
+        let mut locked = false;
+        for line in code_lines(file) {
+            if let Some(name) = declared_fn(&line) {
+                current = name.to_string();
+                locked = false;
+            }
+            if line.contains(".draft_lock(") || line.contains(".write_lock(") {
+                locked = true;
+            }
+            if locked && line.contains(".origin_lock(") {
+                held_then_taken.push(format!("{}: {current}", file.display()));
+            }
+            bodies.entry(current.clone()).or_default().push(line);
+        }
+    }
+    assert!(
+        held_then_taken.is_empty(),
+        "these take the origin lock while they hold a draft or file lock: {held_then_taken:?}"
+    );
+
+    let roots = [
+        "save_engram_from_room",
+        "reflection_room_text",
+        "kept_dir",
+        "joins",
+        "reviews_changes",
+        "switches_read_only_on",
+    ];
+    for root in roots {
+        assert!(
+            bodies.contains_key(root),
+            "no body named {root}: the scan is blind"
+        );
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<(String, Vec<String>)> = roots
+        .iter()
+        .map(|root| (root.to_string(), vec![root.to_string()]))
+        .collect();
+    while let Some((name, path)) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(body) = bodies.get(&name) else {
+            continue;
+        };
+        for line in body {
+            assert!(
+                !line.contains("origin_lock"),
+                "a room reaches the origin lock through {}: {line}",
+                path.join(" -> ")
+            );
+            for prefix in ["self.", "engine.", "Engine::"] {
+                for (at, _) in line.match_indices(prefix) {
+                    let rest = &line[at + prefix.len()..];
+                    let end = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .unwrap_or(rest.len());
+                    let called = &rest[..end];
+                    if rest[end..].trim_start().starts_with('(')
+                        && bodies.contains_key(called)
+                        && !seen.contains(called)
+                    {
+                        let mut next = path.clone();
+                        next.push(called.to_string());
+                        stack.push((called.to_string(), next));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        seen.len() > 20,
+        "the scan followed only {} functions from the room's entries, so it is not \
+         following calls",
+        seen.len()
+    );
+}
+
 /// **The acknowledged cost of the scan above, pinned rather than only
 /// described.** [`declared_fn`] runs on every line before any comment skip
 /// and never resets when a nested `fn` ends, so a needle after a nested `fn`

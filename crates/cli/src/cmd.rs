@@ -939,7 +939,16 @@ pub(crate) fn draft_kind_words(conflict: &serde_json::Value) -> Option<String> {
         ),
         other => other.to_string(),
     };
-    Some(words)
+    // Under an address clash the page itself may have changed on the team's
+    // side too, which a new address does not settle.
+    let page = match conflict["page_kind"].as_str() {
+        None => "",
+        Some("EditDelete") => {
+            "; the team also deleted the page, which a new address does not settle"
+        }
+        Some(_) => "; the team also changed the page itself, which a new address does not settle",
+    };
+    Some(format!("{words}{page}"))
 }
 
 /// The lines `origin update` and `origin status` print about the caller's own
@@ -1147,19 +1156,21 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
             let conflicts = data["conflicts"].as_array().unwrap_or(&empty);
             for c in conflicts {
                 let path = c["path"].as_str().unwrap_or("");
+                // A draft's line names only the ways out its kind leaves: a
+                // file merges no text, a taken address cannot keep its own.
                 match draft_kind_words(c) {
-                    Some(words) => lines.push(format!("  conflict: {path} ({words})")),
+                    Some(_) => lines.extend(update_conflict_lines(domain, c)),
                     None => lines.push(format!("  conflict: {path}")),
                 }
             }
             // A draft's conflict is settled on her draft, and her other files
             // can still be shared meanwhile.
             if conflicts.iter().any(|c| c["draft"] == true) {
-                lines.push(format!(
-                    "These drafts of yours do not fit the team's text. Settle each with: \
-                     crystalline origin resolve {domain} <path> --keep mine|theirs, or \
-                     --content-file <f>"
-                ));
+                lines.push(
+                    "These drafts of yours do not fit the team's text. Settle each one as its \
+                     line says."
+                        .to_string(),
+                );
                 lines.push(format!(
                     "You can still share your other files: crystalline origin share {domain} \
                      --file <path>"
@@ -1528,7 +1539,17 @@ fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> 
     } else {
         lines.push(format!("Resolved: {resolved}"));
         if data["draft"] == true {
+            let what = if file { "file" } else { "page" };
             match data["kept"].as_str() {
+                Some("mine") if data["deletion"] == true && data["moved_to"].is_string() => lines
+                    .push(format!(
+                        "The team moved this {what} to {}, so your deletion removes nothing and \
+                         ends.",
+                        data["moved_to"].as_str().unwrap_or("")
+                    )),
+                Some("mine") if data["deletion"] == true => lines.push(format!(
+                    "Your deletion removes the team's {what} when you share."
+                )),
                 Some("mine") if file => {
                     lines.push("Your file replaces the team's when you share.".to_string())
                 }
@@ -1576,6 +1597,50 @@ fn origin_resolve_lines(domain: &str, asked: &str, data: &serde_json::Value) -> 
 #[cfg(test)]
 mod origin_resolve_tests {
     use super::origin_resolve_lines;
+
+    /// Keep mine says what her side does on a share: a deletion removes the
+    /// team's page or file, a file replaces the team's file.
+    #[test]
+    fn keep_mine_says_what_a_deletion_and_a_file_do() {
+        let said = |receipt: serde_json::Value| origin_resolve_lines("team", "x", &receipt);
+        let deletion = said(serde_json::json!({
+            "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine",
+            "deletion": true,
+        }));
+        assert!(
+            deletion.contains(&"Your deletion removes the team's page when you share.".to_string()),
+            "{deletion:?}"
+        );
+        let file_deletion = said(serde_json::json!({
+            "resolved": "assets/deck.png", "remaining": 0, "draft": true, "file": true,
+            "kept": "mine", "deletion": true,
+        }));
+        assert!(
+            file_deletion
+                .contains(&"Your deletion removes the team's file when you share.".to_string()),
+            "{file_deletion:?}"
+        );
+        let moved = said(serde_json::json!({
+            "resolved": "plan.md", "remaining": 0, "draft": true, "kept": "mine",
+            "deletion": true, "moved_to": "archive/plan.md",
+        }));
+        assert!(
+            moved.contains(
+                &"The team moved this page to archive/plan.md, so your deletion removes nothing \
+                  and ends."
+                    .to_string()
+            ),
+            "{moved:?}"
+        );
+        let file = said(serde_json::json!({
+            "resolved": "assets/deck.png", "remaining": 0, "draft": true, "file": true,
+            "kept": "mine",
+        }));
+        assert!(
+            file.contains(&"Your file replaces the team's when you share.".to_string()),
+            "{file:?}"
+        );
+    }
 
     #[test]
     fn a_count_that_could_not_be_read_is_not_printed_as_zero() {
@@ -4915,6 +4980,62 @@ fn print_report(r: &crystalline_index::SyncReport) {
 mod origin_share_tests {
     use super::origin_share_lines;
 
+    /// Each draft conflict is offered only the ways out that work for it: a
+    /// file has no merged text, a taken address no Keep mine.
+    #[test]
+    fn a_refusal_offers_each_draft_the_ways_out_its_kind_leaves() {
+        let lines = origin_share_lines(
+            "team",
+            &serde_json::json!({
+                "outcome": "conflicts_pending", "count": 3,
+                "conflicts": [
+                    { "path": "assets/deck.png", "kind": "EditEdit", "draft": true, "file": true },
+                    { "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true },
+                    { "path": "plan.md", "kind": "EditEdit", "draft": true },
+                ],
+            }),
+        );
+        let text = lines.join("\n");
+        assert!(
+            text.contains(
+                "  conflict: assets/deck.png (a file: resolve: crystalline origin resolve team \
+                 assets/deck.png --keep mine|theirs)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "resolve team mine.md --keep theirs, or --content-file <f> with another address"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("resolve team plan.md --keep mine|theirs, or --content-file <f>)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("<path> --keep mine|theirs, or --content-file"),
+            "{text}"
+        );
+    }
+
+    /// An address clash over a page the team also changed says both.
+    #[test]
+    fn a_taken_address_says_the_page_changed_too() {
+        let lines = super::update_conflict_lines(
+            "team",
+            &serde_json::json!({
+                "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true,
+                "page_kind": "EditEdit",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "    the team's file z.md now uses the same address; the team also changed the page \
+             itself, which a new address does not settle"
+        );
+    }
+
     #[test]
     fn a_refusal_for_drafts_names_the_resolve_verb_and_the_other_files() {
         let drafts = origin_share_lines(
@@ -4925,15 +5046,13 @@ mod origin_share_tests {
             }),
         );
         assert!(
-            drafts.contains(
-                &"  conflict: plan.md (you and the team changed the same lines)".to_string()
-            ),
+            drafts.contains(&"    you and the team changed the same lines".to_string()),
             "{drafts:?}"
         );
         assert!(
             drafts
                 .iter()
-                .any(|line| line.contains("crystalline origin resolve team <path>")),
+                .any(|line| line.contains("crystalline origin resolve team plan.md")),
             "{drafts:?}"
         );
         assert!(

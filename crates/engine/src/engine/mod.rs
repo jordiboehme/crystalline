@@ -1103,6 +1103,11 @@ pub struct Engine {
     // `Engine::hold_next_draft_edit`, and the same compile-out applies.
     #[cfg(any(test, feature = "testing"))]
     hold_next_draft_edit: std::sync::atomic::AtomicU64,
+    // When armed, a discard of a draft waits this many milliseconds between
+    // its first look at the draft and its draft lock, once. See
+    // `Engine::hold_next_discard`.
+    #[cfg(any(test, feature = "testing"))]
+    hold_next_discard: std::sync::atomic::AtomicU64,
     // A clock rather than a gate: when set, the automation verbs read this
     // time as now, so a test moves a lease past its stale time or a status
     // read to the next day. See `Engine::set_automation_now`.
@@ -2582,6 +2587,8 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             hold_next_draft_edit: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
+            hold_next_discard: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
             automation_now: std::sync::Mutex::new(None),
             automation_deliveries: std::sync::Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
@@ -2960,6 +2967,29 @@ impl Engine {
     pub fn hold_next_draft_edit(&self, millis: u64) {
         self.hold_next_draft_edit
             .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hold the next discard of a draft for `millis` between its first look at
+    /// the draft and the draft lock it drops it under, once, so a test can
+    /// edit the draft inside that window. Nothing in the daemon, the CLI or
+    /// the MCP surface calls this.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_discard(&self, millis: u64) {
+        self.hold_next_discard
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hold above, consuming the arming. Does nothing outside a test build.
+    pub(super) async fn take_discard_hold(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let millis = self
+                .hold_next_discard
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            if millis > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            }
+        }
     }
 
     /// The hold above, consuming the arming. Does nothing at all outside a test
@@ -6479,6 +6509,7 @@ impl Engine {
                 shared: None,
                 merged_at: None,
                 merging: None,
+                settling: None,
             }))
     }
 
@@ -6517,6 +6548,7 @@ impl Engine {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         }))
     }
 
@@ -6951,6 +6983,10 @@ impl Engine {
             // a draft, which is why it screens nothing.
             let view = DomainView::for_actor(self, domain, &HashSet::new(), actor)?;
             view.collect_drops();
+            // A merged text of hers a crash left half saved takes the start
+            // that goes with what her row holds, before anything reads it.
+            self.finish_settling(domain, domain_id, actor, entries)
+                .await;
             // What her proposals hold, settled before anything reads her
             // records: a merged one moves the start of every row it carried.
             let ends = self
@@ -6996,13 +7032,43 @@ impl Engine {
                 }
             }
             pending.push_drops_from(domain, &view);
+            let rows = if followed {
+                let store = self.store.lock().await;
+                store.overlay_entries(domain_id, actor).await?
+            } else {
+                entries.clone()
+            };
+            // A draft from before the record whose team file this pull
+            // deleted: nothing else will ever say the team held it, and its
+            // share would bring the file back, so the frozen list learns it now
+            // and the gate reads it as the team's deletion. Saved at once, so a
+            // pass that stops later does not lose it.
+            if let Some(record) = record.as_mut() {
+                let deleted = deleted_under_old_drafts(
+                    &journal_dir,
+                    domain,
+                    actor,
+                    &rows,
+                    files,
+                    &touched,
+                    &state,
+                );
+                let listed = record.conflicts.entry(actor.clone()).or_default();
+                let before = listed.len();
+                for path in deleted {
+                    if !listed.contains(&path) {
+                        listed.push(path);
+                    }
+                }
+                let added = listed.len() > before;
+                if listed.is_empty() {
+                    record.conflicts.remove(actor);
+                }
+                if added {
+                    self.save_convergence(&journal_dir, domain, record);
+                }
+            }
             if !entries.is_empty() {
-                let rows = if followed {
-                    let store = self.store.lock().await;
-                    store.overlay_entries(domain_id, actor).await?
-                } else {
-                    entries.clone()
-                };
                 let reading = self
                     .read_drafts(domain, domain_id, actor, rows, &root, &state_dir, &state)
                     .await;
@@ -7153,12 +7219,65 @@ impl Engine {
                     }
                 }
                 draft_conflicts::Decision::NotAsked
-                | draft_conflicts::Decision::AddressTaken(_)
+                | draft_conflicts::Decision::AddressTaken { .. }
                 | draft_conflicts::Decision::NoRecord
                 | draft_conflicts::Decision::Step(DraftStep::InStep | DraftStep::Conflict(_)) => {}
             }
         }
         Ok(settled)
+    }
+
+    /// Save each of `actor`'s records that still carries the mark of a merged
+    /// text of hers ([`crate::draft_start::DraftStart::as_settled`]) as it
+    /// reads over the row, under the row's draft lock, so the mark does not
+    /// outlive the crash that left it. Nothing here fails the pass: a record
+    /// that cannot be read or saved keeps its mark, which reads the same.
+    async fn finish_settling(
+        &self,
+        domain: &str,
+        domain_id: DomainId,
+        actor: &str,
+        entries: &[StoredEngram],
+    ) {
+        let Ok(journal_dir) = self.journal_state_dir() else {
+            return;
+        };
+        for entry in entries.iter().filter(|entry| !entry.tombstone) {
+            let marked = crate::draft_start::load(&journal_dir, domain, actor, &entry.path)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.settling.is_some());
+            if !marked {
+                continue;
+            }
+            let finished = async {
+                let lock = self.draft_lock(domain, actor, &entry.path)?;
+                let _guard = lock.lock().await;
+                let row = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &entry.path).await?
+                };
+                let record = crate::draft_start::load(&journal_dir, domain, actor, &entry.path)
+                    .map_err(|source| EngineError::Io {
+                        path: format!("the draft start record of '{}'", entry.path),
+                        source,
+                    })?;
+                if let (Some(row), Some(record)) = (row, record)
+                    && record.settling.is_some()
+                {
+                    self.save_start(domain, actor, &record.as_settled(&row.content))?;
+                }
+                Ok::<(), EngineError>(())
+            };
+            if let Err(e) = finished.await {
+                tracing::warn!(
+                    domain,
+                    actor,
+                    path = entry.path.as_str(),
+                    "a merged text's start could not be saved; it reads the same until it is: {e}"
+                );
+            }
+        }
     }
 
     /// Settle each of `actor`'s records that names a proposal by what became of
@@ -7221,7 +7340,6 @@ impl Engine {
                 Some((entry.path.clone(), record.shared.as_ref()?.proposal))
             })
             .collect();
-        let root_is_there = root.is_dir();
         for (entry, record) in &held {
             let Some(shared) = record.shared.clone() else {
                 continue;
@@ -7243,8 +7361,7 @@ impl Engine {
                 SharedFate::Merged => {
                     // A folder that cannot say does not fold here, so a case
                     // move is never read as landed on a guess.
-                    let folds_case =
-                        root_is_there && folder_folds_case(root, &entry.path) == Some(true);
+                    let folds_case = page_folds_case(root, &entry.path);
                     let key = merged_key(
                         &entry.path,
                         record.from.as_deref(),
@@ -7527,7 +7644,13 @@ impl Engine {
         let same_row = now
             .as_ref()
             .is_some_and(|now| now.tombstone == row.tombstone && now.content == row.content);
-        let same_record = view.start_of(&row.path).ok() == Some(record.cloned());
+        // Read as the reading read it: a merged text of hers that a crash left
+        // half saved reads with the start that goes with the row.
+        let same_record = view
+            .start_of(&row.path)
+            .ok()
+            .map(|start| start.map(|start| start.as_settled(&row.content)))
+            == Some(record.cloned());
         Ok(same_row && same_record)
     }
 
@@ -8048,10 +8171,33 @@ impl Engine {
         let Ok(journal_dir) = self.journal_state_dir() else {
             return 0;
         };
-        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return 0;
+        };
         let left = record.settle(actor, path);
         self.save_convergence(&journal_dir, domain, &record);
         left
+    }
+
+    /// The convergence record, read strictly for a writer that saves it whole.
+    /// A record that cannot be read answers `None` with a warning and is left
+    /// as it is: saved back from a lenient read it would be empty, and its
+    /// frozen list is what keeps an old draft's deletion in view.
+    fn convergence_to_change(
+        &self,
+        journal_dir: &Path,
+        domain: &str,
+    ) -> Option<crate::overlay_journal::ConvergenceRecord> {
+        match crate::overlay_journal::journal_record_strict(journal_dir, domain) {
+            Ok(record) => Some(record),
+            Err(e) => {
+                tracing::warn!(
+                    domain,
+                    "the convergence record could not be read, so it is left as it is: {e}"
+                );
+                None
+            }
+        }
     }
 
     /// Record which overlay actor a proposal belongs to, or forget one that has
@@ -8078,7 +8224,9 @@ impl Engine {
         let Ok(journal_dir) = self.journal_state_dir() else {
             return;
         };
-        let mut record = crate::overlay_journal::journal_record(&journal_dir, domain);
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return;
+        };
         match actor {
             Some(actor) => {
                 record
@@ -9042,8 +9190,10 @@ pub use draft_conflicts::{
 };
 pub use origins::{CONFLICTS_UNREADABLE, not_among_drafts};
 
-/// The moments in a fold a test can step into with `Engine::at_next_fold_step`,
-/// which only a test build has.
+/// The moments in a fold a test can step into with `Engine::at_next_fold_step`.
+/// The type is in every build, since the fold names its steps wherever it
+/// runs; only a test build has the hook that acts on them, and elsewhere
+/// each step is a call that does nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FoldStep {
     /// Just before the review key comes off.
@@ -9104,7 +9254,7 @@ pub use reflection_assets::WrittenReflectionAsset;
 mod manifest_rename;
 mod rename_domain;
 mod review_mode;
-pub(crate) use review_mode::{folder_folds_case, folder_may_fold_case};
+pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
 mod schemas;
 mod search;
 mod sources;
@@ -11877,6 +12027,47 @@ fn prune_settled_file_conflicts(
         });
         !paths.is_empty()
     });
+}
+
+/// The paths of `actor`'s drafts from before the record, rows and files, whose
+/// team file the pull that applied `touched` deleted: each is a path the pull
+/// wrote and the snapshot no longer holds. A tombstone is not one: the team
+/// deleting what she deleted takes nothing from anybody. A record that cannot
+/// be read is skipped here; the gate refuses that draft on its own.
+fn deleted_under_old_drafts(
+    journal_dir: &Path,
+    domain: &str,
+    actor: &str,
+    rows: &[StoredEngram],
+    files: &[crate::overlay_files::FileEntry],
+    touched: &HashSet<&str>,
+    state: &crystalline_remote::state::OriginState,
+) -> Vec<String> {
+    let deleted = |path: &str| touched.contains(path) && !state.files.contains_key(path);
+    let mut paths = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| !row.tombstone && deleted(&row.path))
+    {
+        if matches!(
+            crate::draft_start::load(journal_dir, domain, actor, &row.path),
+            Ok(None)
+        ) {
+            paths.push(row.path.clone());
+        }
+    }
+    for file in files
+        .iter()
+        .filter(|file| !file.tombstone && deleted(&file.path))
+    {
+        if matches!(
+            crate::draft_start::load_file(journal_dir, domain, actor, &file.path),
+            Ok(None)
+        ) {
+            paths.push(file.path.clone());
+        }
+    }
+    paths
 }
 
 /// What [`Engine::take_merge`] did with a merge.

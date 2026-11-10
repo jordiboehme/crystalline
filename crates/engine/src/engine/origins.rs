@@ -3740,6 +3740,10 @@ impl Engine {
             return Ok(());
         };
         for file in &withdrawn.files {
+            // Compared and dropped under the draft lock, so an edit of hers
+            // that lands in between is newer work and stays.
+            let lock = self.draft_lock(domain, actor, &file.path)?;
+            let _guard = lock.lock().await;
             let held = {
                 let store = self.store.lock().await;
                 store.overlay_entry(domain_id, actor, &file.path).await?
@@ -4180,7 +4184,27 @@ impl Engine {
                     refused.push(json!({ "path": path, "reason": "open_in_editor" }));
                     continue;
                 }
-                let kind = if held.tombstone {
+                self.take_discard_hold().await;
+                // The look that decides is taken again under the draft lock,
+                // after the room question, so an edit of hers that landed
+                // since the first look is never dropped with the draft.
+                let lock = self.draft_lock(domain, actor, &path)?;
+                let _guard = lock.lock().await;
+                let now = {
+                    let store = self.store.lock().await;
+                    store.overlay_entry(domain_id, actor, &path).await?
+                };
+                let still = now
+                    .as_ref()
+                    .is_some_and(|now| match target.sha256.as_deref() {
+                        Some(expected) => !now.tombstone && is_draft_digest(&now.content, expected),
+                        None => true,
+                    });
+                let Some(now) = now.filter(|_| still) else {
+                    refused.push(json!({ "path": path, "reason": "changed_since" }));
+                    continue;
+                };
+                let kind = if now.tombstone {
                     "deleted"
                 } else if root.join(&path).is_file() {
                     "modified"
@@ -4202,6 +4226,18 @@ impl Engine {
             // named something this domain has no change at. A refusal to
             // address is not a filesystem failure, so it is answered rather
             // than raised.
+            // Read, compared and cleared under the file's own lock, so an
+            // upload of hers in between is never cleared with the draft.
+            let abs = match crate::overlay_files::file(&state_dir, domain, actor, &path) {
+                Ok(abs) => abs,
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    refused.push(json!({ "path": path, "reason": "unknown_path" }));
+                    continue;
+                }
+                Err(e) => return Err(io(e)),
+            };
+            let lock = self.write_lock(&abs);
+            let _guard = lock.lock().await;
             let held = match crate::overlay_files::held(&state_dir, domain, actor, &path) {
                 Ok(held) => held,
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
@@ -4819,6 +4855,16 @@ impl Engine {
             )));
         }
         let mut kept_file: Option<String> = None;
+        // Where the team moved the file she deleted, read before anything
+        // settles: Keep mine then removes nothing, and the receipt says so.
+        let moved_to = match self.file_draft_of(domain, &journal_dir, actor, path)? {
+            Some(draft) => {
+                let (_, _, state_dir) = self.origin_spec_for_domain(domain)?;
+                crystalline_remote::state::OriginState::load(&state_dir)?
+                    .and_then(|state| super::draft_conflicts::moved_file(&state, &draft))
+            }
+            None => None,
+        };
         let kept = match resolution {
             ops::Resolution::Mine => {
                 // The start is the team's file where the gate reads it, the
@@ -4839,13 +4885,18 @@ impl Engine {
             }
             _ => {
                 // A file from before the record did not cause its conflict, and
-                // its bytes exist nowhere else: they are kept first, as an old
-                // page's text is, and a copy that cannot be kept refuses.
+                // its bytes may exist nowhere else: whatever its kind, they are
+                // kept first, as an old page's text is, and a copy that cannot
+                // be kept refuses.
+                let no_record = crate::draft_start::load_file(&journal_dir, domain, actor, path)
+                    .map_err(io)?
+                    .is_none();
                 if held == crate::overlay_files::Held::Bytes
-                    && self.file_step_of(domain, &journal_dir, actor, path)?
-                        == super::draft_conflicts::FileStep::Conflict(
-                            DraftConflictKind::UnknownStart,
-                        )
+                    && (no_record
+                        || self.file_step_of(domain, &journal_dir, actor, path)?
+                            == super::draft_conflicts::FileStep::Conflict(
+                                DraftConflictKind::UnknownStart,
+                            ))
                 {
                     let bytes = crate::overlay_files::read(&journal_dir, domain, actor, path)
                         .map_err(io)?
@@ -4890,6 +4941,10 @@ impl Engine {
             "draft": true,
             "file": true,
             "kept": kept,
+            // Her side was a deletion, so Keep mine removes the team's file,
+            // unless the team moved it: then `moved_to` names where it went.
+            "deletion": held == crate::overlay_files::Held::Tombstone,
+            "moved_to": moved_to,
             "kept_copy": kept_file.is_some(),
             // A path on this server's disk, so only for the machine owner, who
             // is on it. Anybody else is told where the copy is listed.
@@ -5010,7 +5065,11 @@ impl Engine {
     ///   the last one.
     /// - **Merged** writes the text as her draft, row first, then moves the
     ///   start as Keep mine does. A room open over it meets the new row at its
-    ///   next save, as an external change, and merges it.
+    ///   next save, as an external change, and merges it. Over an address
+    ///   clash whose page the team also changed or deleted (`page_kind`), the
+    ///   start stays where it was: the merged text settles the address, and
+    ///   the team's change to the page is merged by the next pass or asked
+    ///   about, never passed over.
     ///
     /// Every start saved here clears `shared` and `merging`: a merge mark or a
     /// merged proposal no pass settled must not outlive her choice, nor move
@@ -5073,12 +5132,20 @@ impl Engine {
             (at, reading.half_of(at))
         };
         let row = reading.rows[d].clone();
-        let kind = listed
-            .iter()
-            .find(|conflict| conflict.path == row.path)
-            .map(|conflict| conflict.kind);
+        let listed_here = listed.iter().find(|conflict| conflict.path == row.path);
+        let kind = listed_here.map(|conflict| conflict.kind);
+        // An address clash over a page the team also changed or deleted: a
+        // merged text settles the clash only. Her start stays where it was, so
+        // the team's change to the page is merged by the next pass or asked
+        // about, and never passed over with team text she may not have seen.
+        let page_open = listed_here.is_some_and(|conflict| {
+            conflict.kind == DraftConflictKind::AddressTaken && conflict.page_kind.is_some()
+        });
         let mut kept_copy = false;
         let mut warning: Option<String> = None;
+        // Where the team moved the page she deleted, read before anything
+        // settles: Keep mine then removes nothing, and the receipt says so.
+        let moved_to = reading.moved_away(d);
         let kept = match resolution {
             ops::Resolution::Mine => {
                 if !row.tombstone {
@@ -5139,9 +5206,11 @@ impl Engine {
                         row.path
                     )));
                 }
-                // Option A (owner question 2): a draft from before the record
-                // did not cause its conflict, and its text exists nowhere else.
-                if kind == Some(DraftConflictKind::UnknownStart) && !row.tombstone {
+                // A draft from before the record did not cause its conflict, and
+                // its text may exist nowhere else: whatever the kind, it is
+                // kept first.
+                let no_record = reading.records[d].is_none();
+                if (kind == Some(DraftConflictKind::UnknownStart) || no_record) && !row.tombstone {
                     self.keep_a_copy(domain, actor, &row)?;
                     kept_copy = true;
                 }
@@ -5210,7 +5279,11 @@ impl Engine {
                         row.path
                     )));
                 }
-                let (start, half_start) = settled_starts(&mut reading, d, half, can_record)?;
+                let (start, half_start) = if page_open {
+                    (None, None)
+                } else {
+                    settled_starts(&mut reading, d, half, can_record)?
+                };
                 warning = self
                     .settle_row(
                         &view,
@@ -5223,17 +5296,20 @@ impl Engine {
                         start,
                     )
                     .await?;
-                if let Some(t) = half {
+                if let Some(t) = half.filter(|_| !page_open) {
                     self.settle_half(&view, domain, domain_id, actor, &reading, d, t, half_start)
                         .await?;
                 }
                 "merged"
             }
         };
-        // The frozen list of drafts from before the record forgets both paths.
-        self.settle_convergence(domain, actor, &row.path);
-        if let Some(t) = half {
-            self.settle_convergence(domain, actor, &reading.rows[t].path);
+        // The frozen list of drafts from before the record forgets both paths,
+        // unless the page's own conflict still stands on it.
+        if !(page_open && kept == "merged") {
+            self.settle_convergence(domain, actor, &row.path);
+            if let Some(t) = half {
+                self.settle_convergence(domain, actor, &reading.rows[t].path);
+            }
         }
         let remaining = match self.draft_conflicts(domain, actor).await {
             Ok(conflicts) => json!(conflicts.len()),
@@ -5255,6 +5331,10 @@ impl Engine {
             // draft, not in the folder the team reviewed.
             "draft": true,
             "kept": kept,
+            // Her side was a deletion, so Keep mine removes the team's page,
+            // unless the team moved it: then `moved_to` names where it went.
+            "deletion": row.tombstone,
+            "moved_to": moved_to,
             "kept_copy": kept_copy,
         });
         // What the draft writer says beside a write that landed, under the key
@@ -5352,17 +5432,26 @@ impl Engine {
         match settle {
             Settle::Keep => {}
             Settle::Write(text) => {
-                // Her own choice, so the replay of a mark left behind tells her
-                // of no merge.
+                // Her own choice, not a merge: the mark says which start goes
+                // with her text, so a crash after the row reads her text
+                // against the team text she settled, and a crash before it
+                // keeps the start she had. A merge replayed over her text
+                // would put back a team line she left out on purpose.
                 let read = reading.records[i].as_ref().filter(|_| start.is_some());
-                if let Some(read) = read {
+                if let (Some(read), Some(settled)) = (read, start.as_ref()) {
                     let marked = crate::draft_start::DraftStart {
                         merging: Some(false),
+                        settling: Some(Box::new(crate::draft_start::Settling {
+                            text_sha256: sha256_hex(text.as_bytes()),
+                            from: settled.from.clone(),
+                            start: settled.start.clone(),
+                            start_sha256: settled.start_sha256.clone(),
+                        })),
                         ..read.clone()
                     };
                     self.save_start(domain, actor, &marked)?;
                 }
-                match view.write(domain_id, &row.path, text).await {
+                match view.write_settling(domain_id, &row.path, text).await {
                     Ok(said) => warning = said,
                     Err(e) => {
                         if let Some(read) = read
@@ -6595,6 +6684,7 @@ fn settled_starts(
         shared: None,
         merged_at: record.and_then(|record| record.merged_at),
         merging: None,
+        settling: None,
     };
     let half = match half {
         Some(t) => {
@@ -6610,6 +6700,7 @@ fn settled_starts(
                     .as_ref()
                     .and_then(|record| record.merged_at),
                 merging: None,
+                settling: None,
             })
         }
         None => None,

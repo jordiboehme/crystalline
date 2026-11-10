@@ -586,6 +586,7 @@ export type DraftConflictEntry = {
      * For `AddressTaken`: the team's path that holds the address.
      */
     other: string | null;
+    page_kind: DraftConflictKind | null;
     /**
      * The draft's path, or the deletion's when it stands alone.
      */
@@ -598,7 +599,7 @@ export type DraftConflictEntry = {
 export type DraftConflictKind = 'EditEdit' | 'EditDelete' | 'DeleteEdit' | 'AddAdd' | 'UnknownStart' | 'AddressTaken';
 
 /**
- * One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.
+ * One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. For `AddressTaken` `upstream` is the page that holds your address, and `page_upstream` the team's text of your own page when `page_kind` says it changed too. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.
  */
 export type DraftConflictSides = {
     base: string | null;
@@ -618,15 +619,33 @@ export type DraftConflictSides = {
     kind: DraftConflictKind;
     local: string | null;
     moved_from: string | null;
+    /**
+     * For your deletion of a page or file the team moved: where it went.
+     * Keeping your side then removes nothing, since the team's copy stands
+     * there.
+     */
+    moved_to: string | null;
     note: string | null;
+    /**
+     * A draft from before 0.32.0, with no record of its start: taking the
+     * team's side keeps a copy of it first.
+     */
+    old_draft: boolean;
     other: string | null;
+    page_kind: DraftConflictKind | null;
+    /**
+     * For `AddressTaken` with a `page_kind`: the team's text of your own
+     * page. Null when the team deleted it, or when there is no `page_kind`.
+     */
+    page_upstream: string | null;
     path: string;
     upstream: string | null;
     /**
      * What the team's side is: the SHA-256 of its bytes (a page's text or a
      * file's), `absent` when the team holds nothing there, `unreadable` when
-     * its copy cannot be read. Pass it back as `expected_upstream_sha256`
-     * when settling, so a team change made since is not overwritten.
+     * its copy cannot be read. With a `page_kind` it is one token for both
+     * team sides. Pass it back as `expected_upstream_sha256` when settling,
+     * so a team change made since is not overwritten.
      */
     upstream_sha256: string;
 };
@@ -656,6 +675,11 @@ export type DraftConflictsResponse = {
  * Where the resolution landed: in your draft.
  */
 export type DraftResolveReceipt = {
+    /**
+     * Your side was a deletion: keeping it removes the team's page or file
+     * when you share, unless `moved_to` is set.
+     */
+    deletion: boolean;
     /**
      * Always true.
      */
@@ -687,6 +711,11 @@ export type DraftResolveReceipt = {
      * For a file that was kept: where to find it.
      */
     kept_note?: string | null;
+    /**
+     * For a kept deletion of a page or file the team moved: where it went.
+     * Your deletion then removes nothing, and it ends.
+     */
+    moved_to?: string | null;
     /**
      * How many of your conflicts in this domain are left, or null when they
      * could not be counted.

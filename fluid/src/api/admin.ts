@@ -1760,6 +1760,11 @@ export interface DraftConflict {
   movedFrom: string | null;
   /** For `AddressTaken`: the team's path that holds the address, or null. */
   other: string | null;
+  /**
+   * For `AddressTaken`: the page's own conflict when the team also changed or
+   * deleted the page, or null. A new address does not settle that one.
+   */
+  pageKind: DraftConflictKind | null;
   /** A file beside the pages rather than a page. */
   file: boolean;
 }
@@ -1789,6 +1794,15 @@ export interface DraftConflictDetail extends DraftConflict {
    * was shown is refused rather than overwritten. Null from an older server.
    */
   upstreamSha256: string | null;
+  /** With a `pageKind`: the team's text of her own page, null when deleted. */
+  pageUpstream: string | null;
+  /**
+   * A draft from before 0.32.0, whose copy Take theirs keeps first. Null from
+   * an older server, which does not say.
+   */
+  oldDraft: boolean | null;
+  /** For her deletion of a page or file the team moved: where it went. */
+  movedTo: string | null;
   note: string | null;
 }
 
@@ -1839,6 +1853,7 @@ export function readDraftConflict(value: unknown): DraftConflict | null {
     kind: asString(record?.kind) ?? "",
     movedFrom: asString(record?.moved_from),
     other: asString(record?.other),
+    pageKind: asString(record?.page_kind),
     file: record?.file === true,
   };
 }
@@ -1889,12 +1904,16 @@ export async function fetchDraftConflict(
       kind: "",
       movedFrom: null,
       other: null,
+      pageKind: null,
       file: false,
     }),
     base: asString(record?.base),
     local: asString(record?.local),
     upstream: asString(record?.upstream),
     upstreamSha256: asString(record?.upstream_sha256),
+    pageUpstream: asString(record?.page_upstream),
+    oldDraft: typeof record?.old_draft === "boolean" ? record.old_draft : null,
+    movedTo: asString(record?.moved_to),
     note: asString(record?.note),
   };
 }

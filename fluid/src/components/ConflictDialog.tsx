@@ -31,6 +31,8 @@ export interface ConflictDialogProps {
     kind: string;
     movedFrom: string | null;
     other: string | null;
+    /** For `AddressTaken`: the page's own conflict, when it has one. */
+    pageKind?: string | null;
     file: boolean;
   }; /** Told once the conflict is settled, before the dialog leaves. */
   onSettled?: () => void;

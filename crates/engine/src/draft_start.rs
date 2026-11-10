@@ -66,7 +66,8 @@ const RECORD_SUFFIX: &str = ".json";
 const FILES_DIR: &str = "files";
 
 /// How long [`save`] waits before each extra try. Short, since it can run on an
-/// async worker, but long enough for a scanner to let go of a file on Windows.
+/// async worker (see [`pause`]), but long enough for a scanner to let go of a
+/// file on Windows.
 /// The wait is outside the journal's lock, which each try takes for itself.
 const RETRY_WAITS: [Duration; 2] = [Duration::from_millis(10), Duration::from_millis(50)];
 
@@ -99,6 +100,53 @@ pub struct DraftStart {
     /// replay. Absent from every record written before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merging: Option<bool>,
+    /// Stands while a merged text of her own is being written, beside
+    /// `merging`: the text's digest and the start it was settled against. A
+    /// crash after the row leaves her text over the old start, and a merge
+    /// of the two would put back a team line she left out on purpose. So a
+    /// row that holds this text reads with this start, and one that does not
+    /// reads with the old start ([`DraftStart::as_settled`]). Absent from
+    /// every record written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settling: Option<Box<Settling>>,
+}
+
+/// The start a merged text of hers was settled against, while it is written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settling {
+    /// The SHA-256 of the merged text as her row holds it.
+    pub text_sha256: String,
+    pub from: Option<String>,
+    pub start: Option<String>,
+    pub start_sha256: Option<String>,
+}
+
+impl DraftStart {
+    /// The record as it reads over a row that holds `content`: a merged text
+    /// of hers whose row was written takes the start it was settled against,
+    /// and one whose row was not keeps the start it had. Either way no mark
+    /// is left, since nothing was merged. Any other record is as it is.
+    pub fn as_settled(self, content: &str) -> DraftStart {
+        let Some(settling) = self.settling.clone() else {
+            return self;
+        };
+        let settling = *settling;
+        let cleared = DraftStart {
+            merging: None,
+            settling: None,
+            ..self
+        };
+        if sha256_hex(content.as_bytes()) != settling.text_sha256 {
+            return cleared;
+        }
+        DraftStart {
+            from: settling.from,
+            start: settling.start,
+            start_sha256: settling.start_sha256,
+            shared: None,
+            ..cleared
+        }
+    }
 }
 
 /// What an open proposal holds of one row.
@@ -145,7 +193,9 @@ fn starts_dir(state_dir: &Path, domain: &str, actor: &str) -> io::Result<PathBuf
 /// The file the record of `path` stands in, the bytes of the path hashed as they
 /// are: no case folding and no Unicode normalizing, since each spelling is a row
 /// of its own. Public for a test that has to stand something in the record's
-/// way; nothing else outside this module should know where a record lives.
+/// way. Outside this module it is named only to tell the machine owner which
+/// file to remove when a record cannot be read; every read and write of a
+/// record goes through this module.
 #[doc(hidden)]
 pub fn record_file(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Result<PathBuf> {
     entry_path(state_dir, domain, actor, path)?;
@@ -249,9 +299,24 @@ fn with_retries(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => tracing::debug!("a draft start record is tried again: {e}"),
         }
-        std::thread::sleep(wait);
+        pause(wait);
     }
     attempt()
+}
+
+/// Wait `wait` before another try. A save runs under a draft lock on an async
+/// worker, so on a runtime with more than one worker the wait tells the
+/// runtime first and the worker's other tasks move on. A runtime with one
+/// thread has no other worker to move them to, and anywhere else this is an
+/// ordinary sleep.
+fn pause(wait: Duration) {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| std::thread::sleep(wait));
+        }
+        _ => std::thread::sleep(wait),
+    }
 }
 
 /// Write one row's record, atomically through `overlay_journal::save`.
@@ -391,6 +456,23 @@ pub fn all(state_dir: &Path, domain: &str, actor: &str) -> io::Result<Vec<DraftS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A retry's wait does not hold up the worker it runs on: with the one
+    /// worker waiting, another task still runs before the wait is over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_wait_before_a_retry_lets_other_tasks_run() {
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let pausing = tokio::spawn(async move {
+            let _ = started.send(());
+            pause(Duration::from_millis(600));
+            std::time::Instant::now()
+        });
+        waiting.await.unwrap();
+        let other = tokio::spawn(async { std::time::Instant::now() });
+        let ran = other.await.unwrap();
+        let paused = pausing.await.unwrap();
+        assert!(ran < paused, "another task waited for the pause to end");
+    }
     use crate::overlay_journal::{
         JournalEntry, journal_actor_count, journal_clear, journal_counts, journal_entries,
         journal_remove_actor, journal_write,
@@ -415,6 +497,7 @@ mod tests {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         }
     }
 
@@ -443,6 +526,7 @@ mod tests {
             }),
             merged_at: Some("2026-11-06T10:00:00Z".parse().unwrap()),
             merging: None,
+            settling: None,
         };
         let upper = DraftStart {
             path: "Note.md".to_string(),
@@ -455,6 +539,7 @@ mod tests {
             }),
             merged_at: None,
             merging: None,
+            settling: None,
         };
 
         save(state, "team", "alice", &lower).unwrap();
@@ -965,6 +1050,7 @@ mod tests {
                 shared: None,
                 merged_at: None,
                 merging: None,
+                settling: None,
             })
         );
     }

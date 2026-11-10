@@ -746,6 +746,7 @@ mod tests {
             moved_from: None,
             file: false,
             other: None,
+            page_kind: None,
         }
     }
 

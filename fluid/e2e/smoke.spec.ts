@@ -19,6 +19,10 @@
  * a line in one of those files.
  */
 
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import type { Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
@@ -814,85 +818,98 @@ test("a refused direct share offers to share as a proposal", async ({
   await page.unrouteAll({ behavior: "ignoreErrors" });
 });
 
-test("a person settles a draft conflict in the browser", async ({ page }) => {
-  // The fixture domain does not review changes and has no origin, so the
-  // domain listing is the real one with this domain marked as reviewing, and
-  // the draft routes are canned in the shapes they send: three of her drafts
-  // that do not fit the team's text, each settled one way.
-  const listing = await page.request.get(`${BASE_PATH}/api/v1/domains`);
-  expect(listing.ok()).toBe(true);
-  const domains = (await listing.json()) as {
-    domains: { name: string; review?: string | null }[];
-  };
-  for (const row of domains.domains) {
-    if (row.name === DOMAIN) {
-      row.review = "overlay";
-    }
-  }
-  await page.route("**/api/v1/domains", (route) =>
-    route.fulfill({ json: domains }),
-  );
-  const entry = (id: string, path: string) => ({
-    id,
-    path,
-    kind: "EditEdit",
-    moved_from: null,
-    other: null,
-    file: false,
-    draft: true,
-  });
-  let open = [
-    entry("d0000001", "notes/one.md"),
-    entry("d0000002", "notes/two.md"),
-    entry("d0000003", "notes/three.md"),
-  ];
-  const bodies: Record<string, Record<string, unknown>> = {};
-  await page.route(
-    new RegExp(
-      `/api/v1/domains/${DOMAIN}/drafts/conflicts(/[^/?]+)?(/resolve)?$`,
-    ),
-    (route) => {
-      const url = new URL(route.request().url());
-      const parts = url.pathname.split("/drafts/conflicts")[1] ?? "";
-      const [, id, verb] = parts.split("/");
-      if (id === undefined) {
-        return route.fulfill({ json: { conflicts: open, merged: [] } });
-      }
-      const found = open.find((conflict) => conflict.id === id);
-      if (found === undefined) {
-        return route.fulfill({ status: 404, json: { detail: "gone" } });
-      }
-      if (verb === "resolve") {
-        const body = route.request().postDataJSON() as Record<string, unknown>;
-        bodies[found.path] = body;
-        open = open.filter((conflict) => conflict.id !== id);
-        return route.fulfill({
-          json: {
-            draft: true,
-            kept: body.resolution,
-            kept_copy: false,
-            remaining: open.length,
-          },
-        });
-      }
-      return route.fulfill({
-        json: {
-          ...found,
-          base: "The start.\n",
-          local: `My line in ${found.path}.\n`,
-          upstream: `The team's line in ${found.path}.\n`,
-          upstream_sha256: `sha-${found.id}`,
-          note: null,
-          detected_at: null,
-        },
-      });
-    },
-  );
+/** The reviewing domain `run-smoke.sh` set up, and its base snapshot. */
+const REVIEW_DOMAIN = process.env.FLUID_E2E_REVIEW_DOMAIN ?? "drafting-desk";
+const REVIEW_STATE = process.env.FLUID_E2E_REVIEW_STATE ?? "";
+const REVIEW_ROOT = process.env.FLUID_E2E_REVIEW_ROOT ?? "";
 
-  await page.goto(`d/${DOMAIN}`);
+/**
+ * Play the team: write `text` as the team's copy of `path` in the base
+ * snapshot, its stamp in the state and the file in the folder, which is what
+ * a pull leaves. The daemon reads the snapshot from disk on every question,
+ * and its watcher indexes the folder's file.
+ */
+function teamWrites(path: string, text: string): string {
+  const bytes = Buffer.from(text, "utf8");
+  writeFileSync(join(REVIEW_STATE, "base", path), bytes);
+  writeFileSync(join(REVIEW_ROOT, path), bytes);
+  const file = join(REVIEW_STATE, "state.json");
+  const state = JSON.parse(readFileSync(file, "utf8")) as {
+    files: Record<string, { sha256: string; size: number }>;
+  };
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  state.files[path] = { sha256, size: bytes.length };
+  writeFileSync(file, JSON.stringify(state, null, 2));
+  return sha256;
+}
+
+test("a person settles a draft conflict in the browser", async ({
+  page,
+}, testInfo) => {
+  // Real all the way down: three drafts written through the API, the team's
+  // change written where a pull would leave it, and the three settled in the
+  // dialog against the daemon's own draft routes. Each browser has its own
+  // three pages, since both run against one daemon.
+  expect(REVIEW_STATE, "run-smoke.sh names the base snapshot").not.toBe("");
+  expect(REVIEW_ROOT, "run-smoke.sh names the folder").not.toBe("");
+  const prefix = `notes/${testInfo.project.name}`;
+  const paths = [`${prefix}-one.md`, `${prefix}-two.md`, `${prefix}-three.md`];
+  const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
+  const csrf = ((await me.json()) as { csrf: string }).csrf;
+  const api = `${BASE_PATH}/api/v1/domains/${REVIEW_DOMAIN}`;
+  const starts: Record<string, string> = {};
+  for (const path of paths) {
+    const permalink = path.replace(/\.md$/, "");
+    const read = await page.request.get(`${api}/engrams/${permalink}`);
+    expect(read.ok(), await read.text()).toBeTruthy();
+    const detail = (await read.json()) as { content: string };
+    starts[path] = detail.content;
+    const saved = await page.request.put(`${api}/engrams/${permalink}`, {
+      headers: {
+        "X-CSRF-Token": csrf,
+        "If-Match": read.headers().etag ?? "",
+      },
+      data: {
+        content: detail.content.replace(
+          `The start of ${path}.`,
+          `My line in ${path}.`,
+        ),
+      },
+    });
+    expect(saved.ok(), await saved.text()).toBeTruthy();
+  }
+  const shown: Record<string, string> = {};
+  for (const path of paths) {
+    const start = starts[path] ?? "";
+    shown[path] = teamWrites(
+      path,
+      start.replace(`The start of ${path}.`, `The team's line in ${path}.`),
+    );
+  }
+  // The list the notice reads, straight from the daemon.
+  const listed = await page.request.get(`${api}/drafts/conflicts`);
+  expect(listed.ok(), await listed.text()).toBeTruthy();
+  const list = (await listed.json()) as {
+    conflicts: { path: string; kind: string }[];
+    settle_note: string | null;
+  };
+  expect(list.settle_note).toBeNull();
+  for (const path of paths) {
+    expect(list.conflicts).toContainEqual(
+      expect.objectContaining({ path, kind: "EditEdit" }),
+    );
+  }
+
+  const bodies: Record<string, unknown>[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/resolve")) {
+      bodies.push(request.postDataJSON() as Record<string, unknown>);
+    }
+  });
+  await page.goto(`d/${REVIEW_DOMAIN}`);
   const notice = page.getByRole("region", { name: "Your drafts" });
   await expect(notice).toContainText(
-    "3 of your drafts do not fit with the team's text. Settle them before you share.",
+    `${String(list.conflicts.length)} of your drafts do not fit with the team's text. Settle them before you share.`,
   );
 
   const settle = async (path: string) => {
@@ -909,40 +926,59 @@ test("a person settles a draft conflict in the browser", async ({ page }) => {
     );
     return dialog;
   };
+  const [one, two, three] = paths as [string, string, string];
 
-  let dialog = await settle("notes/one.md");
+  let dialog = await settle(one);
   await dialog.getByRole("button", { name: "Keep mine" }).click();
   await expect(dialog).toBeHidden();
 
-  dialog = await settle("notes/two.md");
+  dialog = await settle(two);
   await dialog.getByRole("button", { name: "Take theirs" }).click();
   await expect(dialog).toBeHidden();
 
-  dialog = await settle("notes/three.md");
+  dialog = await settle(three);
   await dialog.getByRole("button", { name: "Edit merged" }).click();
   const merged = dialog.getByLabel("Merged content");
-  await merged.fill("My line and the team's line.\n");
+  const mergedText = (starts[three] ?? "").replace(
+    `The start of ${three}.`,
+    "My line and the team's line.",
+  );
+  await merged.fill(mergedText);
   await dialog.getByRole("button", { name: "Save merged" }).click();
   await expect(dialog).toBeHidden();
 
-  // Each names the team side it was shown, so a newer one would be refused.
-  expect(bodies).toEqual({
-    "notes/one.md": {
-      resolution: "mine",
-      expected_upstream_sha256: "sha-d0000001",
-    },
-    "notes/two.md": {
-      resolution: "theirs",
-      expected_upstream_sha256: "sha-d0000002",
-    },
-    "notes/three.md": {
+  // Each named the team side it was shown, so a newer one would be refused.
+  expect(bodies).toEqual([
+    { resolution: "mine", expected_upstream_sha256: shown[one] },
+    { resolution: "theirs", expected_upstream_sha256: shown[two] },
+    {
       resolution: "merged",
-      content: "My line and the team's line.\n",
-      expected_upstream_sha256: "sha-d0000003",
+      content: mergedText,
+      expected_upstream_sha256: shown[three],
     },
-  });
-  await expect(notice).toBeHidden();
-  await page.unrouteAll({ behavior: "ignoreErrors" });
+  ]);
+  // What the daemon holds now: her text, the team's, and the merge.
+  const reads = async (path: string) => {
+    const read = await page.request.get(
+      `${api}/engrams/${path.replace(/\.md$/, "")}`,
+    );
+    expect(read.ok(), await read.text()).toBeTruthy();
+    return ((await read.json()) as { content: string }).content;
+  };
+  expect(await reads(one)).toContain(`My line in ${one}.`);
+  // Her draft ended: she reads the folder, once its watcher indexed it.
+  await expect.poll(() => reads(two)).toContain(`The team's line in ${two}.`);
+  expect(await reads(three)).toContain("My line and the team's line.");
+  const left = await page.request.get(`${api}/drafts/conflicts`);
+  const after = (await left.json()) as { conflicts: { path: string }[] };
+  for (const path of paths) {
+    expect(after.conflicts.map((conflict) => conflict.path)).not.toContain(
+      path,
+    );
+  }
+  if (after.conflicts.length === 0) {
+    await expect(notice).toBeHidden();
+  }
 });
 
 test("an undeclared MANIFEST section explains itself and can be started", async ({

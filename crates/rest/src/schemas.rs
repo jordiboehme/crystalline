@@ -428,6 +428,12 @@ pub struct DraftConflictEntry {
     /// For `AddressTaken`: the team's path that holds the address.
     #[schema(required = true)]
     pub other: Option<String>,
+    /// For `AddressTaken`: the page's own conflict, when the team also
+    /// changed or deleted the page you drafted. Null otherwise. A merged text
+    /// with a new address settles the address only; this one is still to
+    /// settle after it.
+    #[schema(required = true)]
+    pub page_kind: Option<DraftConflictKind>,
 }
 
 /// What `GET /domains/{domain}/drafts/conflicts` answers.
@@ -453,7 +459,10 @@ pub struct DraftConflictsResponse {
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "One of your draft conflicts with its three sides: \
                         `base` is the text your draft started from, `local` \
-                        your draft and `upstream` the team's text. A side \
+                        your draft and `upstream` the team's text. For \
+                        `AddressTaken` `upstream` is the page that holds your \
+                        address, and `page_upstream` the team's text of your \
+                        own page when `page_kind` says it changed too. A side \
                         with no text is null and `note` says why. A file has \
                         no text sides, and carries `file: true`.")]
 pub struct DraftConflictSides {
@@ -475,14 +484,30 @@ pub struct DraftConflictSides {
     pub upstream: Option<String>,
     /// What the team's side is: the SHA-256 of its bytes (a page's text or a
     /// file's), `absent` when the team holds nothing there, `unreadable` when
-    /// its copy cannot be read. Pass it back as `expected_upstream_sha256`
-    /// when settling, so a team change made since is not overwritten.
+    /// its copy cannot be read. With a `page_kind` it is one token for both
+    /// team sides. Pass it back as `expected_upstream_sha256` when settling,
+    /// so a team change made since is not overwritten.
     #[schema(example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")]
     pub upstream_sha256: String,
     #[schema(required = true)]
     pub moved_from: Option<String>,
     #[schema(required = true)]
     pub other: Option<String>,
+    /// For `AddressTaken`: the page's own conflict, as in the list.
+    #[schema(required = true)]
+    pub page_kind: Option<DraftConflictKind>,
+    /// For `AddressTaken` with a `page_kind`: the team's text of your own
+    /// page. Null when the team deleted it, or when there is no `page_kind`.
+    #[schema(required = true)]
+    pub page_upstream: Option<String>,
+    /// A draft from before 0.32.0, with no record of its start: taking the
+    /// team's side keeps a copy of it first.
+    pub old_draft: bool,
+    /// For your deletion of a page or file the team moved: where it went.
+    /// Keeping your side then removes nothing, since the team's copy stands
+    /// there.
+    #[schema(required = true)]
+    pub moved_to: Option<String>,
     #[schema(required = true)]
     pub note: Option<String>,
     /// Present, and true, only for a file.
@@ -507,6 +532,12 @@ pub struct DraftResolveReceipt {
     /// `mine`, `theirs` or `merged`.
     #[schema(example = "mine")]
     pub kept: String,
+    /// Your side was a deletion: keeping it removes the team's page or file
+    /// when you share, unless `moved_to` is set.
+    pub deletion: bool,
+    /// For a kept deletion of a page or file the team moved: where it went.
+    /// Your deletion then removes nothing, and it ends.
+    pub moved_to: Option<String>,
     /// Whether a copy of your text or file was kept before taking the
     /// team's.
     pub kept_copy: bool,
@@ -697,6 +728,7 @@ mod tests {
             moved_from: None,
             file: false,
             other: None,
+            page_kind: None,
         }]);
         listed.push("draft".to_string());
         listed.sort();

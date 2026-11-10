@@ -2556,6 +2556,7 @@ mod tests {
             }),
             merged_at: None,
             merging: None,
+            settling: None,
         }
     }
 

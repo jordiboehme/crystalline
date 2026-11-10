@@ -2488,6 +2488,7 @@ mod tests {
             moved_from: None,
             file: false,
             other: None,
+            page_kind: None,
         };
         let refused = draft_conflicts_pending_json(&[conflict]);
         assert_eq!(refused["outcome"], "conflicts_pending");

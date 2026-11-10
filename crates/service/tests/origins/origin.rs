@@ -4506,6 +4506,7 @@ pub(super) async fn drafted(eng: &Engine, tmp: &Path, actor: &str, path: &str, t
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();
@@ -4549,6 +4550,7 @@ async fn tombstoned(eng: &Engine, tmp: &Path, actor: &str, path: &str) {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();

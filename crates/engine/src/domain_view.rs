@@ -151,6 +151,10 @@ pub(crate) enum StartRule<'a> {
     /// One of the two movers: this is the record, under whatever path it names.
     /// `None` is a draft with no known start, and no record stands afterwards.
     Carried(Option<DraftStart>),
+    /// A settle that wrote the record itself, just before this row: a held
+    /// row's record is left exactly as it stands. A new row is as under
+    /// [`StartRule::IfNew`].
+    Settling,
 }
 
 /// What one write into this actor's files overlay landed as
@@ -580,6 +584,21 @@ impl<'a> DomainView<'a> {
         self.put(domain_id, path, record, StartRule::IfNew).await
     }
 
+    /// [`DomainView::write`] for a settle that has just written the row's
+    /// record itself, with the mark that says which start goes with this text:
+    /// the record is left as it stands.
+    pub(crate) async fn write_settling(
+        &self,
+        domain_id: DomainId,
+        path: &str,
+        text: &str,
+    ) -> Result<Option<String>> {
+        let record = Engine::overlay_record(path, text)?;
+        self.refuse_address_held_elsewhere(domain_id, &record.permalink, path, None)
+            .await?;
+        self.put(domain_id, path, record, StartRule::Settling).await
+    }
+
     /// [`DomainView::write`] for a verb that read the text it builds on.
     pub(crate) async fn write_from(
         &self,
@@ -893,16 +912,33 @@ impl<'a> DomainView<'a> {
         start: StartRule<'_>,
     ) -> Result<Option<String>> {
         let actor = self.writing_actor()?;
-        let held = {
+        let now = {
             let store = self.engine.store();
             let store = store.lock().await;
-            store.overlay_entry(domain_id, actor, path).await?.is_some()
+            store.overlay_entry(domain_id, actor, path).await?
         };
+        let held = now.is_some();
         let wanted = match start {
+            StartRule::Settling if held => return self.put_row(domain_id, path, record).await,
             StartRule::IfNew | StartRule::IfNewFrom(_) if held => {
+                // A merged text of hers that a crash left half saved is
+                // settled against the row it was written to before the row
+                // changes, or the new text would read with the wrong start.
+                if let Some(now) = &now
+                    && let Some(read) = self.start_of(path)?
+                    && read.settling.is_some()
+                {
+                    self.set_start(path, Some(&read.as_settled(&now.content)))
+                        .map_err(|source| EngineError::Io {
+                            path: format!("the draft start record of '{path}'"),
+                            source,
+                        })?;
+                }
                 return self.put_row(domain_id, path, record).await;
             }
-            StartRule::IfNew => self.engine.fresh_start(self.domain.as_str(), path)?,
+            StartRule::IfNew | StartRule::Settling => {
+                self.engine.fresh_start(self.domain.as_str(), path)?
+            }
             StartRule::IfNewFrom(read) => {
                 self.engine
                     .start_from_read(self.domain.as_str(), path, read)?
@@ -1699,16 +1735,20 @@ impl<'a> DomainView<'a> {
             store
                 .overlay_entry(src.domain_id, actor, &src.path)
                 .await?
-                .is_some_and(|entry| !entry.tombstone)
+                .filter(|entry| !entry.tombstone)
         };
         // Read before anything is dropped, and a broken record refuses here,
         // while nothing has changed. No draft means no record to read: the
         // tombstone written below starts one, and the destination carries that.
-        let source_start = if held_draft {
-            self.start_of(&src.path)?
-        } else {
-            None
+        // A merged text a crash left half saved is settled against the row it
+        // was written to, since the move may change the text.
+        let source_start = match &held_draft {
+            Some(entry) => self
+                .start_of(&src.path)?
+                .map(|start| start.as_settled(&entry.content)),
+            None => None,
         };
+        let held_draft = held_draft.is_some();
         let base = {
             let store = self.engine.store();
             let store = store.lock().await;

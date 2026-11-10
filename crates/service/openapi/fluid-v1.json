@@ -2281,6 +2281,7 @@
                       "kind": "EditEdit",
                       "moved_from": null,
                       "other": null,
+                      "page_kind": null,
                       "path": "notes/plan.md"
                     }
                   ],
@@ -2366,8 +2367,12 @@
                   "kind": "EditEdit",
                   "local": "---\ntitle: Plan\n---\n\nmy version\n",
                   "moved_from": null,
+                  "moved_to": null,
                   "note": null,
+                  "old_draft": false,
                   "other": null,
+                  "page_kind": null,
+                  "page_upstream": null,
                   "path": "notes/plan.md",
                   "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n"
                 }
@@ -2454,6 +2459,7 @@
                   "$ref": "#/components/schemas/DraftResolveReceipt"
                 },
                 "example": {
+                  "deletion": false,
                   "draft": true,
                   "kept": "mine",
                   "kept_copy": false,
@@ -8334,7 +8340,7 @@
           "domains"
         ],
         "summary": "Resolve one recorded conflict by id.",
-        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. A file under `assets/` never merges: taking the team's file first keeps a copy of the folder's, and the receipt says so (`file`, `kept_copy`, `kept_note`). A conflict the pull recorded in the folder only: a draft's conflict is settled through `resolve_draft_conflict`. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
+        "description": "Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`, the default with a GitHub App). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. A file under `assets/` never merges: taking the team's file first keeps a copy of the folder's, and the receipt says so (`file`, `kept_copy`, `kept_note`). This settles only a conflict the pull recorded in the folder. A draft's conflict is settled through `resolve_draft_conflict`. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.",
         "operationId": "resolve_domain_conflict",
         "parameters": [
           {
@@ -13595,7 +13601,8 @@
           "draft",
           "moved_from",
           "file",
-          "other"
+          "other",
+          "page_kind"
         ],
         "properties": {
           "draft": {
@@ -13628,6 +13635,17 @@
             ],
             "description": "For `AddressTaken`: the team's path that holds the address."
           },
+          "page_kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DraftConflictKind",
+                "description": "For `AddressTaken`: the page's own conflict, when the team also\nchanged or deleted the page you drafted. Null otherwise. A merged text\nwith a new address settles the address only; this one is still to\nsettle after it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "path": {
             "type": "string",
             "description": "The draft's path, or the deletion's when it stands alone.",
@@ -13649,7 +13667,7 @@
       },
       "DraftConflictSides": {
         "type": "object",
-        "description": "One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.",
+        "description": "One of your draft conflicts with its three sides: `base` is the text your draft started from, `local` your draft and `upstream` the team's text. For `AddressTaken` `upstream` is the page that holds your address, and `page_upstream` the team's text of your own page when `page_kind` says it changed too. A side with no text is null and `note` says why. A file has no text sides, and carries `file: true`.",
         "required": [
           "id",
           "path",
@@ -13662,6 +13680,10 @@
           "upstream_sha256",
           "moved_from",
           "other",
+          "page_kind",
+          "page_upstream",
+          "old_draft",
+          "moved_to",
           "note"
         ],
         "properties": {
@@ -13708,17 +13730,46 @@
               "null"
             ]
           },
+          "moved_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For your deletion of a page or file the team moved: where it went.\nKeeping your side then removes nothing, since the team's copy stands\nthere."
+          },
           "note": {
             "type": [
               "string",
               "null"
             ]
           },
+          "old_draft": {
+            "type": "boolean",
+            "description": "A draft from before 0.32.0, with no record of its start: taking the\nteam's side keeps a copy of it first."
+          },
           "other": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "page_kind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DraftConflictKind",
+                "description": "For `AddressTaken`: the page's own conflict, as in the list."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "page_upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For `AddressTaken` with a `page_kind`: the team's text of your own\npage. Null when the team deleted it, or when there is no `page_kind`."
           },
           "path": {
             "type": "string",
@@ -13732,7 +13783,7 @@
           },
           "upstream_sha256": {
             "type": "string",
-            "description": "What the team's side is: the SHA-256 of its bytes (a page's text or a\nfile's), `absent` when the team holds nothing there, `unreadable` when\nits copy cannot be read. Pass it back as `expected_upstream_sha256`\nwhen settling, so a team change made since is not overwritten.",
+            "description": "What the team's side is: the SHA-256 of its bytes (a page's text or a\nfile's), `absent` when the team holds nothing there, `unreadable` when\nits copy cannot be read. With a `page_kind` it is one token for both\nteam sides. Pass it back as `expected_upstream_sha256` when settling,\nso a team change made since is not overwritten.",
             "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           }
         }
@@ -13780,9 +13831,14 @@
           "remaining",
           "draft",
           "kept",
+          "deletion",
           "kept_copy"
         ],
         "properties": {
+          "deletion": {
+            "type": "boolean",
+            "description": "Your side was a deletion: keeping it removes the team's page or file\nwhen you share, unless `moved_to` is set."
+          },
           "draft": {
             "type": "boolean",
             "description": "Always true."
@@ -13823,6 +13879,13 @@
               "null"
             ],
             "description": "For a file that was kept: where to find it."
+          },
+          "moved_to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a kept deletion of a page or file the team moved: where it went.\nYour deletion then removes nothing, and it ends."
           },
           "remaining": {
             "type": [

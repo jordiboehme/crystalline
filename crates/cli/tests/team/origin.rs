@@ -2097,16 +2097,18 @@ mod chain {
             "{out}"
         );
         assert!(
-            out.contains("  conflict: notes/plan.md (you changed it, the team deleted it)"),
-            "{out}"
-        );
-        assert!(
             out.contains(
-                "Settle each with: crystalline origin resolve brand <path> --keep mine|theirs, \
-                 or --content-file <f>"
+                "  conflict: notes/plan.md (compare: crystalline origin diff brand --path \
+                 notes/plan.md; resolve: crystalline origin resolve brand notes/plan.md --keep \
+                 mine|theirs, or --content-file <f>)"
             ),
             "{out}"
         );
+        assert!(
+            out.contains("    you changed it, the team deleted it"),
+            "{out}"
+        );
+        assert!(out.contains("Settle each one as its line says."), "{out}");
         assert!(
             out.contains("crystalline origin share brand --file <path>"),
             "{out}"

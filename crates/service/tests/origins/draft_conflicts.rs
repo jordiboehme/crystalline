@@ -92,6 +92,7 @@ fn conflict(actor: &str, path: &str, kind: DraftConflictKind) -> DraftConflict {
         moved_from: None,
         file: false,
         other: None,
+        page_kind: None,
     }
 }
 
@@ -666,6 +667,10 @@ async fn the_conflict_sides_are_start_mine_and_the_teams() {
             "upstream_sha256": sha256_hex(&plan_later()),
             "moved_from": null,
             "other": null,
+            "page_kind": null,
+            "page_upstream": null,
+            "old_draft": false,
+            "moved_to": null,
             "note": null,
         })
     );
@@ -783,6 +788,7 @@ async fn a_generated_listing_row_is_not_a_conflict() {
                 shared: None,
                 merged_at: None,
                 merging: None,
+                settling: None,
             },
         )
         .unwrap();
@@ -807,6 +813,7 @@ async fn a_generated_listing_row_is_not_a_conflict() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();
@@ -849,8 +856,147 @@ async fn address_taken_wins_over_edit_delete() {
         t.conflicts("alice").await,
         vec![DraftConflict {
             other: Some("elsewhere.md".to_string()),
+            page_kind: Some(EditDelete),
             ..conflict("alice", "plan.md", AddressTaken)
         }]
+    );
+}
+
+/// Alice gives her draft of plan.md the address `roadmap` and changes its last
+/// line; bob adds a roadmap page of his own and changes the plan's first line.
+async fn an_address_taken_over_a_stale_page(t: &mut Team) {
+    t.replace(
+        "alice",
+        "plan",
+        "the last line of the plan",
+        "alice's last line",
+    )
+    .await;
+    t.replace("alice", "plan", "permalink: plan", "permalink: roadmap")
+        .await;
+    t.push(&[
+        (
+            "roadmap.md",
+            Some(engram("Roadmap", "roadmap", "bob's roadmap")),
+        ),
+        ("plan.md", Some(plan_later())),
+    ])
+    .await;
+}
+
+/// Under an address another page took, the page itself changed too: she is
+/// told both, sees the team's text of her page, and a merged text that only
+/// moves her address never moves her start past bob's change.
+#[tokio::test]
+async fn edit_merged_over_a_taken_address_keeps_the_team_change_underneath() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    an_address_taken_over_a_stale_page(&mut t).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            other: Some("roadmap.md".to_string()),
+            page_kind: Some(EditEdit),
+            ..conflict("alice", "plan.md", AddressTaken)
+        }]
+    );
+    let sides = t.sides("alice", "plan.md").await;
+    assert_eq!(sides["page_kind"], "EditEdit", "{sides}");
+    assert_eq!(sides["page_upstream"], text(&plan_later()), "{sides}");
+
+    let mine = t
+        .row("alice", "plan.md")
+        .await
+        .replace("permalink: roadmap", "permalink: roadmap-2");
+    t.resolve("alice", "plan.md", None, Some(&mine))
+        .await
+        .unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)],
+        "the merge of bob's change is still to come"
+    );
+    t.eng.converge_overlays("team").await.unwrap();
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains("bob's first line"), "{row}");
+    assert!(row.contains("alice's last line"), "{row}");
+    assert!(row.contains("permalink: roadmap-2"), "{row}");
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// The team deleted her page and gave its address to another one: a merged
+/// text with a new address still leaves her the deletion to settle.
+#[tokio::test]
+async fn edit_merged_over_a_taken_address_keeps_the_team_deletion_underneath() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.write("alice", "Plan", "alice rewrote the plan").await;
+    t.push(&[("plan.md", None)]).await;
+    t.push(&[("elsewhere.md", Some(engram("Elsewhere", "plan", "bob's")))])
+        .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            other: Some("elsewhere.md".to_string()),
+            page_kind: Some(EditDelete),
+            ..conflict("alice", "plan.md", AddressTaken)
+        }]
+    );
+    let mine = t
+        .row("alice", "plan.md")
+        .await
+        .replace("permalink: plan", "permalink: plan-2");
+    t.resolve("alice", "plan.md", None, Some(&mine))
+        .await
+        .unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditDelete)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.forge_file("plan.md"), None);
+}
+
+/// The team side a resolve hands back covers her own page too, so a change
+/// there since she looked is refused.
+#[tokio::test]
+async fn a_taken_address_refuses_a_resolve_after_her_page_changed() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.replace("alice", "plan", "permalink: plan", "permalink: roadmap")
+        .await;
+    t.push(&[(
+        "roadmap.md",
+        Some(engram("Roadmap", "roadmap", "bob's roadmap")),
+    )])
+    .await;
+    let seen = t.sides("alice", "plan.md").await["upstream_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    t.push(&[("plan.md", Some(plan_later()))]).await;
+    let mine = t
+        .row("alice", "plan.md")
+        .await
+        .replace("permalink: roadmap", "permalink: roadmap-2");
+    let err = t
+        .eng
+        .origin_resolve_expecting(
+            "team",
+            "plan.md",
+            None,
+            Some(mine.as_bytes()),
+            Some(&seen),
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .ends_with(crystalline_service::engine::TEAM_CHANGED_SINCE),
+        "{err}"
+    );
+    assert!(
+        t.row("alice", "plan.md")
+            .await
+            .contains("permalink: roadmap\n")
     );
 }
 
@@ -1095,6 +1241,157 @@ async fn an_old_new_file_needs_nothing() {
     assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
+/// An old draft whose page the team deletes after the upgrade: the pull that
+/// deletes it says so, and her share would otherwise bring the page back.
+#[tokio::test]
+async fn an_old_draft_whose_page_the_team_deletes_later_is_edit_delete() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.old_draft("alice", "plan.md", &text(&plan_later())).await;
+    t.old_draft(
+        "alice",
+        "fresh.md",
+        &text(&engram("Fresh", "fresh", "hers")),
+    )
+    .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", UnknownStart)]
+    );
+    t.push(&[("plan.md", None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditDelete)],
+        "a page the team never held stays a new one"
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.forge_file("plan.md"), None);
+
+    // Keep mine brings it back on purpose, and takes it off the list.
+    t.resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    assert_eq!(t.conflicts("alice").await, vec![]);
+}
+
+/// Taking the team's side of that deletion keeps her old text first: it was
+/// in no other place.
+#[tokio::test]
+async fn take_theirs_on_an_old_draft_the_team_deleted_keeps_a_copy() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.old_draft("alice", "plan.md", &text(&plan_later())).await;
+    t.push(&[("plan.md", None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditDelete)]
+    );
+    let receipt = t
+        .resolve("alice", "plan.md", Some("theirs"), None)
+        .await
+        .unwrap();
+    settled(&receipt, "plan.md", "theirs", true);
+    assert_eq!(
+        t.kept_of("alice"),
+        vec![("plan.md".to_string(), text(&plan_later()))]
+    );
+}
+
+/// An old draft the team deleted, whose address another page then took: a
+/// merged text with a new address leaves the deletion on the list.
+#[tokio::test]
+async fn edit_merged_over_a_taken_address_keeps_an_old_draft_deletion() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.old_draft("alice", "plan.md", &text(&plan_later())).await;
+    t.push(&[("plan.md", None)]).await;
+    t.push(&[("elsewhere.md", Some(engram("Elsewhere", "plan", "bob's")))])
+        .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![DraftConflict {
+            other: Some("elsewhere.md".to_string()),
+            page_kind: Some(EditDelete),
+            ..conflict("alice", "plan.md", AddressTaken)
+        }]
+    );
+    let mine = text(&plan_later()).replace("permalink: plan", "permalink: plan-2");
+    t.resolve("alice", "plan.md", None, Some(&mine))
+        .await
+        .unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditDelete)]
+    );
+}
+
+/// The same for a file from before the record.
+#[tokio::test]
+async fn an_old_file_the_team_deletes_later_is_edit_delete() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    draft_start::clear_file(&t.state(), "team", "alice", DECK).unwrap();
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, UnknownStart)]
+    );
+    t.push(&[(DECK, None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditDelete)]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.branch_file("main", DECK), None);
+}
+
+/// A file from before the record keeps a copy on Take theirs whatever its
+/// kind, as a page does: here the team deleted it after the upgrade.
+#[tokio::test]
+async fn take_theirs_on_an_old_file_the_team_deleted_keeps_a_copy() {
+    let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    draft_start::clear_file(&t.state(), "team", "alice", DECK).unwrap();
+    t.push(&[(DECK, None)]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![file_conflict("alice", DECK, EditDelete)]
+    );
+    let receipt = t
+        .resolve("alice", DECK, Some("theirs"), None)
+        .await
+        .unwrap();
+    assert_eq!(receipt["kept_copy"], true, "{receipt}");
+}
+
+/// The sides say whether a draft is from before the record, since Take
+/// theirs keeps a copy of exactly those, and where the team moved a page she
+/// deleted, since Keep mine then removes nothing.
+#[tokio::test]
+async fn the_sides_say_an_old_draft_and_a_page_the_team_moved() {
+    let mut t = team(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    t.old_draft("alice", "plan.md", &text(&plan_later())).await;
+    t.delete("alice", "gone").await;
+    t.push(&[("gone.md", None), ("archive/gone.md", Some(gone()))])
+        .await;
+    let old = t.sides("alice", "plan.md").await;
+    assert_eq!(old["old_draft"], true, "{old}");
+    assert_eq!(old["moved_to"], serde_json::Value::Null, "{old}");
+    let moved = t.sides("alice", "gone.md").await;
+    assert_eq!(moved["old_draft"], false, "{moved}");
+    assert_eq!(moved["moved_to"], "archive/gone.md", "{moved}");
+
+    // Keep mine on it removes nothing: her deletion ends, and the page stands
+    // where the team moved it.
+    let receipt = t
+        .resolve("alice", "gone.md", Some("mine"), None)
+        .await
+        .unwrap();
+    assert_eq!(receipt["moved_to"], "archive/gone.md", "{receipt}");
+    t.eng.converge_overlays("team").await.unwrap();
+    assert!(
+        !t.rows("alice")
+            .await
+            .contains(&("gone.md".to_string(), true))
+    );
+}
+
 #[tokio::test]
 async fn an_old_draft_the_record_file_lists_with_the_file_gone_is_edit_delete() {
     let t = team(&[("plan.md", plan())]).await;
@@ -1189,7 +1486,9 @@ async fn an_old_move_lists_once_at_the_draft() {
 
 /// A landing folder that cannot say whether it folds case is not read as
 /// folding. Her edited case move whose text the team holds at the old spelling
-/// is then not landed, on either disk: a landed move drops both halves, and on a disk that keeps the two apart that drops her rename.
+/// is then not landed: a landed move drops both halves, and on a disk that
+/// keeps the two apart that drops her rename. Only the domain's folder is
+/// asked, so a staging folder that folds on this machine changes nothing.
 #[tokio::test]
 async fn a_case_move_into_a_folder_that_cannot_say_has_not_landed() {
     let t = team(&[(
@@ -1532,6 +1831,7 @@ async fn an_address_her_own_draft_gave_up_is_free_for_her_other_draft() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();
@@ -1554,6 +1854,7 @@ async fn an_address_her_own_draft_gave_up_is_free_for_her_other_draft() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();
@@ -1742,6 +2043,7 @@ async fn a_peer_rename_of_a_file_she_moved_is_address_taken() {
         vec![DraftConflict {
             moved_from: Some("plan.md".to_string()),
             other: Some("bobs.md".to_string()),
+            page_kind: Some(EditDelete),
             ..conflict("alice", "mine.md", AddressTaken)
         }]
     );
@@ -2079,6 +2381,7 @@ async fn a_landing_after_a_merge_leaves_an_edit_that_came_in_meanwhile() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         },
     )
     .unwrap();
@@ -2098,6 +2401,40 @@ async fn a_landing_after_a_merge_leaves_an_edit_that_came_in_meanwhile() {
     let row = t.row("alice", "plan.md").await;
     assert!(row.contains("her line while the pass ran"), "{row}");
     assert!(row.contains(BOB_LINE), "{row}");
+}
+
+/// A discard names the draft it was shown by its digest. An edit of hers that
+/// lands after the discard first looked and before it drops the draft is
+/// newer work, so the discard is refused and the edit stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_while_a_discard_waits_is_never_dropped() {
+    let t = Arc::new(team(&[("plan.md", plan())]).await);
+    t.append("alice", "plan", HER_WORD).await;
+    let seen = sha256_hex(t.row("alice", "plan.md").await.as_bytes());
+    t.eng.hold_next_discard(1500);
+    let discard = {
+        let t = t.clone();
+        tokio::spawn(async move {
+            t.eng
+                .discard_local_changes(
+                    "team",
+                    &[DiscardTarget {
+                        path: "plan.md".to_string(),
+                        sha256: Some(seen),
+                    }],
+                    &ShareActor::Account("alice".to_string()),
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    t.append("alice", "plan", "her line while the discard waited")
+        .await;
+    let answer = discard.await.unwrap().unwrap();
+    assert_eq!(answer["cleared"], serde_json::json!([]), "{answer}");
+    assert_eq!(answer["refused"][0]["reason"], "changed_since", "{answer}");
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains("her line while the discard waited"), "{row}");
 }
 
 /// While the pass waits at one draft's lock, she edits another draft the pass
@@ -3796,6 +4133,28 @@ async fn a_same_line_conflict(t: &mut Team) -> String {
     t.row("alice", "plan.md").await
 }
 
+/// A convergence record that cannot be read is never saved over: its frozen
+/// list is what keeps an old draft's deletion in view, so neither a resolve
+/// nor a share writes a fresh record in its place.
+#[tokio::test]
+async fn a_broken_convergence_record_is_never_saved_over() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    a_same_line_conflict(&mut t).await;
+    let file = t
+        .state()
+        .join("overlays")
+        .join("team")
+        .join(".convergence.json");
+    std::fs::write(&file, b"{ broken").unwrap();
+    t.resolve("alice", "plan.md", Some("mine"), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ broken");
+    let answer = t.share("alice", None).await;
+    assert_eq!(answer["outcome"], "proposed", "{answer}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"{ broken");
+}
+
 /// The plan after bob's first line and a colleague's new paragraph.
 fn plan_with_a_paragraph() -> Vec<u8> {
     engram(
@@ -3804,6 +4163,59 @@ fn plan_with_a_paragraph() -> Vec<u8> {
         "bob's first line\n\nthe middle of the plan\n\nthe last line of the plan\n\n\
          a colleague's new paragraph",
     )
+}
+
+/// Her merged text leaves a team paragraph out on purpose, and the start
+/// could not be saved after the row: the next pass reads her choice as made
+/// against the team text she settled, and never merges the paragraph back.
+#[tokio::test]
+async fn a_merged_text_whose_start_was_not_saved_keeps_her_choice() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_with_a_paragraph()))]).await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![conflict("alice", "plan.md", EditEdit)]
+    );
+    let mine = text(&plan_later());
+    t.eng.fail_next_merge_start();
+    t.resolve("alice", "plan.md", None, Some(&mine))
+        .await
+        .unwrap_err();
+    assert_eq!(t.row("alice", "plan.md").await, mine);
+    assert_eq!(t.conflicts("alice").await, vec![]);
+
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, mine, "her choice stands");
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    let record = t.record("alice", "plan.md").unwrap();
+    assert_eq!(
+        record.start.as_deref(),
+        Some(text(&plan_with_a_paragraph()).as_str())
+    );
+    assert_eq!(record.merging, None);
+    assert_eq!(record.merged_at, None, "no merge changed her words");
+}
+
+/// The same crash, and she writes on before any pass: her next edit reads
+/// against the team text she settled, so the paragraph stays out.
+#[tokio::test]
+async fn an_edit_after_a_half_saved_merged_text_keeps_her_choice() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_with_a_paragraph()))]).await;
+    let mine = text(&plan_later());
+    t.eng.fail_next_merge_start();
+    t.resolve("alice", "plan.md", None, Some(&mine))
+        .await
+        .unwrap_err();
+    t.append("alice", "plan", HER_WORD).await;
+    assert_eq!(t.record("alice", "plan.md").unwrap().settling, None);
+    t.eng.converge_overlays("team").await.unwrap();
+    let row = t.row("alice", "plan.md").await;
+    assert!(row.contains(HER_WORD), "{row}");
+    assert!(!row.contains("a colleague's new paragraph"), "{row}");
+    assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
 /// She merges against the team text she was shown
@@ -4127,6 +4539,7 @@ async fn keep_mine_on_an_old_draft_writes_the_first_record() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         })
     );
     assert_eq!(t.conflicts("alice").await, vec![]);
@@ -5075,6 +5488,7 @@ async fn a_deletion_of_a_file_the_team_moved_is_delete_edit() {
         vec![file_conflict("alice", DECK, DeleteEdit)]
     );
     assert_eq!(t.held_file("alice", DECK), Some(None));
+    assert_eq!(t.sides("alice", DECK).await["moved_to"], "assets/moved.png");
 
     // The team deleting it outright still ends her deletion.
     let mut t = team(&[(DECK, TEAM_DECK.to_vec())]).await;
@@ -5082,6 +5496,44 @@ async fn a_deletion_of_a_file_the_team_moved_is_delete_edit() {
     t.push(&[(DECK, None)]).await;
     assert_eq!(t.conflicts("alice").await, vec![]);
     assert_eq!(t.held_file("alice", DECK), None);
+}
+
+/// The team moved the page she deleted, as a file above: her deletion is
+/// DeleteEdit and stands, whether the page moved unchanged or kept only its
+/// address, and the team side shown is the page where it went.
+#[tokio::test]
+async fn a_deletion_of_a_page_the_team_moved_is_delete_edit() {
+    let mut t = team(&[("plan.md", plan()), ("gone.md", gone())]).await;
+    t.delete("alice", "plan").await;
+    t.delete("alice", "gone").await;
+    let moved = engram("Gone", "gone", "a page she deletes, moved and changed");
+    t.push(&[
+        ("plan.md", None),
+        ("roadmap.md", Some(plan())),
+        ("gone.md", None),
+        ("archive/gone.md", Some(moved.clone())),
+    ])
+    .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![
+            conflict("alice", "gone.md", DeleteEdit),
+            conflict("alice", "plan.md", DeleteEdit),
+        ]
+    );
+    assert_eq!(
+        t.rows("alice").await,
+        vec![("gone.md".to_string(), true), ("plan.md".to_string(), true)]
+    );
+    assert_eq!(t.sides("alice", "plan.md").await["upstream"], text(&plan()));
+    assert_eq!(t.sides("alice", "gone.md").await["upstream"], text(&moved));
+
+    // The team deleting it outright still ends her deletion.
+    let mut t = team(&[("plan.md", plan())]).await;
+    t.delete("alice", "plan").await;
+    t.push(&[("plan.md", None)]).await;
+    assert_eq!(t.conflicts("alice").await, vec![]);
+    assert_eq!(t.rows("alice").await, vec![]);
 }
 
 /// A name that cannot address a folder holds no files, so its list is
@@ -5212,6 +5664,7 @@ fn listed(actor: &str, path: &str, kind: &str) -> serde_json::Value {
         "draft": true,
         "moved_from": null,
         "other": null,
+        "page_kind": null,
         "file": false,
     })
 }
@@ -5351,6 +5804,7 @@ async fn status_detail_carries_both_texts_and_only_her_own() {
     expected["upstream"] = serde_json::json!(text(&plan_later()));
     // What an agent hands back to settle against this team side.
     expected["upstream_sha256"] = serde_json::json!(sha256_hex(&plan_later()));
+    expected["page_upstream"] = serde_json::Value::Null;
     assert_eq!(
         domain["conflicts"],
         serde_json::json!([expected]),

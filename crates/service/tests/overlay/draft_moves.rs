@@ -465,6 +465,7 @@ fn in_step(path: &str, text: &str) -> DraftStart {
         shared: None,
         merged_at: None,
         merging: None,
+        settling: None,
     }
 }
 
@@ -679,6 +680,7 @@ async fn a_tombstone_over_a_draft_from_elsewhere_does_not_read_as_in_step() {
         shared: None,
         merged_at: None,
         merging: None,
+        settling: None,
     };
 
     let f = moved_onto_by_the_team().await;
@@ -840,6 +842,7 @@ async fn a_new_file_records_no_start() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         }),
         "a record that says new, which no record at all could not"
     );
@@ -906,6 +909,7 @@ async fn a_tombstone_names_its_own_path_when_the_snapshot_does_not_hold_it() {
         shared: None,
         merged_at: None,
         merging: None,
+        settling: None,
     };
 
     f.delete("stray").await;
@@ -1718,6 +1722,7 @@ async fn a_followed_team_rename_points_the_record_at_the_new_path() {
             shared: None,
             merged_at: None,
             merging: None,
+            settling: None,
         })
     );
 
@@ -1748,6 +1753,7 @@ fn moved_conflict(path: &str, from: &str, kind: DraftConflictKind) -> DraftConfl
         moved_from: Some(from.to_string()),
         file: false,
         other: None,
+        page_kind: None,
     }
 }
 
@@ -2304,13 +2310,25 @@ async fn a_merged_resolve_whose_start_could_not_move_keeps_the_case_move() {
         .await
         .unwrap_err();
     assert_eq!(f.row("Plan.md").await, bobs(LONG));
+    let marked = f.start("Plan.md").unwrap();
     assert_eq!(
-        f.start("Plan.md"),
-        Some(DraftStart {
+        DraftStart {
+            settling: None,
+            ..marked.clone()
+        },
+        DraftStart {
             merging: Some(false),
             ..before
-        }),
+        },
         "the mark stands over the old start"
+    );
+    assert_eq!(
+        marked
+            .settling
+            .and_then(|settling| settling.start)
+            .as_deref(),
+        Some(bobs(LONG).as_str()),
+        "and says which start goes with her text"
     );
 
     f.engine.converge_overlays("team").await.unwrap();

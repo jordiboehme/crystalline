@@ -2289,9 +2289,9 @@ pub struct ResolveBody {
                    re-indexes the domain. A file under `assets/` never \
                    merges: taking the team's file first keeps a copy of the \
                    folder's, and the receipt says so (`file`, `kept_copy`, \
-                   `kept_note`). A conflict the pull recorded in \
-                   the folder only: a draft's conflict is settled through \
-                   `resolve_draft_conflict`. Entirely local - no GitHub \
+                   `kept_note`). This settles only a conflict the pull \
+                   recorded in the folder. A draft's conflict is settled \
+                   through `resolve_draft_conflict`. Entirely local - no GitHub \
                    connection is needed - but it writes, so a read-only \
                    instance refuses it.",
     params(
@@ -2466,7 +2466,8 @@ fn draft_conflict_error(domain: &str, step: Step, e: EngineError) -> ApiError {
                     "draft": true,
                     "moved_from": null,
                     "file": false,
-                    "other": null
+                    "other": null,
+                    "page_kind": null
                 }],
                 "merged": []
             }),
@@ -2523,31 +2524,48 @@ pub async fn list_draft_conflicts(
 /// What a person told about their draft conflicts may not do with them here,
 /// in plain words, or `None` when every choice is open. The resolve route
 /// refuses each of these; this says so before anybody presses.
-async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Option<&'static str> {
+async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Option<String> {
     if refuse_read_only(state).is_err() {
-        return Some("This server is read-only, so these drafts cannot be settled here.");
-    }
-    if require_domain_write(state, identity, domain).await.is_err() {
         return Some(
-            "You cannot write in this domain, so these drafts cannot be settled here. Ask its \
-             owner for write access.",
+            "This server is read-only, so these drafts cannot be settled here.".to_string(),
         );
+    }
+    if let Err(refused) = require_domain_write(state, identity, domain).await {
+        return Some(not_writable_note(state.access.governs(domain), &refused));
     }
     // Taking the team's text is what a pull does, so it stays open on a
     // locked domain and on an archived repository; the other two do not.
     if state.engine.domain_is_read_only(domain).await {
         return Some(
             "This domain is read-only. Until its owner turns read-only off, you can only take \
-             the team's text for these drafts.",
+             the team's text for these drafts."
+                .to_string(),
         );
     }
     if state.engine.github_archived_repo(domain).is_some() {
         return Some(
             "This domain's repository is archived, so you can only take the team's text for \
-             these drafts.",
+             these drafts."
+                .to_string(),
         );
     }
     None
+}
+
+/// The note for a person the write gate refuses. On a domain GitHub governs,
+/// the gate's own sentence is the way out (link GitHub, or why the link
+/// cannot help yet), and the domain's owner cannot grant what GitHub decides.
+/// Anywhere else write access is the owner's to give.
+fn not_writable_note(governed: bool, refused: &ApiError) -> String {
+    if governed {
+        return format!(
+            "These drafts cannot be settled here yet. {}",
+            refused.detail
+        );
+    }
+    "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for \
+     write access."
+        .to_string()
 }
 
 /// `GET /domains/{domain}/drafts/conflicts/{id}` - one of the caller's own
@@ -2587,6 +2605,10 @@ async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Op
                 "upstream": "---\ntitle: Plan\n---\n\nthe team's version\n",
                 "moved_from": null,
                 "other": null,
+                "page_kind": null,
+                "page_upstream": null,
+                "old_draft": false,
+                "moved_to": null,
                 "note": null
             }),
         ),
@@ -2669,6 +2691,7 @@ pub async fn get_draft_conflict(
                 "remaining": 0,
                 "draft": true,
                 "kept": "mine",
+                "deletion": false,
                 "kept_copy": false
             }),
         ),
@@ -2750,20 +2773,36 @@ pub async fn resolve_draft_conflict(
         refuse_archived_share(&state, &identity, &domain).await?;
     }
     let (keep, content) = resolution_of(&body)?;
-    Ok(Json(
-        state
-            .engine
-            .resolve_own_draft_conflict(
-                &domain,
-                &id,
-                keep,
-                content.as_deref(),
-                body.expected_upstream_sha256.as_deref(),
-                ShareActor::Account(user.name.clone()),
-            )
-            .await
-            .map_err(|e| draft_conflict_error(&domain, Step::Write, e))?,
-    ))
+    let receipt = state
+        .engine
+        .resolve_own_draft_conflict(
+            &domain,
+            &id,
+            keep,
+            content.as_deref(),
+            body.expected_upstream_sha256.as_deref(),
+            ShareActor::Account(user.name.clone()),
+        )
+        .await
+        .map_err(|e| draft_conflict_error(&domain, Step::Write, e))?;
+    Ok(Json(warning_for_the_reader(&domain, receipt)))
+}
+
+/// What a person reads when her settled draft landed but this server could
+/// not keep its copy on disk. The engine's own sentence names a command and a
+/// folder of the server's, which only whoever runs it can act on; it goes to
+/// the log, and she reads what is true for her.
+const DRAFT_NOT_BACKED_UP: &str = "Your choice is saved, but this server could not keep a \
+     backup copy of it. Ask whoever runs this server to look at its log.";
+
+/// A resolve receipt with its `draft_warning` worded for the person reading
+/// it, as [`DRAFT_NOT_BACKED_UP`] says why.
+fn warning_for_the_reader(domain: &str, mut receipt: Value) -> Value {
+    if let Some(warning) = receipt.get("draft_warning").and_then(Value::as_str) {
+        tracing::warn!(domain, "a settled draft was not mirrored: {warning}");
+        receipt["draft_warning"] = Value::String(DRAFT_NOT_BACKED_UP.to_string());
+    }
+    receipt
 }
 
 /// A [`ResolveBody`] as the engine's resolve verbs take it: `keep` for
@@ -4001,6 +4040,35 @@ pub async fn github_domain_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A person on a governed domain is pointed at what the write gate says,
+    /// which is linking GitHub, never at an owner who cannot grant it.
+    #[test]
+    fn the_settle_note_on_a_governed_domain_says_what_the_gate_says() {
+        let refused = ApiError::forbidden(crate::LINK_GITHUB_TO_WRITE);
+        let note = not_writable_note(true, &refused);
+        assert!(note.ends_with(crate::LINK_GITHUB_TO_WRITE), "{note}");
+        assert!(!note.contains("owner"), "{note}");
+        let note = not_writable_note(false, &refused);
+        assert!(note.contains("Ask its owner for write access."), "{note}");
+    }
+
+    /// The machine owner's sentence about a draft not mirrored never reaches
+    /// a person over this API; a sentence for her does.
+    #[test]
+    fn a_draft_warning_is_worded_for_the_reader() {
+        let receipt = serde_json::json!({
+            "resolved": "plan.md",
+            "draft_warning": "the draft of 'plan.md' landed in the index, but this machine \
+                              could not mirror it under its state directory (/srv/x), so a \
+                              'crystalline reindex --wipe' would lose it",
+        });
+        let read = warning_for_the_reader("team", receipt);
+        assert_eq!(read["draft_warning"], DRAFT_NOT_BACKED_UP);
+        assert_eq!(read["resolved"], "plan.md");
+        let quiet = warning_for_the_reader("team", serde_json::json!({"resolved": "plan.md"}));
+        assert_eq!(quiet.get("draft_warning"), None);
+    }
 
     /// The example's kept entry is a real one: its message is the sentence
     /// `kept_message` words for the same entry, so the document can never

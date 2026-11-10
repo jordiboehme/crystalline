@@ -364,6 +364,7 @@ impl Fixture {
                 shared: None,
                 merged_at: None,
                 merging: None,
+                settling: None,
             },
         )
         .unwrap();

@@ -2104,6 +2104,16 @@ pub(crate) fn folder_may_fold_case(root: &Path, rel: &str) -> bool {
     folder_folds_case(root, rel) != Some(false)
 }
 
+/// Whether a page at `rel` lands where two spellings are one name: asked of
+/// the domain's folder `root` only, and only a folder that says it folds
+/// counts. A folder that cannot say does not fold, so a case move is never
+/// read as landed on a guess and no rename is lost. The folder a share stages
+/// its tree in is not asked, unlike for files (`Engine::file_may_fold_case`):
+/// where it folds and the domain folder does not, a case move stays a draft.
+pub(crate) fn page_folds_case(root: &Path, rel: &str) -> bool {
+    root.is_dir() && folder_folds_case(root, rel) == Some(true)
+}
+
 /// Whether the folder a file at `rel` would land in treats two spellings as one
 /// name: `Some(true)` it folds, `Some(false)` it keeps them apart, `None` it
 /// cannot say. The folder asked is the nearest one that exists, since a symlink

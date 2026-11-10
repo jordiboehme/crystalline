@@ -416,6 +416,7 @@ async fn an_editor_with_no_share_role_can_settle_her_own_conflict() {
                 "moved_from": null,
                 "file": false,
                 "other": null,
+                "page_kind": null,
             }],
             "merged": [],
             // Every choice is open to her here.

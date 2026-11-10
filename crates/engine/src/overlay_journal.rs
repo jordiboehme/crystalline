@@ -701,11 +701,12 @@ pub fn journal_record(state_dir: &Path, domain: &str) -> ConvergenceRecord {
 /// The convergence record one domain's journal holds, read strictly: no file is
 /// an empty record, and a file that cannot be read or parsed is an error.
 ///
-/// For the one reader that decides with it: an old draft whose file the team no
-/// longer holds is a deletion she has to see only when this record lists it, so
-/// an unreadable record read as empty would let her share add back what the
-/// team deleted. Every other reader keeps [`journal_record`], for which the
-/// record is a report.
+/// For the readers that decide with it, and for every writer that saves it
+/// whole: an old draft whose file the team no longer holds is a deletion she
+/// has to see only when this record lists it, so an unreadable record read as
+/// empty would let her share add back what the team deleted, and one saved
+/// back from such a read would lose the list for good. A reader that only
+/// reports keeps [`journal_record`].
 pub fn journal_record_strict(state_dir: &Path, domain: &str) -> io::Result<ConvergenceRecord> {
     let file = record_path(state_dir, domain)?;
     let bytes = match std::fs::read(&file) {

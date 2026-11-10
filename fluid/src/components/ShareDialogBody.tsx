@@ -999,6 +999,7 @@ export default function ShareDialogBody({
                 kind: settling.kind,
                 movedFrom: settling.movedFrom,
                 other: settling.other,
+                pageKind: settling.pageKind,
                 file: settling.file,
               }}
               onSettled={() => {

@@ -32,10 +32,12 @@
  * as its description so the button's own name stays the same. And two choices
  * can be off: Keep mine for an address another team page holds (sharing it
  * would land a second page at that address), and Edit merged for a file, which
- * has no text to merge. A receipt that carries a sentence of the server's (a
- * kept copy, a draft that landed but not on disk) is shown before the dialog
- * goes, since it is the only place that says it. The folder's own conflict at
- * a file shows its kept copy the same way.
+ * has no text to merge. An address clash over a page the team also changed
+ * says so and shows the team's text of that page, since a new address does
+ * not settle it. A receipt that carries a sentence of the server's (a kept
+ * copy, a draft that landed but not on disk) is shown before the dialog goes,
+ * since it is the only place that says it. The folder's own conflict at a file
+ * shows its kept copy the same way, and offers no merge either.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -108,11 +110,68 @@ function draftKindSentence(
   }
 }
 
-/** The hint under Take theirs: an old draft's text is kept, any other is not. */
-function theirsHint(kind: string, local: string | null, file: boolean): string {
-  // An old draft is kept first because it exists nowhere else; a deletion
+/**
+ * What else an address clash holds: the page she drafted changed or went on
+ * the team's side too, which a new address does not settle. Empty when it
+ * did not.
+ */
+function pageKindSentence(pageKind: string | null, path: string): string {
+  switch (pageKind) {
+    case null:
+      return "";
+    case "EditDelete":
+      return ` The team also deleted ${path}.`;
+    case "UnknownStart":
+      return ` We cannot tell what the team changed in ${path} since your draft started.`;
+    default:
+      return ` The team also changed ${path} itself.`;
+  }
+}
+
+/** The hint under Keep mine: what her side does to the team's on a share. */
+function mineHint(
+  kind: string,
+  file: boolean,
+  addressTaken: boolean,
+  movedTo: string | null,
+): string {
+  if (addressTaken) {
+    return "Change the address in Edit merged, or take theirs.";
+  }
+  const what = file ? "file" : "page";
+  // The team moved what she deleted: its copy stands at the new name, so her
+  // deletion has nothing left to remove.
+  if (kind === "DeleteEdit" && movedTo !== null) {
+    return `The team moved this ${what} to ${movedTo}. Keeping your deletion removes nothing, and it ends.`;
+  }
+  if (kind === "DeleteEdit") {
+    return `Your deletion removes the team's ${what} when you share.`;
+  }
+  return file
+    ? "Your file replaces the team's when you share."
+    : "Your text replaces the team's when you share.";
+}
+
+/** Whether a path is a file beside the pages, which has no text to merge. */
+function isFilePath(path: string): boolean {
+  return path.startsWith("assets/");
+}
+
+/**
+ * The hint under Take theirs: a draft from before 0.32.0 is kept first,
+ * whatever its kind, and any other is not. The server says which one this
+ * is; an older server does not, and then only `UnknownStart` is read as old.
+ */
+function theirsHint(
+  kind: string,
+  oldDraft: boolean | null,
+  local: string | null,
+  file: boolean,
+): string {
+  // An old draft is kept first because it may exist nowhere else; a deletion
   // has no text to keep.
-  return kind === "UnknownStart" && (file || local !== null)
+  const old = oldDraft ?? kind === "UnknownStart";
+  return old && (file || local !== null)
     ? "Your draft ends. A copy stays in your kept texts."
     : "Your draft ends and your text is gone.";
 }
@@ -126,8 +185,9 @@ export default function ConflictDialogBody({
 }: ConflictDialogProps): ReactElement {
   const queryClient = useQueryClient();
   const mergedField = useId();
-  const mineHint = useId();
+  const mineHintId = useId();
   const theirsHintId = useId();
+  const mergedHintId = useId();
   // Whether the merge editor is showing, kept APART from the text in it. One
   // piece of state would mean closing the editor threw the text away, and the
   // toggle sits one button away from "Save merged": a misclick would delete a
@@ -256,11 +316,15 @@ export default function ConflictDialogBody({
             kind: sides.kind,
             movedFrom: sides.movedFrom,
             other: sides.other,
+            pageKind: sides.pageKind,
             file: sides.file,
           }
         : draft;
   const file = shown?.file === true;
   const addressTaken = shown?.kind === "AddressTaken";
+  // The page under a taken address changed too: a merged text with a new
+  // address settles the address, and the page is asked about after it.
+  const pageKind = addressTaken ? (shown?.pageKind ?? null) : null;
   const readProblem =
     detail.error === null ? null : problemDetail(detail.error);
 
@@ -304,7 +368,7 @@ export default function ConflictDialogBody({
                     conflict.path,
                     shown.movedFrom,
                     shown.other,
-                  )}
+                  ) + pageKindSentence(pageKind, conflict.path)}
           </Dialog.Description>
 
           {(problem ?? readProblem) !== null && (
@@ -366,6 +430,13 @@ export default function ConflictDialogBody({
                         : "The team deleted this file."
                     }
                   />
+                  {pageKind !== null && (
+                    <Side
+                      label="The team's text of your page"
+                      text={sides?.pageUpstream ?? null}
+                      empty="The team deleted this page."
+                    />
+                  )}
                 </div>
               )}
 
@@ -393,7 +464,7 @@ export default function ConflictDialogBody({
                     type="button"
                     disabled={resolve.isPending}
                     aria-disabled={addressTaken ? true : undefined}
-                    aria-describedby={mineHint}
+                    aria-describedby={mineHintId}
                     onClick={() => {
                       if (!addressTaken) {
                         settle("mine");
@@ -403,10 +474,13 @@ export default function ConflictDialogBody({
                   >
                     Keep mine
                   </button>
-                  <span id={mineHint} className={HINT_CLASSES}>
-                    {addressTaken
-                      ? "Change the address in Edit merged, or take theirs."
-                      : "Your text replaces the team's when you share."}
+                  <span id={mineHintId} className={HINT_CLASSES}>
+                    {mineHint(
+                      shown.kind,
+                      file,
+                      addressTaken,
+                      sides?.movedTo ?? null,
+                    )}
                   </span>
                 </li>
                 <li className="flex flex-wrap items-center gap-2">
@@ -422,7 +496,12 @@ export default function ConflictDialogBody({
                     Take theirs
                   </button>
                   <span id={theirsHintId} className={HINT_CLASSES}>
-                    {theirsHint(shown.kind, conflict.local, file)}
+                    {theirsHint(
+                      shown.kind,
+                      sides?.oldDraft ?? null,
+                      conflict.local,
+                      file,
+                    )}
                   </span>
                 </li>
                 <li className="flex flex-wrap items-center gap-2">
@@ -435,6 +514,9 @@ export default function ConflictDialogBody({
                       <button
                         type="button"
                         aria-expanded={mergeOpen}
+                        aria-describedby={
+                          pageKind === null ? undefined : mergedHintId
+                        }
                         onClick={() => {
                           // Her text, or the team's where her side is a
                           // deletion: an empty start would save nothing.
@@ -459,6 +541,12 @@ export default function ConflictDialogBody({
                         >
                           Save merged
                         </button>
+                      )}
+                      {pageKind !== null && (
+                        <span id={mergedHintId} className={HINT_CLASSES}>
+                          A new address settles the address only. The team's
+                          change to the page is settled after it.
+                        </span>
                       )}
                     </>
                   )}
@@ -507,7 +595,7 @@ export default function ConflictDialogBody({
                 />
               </div>
 
-              {mergeOpen && (
+              {mergeOpen && !isFilePath(conflict.path) && (
                 <div className="mt-3 flex flex-col gap-1 text-sm">
                   <label htmlFor={mergedField}>Merged content</label>
                   <textarea
@@ -532,21 +620,29 @@ export default function ConflictDialogBody({
                 </button>
                 {/* The escape hatch, and a toggle rather than a mode: opening
                     it does not take the two straight answers away, because
-                    reading the merge is often what decides one of them. */}
-                <button
-                  type="button"
-                  aria-expanded={mergeOpen}
-                  onClick={() => {
-                    // Seeded once, on the first opening: after that the text
-                    // is whatever it was left as, so reopening never
-                    // overwrites a merge with the prefill it started from.
-                    setMerged((text) => text ?? conflict.local ?? "");
-                    setMergeOpen((open) => !open);
-                  }}
-                  className={BUTTON.secondary}
-                >
-                  Edit merged
-                </button>
+                    reading the merge is often what decides one of them. A
+                    file beside the pages has no text to merge, and the server
+                    refuses one, so it is not offered. */}
+                {isFilePath(conflict.path) ? (
+                  <span className={`self-center ${HINT_CLASSES}`}>
+                    A file cannot be merged here. Keep one of the two.
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    aria-expanded={mergeOpen}
+                    onClick={() => {
+                      // Seeded once, on the first opening: after that the
+                      // text is whatever it was left as, so reopening never
+                      // overwrites a merge with the prefill it started from.
+                      setMerged((text) => text ?? conflict.local ?? "");
+                      setMergeOpen((open) => !open);
+                    }}
+                    className={BUTTON.secondary}
+                  >
+                    Edit merged
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={resolve.isPending}
@@ -570,7 +666,7 @@ export default function ConflictDialogBody({
                 {/* The primary tier only on the merge, because it is the only
                     one of the three that commits something somebody wrote
                     rather than picking a side that already exists. */}
-                {mergeOpen && (
+                {mergeOpen && !isFilePath(conflict.path) && (
                   <button
                     type="button"
                     disabled={resolve.isPending}

@@ -991,3 +991,219 @@ describe("the conflict dialog for a draft, against a moving team side", () => {
     );
   });
 });
+
+describe("the conflict dialog says what each choice really does", () => {
+  it("says a deletion and a file in the Keep mine hint", async () => {
+    const rows: [Record<string, unknown>, boolean, string][] = [
+      [
+        { kind: "DeleteEdit", local: null },
+        false,
+        "Your deletion removes the team's page when you share.",
+      ],
+      [
+        { path: "assets/deck.pdf", local: null, upstream: null, file: true },
+        true,
+        "Your file replaces the team's when you share.",
+      ],
+      [
+        {
+          kind: "DeleteEdit",
+          path: "assets/deck.pdf",
+          local: null,
+          upstream: null,
+          file: true,
+        },
+        true,
+        "Your deletion removes the team's file when you share.",
+      ],
+    ];
+    for (const [over, file, hint] of rows) {
+      serveDraft(draftSides(over));
+      const view = mountDraft({
+        ...EDIT_EDIT,
+        kind: typeof over.kind === "string" ? over.kind : "EditEdit",
+        file,
+      });
+      const dialog = await screen.findByRole("dialog", {
+        name: "Settle conflict",
+      });
+      const mine = await within(dialog).findByRole("button", {
+        name: "Keep mine",
+      });
+      await waitFor(() => {
+        expect(hintOf(mine)).toBe(hint);
+      });
+      view.unmount();
+    }
+  });
+
+  it("says the page under a taken address changed too, and shows its team text", async () => {
+    serveDraft(
+      draftSides({
+        kind: "AddressTaken",
+        other: "notes/z.md",
+        upstream: "the page that holds the address",
+        page_kind: "EditEdit",
+        page_upstream: "the team's newer text of notes/a.md",
+      }),
+    );
+    mountDraft({
+      ...EDIT_EDIT,
+      kind: "AddressTaken",
+      other: "notes/z.md",
+      pageKind: "EditEdit",
+    });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    await waitFor(() => {
+      expect(dialog).toHaveAccessibleDescription(
+        "The team's file notes/z.md now uses the same address as your draft of notes/a.md. The team also changed notes/a.md itself.",
+      );
+    });
+    expect(
+      within(dialog).getByText("The team's text of your page"),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByText("the team's newer text of notes/a.md"),
+    ).toBeVisible();
+    expect(
+      hintOf(within(dialog).getByRole("button", { name: "Edit merged" })),
+    ).toBe(
+      "A new address settles the address only. The team's change to the page is settled after it.",
+    );
+  });
+
+  it("says a page under a taken address that the team deleted", async () => {
+    serveDraft(
+      draftSides({
+        kind: "AddressTaken",
+        other: "notes/z.md",
+        page_kind: "EditDelete",
+        page_upstream: null,
+      }),
+    );
+    mountDraft({
+      ...EDIT_EDIT,
+      kind: "AddressTaken",
+      other: "notes/z.md",
+      pageKind: "EditDelete",
+    });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    await waitFor(() => {
+      expect(dialog).toHaveAccessibleDescription(
+        "The team's file notes/z.md now uses the same address as your draft of notes/a.md. The team also deleted notes/a.md.",
+      );
+    });
+    expect(
+      within(dialog).getByText("The team deleted this page."),
+    ).toBeVisible();
+  });
+});
+
+describe("the folder's conflict at a file", () => {
+  it("offers no Edit merged for a file, and says why", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          conflicts: [
+            {
+              id: "abc12345",
+              path: "assets/deck.png",
+              kind: "EditEdit",
+              base_commit: "9f3c1a2",
+              upstream_commit: "b2c3d4e",
+              detected_at: "2026-08-21T09:00:00Z",
+            },
+          ],
+        }),
+      "/domains/eng/sync/conflicts/abc12345": () =>
+        detailResponse({
+          path: "assets/deck.png",
+          base: null,
+          local: null,
+          upstream: null,
+          note: "the local side is not UTF-8 and is omitted",
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await screen.findByRole("region", { name: "Team sync" });
+    await userEvent.click(
+      within(card).getByRole("button", { name: "assets/deck.png" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /conflict/i });
+    expect(
+      await within(dialog).findByText(
+        "A file cannot be merged here. Keep one of the two.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).queryByRole("button", { name: "Edit merged" }),
+    ).toBeNull();
+    expect(
+      within(dialog).getByRole("button", { name: "Keep mine" }),
+    ).toBeEnabled();
+    expect(
+      within(dialog).getByRole("button", { name: "Take theirs" }),
+    ).toBeEnabled();
+  });
+});
+
+describe("the hints say what really happens to an old draft and a moved page", () => {
+  it("says a copy is kept for any draft from before the record", async () => {
+    serveDraft(
+      draftSides({ kind: "EditDelete", upstream: null, old_draft: true }),
+    );
+    mountDraft({ ...EDIT_EDIT, kind: "EditDelete" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const theirs = await within(dialog).findByRole("button", {
+      name: "Take theirs",
+    });
+    await waitFor(() => {
+      expect(hintOf(theirs)).toBe(
+        "Your draft ends. A copy stays in your kept texts.",
+      );
+    });
+  });
+
+  it("says a draft with a record keeps no copy, whatever its kind", async () => {
+    serveDraft(draftSides({ kind: "UnknownStart", old_draft: false }));
+    mountDraft({ ...EDIT_EDIT, kind: "UnknownStart" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const theirs = await within(dialog).findByRole("button", {
+      name: "Take theirs",
+    });
+    await waitFor(() => {
+      expect(hintOf(theirs)).toBe("Your draft ends and your text is gone.");
+    });
+  });
+
+  it("says keeping a deletion of a page the team moved removes nothing", async () => {
+    serveDraft(
+      draftSides({
+        kind: "DeleteEdit",
+        local: null,
+        moved_to: "archive/a.md",
+      }),
+    );
+    mountDraft({ ...EDIT_EDIT, kind: "DeleteEdit" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    const mine = await within(dialog).findByRole("button", {
+      name: "Keep mine",
+    });
+    await waitFor(() => {
+      expect(hintOf(mine)).toBe(
+        "The team moved this page to archive/a.md. Keeping your deletion removes nothing, and it ends.",
+      );
+    });
+  });
+});

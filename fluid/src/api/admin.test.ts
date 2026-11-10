@@ -1057,6 +1057,7 @@ describe("the admin client layer", () => {
           kind: "EditEdit",
           movedFrom: "notes/old.md",
           other: null,
+          pageKind: null,
           file: false,
         },
         {
@@ -1065,6 +1066,7 @@ describe("the admin client layer", () => {
           kind: "UnknownStart",
           movedFrom: null,
           other: null,
+          pageKind: null,
           file: true,
         },
       ],
@@ -1105,11 +1107,15 @@ describe("the admin client layer", () => {
       kind: "AddressTaken",
       movedFrom: null,
       other: "notes/z.md",
+      pageKind: null,
       file: false,
       base: "start",
       local: "mine",
       upstream: "theirs",
       upstreamSha256: "abc123",
+      pageUpstream: null,
+      oldDraft: null,
+      movedTo: null,
       note: null,
     });
   });
@@ -1182,6 +1188,7 @@ describe("the admin client layer", () => {
         kind: "EditDelete",
         movedFrom: null,
         other: null,
+        pageKind: null,
         file: false,
       },
     ]);
