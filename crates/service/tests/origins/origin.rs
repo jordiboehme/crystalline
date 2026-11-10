@@ -7717,6 +7717,162 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
     other.drop_schema().await.unwrap();
 }
 
+/// The review pass reads and writes drafts through `Store`, so it is pinned on
+/// Postgres too: a colleague's change on another line merges into her draft and
+/// she reads both lines, and a change of the line she changed stays her text
+/// and refuses her share as a conflict.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_stale_draft_merges_and_refuses_on_postgres() {
+    let _scratch = crate::support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let plan = |first: &str, last: &str| {
+        engram(
+            "Plan",
+            "plan",
+            &format!("{first}\n\nthe middle of the plan\n\n{last}"),
+        )
+    };
+    let c1 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "plan.md",
+            plan("the first line of the plan", "the last line of the plan"),
+        ),
+        (
+            "note.md",
+            engram("Note", "note", "the note as the team has it"),
+        ),
+    ]));
+    mock.set_branch("main", &c1);
+    let Some((eng, _url, _schema)) = standalone_on_postgres(tmp.path(), mock.clone()).await else {
+        return;
+    };
+    let root = tmp.path().join("team-knowledge");
+    eng.origin_add(
+        "acme/team",
+        Some("team"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        None,
+    )
+    .await
+    .unwrap();
+    eng.set_review_mode(
+        "team",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let alice = Scope::User {
+        account: "alice".to_string(),
+        admin: false,
+    };
+    let edit = |identifier: &str, find: &str, with: &str| crystalline_service::params::EditParams {
+        identifier: identifier.to_string(),
+        domain: "team".to_string(),
+        operation: "find_replace".to_string(),
+        content: Some(with.to_string()),
+        key: None,
+        value: None,
+        values: None,
+        find_text: Some(find.to_string()),
+        expected_replacements: None,
+        section: None,
+        include_subsections: false,
+        expected_checksum: None,
+        ack_scope: None,
+        share_link: None,
+        model: None,
+    };
+    eng.edit_engram_as(
+        &edit("plan", "the last line of the plan", "alice's own last word"),
+        None,
+        &alice,
+    )
+    .await
+    .unwrap();
+    eng.edit_engram_as(
+        &edit(
+            "note",
+            "the note as the team has it",
+            "the note as alice has it",
+        ),
+        None,
+        &alice,
+    )
+    .await
+    .unwrap();
+
+    // Bob changes the plan's first line, and the note's only line.
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "plan.md",
+            plan("bob's first line", "the last line of the plan"),
+        ),
+        ("note.md", engram("Note", "note", "the note as bob has it")),
+    ]));
+    mock.set_branch("main", &c2);
+    let result = eng
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(result["errors"].as_array().unwrap().len(), 0, "{result}");
+
+    let read = |identifier: &'static str| {
+        let eng = &eng;
+        let alice = &alice;
+        async move {
+            eng.read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("team".to_string()),
+                    share_link: None,
+                    include_images: None,
+                },
+                alice,
+            )
+            .await
+            .unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let plan_read = read("plan").await;
+    assert!(
+        plan_read.contains("bob's first line") && plan_read.contains("alice's own last word"),
+        "a clean merge reads both lines: {plan_read}"
+    );
+    let note_read = read("note").await;
+    assert!(
+        note_read.contains("the note as alice has it"),
+        "her text stays: {note_read}"
+    );
+
+    let answer = eng
+        .origin_share(
+            "team",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["outcome"], "conflicts_pending", "{answer}");
+    assert!(
+        answer.to_string().contains("note.md") && !answer.to_string().contains("plan.md"),
+        "only the same-line edit is a conflict: {answer}"
+    );
+}
+
 // --- who may read, chosen at connect ----------------------------------------
 
 /// An engine with a GitHub App pointed at a forge serving `acme/kb` (the App
