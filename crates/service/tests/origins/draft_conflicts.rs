@@ -1322,6 +1322,28 @@ async fn edit_merged_over_a_taken_address_keeps_an_old_draft_deletion() {
     );
 }
 
+/// The pull that deletes the page learns it before its sync and its pass, so
+/// an update whose pass never ran still leaves the deletion in view, and the
+/// later share's own pull, which applies nothing, cannot lose it.
+#[tokio::test]
+async fn an_old_draft_whose_page_a_pull_deleted_with_no_pass_is_edit_delete() {
+    let t = team(&[("plan.md", plan()), (DECK, TEAM_DECK.to_vec())]).await;
+    t.old_draft("alice", "plan.md", &text(&plan_later())).await;
+    t.upload("alice", DECK, HER_DECK).await;
+    draft_start::clear_file(&t.state(), "team", "alice", DECK).unwrap();
+    t.push_with_no_pass(&[("plan.md", None), (DECK, None)])
+        .await;
+    assert_eq!(
+        t.conflicts("alice").await,
+        vec![
+            file_conflict("alice", DECK, EditDelete),
+            conflict("alice", "plan.md", EditDelete),
+        ]
+    );
+    assert_eq!(t.share("alice", None).await["outcome"], "conflicts_pending");
+    assert_eq!(t.forge_file("plan.md"), None);
+}
+
 /// The same for a file from before the record.
 #[tokio::test]
 async fn an_old_file_the_team_deletes_later_is_edit_delete() {
@@ -4195,6 +4217,24 @@ async fn a_merged_text_whose_start_was_not_saved_keeps_her_choice() {
     );
     assert_eq!(record.merging, None);
     assert_eq!(record.merged_at, None, "no merge changed her words");
+}
+
+/// The same crash with a merged text sent in CRLF, as a Windows editor saves
+/// it: the row holds it as LF, and the mark matches the row all the same.
+#[tokio::test]
+async fn a_crlf_merged_text_whose_start_was_not_saved_keeps_her_choice() {
+    let mut t = team(&[("plan.md", plan())]).await;
+    same_line(&t).await;
+    t.push(&[("plan.md", Some(plan_with_a_paragraph()))]).await;
+    let mine = text(&plan_later());
+    t.eng.fail_next_merge_start();
+    t.resolve("alice", "plan.md", None, Some(&mine.replace('\n', "\r\n")))
+        .await
+        .unwrap_err();
+    assert_eq!(t.row("alice", "plan.md").await, mine);
+    t.eng.converge_overlays("team").await.unwrap();
+    assert_eq!(t.row("alice", "plan.md").await, mine, "her choice stands");
+    assert_eq!(t.conflicts("alice").await, vec![]);
 }
 
 /// The same crash, and she writes on before any pass: her next edit reads

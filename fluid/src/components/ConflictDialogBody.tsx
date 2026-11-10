@@ -434,7 +434,13 @@ export default function ConflictDialogBody({
                     <Side
                       label="The team's text of your page"
                       text={sides?.pageUpstream ?? null}
-                      empty="The team deleted this page."
+                      // Only a deletion is said as one: a page the team
+                      // changed whose text cannot be shown still stands.
+                      empty={
+                        pageKind === "EditDelete"
+                          ? "The team deleted this page."
+                          : "(no readable content)"
+                      }
                     />
                   )}
                 </div>

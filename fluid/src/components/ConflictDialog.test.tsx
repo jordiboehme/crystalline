@@ -1207,3 +1207,33 @@ describe("the hints say what really happens to an old draft and a moved page", (
     });
   });
 });
+
+describe("the page pane under a taken address", () => {
+  it("says an unreadable team page is unreadable, not deleted", async () => {
+    serveDraft(
+      draftSides({
+        kind: "AddressTaken",
+        other: "notes/z.md",
+        page_kind: "EditEdit",
+        page_upstream: null,
+        note: "the page_upstream side is not UTF-8 and is omitted",
+      }),
+    );
+    mountDraft({
+      ...EDIT_EDIT,
+      kind: "AddressTaken",
+      other: "notes/z.md",
+      pageKind: "EditEdit",
+    });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Settle conflict",
+    });
+    expect(
+      await within(dialog).findByText("The team's text of your page"),
+    ).toBeVisible();
+    expect(
+      within(dialog).queryByText("The team deleted this page."),
+    ).toBeNull();
+    expect(within(dialog).getByText("(no readable content)")).toBeVisible();
+  });
+});

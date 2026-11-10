@@ -946,6 +946,9 @@ pub(crate) fn draft_kind_words(conflict: &serde_json::Value) -> Option<String> {
         Some("EditDelete") => {
             "; the team also deleted the page, which a new address does not settle"
         }
+        Some("UnknownStart") => {
+            "; we cannot tell what the team changed in the page since your draft started"
+        }
         Some(_) => "; the team also changed the page itself, which a new address does not settle",
     };
     Some(format!("{words}{page}"))
@@ -5016,6 +5019,24 @@ mod origin_share_tests {
         assert!(
             !text.contains("<path> --keep mine|theirs, or --content-file"),
             "{text}"
+        );
+    }
+
+    /// An old draft under an address clash: nobody can tell what the team
+    /// changed in the page, and the line says so rather than claim a change.
+    #[test]
+    fn a_taken_address_over_an_old_draft_says_it_cannot_tell() {
+        let lines = super::update_conflict_lines(
+            "team",
+            &serde_json::json!({
+                "path": "mine.md", "kind": "AddressTaken", "other": "z.md", "draft": true,
+                "page_kind": "UnknownStart",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "    the team's file z.md now uses the same address; we cannot tell what the team \
+             changed in the page since your draft started"
         );
     }
 

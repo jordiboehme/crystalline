@@ -6839,6 +6839,88 @@ impl Engine {
         self.converge_overlays_of(domain, touched, None).await
     }
 
+    /// Add to the frozen list every draft from before the record, row or file,
+    /// whose team file the pull that applied `touched` deleted
+    /// ([`deleted_under_old_drafts`]). Nothing else will ever say the team held
+    /// it, and its share would bring the file back.
+    ///
+    /// Asked straight after the pull, under the origin lock its caller holds,
+    /// before the sync and before the pass: a sync that fails, or a pass that
+    /// stops at an earlier person's drafts, must not let the deletion go
+    /// unlearned, since the next pull no longer names it. A list that cannot
+    /// be read is left as it is; the gate then refuses those drafts. Nothing
+    /// here fails the pull.
+    pub(super) async fn learn_old_draft_deletions(&self, domain: &str, touched: &[String]) {
+        if touched.is_empty() || !self.drafts_stay_open(domain) {
+            return;
+        }
+        let (Ok(journal_dir), Ok(state_dir)) =
+            (self.journal_state_dir(), self.origin_state_dir(domain))
+        else {
+            return;
+        };
+        let Ok(Some(state)) = crystalline_remote::state::OriginState::load(&state_dir) else {
+            return;
+        };
+        let Some(mut record) = self.convergence_to_change(&journal_dir, domain) else {
+            return;
+        };
+        let rows: Vec<(String, Vec<StoredEngram>)> = {
+            let store = self.store.lock().await;
+            let Ok(Some(domain_id)) = store.domain_id(domain).await else {
+                return;
+            };
+            let mut rows = Vec::new();
+            for (actor, _) in store.overlay_counts(domain_id).await.unwrap_or_default() {
+                let entries = store
+                    .overlay_entries(domain_id, &actor)
+                    .await
+                    .unwrap_or_default();
+                rows.push((actor, entries));
+            }
+            rows
+        };
+        let files = self.overlay_domain_files(domain);
+        let touched: HashSet<&str> = touched.iter().map(String::as_str).collect();
+        let mut actors: BTreeSet<String> = rows.iter().map(|(actor, _)| actor.clone()).collect();
+        actors.extend(files.per_actor.keys().cloned());
+        let mut added = false;
+        for actor in actors {
+            let entries = rows
+                .iter()
+                .find(|(held, _)| *held == actor)
+                .map(|(_, entries)| entries.as_slice())
+                .unwrap_or_default();
+            let own_files = files
+                .per_actor
+                .get(&actor)
+                .map(|read| read.entries.as_slice())
+                .unwrap_or_default();
+            let deleted = deleted_under_old_drafts(
+                &journal_dir,
+                domain,
+                &actor,
+                entries,
+                own_files,
+                &touched,
+                &state,
+            );
+            if deleted.is_empty() {
+                continue;
+            }
+            let listed = record.conflicts.entry(actor).or_default();
+            for path in deleted {
+                if !listed.contains(&path) {
+                    listed.push(path);
+                    added = true;
+                }
+            }
+        }
+        if added {
+            self.save_convergence(&journal_dir, domain, &record);
+        }
+    }
+
     /// [`Engine::converge_pulled_overlays`] for one actor's drafts and files
     /// only, when `only` names them, so a caller who asked about their own
     /// drafts writes nobody else's. The convergence record keeps the other
@@ -7038,36 +7120,6 @@ impl Engine {
             } else {
                 entries.clone()
             };
-            // A draft from before the record whose team file this pull
-            // deleted: nothing else will ever say the team held it, and its
-            // share would bring the file back, so the frozen list learns it now
-            // and the gate reads it as the team's deletion. Saved at once, so a
-            // pass that stops later does not lose it.
-            if let Some(record) = record.as_mut() {
-                let deleted = deleted_under_old_drafts(
-                    &journal_dir,
-                    domain,
-                    actor,
-                    &rows,
-                    files,
-                    &touched,
-                    &state,
-                );
-                let listed = record.conflicts.entry(actor.clone()).or_default();
-                let before = listed.len();
-                for path in deleted {
-                    if !listed.contains(&path) {
-                        listed.push(path);
-                    }
-                }
-                let added = listed.len() > before;
-                if listed.is_empty() {
-                    record.conflicts.remove(actor);
-                }
-                if added {
-                    self.save_convergence(&journal_dir, domain, record);
-                }
-            }
             if !entries.is_empty() {
                 let reading = self
                     .read_drafts(domain, domain_id, actor, rows, &root, &state_dir, &state)

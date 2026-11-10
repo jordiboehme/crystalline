@@ -1218,6 +1218,9 @@ impl Engine {
         let report = ops::pull(provider.as_ref(), &spec, &root, &state_dir)
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        // Before the sync, which can fail and return here: the paths this pull
+        // deleted are named by this pull only.
+        self.learn_old_draft_deletions(name, &report.applied).await;
 
         self.sync(Some(name)).await?;
         // The pull advanced the base, so every draft standing over this domain
@@ -1225,7 +1228,11 @@ impl Engine {
         // not before: the pass reads the base snapshot for content but the rest
         // of this call expects a domain whose rows are current. A failure here
         // is a warning rather than a failed update - the pull has already
-        // landed on disk, and the next pull runs the whole pass again.
+        // landed on disk. Any later pass decides every draft again from what
+        // stands, since the deletions only this pull could name were learned
+        // above. The one thing it cannot do again is follow this pull's
+        // renames: a plain draft left at a renamed path reads as the team's
+        // deletion, a conflict she is shown, rather than moving.
         if !report.up_to_date
             && let Err(e) = self.converge_pulled_overlays(name, &report.applied).await
         {
@@ -2250,6 +2257,10 @@ impl Engine {
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))
             .map_err(|e| enrich_write_error(e, acting, &spec.repo))?;
+        // Before the sync and the pass, as on the update path: the paths this
+        // pull deleted are named by this pull only.
+        self.learn_old_draft_deletions(domain, &report.applied)
+            .await;
         // This pull advances the base like any other, so the same convergence
         // runs on it - and it runs BEFORE the tree is staged, so a draft the
         // team has already merged is not proposed straight back at them. It
@@ -2626,6 +2637,7 @@ impl Engine {
                     {
                         receipt["free_error"] = json!(said);
                     }
+                    self.learn_old_draft_deletions(domain, &paths).await;
                     match self.converge_pulled_overlays(domain, &paths).await {
                         Ok(folded) => {
                             receipt["drafts_folded"] = json!(folded.cleared);
@@ -5442,7 +5454,9 @@ impl Engine {
                     let marked = crate::draft_start::DraftStart {
                         merging: Some(false),
                         settling: Some(Box::new(crate::draft_start::Settling {
-                            text_sha256: sha256_hex(text.as_bytes()),
+                            // As the row stores it, in LF, or a CRLF text
+                            // would never match its own row.
+                            text_sha256: sha256_hex(crystalline_core::to_lf(text).as_bytes()),
                             from: settled.from.clone(),
                             start: settled.start.clone(),
                             start_sha256: settled.start_sha256.clone(),

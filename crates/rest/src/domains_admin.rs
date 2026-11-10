@@ -2557,11 +2557,19 @@ async fn settle_note(state: &RestState, identity: &Identity, domain: &str) -> Op
 /// cannot help yet), and the domain's owner cannot grant what GitHub decides.
 /// Anywhere else write access is the owner's to give.
 fn not_writable_note(governed: bool, refused: &ApiError) -> String {
+    // Anything but a refusal (an access layer that could not be read) is a
+    // fault of the server's: its detail holds a cause chain, which is for the
+    // log, not for the person.
+    if refused.status != axum::http::StatusCode::FORBIDDEN {
+        return "These drafts cannot be settled here right now. Try again later.".to_string();
+    }
     if governed {
-        return format!(
-            "These drafts cannot be settled here yet. {}",
-            refused.detail
-        );
+        let mut said = refused.detail.chars();
+        let sentence = match said.next() {
+            Some(first) => first.to_uppercase().chain(said).collect::<String>(),
+            None => String::new(),
+        };
+        return format!("These drafts cannot be settled here yet. {sentence}");
     }
     "You cannot write in this domain, so these drafts cannot be settled here. Ask its owner for \
      write access."
@@ -4051,6 +4059,31 @@ mod tests {
         assert!(!note.contains("owner"), "{note}");
         let note = not_writable_note(false, &refused);
         assert!(note.contains("Ask its owner for write access."), "{note}");
+    }
+
+    /// Only a 403's own sentence is passed on, starting with a capital; a
+    /// refusal of any other kind carries a cause chain from inside the server,
+    /// and gets a plain sentence instead.
+    #[test]
+    fn the_settle_note_passes_on_only_a_refusal_and_never_a_cause_chain() {
+        let below = ApiError::forbidden(
+            "your membership on this domain is reader, and editor access is required",
+        );
+        assert_eq!(
+            not_writable_note(true, &below),
+            "These drafts cannot be settled here yet. Your membership on this domain is \
+             reader, and editor access is required"
+        );
+        let broken = ApiError::internal("this domain's membership is unreadable: disk: io error");
+        for governed in [true, false] {
+            let note = not_writable_note(governed, &broken);
+            assert!(!note.contains("io error"), "{note}");
+            assert!(!note.contains("membership"), "{note}");
+            assert_eq!(
+                note,
+                "These drafts cannot be settled here right now. Try again later."
+            );
+        }
     }
 
     /// The machine owner's sentence about a draft not mirrored never reaches
