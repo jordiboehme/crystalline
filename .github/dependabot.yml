@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # A new action release waits a week before it is proposed, so a release
+    # that is pulled or compromised in its first days never reaches CI.
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns:
