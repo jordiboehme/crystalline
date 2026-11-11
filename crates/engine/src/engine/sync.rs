@@ -98,7 +98,7 @@ impl Engine {
 
     /// Sync one or all registered domains, returning per-domain reports.
     pub async fn sync(&self, only: Option<&str>) -> Result<Value> {
-        self.sync_take_over(only, false).await
+        boxed(|| self.sync_take_over(only, false)).await
     }
 
     /// Sync like [`Engine::sync`], but with an explicit host-takeover flag for the

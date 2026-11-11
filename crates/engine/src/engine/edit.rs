@@ -448,7 +448,7 @@ impl Engine {
         apply: F,
     ) -> Result<Option<String>>
     where
-        F: FnMut(&str) -> Result<String>,
+        F: FnMut(&str) -> Result<String> + Send,
     {
         // The live landing is dropped here rather than plumbed on: the callers
         // that reach this shorthand (a retirement, a split's tail, a
@@ -461,19 +461,21 @@ impl Engine {
         // verbs carry no peer to name, because none of their surfaces resolves
         // one. The text still composes into the open room; what an author does
         // not get is a chip for the agent that retired the page under them.
-        self.apply_source_edit_staged(
-            desc,
-            source,
-            view,
-            expected_checksum,
-            actor,
-            model,
-            scope,
-            None,
-            false,
-            false,
-            apply,
-        )
+        boxed(|| {
+            self.apply_source_edit_staged(
+                desc,
+                source,
+                view,
+                expected_checksum,
+                actor,
+                model,
+                scope,
+                None,
+                false,
+                false,
+                apply,
+            )
+        })
         .await
         .map(|edited| edited.warning)
         .map_err(|failure| failure.error)
@@ -740,8 +742,7 @@ impl Engine {
                 .draft_lock(&desc.domain, who, &desc.path)
                 .map_err(SourceEditFailure::before)?;
             let _guard = lock.lock().await;
-            let current = view
-                .text_for_draft(source, desc)
+            let current = boxed(|| view.text_for_draft(source, desc))
                 .await
                 .map_err(SourceEditFailure::before)?
                 .ok_or_else(|| {
@@ -778,10 +779,10 @@ impl Engine {
                     "reindex failed (test seam)".to_string(),
                 )));
             }
-            let warning = view
-                .write_from(desc.domain_id, &desc.path, &edited, Some(&current))
-                .await
-                .map_err(SourceEditFailure::before)?;
+            let warning =
+                boxed(|| view.write_from(desc.domain_id, &desc.path, &edited, Some(&current)))
+                    .await
+                    .map_err(SourceEditFailure::before)?;
             // Neither tail below runs. A draft of the MANIFEST is one actor's
             // proposal about the domain's routing, not the domain's routing,
             // and a draft belongs in no folder's generated index - both of
