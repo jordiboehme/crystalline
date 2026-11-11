@@ -35,24 +35,42 @@ struct Fixture {
 /// write a test makes (the maintenance state file among them) can reach the
 /// developer's real state. The support module's `ScratchStateDir` does this
 /// for the grouped binaries; this binary uses none of the shared helpers.
+///
+/// A static is never dropped, so the home is removed by an `atexit` hook
+/// instead; without it every test process (one per test under nextest) left
+/// an empty folder in the temp dir. The removal ignores every error.
 fn scratch_home() {
-    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path();
+        let home = tempfile::tempdir().unwrap().keep();
         // SAFETY: set once, before any server task of this process reads
         // them, and never restored: the process ends with the test.
         unsafe {
-            std::env::set_var("HOME", home);
+            std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CONFIG_HOME", home.join("config"));
             std::env::set_var("XDG_STATE_HOME", home.join("state"));
             std::env::set_var("XDG_CACHE_HOME", home.join("cache"));
-            std::env::set_var("USERPROFILE", home);
+            std::env::set_var("USERPROFILE", &home);
             std::env::set_var("APPDATA", home.join("state"));
             std::env::set_var("LOCALAPPDATA", home.join("local"));
         }
-        dir
+        // SAFETY: `atexit` only records the function pointer; the hook is a
+        // plain `extern "C" fn` that does not unwind.
+        unsafe {
+            libc::atexit(remove_scratch_home);
+        }
+        home
     });
+}
+
+/// The home [`scratch_home`] created, once it has created one.
+static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The exit hook [`scratch_home`] registers: remove the home, ignoring every
+/// error, since a panic here would cross the C boundary and abort.
+extern "C" fn remove_scratch_home() {
+    if let Some(home) = HOME.get() {
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 /// `eng` (alpha) and `lab` (secret), an admin `root`, an editor `ada` and a

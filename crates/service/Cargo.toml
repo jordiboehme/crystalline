@@ -123,6 +123,9 @@ crystalline-service = { path = ".", default-features = false, features = [
     "testing",
 ] }
 tempfile = { workspace = true }
+# `rest_events` removes its scratch home in an `atexit` hook, on every
+# platform (the `[dependencies]` entry is unix only).
+libc = { workspace = true }
 # The integration tests open a Turso database and walk a tree directly.
 turso = { workspace = true }
 walkdir = { workspace = true }
