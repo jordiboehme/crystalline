@@ -42,3 +42,31 @@ test("the login screen offers the provider beside the local form", async ({
     `${BASE_PATH}/api/v1/auth/oidc/login`,
   );
 });
+
+test("the Log in button stays where it is when the provider answer arrives", async ({
+  page,
+}) => {
+  // Hold the providers answer back, so the form is on screen without the
+  // single sign-on link, as it is for a moment on every load.
+  let release: () => void = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/v1/auth/providers", async (route) => {
+    await held;
+    await route.continue();
+  });
+  await page.goto("./");
+  const button = page.getByRole("button", { name: "Log in" });
+  await expect(button).toBeVisible();
+  const sso = page.getByRole("link", { name: `Sign in with ${SSO_NAME}` });
+  await expect(sso).toHaveCount(0);
+  const before = await button.boundingBox();
+
+  release();
+  await expect(sso).toBeVisible();
+  const after = await button.boundingBox();
+  expect(before).not.toBeNull();
+  expect(after?.y).toBe(before?.y);
+  expect(after?.x).toBe(before?.x);
+});
