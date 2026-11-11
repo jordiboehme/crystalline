@@ -79,28 +79,43 @@ afterEach(() => {
 });
 
 /**
+ * The test's clock, stubbed from its first `starved` to its end: it stands
+ * still, so a parse after that has the time it needs at any load, and moves
+ * only in `starved`. It never goes back.
+ */
+const clock = {
+  start: 0,
+  ahead: 0,
+  starved: false,
+  spy: null as MockInstance<typeof Date.now> | null,
+};
+
+/**
  * `press` on a clock that finds a second gone at every look, so a parse takes
  * one step and stops, at any load: a press whose own parse budget (D35) runs
  * out. The clock stays ahead afterwards and never goes back.
  */
-const now = Date.now.bind(Date);
-const clockAhead = { ms: 0 };
 function starved<T>(press: () => T): T {
-  const spy = vi.spyOn(Date, "now");
-  spy.mockImplementation(() => {
-    clockAhead.ms += 1_000;
-    return now() + clockAhead.ms;
-  });
+  if (!clock.spy) {
+    clock.start = Date.now();
+    clock.spy = vi.spyOn(Date, "now").mockImplementation(() => {
+      if (clock.starved) clock.ahead += 1_000;
+      return clock.start + clock.ahead;
+    });
+  }
+  clock.starved = true;
   try {
     return press();
   } finally {
-    spy.mockImplementation(() => now() + clockAhead.ms);
+    clock.starved = false;
   }
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
-  clockAhead.ms = 0;
+  clock.spy = null;
+  clock.ahead = 0;
+  clock.starved = false;
 });
 
 type Mode = "hidden" | "show";
@@ -850,7 +865,8 @@ describe.each(ROOMS)("a cell deep in a long page, $name", ({ room }) => {
     });
     const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
-    const view = openAt(main, cell.content.from, false).view;
+    // The cell opens on a starved clock: its parse stops above the row.
+    const view = starved(() => openAt(main, cell.content.from, false)).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
     const said: string[] = [];
     const named: string[] = [];
@@ -893,7 +909,8 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     });
     const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
-    const view = openAt(main, cell.content.from, false).view;
+    // The cell opens on a starved clock: its parse stops above the row.
+    const view = starved(() => openAt(main, cell.content.from, false)).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
     const said: string[] = [];
     view.dispatch({
@@ -931,7 +948,8 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     });
     const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
-    const view = openAt(main, cell.content.from, false).view;
+    // The cell opens on a starved clock: its parse stops above the row.
+    const view = starved(() => openAt(main, cell.content.from, false)).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
     const said: string[] = [];
     view.dispatch({
@@ -984,7 +1002,8 @@ describe.each(ROOMS)("an unread cell, $name", ({ room }) => {
     });
     const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
-    const view = openAt(main, cell.content.from + 4, false).view;
+    // The cell opens on a starved clock: its parse stops above the row.
+    const view = starved(() => openAt(main, cell.content.from + 4, false)).view;
     expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
     const said: string[] = [];
     view.dispatch({

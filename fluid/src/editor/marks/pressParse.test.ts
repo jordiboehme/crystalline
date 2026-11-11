@@ -2,9 +2,10 @@
  * What a press judges after a reparse that stopped short, beside the keys in
  * `shortReparse.test.ts`: a replaced selection, a new link, a picture, a rich
  * paste and the `/` menu. Each of them read "nothing here" off a short tree
- * as "allowed". The clock is stubbed, so this holds at any load: while
- * starved, each look finds a second gone and a parse takes one step and stops
- * (@codemirror/language 6.13.1, D26).
+ * as "allowed". The clock is stubbed, so this holds at any load: it stands
+ * still, and moves only as a test says. While starved, each look finds a
+ * second gone and a parse takes one step and stops (@codemirror/language
+ * 6.13.1, D26).
  */
 
 import { CompletionContext } from "@codemirror/autocomplete";
@@ -35,8 +36,6 @@ import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 const clock = { starved: false, stall: 0, pauseAt: 0, seen: 0 };
 
 beforeEach(() => {
-  // Time moves only when a test moves it. Real time under the stubbed steps
-  // would let a busy machine run out a budget the test means to be reached.
   const start = Date.now();
   let ahead = 0;
   vi.spyOn(Date, "now").mockImplementation(() => {
