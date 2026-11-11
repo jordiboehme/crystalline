@@ -181,8 +181,12 @@ export default function LoginPage() {
         ? "the login could not be sent"
         : null;
 
+  // Anchored near the top, not centred: the providers answer lands a moment
+  // after the form shows and adds the single sign-on link under it. In a
+  // centred card that growth moved the form up by half of it, and a press on
+  // Log in in that moment landed beside the button.
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6 dark:bg-slate-950">
+    <main className="flex min-h-screen items-start justify-center bg-slate-50 p-6 pt-[15vh] dark:bg-slate-950">
       <div className="w-full max-w-sm">
         {/*
           The mark, decorative on purpose: the word it stands over is right
