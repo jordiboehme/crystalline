@@ -35,7 +35,9 @@ import { PARSE_BUDGET, deadlineIn, parsedTo } from "./parse";
 const clock = { starved: false, stall: 0, pauseAt: 0, seen: 0 };
 
 beforeEach(() => {
-  const now = Date.now.bind(Date);
+  // Time moves only when a test moves it. Real time under the stubbed steps
+  // would let a busy machine run out a budget the test means to be reached.
+  const start = Date.now();
   let ahead = 0;
   vi.spyOn(Date, "now").mockImplementation(() => {
     if (clock.starved) ahead += 1_000;
@@ -45,7 +47,7 @@ beforeEach(() => {
       clock.stall -= 1;
       ahead += 1_000;
     }
-    return now() + ahead;
+    return start + ahead;
   });
 });
 
