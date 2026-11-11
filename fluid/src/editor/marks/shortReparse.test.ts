@@ -6,8 +6,9 @@
  * A reference link's definition usually stands further down, so a press that
  * parsed only to its own line read the link as plain text, and the marks a
  * whole tree hides as letters to delete. The clock is stubbed, so this holds
- * at any load: while `starved`, each look finds a second gone and a parse
- * takes one step and stops (@codemirror/language 6.13.1, D26).
+ * at any load: it stands still, and moves only while `starved`, when each
+ * look finds a second gone and a parse takes one step and stops
+ * (@codemirror/language 6.13.1, D26).
  */
 
 import { syntaxTree } from "@codemirror/language";
@@ -36,11 +37,11 @@ import {
 const clock = { starved: false };
 
 beforeEach(() => {
-  const now = Date.now.bind(Date);
+  const start = Date.now();
   let ahead = 0;
   vi.spyOn(Date, "now").mockImplementation(() => {
     if (clock.starved) ahead += 1_000;
-    return now() + ahead;
+    return start + ahead;
   });
 });
 

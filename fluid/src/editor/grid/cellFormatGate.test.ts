@@ -35,12 +35,14 @@ import { gridTables } from "./structure";
 import { parsedState } from "../../test/parse";
 
 /**
- * While set, the clock jumps a second at every look, as on a machine too
- * busy to give a parse any time: a parse takes one step and stops. The
- * clock never goes back, so nothing that times itself sees time run
- * backwards afterwards. This relies on @codemirror/language 6.13.1 reading
- * `Date.now` for its parse budget (D26): if a later version times its
- * parse another way, this test no longer starves it.
+ * The clock stands still from the start of each test, so a parse has all the
+ * time it needs at any load. While `starved` is set, it jumps a second at
+ * every look, as on a machine too busy to give a parse any time: a parse
+ * takes one step and stops. The clock never goes back, so nothing that times
+ * itself sees time run backwards afterwards. This relies on
+ * @codemirror/language 6.13.1 reading `Date.now` for its parse budget (D26):
+ * if a later version times its parse another way, this test no longer starves
+ * it.
  */
 const parsing = { starved: false };
 
@@ -49,11 +51,11 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  const now = Date.now.bind(Date);
+  const start = Date.now();
   let ahead = 0;
   vi.spyOn(Date, "now").mockImplementation(() => {
     if (parsing.starved) ahead += 1_000;
-    return now() + ahead;
+    return start + ahead;
   });
 });
 
@@ -85,7 +87,10 @@ describe.each(ROOMS)(
       });
       const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
       if (!cell) throw new Error("no cell");
+      // The cell opens on a starved clock, so its parse stops above the row.
+      parsing.starved = true;
       const view = openAt(main, cell.content.from, false).view;
+      parsing.starved = false;
       expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
       const said: string[] = [];
       view.dispatch({

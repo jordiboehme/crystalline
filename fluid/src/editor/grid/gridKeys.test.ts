@@ -1004,14 +1004,7 @@ describe("an undo in a cell whose parse fell short (D54)", () => {
     const main = solo(`${above}\n\n${DOC}`);
     const view = open(main, 1, 1);
     typeIn({ view, destroy: () => undefined }, "x");
-    const now = Date.now.bind(Date);
-    let ahead = 0;
-    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
-      ahead += 1_000;
-      return now() + ahead;
-    });
-    press(cellView(main), "z", { mod: true });
-    clock.mockRestore();
+    onJumpingClock(() => press(cellView(main), "z", { mod: true }));
     // The state's own tree stopped short, as on a busy machine.
     expect(syntaxTree(main.state).length).toBeLessThan(main.state.doc.length);
     expect(bytes(main.state)).toBe(`${above}\n\n${DOC}`);
@@ -1050,18 +1043,39 @@ function expectIntent(main: EditorView, row: number, column: number): void {
   expect(main.state.field(openCellField)?.focused).toBe(true);
 }
 
+/**
+ * The test's clock, stubbed from its first jump to its end: it stands still,
+ * and jumps a second at every look only while `jumping`. So a parse after the
+ * jump has the time it needs at any load, and the clock never goes back.
+ */
+const clock = {
+  start: 0,
+  ahead: 0,
+  jumping: false,
+  spy: null as MockInstance<typeof Date.now> | null,
+};
+
+afterEach(() => {
+  clock.spy?.mockRestore();
+  clock.spy = null;
+  clock.ahead = 0;
+  clock.jumping = false;
+});
+
 /** Runs `act` with a clock that jumps a second at every look (D54). */
 function onJumpingClock<T>(act: () => T): T {
-  const now = Date.now.bind(Date);
-  let ahead = 0;
-  const clock = vi.spyOn(Date, "now").mockImplementation(() => {
-    ahead += 1_000;
-    return now() + ahead;
-  });
+  if (!clock.spy) {
+    clock.start = Date.now();
+    clock.spy = vi.spyOn(Date, "now").mockImplementation(() => {
+      if (clock.jumping) clock.ahead += 1_000;
+      return clock.start + clock.ahead;
+    });
+  }
+  clock.jumping = true;
   try {
     return act();
   } finally {
-    clock.mockRestore();
+    clock.jumping = false;
   }
 }
 

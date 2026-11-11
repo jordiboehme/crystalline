@@ -884,6 +884,14 @@ describe("words the old fuzzy lookup found and the exact one keeps", () => {
  */
 describe("the caret after a commit whose parse fell short (D64)", () => {
   it("goes into the box once the parse hides its fence line", async () => {
+    // The clock stands still, and jumps only during the commit.
+    const start = Date.now();
+    let ahead = 0;
+    let jumping = false;
+    vi.spyOn(Date, "now").mockImplementation(() => {
+      if (jumping) ahead += 1_000;
+      return start + ahead;
+    });
     const above = Array.from(
       { length: 200 },
       (_, i) => `Paragraph ${String(i)} of the page.`,
@@ -897,12 +905,7 @@ describe("the caret after a commit whose parse fell short (D64)", () => {
       at: fence,
       rect: new DOMRect(),
     });
-    const now = Date.now.bind(Date);
-    let ahead = 0;
-    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
-      ahead += 1_000;
-      return now() + ahead;
-    });
+    jumping = true;
     try {
       expect(
         commitElementEdit(view, (state, edit) =>
@@ -912,7 +915,7 @@ describe("the caret after a commit whose parse fell short (D64)", () => {
         ),
       ).toBe(true);
     } finally {
-      clock.mockRestore();
+      jumping = false;
     }
     // The commit's tree stops short of the box: the caret is on its fence.
     expect(syntaxTree(view.state).length).toBeLessThan(fence);
