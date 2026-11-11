@@ -8,8 +8,9 @@
  * read": it has a parse budget of its own (D35), and only a press whose
  * budget ran out says the cell is loading.
  *
- * The clock is stubbed, so all of this holds at any load: while `starved`,
- * each look at it finds a second gone, and a parse takes one step and stops.
+ * The clock is stubbed, so all of this holds at any load: it stands still
+ * from the start of each test, and moves only while `starved`, when each look
+ * at it finds a second gone and a parse takes one step and stops.
  * This relies on @codemirror/language 6.13.1 reading `Date.now` for its parse
  * budget (D26), as `cellFormatGate.test.ts` does.
  */
@@ -49,11 +50,11 @@ beforeAll(async () => {
 });
 
 beforeEach(() => {
-  const now = Date.now.bind(Date);
+  const start = Date.now();
   let ahead = 0;
   vi.spyOn(Date, "now").mockImplementation(() => {
     if (clock.starved) ahead += 1_000;
-    return now() + ahead;
+    return start + ahead;
   });
 });
 
@@ -101,8 +102,9 @@ function cutNextWrite(view: EditorView): void {
 }
 
 /**
- * The pins of D13 and D17 on a fair clock, with no stub at work: a cell that
- * opened before its row was read, or whose reparse stopped short. A press over
+ * The pins of D13 and D17 on a clock that stands still while the press runs: a
+ * cell that opened before its row was read (on a starved clock), or whose
+ * reparse stopped short. A press over
  * marks is written as on a whole tree, or not at all, and never leaves a lone
  * mark. `cellMarks.test.ts` pins the refusal past the press's own budget.
  */
@@ -144,7 +146,10 @@ describe.each([
       if (!cell) throw new Error("no cell");
       const lineFrom = main.state.doc.lineAt(cell.content.from).from;
       const from = lineFrom + row.indexOf(word);
+      // An unread cell opens on a starved clock: its parse stops above the row.
+      clock.starved = unread;
       const view = openAt(main, cell.content.to, false).view;
+      clock.starved = false;
       if (unread) {
         expect(syntaxTree(view.state).length).toBeLessThan(cell.content.from);
       }
@@ -197,8 +202,8 @@ describe.each([
       (_n, row, word, n) => {
         for (const write of [type, paste]) {
           const whole = pressed(row, word, n, false, write);
-          // Not at all is fair too: the press's own 150 ms can run out on a
-          // machine under load, and then it refuses (D17).
+          // Not at all is fair too: where the press's own 150 ms runs out,
+          // it refuses (D17). The clock stands still here, so it does not.
           expect([whole, row]).toContain(pressed(row, word, n, true, write));
         }
       },
@@ -404,7 +409,9 @@ describe.each([
     const cell = gridTables(parsedState(main.state))[0]?.rows[1]?.[1];
     if (!cell) throw new Error("no cell");
     const { from, to } = cell.content;
+    clock.starved = true;
     const view = openAt(main, to, false).view;
+    clock.starved = false;
     const said = hearing(view);
     shortened(view, from);
     view.dispatch({

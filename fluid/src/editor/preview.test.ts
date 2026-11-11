@@ -281,25 +281,33 @@ describe("live preview", () => {
 
 describe("a checkbox redrawn after a short reparse", () => {
   it("comes back when the parse catches up, and the bytes are right", () => {
-    const view = editor(DOC, 0);
-    const now = Date.now.bind(Date);
+    // The clock stands still, and jumps a second at every look only while
+    // the box is clicked, so that click's reparse takes one step.
+    const start = Date.now();
     let ahead = 0;
+    let jumping = false;
     const spy = vi.spyOn(Date, "now").mockImplementation(() => {
-      ahead += 1_000;
-      return now() + ahead;
+      if (jumping) ahead += 1_000;
+      return start + ahead;
     });
-    view.dom
-      .querySelector<HTMLInputElement>("input.cm-task-toggle")
-      ?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    spy.mockImplementation(() => now() + ahead);
-    expect(docText(view.state)).toContain("- [x] a task");
-    expect(view.dom.querySelector("input.cm-task-toggle")).toBeNull();
-    parsedView(view);
-    expect(
-      view.dom.querySelector<HTMLInputElement>("input.cm-task-toggle")?.checked,
-    ).toBe(true);
-    spy.mockRestore();
-    view.destroy();
+    try {
+      const view = editor(DOC, 0);
+      jumping = true;
+      view.dom
+        .querySelector<HTMLInputElement>("input.cm-task-toggle")
+        ?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      jumping = false;
+      expect(docText(view.state)).toContain("- [x] a task");
+      expect(view.dom.querySelector("input.cm-task-toggle")).toBeNull();
+      parsedView(view);
+      expect(
+        view.dom.querySelector<HTMLInputElement>("input.cm-task-toggle")
+          ?.checked,
+      ).toBe(true);
+      view.destroy();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
