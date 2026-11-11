@@ -6,6 +6,7 @@
 use crystalline_core::config::RenameAnswer;
 use crystalline_core::manifest::domain_name_at;
 use crystalline_core::relink::BodyGate;
+use futures::future::BoxFuture;
 
 use super::*;
 use crate::rename::{
@@ -85,8 +86,7 @@ impl Engine {
         local_only: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        self.rename_domain_as(domain, new, NameOrigin::Explicit, local_only, scope)
-            .await
+        boxed(|| self.rename_domain_as(domain, new, NameOrigin::Explicit, local_only, scope)).await
     }
 
     /// Rename a domain on this machine only: its local name, and every store
@@ -119,10 +119,15 @@ impl Engine {
         origin: NameOrigin,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        self.rename_domain_as(old, new, origin, true, scope).await
+        boxed(|| self.rename_domain_as(old, new, origin, true, scope)).await
     }
 
     /// The one rename both entry points reach.
+    ///
+    /// Its larger awaits are built through [`boxed`], so this frame and the
+    /// futures of the entry points above it stay small: a full rename runs
+    /// the edit path under its relink step, and in a debug build the whole
+    /// chain once came close to a 2 MiB thread stack.
     async fn rename_domain_as(
         &self,
         old: &str,
@@ -217,15 +222,16 @@ impl Engine {
                 // The rooms learn the new name once the rename is done; a
                 // finish that stops again tells them `internal` (the old
                 // name still serves until it is finished).
-                let closed_editors = self.close_editors(old).await;
-                let mut report = self
-                    .finish_rename(
+                let closed_editors = boxed(|| self.close_editors(old)).await;
+                let mut report = boxed(|| {
+                    self.finish_rename(
                         journal,
                         &state_dir,
                         true,
                         DomainAudience::Accounts(HashSet::new()),
                     )
-                    .await?;
+                })
+                .await?;
                 closed_editors.renamed(new).await;
                 if let Value::Object(map) = &mut report {
                     map.entry("shadows").or_insert_with(|| json!([]));
@@ -291,15 +297,16 @@ impl Engine {
         let reviewing_draft = if local_only {
             false
         } else {
-            self.refuse_unwritable_manifest(old, new).await?
+            boxed(|| self.refuse_unwritable_manifest(old, new)).await?
         };
         // Judged on the text the MANIFEST step would edit: in a reviewing
         // domain the caller's draft when there is one. A kept MANIFEST is not
         // drafted.
-        let manifest_kept = !local_only && !self.manifest_takes_name(old, new, scope).await?;
+        let manifest_kept =
+            !local_only && !boxed(|| self.manifest_takes_name(old, new, scope)).await?;
         let manifest_draft = reviewing_draft && !manifest_kept;
         self.refuse_shared_index(old).await?;
-        self.refuse_leftovers(new, &state_dir, scope).await?;
+        boxed(|| self.refuse_leftovers(new, &state_dir, scope)).await?;
         // What the journal belongs to, read before anything is paused.
         let owner = self.rename_owner(&state_dir).await?;
         // Who could read the old name, read while the privacy records still
@@ -360,7 +367,7 @@ impl Engine {
                 .filter(|s| table.resolve(s) == Some(old))
                 .cloned()
                 .collect();
-            (reaching, self.writable_domains(scope).await?)
+            (reaching, boxed(|| self.writable_domains(scope)).await?)
         };
 
         // Rooms save their last text while the domain is still registered
@@ -372,13 +379,13 @@ impl Engine {
         // editors, and its refusal says so. A full rename closes them before
         // its MANIFEST and relink steps too, so those edits reach the file
         // rather than a room that is about to close.
-        let closed_editors = self.close_editors(old).await;
+        let closed_editors = boxed(|| self.close_editors(old)).await;
 
         // A rename of this machine's name only pauses before its journal, so
         // a busy domain refuses with nothing started. A full rename pauses
         // after its MANIFEST and relink steps, which write into the domain
         // like any other edit and would otherwise wait on its own pause.
-        if local_only && !self.pause_and_drain(old, new).await {
+        if local_only && !boxed(|| self.pause_and_drain(old, new)).await {
             let closed = if closed_editors.any() {
                 " Its open editors were closed and reopen on the next edit."
             } else {
@@ -429,9 +436,8 @@ impl Engine {
         // after its MANIFEST and link steps); its journal finishes it later,
         // and until then the old name serves, so the rooms are told
         // `internal` when the answer drops.
-        let mut report = self
-            .finish_rename(journal, &state_dir, true, old_audience)
-            .await?;
+        let mut report =
+            boxed(|| self.finish_rename(journal, &state_dir, true, old_audience)).await?;
         closed_editors.renamed(new).await;
         if let Value::Object(map) = &mut report {
             if !shadows.is_empty() {
@@ -988,7 +994,7 @@ impl Engine {
         self.announce_domain(&new, None, None);
 
         let entry = self.domain_entry(&new)?;
-        if sync_after && let Err(e) = self.sync(Some(&new)).await {
+        if sync_after && let Err(e) = boxed(|| self.sync(Some(&new))).await {
             tracing::warn!(
                 domain = %new,
                 error = %e,
@@ -1151,10 +1157,7 @@ impl Engine {
                 }
                 continue;
             }
-            match self
-                .relink_one(&domain, &path, &scope, spellings, new)
-                .await
-            {
+            match boxed(|| self.relink_one(&domain, &path, &scope, spellings, new)).await {
                 Ok(0) => {}
                 Ok(references) => {
                     let counts = outcome.rewritten.entry(domain).or_default();
@@ -1640,27 +1643,55 @@ impl Engine {
     }
 
     /// One step, safe to run again.
-    async fn run_rename_step(
-        &self,
+    ///
+    /// Not an `async fn`: each step that awaits is its own boxed future, so
+    /// polling a step costs only that step's stack frame, and the futures of
+    /// [`Engine::finish_rename`] and the rename above it hold a pointer
+    /// instead of the relink step's whole edit path. One state machine over
+    /// every step gave its poll a frame of about 39 KB in a debug build, and
+    /// the callers' frames grew with it.
+    fn run_rename_step<'a>(
+        &'a self,
         step: RenameStep,
-        journal: &RenameJournal,
-        state_dir: &Path,
-        outcome: &mut RenameOutcome,
-    ) -> Result<()> {
+        journal: &'a RenameJournal,
+        state_dir: &'a Path,
+        outcome: &'a mut RenameOutcome,
+    ) -> BoxFuture<'a, Result<()>> {
         let (old, new) = (journal.old.as_str(), journal.new.as_str());
         match step {
-            RenameStep::Manifest => self.rename_manifest(journal).await?,
-            RenameStep::Relink => self.rename_relink(journal, outcome).await?,
-            RenameStep::IndexRow => {
+            RenameStep::Manifest => Box::pin(self.rename_manifest(journal)),
+            RenameStep::Relink => Box::pin(self.rename_relink(journal, outcome)),
+            RenameStep::IndexRow => Box::pin(async move {
                 let store = self.store.lock().await;
                 store.rename_domain_row(old, new).await?;
-            }
-            RenameStep::AuthTables => {
+                Ok(())
+            }),
+            RenameStep::AuthTables => Box::pin(async move {
                 if let Some(access) = self.rename_access().await? {
                     access.rename_domain(old, new).await.map_err(|e| {
                         EngineError::Internal(format!("moving the records of '{old}': {e:#}"))
                     })?;
                 }
+                Ok(())
+            }),
+            step => Box::pin(async move { self.run_plain_rename_step(step, journal, state_dir) }),
+        }
+    }
+
+    /// The steps of [`Engine::run_rename_step`] that await nothing.
+    fn run_plain_rename_step(
+        &self,
+        step: RenameStep,
+        journal: &RenameJournal,
+        state_dir: &Path,
+    ) -> Result<()> {
+        let (old, new) = (journal.old.as_str(), journal.new.as_str());
+        match step {
+            RenameStep::Manifest
+            | RenameStep::Relink
+            | RenameStep::IndexRow
+            | RenameStep::AuthTables => {
+                unreachable!("run_rename_step runs the steps that await")
             }
             RenameStep::OriginsDir => {
                 move_state_dir(&self.rename_origins_root()?, old, new).map_err(io_error)?;

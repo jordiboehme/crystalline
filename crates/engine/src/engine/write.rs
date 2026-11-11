@@ -289,8 +289,7 @@ impl Engine {
     /// virtual domain builds the markdown in memory and indexes it straight into
     /// the database, touching no filesystem.
     pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
-        self.write_engram_as(p, None, &crate::scope::Scope::Unrestricted)
-            .await
+        boxed(|| self.write_engram_as(p, None, &crate::scope::Scope::Unrestricted)).await
     }
 
     /// [`Engine::write_engram`] with the writer's identity: `client` is the

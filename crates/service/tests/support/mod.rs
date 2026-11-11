@@ -2227,3 +2227,48 @@ pub fn raw_session_id(raw: &str) -> String {
     }
     panic!("no mcp-session-id header in response:\n{raw}");
 }
+
+/// A temp folder for a served fixture, removed when the process exits rather
+/// than when the fixture drops.
+///
+/// A fixture that serves a router never stops its server: a co-editing room
+/// still open when the test returns closes after the fixture is gone, and its
+/// last save (a kept copy of a deleted draft, say) re-creates folders under a
+/// `TempDir` that was just removed, which then stay in the temp dir. Removed
+/// at exit, the folder outlives the runtime that wrote into it. The removal
+/// ignores every error; a process that aborts leaves the folder behind, as a
+/// `TempDir` would.
+pub struct ExitTempDir(std::path::PathBuf);
+
+impl ExitTempDir {
+    pub fn new() -> ExitTempDir {
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        let path = tempfile::tempdir().unwrap().keep();
+        EXIT_DIRS.lock().unwrap().push(path.clone());
+        // SAFETY: `atexit` only records the function pointer; the hook is a
+        // plain `extern "C" fn` that does not unwind.
+        HOOK.call_once(|| unsafe {
+            libc::atexit(remove_exit_dirs);
+        });
+        ExitTempDir(path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+/// Every folder an [`ExitTempDir`] made in this process.
+static EXIT_DIRS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// The exit hook [`ExitTempDir::new`] registers once: remove every folder,
+/// ignoring every error, since a panic here would cross the C boundary.
+extern "C" fn remove_exit_dirs() {
+    let dirs = match EXIT_DIRS.lock() {
+        Ok(dirs) => dirs,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for dir in dirs.iter() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

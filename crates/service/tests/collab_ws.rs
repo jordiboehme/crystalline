@@ -49,7 +49,7 @@ struct Fixture {
     /// A save through this surface marks its domain pending under the state
     /// directory, so the whole fixture runs against a scratch one.
     _scratch: support::ScratchStateDir,
-    _tmp: tempfile::TempDir,
+    _tmp: support::ExitTempDir,
 }
 
 /// A served instance over a file domain `eng` holding MANIFEST, alpha, a CRLF
@@ -58,7 +58,7 @@ struct Fixture {
 /// crates share no helpers, so both are copied rather than imported.
 async fn serve(opts: Options_) -> Fixture {
     let scratch = support::ScratchStateDir::acquire();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = support::ExitTempDir::new();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
         auth: Some(AuthConfig {
@@ -1136,14 +1136,14 @@ struct Review {
     /// The domain folder, so a test can assert that nothing reached it.
     domain_dir: std::path::PathBuf,
     _scratch: support::ScratchStateDir,
-    _tmp: tempfile::TempDir,
+    _tmp: support::ExitTempDir,
 }
 
 const TEAM_PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Plan\n\nWhat the team agreed.\n";
 
 async fn serve_review() -> Review {
     let scratch = support::ScratchStateDir::acquire();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = support::ExitTempDir::new();
     let root = tmp.path().to_path_buf();
     let dir = root.join("team");
     std::fs::create_dir_all(&dir).unwrap();

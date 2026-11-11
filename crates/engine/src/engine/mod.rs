@@ -82,6 +82,21 @@ use crate::similar::{
     SimilarEngram, SimilarProbe,
 };
 
+/// Build the future `make` returns in this function's own frame and box it.
+///
+/// For a large inner await on a deep path: `boxed(|| self.inner(..)).await`.
+/// In a debug build an `async fn`'s poll frame keeps a slot as large as each
+/// future it builds, and its state embeds them, so every caller above grows
+/// with the whole call tree below. Built here, the future's bytes sit on this
+/// frame only while it is made, and the caller holds a pointer. The deepest
+/// tests run on a 2 MiB thread, where those kilobytes add up.
+pub(crate) fn boxed<'a, F>(make: impl FnOnce() -> F) -> futures::future::BoxFuture<'a, F::Output>
+where
+    F: std::future::Future + Send + 'a,
+{
+    Box::pin(make())
+}
+
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
 

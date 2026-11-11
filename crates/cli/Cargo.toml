@@ -106,6 +106,9 @@ axum = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = "3.1.4"
 tempfile = { workspace = true }
+# `tests/common` removes each test process's default home in an `atexit`
+# hook, on every platform (the `[dependencies]` entry is unix only).
+libc = { workspace = true }
 serde_json = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }

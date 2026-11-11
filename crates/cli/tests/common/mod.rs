@@ -172,18 +172,39 @@ pub fn isolated_state_dir(home: &Path) -> PathBuf {
 /// migrating the real index. The directory is created lazily under the system
 /// temp dir and lives for the whole process; a test that sets its own
 /// variables afterwards simply overrides these.
+///
+/// It is removed when the process exits (an `atexit` hook registered when it
+/// is created), because a static is never dropped: under nextest every test is
+/// a process of its own, and a folder kept for the OS temp cleaner instead
+/// left thousands behind after a few runs. The removal is best effort and
+/// never fails the test: on Windows a child that still holds a file in it
+/// makes the delete fail, and that folder is then left to the temp cleaner. A
+/// process that aborts (a stack overflow, a killed test) runs no hook either.
 pub fn default_home() -> &'static Path {
-    static HOME: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
-        // Statics are never dropped, so the directory is kept explicitly; it
-        // is empty until a child writes into it and the OS temp cleaner owns
-        // it from here.
-        tempfile::Builder::new()
+    DEFAULT_HOME.get_or_init(|| {
+        let home = tempfile::Builder::new()
             .prefix("crystalline-cli-test-home-")
             .tempdir()
             .expect("create the default test home")
-            .keep()
-    });
-    &HOME
+            .keep();
+        // SAFETY: `atexit` only records the function pointer; the hook is a
+        // plain `extern "C" fn` that does not unwind.
+        unsafe {
+            libc::atexit(remove_default_home);
+        }
+        home
+    })
+}
+
+/// The folder [`default_home`] created, once it has created one.
+static DEFAULT_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The exit hook [`default_home`] registers: remove the folder, ignoring every
+/// error, since a panic here would cross the C boundary and abort.
+extern "C" fn remove_default_home() {
+    if let Some(home) = DEFAULT_HOME.get() {
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
 
 /// A `crystalline` command already isolated under [`default_home`].

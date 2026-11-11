@@ -301,7 +301,7 @@ impl Engine {
     }
 
     pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
-        self.read_engram_in(p, scope, true, None).await
+        boxed(|| self.read_engram_in(p, scope, true, None)).await
     }
 
     /// [`Engine::read_engram`], with the reading agent as a named peer in the
