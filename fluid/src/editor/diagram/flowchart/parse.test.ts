@@ -571,13 +571,20 @@ describe("span invariants over the corpus", () => {
 });
 
 describe("a @{ } box before an arrow id", () => {
-  test("a space between them is not understood, as mermaid refuses it", async () => {
-    const spaced = 'flowchart TD\n  A@{ shape: diam, label: "x" } e1@--> B';
-    expect(parseFlowchart(spaced).understood).toBe(false);
-    expect(await flowDbOf(spaced, false)).toHaveProperty("error");
-    const group = 'flowchart TD\n  B & A@{ shape: diam, label: "x" } e1@--> C';
-    expect(parseFlowchart(group).understood).toBe(false);
-    expect(await flowDbOf(group, false)).toHaveProperty("error");
+  test("a space between them is understood, as mermaid reads it since 12.3", async () => {
+    for (const spaced of [
+      'flowchart TD\n  A@{ shape: diam, label: "x" } e1@--> B',
+      'flowchart TD\n  B & A@{ shape: diam, label: "x" } e1@--> C',
+    ]) {
+      const model = parseFlowchart(spaced);
+      expect(model.understood).toBe(true);
+      expect(model.edges.some((e) => e.mermaidId === "e1")).toBe(true);
+      const db = await flowDbOf(spaced, false);
+      if ("error" in db) {
+        throw new Error(String(db.error));
+      }
+      expect(agreesFlow(model, db)).toBeNull();
+    }
   });
 
   test("the tight form stays understood, and mermaid reads it the same", async () => {

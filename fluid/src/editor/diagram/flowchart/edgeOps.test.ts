@@ -454,18 +454,13 @@ describe("reverse", () => {
     ).toBe("invalid");
   });
 
-  test("a @{ } box cannot go in front of an arrow id with a space, mermaid refuses that", async () => {
+  test("a @{ } box goes in front of an arrow id with a space, mermaid reads that since 12.3", async () => {
     const key = { start: "B", end: "A", occurrence: 0 };
     const op: FlowOp = { op: "reverse", edge: key };
-    expect(refusal('B e1@--> A@{ shape: diam, label: "x" }', op)).toBe(
-      "invalid",
-    );
-    expect(
-      await flowDbOf(
-        'flowchart TD\n  A@{ shape: diam, label: "x" } e1@--> B',
-        false,
-      ),
-    ).toHaveProperty("error");
+    expect(refusal('B e1@--> A@{ shape: diam, label: "x" }', op)).toBeNull();
+    const reversed = on('B e1@--> A@{ shape: diam, label: "x" }', op);
+    const db = await flowDbOf(`flowchart TD\n  ${reversed}`, false);
+    expect(db).not.toHaveProperty("error");
     // No id, no problem, and the box's bytes stay.
     expect(on('B --> A@{ shape: diam, label: "x" }', op)).toBe(
       'A@{ shape: diam, label: "x" } --> B',
