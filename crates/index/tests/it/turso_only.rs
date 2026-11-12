@@ -14,7 +14,7 @@
 //! whole wave while its guard stayed green.
 //!
 //! The folder derivation used to be guarded here the same wrong way, over a
-//! hand-copied literal, and is now the `Store::browse_level` entry of the
+//! hand-copied literal, and is now the `ReadStore::browse_level` entry of the
 //! registry in `tests/it/plans.rs`, which reads the shipped builder and keeps
 //! naming `idx_engram_path_actor` in full. `temporal_current_filter_uses_the_promoted_index`
 //! stays: it probes a shape nothing issues, rather than a statement the store

@@ -2058,7 +2058,7 @@ mod tests {
     }
 
     /// v19 over a v18 schema: the C-collated partial index the close-folder
-    /// probe (`Store::folder_holds_other`) seeks on is there after the store
+    /// probe (`ReadStore::folder_holds_other`) seeks on is there after the store
     /// opens, it is the base rows' alone, a replay of the step is a no-op, and
     /// the probe's own statement reads the index rather than the whole domain.
     #[tokio::test]

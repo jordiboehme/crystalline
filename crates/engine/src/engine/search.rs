@@ -403,7 +403,7 @@ impl Engine {
     /// index. A named domain whose engrams still wait for vectors therefore
     /// answers as text, as the Reflection's search does, rather than running a
     /// vector scan that finds nothing. The store's staleness gate reads the same
-    /// domains (`Store::search`), so the decision and the gate never disagree.
+    /// domains (`ReadStore::search`), so the decision and the gate never disagree.
     async fn effective_mode(
         &self,
         store: &dyn ReadStore,

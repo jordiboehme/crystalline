@@ -437,7 +437,7 @@ pub fn resolve_references_to_sql(
     )
 }
 
-/// The edge half of [`Store::engrams_referencing_domains`]: every base engram
+/// The edge half of [`ReadStore::engrams_referencing_domains`]: every base engram
 /// with a relation or link row naming one of the spellings in `list`.
 ///
 /// Driven from the reference tables through their partial `to_domain`
@@ -462,7 +462,7 @@ pub fn referencing_domains_sql(list: &str) -> String {
     )
 }
 
-/// The read behind [`Store::spelled_references`]: one domain's base
+/// The read behind [`ReadStore::spelled_references`]: one domain's base
 /// references whose domain prefix is one of the spellings in `list`, relation
 /// rows then link rows. `domain` is the caller's placeholder for the domain id.
 ///
@@ -563,7 +563,7 @@ pub(crate) fn changed_spellings(
 }
 
 /// The `crystalline://<spelling>` needles the URL half of
-/// [`Store::engrams_referencing_domains`] searches bodies for. A needle also
+/// [`ReadStore::engrams_referencing_domains`] searches bodies for. A needle also
 /// matches a longer name that starts with the spelling, which
 /// [`names_a_domain_url`] then rules out.
 pub(crate) fn domain_url_needles(spellings: &[String]) -> Vec<String> {
@@ -1569,7 +1569,7 @@ pub struct EngramDescriptor {
     pub status: String,
 }
 
-/// One level of a domain's folder tree, as [`Store::browse_level`] reports it:
+/// One level of a domain's folder tree, as [`ReadStore::browse_level`] reports it:
 /// the engrams a navigation view draws at this level, the child folders under
 /// it, and how many engrams the level really holds.
 ///
@@ -1599,7 +1599,7 @@ pub struct BrowseLevel {
     /// does to the rows, so it moves with `depth` and never counts an engram
     /// nested deeper than the level drawn. A search filtered by the same folder
     /// counts recursively instead and legitimately reports more. See
-    /// [`Store::browse_level`] for why the two differ and what it would take to
+    /// [`ReadStore::browse_level`] for why the two differ and what it would take to
     /// return both.
     pub total: usize,
 }
@@ -1620,7 +1620,7 @@ pub(crate) fn folder_slash(prefix: &str) -> String {
 }
 
 /// The half-open byte range `[low, high)` every path under a folder falls in,
-/// for [`Store::folder_holds_other`]: `notes/` up to `notes0`, `0` being the
+/// for [`ReadStore::folder_holds_other`]: `notes/` up to `notes0`, `0` being the
 /// character after `/`. Compared bytewise (SQLite's default collation, and
 /// `COLLATE "C"` on Postgres), so the match folds no case and reads no
 /// wildcard, and a plain range over `path` is one an index can seek
@@ -1635,7 +1635,7 @@ pub(crate) fn folder_range(prefix: &str) -> (String, String) {
 }
 
 /// A stored engram's addressing plus its full markdown content and checksum.
-/// Returned by [`Store::all_engram_contents`] to materialize a whole domain for
+/// Returned by [`ReadStore::all_engram_contents`] to materialize a whole domain for
 /// `domain export`, and shaped so an export writes each engram back to disk
 /// verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1698,7 +1698,7 @@ pub struct InboundRef {
 }
 
 /// One engram whose stored content holds a given text, from
-/// [`Store::engrams_mentioning`].
+/// [`ReadStore::engrams_mentioning`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentMention {
     /// The engram's domain name.
@@ -1717,7 +1717,7 @@ pub struct ContentMention {
 /// `links_to` on an edge meets it again on the chip that counts those edges.
 pub const LINKS_TO: &str = "links_to";
 
-/// One row of [`Store::inbound_page`]: an engram that points at the target, and
+/// One row of [`ReadStore::inbound_page`]: an engram that points at the target, and
 /// the relation it points with.
 ///
 /// Addressed rather than merely located: [`InboundRef`] carries a path because
@@ -1742,10 +1742,10 @@ pub struct InboundHit {
     pub rel: String,
 }
 
-/// What [`Store::inbound_page`] takes: which engram is being pointed at, and
+/// What [`ReadStore::inbound_page`] takes: which engram is being pointed at, and
 /// how the caller wants the references to it narrowed and paged.
 ///
-/// The target is spelled the way [`Store::inbound_refs`] spells it - id, domain
+/// The target is spelled the way [`ReadStore::inbound_refs`] spells it - id, domain
 /// and the permalink and title an unresolved reference is text-matched against -
 /// because both walk the same rows and must agree about what points where.
 #[derive(Debug, Clone)]
@@ -1805,7 +1805,7 @@ pub(crate) fn page_window(page: usize, limit: usize) -> (i64, i64) {
     (limit as i64, offset as i64)
 }
 
-/// One page of [`Store::inbound_page`], with the counts a client draws its
+/// One page of [`ReadStore::inbound_page`], with the counts a client draws its
 /// chips from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InboundPage {
@@ -1876,7 +1876,7 @@ pub struct EmbeddingRow {
 }
 
 /// One engram's lead vector: the embedding of its first chunk (`seq = 0`)
-/// for one model, as [`Store::lead_vectors`] returns it.
+/// for one model, as [`ReadStore::lead_vectors`] returns it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeadVector {
     /// The engram the lead chunk belongs to.
@@ -2155,7 +2155,7 @@ pub struct NewReflectionChunk {
 }
 
 /// The closest chunk of one section, as cosine similarity: one row of
-/// [`Store::reflection_vector_hits`], keyed `(path, section_ord)` the way
+/// [`ReadStore::reflection_vector_hits`], keyed `(path, section_ord)` the way
 /// [`crate::reflection::rank_sections`] merges the two halves (R60).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionVector {
@@ -2291,7 +2291,7 @@ impl RebuildKind {
 }
 
 /// The instance currently holding a file domain's host lock in a shared
-/// database. Returned by [`Store::domain_host`] and carried by
+/// database. Returned by [`ReadStore::domain_host`] and carried by
 /// [`HostClaim::HeldByOther`] so a refused sync can name the host and its last
 /// heartbeat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2387,7 +2387,7 @@ pub struct LeaseHolder {
 }
 
 /// The lease of one loop on one domain, as stored. A stale lease (not
-/// renewed in time) is still returned by [`Store::automation_lease`]; the
+/// renewed in time) is still returned by [`ReadStore::automation_lease`]; the
 /// caller decides what stale means.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct AutomationLease {
@@ -2619,7 +2619,7 @@ pub struct ReflectionRow {
     pub modified: String,
 }
 
-/// One engram a Reflection section cites, as [`Store::cited_engrams`]
+/// One engram a Reflection section cites, as [`ReadStore::cited_engrams`]
 /// answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CitedEngram {
@@ -2635,7 +2635,7 @@ pub struct CitedEngram {
     pub mtime: i64,
 }
 
-/// A [`ReflectionRow`] without its `content`: [`Store::list_reflection_stamps`].
+/// A [`ReflectionRow`] without its `content`: [`ReadStore::list_reflection_stamps`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflectionStamp {
     /// The path inside `reflections/`.
@@ -2914,7 +2914,7 @@ pub trait ReadStore: Send + Sync {
     /// segment is the Reflection's folder in any ASCII letter case, in no
     /// particular order. The Reflection gate's fast path (R82): a domain that
     /// records engrams and none under the folder has nothing pending, which
-    /// this answers without loading every [`Store::file_stamps`] entry.
+    /// this answers without loading every [`ReadStore::file_stamps`] entry.
     async fn engram_rows_under_reflections(
         &self,
         domain: DomainId,
@@ -2944,7 +2944,7 @@ pub trait ReadStore: Send + Sync {
     /// mtime. A permalink no base row holds has no answer, a permalink named
     /// twice answers once, and the order is unspecified. One index seek per
     /// distinct permalink, so a page citing a few engrams never reads the
-    /// whole domain's [`Store::file_stamps`].
+    /// whole domain's [`ReadStore::file_stamps`].
     async fn cited_engrams(
         &self,
         domain: DomainId,
@@ -3034,7 +3034,7 @@ pub trait ReadStore: Send + Sync {
     /// folder `prefix` (with or without its trailing slash), at any depth. One
     /// `LIMIT 1` probe that stops at the first row, for a caller that asks
     /// only "is this folder new", which is the close-folder hint on a write
-    /// receipt; [`Store::browse_level`] answers a bigger question with a count
+    /// receipt; [`ReadStore::browse_level`] answers a bigger question with a count
     /// and a `DISTINCT` scan.
     ///
     /// The prefix is matched exactly, case included and never as a pattern:
@@ -3083,7 +3083,7 @@ pub trait ReadStore: Send + Sync {
     /// Every base engram whose stored content holds `needle` verbatim, as its
     /// domain and path, ordered by domain name then path.
     ///
-    /// The move's second finder, beside [`Store::inbound_refs`]: a
+    /// The move's second finder, beside [`ReadStore::inbound_refs`]: a
     /// `crystalline://domain/permalink` URL written in prose is a reference a
     /// reader follows, but the parser never turns it into a `link` row, so no
     /// edge table knows about it. This asks the content instead, and the move
@@ -3101,7 +3101,7 @@ pub trait ReadStore: Send + Sync {
     /// One page of the references that point at an engram, filtered and counted
     /// in SQL, with the per-relation summary of all of them.
     ///
-    /// The paged twin of [`Store::inbound_refs`], over exactly the same rows:
+    /// The paged twin of [`ReadStore::inbound_refs`], over exactly the same rows:
     /// resolved references plus the unresolved same-domain ones whose text names
     /// this engram, so a total here and the count `read_engram` reports are the
     /// same number. What differs is what a reader needs - a title and a
@@ -3163,7 +3163,7 @@ pub trait ReadStore: Send + Sync {
     /// so the cost tracks the number of dangling references rather than the size
     /// of the domain.
     ///
-    /// `actor` is who is asking, the same dimension [`Store::outbound_refs`]
+    /// `actor` is who is asking, the same dimension [`ReadStore::outbound_refs`]
     /// names. `None` is the domain's own queue: the rows its files hold, judged
     /// by the stored `to_id`. `Some(a)` is that actor's queue - the base rows
     /// their drafts do not shadow plus their own drafts - judged in their view,
@@ -3182,11 +3182,11 @@ pub trait ReadStore: Send + Sync {
             .await
     }
 
-    /// [`Store::search`] with an explicit lexical candidate cap, so a test can
+    /// [`ReadStore::search`] with an explicit lexical candidate cap, so a test can
     /// exercise the cap boundary over a handful of engrams. `candidate_cap` only
     /// bounds how many LIKE candidates the lexical prefilter loads and ranks; it
     /// never changes the shape of a hit. Production always goes through
-    /// [`Store::search`], which passes [`LEXICAL_CANDIDATE_CAP`].
+    /// [`ReadStore::search`], which passes [`LEXICAL_CANDIDATE_CAP`].
     async fn search_with_candidate_cap(
         &self,
         query: &SearchQuery,
@@ -3247,8 +3247,8 @@ pub trait ReadStore: Send + Sync {
     /// count, read fresh; a domain that does not exist counts nothing. With
     /// `None` it is the table-wide snapshot, served from a cache every
     /// mutator that can change an embedding drops. This is the one place the
-    /// count is made: [`Store::embedding_coverage_of`],
-    /// [`Store::embedding_coverage`] and [`Store::reflection_coverage`] are
+    /// count is made: [`ReadStore::embedding_coverage_of`],
+    /// [`ReadStore::embedding_coverage`] and [`ReadStore::reflection_coverage`] are
     /// this call with fixed arguments.
     async fn embedding_coverage_in(
         &self,
@@ -3256,7 +3256,7 @@ pub trait ReadStore: Send + Sync {
         domains: Option<&[DomainId]>,
     ) -> Result<EmbeddingCoverage>;
 
-    /// [`Store::embedding_coverage_in`] on the engram chunks of the domains
+    /// [`ReadStore::embedding_coverage_in`] on the engram chunks of the domains
     /// called `names`. A name that is not a registered domain counts nothing.
     /// The one place names become ids for a search: the engine's mode decision
     /// and the store's staleness gate both read it, so they cannot disagree.
@@ -3271,12 +3271,12 @@ pub trait ReadStore: Send + Sync {
             .await
     }
 
-    /// [`Store::embedding_coverage_in`] over the whole table.
+    /// [`ReadStore::embedding_coverage_in`] over the whole table.
     async fn embedding_coverage_of(&self, table: ChunkTable) -> Result<EmbeddingCoverage> {
         self.embedding_coverage_in(table, None).await
     }
 
-    /// [`Store::chunks_needing_embedding_in`] on the engram chunks.
+    /// [`ReadStore::chunks_needing_embedding_in`] on the engram chunks.
     async fn chunks_needing_embedding(
         &self,
         model: &str,
@@ -3288,10 +3288,10 @@ pub trait ReadStore: Send + Sync {
             .await
     }
 
-    /// [`Store::embedding_coverage_of`] the engram chunks: what `status` and
+    /// [`ReadStore::embedding_coverage_of`] the engram chunks: what `status` and
     /// the backlog read, and what a search that names no domain decides its
     /// mode and staleness on (R55). A search that names domains reads
-    /// [`Store::embedding_coverage_in`] of those domains instead (R88).
+    /// [`ReadStore::embedding_coverage_in`] of those domains instead (R88).
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage> {
         self.embedding_coverage_of(ChunkTable::Engram).await
     }
@@ -3375,7 +3375,7 @@ pub trait ReadStore: Send + Sync {
 
     /// The line vectors for `model` of those `hashes` that have one, by hash.
     /// A row whose stored width disagrees with its `dims` is skipped with a
-    /// warning. Read like [`Store::observation_vectors_present`].
+    /// warning. Read like [`ReadStore::observation_vectors_present`].
     async fn observation_vectors(
         &self,
         model: &str,
@@ -3407,7 +3407,7 @@ pub trait ReadStore: Send + Sync {
     /// included, for the same reason.
     async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
 
-    /// [`Store::overlay_entries`] without the bodies: every draft path one
+    /// [`ReadStore::overlay_entries`] without the bodies: every draft path one
     /// actor holds in a domain with its tombstone flag, ordered by path. For a
     /// caller that only asks where drafts stand, such as the close-folder hint
     /// on a write receipt, so it never loads a draft's text to learn its path.
@@ -3426,7 +3426,7 @@ pub trait ReadStore: Send + Sync {
 
     /// Every domain name the index holds, sorted.
     ///
-    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
+    /// The cheap half of [`ReadStore::domain_stats`], for the caller that needs to
     /// know *which* domains have rows rather than how many rows each has. One
     /// column of a table with a row per domain, against six correlated counting
     /// scans per domain - which matters because the serving screen asks this on
@@ -3459,12 +3459,12 @@ pub trait ReadStore: Send + Sync {
     /// backends pin the collation, so the listing is identical across them).
     async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>>;
 
-    /// [`Store::get_asset`] on the engram attachments.
+    /// [`ReadStore::get_asset`] on the engram attachments.
     async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>> {
         self.get_asset(AssetTable::Engram, domain, path).await
     }
 
-    /// [`Store::list_assets`] on the engram attachments.
+    /// [`ReadStore::list_assets`] on the engram attachments.
     async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>> {
         self.list_assets(AssetTable::Engram, domain).await
     }
@@ -3489,9 +3489,9 @@ pub trait ReadStore: Send + Sync {
     /// embedded chunks and a per-model breakdown, read fresh (never cached).
     /// A reflection search reads it for its mode decision and its staleness
     /// gate, so a domain whose pages are not embedded yet answers as text
-    /// while another domain's are. [`Store::embedding_coverage_of`] stays the
+    /// while another domain's are. [`ReadStore::embedding_coverage_of`] stays the
     /// table-wide count that status and the backlog read. This is
-    /// [`Store::embedding_coverage_in`] on the reflection chunks of `domain`.
+    /// [`ReadStore::embedding_coverage_in`] on the reflection chunks of `domain`.
     async fn reflection_coverage(&self, domain: DomainId) -> Result<EmbeddingCoverage> {
         self.embedding_coverage_in(ChunkTable::Reflection, Some(&[domain]))
             .await
@@ -3503,7 +3503,7 @@ pub trait ReadStore: Send + Sync {
     /// best first, ties on path then section order. Answers
     /// [`crate::IndexError::StaleEmbeddings`] when the stored reflection vectors
     /// cannot be compared with the query (`crate::rank::check_staleness`
-    /// over [`Store::reflection_coverage`] of `domain`), so a caller falls
+    /// over [`ReadStore::reflection_coverage`] of `domain`), so a caller falls
     /// back to text.
     async fn reflection_vector_hits(
         &self,
@@ -3523,7 +3523,7 @@ pub trait ReadStore: Send + Sync {
     /// The current holder of a file domain's host lock, or `None` when unheld.
     async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>>;
 
-    /// [`Store::domain_host`] read for a walk about to apply: inside the
+    /// [`ReadStore::domain_host`] read for a walk about to apply: inside the
     /// caller's write transaction the lock row stays as read until it ends
     /// (`FOR SHARE` on Postgres), so a claim of the domain waits for the
     /// apply to commit instead of landing in the middle of it. A Turso
@@ -3870,7 +3870,7 @@ pub trait Store: ReadStore {
     /// The embedding lives in columns on the chunk table (`embedding`, `dims`,
     /// `model`), so this nulls those three and never removes a chunk row: the
     /// text stays, and every cleared chunk is back in
-    /// [`Store::chunks_needing_embedding_in`] for the active model. Called once
+    /// [`ReadStore::chunks_needing_embedding_in`] for the active model. Called once
     /// per table by an embed pass that finds the active model covering every
     /// chunk of that table, to reclaim the space an install's previous model
     /// left behind. A user who switches back simply re-embeds; nothing is kept
@@ -3922,7 +3922,7 @@ pub trait Store: ReadStore {
     ) -> Result<()>;
 
     /// Delete the line vectors of `hashes` under `model` in one transaction,
-    /// on the full key like [`Store::observation_vectors_present`]; returns
+    /// on the full key like [`ReadStore::observation_vectors_present`]; returns
     /// how many went.
     async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64>;
 
@@ -4309,7 +4309,7 @@ pub trait Store: ReadStore {
     ) -> Result<()>;
 
     /// Write the domain's host move only when its stored text still is
-    /// `expected`, the text the caller read ([`Store::host_move_text`]):
+    /// `expected`, the text the caller read ([`ReadStore::host_move_text`]):
     /// `false` and nothing written when another writer changed it in
     /// between. The stored text is compared as stored, so a mark in an older
     /// or newer shape matches the read of it.
@@ -4367,7 +4367,7 @@ pub enum DomainLookup {
 }
 
 /// The one domain-scoped lookup every identifier-taking surface shares: the
-/// permalink, then the title, both through [`Store::find_engram`] and nothing
+/// permalink, then the title, both through [`ReadStore::find_engram`] and nothing
 /// else. A file path is no identifier. A miss carries the permalink the
 /// identifier's slug ([`crystalline_core::path_permalink`]) is, when the slug
 /// differs from the identifier and an engram answers to it as its permalink,

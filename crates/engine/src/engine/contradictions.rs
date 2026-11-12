@@ -1892,7 +1892,7 @@ impl Engine {
     /// checksum is recomputed under `rules` here on every walk.
     ///
     /// The lead-vector fetch is the whole domain's, unbounded (see
-    /// [`Store::lead_vectors`]); a caller that only needs statuses, windows,
+    /// [`ReadStore::lead_vectors`]); a caller that only needs statuses, windows,
     /// checksums and lines passes `false` and pays nothing for it.
     pub(crate) async fn contradiction_facts(
         &self,

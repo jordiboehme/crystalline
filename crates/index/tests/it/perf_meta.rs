@@ -317,7 +317,7 @@ async fn scoped_lexical_plan_at_20k_postgres() {
 }
 
 /// The filter-only `$contains` searches an ingesting agent runs when a block
-/// changed or went away, on any backend: the whole `Store::search` (the
+/// changed or went away, on any backend: the whole `ReadStore::search` (the
 /// count, the page and the tag hydration), unscoped and scoped to the
 /// domain, as the median of 21 warm runs per case. The target is under
 /// 50 ms.

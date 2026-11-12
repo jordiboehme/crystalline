@@ -1519,7 +1519,7 @@ pub const HOST_MOVE_SQL: &str = "SELECT host_move FROM domain WHERE id=$1";
 pub const RECORD_SYNC_SQL: &str = "UPDATE domain SET last_sync=$1 WHERE id=$2 \
      AND ($3 OR last_sync IS NULL OR last_sync < $4)";
 
-/// The on-disk snapshot behind [`Store::file_stamps`].
+/// The on-disk snapshot behind [`ReadStore::file_stamps`].
 ///
 /// The snapshot names what is on disk, so it is the base rows and only the base
 /// rows. The sync driver derives its deletes by subtracting the walk from this
@@ -1539,14 +1539,14 @@ pub const FILE_STAMPS_SQL: &str =
 #[doc(hidden)]
 pub const ENGRAM_ROWS_UNDER_REFLECTIONS_SQL: &str = "SELECT path FROM engram WHERE domain_id=$1 AND actor = '' AND lower(substr(path, 1, 12) COLLATE \"C\") = 'reflections/' LIMIT $2";
 
-/// Whether one path holds a base engram row, behind [`Store::base_paths`]:
+/// Whether one path holds a base engram row, behind [`ReadStore::base_paths`]:
 /// a full-key seek of the unique `idx_engram_path_actor`, run once per path,
 /// reading no body.
 #[doc(hidden)]
 pub const BASE_PATH_SQL: &str =
     "SELECT 1 FROM engram WHERE domain_id=$1 AND path=$2 AND actor = '' LIMIT 1";
 
-/// One cited engram by permalink, behind [`Store::cited_engrams`]: a
+/// One cited engram by permalink, behind [`ReadStore::cited_engrams`]: a
 /// full-key seek of the unique `idx_engram_permalink_actor`, run once per
 /// permalink. A plain equality rather than an `IN` list, which turso would
 /// back with an ephemeral table.
@@ -1559,18 +1559,18 @@ pub const HAS_ENGRAM_ROWS_SQL: &str =
     "SELECT 1 FROM engram WHERE domain_id=$1 AND actor = '' LIMIT 1";
 
 /// The reflection rows without their text, behind
-/// [`Store::list_reflection_stamps`]; the method sorts them by path.
+/// [`ReadStore::list_reflection_stamps`]; the method sorts them by path.
 #[doc(hidden)]
 pub const REFLECTION_STAMPS_SQL: &str =
     "SELECT path, title, sha256, size, modified FROM reflection WHERE domain_id=$1";
 
 /// Whether the domain has any reflection row, half of
-/// [`Store::has_reflection_rows`].
+/// [`ReadStore::has_reflection_rows`].
 #[doc(hidden)]
 pub const HAS_REFLECTION_PAGE_SQL: &str = "SELECT 1 FROM reflection WHERE domain_id=$1 LIMIT 1";
 
 /// Whether the domain has any Reflection file row, the other half of
-/// [`Store::has_reflection_rows`].
+/// [`ReadStore::has_reflection_rows`].
 #[doc(hidden)]
 pub const HAS_REFLECTION_ASSET_SQL: &str =
     "SELECT 1 FROM reflection_asset WHERE domain_id=$1 LIMIT 1";
@@ -1582,7 +1582,7 @@ pub const HAS_REFLECTION_ASSET_SQL: &str =
 pub const UPSERT_PROBE_SQL: &str = "SELECT id, path FROM engram WHERE domain_id=$1 AND path=$2 AND actor=$4 \
      UNION ALL SELECT id, path FROM engram WHERE domain_id=$1 AND permalink=$3 AND actor=$4";
 
-/// The probe behind [`Store::folder_holds_other`]: one base row under a folder
+/// The probe behind [`ReadStore::folder_holds_other`]: one base row under a folder
 /// other than the write's own path, at any depth, never a reserved name. The
 /// range is over `path COLLATE "C"`, the bytewise order that keeps every path
 /// under `notes/` between `notes/` and `notes0`, and `idx_engram_base_path_c`
@@ -1595,14 +1595,14 @@ pub const FOLDER_HOLDS_OTHER_SQL: &str = "SELECT 1 FROM engram e WHERE e.domain_
      AND right(e.path, 9) <> '/index.md' AND right(e.path, 7) <> '/log.md' \
      LIMIT 1";
 
-/// The read behind [`Store::contradiction_pairs_scored`], one domain's pair
+/// The read behind [`ReadStore::contradiction_pairs_scored`], one domain's pair
 /// rows for one model through `idx_contradiction_pair_domain`. The Turso text
 /// with `$n` placeholders.
 #[doc(hidden)]
 pub const CONTRADICTION_PAIRS_SCORED_SQL: &str = "SELECT cp.engram_a, cp.engram_b, cp.checksum_a, cp.checksum_b FROM contradiction_pair cp \
      WHERE cp.domain_id=$1 AND cp.model=$2 ORDER BY cp.engram_a, cp.engram_b";
 
-/// The sweep's read behind [`Store::contradictions`], through
+/// The sweep's read behind [`ReadStore::contradictions`], through
 /// `idx_contradiction_domain`. The floor applies to the higher reading order.
 #[doc(hidden)]
 pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a, cn.line_b, cn.hash_a, cn.hash_b, \
@@ -1674,7 +1674,7 @@ pub const CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL: &str =
 pub const CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL: &str =
     "UPDATE relation SET to_id = NULL WHERE to_id IN (SELECT id FROM engram WHERE domain_id = $1)";
 
-/// The read behind [`Store::scored_pair_count`], through
+/// The read behind [`ReadStore::scored_pair_count`], through
 /// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
 /// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
 /// which leads with `domain_id`. Called on every `ctl status` and every
@@ -1703,13 +1703,13 @@ pub const CLEAR_ALL_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction";
 #[doc(hidden)]
 pub const CLEAR_ALL_CONTRADICTION_PAIRS_SQL: &str = "DELETE FROM contradiction_pair";
 
-/// The pruning read behind [`Store::observation_vector_hashes`]: the primary
+/// The pruning read behind [`ReadStore::observation_vector_hashes`]: the primary
 /// key `(model, hash)` serves `model=$1` as its leading column.
 #[doc(hidden)]
 pub const OBSERVATION_VECTOR_HASHES_SQL: &str =
     "SELECT ov.hash FROM observation_vector ov WHERE ov.model=$1";
 
-/// The presence check behind [`Store::observation_vectors_present`] for `n`
+/// The presence check behind [`ReadStore::observation_vectors_present`] for `n`
 /// hashes, through the primary key.
 #[doc(hidden)]
 pub fn observation_vectors_present_sql(n: usize) -> String {
@@ -1719,7 +1719,7 @@ pub fn observation_vectors_present_sql(n: usize) -> String {
     )
 }
 
-/// The read behind [`Store::observation_vectors`] for `n` hashes.
+/// The read behind [`ReadStore::observation_vectors`] for `n` hashes.
 #[doc(hidden)]
 pub fn observation_vectors_sql(n: usize) -> String {
     format!(
@@ -1764,7 +1764,7 @@ pub const REFLECTION_VECTOR_SQL: &str = "SELECT rc.path, rc.section_ord, min(rc.
      WHERE rc.domain_id=$2 AND rc.embedding IS NOT NULL AND rc.model=$3 AND rc.dims=$4 \
      GROUP BY rc.path, rc.section_ord ORDER BY dist ASC, rc.path COLLATE \"C\" ASC, rc.section_ord ASC LIMIT 100";
 
-/// The aggregate behind [`Store::embedding_coverage_in`] on the engram chunks:
+/// The aggregate behind [`ReadStore::embedding_coverage_in`] on the engram chunks:
 /// one domain's chunks grouped by model and width, each group with its row
 /// count and its embedded count. A chunk has no domain of its own, so the
 /// engram row carries it; every actor's rows count, as the embedding backlog
@@ -1776,7 +1776,7 @@ pub const ENGRAM_COVERAGE_SQL: &str = "SELECT c.model, c.dims, count(*), count(c
      FROM chunk c JOIN engram e ON e.id=c.engram_id WHERE e.domain_id=$1 \
      GROUP BY c.model, c.dims";
 
-/// The aggregate behind [`Store::embedding_coverage_in`] on the reflection chunks: one domain's reflection
+/// The aggregate behind [`ReadStore::embedding_coverage_in`] on the reflection chunks: one domain's reflection
 /// chunks grouped by model and width, each group with its row count and its
 /// embedded count. A chunk not embedded yet has no model and no width, so it
 /// lands in the one group whose embedded count is 0. The domain index serves
@@ -1785,7 +1785,7 @@ pub const ENGRAM_COVERAGE_SQL: &str = "SELECT c.model, c.dims, count(*), count(c
 pub const REFLECTION_COVERAGE_SQL: &str = "SELECT rc.model, rc.dims, count(*), count(rc.embedding) \
      FROM reflection_chunk rc WHERE rc.domain_id=$1 GROUP BY rc.model, rc.dims";
 
-/// The address lookup behind [`Store::find_engram`].
+/// The address lookup behind [`ReadStore::find_engram`].
 ///
 /// A permalink hit wins over a title hit; among title hits the lowest path
 /// wins, and `LIMIT 1` makes that tie-break the whole answer, so the path key
@@ -1801,7 +1801,7 @@ pub const FIND_ENGRAM_SQL: &str = "SELECT e.id, e.domain_id, d.name, e.path, e.p
      WHERE e.actor = '' AND d.name=$1 AND (e.permalink=$2 OR lower(e.title)=lower($2)) \
      ORDER BY CASE WHEN e.permalink=$2 THEN 0 ELSE 1 END, e.path COLLATE \"C\" LIMIT 1";
 
-/// The listing behind [`Store::list_engrams`], for the filters the caller built.
+/// The listing behind [`ReadStore::list_engrams`], for the filters the caller built.
 #[doc(hidden)]
 pub fn list_engrams_sql(clauses: &str) -> String {
     format!(
@@ -1811,7 +1811,7 @@ pub fn list_engrams_sql(clauses: &str) -> String {
     )
 }
 
-/// The folder derivation inside [`Store::browse_level`]: each first segment
+/// The folder derivation inside [`ReadStore::browse_level`]: each first segment
 /// below the prefix with how many rows sit under it at any depth, read out of
 /// the path column alone.
 ///
@@ -1829,7 +1829,7 @@ pub fn folder_level_sql(rel: &str, under: &str) -> String {
     )
 }
 
-/// The sweep's dangling-reference read behind [`Store::unresolved_refs`].
+/// The sweep's dangling-reference read behind [`ReadStore::unresolved_refs`].
 ///
 /// The turso query, column for column. The kind discriminator is cast to `int8`
 /// so `cell_i64` decodes it (a bare integer literal is `int4`), and the prose
@@ -1863,7 +1863,7 @@ pub fn unresolved_refs_sql(src_screen: &str, rel_pending: &str, link_pending: &s
     )
 }
 
-/// The per-domain twin read behind [`Store::lead_vectors`]: one row per engram
+/// The per-domain twin read behind [`ReadStore::lead_vectors`]: one row per engram
 /// whose first chunk carries an embedding for the model asked about.
 ///
 /// This selects the raw `embedding` column, whose type includes the column's

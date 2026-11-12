@@ -102,7 +102,7 @@ where
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
 
-/// How many seed ids one [`Store::neighbors`] call takes during a consolidation
+/// How many seed ids one [`ReadStore::neighbors`] call takes during a consolidation
 /// sweep. The backends inline the seed list into an SQL `IN (...)`, so a whole
 /// domain in one call would build a statement proportional to its size. The
 /// slices are merged afterwards, which is what keeps the resolved degrees
@@ -4249,7 +4249,7 @@ impl Engine {
     /// Asked of the index on every call rather than cached, so a domain removed
     /// or registered while this engine runs takes effect on the next read rather
     /// than at the next restart. It is one column of a table with a row per
-    /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
+    /// domain ([`ReadStore::domain_names`], deliberately not `domain_stats`, whose
     /// per-domain counts this would pay for and never look at).
     ///
     /// "Registered" is [`Engine::registered_domain_names`], all three tiers
@@ -4263,7 +4263,7 @@ impl Engine {
     /// orphan (every installation, once Part B has collected) pays the cheap
     /// in-memory check and no file read at all.
     ///
-    /// [`Store::domain_names`]: crystalline_index::Store::domain_names
+    /// [`ReadStore::domain_names`]: crystalline_index::ReadStore::domain_names
     async fn unregistered_domains(&self) -> Result<HashSet<String>> {
         let known: HashSet<String> = self.known_domain_names().into_iter().collect();
         let names = self.reader().domain_names().await?;

@@ -11750,7 +11750,7 @@ parity!(
 /// address a reference actually named. Only meaningful about a reference that
 /// is bound at all - an unresolved row reaches its author's draft through the
 /// other arm - so every caller below asserts `resolved` off
-/// [`Store::outbound_refs`] with no actor first, which reads the stored column
+/// [`ReadStore::outbound_refs`] with no actor first, which reads the stored column
 /// and nothing else.
 async fn binds_to(store: &dyn Store, from: EngramId, actor: Option<&str>, to: EngramId) -> bool {
     store

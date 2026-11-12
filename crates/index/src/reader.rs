@@ -5,7 +5,7 @@
 //! instead, so a search does not wait for a sync apply and two searches do not
 //! wait for each other:
 //!
-//! - [`ReadPool`] keeps a few read connections of the backend (turso: more
+//! - A read pool keeps a few read connections of the backend (turso: more
 //!   connections of the same database, `query_only`; Postgres: a pool of its
 //!   own with read-only sessions). One call takes one connection and runs in
 //!   one read transaction, so a method sees one state, as it did under the

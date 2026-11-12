@@ -1,4 +1,4 @@
-//! `Store::lead_vectors` on both backends: one row per engram whose first
+//! `ReadStore::lead_vectors` on both backends: one row per engram whose first
 //! chunk carries an embedding for the model asked about, the vector as stored,
 //! ordered by engram id, and nothing for a model that never embedded here.
 //!
