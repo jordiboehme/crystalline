@@ -831,6 +831,12 @@ impl Engine {
                     let hosted_here = !self.instance_id.is_empty()
                         && s.host_instance_id.as_deref() == Some(self.instance_id.as_str());
                     map.insert("hosted_here".to_string(), json!(hosted_here));
+                    // The index stamps only a sync that changed the domain;
+                    // the report says when this engine last synced it.
+                    map.insert(
+                        "last_sync".to_string(),
+                        json!(self.last_sync_of(&s.name, s.last_sync.as_deref())),
+                    );
                 }
                 v
             })

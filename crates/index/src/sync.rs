@@ -1693,6 +1693,9 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         apply_seam::hold(walker).await;
     }
     let mut elsewhere = crate::OnlyElsewhere::default();
+    // Whether this apply changed a row, so the sync stamp is written only
+    // then: a sync that found nothing new writes nothing at all.
+    let mut wrote = false;
     let apply = apply_changes(
         store,
         domain,
@@ -1728,7 +1731,10 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     )
     .await
     {
-        Ok(reconciled) => elsewhere.attachments = reconciled.unseen,
+        Ok(reconciled) => {
+            wrote |= reconciled.changed > 0;
+            elsewhere.attachments = reconciled.unseen;
+        }
         Err(e) => {
             let _ = store.rollback().await;
             return Err(e);
@@ -1808,7 +1814,7 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
                 .swap_host_move(domain, read_text.as_deref(), next.as_ref())
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => wrote = true,
                 Ok(false) => {
                     let _ = store.rollback().await;
                     return Err(IndexError::HostMoveChanged(format!(
@@ -1850,9 +1856,13 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     // the same transaction. Unconditional, which is what delivers
     // populate-on-next-sync: a domain that has never synced under this feature
     // gains its aliases on its first sync, and a removed section clears them.
-    if let Err(e) = refresh_tag_aliases(store, domain).await {
-        let _ = store.rollback().await;
-        return Err(e);
+    // A map that already says what the MANIFEST says is not written.
+    match refresh_tag_aliases(store, domain).await {
+        Ok(replaced) => wrote |= replaced,
+        Err(e) => {
+            let _ = store.rollback().await;
+            return Err(e);
+        }
     }
 
     // The rebuild this scan was the disk half of is complete: clear its marker
@@ -1876,8 +1886,21 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         return Err(e);
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = store.record_sync(domain, &now).await {
+    // A sync that changed nothing leaves the stamp as it is, unless the
+    // domain has none yet or it is older than the refresh interval, so an
+    // idle domain synced on every watcher flush writes it at most once per
+    // interval; see `Store::record_sync`.
+    wrote |= !report.changes.is_empty()
+        || report.added + report.updated + report.deleted + report.moved > 0
+        || report.reflections_changed > 0
+        || report.relations_resolved + report.links_resolved > 0
+        || ends_rebuild;
+    let now = chrono::Utc::now();
+    let refresh_before = (now - SYNC_STAMP_REFRESH).to_rfc3339();
+    if let Err(e) = store
+        .record_sync(domain, &now.to_rfc3339(), wrote, &refresh_before)
+        .await
+    {
         let _ = store.rollback().await;
         return Err(e);
     }
@@ -1886,6 +1909,13 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
 }
+
+/// How old a domain's sync stamp may grow before a sync that changed nothing
+/// writes it again: one hour. A sync that changed nothing writes nothing else,
+/// so this bounds an idle domain to one small write per hour, and keeps the
+/// stamp a reader without the engine's memory sees (a daemonless `status`, a
+/// domain another instance hosts) at most this stale after a sync.
+pub const SYNC_STAMP_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// A hold inside the apply, after the walker check and the read of the host
 /// move and before any row is written, for the tests that land a claim or a
@@ -2397,7 +2427,10 @@ struct Reconciled {
 /// unparseable MANIFEST folds to no pairs, so the rows are cleared and a removed
 /// section takes effect on the next sync. The store never parses markdown: the
 /// pairs are folded here in the format layer and handed over already lowercased.
-pub async fn refresh_tag_aliases<S: Store + ?Sized>(store: &S, domain: DomainId) -> Result<()> {
+///
+/// Answers whether it wrote: rows that already match the MANIFEST are left
+/// alone.
+pub async fn refresh_tag_aliases<S: Store + ?Sized>(store: &S, domain: DomainId) -> Result<bool> {
     let pairs = match store.engram_content(domain, "MANIFEST.md").await? {
         Some(content) => crystalline_core::tag_alias_pairs(&content),
         None => Vec::new(),

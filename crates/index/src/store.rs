@@ -248,6 +248,25 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
     )
 }
 
+/// Whether [`resolve_pending_sql`] would bind any row of one reference table
+/// in one domain: the same predicate as a read, which stops at the first row.
+///
+/// Turso asks this before the update. An `UPDATE` of `to_id` (an indexed
+/// column) is backed by an ephemeral table in turso_core 0.8.x, which creates
+/// a temporary directory on disk as the statement opens, whether or not a row
+/// matches; the resolve pass runs on every sync, and almost every time it
+/// binds nothing. This read needs no ephemeral table, so a pass with nothing
+/// to bind touches neither the database nor the temporary folder.
+#[doc(hidden)]
+pub fn resolve_pending_probe_sql(table: &str, placeholder: &str) -> String {
+    format!(
+        "SELECT 1 FROM {table} \
+         WHERE {table}.to_id IS NULL AND {table}.domain_id = {placeholder} \
+         AND {resolved} IS NOT NULL LIMIT 1",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
 /// The unbind a base write runs, one statement per reference table, when the
 /// engram it writes carries a title that a `[[C# Basics]]` reference may name
 /// whole: every row whose whole text (`to_whole`) is that title, whose target
@@ -502,6 +521,22 @@ pub(crate) fn spelling_plan(spellings: &[(String, DomainId)]) -> Result<Spelling
             .collect(),
         scope,
     })
+}
+
+/// The tag-alias rows [`Store::replace_tag_aliases`] leaves for `pairs`: the
+/// first canonical listed for each alias, as the insert that ignores a
+/// duplicate alias keeps it. A store compares its rows with this before it
+/// writes, so a refresh of an unchanged map writes nothing.
+pub(crate) fn wanted_tag_aliases(
+    pairs: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut wanted = std::collections::BTreeMap::new();
+    for (alias, canonical) in pairs {
+        wanted
+            .entry(alias.clone())
+            .or_insert_with(|| canonical.clone());
+    }
+    wanted
 }
 
 /// Every spelling whose mapping differs between two snapshots of the spelling
@@ -3248,9 +3283,13 @@ pub trait Store: Send + Sync {
     /// then inserts each pair, ignoring a duplicate alias. Called by
     /// [`crate::sync::refresh_tag_aliases`] on every sync, so an empty slice
     /// clears the domain's aliases. Both sides are already lowercased by the
-    /// caller; the store never parses markdown.
-    async fn replace_tag_aliases(&self, domain: DomainId, pairs: &[(String, String)])
-    -> Result<()>;
+    /// caller; the store never parses markdown. Rows that already say exactly
+    /// this are left alone and nothing is written; answers whether it wrote.
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<bool>;
 
     /// The distinct folded `(alias, canonical)` tag-alias pairs, optionally
     /// scoped to a set of domain names, ordered by alias then canonical. An
@@ -3735,8 +3774,22 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
-    /// Record that a domain finished syncing at the given RFC 3339 instant.
-    async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
+    /// Record that a sync of a domain finished at the given RFC 3339 instant.
+    /// `changed` is whether the sync wrote anything. A sync that changed
+    /// nothing stamps the domain only when it carries no stamp yet (so the
+    /// first sync of an empty domain still reads as synced) or when its stamp
+    /// is older than `refresh_before`, so an idle domain synced on every
+    /// watcher flush writes its stamp at most once per refresh interval
+    /// ([`crate::SYNC_STAMP_REFRESH`]) and the stamp is never older
+    /// than that interval after a sync. An engine that wants the exact time
+    /// of its last sync keeps it in memory.
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()>;
 
     /// Record that every named domain was seen registered at the given RFC
     /// 3339 instant, writing `last_registered` on each matching row.

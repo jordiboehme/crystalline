@@ -213,7 +213,7 @@ impl Engine {
                 "engrams": s.map(|d| d.engrams),
                 "observations": s.map(|d| d.observations),
                 "relations": s.map(|d| d.relations),
-                "last_sync": s.and_then(|d| d.last_sync.clone()),
+                "last_sync": self.last_sync_of(name, s.and_then(|d| d.last_sync.as_deref())),
                 // Whether this domain is private, so a client badges the row it
                 // already has instead of asking after each one. Every domain a
                 // caller may not read was dropped above, so this only ever says

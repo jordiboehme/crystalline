@@ -3887,3 +3887,38 @@ both_backends!(
     doctor_fix_leaves_a_held_old_name_alone,
     doctor_fix_leaves_a_held_old_name_alone_body
 );
+
+/// The time of the last sync the engine keeps in memory follows the domain:
+/// a rename moves it off the old name, and a removal drops it, so a domain
+/// later added under either name does not show a sync it never had.
+async fn the_last_sync_kept_in_memory_follows_a_rename_and_a_removal_body(
+    store: Arc<Mutex<dyn Store>>,
+) {
+    let m = machine(store).await;
+    let engine = m.engine(true).await;
+    engine.sync(None).await.unwrap();
+    assert!(engine.last_synced_here("eng").is_some());
+
+    engine
+        .rename_domain_local(
+            "eng",
+            "platform",
+            NameOrigin::Explicit,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.last_synced_here("eng"), None, "the old name is gone");
+    assert!(engine.last_synced_here("platform").is_some());
+
+    engine
+        .unregister_domain("platform", &Scope::Unrestricted, false, &[])
+        .await
+        .unwrap();
+    assert_eq!(engine.last_synced_here("platform"), None);
+}
+
+both_backends!(
+    the_last_sync_kept_in_memory_follows_a_rename_and_a_removal,
+    the_last_sync_kept_in_memory_follows_a_rename_and_a_removal_body
+);

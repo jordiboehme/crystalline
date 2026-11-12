@@ -19,6 +19,7 @@ mod embed_tick;
 mod engine_writes;
 mod file_stamps;
 mod graph;
+mod idle_sync;
 mod index_files;
 mod layout_guard;
 mod line_endings;

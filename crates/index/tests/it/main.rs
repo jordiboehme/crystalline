@@ -10,6 +10,7 @@ mod contradictions;
 mod disclosures;
 mod embed;
 mod embed_model;
+mod idle_sync;
 mod lead_vectors;
 mod nli_model;
 mod perf;
