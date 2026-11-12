@@ -1479,7 +1479,9 @@ async fn mcp_ctx_built(
     let mut built = Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
         // An empty temp directory, so nothing here ever reads the developer's
         // real OS keychain looking for a GitHub credential.
-        .with_token_store_dir(root.join("tokens"));
+        .with_token_store_dir(root.join("tokens"))
+        // Origin state under the test's own folder, never the machine's.
+        .with_origins_dir(root.join("origins"));
     if let Some(mock) = &mock {
         built = built.with_origin_provider(mock.clone());
     }
@@ -2462,9 +2464,7 @@ fn without_name(raw: &str, name: &str) -> String {
 /// an unregistered name through to an unscoped lookup, whose refusal listed
 /// every registered domain, private ones included. So a typo read back the
 /// name of `lab`, which this caller is not shown anywhere else. `origin_status`
-/// is pinned beside them; `update_domain` refuses this editor on its role
-/// before it reads a name, see
-/// [`update_domain_needs_the_admin_role_the_sync_route_needs`].
+/// and `update_domain` are pinned beside them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
     let ctx = mcp_team_ctx().await;
@@ -2483,6 +2483,7 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
             serde_json::json!({ "paths": ["lab-note.md"] }),
         ),
         ("origin_status", serde_json::json!({})),
+        ("update_domain", serde_json::json!({})),
     ] {
         let ask = |name: &str| {
             let mut arguments = extra.clone();
@@ -2507,68 +2508,113 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
     }
 }
 
-/// **`update_domain` needs the role `POST /api/v1/domains/{domain}/sync`
-/// needs.** The JSON API lets only an admin pull a team domain's origin on
-/// demand, so an editor's or a viewer's agent is refused the same pull over
-/// MCP. The role is checked before the name, so a hidden domain and an unknown
-/// one get the same refusal, and nothing is pulled into a domain either way.
-/// An admin passes the role gate and is answered on the name.
+/// Give `lab` an origin state with one open proposal carrying a reviewer's
+/// comment, checked at a fixed time: what a pull leaves behind.
+fn seed_lab_feedback(ctx: &VisibilityCtx) {
+    let mut state = crystalline_remote::state::OriginState::new("acme/lab", "main");
+    state.last_checked = Some(
+        chrono::DateTime::parse_from_rfc3339("2026-11-01T09:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    state.proposals.push(
+        serde_json::from_value(serde_json::json!({
+            "number": 7,
+            "url": "https://github.com/acme/lab/pull/7",
+            "branch": "crystalline/share-7",
+            "title": "Share lab notes",
+            "created_at": "2026-10-30T08:00:00Z",
+            "status": "Open",
+            "files": [],
+            "review_state": "changes_requested",
+            "feedback": [{
+                "author": "ana",
+                "body": "needs a source",
+                "path": null,
+                "line": null,
+                "submitted_at": "2026-10-31T10:00:00Z",
+                "kind": "comment"
+            }]
+        }))
+        .unwrap(),
+    );
+    state
+        .save(&ctx.tmp.path().join("origins").join("lab"))
+        .unwrap();
+}
+
+/// **`update_domain` hands review feedback to a reader, and only an admin's
+/// call starts a pull.** `POST /api/v1/domains/{domain}/sync` is admin only,
+/// so an editor's or a viewer's agent may not start the same pull over MCP.
+/// It still gets the reviewers' comments: the call reads what the last pull
+/// stored, says nothing was pulled and when the repository was last checked,
+/// and never reaches the forge. An admin's call pulls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_domain_needs_the_admin_role_the_sync_route_needs() {
-    let ctx = mcp_team_ctx().await;
+async fn update_domain_shows_a_reader_the_feedback_and_pulls_only_for_an_admin() {
+    let ctx = mcp_team_ctx_with_forge().await;
     ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Editor)
         .await;
+    ctx.add_member(
+        "lab",
+        "looker",
+        crystalline_service::rest::MemberLevel::Viewer,
+    )
+    .await;
+    seed_lab_feedback(&ctx);
     let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
-
-    for who in ["mem", "out", "looker"] {
+    for who in ["mem", "looker"] {
         let session = McpTestSession::open(&ctx.addr, Some(&ctx.token_for(who).await)).await;
-        let named = session
-            .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
-            .await;
-        let unknown = session
-            .call_tool("update_domain", serde_json::json!({ "domain": "nope" }))
-            .await;
-        let sweep = session
-            .call_tool("update_domain", serde_json::json!({}))
-            .await;
-        assert!(
-            named.contains("reserved for an instance admin"),
-            "{who} is refused on the role:\n{named}"
-        );
-        // The tool text only: the raw answers differ in their date and
-        // stream event id.
-        let text = |answer: &str| {
-            answer
-                .split("\"text\":")
-                .nth(1)
-                .and_then(|rest| rest.split("\"}").next())
-                .map(str::to_string)
-        };
-        assert_eq!(
-            text(&named),
-            text(&unknown),
-            "{who}: a name changes nothing in the answer"
-        );
-        assert_eq!(
-            text(&named),
-            text(&sweep),
-            "{who}: and neither does naming none"
-        );
-        assert!(!named.contains("lab"), "{who}: the refusal names no domain");
+        for args in [
+            serde_json::json!({ "domain": "lab" }),
+            serde_json::json!({}),
+        ] {
+            let answer = session.call_tool("update_domain", args.clone()).await;
+            assert!(
+                answer.contains("needs a source"),
+                "{who} {args}: the comment text is there:\n{answer}"
+            );
+            assert!(
+                answer.contains("only an instance admin can start a new pull")
+                    && answer.contains("2026-11-01T09:30:00Z"),
+                "{who} {args}: the answer says nothing was pulled, and since when:\n{answer}"
+            );
+            // A pull would have gone to the forge double, which holds no
+            // repository, and come back as an error row (see the admin below).
+            assert!(
+                !answer.contains("Could not find the GitHub repository"),
+                "{who} {args}: no pull was started:\n{answer}"
+            );
+        }
     }
     assert_eq!(
         std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
         before,
-        "nothing was pulled"
+        "nothing was pulled into the folder"
     );
 
+    // A caller that may not read the domain is answered as before: a hidden
+    // name is an unregistered one.
+    let out = McpTestSession::open(&ctx.addr, Some(&ctx.token_for("out").await)).await;
+    let hidden = out
+        .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(hidden.contains("not registered"), "{hidden}");
+    assert!(!hidden.contains("needs a source"), "{hidden}");
+
+    // The admin's call starts the pull.
     let boss = McpTestSession::open(&ctx.addr, Some(&ctx.token_for("boss").await)).await;
-    let unknown = boss
-        .call_tool("update_domain", serde_json::json!({ "domain": "nope" }))
+    let pulled = boss
+        .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
         .await;
     assert!(
-        unknown.contains("not registered") && !unknown.contains("instance admin"),
-        "an admin passes the role gate and is answered on the name:\n{unknown}"
+        !pulled.contains("only an instance admin can start a new pull"),
+        "{pulled}"
+    );
+    // The forge double holds no repository, so the pull it started comes
+    // back as that domain's error row: proof the call went to the forge.
+    assert!(
+        pulled.contains("Could not find the GitHub repository acme/lab"),
+        "the admin's call started a pull: {pulled}"
     );
 }
 

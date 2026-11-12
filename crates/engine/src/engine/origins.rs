@@ -1182,6 +1182,77 @@ impl Engine {
         Ok(json!({ "domains": domains, "errors": errors }))
     }
 
+    /// The review feedback `origin_update` would hand back, read from what the
+    /// last pull stored, with no pull: for a caller that may read the domain
+    /// but may not start a pull (an account without the instance admin role,
+    /// see `update_domain` over MCP, which mirrors the admin-only
+    /// `POST /api/v1/domains/{domain}/sync`).
+    ///
+    /// The same targets and the same hidden-domain rule as `origin_update`,
+    /// and the same `open_proposals` rows, feedback included, so an agent
+    /// reads one shape either way. Each row says it is stored (`pulled:
+    /// false`), when the team's repository was last checked, and in `note`
+    /// that only an admin can start a new pull. Nothing touches the network,
+    /// the files or the index.
+    pub async fn origin_feedback(
+        &self,
+        domain: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
+        }
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
+        let mut domains = Vec::new();
+        let mut errors = Vec::new();
+        for (name, entry) in targets {
+            let state = self
+                .origin_spec_for(&name, &entry)
+                .and_then(|(_, _, state_dir)| {
+                    crystalline_remote::state::OriginState::load(&state_dir).map_err(Into::into)
+                });
+            match state {
+                Ok(state) => {
+                    let checked = state.as_ref().and_then(|s| s.last_checked);
+                    let open_proposals: Vec<Value> = state
+                        .as_ref()
+                        .map(|s| {
+                            s.proposals
+                                .iter()
+                                .filter(|p| {
+                                    p.status == crystalline_remote::state::ProposalStatus::Open
+                                })
+                                .map(|p| serde_json::to_value(p).expect("a proposal serializes"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let note = match checked {
+                        Some(at) => format!(
+                            "Showing the review feedback stored at the last check of the team's \
+                             repository, at {}. Nothing was pulled: only an instance admin can \
+                             start a new pull. The server also pulls on its own schedule.",
+                            at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        ),
+                        None => "The team's repository has not been checked yet, so there is no \
+                                 stored review feedback. Nothing was pulled: only an instance \
+                                 admin can start a pull. The server also pulls on its own schedule."
+                            .to_string(),
+                    };
+                    domains.push(json!({
+                        "domain": name,
+                        "pulled": false,
+                        "last_checked": checked,
+                        "open_proposals": open_proposals,
+                        "note": note,
+                    }));
+                }
+                Err(e) => errors.push(json!({ "domain": name, "error": row_error(scope, &e) })),
+            }
+        }
+        Ok(json!({ "domains": domains, "errors": errors }))
+    }
+
     /// Pulls and syncs one domain, under its origin lock. The per-domain body
     /// behind `origin_update`'s aggregate loop.
     pub(super) async fn origin_update_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {

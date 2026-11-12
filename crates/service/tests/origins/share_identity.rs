@@ -2015,18 +2015,21 @@ async fn a_github_link_asked_by_an_editor_reads_plain_words() {
 }
 
 /// The same sentences on the verbs an editor runs every day: a share refuses
-/// with them, and `update_domain`, which needs the admin role, refuses an
-/// editor in plain words before it reaches the App. An admin's pull keeps the
-/// fix.
+/// with them. `update_domain` never reaches the App for an editor, since only
+/// an admin's call pulls: the editor reads the stored feedback, and its answer
+/// carries no admin detail either. An admin's pull keeps the fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_verbs_an_editor_runs_read_plain_words_about_the_app() {
     for app in [App::Refused, App::Locked] {
         let (_fx, editor, admin) = editor_and_admin(app, true).await;
-        no_admin_detail(&said(
+        let read = said(
             editor
                 .call("update_domain", json!({ "domain": "kb" }))
                 .await,
-        ));
+        );
+        assert!(read.contains("Nothing was pulled"), "{read}");
+        assert!(!read.contains("crystalline "), "{read}");
+        assert!(!read.contains("github.api_url"), "{read}");
         // The gate answers first here, in its own plain words.
         let share = said(
             editor
