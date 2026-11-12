@@ -121,6 +121,8 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
   - `origins/`, the state of team domains (with the recorded ids of each repository connected through a GitHub App), and `origins/github-token.json` (plus `origins/github-token-personal-<name>.json` for personal GitHub identities and linked GitHub accounts, and `origins/github-app.json` for a GitHub App) only when the OS keychain cannot be used (on Windows these files get no extra access restriction; on macOS and Linux they are readable by the owner only). A GitHub App saved in the keychain leaves `origins/github-app.present`, which holds only the GitHub host;
   - `overlays/`, the review-mode drafts;
   - `instance-id`, `installs.json` and `hooks/maintenance.json`.
+
+  On macOS and Linux the state folder is readable by its owner only (mode `0700`), and so are both databases with their `-wal` and `-shm` files and `daemon.log` (mode `0600`). The daemon sets these modes when it starts, so an older install is tightened on its first start after an upgrade. On Windows nothing is changed.
 - The GitHub tokens and a saved GitHub App are otherwise kept in the OS keychain (Credential Manager on Windows). An App from the `CRYSTALLINE_GITHUB_APP_*` variables is never written down, and the App's installation tokens are kept in memory only.
 
 Nothing is encrypted at rest. Use disk encryption.

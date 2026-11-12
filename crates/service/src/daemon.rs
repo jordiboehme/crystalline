@@ -415,6 +415,15 @@ pub async fn run_serve(
             tracing::warn!("{line}");
         }
     }
+    // The state folder holds the index, the accounts database and the log,
+    // none of which another account on this machine may read: owner-only on
+    // Unix, tightened here for an install from before that rule. Best effort,
+    // since a folder this process cannot change must not stop the start.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        for problem in crystalline_core::owner_only::secure_state_dir(&state) {
+            tracing::warn!("{problem}");
+        }
+    }
     // Record what this invocation asked to serve before anything can fail on
     // the lock: the refusal below needs it, and so do the record and /health.
     crate::instance::record_serve_intent(crate::instance::ServeIntent {

@@ -1446,6 +1446,12 @@ impl AuthStore {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let db = open_database(path).await?;
+        // Password and token hashes: owner-only on Unix, including a database
+        // that was just created at the umask's mode. Best effort, like the
+        // state folder itself.
+        if let Err(e) = crystalline_core::owner_only::tighten_database(path) {
+            tracing::warn!("could not make {} owner-only: {e}", path.display());
+        }
         let conn = db.connect().context("connecting to the auth database")?;
         // The CLI and the daemon write the same file. Wait rather than fail;
         // every transaction here is a single short statement.
