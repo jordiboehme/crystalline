@@ -67,6 +67,10 @@ pub(crate) enum Touched {
     /// These domain-relative, forward-slashed paths changed: each is read
     /// again whatever its stat says.
     Paths(Vec<String>),
+    /// No path in particular, as for the warm-up after start. Nothing is
+    /// forced and the memo is kept: the walk takes every file's stat, so a
+    /// file that changed is read again anyway.
+    Full,
 }
 
 impl Touched {
@@ -79,6 +83,7 @@ impl Touched {
     pub(crate) fn forced(self) -> Vec<String> {
         match self {
             Touched::Paths(paths) => paths,
+            Touched::Full => Vec::new(),
         }
     }
 }

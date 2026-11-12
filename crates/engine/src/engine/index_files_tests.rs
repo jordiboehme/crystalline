@@ -152,3 +152,31 @@ async fn the_memo_follows_a_rename_and_goes_with_the_domain() {
         .await;
     assert!(engine.index_memos.lock().unwrap().is_empty());
 }
+
+/// After a start whose sync found nothing changed, the memo is empty and a
+/// write would read every file; the warm-up fills it, so the first write
+/// reads only its own file.
+#[tokio::test]
+async fn after_the_warm_up_the_first_write_reads_only_its_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (engine, _root) = domain(tmp.path(), 30).await;
+    // What a restart leaves: no memo at all.
+    engine.index_memos.lock().unwrap().clear();
+    engine.warm_index_files().await;
+    assert_eq!(last_refresh(&engine, "notes").await.read, 31);
+
+    engine
+        .write_engram(&params("After the warm-up", "f2"))
+        .await
+        .unwrap();
+    let after = last_refresh(&engine, "notes").await;
+    assert_eq!((after.read, after.reused), (1, 31));
+
+    // Without the warm-up the first write pays for the whole domain.
+    engine.index_memos.lock().unwrap().clear();
+    engine
+        .write_engram(&params("Cold write", "f0"))
+        .await
+        .unwrap();
+    assert_eq!(last_refresh(&engine, "notes").await.read, 33);
+}

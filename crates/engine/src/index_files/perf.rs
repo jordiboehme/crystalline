@@ -339,6 +339,14 @@ async fn perf_index_write_engram() {
             "index.files {files}: first sync {:.0} ms",
             started.elapsed().as_secs_f64() * 1000.0
         );
+        if files {
+            let started = Instant::now();
+            engine.warm_index_files().await;
+            println!(
+                "index.files {files}: warm-up {:.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         // One write first, so the domain is warm before anything is timed.
         engine.write_engram(&write_params(1_000_000)).await.unwrap();
         let mut times = Vec::new();

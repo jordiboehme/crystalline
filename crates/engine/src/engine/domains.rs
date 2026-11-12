@@ -837,6 +837,23 @@ impl Engine {
         }
     }
 
+    /// Fill the index refresh memo of every file domain, so the first write
+    /// after a start reads only its own file instead of every concept file
+    /// of its domain. Since a sync that changed nothing skips the refresh,
+    /// the startup sync of an unchanged domain leaves the memo empty; this
+    /// is the pass that fills it. It is an ordinary refresh, so a listing
+    /// out of step with its folder is put right on the way. Callers run it
+    /// in the background after the startup sync: a write that arrives first
+    /// waits for the domain's pass and then finds the memo full.
+    pub async fn warm_index_files(&self) {
+        for (name, entry) in self.registered_domain_entries() {
+            if entry.is_virtual() {
+                continue;
+            }
+            self.refresh_index_files(&name, Touched::Full).await;
+        }
+    }
+
     // --- routing instructions ------------------------------------------------
 
     /// Recompute the cached virtual-domain routing bullets from the database.
