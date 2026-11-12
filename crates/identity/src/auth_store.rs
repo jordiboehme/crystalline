@@ -1373,24 +1373,29 @@ pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 /// refresh retries with the token it still holds. Without a window both look
 /// exactly like a stolen token coming back, and the grant was revoked about
 /// once a day. Inside the window such a token gets its own fresh pair (see
-/// [`RefreshOutcome::Reissued`]); after it the token is a replay and revokes
-/// the grant, as before. Sixty seconds is far longer than the gap between
-/// two parallel refreshes or a retry, and short enough that a copy of a token
-/// found later still trips the replay rule.
+/// [`RefreshOutcome::Reissued`]), at most [`OAUTH_REISSUES_PER_ROTATION`]
+/// times, and that pair then lives like any session; after the window, or
+/// past the cap, the token is a replay and revokes the grant, as before.
+/// Sixty seconds is far longer than the gap between two parallel refreshes
+/// or a retry, and short enough that a copy of a token found later still
+/// trips the replay rule.
 pub const OAUTH_REFRESH_GRACE_SECS: i64 = 60;
 
-/// How many live refresh tokens one grant may hold at once. Every answer
-/// inside [`OAUTH_REFRESH_GRACE_SECS`] adds one, so a client whose parallel
-/// sessions come and go would collect them without end. At every new token
-/// the oldest live ones past this number are deleted outright: presenting
-/// one later is an unknown token (the session signs in again), never a
-/// replay that would end the whole grant for the others.
-pub const OAUTH_LIVE_TOKENS_KEPT: i64 = 8;
+/// How many times one rotated refresh token may be answered with a pair of
+/// its own inside [`OAUTH_REFRESH_GRACE_SECS`]: one retry after a lost answer
+/// plus one parallel session. A further presentation inside the window is a
+/// replay and ends the grant. Without the cap a copy of the token could be
+/// presented again and again to mint any number of sessions.
+pub const OAUTH_REISSUES_PER_ROTATION: i64 = 2;
 
-/// How many rotated refresh tokens one grant remembers, newest first. They
-/// are what makes a replay detectable, also two or more rotations back; a
-/// token older than these is forgotten and reads as unknown.
-pub const OAUTH_RETIRED_TOKENS_KEPT: i64 = 8;
+/// How many live refresh tokens one grant may hold at once. A hard ceiling
+/// only: the reissue cap already keeps the set small, and a live token goes
+/// on its own once its thirty days pass. A reissue that would go past it is
+/// a replay and ends the grant; no session's live token is ever deleted to
+/// make room, so a flood of copies can never push the real session out.
+/// Sized for a client that leaves a couple of unused sessions behind every
+/// day for a month.
+pub const OAUTH_LIVE_TOKENS_MAX: i64 = 128;
 
 /// How long the record of an ended grant is listed on the account's
 /// Connected clients card, in seconds: seven days, long enough that a person
@@ -4285,6 +4290,17 @@ impl AuthStore {
             )
             .await
             .context("pruning ended oauth grant records")?;
+        // An account's records go with the account (`delete_oauth_grants_of`),
+        // but an older binary removes accounts without knowing this table, so
+        // records of an account that is gone are swept here too.
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_ended
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grant_ended.user)",
+                (),
+            )
+            .await
+            .context("pruning ended oauth grant records of removed accounts")?;
         Ok(removed as usize)
     }
 
@@ -4447,10 +4463,12 @@ impl AuthStore {
     /// for a grant's first pair. It is what the grace rule asks about later:
     /// a token whose successor has itself been rotated is past its grace.
     ///
-    /// Then the grant's token set is kept small: live tokens past their own
-    /// thirty days go, the live ones past [`OAUTH_LIVE_TOKENS_KEPT`] (oldest
-    /// first) are deleted outright, and only the newest
-    /// [`OAUTH_RETIRED_TOKENS_KEPT`] rotated ones are remembered.
+    /// Then the tokens that can never be presented with any effect again go:
+    /// live tokens past their own thirty days, and rotated tokens rotated
+    /// more than [`OAUTH_REFRESH_TTL_SECS`] ago. Pruning is by time only,
+    /// never by count: a rotated token is what makes a replay detectable, so
+    /// forgetting one early would turn a replay into an unknown token, and
+    /// deleting a live one would sign a session out.
     async fn mint_oauth_token(
         &self,
         id: i64,
@@ -4494,57 +4512,31 @@ impl AuthStore {
             )
             .await
             .context("pruning expired oauth tokens")?;
-        let live = self
-            .grant_token_hashes(
-                "SELECT refresh_hash FROM oauth_grant_token
-                 WHERE grant_id = ?1 AND rotated_at IS NULL
-                 ORDER BY issued_at DESC, rowid DESC",
-                id,
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token
+                 WHERE grant_id = ?1 AND rotated_at IS NOT NULL AND rotated_at <= ?2",
+                vec![
+                    Value::Integer(id),
+                    Value::Integer(now - OAUTH_REFRESH_TTL_SECS),
+                ],
             )
-            .await?;
-        let retired = self
-            .grant_token_hashes(
-                "SELECT refresh_hash FROM oauth_grant_token
-                 WHERE grant_id = ?1 AND rotated_at IS NOT NULL
-                 ORDER BY rotated_at DESC, rowid DESC",
-                id,
-            )
-            .await?;
-        let surplus = live
-            .iter()
-            .skip(OAUTH_LIVE_TOKENS_KEPT as usize)
-            .chain(retired.iter().skip(OAUTH_RETIRED_TOKENS_KEPT as usize));
-        for hash in surplus {
-            self.conn
-                .execute(
-                    "DELETE FROM oauth_grant_token WHERE refresh_hash = ?1",
-                    vec![Value::Text(hash.clone())],
-                )
-                .await
-                .context("pruning old oauth tokens")?;
-        }
+            .await
+            .context("pruning old rotated oauth tokens")?;
         Ok(())
     }
 
-    /// The refresh hashes one `SELECT refresh_hash ... WHERE grant_id = ?1`
-    /// statement answers, in its order.
-    async fn grant_token_hashes(&self, sql: &str, id: i64) -> Result<Vec<String>> {
-        let mut rows = self
-            .conn
-            .query(sql, vec![Value::Integer(id)])
-            .await
-            .context("reading an oauth grant's tokens")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .context("reading an oauth grant's tokens")?
+    /// One `SELECT COUNT(*)` over `oauth_grant_token`. Fails closed: a count
+    /// that cannot be read must not read as room for one more session.
+    async fn count_tokens(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
+        match self
+            .query_first(sql, params)
+            .await?
+            .map(|row| row.get_value(0))
         {
-            if let Some(hash) = cell_text(&row, 0) {
-                out.push(hash);
-            }
+            Some(Ok(Value::Integer(n))) => Ok(n),
+            _ => bail!("the oauth tokens of a grant could not be counted"),
         }
-        Ok(out)
     }
 
     /// Present a refresh token: it rotates, it gets a pair of its own inside
@@ -4577,21 +4569,29 @@ impl AuthStore {
     ///    an enabled account: it is rotated. It is marked rotated now, its
     ///    access token dies on the spot, and a new pair is minted from it
     ///    ([`RefreshOutcome::Rotated`]).
-    /// 2. **Rotated less than [`OAUTH_REFRESH_GRACE_SECS`] ago**, and no token
-    ///    minted from it has itself been rotated since: it gets a new pair of
-    ///    its own ([`RefreshOutcome::Reissued`]). The pair the first rotation
-    ///    handed out stays live too, so two parallel sessions both keep
-    ///    working. It still has to be this client's grant on an enabled
-    ///    account inside its window, the same checks the live branch makes.
+    /// 2. **Rotated 0 to 59 seconds ago** ([`OAUTH_REFRESH_GRACE_SECS`]), and
+    ///    no token minted from it has itself been rotated since: it gets a new
+    ///    pair of its own ([`RefreshOutcome::Reissued`]), at most
+    ///    [`OAUTH_REISSUES_PER_ROTATION`] times per rotated token and only
+    ///    while the grant holds fewer than [`OAUTH_LIVE_TOKENS_MAX`] live
+    ///    tokens. The pair the first rotation handed out stays live too, so
+    ///    two parallel sessions both keep working, and the new pair then lives
+    ///    like any session. It still has to be this client's grant on an
+    ///    enabled account inside its window, the same checks the live branch
+    ///    makes.
     /// 3. **Any other rotated token** is a replay and revokes the whole grant
-    ///    ([`RefreshOutcome::Replayed`]): one that came back after the window,
-    ///    one presented by another client, and one whose successor has been
-    ///    rotated in its turn. The last is the token two rotations back: a
-    ///    client that has already refreshed again from the answer does not
-    ///    need the old token any more, so its return is evidence of a copy,
-    ///    even inside the sixty seconds.
-    /// 4. Anything else, a forgotten token among them, is
-    ///    [`RefreshOutcome::Unknown`].
+    ///    ([`RefreshOutcome::Replayed`]): one that came back after the window
+    ///    or with a rotation time in the future (a clock stepped back), one
+    ///    presented by another client, one presented again past the reissue
+    ///    cap or into a full live set, and one whose successor (or a sibling
+    ///    minted from it inside the window) has been rotated in its turn. The
+    ///    last is the token two rotations back: a client that has already
+    ///    refreshed again from the answer does not need the old token any
+    ///    more, so its return is evidence of a copy, even inside the sixty
+    ///    seconds. Rotated tokens are remembered for thirty days after their
+    ///    rotation, whatever the count, so a long chain of rotations never
+    ///    makes a stolen token forgotten.
+    /// 4. Anything else is [`RefreshOutcome::Unknown`].
     ///
     /// Each new pair gets [`OAUTH_ACCESS_TTL_SECS`] for its access token and
     /// [`OAUTH_REFRESH_TTL_SECS`] for its refresh token from `now`, and the
@@ -4700,7 +4700,10 @@ impl AuthStore {
                 )
                 .await?
                 .is_some();
-            if since_rotation < OAUTH_REFRESH_GRACE_SECS && !successor_rotated {
+            // A negative age (the clock stepped back) is outside the window,
+            // not a window that never closes.
+            let in_window = (0..OAUTH_REFRESH_GRACE_SECS).contains(&since_rotation);
+            if in_window && !successor_rotated {
                 let grant = self
                     .query_first(
                         "SELECT g.client_id, g.resource, g.refresh_expires_at, u.disabled
@@ -4724,13 +4727,34 @@ impl AuthStore {
                         outcome = RefreshOutcome::WrongTarget;
                         return Ok(());
                     }
-                    self.mint_oauth_token(id, &pair, Some(&presented), now)
+                    // Every pair minted from this token, the rotation's own
+                    // included, and every live token of the grant. Past
+                    // either cap the presentation is a replay below: a copy
+                    // presented over and over never mints a third session,
+                    // and never pushes a real one out.
+                    let minted = self
+                        .count_tokens(
+                            "SELECT COUNT(*) FROM oauth_grant_token WHERE rotated_from = ?1",
+                            vec![Value::Text(presented.clone())],
+                        )
                         .await?;
-                    outcome = RefreshOutcome::Reissued {
-                        grant: pair.issued(id),
-                        since_rotation,
-                    };
-                    return Ok(());
+                    let live = self
+                        .count_tokens(
+                            "SELECT COUNT(*) FROM oauth_grant_token
+                             WHERE grant_id = ?1 AND rotated_at IS NULL
+                               AND refresh_expires_at > ?2",
+                            vec![Value::Integer(id), Value::Integer(now)],
+                        )
+                        .await?;
+                    if minted <= OAUTH_REISSUES_PER_ROTATION && live < OAUTH_LIVE_TOKENS_MAX {
+                        self.mint_oauth_token(id, &pair, Some(&presented), now)
+                            .await?;
+                        outcome = RefreshOutcome::Reissued {
+                            grant: pair.issued(id),
+                            since_rotation,
+                        };
+                        return Ok(());
+                    }
                 }
             }
             // A token whose grant is already gone (an orphan the prune has
@@ -12039,12 +12063,102 @@ mod tests {
         assert_eq!(count_rows(&store, "oauth_grants").await, 0);
     }
 
-    /// Every answer inside the window adds a live token, so the set is kept
-    /// small: past `OAUTH_LIVE_TOKENS_KEPT` the oldest live tokens are
-    /// deleted outright (an unknown token later, never a replay), and only
-    /// `OAUTH_RETIRED_TOKENS_KEPT` rotated ones are remembered.
+    /// The live refresh tokens of a grant, counted in the database.
+    async fn live_tokens(store: &AuthStore) -> i64 {
+        store
+            .count_tokens(
+                "SELECT COUNT(*) FROM oauth_grant_token WHERE rotated_at IS NULL",
+                vec![],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Whether the row of `refresh_token` is still in the database.
+    async fn token_row_exists(store: &AuthStore, refresh_token: &str) -> bool {
+        store
+            .query_first(
+                "SELECT 1 FROM oauth_grant_token WHERE refresh_hash = ?1",
+                vec![Value::Text(token_hash(refresh_token))],
+            )
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// A copy of one rotated token presented over and over inside the window
+    /// gets at most two pairs of its own (a retry and a parallel session);
+    /// the third presentation is a replay that ends the grant. At no point is
+    /// a session's live token deleted to make room, so the real session is
+    /// never pushed out while the copy keeps the grant.
     #[tokio::test]
-    async fn a_grant_keeps_a_bounded_set_of_tokens() {
+    async fn a_flood_of_copies_inside_the_window_revokes_and_evicts_nobody() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(real) = store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap()
+        else {
+            panic!("a live refresh token rotates");
+        };
+        let mut copies = Vec::new();
+        for i in 1..=OAUTH_REISSUES_PER_ROTATION {
+            match store
+                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + i)
+                .await
+                .unwrap()
+            {
+                RefreshOutcome::Reissued { grant, .. } => copies.push(grant),
+                other => panic!("presentation {i} inside the window is reissued, got {other:?}"),
+            }
+            assert!(
+                token_row_exists(&store, &real.refresh_token).await,
+                "the real session's token is never deleted"
+            );
+            assert!(
+                store
+                    .oauth_access_user(&real.access_token, OAUTH_RESOURCE)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(live_tokens(&store).await, 1 + OAUTH_REISSUES_PER_ROTATION);
+
+        match store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 5)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed {
+                grant,
+                since_rotation,
+            } => {
+                assert_eq!(grant, issued.id);
+                assert_eq!(since_rotation, 5);
+            }
+            other => panic!("the third copy inside the window is a replay, got {other:?}"),
+        }
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+        assert_eq!(
+            store.list_ended_oauth_grants("ada").await.unwrap()[0]
+                .ended
+                .as_ref()
+                .map(|e| e.reason),
+            Some(OauthGrantEndReason::Replayed)
+        );
+    }
+
+    /// The live set has a hard ceiling, and reaching it never deletes a
+    /// session: a reissue into a full set is a replay.
+    #[tokio::test]
+    async fn a_reissue_into_a_full_live_set_is_a_replay() {
         let (_dir, store) = store().await;
         let client = oauth_cast(&store).await;
         let now = chrono::Utc::now().timestamp();
@@ -12056,52 +12170,52 @@ mod tests {
             .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
             .await
             .unwrap();
-        let mut siblings = Vec::new();
-        for i in 0..12 {
-            match store
-                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + i)
-                .await
-                .unwrap()
-            {
-                RefreshOutcome::Reissued { grant, .. } => siblings.push(grant),
-                other => panic!("inside the window, got {other:?}"),
-            }
-        }
-        let row = store
-            .query_first(
-                "SELECT COUNT(*) FROM oauth_grant_token WHERE rotated_at IS NULL",
-                vec![],
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(row.get_value(0), Ok(Value::Integer(n)) if n == OAUTH_LIVE_TOKENS_KEPT));
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant_at(
-                        &siblings[0].refresh_token,
-                        &client.client_id,
-                        None,
-                        now + 20
-                    )
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "a live token pushed out of the set is unknown, not a replay"
-        );
-        assert_eq!(count_rows(&store, "oauth_grants").await, 1);
-
-        let mut current = siblings.last().unwrap().clone();
-        for i in 0..12 {
-            match store
-                .refresh_oauth_grant_at(
-                    &current.refresh_token,
-                    &client.client_id,
-                    None,
-                    now + 30 + i,
+        // Sessions left behind earlier, written straight into the table.
+        for i in 1..OAUTH_LIVE_TOKENS_MAX {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO oauth_grant_token
+                         (refresh_hash, grant_id, access_hash, access_expires_at,
+                          refresh_expires_at, issued_at, rotated_at, rotated_from)
+                     VALUES (?1, ?2, NULL, 0, ?3, ?4, NULL, NULL)",
+                    vec![
+                        Value::Text(format!("filler{i}")),
+                        Value::Integer(issued.id),
+                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                        Value::Integer(now - 100),
+                    ],
                 )
+                .await
+                .unwrap();
+        }
+        assert_eq!(live_tokens(&store).await, OAUTH_LIVE_TOKENS_MAX);
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
+                .await
+                .unwrap(),
+            RefreshOutcome::Replayed { .. }
+        ));
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// Rotating a chain many times never makes an old token forgotten: the
+    /// rotated hashes are kept by time, not by count, so a token nine and more
+    /// rotations back is still a replay.
+    #[tokio::test]
+    async fn a_token_many_rotations_back_still_replays() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let mut current = issued.clone();
+        for i in 0..12 {
+            match store
+                .refresh_oauth_grant_at(&current.refresh_token, &client.client_id, None, now + i)
                 .await
                 .unwrap()
             {
@@ -12109,10 +12223,168 @@ mod tests {
                 other => panic!("a live token rotates, got {other:?}"),
             }
         }
+        assert_eq!(live_tokens(&store).await, 1);
+        assert_eq!(count_rows(&store, "oauth_grant_token").await, 13);
+        match store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 3600)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, issued.id),
+            other => panic!("a token twelve rotations back is a replay, got {other:?}"),
+        }
+    }
+
+    /// A rotated token is forgotten only once thirty days have passed since
+    /// its rotation, by which time its own window has closed as well.
+    #[tokio::test]
+    async fn a_rotated_token_is_forgotten_after_thirty_days() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap()
+        else {
+            panic!("a live refresh token rotates");
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grant_token SET rotated_at = ?2 WHERE refresh_hash = ?1",
+                vec![
+                    Value::Text(token_hash(&issued.refresh_token)),
+                    Value::Integer(now - OAUTH_REFRESH_TTL_SECS + 10),
+                ],
+            )
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(third) = store
+            .refresh_oauth_grant_at(&second.refresh_token, &client.client_id, None, now + 1)
+            .await
+            .unwrap()
+        else {
+            panic!("a live refresh token rotates");
+        };
         assert!(
-            count_rows(&store, "oauth_grant_token").await
-                <= OAUTH_LIVE_TOKENS_KEPT + OAUTH_RETIRED_TOKENS_KEPT
+            token_row_exists(&store, &issued.refresh_token).await,
+            "younger than thirty days: kept"
         );
+        store
+            .refresh_oauth_grant_at(&third.refresh_token, &client.client_id, None, now + 20)
+            .await
+            .unwrap();
+        assert!(
+            !token_row_exists(&store, &issued.refresh_token).await,
+            "thirty days after its rotation it is pruned"
+        );
+    }
+
+    /// The window of a rotated token closes once any pair minted from it has
+    /// been rotated, a sibling from inside the window included.
+    #[tokio::test]
+    async fn a_siblings_rotation_closes_the_window_for_its_parent() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap();
+        let RefreshOutcome::Reissued { grant: sibling, .. } = store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
+            .await
+            .unwrap()
+        else {
+            panic!("inside the window the token is reissued");
+        };
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(&sibling.refresh_token, &client.client_id, None, now + 2)
+                .await
+                .unwrap(),
+            RefreshOutcome::Rotated(_)
+        ));
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 3)
+                .await
+                .unwrap(),
+            RefreshOutcome::Replayed { .. }
+        ));
+    }
+
+    /// A clock stepped back makes the age negative, and a negative age is
+    /// outside the window rather than a window that never closes.
+    #[tokio::test]
+    async fn a_rotation_time_in_the_future_is_no_reissue() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap();
+        match store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now - 5)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { since_rotation, .. } => assert_eq!(since_rotation, -5),
+            other => panic!("a negative age is a replay, got {other:?}"),
+        }
+    }
+
+    /// The daemon and the CLI hold two store handles on one file; two
+    /// refreshes of one token through both at the same moment still get one
+    /// rotation and one reissue, and the grant lives.
+    #[tokio::test]
+    async fn parallel_refreshes_through_two_stores_on_one_file_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let daemon = AuthStore::open(&path).await.unwrap();
+        let cli = AuthStore::open(&path).await.unwrap();
+        let client = oauth_cast(&daemon).await;
+        let issued = daemon
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let (one, two) = tokio::join!(
+            daemon.refresh_oauth_grant(&issued.refresh_token, &client.client_id, None),
+            cli.refresh_oauth_grant(&issued.refresh_token, &client.client_id, None),
+        );
+        let outcomes = [one.unwrap(), two.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, RefreshOutcome::Rotated(_)))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| matches!(o, RefreshOutcome::Reissued { .. }))
+                .count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert_eq!(daemon.list_oauth_grants("ada").await.unwrap().len(), 1);
+        assert_eq!(cli.list_oauth_grants("ada").await.unwrap().len(), 1);
     }
 
     /// The record of an ended grant: written for a replay (above) and for an
@@ -12174,6 +12446,57 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The rotation time of a migrated predecessor is read off the access
+    /// token's issue. A predecessor rotated ten seconds before the upgrade is
+    /// inside the window afterwards and is reissued, not a replay.
+    #[tokio::test]
+    async fn a_migrated_predecessor_inside_the_window_is_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let previous = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let (id, client_id) = {
+            let store = AuthStore::open(&path).await.unwrap();
+            let client = oauth_cast(&store).await;
+            let now = chrono::Utc::now().timestamp();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO oauth_grants
+                         (user, client_id, resource, access_hash, access_expires_at,
+                          refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
+                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        Value::Text(client.client_id.clone()),
+                        Value::Text(OAUTH_RESOURCE.to_string()),
+                        Value::Text(token_hash("coa_current")),
+                        Value::Integer(now + OAUTH_ACCESS_TTL_SECS - 10),
+                        Value::Text(token_hash("cor_current")),
+                        Value::Text(token_hash(&previous)),
+                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .unwrap();
+            (store.conn.last_insert_rowid(), client.client_id)
+        };
+        let store = AuthStore::open(&path).await.unwrap();
+        let rotated_at = token_int(&store, &previous, "rotated_at").await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now - 12..=now - 8).contains(&rotated_at),
+            "the rotation time is the current access token's issue: {rotated_at} vs {now}"
+        );
+        match store
+            .refresh_oauth_grant(&previous, &client_id, None)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Reissued { grant, .. } => assert_eq!(grant.id, id),
+            other => panic!("inside the window after the upgrade, got {other:?}"),
+        }
     }
 
     /// A file written before 0.32.1 holds each grant's pair in `oauth_grants`
