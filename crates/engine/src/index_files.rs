@@ -328,9 +328,11 @@ fn collect(root: &Path, mode: ReflectionMode, memo: &mut ListingMemo, forced: &[
     // artifact folders the MANIFEST provisions from inside this root and,
     // while the Reflection is in effect, nothing under `reflections/`.
     let layout = DomainLayout::at(root, mode);
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !layout.prunes_dir(&slash_rel(root, e.path())));
+    // Only a folder is pruned here; a file the layout leaves out is
+    // classified as such below, so it costs no path string of its own.
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        e.depth() == 0 || !e.file_type().is_dir() || !layout.prunes_dir(&slash_rel(root, e.path()))
+    });
 
     for entry in walker.filter_map(Result::ok) {
         let Some(rel) = rel_path(root, entry.path()) else {
