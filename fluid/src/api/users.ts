@@ -42,7 +42,7 @@ export async function patchUser(
   return patched.user;
 }
 
-/** Replace a password, revoking the account's sessions. */
+/** Replace a password, revoking the account's sessions, MCP tokens and OAuth grants. */
 export async function resetPassword(
   name: string,
   password: string,

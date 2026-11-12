@@ -1152,7 +1152,8 @@ enum UsersCommand {
     /// List every account with its role, its Reflection level and whether it
     /// is disabled.
     List,
-    /// Replace an account's password.
+    /// Replace an account's password. Revokes its sessions, MCP tokens and
+    /// OAuth connections.
     Passwd {
         /// The account to change.
         name: String,
