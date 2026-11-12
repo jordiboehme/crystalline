@@ -120,9 +120,6 @@ fn refused(err: impl std::fmt::Display) {
     );
 }
 
-/// Every family of engram write on an instance that does not host the
-/// domain is refused while its host is live, names the host, and changes
-/// neither this disk nor the shared rows.
 /// A sync on the instance that already hosts the domain, under the lease it
 /// keeps and with a fresh heartbeat, does not claim the lock again: the lock
 /// row keeps its heartbeat, so an idle sync on every watcher flush does not
@@ -157,6 +154,45 @@ async fn a_sync_of_a_domain_already_hosted_here_does_not_claim_it_again_on_postg
     assert!(err.to_string().contains("inst-a"), "{err}");
 }
 
+/// An instance that asks for the lock and does not get it writes nothing:
+/// the domain row keeps the host's path, so the two instances do not write
+/// their own paths over each other on every sync.
+#[tokio::test]
+async fn a_refused_claim_leaves_the_hosts_path_on_postgres() {
+    let Some(p) = pair().await else {
+        return;
+    };
+    let path = || async {
+        let store = store_on(&p.scratch).await;
+        let store = store.lock().await;
+        store
+            .domain_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "eng")
+            .unwrap()
+            .path
+    };
+    let hosts = path().await;
+    assert_ne!(
+        hosts,
+        p.b_root.to_string_lossy(),
+        "the fixture paths differ"
+    );
+
+    p.beta.sync(Some("eng")).await.unwrap_err();
+    p.beta.sync(None).await.unwrap();
+    assert_eq!(path().await, hosts, "the refused instance wrote no path");
+
+    // Taking the lock over is what moves the row to the taker's path.
+    p.beta.sync_take_over(Some("eng"), true).await.unwrap();
+    assert_eq!(path().await, p.b_root.to_string_lossy());
+}
+
+/// Every family of engram write on an instance that does not host the
+/// domain is refused while its host is live, names the host, and changes
+/// neither this disk nor the shared rows.
 #[tokio::test]
 async fn a_live_host_refuses_every_engram_write_on_postgres() {
     let Some(p) = pair().await else { return };

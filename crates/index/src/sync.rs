@@ -1886,17 +1886,21 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         return Err(e);
     }
 
-    // The stamp says when a sync last changed the domain's index. A sync
-    // that changed nothing leaves it as it is (the first sync of a domain
-    // still stamps it), so an idle domain synced on every watcher flush
-    // writes nothing; see `Store::record_sync`.
+    // A sync that changed nothing leaves the stamp as it is, unless the
+    // domain has none yet or it is older than the refresh interval, so an
+    // idle domain synced on every watcher flush writes it at most once per
+    // interval; see `Store::record_sync`.
     wrote |= !report.changes.is_empty()
         || report.added + report.updated + report.deleted + report.moved > 0
         || report.reflections_changed > 0
         || report.relations_resolved + report.links_resolved > 0
         || ends_rebuild;
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = store.record_sync(domain, &now, wrote).await {
+    let now = chrono::Utc::now();
+    let refresh_before = (now - SYNC_STAMP_REFRESH).to_rfc3339();
+    if let Err(e) = store
+        .record_sync(domain, &now.to_rfc3339(), wrote, &refresh_before)
+        .await
+    {
         let _ = store.rollback().await;
         return Err(e);
     }
@@ -1905,6 +1909,13 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
 }
+
+/// How old a domain's sync stamp may grow before a sync that changed nothing
+/// writes it again: one hour. A sync that changed nothing writes nothing else,
+/// so this bounds an idle domain to one small write per hour, and keeps the
+/// stamp a reader without the engine's memory sees (a daemonless `status`, a
+/// domain another instance hosts) at most this stale after a sync.
+pub const SYNC_STAMP_REFRESH: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 
 /// A hold inside the apply, after the walker check and the read of the host
 /// move and before any row is written, for the tests that land a claim or a

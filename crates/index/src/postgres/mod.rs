@@ -1435,11 +1435,12 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
 #[doc(hidden)]
 pub const HOST_MOVE_SQL: &str = "SELECT host_move FROM domain WHERE id=$1";
 
-/// The sync stamp an apply writes when it changed the index, or when the
-/// domain has none yet: one primary-key seek. `$3` is whether it changed.
+/// The sync stamp an apply writes when it changed the index, when the domain
+/// has none yet, or when the one it has is older than `$4`: one primary-key
+/// seek. `$3` is whether it changed.
 #[doc(hidden)]
-pub const RECORD_SYNC_SQL: &str =
-    "UPDATE domain SET last_sync=$1 WHERE id=$2 AND ($3 OR last_sync IS NULL)";
+pub const RECORD_SYNC_SQL: &str = "UPDATE domain SET last_sync=$1 WHERE id=$2 \
+     AND ($3 OR last_sync IS NULL OR last_sync < $4)";
 
 /// The on-disk snapshot behind [`Store::file_stamps`].
 ///
@@ -1824,19 +1825,22 @@ impl Store for PostgresStore {
         // nothing then: the upsert below rewrites the row even when nothing
         // in it changes, and takes a value from the id sequence even when it
         // inserts nothing.
-        let existing: Option<(i64, Option<String>, String, bool)> = sqlx::query_as(
-            "SELECT d.id, d.path, d.kind, \
-             EXISTS(SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name) \
-             FROM domain d WHERE d.name=$1",
-        )
-        .bind(name)
-        .fetch_optional(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        if let Some((id, held_path, held_kind, spelled)) = existing
+        // Two point reads, as on turso.
+        let existing: Option<(i64, Option<String>, String)> =
+            sqlx::query_as("SELECT id, path, kind FROM domain WHERE name=$1")
+                .bind(name)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?;
+        if let Some((id, held_path, held_kind)) = existing
             && held_path.as_deref() == path
             && held_kind == kind_str(kind)
-            && spelled
+            && sqlx::query("SELECT 1 FROM domain_spelling WHERE spelling=$1")
+                .bind(name)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?
+                .is_some()
         {
             return Ok(DomainId(id));
         }
@@ -4091,12 +4095,19 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()> {
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()> {
         let mut conn = self.acquire().await?;
         sqlx::query(RECORD_SYNC_SQL)
             .bind(when)
             .bind(domain.0)
             .bind(changed)
+            .bind(refresh_before)
             .execute(conn.as_mut())
             .await
             .map_err(IndexError::from)?;

@@ -4013,6 +4013,20 @@ impl Engine {
         }
     }
 
+    /// Move the time of the last sync of `old` to `new`, for a rename.
+    pub(crate) fn rekey_last_synced(&self, old: &str, new: &str) {
+        let mut synced = self.last_synced.lock().unwrap();
+        if let Some(at) = synced.remove(old) {
+            synced.insert(new.to_string(), at);
+        }
+    }
+
+    /// The time this engine last finished a sync of `domain`, if it did.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn last_synced_here(&self, domain: &str) -> Option<String> {
+        self.last_synced.lock().unwrap().get(domain).cloned()
+    }
+
     /// When a domain was last synced, for the listing: the newer of the
     /// index's stamp, which only a sync that changed the domain moves, and
     /// the last sync this engine finished.
@@ -5509,9 +5523,20 @@ impl Engine {
         take_over: bool,
         to_watcher: bool,
     ) -> Result<HostClaim> {
-        let id = store
-            .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
-            .await?;
+        // The row is looked up, not written: on a shared database each
+        // instance keeps the domain at its own path, and an instance that
+        // does not get the lock must not write its path over the host's. A
+        // domain with no row yet is registered here, as the claim needs its
+        // id; the path is written only once the lock is this instance's.
+        let root_text = root.to_string_lossy();
+        let id = match store.domain_id(name).await? {
+            Some(id) => id,
+            None => {
+                store
+                    .upsert_domain(name, Some(&root_text), DomainKind::File)
+                    .await?
+            }
+        };
         let now = now_offset().to_rfc3339();
         let stale_before = (now_offset() - Duration::seconds(self.stale_secs)).to_rfc3339();
         // A long-running engine re-claims each domain it syncs, and a domain
@@ -5562,6 +5587,11 @@ impl Engine {
                 .await?
             }
         };
+        if claimed.claim.is_acquired() {
+            store
+                .upsert_domain(name, Some(&root_text), DomainKind::File)
+                .await?;
+        }
         // The claim's token is kept for the release, the newest one: every
         // claim writes a new token, a re-claim of a domain held here too
         // (unless it was answered from the row above, which keeps the token
@@ -8806,6 +8836,7 @@ impl Engine {
     /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
         self.forget_contradiction_domain(name);
+        self.last_synced.lock().unwrap().remove(name);
         self.bump_reflection_generation(name);
         self.discovered_domains.write().unwrap().remove(name);
         self.mark_names_stale();

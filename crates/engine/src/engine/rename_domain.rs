@@ -1834,6 +1834,7 @@ impl Engine {
                 leases.insert(new.to_string(), lease);
             }
         }
+        self.rekey_last_synced(old, new);
         self.origin_poller.rename_domain(old, new);
         {
             let mut routing = self.routing_virtual.write().unwrap();

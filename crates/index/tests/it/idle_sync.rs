@@ -28,7 +28,8 @@
 use std::path::{Path, PathBuf};
 
 use crystalline_index::{
-    ChunkParams, DomainKind, Store, TursoStore, apply_scan, scan_paths, sync_domain_with,
+    ChunkParams, DomainKind, SYNC_STAMP_REFRESH, Store, TursoStore, apply_scan, scan_paths,
+    sync_domain_with,
 };
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -178,6 +179,60 @@ async fn an_unchanged_targeted_sync_writes_nothing() {
     );
 
     edit_grows_the_log(&store, root.path(), &db).await;
+}
+
+/// A sync that changed nothing still refreshes a stamp older than
+/// [`SYNC_STAMP_REFRESH`], once, so a reader without the engine's memory
+/// never sees a stamp much older than the last sync; the next unchanged sync
+/// within the interval writes nothing again. The old stamp is written into
+/// the store rather than waited for.
+#[tokio::test]
+async fn an_unchanged_sync_refreshes_a_stamp_older_than_the_interval() {
+    let root = tempfile::tempdir().unwrap();
+    let db_dir = tempfile::tempdir().unwrap();
+    let (store, db) = synced_store(root.path(), db_dir.path()).await;
+    let domain = store.domain_id("d").await.unwrap().unwrap();
+    let stamp = |stats: Vec<crystalline_index::DomainStats>| {
+        stats
+            .into_iter()
+            .find(|d| d.name == "d")
+            .and_then(|d| d.last_sync)
+            .unwrap()
+    };
+
+    // A stamp just inside the interval stays, and nothing is written.
+    let inside =
+        (chrono::Utc::now() - SYNC_STAMP_REFRESH + chrono::TimeDelta::minutes(5)).to_rfc3339();
+    store.record_sync(domain, &inside, true, "").await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    sync_domain_with(&store, "d", root.path(), &params())
+        .await
+        .unwrap();
+    assert_eq!(stamp(store.domain_stats().await.unwrap()), inside);
+    assert_eq!(wal_frames(&db), 0, "a stamp inside the interval stays");
+
+    // One just past it is refreshed by the next unchanged sync.
+    let past =
+        (chrono::Utc::now() - SYNC_STAMP_REFRESH - chrono::TimeDelta::minutes(5)).to_rfc3339();
+    store.record_sync(domain, &past, true, "").await.unwrap();
+    store.checkpoint_wal().await.unwrap();
+    sync_domain_with(&store, "d", root.path(), &params())
+        .await
+        .unwrap();
+    let refreshed = stamp(store.domain_stats().await.unwrap());
+    assert!(
+        refreshed > inside,
+        "the old stamp was refreshed: {refreshed}"
+    );
+    assert!(wal_frames(&db) > 0, "the refresh is a write");
+
+    // And the sync after that writes nothing again.
+    store.checkpoint_wal().await.unwrap();
+    sync_domain_with(&store, "d", root.path(), &params())
+        .await
+        .unwrap();
+    assert_eq!(stamp(store.domain_stats().await.unwrap()), refreshed);
+    assert_eq!(wal_frames(&db), 0, "a fresh stamp is not written again");
 }
 
 #[tokio::test]
@@ -412,4 +467,71 @@ async fn walk(
         .unwrap();
     scan.walked_by("inst");
     apply_scan(store, domain, scan).await.unwrap();
+}
+
+/// The variable that tells the child run of
+/// [`an_unchanged_sync_creates_no_temporary_directory`] that it is the child.
+#[cfg(unix)]
+const TEMPDIR_CHILD: &str = "CRYSTALLINE_IDLE_SYNC_TEMPDIR_CHILD";
+
+/// An unchanged sync creates no temporary directory either. Turso backs an
+/// ephemeral table (a correlated subquery, an `UPDATE` of an indexed column)
+/// with a directory it creates as the statement opens, which is a filesystem
+/// write of its own on every idle sync, and on Windows the source of the
+/// refused creates `Conn` retries.
+///
+/// The check runs in a child process of this test binary, whose temporary
+/// folder is a directory of its own: the child syncs once, makes that folder
+/// read-only and syncs again, full and targeted, and any temporary directory
+/// the second sync tried to create fails it. A child, so no other test ever
+/// sees a read-only temporary folder.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unchanged_sync_creates_no_temporary_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(tmp) = std::env::var(TEMPDIR_CHILD) {
+        let root = tempfile::tempdir().unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let (store, _db) = synced_store(root.path(), db_dir.path()).await;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let full = sync_domain_with(&store, "d", root.path(), &params()).await;
+        let targeted = async {
+            let domain = store
+                .upsert_domain("d", Some(&root.path().to_string_lossy()), DomainKind::File)
+                .await?;
+            let snapshot = store.file_stamps(domain).await?;
+            let scan = scan_paths(
+                "d",
+                root.path(),
+                snapshot,
+                vec!["a.md".to_string(), "MANIFEST.md".to_string()],
+                &params(),
+            )
+            .await;
+            apply_scan(&store, domain, scan).await
+        }
+        .await;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        full.expect("the unchanged full sync needed no temporary directory");
+        targeted.expect("the unchanged targeted sync needed no temporary directory");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "idle_sync::an_unchanged_sync_creates_no_temporary_directory",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(TEMPDIR_CHILD, tmp.path())
+        .env("TMPDIR", tmp.path())
+        .output()
+        .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains("1 passed"), "the child ran the test: {said}");
 }

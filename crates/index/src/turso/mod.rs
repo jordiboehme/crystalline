@@ -422,6 +422,20 @@ impl TursoStore {
         Ok(())
     }
 
+    /// Whether the resolve pass over `table` would bind a row of `domain`
+    /// ([`crate::store::resolve_pending_probe_sql`]): a read first, so a pass
+    /// with nothing to bind opens no ephemeral table and creates no temporary
+    /// directory.
+    async fn resolve_pending_due(&self, table: &str, domain: DomainId) -> Result<bool> {
+        Ok(query_first(
+            &self.conn,
+            &crate::store::resolve_pending_probe_sql(table, "?1"),
+            vec![Value::Integer(domain.0)],
+        )
+        .await?
+        .is_some())
+    }
+
     /// The compare of a compare-and-swap on the base row at `path`, as a
     /// guarded write: the same statement the Postgres twin needs to be safe
     /// against a second writer, a no-op UPDATE that only matches the row while
@@ -1308,11 +1322,12 @@ fn resolve_pending_sql(table: &str) -> String {
 #[doc(hidden)]
 pub const HOST_MOVE_SQL: &str = "SELECT host_move FROM domain WHERE id=?1";
 
-/// The sync stamp an apply writes when it changed the index, or when the
-/// domain has none yet: one primary-key seek. `?3` is whether it changed.
+/// The sync stamp an apply writes when it changed the index, when the domain
+/// has none yet, or when the one it has is older than `?4`: one primary-key
+/// seek. `?3` is whether it changed.
 #[doc(hidden)]
-pub const RECORD_SYNC_SQL: &str =
-    "UPDATE domain SET last_sync=?1 WHERE id=?2 AND (?3 = 1 OR last_sync IS NULL)";
+pub const RECORD_SYNC_SQL: &str = "UPDATE domain SET last_sync=?1 WHERE id=?2 \
+     AND (?3 = 1 OR last_sync IS NULL OR last_sync < ?4)";
 
 /// The on-disk snapshot behind [`Store::file_stamps`].
 ///
@@ -1768,11 +1783,11 @@ impl Store for TursoStore {
         // time the row is already exactly this one. Read first and write
         // nothing then: an upsert that changes nothing still rewrites the
         // row and appends to the log, on every sync of an idle domain.
+        // Two point reads, no subquery: turso backs a correlated subquery
+        // with an ephemeral table, which creates a temporary directory.
         let existing = query_first(
             &self.conn,
-            "SELECT d.id, d.path, d.kind, \
-             EXISTS(SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name) \
-             FROM domain d WHERE d.name=?1",
+            "SELECT id, path, kind FROM domain WHERE name=?1",
             vec![Value::Text(name.to_string())],
         )
         .await?;
@@ -1780,7 +1795,13 @@ impl Store for TursoStore {
             && let Some(id) = cell_i64(r, 0)
             && cell_text(r, 1).as_deref() == Some(path)
             && cell_text(r, 2).as_deref() == Some(kind)
-            && cell_i64(r, 3) == Some(1)
+            && query_first(
+                &self.conn,
+                "SELECT 1 FROM domain_spelling WHERE spelling=?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?
+            .is_some()
         {
             return Ok(DomainId(id));
         }
@@ -2520,6 +2541,9 @@ impl Store for TursoStore {
     }
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
+        if !self.resolve_pending_due("relation", domain).await? {
+            return Ok(0);
+        }
         let n = self
             .conn
             .execute(
@@ -2533,6 +2557,9 @@ impl Store for TursoStore {
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
         // The wikilink twin of resolve_pending_relations over the `link` table,
         // matching by the same rule. Links carry no rel_type.
+        if !self.resolve_pending_due("link", domain).await? {
+            return Ok(0);
+        }
         let n = self
             .conn
             .execute(&resolve_pending_sql("link"), vec![Value::Integer(domain.0)])
@@ -3889,7 +3916,13 @@ impl Store for TursoStore {
         self.truncate_wal().await
     }
 
-    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()> {
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()> {
         self.conn
             .execute(
                 RECORD_SYNC_SQL,
@@ -3897,6 +3930,7 @@ impl Store for TursoStore {
                     Value::Text(when.to_string()),
                     Value::Integer(domain.0),
                     Value::Integer(i64::from(changed)),
+                    Value::Text(refresh_before.to_string()),
                 ],
             )
             .await?;

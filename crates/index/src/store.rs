@@ -248,6 +248,25 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
     )
 }
 
+/// Whether [`resolve_pending_sql`] would bind any row of one reference table
+/// in one domain: the same predicate as a read, which stops at the first row.
+///
+/// Turso asks this before the update. An `UPDATE` of `to_id` (an indexed
+/// column) is backed by an ephemeral table in turso_core 0.8.x, which creates
+/// a temporary directory on disk as the statement opens, whether or not a row
+/// matches; the resolve pass runs on every sync, and almost every time it
+/// binds nothing. This read needs no ephemeral table, so a pass with nothing
+/// to bind touches neither the database nor the temporary folder.
+#[doc(hidden)]
+pub fn resolve_pending_probe_sql(table: &str, placeholder: &str) -> String {
+    format!(
+        "SELECT 1 FROM {table} \
+         WHERE {table}.to_id IS NULL AND {table}.domain_id = {placeholder} \
+         AND {resolved} IS NOT NULL LIMIT 1",
+        resolved = reference_match(table, ReferenceCandidates::Base)
+    )
+}
+
 /// The unbind a base write runs, one statement per reference table, when the
 /// engram it writes carries a title that a `[[C# Basics]]` reference may name
 /// whole: every row whose whole text (`to_whole`) is that title, whose target
@@ -3755,14 +3774,22 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
-    /// Record that a sync of a domain changed its index at the given RFC 3339
-    /// instant. `changed` is whether the sync wrote anything: a sync that
-    /// changed nothing stamps only a domain that carries no stamp yet, so the
-    /// first sync of an empty domain still reads as synced, and every later
-    /// sync of an unchanged domain writes nothing at all. The stamp therefore
-    /// says when the index of the domain last changed through a sync, not
-    /// when the last sync ran; an engine that wants the latter keeps it.
-    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()>;
+    /// Record that a sync of a domain finished at the given RFC 3339 instant.
+    /// `changed` is whether the sync wrote anything. A sync that changed
+    /// nothing stamps the domain only when it carries no stamp yet (so the
+    /// first sync of an empty domain still reads as synced) or when its stamp
+    /// is older than `refresh_before`, so an idle domain synced on every
+    /// watcher flush writes its stamp at most once per refresh interval
+    /// ([`crate::SYNC_STAMP_REFRESH`]) and the stamp is never older
+    /// than that interval after a sync. An engine that wants the exact time
+    /// of its last sync keeps it in memory.
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()>;
 
     /// Record that every named domain was seen registered at the given RFC
     /// 3339 instant, writing `last_registered` on each matching row.

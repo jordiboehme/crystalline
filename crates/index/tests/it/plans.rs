@@ -317,9 +317,19 @@ pub fn registry() -> Vec<HotStatement> {
             turso: || crystalline_index::turso::RECORD_SYNC_SQL.to_string(),
             #[cfg(feature = "postgres")]
             postgres: || crystalline_index::postgres::RECORD_SYNC_SQL.to_string(),
-            literals: &["'2026-10-15T00:00:00+00:00'", "1", "1"],
+            literals: &[
+                "'2026-10-15T00:00:00+00:00'",
+                "1",
+                "1",
+                "'2026-10-14T23:00:00+00:00'",
+            ],
             #[cfg(feature = "postgres")]
-            literals_pg: Some(&["'2026-10-15T00:00:00+00:00'", "1", "true"]),
+            literals_pg: Some(&[
+                "'2026-10-15T00:00:00+00:00'",
+                "1",
+                "true",
+                "'2026-10-14T23:00:00+00:00'",
+            ]),
             scan_expected: &[],
             #[cfg(feature = "postgres")]
             scan_expected_pg: None,
@@ -844,6 +854,38 @@ pub fn registry() -> Vec<HotStatement> {
             turso: || crystalline_index::resolve_pending_sql("link", "?1"),
             #[cfg(feature = "postgres")]
             postgres: || crystalline_index::resolve_pending_sql("link", "$1"),
+            literals: &["1"],
+            #[cfg(feature = "postgres")]
+            literals_pg: None,
+            scan_expected: &[],
+            #[cfg(feature = "postgres")]
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_link_unresolved"],
+            #[cfg(feature = "postgres")]
+            postgres_must_seek: &["domain_spelling_pkey"],
+        },
+        HotStatement {
+            // The read turso runs before the relation resolve pass, on every sync.
+            issued_by: "TursoStore::resolve_pending_due (relation)",
+            turso: || crystalline_index::resolve_pending_probe_sql("relation", "?1"),
+            #[cfg(feature = "postgres")]
+            postgres: || crystalline_index::resolve_pending_probe_sql("relation", "$1"),
+            literals: &["1"],
+            #[cfg(feature = "postgres")]
+            literals_pg: None,
+            scan_expected: &[],
+            #[cfg(feature = "postgres")]
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_unresolved"],
+            #[cfg(feature = "postgres")]
+            postgres_must_seek: &["domain_spelling_pkey"],
+        },
+        HotStatement {
+            // The read turso runs before the link resolve pass, on every sync.
+            issued_by: "TursoStore::resolve_pending_due (link)",
+            turso: || crystalline_index::resolve_pending_probe_sql("link", "?1"),
+            #[cfg(feature = "postgres")]
+            postgres: || crystalline_index::resolve_pending_probe_sql("link", "$1"),
             literals: &["1"],
             #[cfg(feature = "postgres")]
             literals_pg: None,

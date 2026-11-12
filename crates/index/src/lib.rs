@@ -83,8 +83,8 @@ pub use store::{
 pub use store::{
     count_references_to_sql, link_frontier_sql, meta_value_match_sql, meta_value_union_sql,
     referencing_domains_sql, relation_frontier_sql, reset_spelled_references_sql,
-    resolve_pending_sql, resolve_references_to_sql, resolve_spelled_references_sql,
-    spelled_references_sql, unbind_shadowed_by_title_sql,
+    resolve_pending_probe_sql, resolve_pending_sql, resolve_references_to_sql,
+    resolve_spelled_references_sql, spelled_references_sql, unbind_shadowed_by_title_sql,
 };
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
@@ -94,8 +94,8 @@ pub use sweep::{
 };
 pub use sync::{
     DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReflectionPathChange,
-    ReflectionPathKind, ReflectionWalk, ReindexHooks, ReparseSeam, ReparseStep, SyncReport,
-    apply_scan, apply_scan_with_slab, pending_engrams, reflection_effective,
+    ReflectionPathKind, ReflectionWalk, ReindexHooks, ReparseSeam, ReparseStep, SYNC_STAMP_REFRESH,
+    SyncReport, apply_scan, apply_scan_with_slab, pending_engrams, reflection_effective,
     reflection_files_on_disk, reflection_mode, refresh_tag_aliases, reindex_domains, reparse_due,
     reparse_stored_domain, reparse_stored_domain_with, resolve_forward_refs, scan_domain,
     scan_paths, sync_domain, sync_domain_with,
