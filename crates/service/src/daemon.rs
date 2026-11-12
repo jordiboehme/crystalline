@@ -1289,6 +1289,66 @@ enum WatchTick {
 /// save storm never reaches it.
 const WATCH_TICK_CAPACITY: usize = 4096;
 
+/// Whether a notify event of this kind may mean a domain's content changed.
+///
+/// Reads are not changes. On Linux, notify's inotify backend arms `IN_OPEN`
+/// and reports every open of a file or folder under a watched root as
+/// `Access(Open(_))`, and a close after reading as `Access(Close(Read))`. The
+/// daemon's own sync walk opens `MANIFEST.md` and every subfolder, and a
+/// folder path escalates its domain to a full rescan, so forwarding those
+/// events fed a loop: each sync produced the events for the next one, and an
+/// idle domain was walked again about three times a second. macOS fsevents
+/// reports no reads, which is why the loop never showed there.
+///
+/// So every `Access` kind is dropped except `Close(Write)` (inotify's
+/// `IN_CLOSE_WRITE`, a file that was open for writing was closed) and a close
+/// whose mode the backend could not name (`Close(Any)`, `Close(Other)`), kept on
+/// the safe side. `Any` and `Other` are kept too: a backend that cannot name
+/// what happened may be reporting a change. A rescan notice does not go through
+/// this test at all (see [`watch_callback`]).
+fn is_change(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode};
+    match kind {
+        EventKind::Access(AccessKind::Close(mode)) => {
+            !matches!(mode, AccessMode::Read | AccessMode::Execute)
+        }
+        EventKind::Access(_) => false,
+        EventKind::Any
+        | EventKind::Create(_)
+        | EventKind::Modify(_)
+        | EventKind::Remove(_)
+        | EventKind::Other => true,
+    }
+}
+
+/// The notify callback of [`run_watcher`]: turns each event into ticks on the
+/// debounce channel. A rescan/overflow notice (an inotify `IN_Q_OVERFLOW`, an
+/// fsevents rescan) means events were dropped, so which paths changed is
+/// unknown: it always queues a full rescan, whatever the event's kind. An event
+/// that is not a change (see [`is_change`]) queues nothing else. The callback
+/// never blocks a notify thread: a tick that does not fit sets `overflow`,
+/// which escalates the next flush to a full rescan (see [`drain_overflow`]).
+fn watch_callback(
+    tx: tokio::sync::mpsc::Sender<WatchTick>,
+    overflow: Arc<AtomicBool>,
+) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else { return };
+        if event.need_rescan() && tx.try_send(WatchTick::Rescan).is_err() {
+            overflow.store(true, Ordering::Relaxed);
+        }
+        if !is_change(&event.kind) {
+            return;
+        }
+        for path in event.paths {
+            if tx.try_send(WatchTick::Path(path)).is_err() {
+                overflow.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Fold a set overflow flag into this flush: an overflowing burst means ticks
 /// were dropped and which paths they carried is unknown, exactly the situation
 /// the watcher's rescan signal already covers, so every watched domain escalates
@@ -1354,22 +1414,7 @@ async fn run_watcher(
     // The name adoptions a flush asks for, run on their own task: at most one
     // running and one more queued however many flushes ask.
     let adoptions = Arc::new(Coalesced::default());
-    let cb_overflow = overflow.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            // A rescan/overflow notice (an inotify IN_Q_OVERFLOW, an fsevents
-            // rescan) means events were dropped, so which paths changed is
-            // unknown: signal a full rescan rather than trust a partial stream.
-            if event.need_rescan() && tx.try_send(WatchTick::Rescan).is_err() {
-                cb_overflow.store(true, Ordering::Relaxed);
-            }
-            for path in event.paths {
-                if tx.try_send(WatchTick::Path(path)).is_err() {
-                    cb_overflow.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-    })?;
+    let mut watcher = notify::recommended_watcher(watch_callback(tx, overflow.clone()))?;
     // Claim the host lock for each startup file domain before arming its watch:
     // an acquired domain is watched (and synced) here, a domain held by another
     // live instance is skipped and served read-from-database only. Claiming
@@ -5114,6 +5159,148 @@ mod tests {
         d.add("a.md".to_string());
         assert!(d.full, "a later path never un-escalates a full batch");
         assert!(d.paths.is_empty());
+    }
+
+    // is_change: reads (opens, reads, a close after reading) are no change, so
+    // the daemon's own sync walk cannot wake the watcher again; writes, creates,
+    // removals and kinds a backend cannot name are.
+    #[test]
+    fn is_change_drops_reads_and_keeps_writes() {
+        use notify::EventKind;
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind,
+        };
+        let reads = [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Open(AccessMode::Write)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Any),
+            EventKind::Access(AccessKind::Other),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Execute)),
+        ];
+        for kind in reads {
+            assert!(!is_change(&kind), "{kind:?} is a read, not a change");
+        }
+        let changes = [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Access(AccessKind::Close(AccessMode::Any)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+            EventKind::Other,
+        ];
+        for kind in changes {
+            assert!(is_change(&kind), "{kind:?} may be a change");
+        }
+    }
+
+    // watch_callback: a rescan notice queues a full rescan whatever its kind,
+    // even on a read kind whose paths are dropped.
+    #[test]
+    fn watch_callback_never_drops_a_rescan_notice() {
+        use notify::event::{AccessKind, AccessMode, Event, EventKind, Flag};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let mut callback = watch_callback(tx, overflow.clone());
+        callback(Ok(Event::new(EventKind::Access(AccessKind::Open(
+            AccessMode::Any,
+        )))
+        .add_path(PathBuf::from("/roots/a/MANIFEST.md"))
+        .set_flag(Flag::Rescan)));
+        assert!(matches!(rx.try_recv(), Ok(WatchTick::Rescan)));
+        assert!(rx.try_recv().is_err(), "the read's path is not queued");
+        assert!(!overflow.load(Ordering::Relaxed));
+    }
+
+    // watch_callback: a read queues nothing, a write queues its path.
+    #[test]
+    fn watch_callback_forwards_writes_and_drops_reads() {
+        use notify::event::{AccessKind, AccessMode, DataChange, Event, EventKind, ModifyKind};
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut callback = watch_callback(tx, Arc::new(AtomicBool::new(false)));
+        let path = PathBuf::from("/roots/a/note.md");
+        callback(Ok(Event::new(EventKind::Access(AccessKind::Open(
+            AccessMode::Any,
+        )))
+        .add_path(path.clone())));
+        callback(Ok(Event::new(EventKind::Access(AccessKind::Close(
+            AccessMode::Read,
+        )))
+        .add_path(path.clone())));
+        assert!(rx.try_recv().is_err(), "reads queue nothing");
+        callback(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+            DataChange::Content,
+        )))
+        .add_path(path.clone())));
+        assert!(matches!(rx.try_recv(), Ok(WatchTick::Path(p)) if p == path));
+    }
+
+    /// Regression for the Linux sync loop: inotify reports every open of a
+    /// file or folder under a watched root, and the daemon's sync walk opens
+    /// `MANIFEST.md` and every subfolder. Those events used to reach the
+    /// debounce channel, a folder path escalated to a full rescan, and the
+    /// rescan's own opens woke the watcher again, about three times a second
+    /// on an idle domain. A real watcher on a domain with a subfolder must
+    /// queue no tick while the domain is only read (a walk like a sync's),
+    /// and must still queue one when a file is written.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reading_a_watched_domain_queues_no_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("eng");
+        let sub = root.join("notes");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("MANIFEST.md"), "# Eng\n").unwrap();
+        std::fs::write(sub.join("a.md"), "# A\n").unwrap();
+        // Read everything once before the watch is armed, so a first-read
+        // access-time update cannot show up as a change below.
+        let walk = || {
+            for dir in [&root, &sub] {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_file() {
+                        let _ = std::fs::read_to_string(&path).unwrap();
+                    }
+                }
+            }
+        };
+        walk();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WATCH_TICK_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let mut watcher =
+            notify::recommended_watcher(watch_callback(tx, overflow.clone())).unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+
+        // Read the domain the way a sync walk does, three times over.
+        for _ in 0..3 {
+            walk();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut stray = Vec::new();
+        while let Ok(tick) = rx.try_recv() {
+            stray.push(match tick {
+                WatchTick::Path(path) => path.display().to_string(),
+                WatchTick::Rescan => "rescan".to_string(),
+            });
+        }
+        assert!(stray.is_empty(), "reads queued ticks: {stray:?}");
+        assert!(!overflow.load(Ordering::Relaxed));
+
+        // A write still reaches the channel, so the silence above is the
+        // filter and not a watch that never fired.
+        std::fs::write(sub.join("a.md"), "# A changed\n").unwrap();
+        let tick = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a write queues a tick")
+            .unwrap();
+        assert!(matches!(tick, WatchTick::Path(p) if p.ends_with("a.md")));
+        drop(watcher);
     }
 
     // accumulate_tick: a rescan/overflow signal marks every watched domain full;
