@@ -273,3 +273,64 @@ async fn inbound_references_after_a_move_are_current() {
         "the reader sees the moved source at once: {text}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_listing_verbs_answer_while_the_writer_holds_an_open_transaction() {
+    use crystalline_service::params::{
+        BrowseParams, ListDomainsParams, RecentParams, VocabularyParams,
+    };
+    let (_tmp, engine) = engine(4).await;
+    engine
+        .write_engram(&write(
+            "Docking clamps",
+            "The clamps misread below eight degrees.",
+        ))
+        .await
+        .unwrap();
+    let out = {
+        let engine = engine.clone();
+        beside_held_writer(&engine.clone(), async move {
+            let scope = Scope::Unrestricted;
+            let browse = engine
+                .browse_domain(
+                    &BrowseParams {
+                        domain: "open".to_string(),
+                        path: None,
+                        depth: None,
+                        glob: None,
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap();
+            let recent = engine
+                .recent_activity(
+                    &RecentParams {
+                        domains: Vec::new(),
+                        timeframe: None,
+                        types: Vec::new(),
+                    },
+                    &scope,
+                )
+                .await
+                .unwrap();
+            let vocabulary = engine
+                .vocabulary(&VocabularyParams::default(), &scope)
+                .await
+                .unwrap();
+            let domains = engine
+                .list_domains(&ListDomainsParams::default(), &scope)
+                .await
+                .unwrap();
+            [browse, recent, vocabulary, domains].map(|v| v.to_string())
+        })
+        .await
+    };
+    for (verb, text) in ["browse", "recent", "vocabulary"].iter().zip(&out) {
+        assert!(
+            text.contains("docking-clamps") || text.contains("\"t\""),
+            "{verb}: {text}"
+        );
+    }
+    assert!(out[3].contains("open"), "list_domains: {}", out[3]);
+}

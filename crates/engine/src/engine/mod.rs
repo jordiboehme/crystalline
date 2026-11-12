@@ -4415,17 +4415,11 @@ impl Engine {
         hidden: &HashSet<String>,
     ) -> Result<crystalline_index::Vocabulary> {
         Ok(match (domain, hidden.is_empty()) {
-            (_, true) => {
-                let store = self.store.lock().await;
-                store.vocabulary(domain, None).await?
-            }
+            (_, true) => self.reader().vocabulary(domain, None).await?,
             (Some(domain), false) if hidden.contains(domain) => {
                 crystalline_index::Vocabulary::default()
             }
-            (Some(domain), false) => {
-                let store = self.store.lock().await;
-                store.vocabulary(Some(domain), None).await?
-            }
+            (Some(domain), false) => self.reader().vocabulary(Some(domain), None).await?,
             (None, false) => {
                 let names = match self.scoped_domains(&[], hidden).await? {
                     ScopedDomains::Only(names) => names,
@@ -4433,12 +4427,11 @@ impl Engine {
                     // `Nothing` means there is no domain to sweep.
                     _ => Vec::new(),
                 };
-                let store = self.store.lock().await;
+                let store = self.reader();
                 let mut parts = Vec::with_capacity(names.len());
                 for name in &names {
                     parts.push(store.vocabulary(Some(name), None).await?);
                 }
-                drop(store);
                 crystalline_index::merge_vocabularies(parts)
             }
         })

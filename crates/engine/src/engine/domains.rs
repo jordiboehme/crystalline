@@ -34,10 +34,7 @@ impl Engine {
             engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
         };
-        let mut items = {
-            let store = self.store.lock().await;
-            store.recent(&filter).await?
-        };
+        let mut items = self.reader().recent(&filter).await?;
         // This reader's own drafts, folded in after the screen above exactly as
         // they are on a browse: the domains `hidden_for` already allowed, and
         // only then whose drafts they are.
@@ -150,15 +147,14 @@ impl Engine {
         // hidden (decision D19); the mounted domain is listed by the router.
         let mut hidden = hidden;
         hidden.extend(self.shadowed_domains());
-        let store = self.store.lock().await;
-        let stats: HashMap<String, _> = store
+        let stats: HashMap<String, _> = self
+            .reader()
             .domain_stats()
             .await
             .unwrap_or_default()
             .into_iter()
             .map(|d| (d.name.clone(), d))
             .collect();
-        drop(store);
         // The name table as it stands, read once for every row: each domain's
         // canonical name, its effective aliases and whether its canonical name
         // is shadowed by another domain's local name. A caller who may not see
@@ -1139,11 +1135,10 @@ impl Engine {
         // whole domain filtered here: the prefix and the depth cut are pushed
         // into SQL in every case, the root included, so a client that refetches
         // its tree can never pull tens of thousands of rows across per request.
-        let store = self.store.lock().await;
-        let mut level = store
+        let mut level = self
+            .reader()
             .browse_level(&p.domain, prefix.as_deref(), depth, TREE_LEVEL_CAP)
             .await?;
-        drop(store);
 
         // This reader's own drafts shadow the level they are in: a path they
         // have tombstoned leaves it, a path they are drafting is described by

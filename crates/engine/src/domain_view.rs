@@ -1877,8 +1877,7 @@ impl<'a> DomainView<'a> {
         {
             let (domain_id, _) = self.engine.domain_source(domain).await?;
             let entries = {
-                let store = self.engine.store();
-                let store = store.lock().await;
+                let store = self.engine.reader();
                 store.overlay_entries(domain_id, actor).await?
             };
             if entries.is_empty() {
@@ -1889,8 +1888,7 @@ impl<'a> DomainView<'a> {
                 // thing that ties a draft to the row it shadows here: a
                 // recency listing carries no path.
                 let shadowed = {
-                    let store = self.engine.store();
-                    let store = store.lock().await;
+                    let store = self.engine.reader();
                     store
                         .list_engrams(domain, Some(&entry.path), None)
                         .await?
@@ -1976,8 +1974,7 @@ impl<'a> DomainView<'a> {
         };
         let (domain_id, _) = self.engine.domain_source(domain).await?;
         let entries = {
-            let store = self.engine.store();
-            let store = store.lock().await;
+            let store = self.engine.reader();
             store.overlay_entries(domain_id, actor).await?
         };
         if entries.is_empty() {
@@ -2018,8 +2015,7 @@ impl<'a> DomainView<'a> {
         if !in_folders.is_empty() {
             let paths: Vec<String> = in_folders.iter().map(|(_, e)| e.path.clone()).collect();
             let base = {
-                let store = self.engine.store();
-                let store = store.lock().await;
+                let store = self.engine.reader();
                 store.base_paths(domain_id, &paths).await?
             };
             for (head, entry) in in_folders {
