@@ -21,8 +21,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use crystalline_core::config::EmbeddingsConfig;
+use crystalline_index::ReadStore;
 use crystalline_index::{
-    ChunkParams, EMBED_PAGE_SIZE, SearchMode, SearchQuery, Store, TursoStore, download_local_model,
+    ChunkParams, EMBED_PAGE_SIZE, SearchMode, SearchQuery, TursoStore, download_local_model,
     provider_from_config, run_embedding_pass, sync_domain_with,
 };
 

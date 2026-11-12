@@ -4310,6 +4310,7 @@ async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_domain_another_instance_scores_loads_no_model_and_waits_for_its_claim() {
+    use crystalline_index::ReadStore;
     use crystalline_index::Store;
     let Some(scratch) = crate::support::scratch_schema("ctx") else {
         return;

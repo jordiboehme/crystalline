@@ -109,6 +109,7 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
+use crate::store::ReadStore;
 use crate::store::WorkClaim;
 use crate::store::{
     AssetTable, AttachmentRow, BrowseLevel, ChunkJob, ChunkTable, CitedEngram, ContentMention,
@@ -1810,69 +1811,7 @@ pub fn lead_vectors_sql(actor_screen: &str, generation: u64) -> String {
 }
 
 #[async_trait]
-impl Store for PostgresStore {
-    async fn upsert_domain(
-        &self,
-        name: &str,
-        path: Option<&str>,
-        kind: DomainKind,
-    ) -> Result<DomainId> {
-        // A virtual domain stores `path = NULL`; `kind` discriminates on both
-        // backends.
-        let mut conn = self.acquire().await?;
-        // Every sync of every domain comes through here, and almost every
-        // time the row is already exactly this one. Read first and write
-        // nothing then: the upsert below rewrites the row even when nothing
-        // in it changes, and takes a value from the id sequence even when it
-        // inserts nothing.
-        // Two point reads, as on turso.
-        let existing: Option<(i64, Option<String>, String)> =
-            sqlx::query_as("SELECT id, path, kind FROM domain WHERE name=$1")
-                .bind(name)
-                .fetch_optional(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?;
-        if let Some((id, held_path, held_kind)) = existing
-            && held_path.as_deref() == path
-            && held_kind == kind_str(kind)
-            && sqlx::query("SELECT 1 FROM domain_spelling WHERE spelling=$1")
-                .bind(name)
-                .fetch_optional(conn.as_mut())
-                .await
-                .map_err(IndexError::from)?
-                .is_some()
-        {
-            return Ok(DomainId(id));
-        }
-        // A new row is stamped with the current parser generation, so a fresh
-        // index never reparses what it has only just parsed; an existing row
-        // keeps the generation it has.
-        let row: (i64,) = sqlx::query_as(
-            "INSERT INTO domain(name, path, kind, parse_generation) VALUES($1,$2,$3,$4) \
-             ON CONFLICT(name) DO UPDATE SET path=EXCLUDED.path, kind=EXCLUDED.kind RETURNING id",
-        )
-        .bind(name)
-        .bind(path)
-        .bind(kind_str(kind))
-        .bind(i64::from(crystalline_core::PARSE_GENERATION))
-        .fetch_one(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        // The row answers to its own name. A spelling another domain already
-        // holds is left with it; the name table's refresh settles precedence.
-        // No transaction of its own: a sync may already be inside one.
-        sqlx::query(
-            "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
-             ON CONFLICT(spelling) DO NOTHING",
-        )
-        .bind(name)
-        .bind(row.0)
-        .execute(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(DomainId(row.0))
-    }
-
+impl ReadStore for PostgresStore {
     async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
         let mut conn = self.acquire().await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
@@ -1900,265 +1839,6 @@ impl Store for PostgresStore {
             .into_iter()
             .map(|(id, key, value)| (EngramId(id), key, value))
             .collect())
-    }
-
-    async fn replace_domain_spellings(
-        &self,
-        spellings: &[(String, DomainId)],
-    ) -> Result<Vec<String>> {
-        // Every statement below runs on the pinned transaction connection, and
-        // each block drops its guard before the next `domain_spellings` read
-        // (which pins the same connection) and before the commit.
-        let SpellingPlan { rows, scope } = spelling_plan(spellings)?;
-        in_transaction(self, async {
-            {
-                let mut conn = self.acquire().await?;
-                for id in &scope {
-                    let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM domain WHERE id=$1")
-                        .bind(id.0)
-                        .fetch_optional(conn.as_mut())
-                        .await
-                        .map_err(IndexError::from)?;
-                    if known.is_none() {
-                        return Err(IndexError::Invalid(format!(
-                            "no domain row has id {}; sync the domain before recording its spellings",
-                            id.0
-                        )));
-                    }
-                }
-            }
-            let before = self.domain_spellings().await?;
-            {
-                let mut conn = self.acquire().await?;
-                let c = conn.as_mut();
-                // The listed domains' spellings go, all but each row's own name.
-                for id in &scope {
-                    sqlx::query(
-                        "DELETE FROM domain_spelling WHERE domain_id=$1 \
-                         AND spelling <> (SELECT name FROM domain WHERE id=$1)",
-                    )
-                    .bind(id.0)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-                }
-                // The list, each spelling taken for its domain from whoever held it.
-                for (spelling, id) in &rows {
-                    claim_own_spelling(&mut *c, spelling, *id).await?;
-                }
-                // Then every row's own name, last, so a local name wins over any
-                // canonical name or alias on the same spelling - the list's or
-                // one recorded earlier, by this instance or another.
-                let displaced: Vec<(String, i64)> = sqlx::query_as(
-                    "SELECT d.name, d.id FROM domain d WHERE NOT EXISTS \
-                     (SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name AND s.domain_id=d.id)",
-                )
-                .fetch_all(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-                for (name, id) in displaced {
-                    claim_own_spelling(&mut *c, &name, DomainId(id)).await?;
-                }
-            }
-            let after = self.domain_spellings().await?;
-            Ok(changed_spellings(&before, &after))
-        })
-        .await
-    }
-
-    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
-        if spellings.is_empty() {
-            return Ok(0);
-        }
-        let list = placeholders(1, spellings.len());
-        // -- actor: all - a draft's reference named the spelling too, and binds
-        // again through the actor's own resolve pass.
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            let mut reset = 0;
-            for table in ["relation", "link"] {
-                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
-                let sql = reset_spelled_references_sql(table, &list);
-                reset += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?
-                    .rows_affected();
-            }
-            Ok(reset)
-        })
-        .await
-    }
-
-    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
-        if spellings.is_empty() {
-            return Ok(0);
-        }
-        let list = placeholders(1, spellings.len());
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            let mut bound = 0;
-            for table in ["relation", "link"] {
-                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
-                let sql = resolve_spelled_references_sql(table, &list);
-                bound += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?
-                    .rows_affected();
-            }
-            Ok(bound)
-        })
-        .await
-    }
-
-    async fn resolve_references_to(
-        &self,
-        domain: DomainId,
-        spellings: &[String],
-        targets: &[String],
-    ) -> Result<Vec<(DomainId, u64)>> {
-        if spellings.is_empty() || targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        let spelled = placeholders(2, spellings.len());
-        let first = 2 + spellings.len();
-        let targeted = (first..first + targets.len())
-            .map(|i| format!("lower(${i})"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let params = || {
-            let mut out = vec![Param::Int(domain.0)];
-            out.extend(spellings.iter().map(|s| Param::Text(s.clone())));
-            out.extend(targets.iter().map(|t| Param::Text(t.clone())));
-            out
-        };
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
-            for table in ["relation", "link"] {
-                let sql = count_references_to_sql(table, "$1", &spelled, &targeted);
-                let rows = bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
-                    .fetch_all(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-                for row in rows {
-                    let id: i64 = row.try_get(0).map_err(IndexError::from)?;
-                    let n: i64 = row.try_get(1).map_err(IndexError::from)?;
-                    *counts.entry(id).or_default() += n as u64;
-                }
-                let sql = resolve_references_to_sql(table, "$1", &spelled, &targeted);
-                bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            Ok(counts
-                .into_iter()
-                .filter(|(_, n)| *n > 0)
-                .map(|(id, n)| (DomainId(id), n))
-                .collect())
-        })
-        .await
-    }
-
-    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()> {
-        if old == new {
-            return Ok(());
-        }
-        in_transaction(self, async {
-            let old_id = self.domain_id(old).await?;
-            let new_id = self.domain_id(new).await?;
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            match (old_id, new_id) {
-                (Some(_), Some(_)) => return Err(rename_onto_taken_row(old, new)),
-                (Some(id), None) => {
-                    sqlx::query("UPDATE domain SET name=$2 WHERE id=$1")
-                        .bind(id.0)
-                        .bind(new)
-                        .execute(&mut *c)
-                        .await
-                        .map_err(IndexError::from)?;
-                    // The old name stays an alias of the row, so every
-                    // reference spelled with it keeps resolving; one another
-                    // domain holds is left with that domain.
-                    sqlx::query(
-                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
-                         ON CONFLICT(spelling) DO NOTHING",
-                    )
-                    .bind(old)
-                    .bind(id.0)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-                    take_spelling_for_rename(&mut *c, new, id).await?;
-                }
-                // Renamed already: make sure the own name is in place, and
-                // leave `old` alone - by now it may be an alias on purpose, or
-                // it was never this row's name and must not become one.
-                (None, Some(id)) => take_spelling_for_rename(&mut *c, new, id).await?,
-                (None, None) => {}
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
-        // May delete stray chunk rows, so the coverage snapshot may be stale.
-        self.invalidate_coverage();
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            // -- actor: all - one actor's draft is content too, so any row of
-            // any actor keeps the domain row. `FOR UPDATE` holds the row until
-            // the commit, so a registration of the same name waits for it.
-            let id: Option<(i64,)> = sqlx::query_as(
-                "SELECT d.id FROM domain d WHERE d.name=$1 \
-                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM reflection r WHERE r.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM reflection_asset f WHERE f.domain_id=d.id) \
-                 FOR UPDATE OF d",
-            )
-            .bind(name)
-            .fetch_optional(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-            let Some((id,)) = id else {
-                return Ok(false);
-            };
-            // `domain_lock`, the two automation tables, `reflection_disclosure`
-            // and `tag_alias` name the row without a cascade, and `relation`
-            // and `link` carry its id with no key at all, so each is cleared
-            // before the row itself.
-            for sql in [
-                "DELETE FROM domain_spelling WHERE domain_id=$1",
-                // A chunk is not content, so it does not keep the row; it
-                // goes with it (the funnel never leaves one without its page).
-                "DELETE FROM reflection_chunk WHERE domain_id=$1",
-                "DELETE FROM tag_alias WHERE domain_id=$1",
-                "DELETE FROM domain_lock WHERE domain_id=$1",
-                "DELETE FROM automation_lease WHERE domain_id=$1",
-                "DELETE FROM automation_run WHERE domain_id=$1",
-                "DELETE FROM reflection_disclosure WHERE domain_id=$1",
-                "DELETE FROM relation WHERE domain_id=$1",
-                "DELETE FROM link WHERE domain_id=$1",
-                "DELETE FROM domain WHERE id=$1",
-            ] {
-                sqlx::query(sql)
-                    .bind(id)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            Ok(true)
-        })
-        .await
     }
 
     async fn engrams_referencing_domains(
@@ -2378,43 +2058,6 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
-    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
-        self.upsert_row(domain, "", record).await
-    }
-
-    async fn upsert_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: Option<&str>,
-    ) -> Result<EngramId> {
-        // Compare-and-swap: if a row exists at this path and the caller's
-        // expected sha no longer matches the stored one, refuse. The engine
-        // holds the transaction open (the pinned connection), so the compare and
-        // the write are one atomic unit.
-        //
-        // No row at all is an insert, which nothing guards.
-        if let Some(expected) = expected_sha {
-            self.guarded_compare(domain, &record.path, expected).await?;
-        }
-        self.upsert_engram(domain, record).await
-    }
-
-    async fn update_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: &str,
-    ) -> Result<Option<EngramId>> {
-        if !self
-            .guarded_compare(domain, &record.path, expected_sha)
-            .await?
-        {
-            return Ok(None);
-        }
-        self.upsert_engram(domain, record).await.map(Some)
-    }
-
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let mut conn = self.acquire().await?;
         let row = sqlx::query(
@@ -2451,242 +2094,6 @@ impl Store for PostgresStore {
         let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
-    }
-
-    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
-        // Deletes this domain's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        // Delete a single domain's engram, attachment and child rows, keeping
-        // the domain row. Child rows first so the enforced foreign keys are
-        // satisfied, attachment blobs before the attachment rows that own them
-        // and the bodies in `engram_content` before the engram rows they hang
-        // off.
-        // `upsert_domain` reuses the id for a name it has seen, so anything left
-        // here would resurface as the next registration's own.
-        // -- actor: all - a domain's removal takes its drafts with it. Nothing
-        // survives the domain they were drafts of, so these statements name
-        // every actor's rows on purpose; the overlay journal is swept on the
-        // same paths so the rows and their mirror go together.
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        for sql in [
-            "DELETE FROM contradiction WHERE domain_id=$1",
-            "DELETE FROM contradiction_pair WHERE domain_id=$1",
-            "DELETE FROM observation_tag WHERE observation_id IN \
-             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=$1)",
-            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
-            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
-            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
-            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
-            "DELETE FROM relation WHERE domain_id=$1",
-            "DELETE FROM link WHERE domain_id=$1",
-            // Every reference from another domain that named one of these
-            // engrams goes back to pending before the rows go, in whatever
-            // transaction the caller holds, as `delete_engram` does: a `to_id`
-            // naming a row nobody holds would read as resolved forever. See the turso twin.
-            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
-            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
-            // -- actor: all - the bodies of every row about to go, named
-            // through them since `engram_content` has no domain of its own.
-            "DELETE FROM engram_content WHERE engram_id IN \
-             (SELECT id FROM engram WHERE domain_id=$1)",
-            "DELETE FROM engram WHERE domain_id=$1",
-            "DELETE FROM tag_alias WHERE domain_id=$1",
-            "DELETE FROM attachment_blob WHERE attachment_id IN \
-             (SELECT id FROM attachment WHERE domain_id=$1)",
-            "DELETE FROM attachment WHERE domain_id=$1",
-            "DELETE FROM reflection_chunk WHERE domain_id=$1",
-            "DELETE FROM reflection WHERE domain_id=$1",
-            "DELETE FROM reflection_asset WHERE domain_id=$1",
-            // Every spelling but the row's own name, which stays with the row.
-            // The declared cascade never fires: the row is kept.
-            "DELETE FROM domain_spelling WHERE domain_id=$1 \
-             AND spelling <> (SELECT name FROM domain WHERE id=$1)",
-        ] {
-            sqlx::query(sql)
-                .bind(domain.0)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-        }
-        Ok(())
-    }
-
-    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
-        // Deletes the engram's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        // The base row at this path. A draft is dropped by its own actor
-        // through `clear_overlay_entry`, never by the sync driver noticing that
-        // a file left disk - the draft was never on disk.
-        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
-            .bind(domain.0)
-            .bind(path)
-            .fetch_optional(&mut *c)
-            .await
-            .map_err(IndexError::from)?
-            .and_then(|r| cell_i64(&r, 0));
-        if let Some(id) = id {
-            // The declared cascade would take these with the engram row; they
-            // are written out for symmetry with Turso, which enforces nothing.
-            for sql in [
-                DELETE_ENGRAM_CONTRADICTIONS_SQL,
-                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
-            ] {
-                sqlx::query(sql)
-                    .bind(id)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            delete_children(&mut *c, id).await?;
-            // Every reference that named this engram goes back to pending in
-            // the same transaction. See the turso twin.
-            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
-                sqlx::query(sql)
-                    .bind(id)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
-                .bind(id)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-            sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
-                .bind(id)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-            // -- actor: all - the row is already named by its id, which the
-            // base-scoped lookup above resolved.
-            sqlx::query("DELETE FROM engram WHERE id=$1")
-                .bind(id)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-        }
-        Ok(())
-    }
-
-    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()> {
-        // The permalink follows the move only when it was path-derived, so an
-        // explicit frontmatter permalink is preserved across a move.
-        let old_slug = crystalline_core::slugify(from);
-        let new_slug = crystalline_core::slugify(to);
-        let mut conn = self.acquire().await?;
-        sqlx::query(
-            "UPDATE engram SET path=$1, \
-             permalink = CASE WHEN permalink=$2 THEN $3 ELSE permalink END \
-             WHERE domain_id=$4 AND path=$5 AND actor = ''",
-        )
-        .bind(to)
-        .bind(&old_slug)
-        .bind(&new_slug)
-        .bind(domain.0)
-        .bind(from)
-        .execute(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    async fn readdress_engram(
-        &self,
-        domain: DomainId,
-        from: &str,
-        to: &str,
-        permalink: &str,
-    ) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        sqlx::query(
-            "UPDATE engram SET path=$1, permalink=$2 \
-             WHERE domain_id=$3 AND path=$4 AND actor = ''",
-        )
-        .bind(to)
-        .bind(permalink)
-        .bind(domain.0)
-        .bind(from)
-        .execute(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
-        // The statement lives in `crate::store`, one copy for both backends;
-        // postgres binds the domain id as `$1`.
-        let sql = crate::store::resolve_pending_sql("relation", "$1");
-        let mut conn = self.acquire().await?;
-        let done = sqlx::query(AssertSqlSafe(sql))
-            .bind(domain.0)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(done.rows_affected())
-    }
-
-    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
-        // The wikilink twin of resolve_pending_relations over the `link` table,
-        // matching by the same rule. Links carry no rel_type.
-        let sql = crate::store::resolve_pending_sql("link", "$1");
-        let mut conn = self.acquire().await?;
-        let done = sqlx::query(AssertSqlSafe(sql))
-            .bind(domain.0)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(done.rows_affected())
-    }
-
-    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
-        if actor.is_empty() {
-            return Err(IndexError::Constraint(
-                "a reference pass over an actor's own rows must name that actor; the empty \
-                 actor is the base row's own key"
-                    .to_string(),
-            ));
-        }
-        let mut conn = self.acquire().await?;
-        let mut bound = 0u64;
-        for table in ["relation", "link"] {
-            // What dangles is unbound. A `to_id` naming a row nobody holds any
-            // more is the trace of a draft that went away, and the existence
-            // probe deliberately asks about every actor's rows: whose the
-            // vanished row was does not change that this one now points at
-            // nothing.
-            let dangling = format!(
-                "UPDATE {table} SET to_id = NULL WHERE domain_id = $1 AND to_id IS NOT NULL \
-                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
-                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
-            );
-            exec(
-                conn.as_mut(),
-                &dangling,
-                vec![Param::Int(domain.0), Param::Text(actor.to_string())],
-            )
-            .await?;
-            // Then what is pending is bound, in this actor's own view.
-            let mut params = vec![Param::Int(domain.0), Param::Text(actor.to_string())];
-            let mut n = 3usize;
-            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
-            let view = reference_match(
-                table,
-                ReferenceCandidates::View {
-                    screen: &actor_screen,
-                },
-            );
-            let sql = format!(
-                "UPDATE {table} SET to_id = {view} \
-                 WHERE {table}.to_id IS NULL AND {table}.domain_id = $1 \
-                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
-                 AND {view} IS NOT NULL"
-            );
-            bound += exec(conn.as_mut(), &sql, params).await?;
-        }
-        Ok(bound)
     }
 
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
@@ -2896,50 +2303,6 @@ impl Store for PostgresStore {
         let mut conn = self.acquire().await?;
         let rows = query_all(conn.as_mut(), &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
-    }
-
-    async fn replace_tag_aliases(
-        &self,
-        domain: DomainId,
-        pairs: &[(String, String)],
-    ) -> Result<bool> {
-        // Delete then re-insert: the map is fully derived from MANIFEST content,
-        // so a change replaces the domain's rows wholesale and an empty slice
-        // clears them. `ON CONFLICT DO NOTHING` drops a duplicate alias (the
-        // caller already deduped first-wins, so this is belt and braces). Runs on
-        // the acquired connection so it stays inside the sync transaction.
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        // A map that already holds exactly these pairs is left alone, so the
-        // refresh every sync runs writes nothing while the MANIFEST is
-        // unchanged.
-        let held: Vec<(String, String)> =
-            sqlx::query_as("SELECT alias, canonical FROM tag_alias WHERE domain_id=$1")
-                .bind(domain.0)
-                .fetch_all(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-        let held: std::collections::BTreeMap<String, String> = held.into_iter().collect();
-        if held == crate::store::wanted_tag_aliases(pairs) {
-            return Ok(false);
-        }
-        sqlx::query("DELETE FROM tag_alias WHERE domain_id=$1")
-            .bind(domain.0)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        for (alias, canonical) in pairs {
-            sqlx::query(
-                "INSERT INTO tag_alias(domain_id, alias, canonical) VALUES($1, $2, $3) ON CONFLICT DO NOTHING",
-            )
-            .bind(domain.0)
-            .bind(alias)
-            .bind(canonical)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        }
-        Ok(true)
     }
 
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
@@ -3420,91 +2783,6 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
-    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
-        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
-        // now stale.
-        self.invalidate_coverage();
-        let eid = engram_id.0;
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        // Carry over the embedding of any chunk whose fingerprint is unchanged so
-        // an edit only re-embeds the paragraphs that changed. The fingerprint
-        // folds in the model id, so a chunk embedded by a different model does
-        // not match and is left for re-embedding.
-        //
-        // This selects the raw `embedding` column, whose type includes the
-        // column's typmod, so it is the one statement in this module exposed to
-        // `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module
-        // doc). The trailing `/* w{generation} */` comment is inert to Postgres but not
-        // to sqlx's statement cache: it makes the SQL text - and so the cache
-        // key - change every time the column is resized, which forces a fresh
-        // prepare against the current column shape on whichever connection runs
-        // this next, without needing to reach every pooled connection directly.
-        // This runs inside `sync`'s explicit transaction (the raw `BEGIN` in
-        // `begin()`), where a failed statement would abort the whole
-        // transaction with no way to recover by retrying in place, which is why
-        // prevention rather than retry is the fix here.
-        let generation = self.embedding_generation.load(Ordering::Relaxed);
-        let carry_sql = format!(
-            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL /* w{generation} */"
-        );
-        let existing = sqlx::query(AssertSqlSafe(carry_sql))
-            .bind(eid)
-            .fetch_all(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        let mut carry: HashMap<String, (Option<String>, Option<i64>, pgvector::Vector)> =
-            HashMap::new();
-        for r in &existing {
-            let Some(hash) = cell_text(r, 0) else {
-                continue;
-            };
-            let model = r.try_get::<Option<String>, _>(1).ok().flatten();
-            let dims = r.try_get::<Option<i64>, _>(2).ok().flatten();
-            let Some(emb) = r.try_get::<Option<pgvector::Vector>, _>(3).ok().flatten() else {
-                continue;
-            };
-            carry.insert(hash, (model, dims, emb));
-        }
-
-        sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
-            .bind(eid)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-
-        // One 7-column multi-row insert for every chunk: a carry hit binds its
-        // preserved model, dims and embedding, a miss binds NULL for all three
-        // and leaves the chunk pending re-embedding.
-        for batch in chunks.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
-            for chunk in batch {
-                params.push(Param::Int(eid));
-                params.push(Param::Int(chunk.seq));
-                params.push(Param::Text(chunk.text.clone()));
-                params.push(Param::Text(chunk.text_hash.clone()));
-                match carry.get(&chunk.text_hash) {
-                    Some((model, dims, emb)) => {
-                        params.push(Param::TextOpt(model.clone()));
-                        params.push(Param::IntOpt(*dims));
-                        params.push(Param::VectorOpt(Some(emb.clone())));
-                    }
-                    None => {
-                        params.push(Param::TextOpt(None));
-                        params.push(Param::IntOpt(None));
-                        params.push(Param::VectorOpt(None));
-                    }
-                }
-            }
-            let sql = format!(
-                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
-                value_rows(7, batch.len(), None)
-            );
-            exec(&mut *c, &sql, params).await?;
-        }
-        Ok(())
-    }
-
     async fn chunks_needing_embedding_in(
         &self,
         table: ChunkTable,
@@ -3573,77 +2851,6 @@ impl Store for PostgresStore {
                 text_hash: cell_text(r, 4).unwrap_or_default(),
             })
             .collect())
-    }
-
-    async fn store_embeddings_in(
-        &self,
-        table: ChunkTable,
-        batch: &[EmbeddingRow],
-        model: &str,
-    ) -> Result<()> {
-        // Writes embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        // Validate the whole batch before any write so a bad row never leaves
-        // earlier rows committed.
-        for row in batch {
-            if row.embedding.len() != row.dims {
-                return Err(IndexError::Invalid(format!(
-                    "embedding length {} does not match declared dims {}",
-                    row.embedding.len(),
-                    row.dims
-                )));
-            }
-        }
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        // `dims` is per row, and a width change may DDL (resize the column, drop
-        // and recreate the index), so make each distinct width current once and
-        // before the transaction opens rather than once per row inside it.
-        let mut widths: Vec<usize> = Vec::new();
-        for row in batch {
-            if !widths.contains(&row.dims) {
-                widths.push(row.dims);
-            }
-        }
-        for dims in widths {
-            self.ensure_embedding_width(&mut *c, table, dims).await?;
-        }
-        // The per-row updates then commit together, mirroring `wipe`.
-        sqlx::query("BEGIN")
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        for row in batch {
-            let vector = pgvector::Vector::from(row.embedding.clone());
-            if let Err(e) = sqlx::query(chunk_sql(table).store)
-                .bind(vector)
-                .bind(row.dims as i64)
-                .bind(model)
-                .bind(row.chunk_id)
-                .execute(&mut *c)
-                .await
-            {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
-                return Err(e.into());
-            }
-        }
-        sqlx::query("COMMIT")
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
-        // Clears embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        let mut conn = self.acquire().await?;
-        let done = sqlx::query(chunk_sql(table).prune)
-            .bind(model)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(done.rows_affected() as usize)
     }
 
     async fn embedding_coverage_in(
@@ -3736,91 +2943,6 @@ impl Store for PostgresStore {
                 })
             })
             .collect())
-    }
-
-    async fn replace_contradictions(
-        &self,
-        domain: DomainId,
-        pair: &ScoredPair,
-        cosine: f64,
-        model: &str,
-        scored_at: &str,
-        rows: &[ContradictionRow],
-    ) -> Result<()> {
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            for sql in [DELETE_PAIR_CONTRADICTIONS_SQL, DELETE_CONTRADICTION_PAIR_SQL] {
-                sqlx::query(sql)
-                    .bind(pair.a.0)
-                    .bind(pair.b.0)
-                    .bind(model)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            let stored = sqlx::query(INSERT_CONTRADICTION_PAIR_SQL)
-            .bind(domain.0)
-            .bind(pair.a.0)
-            .bind(pair.b.0)
-            .bind(&pair.checksum_a)
-            .bind(&pair.checksum_b)
-            .bind(cosine)
-            .bind(model)
-            .bind(scored_at)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?
-            .rows_affected();
-            // Either engram went while the pair was scored: nothing to keep.
-            if stored == 0 {
-                return Ok(());
-            }
-            for row in rows {
-                sqlx::query(
-                    "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                )
-                .bind(domain.0)
-                .bind(row.a.0)
-                .bind(row.b.0)
-                .bind(row.line_a as i64)
-                .bind(row.line_b as i64)
-                .bind(&row.hash_a)
-                .bind(&row.hash_b)
-                .bind(model)
-                .bind(f64::from(row.score_ab))
-                .bind(f64::from(row.score_ba))
-                .bind(f64::from(row.similarity))
-                .bind(i64::from(row.period))
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            for sql in [
-                DELETE_PAIR_CONTRADICTIONS_SQL,
-                DELETE_CONTRADICTION_PAIR_SQL,
-            ] {
-                sqlx::query(sql)
-                    .bind(a.0)
-                    .bind(b.0)
-                    .bind(model)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?;
-            }
-            Ok(())
-        })
-        .await
     }
 
     async fn contradictions(
@@ -3931,35 +3053,6 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
-    async fn store_observation_vectors(
-        &self,
-        model: &str,
-        rows: &[ObservationVector],
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            for row in rows {
-                sqlx::query(
-                    "INSERT INTO observation_vector (model, hash, dims, vector) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT (model, hash) DO NOTHING",
-                )
-                .bind(model)
-                .bind(&row.hash)
-                .bind(row.vector.len() as i64)
-                .bind(crate::store::pack_f32_le(&row.vector))
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
     async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>> {
         let mut conn = self.acquire().await?;
         let rows = sqlx::query(OBSERVATION_VECTOR_HASHES_SQL)
@@ -3970,176 +3063,6 @@ impl Store for PostgresStore {
         Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
     }
 
-    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
-        if hashes.is_empty() {
-            return Ok(0);
-        }
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            let mut gone = 0u64;
-            for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
-                let sql = delete_observation_vectors_sql(run.len());
-                let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
-                for h in run {
-                    q = q.bind(h);
-                }
-                gone += q
-                    .execute(&mut *c)
-                    .await
-                    .map_err(IndexError::from)?
-                    .rows_affected();
-            }
-            Ok(gone)
-        })
-        .await
-    }
-
-    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
-        let mut conn = self.acquire().await?;
-        Ok(sqlx::query(DELETE_OBSERVATION_VECTORS_EXCEPT_SQL)
-            .bind(model)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?
-            .rows_affected())
-    }
-
-    async fn clear_observation_vectors(&self) -> Result<u64> {
-        let mut conn = self.acquire().await?;
-        Ok(sqlx::query(CLEAR_OBSERVATION_VECTORS_SQL)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?
-            .rows_affected())
-    }
-
-    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
-        in_transaction(self, async {
-            let mut conn = self.acquire().await?;
-            let c = conn.as_mut();
-            match domains {
-                None => {
-                    for sql in [
-                        CLEAR_ALL_CONTRADICTIONS_SQL,
-                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
-                    ] {
-                        sqlx::query(sql)
-                            .execute(&mut *c)
-                            .await
-                            .map_err(IndexError::from)?;
-                    }
-                }
-                Some(ids) => {
-                    for id in ids {
-                        for sql in [
-                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
-                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
-                        ] {
-                            sqlx::query(sql)
-                                .bind(id.0)
-                                .execute(&mut *c)
-                                .await
-                                .map_err(IndexError::from)?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// A postgres database may be shared by several instances at once.
-    fn shares_database(&self) -> bool {
-        true
-    }
-
-    /// A session-level advisory lock on a connection of its own, taken out of
-    /// the pool for as long as the claim lives. It never runs on the pinned
-    /// transaction connection: that one goes back to the pool at commit.
-    async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>> {
-        let id = work_claim_id(self.schema.as_deref(), key);
-        let mut conn = self.pool.acquire().await.map_err(IndexError::from)?;
-        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-            .bind(id)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(IndexError::from)?;
-        Ok(taken.then(|| WorkClaim::session(conn, id)))
-    }
-
-    async fn wipe(&self) -> Result<()> {
-        // Deletes every chunk, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        sqlx::query("BEGIN")
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        for table in migrations::WIPE_TABLES {
-            if let Err(e) = sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
-                .execute(&mut *c)
-                .await
-            {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
-                return Err(e.into());
-            }
-        }
-        sqlx::query("COMMIT")
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        self.tag_cache.lock().unwrap().clear();
-        Ok(())
-    }
-
-    async fn record_sync(
-        &self,
-        domain: DomainId,
-        when: &str,
-        changed: bool,
-        refresh_before: &str,
-    ) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        sqlx::query(RECORD_SYNC_SQL)
-            .bind(when)
-            .bind(domain.0)
-            .bind(changed)
-            .bind(refresh_before)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    /// Runs on `PostgresStore::acquire`'s connection, which is the pinned
-    /// transaction connection when one is open - the same reason `record_sync`
-    /// does, and the reason clearing the marker inside the apply's transaction
-    /// is atomic with it here as it is on Turso.
-    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET rebuild_started=$1, rebuild_kind=$2 WHERE id=$3")
-            .bind(when)
-            .bind(kind.as_str())
-            .bind(domain.0)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=$1")
-            .bind(domain.0)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
     async fn parse_generation(&self, domain: DomainId) -> Result<u32> {
         let mut conn = self.acquire().await?;
         let row: Option<(i64,)> = sqlx::query_as("SELECT parse_generation FROM domain WHERE id=$1")
@@ -4148,51 +3071,6 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         Ok(row.map(|(g,)| u32::try_from(g).unwrap_or(0)).unwrap_or(0))
-    }
-
-    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
-        let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET parse_generation=$2 WHERE id=$1")
-            .bind(domain.0)
-            .bind(i64::from(generation))
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
-        // An empty configuration is a legitimate one; stamping nothing runs no
-        // statement, matching the Turso backend, where `IN ()` is a syntax
-        // error.
-        if names.is_empty() {
-            return Ok(());
-        }
-        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
-        let mut conn = self.acquire().await?;
-        sqlx::query("UPDATE domain SET last_registered=$1 WHERE name = ANY($2)")
-            .bind(when)
-            .bind(&owned)
-            .execute(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(())
-    }
-
-    // --- the actor dimension -------------------------------------------------
-
-    async fn upsert_overlay(
-        &self,
-        domain: DomainId,
-        actor: &str,
-        record: &EngramRecord,
-    ) -> Result<EngramId> {
-        if actor.is_empty() {
-            return Err(IndexError::Constraint(
-                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
-            ));
-        }
-        self.upsert_row(domain, actor, record).await
     }
 
     async fn overlay_entry(
@@ -4288,59 +3166,6 @@ impl Store for PostgresStore {
                 )
             })
             .collect())
-    }
-
-    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
-        if actor.is_empty() {
-            return Ok(false);
-        }
-        // Deletes the draft's chunks, so the coverage snapshot is now stale.
-        // No contradiction rows to delete: drafts are never scored.
-        self.invalidate_coverage();
-        let mut conn = self.acquire().await?;
-        let c = conn.as_mut();
-        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3")
-            .bind(domain.0)
-            .bind(actor)
-            .bind(path)
-            .fetch_optional(&mut *c)
-            .await
-            .map_err(IndexError::from)?
-            .and_then(|r| cell_i64(&r, 0));
-        let Some(id) = id else {
-            return Ok(false);
-        };
-        delete_children(&mut *c, id).await?;
-        // Every reference that named this draft goes back to pending in the
-        // same transaction. See the turso twin.
-        for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
-            sqlx::query(sql)
-                .bind(id)
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
-        }
-        sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
-            .bind(id)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
-            .bind(id)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        // -- actor: by id - the row is already named by its id, which the
-        // actor-scoped lookup above resolved, so this statement is inside that
-        // actor's dimension without screening for it again. The census reads
-        // each statement alone, and alone this one names no actor, so it says
-        // here which of the two waivers it holds.
-        sqlx::query("DELETE FROM engram WHERE id=$1")
-            .bind(id)
-            .execute(&mut *c)
-            .await
-            .map_err(IndexError::from)?;
-        Ok(true)
     }
 
     async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>> {
@@ -4600,6 +3425,1446 @@ impl Store for PostgresStore {
         ))
     }
 
+    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT DISTINCT holder_instance_id FROM domain_lock WHERE holder_label=$1 AND heartbeat_at>=$2",
+        )
+        .bind(label)
+        .bind(stale_before)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT holder_label FROM domain_lock WHERE holder_instance_id=$1 AND holder_label<>'' \
+             UNION SELECT last_host_label FROM domain WHERE last_host_id=$1 AND last_host_label<>''",
+        )
+        .bind(instance_id)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(DOMAIN_HOST_SQL)
+            .bind(domain.0)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.map(|r| domain_host_of(&r)))
+    }
+
+    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(
+            "SELECT holder_instance_id, COALESCE(NULLIF(holder_label,''), holder_instance_id), heartbeat_at, acquired_at FROM domain_lock WHERE domain_id=$1 FOR SHARE",
+        )
+        .bind(domain.0)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.map(|r| domain_host_of(&r)))
+    }
+
+    async fn automation_lease(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+    ) -> Result<Option<AutomationLease>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(AUTOMATION_LEASE_SQL)
+            .bind(domain.0)
+            .bind(loop_kind)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        row.map(|r| automation_lease_of(&r)).transpose()
+    }
+
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT path, records FROM reflection_disclosure WHERE domain_id=$1 \
+             ORDER BY path COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows)
+    }
+
+    async fn automation_runs(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationRun>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(
+            "SELECT started_at, ended_at, runner, account, outcome, done, \"left\", \
+             judgment_waiting, summary, pr_url, left_items FROM automation_run \
+             WHERE domain_id=$1 AND loop_kind=$2 ORDER BY id DESC LIMIT $3",
+        )
+        .bind(domain.0)
+        .bind(loop_kind)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        rows.iter().map(automation_run_of).collect()
+    }
+
+    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query("SELECT last_host_id, last_host_label FROM domain WHERE id=$1")
+            .bind(domain.0)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.and_then(|r| {
+            let id = cell_text(&r, 0)?;
+            let label = cell_text(&r, 1)
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| id.clone());
+            Some((id, label))
+        }))
+    }
+
+    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM domain_lock WHERE holder_label=$1 AND holder_instance_id<>$2) \
+             OR EXISTS(SELECT 1 FROM domain WHERE last_host_label=$1 AND last_host_id<>$2)",
+        )
+        .bind(label)
+        .bind(instance_id)
+        .fetch_one(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(row.try_get::<bool, _>(0).unwrap_or(false))
+    }
+
+    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>> {
+        let mut conn = self.acquire().await?;
+        let row = sqlx::query(HOST_MOVE_SQL)
+            .bind(domain.0)
+            .fetch_optional(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(row.and_then(|r| cell_text(&r, 0)))
+    }
+
+    async fn get_asset(
+        &self,
+        table: AssetTable,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<AttachmentRow>> {
+        let mut conn = self.acquire().await?;
+        let row = query_first(
+            conn.as_mut(),
+            asset_sql(table).get,
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(attachment_from_row))
+    }
+
+    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>> {
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            asset_sql(table).list,
+            vec![Param::Int(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(attachment_from_row).collect())
+    }
+
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
+        let mut conn = self.acquire().await?;
+        let row = query_first(
+            conn.as_mut(),
+            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
+             WHERE a.domain_id=$1 AND a.path=$2",
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| r.try_get::<Option<Vec<u8>>, _>(0).ok().flatten()))
+    }
+
+    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>> {
+        let mut conn = self.acquire().await?;
+        let row = query_first(
+            conn.as_mut(),
+            "SELECT path, title, content, sha256, size, modified FROM reflection \
+             WHERE domain_id=$1 AND path=$2",
+            vec![Param::Int(domain.0), Param::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(reflection_from_row))
+    }
+
+    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>> {
+        let mut conn = self.acquire().await?;
+        // `COLLATE "C"` pins byte order, the order Turso's TEXT sorts in.
+        let rows = query_all(
+            conn.as_mut(),
+            "SELECT path, title, content, sha256, size, modified FROM reflection \
+             WHERE domain_id=$1 ORDER BY path COLLATE \"C\"",
+            vec![Param::Int(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(reflection_from_row).collect())
+    }
+
+    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>> {
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            REFLECTION_STAMPS_SQL,
+            vec![Param::Int(domain.0)],
+        )
+        .await?;
+        let mut stamps: Vec<ReflectionStamp> = rows
+            .iter()
+            .map(|r| ReflectionStamp {
+                path: cell_text(r, 0).unwrap_or_default(),
+                title: cell_text(r, 1).unwrap_or_default(),
+                sha256: cell_text(r, 2).unwrap_or_default(),
+                size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
+                modified: cell_text(r, 4).unwrap_or_default(),
+            })
+            .collect();
+        // Byte order, the order `list_reflections` pins with `COLLATE "C"`;
+        // Rust compares strings byte by byte.
+        stamps.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(stamps)
+    }
+
+    async fn reflection_vector_hits(
+        &self,
+        domain: DomainId,
+        query: &[f32],
+        model: &str,
+    ) -> Result<Vec<SectionVector>> {
+        // A width this domain's vectors do not have is caught here, before
+        // the statement runs, as the engram semantic scan relies on too: a
+        // read never resizes the column. A domain with no vectors passes,
+        // and `rc.dims` keeps every row from the distance, so a query of
+        // another width than the column answers no hits rather than an
+        // error (`reflection_coverage_is_counted_per_domain`).
+        let coverage = self.reflection_coverage(domain).await?;
+        crate::rank::check_staleness(&coverage, model, query.len())?;
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            REFLECTION_VECTOR_SQL,
+            vec![
+                Param::Vector(pgvector::Vector::from(query.to_vec())),
+                Param::Int(domain.0),
+                Param::Text(model.to_string()),
+                Param::Int(query.len() as i64),
+            ],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SectionVector {
+                path: cell_text(r, 0).unwrap_or_default(),
+                section_ord: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                similarity: 1.0 - cell_real(r, 2).unwrap_or(1.0),
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl Store for PostgresStore {
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId> {
+        // A virtual domain stores `path = NULL`; `kind` discriminates on both
+        // backends.
+        let mut conn = self.acquire().await?;
+        // Every sync of every domain comes through here, and almost every
+        // time the row is already exactly this one. Read first and write
+        // nothing then: the upsert below rewrites the row even when nothing
+        // in it changes, and takes a value from the id sequence even when it
+        // inserts nothing.
+        // Two point reads, as on turso.
+        let existing: Option<(i64, Option<String>, String)> =
+            sqlx::query_as("SELECT id, path, kind FROM domain WHERE name=$1")
+                .bind(name)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?;
+        if let Some((id, held_path, held_kind)) = existing
+            && held_path.as_deref() == path
+            && held_kind == kind_str(kind)
+            && sqlx::query("SELECT 1 FROM domain_spelling WHERE spelling=$1")
+                .bind(name)
+                .fetch_optional(conn.as_mut())
+                .await
+                .map_err(IndexError::from)?
+                .is_some()
+        {
+            return Ok(DomainId(id));
+        }
+        // A new row is stamped with the current parser generation, so a fresh
+        // index never reparses what it has only just parsed; an existing row
+        // keeps the generation it has.
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO domain(name, path, kind, parse_generation) VALUES($1,$2,$3,$4) \
+             ON CONFLICT(name) DO UPDATE SET path=EXCLUDED.path, kind=EXCLUDED.kind RETURNING id",
+        )
+        .bind(name)
+        .bind(path)
+        .bind(kind_str(kind))
+        .bind(i64::from(crystalline_core::PARSE_GENERATION))
+        .fetch_one(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        // The row answers to its own name. A spelling another domain already
+        // holds is left with it; the name table's refresh settles precedence.
+        // No transaction of its own: a sync may already be inside one.
+        sqlx::query(
+            "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+             ON CONFLICT(spelling) DO NOTHING",
+        )
+        .bind(name)
+        .bind(row.0)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(DomainId(row.0))
+    }
+
+    async fn replace_domain_spellings(
+        &self,
+        spellings: &[(String, DomainId)],
+    ) -> Result<Vec<String>> {
+        // Every statement below runs on the pinned transaction connection, and
+        // each block drops its guard before the next `domain_spellings` read
+        // (which pins the same connection) and before the commit.
+        let SpellingPlan { rows, scope } = spelling_plan(spellings)?;
+        in_transaction(self, async {
+            {
+                let mut conn = self.acquire().await?;
+                for id in &scope {
+                    let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM domain WHERE id=$1")
+                        .bind(id.0)
+                        .fetch_optional(conn.as_mut())
+                        .await
+                        .map_err(IndexError::from)?;
+                    if known.is_none() {
+                        return Err(IndexError::Invalid(format!(
+                            "no domain row has id {}; sync the domain before recording its spellings",
+                            id.0
+                        )));
+                    }
+                }
+            }
+            let before = self.domain_spellings().await?;
+            {
+                let mut conn = self.acquire().await?;
+                let c = conn.as_mut();
+                // The listed domains' spellings go, all but each row's own name.
+                for id in &scope {
+                    sqlx::query(
+                        "DELETE FROM domain_spelling WHERE domain_id=$1 \
+                         AND spelling <> (SELECT name FROM domain WHERE id=$1)",
+                    )
+                    .bind(id.0)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                }
+                // The list, each spelling taken for its domain from whoever held it.
+                for (spelling, id) in &rows {
+                    claim_own_spelling(&mut *c, spelling, *id).await?;
+                }
+                // Then every row's own name, last, so a local name wins over any
+                // canonical name or alias on the same spelling - the list's or
+                // one recorded earlier, by this instance or another.
+                let displaced: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT d.name, d.id FROM domain d WHERE NOT EXISTS \
+                     (SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name AND s.domain_id=d.id)",
+                )
+                .fetch_all(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+                for (name, id) in displaced {
+                    claim_own_spelling(&mut *c, &name, DomainId(id)).await?;
+                }
+            }
+            let after = self.domain_spellings().await?;
+            Ok(changed_spellings(&before, &after))
+        })
+        .await
+    }
+
+    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        // -- actor: all - a draft's reference named the spelling too, and binds
+        // again through the actor's own resolve pass.
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut reset = 0;
+            for table in ["relation", "link"] {
+                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
+                let sql = reset_spelled_references_sql(table, &list);
+                reset += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(reset)
+        })
+        .await
+    }
+
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut bound = 0;
+            for table in ["relation", "link"] {
+                let params = spellings.iter().map(|s| Param::Text(s.clone())).collect();
+                let sql = resolve_spelled_references_sql(table, &list);
+                bound += bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(bound)
+        })
+        .await
+    }
+
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>> {
+        if spellings.is_empty() || targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let spelled = placeholders(2, spellings.len());
+        let first = 2 + spellings.len();
+        let targeted = (first..first + targets.len())
+            .map(|i| format!("lower(${i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = || {
+            let mut out = vec![Param::Int(domain.0)];
+            out.extend(spellings.iter().map(|s| Param::Text(s.clone())));
+            out.extend(targets.iter().map(|t| Param::Text(t.clone())));
+            out
+        };
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+            for table in ["relation", "link"] {
+                let sql = count_references_to_sql(table, "$1", &spelled, &targeted);
+                let rows = bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
+                    .fetch_all(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                for row in rows {
+                    let id: i64 = row.try_get(0).map_err(IndexError::from)?;
+                    let n: i64 = row.try_get(1).map_err(IndexError::from)?;
+                    *counts.entry(id).or_default() += n as u64;
+                }
+                let sql = resolve_references_to_sql(table, "$1", &spelled, &targeted);
+                bind_all(sqlx::query(AssertSqlSafe(sql.as_str())), params())
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(id, n)| (DomainId(id), n))
+                .collect())
+        })
+        .await
+    }
+
+    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            let old_id = self.domain_id(old).await?;
+            let new_id = self.domain_id(new).await?;
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            match (old_id, new_id) {
+                (Some(_), Some(_)) => return Err(rename_onto_taken_row(old, new)),
+                (Some(id), None) => {
+                    sqlx::query("UPDATE domain SET name=$2 WHERE id=$1")
+                        .bind(id.0)
+                        .bind(new)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(IndexError::from)?;
+                    // The old name stays an alias of the row, so every
+                    // reference spelled with it keeps resolving; one another
+                    // domain holds is left with that domain.
+                    sqlx::query(
+                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES($1, $2) \
+                         ON CONFLICT(spelling) DO NOTHING",
+                    )
+                    .bind(old)
+                    .bind(id.0)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+                    take_spelling_for_rename(&mut *c, new, id).await?;
+                }
+                // Renamed already: make sure the own name is in place, and
+                // leave `old` alone - by now it may be an alias on purpose, or
+                // it was never this row's name and must not become one.
+                (None, Some(id)) => take_spelling_for_rename(&mut *c, new, id).await?,
+                (None, None) => {}
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
+        // May delete stray chunk rows, so the coverage snapshot may be stale.
+        self.invalidate_coverage();
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            // -- actor: all - one actor's draft is content too, so any row of
+            // any actor keeps the domain row. `FOR UPDATE` holds the row until
+            // the commit, so a registration of the same name waits for it.
+            let id: Option<(i64,)> = sqlx::query_as(
+                "SELECT d.id FROM domain d WHERE d.name=$1 \
+                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM reflection r WHERE r.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM reflection_asset f WHERE f.domain_id=d.id) \
+                 FOR UPDATE OF d",
+            )
+            .bind(name)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+            let Some((id,)) = id else {
+                return Ok(false);
+            };
+            // `domain_lock`, the two automation tables, `reflection_disclosure`
+            // and `tag_alias` name the row without a cascade, and `relation`
+            // and `link` carry its id with no key at all, so each is cleared
+            // before the row itself.
+            for sql in [
+                "DELETE FROM domain_spelling WHERE domain_id=$1",
+                // A chunk is not content, so it does not keep the row; it
+                // goes with it (the funnel never leaves one without its page).
+                "DELETE FROM reflection_chunk WHERE domain_id=$1",
+                "DELETE FROM tag_alias WHERE domain_id=$1",
+                "DELETE FROM domain_lock WHERE domain_id=$1",
+                "DELETE FROM automation_lease WHERE domain_id=$1",
+                "DELETE FROM automation_run WHERE domain_id=$1",
+                "DELETE FROM reflection_disclosure WHERE domain_id=$1",
+                "DELETE FROM relation WHERE domain_id=$1",
+                "DELETE FROM link WHERE domain_id=$1",
+                "DELETE FROM domain WHERE id=$1",
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
+        self.upsert_row(domain, "", record).await
+    }
+
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId> {
+        // Compare-and-swap: if a row exists at this path and the caller's
+        // expected sha no longer matches the stored one, refuse. The engine
+        // holds the transaction open (the pinned connection), so the compare and
+        // the write are one atomic unit.
+        //
+        // No row at all is an insert, which nothing guards.
+        if let Some(expected) = expected_sha {
+            self.guarded_compare(domain, &record.path, expected).await?;
+        }
+        self.upsert_engram(domain, record).await
+    }
+
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>> {
+        if !self
+            .guarded_compare(domain, &record.path, expected_sha)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.upsert_engram(domain, record).await.map(Some)
+    }
+
+    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Deletes this domain's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        // Delete a single domain's engram, attachment and child rows, keeping
+        // the domain row. Child rows first so the enforced foreign keys are
+        // satisfied, attachment blobs before the attachment rows that own them
+        // and the bodies in `engram_content` before the engram rows they hang
+        // off.
+        // `upsert_domain` reuses the id for a name it has seen, so anything left
+        // here would resurface as the next registration's own.
+        // -- actor: all - a domain's removal takes its drafts with it. Nothing
+        // survives the domain they were drafts of, so these statements name
+        // every actor's rows on purpose; the overlay journal is swept on the
+        // same paths so the rows and their mirror go together.
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        for sql in [
+            "DELETE FROM contradiction WHERE domain_id=$1",
+            "DELETE FROM contradiction_pair WHERE domain_id=$1",
+            "DELETE FROM observation_tag WHERE observation_id IN \
+             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=$1)",
+            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM relation WHERE domain_id=$1",
+            "DELETE FROM link WHERE domain_id=$1",
+            // Every reference from another domain that named one of these
+            // engrams goes back to pending before the rows go, in whatever
+            // transaction the caller holds, as `delete_engram` does: a `to_id`
+            // naming a row nobody holds would read as resolved forever. See the turso twin.
+            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
+            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
+            // -- actor: all - the bodies of every row about to go, named
+            // through them since `engram_content` has no domain of its own.
+            "DELETE FROM engram_content WHERE engram_id IN \
+             (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM engram WHERE domain_id=$1",
+            "DELETE FROM tag_alias WHERE domain_id=$1",
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=$1)",
+            "DELETE FROM attachment WHERE domain_id=$1",
+            "DELETE FROM reflection_chunk WHERE domain_id=$1",
+            "DELETE FROM reflection WHERE domain_id=$1",
+            "DELETE FROM reflection_asset WHERE domain_id=$1",
+            // Every spelling but the row's own name, which stays with the row.
+            // The declared cascade never fires: the row is kept.
+            "DELETE FROM domain_spelling WHERE domain_id=$1 \
+             AND spelling <> (SELECT name FROM domain WHERE id=$1)",
+        ] {
+            sqlx::query(sql)
+                .bind(domain.0)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
+        // Deletes the engram's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // The base row at this path. A draft is dropped by its own actor
+        // through `clear_overlay_entry`, never by the sync driver noticing that
+        // a file left disk - the draft was never on disk.
+        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND path=$2 AND actor = ''")
+            .bind(domain.0)
+            .bind(path)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?
+            .and_then(|r| cell_i64(&r, 0));
+        if let Some(id) = id {
+            // The declared cascade would take these with the engram row; they
+            // are written out for symmetry with Turso, which enforces nothing.
+            for sql in [
+                DELETE_ENGRAM_CONTRADICTIONS_SQL,
+                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
+            ] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            delete_children(&mut *c, id).await?;
+            // Every reference that named this engram goes back to pending in
+            // the same transaction. See the turso twin.
+            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+                .bind(id)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
+                .bind(id)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            // -- actor: all - the row is already named by its id, which the
+            // base-scoped lookup above resolved.
+            sqlx::query("DELETE FROM engram WHERE id=$1")
+                .bind(id)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()> {
+        // The permalink follows the move only when it was path-derived, so an
+        // explicit frontmatter permalink is preserved across a move.
+        let old_slug = crystalline_core::slugify(from);
+        let new_slug = crystalline_core::slugify(to);
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "UPDATE engram SET path=$1, \
+             permalink = CASE WHEN permalink=$2 THEN $3 ELSE permalink END \
+             WHERE domain_id=$4 AND path=$5 AND actor = ''",
+        )
+        .bind(to)
+        .bind(&old_slug)
+        .bind(&new_slug)
+        .bind(domain.0)
+        .bind(from)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(
+            "UPDATE engram SET path=$1, permalink=$2 \
+             WHERE domain_id=$3 AND path=$4 AND actor = ''",
+        )
+        .bind(to)
+        .bind(permalink)
+        .bind(domain.0)
+        .bind(from)
+        .execute(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
+        // The statement lives in `crate::store`, one copy for both backends;
+        // postgres binds the domain id as `$1`.
+        let sql = crate::store::resolve_pending_sql("relation", "$1");
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(AssertSqlSafe(sql))
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
+        // The wikilink twin of resolve_pending_relations over the `link` table,
+        // matching by the same rule. Links carry no rel_type.
+        let sql = crate::store::resolve_pending_sql("link", "$1");
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(AssertSqlSafe(sql))
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "a reference pass over an actor's own rows must name that actor; the empty \
+                 actor is the base row's own key"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.acquire().await?;
+        let mut bound = 0u64;
+        for table in ["relation", "link"] {
+            // What dangles is unbound. A `to_id` naming a row nobody holds any
+            // more is the trace of a draft that went away, and the existence
+            // probe deliberately asks about every actor's rows: whose the
+            // vanished row was does not change that this one now points at
+            // nothing.
+            let dangling = format!(
+                "UPDATE {table} SET to_id = NULL WHERE domain_id = $1 AND to_id IS NOT NULL \
+                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
+                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
+            );
+            exec(
+                conn.as_mut(),
+                &dangling,
+                vec![Param::Int(domain.0), Param::Text(actor.to_string())],
+            )
+            .await?;
+            // Then what is pending is bound, in this actor's own view.
+            let mut params = vec![Param::Int(domain.0), Param::Text(actor.to_string())];
+            let mut n = 3usize;
+            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
+            let view = reference_match(
+                table,
+                ReferenceCandidates::View {
+                    screen: &actor_screen,
+                },
+            );
+            let sql = format!(
+                "UPDATE {table} SET to_id = {view} \
+                 WHERE {table}.to_id IS NULL AND {table}.domain_id = $1 \
+                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = $1 AND actor = $2) \
+                 AND {view} IS NOT NULL"
+            );
+            bound += exec(conn.as_mut(), &sql, params).await?;
+        }
+        Ok(bound)
+    }
+
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<bool> {
+        // Delete then re-insert: the map is fully derived from MANIFEST content,
+        // so a change replaces the domain's rows wholesale and an empty slice
+        // clears them. `ON CONFLICT DO NOTHING` drops a duplicate alias (the
+        // caller already deduped first-wins, so this is belt and braces). Runs on
+        // the acquired connection so it stays inside the sync transaction.
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // A map that already holds exactly these pairs is left alone, so the
+        // refresh every sync runs writes nothing while the MANIFEST is
+        // unchanged.
+        let held: Vec<(String, String)> =
+            sqlx::query_as("SELECT alias, canonical FROM tag_alias WHERE domain_id=$1")
+                .bind(domain.0)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        let held: std::collections::BTreeMap<String, String> = held.into_iter().collect();
+        if held == crate::store::wanted_tag_aliases(pairs) {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM tag_alias WHERE domain_id=$1")
+            .bind(domain.0)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        for (alias, canonical) in pairs {
+            sqlx::query(
+                "INSERT INTO tag_alias(domain_id, alias, canonical) VALUES($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(domain.0)
+            .bind(alias)
+            .bind(canonical)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        }
+        Ok(true)
+    }
+
+    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
+        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
+        // now stale.
+        self.invalidate_coverage();
+        let eid = engram_id.0;
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // Carry over the embedding of any chunk whose fingerprint is unchanged so
+        // an edit only re-embeds the paragraphs that changed. The fingerprint
+        // folds in the model id, so a chunk embedded by a different model does
+        // not match and is left for re-embedding.
+        //
+        // This selects the raw `embedding` column, whose type includes the
+        // column's typmod, so it is the one statement in this module exposed to
+        // `ensure_embedding_width`'s DDL-vs-cached-plan hazard (see the module
+        // doc). The trailing `/* w{generation} */` comment is inert to Postgres but not
+        // to sqlx's statement cache: it makes the SQL text - and so the cache
+        // key - change every time the column is resized, which forces a fresh
+        // prepare against the current column shape on whichever connection runs
+        // this next, without needing to reach every pooled connection directly.
+        // This runs inside `sync`'s explicit transaction (the raw `BEGIN` in
+        // `begin()`), where a failed statement would abort the whole
+        // transaction with no way to recover by retrying in place, which is why
+        // prevention rather than retry is the fix here.
+        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let carry_sql = format!(
+            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL /* w{generation} */"
+        );
+        let existing = sqlx::query(AssertSqlSafe(carry_sql))
+            .bind(eid)
+            .fetch_all(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        let mut carry: HashMap<String, (Option<String>, Option<i64>, pgvector::Vector)> =
+            HashMap::new();
+        for r in &existing {
+            let Some(hash) = cell_text(r, 0) else {
+                continue;
+            };
+            let model = r.try_get::<Option<String>, _>(1).ok().flatten();
+            let dims = r.try_get::<Option<i64>, _>(2).ok().flatten();
+            let Some(emb) = r.try_get::<Option<pgvector::Vector>, _>(3).ok().flatten() else {
+                continue;
+            };
+            carry.insert(hash, (model, dims, emb));
+        }
+
+        sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+            .bind(eid)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+
+        // One 7-column multi-row insert for every chunk: a carry hit binds its
+        // preserved model, dims and embedding, a miss binds NULL for all three
+        // and leaves the chunk pending re-embedding.
+        for batch in chunks.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
+            for chunk in batch {
+                params.push(Param::Int(eid));
+                params.push(Param::Int(chunk.seq));
+                params.push(Param::Text(chunk.text.clone()));
+                params.push(Param::Text(chunk.text_hash.clone()));
+                match carry.get(&chunk.text_hash) {
+                    Some((model, dims, emb)) => {
+                        params.push(Param::TextOpt(model.clone()));
+                        params.push(Param::IntOpt(*dims));
+                        params.push(Param::VectorOpt(Some(emb.clone())));
+                    }
+                    None => {
+                        params.push(Param::TextOpt(None));
+                        params.push(Param::IntOpt(None));
+                        params.push(Param::VectorOpt(None));
+                    }
+                }
+            }
+            let sql = format!(
+                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
+                value_rows(7, batch.len(), None)
+            );
+            exec(&mut *c, &sql, params).await?;
+        }
+        Ok(())
+    }
+
+    async fn store_embeddings_in(
+        &self,
+        table: ChunkTable,
+        batch: &[EmbeddingRow],
+        model: &str,
+    ) -> Result<()> {
+        // Writes embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        // Validate the whole batch before any write so a bad row never leaves
+        // earlier rows committed.
+        for row in batch {
+            if row.embedding.len() != row.dims {
+                return Err(IndexError::Invalid(format!(
+                    "embedding length {} does not match declared dims {}",
+                    row.embedding.len(),
+                    row.dims
+                )));
+            }
+        }
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        // `dims` is per row, and a width change may DDL (resize the column, drop
+        // and recreate the index), so make each distinct width current once and
+        // before the transaction opens rather than once per row inside it.
+        let mut widths: Vec<usize> = Vec::new();
+        for row in batch {
+            if !widths.contains(&row.dims) {
+                widths.push(row.dims);
+            }
+        }
+        for dims in widths {
+            self.ensure_embedding_width(&mut *c, table, dims).await?;
+        }
+        // The per-row updates then commit together, mirroring `wipe`.
+        sqlx::query("BEGIN")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        for row in batch {
+            let vector = pgvector::Vector::from(row.embedding.clone());
+            if let Err(e) = sqlx::query(chunk_sql(table).store)
+                .bind(vector)
+                .bind(row.dims as i64)
+                .bind(model)
+                .bind(row.chunk_id)
+                .execute(&mut *c)
+                .await
+            {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+                return Err(e.into());
+            }
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
+        // Clears embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let mut conn = self.acquire().await?;
+        let done = sqlx::query(chunk_sql(table).prune)
+            .bind(model)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(done.rows_affected() as usize)
+    }
+
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for sql in [DELETE_PAIR_CONTRADICTIONS_SQL, DELETE_CONTRADICTION_PAIR_SQL] {
+                sqlx::query(sql)
+                    .bind(pair.a.0)
+                    .bind(pair.b.0)
+                    .bind(model)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            let stored = sqlx::query(INSERT_CONTRADICTION_PAIR_SQL)
+            .bind(domain.0)
+            .bind(pair.a.0)
+            .bind(pair.b.0)
+            .bind(&pair.checksum_a)
+            .bind(&pair.checksum_b)
+            .bind(cosine)
+            .bind(model)
+            .bind(scored_at)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected();
+            // Either engram went while the pair was scored: nothing to keep.
+            if stored == 0 {
+                return Ok(());
+            }
+            for row in rows {
+                sqlx::query(
+                    "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                )
+                .bind(domain.0)
+                .bind(row.a.0)
+                .bind(row.b.0)
+                .bind(row.line_a as i64)
+                .bind(row.line_b as i64)
+                .bind(&row.hash_a)
+                .bind(&row.hash_b)
+                .bind(model)
+                .bind(f64::from(row.score_ab))
+                .bind(f64::from(row.score_ba))
+                .bind(f64::from(row.similarity))
+                .bind(i64::from(row.period))
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for sql in [
+                DELETE_PAIR_CONTRADICTIONS_SQL,
+                DELETE_CONTRADICTION_PAIR_SQL,
+            ] {
+                sqlx::query(sql)
+                    .bind(a.0)
+                    .bind(b.0)
+                    .bind(model)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for row in rows {
+                sqlx::query(
+                    "INSERT INTO observation_vector (model, hash, dims, vector) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (model, hash) DO NOTHING",
+                )
+                .bind(model)
+                .bind(&row.hash)
+                .bind(row.vector.len() as i64)
+                .bind(crate::store::pack_f32_le(&row.vector))
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut gone = 0u64;
+            for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
+                let sql = delete_observation_vectors_sql(run.len());
+                let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
+                for h in run {
+                    q = q.bind(h);
+                }
+                gone += q
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(gone)
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
+        let mut conn = self.acquire().await?;
+        Ok(sqlx::query(DELETE_OBSERVATION_VECTORS_EXCEPT_SQL)
+            .bind(model)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected())
+    }
+
+    async fn clear_observation_vectors(&self) -> Result<u64> {
+        let mut conn = self.acquire().await?;
+        Ok(sqlx::query(CLEAR_OBSERVATION_VECTORS_SQL)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected())
+    }
+
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            match domains {
+                None => {
+                    for sql in [
+                        CLEAR_ALL_CONTRADICTIONS_SQL,
+                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
+                    ] {
+                        sqlx::query(sql)
+                            .execute(&mut *c)
+                            .await
+                            .map_err(IndexError::from)?;
+                    }
+                }
+                Some(ids) => {
+                    for id in ids {
+                        for sql in [
+                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
+                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
+                        ] {
+                            sqlx::query(sql)
+                                .bind(id.0)
+                                .execute(&mut *c)
+                                .await
+                                .map_err(IndexError::from)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// A postgres database may be shared by several instances at once.
+    fn shares_database(&self) -> bool {
+        true
+    }
+
+    /// A session-level advisory lock on a connection of its own, taken out of
+    /// the pool for as long as the claim lives. It never runs on the pinned
+    /// transaction connection: that one goes back to the pool at commit.
+    async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>> {
+        let id = work_claim_id(self.schema.as_deref(), key);
+        let mut conn = self.pool.acquire().await.map_err(IndexError::from)?;
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(taken.then(|| WorkClaim::session(conn, id)))
+    }
+
+    async fn wipe(&self) -> Result<()> {
+        // Deletes every chunk, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        sqlx::query("BEGIN")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        for table in migrations::WIPE_TABLES {
+            if let Err(e) = sqlx::query(AssertSqlSafe(format!("DELETE FROM {table}")))
+                .execute(&mut *c)
+                .await
+            {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+                return Err(e.into());
+            }
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        self.tag_cache.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query(RECORD_SYNC_SQL)
+            .bind(when)
+            .bind(domain.0)
+            .bind(changed)
+            .bind(refresh_before)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    /// Runs on `PostgresStore::acquire`'s connection, which is the pinned
+    /// transaction connection when one is open - the same reason `record_sync`
+    /// does, and the reason clearing the marker inside the apply's transaction
+    /// is atomic with it here as it is on Turso.
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET rebuild_started=$1, rebuild_kind=$2 WHERE id=$3")
+            .bind(when)
+            .bind(kind.as_str())
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=$1")
+            .bind(domain.0)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET parse_generation=$2 WHERE id=$1")
+            .bind(domain.0)
+            .bind(i64::from(generation))
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // An empty configuration is a legitimate one; stamping nothing runs no
+        // statement, matching the Turso backend, where `IN ()` is a syntax
+        // error.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET last_registered=$1 WHERE name = ANY($2)")
+            .bind(when)
+            .bind(&owned)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    // --- the actor dimension -------------------------------------------------
+
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
+            ));
+        }
+        self.upsert_row(domain, actor, record).await
+    }
+
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
+        if actor.is_empty() {
+            return Ok(false);
+        }
+        // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        // No contradiction rows to delete: drafts are never scored.
+        self.invalidate_coverage();
+        let mut conn = self.acquire().await?;
+        let c = conn.as_mut();
+        let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3")
+            .bind(domain.0)
+            .bind(actor)
+            .bind(path)
+            .fetch_optional(&mut *c)
+            .await
+            .map_err(IndexError::from)?
+            .and_then(|r| cell_i64(&r, 0));
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        delete_children(&mut *c, id).await?;
+        // Every reference that named this draft goes back to pending in the
+        // same transaction. See the turso twin.
+        for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+            sqlx::query(sql)
+                .bind(id)
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        }
+        sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        sqlx::query("DELETE FROM engram_content WHERE engram_id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        // -- actor: by id - the row is already named by its id, which the
+        // actor-scoped lookup above resolved, so this statement is inside that
+        // actor's dimension without screening for it again. The census reads
+        // each statement alone, and alone this one names no actor, so it says
+        // here which of the two waivers it holds.
+        sqlx::query("DELETE FROM engram WHERE id=$1")
+            .bind(id)
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(true)
+    }
+
     async fn claim_domain_host(
         &self,
         domain: DomainId,
@@ -4674,32 +4939,6 @@ impl Store for PostgresStore {
         Ok(done.rows_affected() > 0)
     }
 
-    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>> {
-        let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
-            "SELECT DISTINCT holder_instance_id FROM domain_lock WHERE holder_label=$1 AND heartbeat_at>=$2",
-        )
-        .bind(label)
-        .bind(stale_before)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
-    }
-
-    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>> {
-        let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
-            "SELECT holder_label FROM domain_lock WHERE holder_instance_id=$1 AND holder_label<>'' \
-             UNION SELECT last_host_label FROM domain WHERE last_host_id=$1 AND last_host_label<>''",
-        )
-        .bind(instance_id)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
-    }
-
     async fn release_domain_host(
         &self,
         domain: DomainId,
@@ -4739,28 +4978,6 @@ impl Store for PostgresStore {
         .await
         .map_err(IndexError::from)?;
         Ok(done.rows_affected() > 0)
-    }
-
-    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query(DOMAIN_HOST_SQL)
-            .bind(domain.0)
-            .fetch_optional(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(row.map(|r| domain_host_of(&r)))
-    }
-
-    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query(
-            "SELECT holder_instance_id, COALESCE(NULLIF(holder_label,''), holder_instance_id), heartbeat_at, acquired_at FROM domain_lock WHERE domain_id=$1 FOR SHARE",
-        )
-        .bind(domain.0)
-        .fetch_optional(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(row.map(|r| domain_host_of(&r)))
     }
 
     async fn take_automation_lease(
@@ -4938,21 +5155,6 @@ impl Store for PostgresStore {
         row.map(|r| automation_lease_of(&r)).transpose()
     }
 
-    async fn automation_lease(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-    ) -> Result<Option<AutomationLease>> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query(AUTOMATION_LEASE_SQL)
-            .bind(domain.0)
-            .bind(loop_kind)
-            .fetch_optional(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        row.map(|r| automation_lease_of(&r)).transpose()
-    }
-
     async fn record_automation_run(
         &self,
         domain: DomainId,
@@ -5000,19 +5202,6 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
-        let mut conn = self.acquire().await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT path, records FROM reflection_disclosure WHERE domain_id=$1 \
-             ORDER BY path COLLATE \"C\"",
-        )
-        .bind(domain.0)
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(rows)
-    }
-
     async fn set_reflection_disclosures(
         &self,
         domain: DomainId,
@@ -5038,27 +5227,6 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn automation_runs(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-        limit: usize,
-    ) -> Result<Vec<AutomationRun>> {
-        let mut conn = self.acquire().await?;
-        let rows = sqlx::query(
-            "SELECT started_at, ended_at, runner, account, outcome, done, \"left\", \
-             judgment_waiting, summary, pr_url, left_items FROM automation_run \
-             WHERE domain_id=$1 AND loop_kind=$2 ORDER BY id DESC LIMIT $3",
-        )
-        .bind(domain.0)
-        .bind(loop_kind)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        rows.iter().map(automation_run_of).collect()
-    }
-
     async fn swap_host_move(
         &self,
         domain: DomainId,
@@ -5079,36 +5247,6 @@ impl Store for PostgresStore {
         Ok(done.rows_affected() > 0)
     }
 
-    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query("SELECT last_host_id, last_host_label FROM domain WHERE id=$1")
-            .bind(domain.0)
-            .fetch_optional(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(row.and_then(|r| {
-            let id = cell_text(&r, 0)?;
-            let label = cell_text(&r, 1)
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| id.clone());
-            Some((id, label))
-        }))
-    }
-
-    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM domain_lock WHERE holder_label=$1 AND holder_instance_id<>$2) \
-             OR EXISTS(SELECT 1 FROM domain WHERE last_host_label=$1 AND last_host_id<>$2)",
-        )
-        .bind(label)
-        .bind(instance_id)
-        .fetch_one(conn.as_mut())
-        .await
-        .map_err(IndexError::from)?;
-        Ok(row.try_get::<bool, _>(0).unwrap_or(false))
-    }
-
     async fn set_last_domain_host(
         &self,
         domain: DomainId,
@@ -5124,16 +5262,6 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         Ok(())
-    }
-
-    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>> {
-        let mut conn = self.acquire().await?;
-        let row = sqlx::query(HOST_MOVE_SQL)
-            .bind(domain.0)
-            .fetch_optional(conn.as_mut())
-            .await
-            .map_err(IndexError::from)?;
-        Ok(row.and_then(|r| cell_text(&r, 0)))
     }
 
     async fn end_rebuild_stamped(&self, domain: DomainId, started: &str) -> Result<()> {
@@ -5206,33 +5334,6 @@ impl Store for PostgresStore {
         Ok(n > 0)
     }
 
-    async fn get_asset(
-        &self,
-        table: AssetTable,
-        domain: DomainId,
-        path: &str,
-    ) -> Result<Option<AttachmentRow>> {
-        let mut conn = self.acquire().await?;
-        let row = query_first(
-            conn.as_mut(),
-            asset_sql(table).get,
-            vec![Param::Int(domain.0), Param::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.as_ref().map(attachment_from_row))
-    }
-
-    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>> {
-        let mut conn = self.acquire().await?;
-        let rows = query_all(
-            conn.as_mut(),
-            asset_sql(table).list,
-            vec![Param::Int(domain.0)],
-        )
-        .await?;
-        Ok(rows.iter().map(attachment_from_row).collect())
-    }
-
     async fn write_attachment_blob(
         &self,
         domain: DomainId,
@@ -5259,18 +5360,6 @@ impl Store for PostgresStore {
         .await
         .map_err(IndexError::from)?;
         Ok(())
-    }
-
-    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
-        let mut conn = self.acquire().await?;
-        let row = query_first(
-            conn.as_mut(),
-            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
-             WHERE a.domain_id=$1 AND a.path=$2",
-            vec![Param::Int(domain.0), Param::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.and_then(|r| r.try_get::<Option<Vec<u8>>, _>(0).ok().flatten()))
     }
 
     async fn upsert_reflection(&self, domain: DomainId, row: &ReflectionRow) -> Result<()> {
@@ -5400,91 +5489,6 @@ impl Store for PostgresStore {
             exec(&mut *c, &sql, params).await?;
         }
         Ok(())
-    }
-
-    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>> {
-        let mut conn = self.acquire().await?;
-        let row = query_first(
-            conn.as_mut(),
-            "SELECT path, title, content, sha256, size, modified FROM reflection \
-             WHERE domain_id=$1 AND path=$2",
-            vec![Param::Int(domain.0), Param::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.as_ref().map(reflection_from_row))
-    }
-
-    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>> {
-        let mut conn = self.acquire().await?;
-        // `COLLATE "C"` pins byte order, the order Turso's TEXT sorts in.
-        let rows = query_all(
-            conn.as_mut(),
-            "SELECT path, title, content, sha256, size, modified FROM reflection \
-             WHERE domain_id=$1 ORDER BY path COLLATE \"C\"",
-            vec![Param::Int(domain.0)],
-        )
-        .await?;
-        Ok(rows.iter().map(reflection_from_row).collect())
-    }
-
-    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>> {
-        let mut conn = self.acquire().await?;
-        let rows = query_all(
-            conn.as_mut(),
-            REFLECTION_STAMPS_SQL,
-            vec![Param::Int(domain.0)],
-        )
-        .await?;
-        let mut stamps: Vec<ReflectionStamp> = rows
-            .iter()
-            .map(|r| ReflectionStamp {
-                path: cell_text(r, 0).unwrap_or_default(),
-                title: cell_text(r, 1).unwrap_or_default(),
-                sha256: cell_text(r, 2).unwrap_or_default(),
-                size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
-                modified: cell_text(r, 4).unwrap_or_default(),
-            })
-            .collect();
-        // Byte order, the order `list_reflections` pins with `COLLATE "C"`;
-        // Rust compares strings byte by byte.
-        stamps.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(stamps)
-    }
-
-    async fn reflection_vector_hits(
-        &self,
-        domain: DomainId,
-        query: &[f32],
-        model: &str,
-    ) -> Result<Vec<SectionVector>> {
-        // A width this domain's vectors do not have is caught here, before
-        // the statement runs, as the engram semantic scan relies on too: a
-        // read never resizes the column. A domain with no vectors passes,
-        // and `rc.dims` keeps every row from the distance, so a query of
-        // another width than the column answers no hits rather than an
-        // error (`reflection_coverage_is_counted_per_domain`).
-        let coverage = self.reflection_coverage(domain).await?;
-        crate::rank::check_staleness(&coverage, model, query.len())?;
-        let mut conn = self.acquire().await?;
-        let rows = query_all(
-            conn.as_mut(),
-            REFLECTION_VECTOR_SQL,
-            vec![
-                Param::Vector(pgvector::Vector::from(query.to_vec())),
-                Param::Int(domain.0),
-                Param::Text(model.to_string()),
-                Param::Int(query.len() as i64),
-            ],
-        )
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| SectionVector {
-                path: cell_text(r, 0).unwrap_or_default(),
-                section_ord: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
-                similarity: 1.0 - cell_real(r, 2).unwrap_or(1.0),
-            })
-            .collect())
     }
 
     async fn begin(&self) -> Result<()> {

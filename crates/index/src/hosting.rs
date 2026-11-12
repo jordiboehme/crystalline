@@ -380,6 +380,7 @@ mod seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ReadStore;
 
     #[test]
     fn the_line_names_the_counts_the_host_and_both_ways_out() {

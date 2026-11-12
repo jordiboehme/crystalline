@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, PathChangeKind, ReflectionPathChange, ReflectionPathKind, SearchQuery,
     Store, TursoStore, apply_scan, scan_paths, sync_domain_with,

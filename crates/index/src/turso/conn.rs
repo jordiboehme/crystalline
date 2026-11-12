@@ -588,6 +588,7 @@ mod tests {
     use turso::{Builder, Connection, Value};
 
     use super::{Conn, hook, is_tempdir_refusal};
+    use crate::store::ReadStore;
     use crate::store::{DomainKind, Store};
 
     /// Set in the child run of

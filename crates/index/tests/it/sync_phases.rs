@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, EngramRecord, FileStamp, SearchQuery, Store, TursoStore, apply_scan,
     scan_domain, sync_domain_with,

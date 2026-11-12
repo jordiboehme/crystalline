@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, SearchOrder, SearchQuery, Store,
     SyncReport, TursoStore, apply_scan, meta_value_union_sql, parse_metadata_filters,

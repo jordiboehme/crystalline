@@ -22,6 +22,7 @@
 
 use std::path::Path;
 
+use crystalline_index::ReadStore;
 use crystalline_index::{RecentFilter, SearchQuery, Store, TursoStore, sync_domain};
 
 fn write(dir: &Path, rel: &str, content: &str) {

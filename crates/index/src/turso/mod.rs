@@ -44,6 +44,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use turso::{Builder, Connection, Database, Row, Value};
 
+use crate::store::ReadStore;
 use conn::Conn;
 
 use crate::alias::{AliasMap, query_uses_tags};
@@ -1768,77 +1769,7 @@ async fn probe_fts(conn: &Connection) -> bool {
 }
 
 #[async_trait]
-impl Store for TursoStore {
-    async fn upsert_domain(
-        &self,
-        name: &str,
-        path: Option<&str>,
-        kind: DomainKind,
-    ) -> Result<DomainId> {
-        // Virtual domains have no filesystem root; SQLite keeps `path NOT NULL`,
-        // so an absent path stores the empty string and `kind` discriminates.
-        let path = path.unwrap_or("");
-        let kind = kind_str(kind);
-        // Every sync of every domain comes through here, and almost every
-        // time the row is already exactly this one. Read first and write
-        // nothing then: an upsert that changes nothing still rewrites the
-        // row and appends to the log, on every sync of an idle domain.
-        // Two point reads, no subquery: turso backs a correlated subquery
-        // with an ephemeral table, which creates a temporary directory.
-        let existing = query_first(
-            &self.conn,
-            "SELECT id, path, kind FROM domain WHERE name=?1",
-            vec![Value::Text(name.to_string())],
-        )
-        .await?;
-        if let Some(r) = &existing
-            && let Some(id) = cell_i64(r, 0)
-            && cell_text(r, 1).as_deref() == Some(path)
-            && cell_text(r, 2).as_deref() == Some(kind)
-            && query_first(
-                &self.conn,
-                "SELECT 1 FROM domain_spelling WHERE spelling=?1",
-                vec![Value::Text(name.to_string())],
-            )
-            .await?
-            .is_some()
-        {
-            return Ok(DomainId(id));
-        }
-        self.conn
-            .execute(
-                // A new row is stamped with the current parser generation, so
-                // a fresh index never reparses what it has only just parsed; an
-                // existing row keeps the generation it has.
-                "INSERT INTO domain(name, path, kind, parse_generation) VALUES(?1, ?2, ?3, ?4) \
-                 ON CONFLICT(name) DO UPDATE SET path=excluded.path, kind=excluded.kind",
-                vec![
-                    Value::Text(name.to_string()),
-                    Value::Text(path.to_string()),
-                    Value::Text(kind.to_string()),
-                    Value::Integer(i64::from(crystalline_core::PARSE_GENERATION)),
-                ],
-            )
-            .await?;
-        let id = scalar_i64(
-            &self.conn,
-            "SELECT id FROM domain WHERE name=?1",
-            vec![Value::Text(name.to_string())],
-        )
-        .await?;
-        // The row answers to its own name. A spelling another domain already
-        // holds is left with it; the name table's refresh settles precedence.
-        // No transaction of its own: a sync may already be inside one.
-        self.conn
-            .execute(
-                "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
-                 ON CONFLICT(spelling) DO NOTHING",
-                vec![Value::Text(name.to_string()), Value::Integer(id)],
-            )
-            .await?;
-        Ok(DomainId(id))
-    }
-
+impl ReadStore for TursoStore {
     async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>> {
         // TEXT sorts byte-wise here, the order the Postgres twin pins itself to
         // with an explicit `COLLATE "C"`.
@@ -1872,248 +1803,6 @@ impl Store for TursoStore {
                 ))
             })
             .collect())
-    }
-
-    async fn replace_domain_spellings(
-        &self,
-        spellings: &[(String, DomainId)],
-    ) -> Result<Vec<String>> {
-        let SpellingPlan { rows, scope } = spelling_plan(spellings)?;
-        in_transaction(self, async {
-            for id in &scope {
-                let known = query_first(
-                    &self.conn,
-                    "SELECT id FROM domain WHERE id=?1",
-                    vec![Value::Integer(id.0)],
-                )
-                .await?;
-                if known.is_none() {
-                    return Err(IndexError::Invalid(format!(
-                        "no domain row has id {}; sync the domain before recording its spellings",
-                        id.0
-                    )));
-                }
-            }
-            let before = self.domain_spellings().await?;
-            // The listed domains' spellings go, all but each row's own name.
-            for id in &scope {
-                self.conn
-                    .execute(
-                        "DELETE FROM domain_spelling WHERE domain_id=?1 \
-                         AND spelling <> (SELECT name FROM domain WHERE id=?1)",
-                        vec![Value::Integer(id.0)],
-                    )
-                    .await?;
-            }
-            // The list, each spelling taken for its domain from whoever held it.
-            for (spelling, id) in &rows {
-                self.conn
-                    .execute(
-                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
-                         ON CONFLICT(spelling) DO UPDATE SET domain_id=excluded.domain_id",
-                        vec![Value::Text(spelling.clone()), Value::Integer(id.0)],
-                    )
-                    .await?;
-            }
-            // Then every row's own name, last, so a local name wins over any
-            // canonical name or alias on the same spelling - the list's or one
-            // recorded earlier, by this instance or another.
-            let displaced = query_all(
-                &self.conn,
-                "SELECT d.name, d.id FROM domain d WHERE NOT EXISTS \
-                 (SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name AND s.domain_id=d.id)",
-                Vec::new(),
-            )
-            .await?;
-            for r in &displaced {
-                let (Some(name), Some(id)) = (cell_text(r, 0), cell_i64(r, 1)) else {
-                    continue;
-                };
-                self.conn
-                    .execute(
-                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
-                         ON CONFLICT(spelling) DO UPDATE SET domain_id=excluded.domain_id",
-                        vec![Value::Text(name), Value::Integer(id)],
-                    )
-                    .await?;
-            }
-            let after = self.domain_spellings().await?;
-            Ok(changed_spellings(&before, &after))
-        })
-        .await
-    }
-
-    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
-        if spellings.is_empty() {
-            return Ok(0);
-        }
-        let list = placeholders(1, spellings.len());
-        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
-        // -- actor: all - a draft's reference named the spelling too, and binds
-        // again through the actor's own resolve pass.
-        in_transaction(self, async {
-            let mut reset = 0;
-            for table in ["relation", "link"] {
-                reset += self
-                    .conn
-                    .execute(&reset_spelled_references_sql(table, &list), params.clone())
-                    .await?;
-            }
-            Ok(reset)
-        })
-        .await
-    }
-
-    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
-        if spellings.is_empty() {
-            return Ok(0);
-        }
-        let list = placeholders(1, spellings.len());
-        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
-        in_transaction(self, async {
-            let mut bound = 0;
-            for table in ["relation", "link"] {
-                bound += self
-                    .conn
-                    .execute(
-                        &resolve_spelled_references_sql(table, &list),
-                        params.clone(),
-                    )
-                    .await?;
-            }
-            Ok(bound)
-        })
-        .await
-    }
-
-    async fn resolve_references_to(
-        &self,
-        domain: DomainId,
-        spellings: &[String],
-        targets: &[String],
-    ) -> Result<Vec<(DomainId, u64)>> {
-        if spellings.is_empty() || targets.is_empty() {
-            return Ok(Vec::new());
-        }
-        let spelled = placeholders(2, spellings.len());
-        let first = 2 + spellings.len();
-        let targeted = (first..first + targets.len())
-            .map(|i| format!("lower(?{i})"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut params: Vec<Value> = vec![Value::Integer(domain.0)];
-        params.extend(spellings.iter().map(|s| Value::Text(s.clone())));
-        params.extend(targets.iter().map(|t| Value::Text(t.clone())));
-        in_transaction(self, async {
-            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
-            for table in ["relation", "link"] {
-                let rows = query_all(
-                    &self.conn,
-                    &count_references_to_sql(table, "?1", &spelled, &targeted),
-                    params.clone(),
-                )
-                .await?;
-                for row in rows {
-                    if let (Some(id), Some(n)) = (cell_i64(&row, 0), cell_i64(&row, 1)) {
-                        *counts.entry(id).or_default() += n as u64;
-                    }
-                }
-                self.conn
-                    .execute(
-                        &resolve_references_to_sql(table, "?1", &spelled, &targeted),
-                        params.clone(),
-                    )
-                    .await?;
-            }
-            Ok(counts
-                .into_iter()
-                .filter(|(_, n)| *n > 0)
-                .map(|(id, n)| (DomainId(id), n))
-                .collect())
-        })
-        .await
-    }
-
-    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()> {
-        if old == new {
-            return Ok(());
-        }
-        in_transaction(self, async {
-            let old_id = self.domain_id(old).await?;
-            let new_id = self.domain_id(new).await?;
-            match (old_id, new_id) {
-                (Some(_), Some(_)) => return Err(rename_onto_taken_row(old, new)),
-                (Some(id), None) => {
-                    self.conn
-                        .execute(
-                            "UPDATE domain SET name=?2 WHERE id=?1",
-                            vec![Value::Integer(id.0), Value::Text(new.to_string())],
-                        )
-                        .await?;
-                    // The old name stays an alias of the row, so every
-                    // reference spelled with it keeps resolving; one another
-                    // domain holds is left with that domain.
-                    self.conn
-                        .execute(
-                            "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
-                             ON CONFLICT(spelling) DO NOTHING",
-                            vec![Value::Text(old.to_string()), Value::Integer(id.0)],
-                        )
-                        .await?;
-                    self.take_spelling_for_rename(new, id).await?;
-                }
-                // Renamed already: make sure the own name is in place, and
-                // leave `old` alone - by now it may be an alias on purpose, or
-                // it was never this row's name and must not become one.
-                (None, Some(id)) => self.take_spelling_for_rename(new, id).await?,
-                (None, None) => {}
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
-        // May delete stray chunk rows, so the coverage snapshot may be stale.
-        self.invalidate_coverage();
-        in_transaction(self, async {
-            // -- actor: all - one actor's draft is content too, so any row of
-            // any actor keeps the domain row.
-            let id = query_first(
-                &self.conn,
-                "SELECT d.id FROM domain d WHERE d.name=?1 \
-                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM reflection r WHERE r.domain_id=d.id) \
-                 AND NOT EXISTS (SELECT 1 FROM reflection_asset f WHERE f.domain_id=d.id)",
-                vec![Value::Text(name.to_string())],
-            )
-            .await?
-            .and_then(|r| cell_i64(&r, 0));
-            let Some(id) = id else {
-                return Ok(false);
-            };
-            // Foreign keys are not enforced here, so every table that names
-            // the row is cleared by hand before the row itself.
-            for sql in [
-                "DELETE FROM domain_spelling WHERE domain_id=?1",
-                // A chunk is not content, so it does not keep the row; it
-                // goes with it (the funnel never leaves one without its page).
-                "DELETE FROM reflection_chunk WHERE domain_id=?1",
-                "DELETE FROM tag_alias WHERE domain_id=?1",
-                "DELETE FROM domain_lock WHERE domain_id=?1",
-                "DELETE FROM automation_lease WHERE domain_id=?1",
-                "DELETE FROM automation_run WHERE domain_id=?1",
-                "DELETE FROM reflection_disclosure WHERE domain_id=?1",
-                "DELETE FROM relation WHERE domain_id=?1",
-                "DELETE FROM link WHERE domain_id=?1",
-                "DELETE FROM domain WHERE id=?1",
-            ] {
-                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
-            }
-            Ok(true)
-        })
-        .await
     }
 
     async fn engrams_referencing_domains(
@@ -2318,42 +2007,6 @@ impl Store for TursoStore {
         Ok(out)
     }
 
-    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
-        self.upsert_row(domain, "", record).await
-    }
-
-    async fn upsert_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: Option<&str>,
-    ) -> Result<EngramId> {
-        // Compare-and-swap: if a row exists at this path and the caller supplied
-        // an expected sha that no longer matches the stored one, refuse. The
-        // engine holds the transaction open around this, so the compare and the
-        // subsequent write are one atomic unit. No row at all is an insert,
-        // which nothing guards.
-        if let Some(expected) = expected_sha {
-            self.guarded_compare(domain, &record.path, expected).await?;
-        }
-        self.upsert_engram(domain, record).await
-    }
-
-    async fn update_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: &str,
-    ) -> Result<Option<EngramId>> {
-        if !self
-            .guarded_compare(domain, &record.path, expected_sha)
-            .await?
-        {
-            return Ok(None);
-        }
-        self.upsert_engram(domain, record).await.map(Some)
-    }
-
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
         let row = query_first(
             &self.conn,
@@ -2389,229 +2042,6 @@ impl Store for TursoStore {
         let mut out: Vec<StoredEngram> = rows.iter().map(stored_engram_from_row).collect();
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
-    }
-
-    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
-        // Deletes this domain's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        // Delete a single domain's engram, attachment and child rows, keeping
-        // the domain row. Child rows first, then chunks, then the engram rows
-        // themselves; attachment blobs before the attachment rows that own
-        // them, and the bodies in `engram_content` before the engram rows they
-        // hang off, which is written out rather than left to a cascade because
-        // foreign keys are not enforced here. `upsert_domain` reuses the id for
-        // a name it has seen, so anything left here would resurface as the next
-        // registration's own.
-        // -- actor: all - a domain's removal takes its drafts with it. Nothing
-        // survives the domain they were drafts of, so these statements name
-        // every actor's rows on purpose; the overlay journal is swept on the
-        // same paths so the rows and their mirror go together.
-        let did = vec![Value::Integer(domain.0)];
-        for sql in [
-            "DELETE FROM contradiction WHERE domain_id=?1",
-            "DELETE FROM contradiction_pair WHERE domain_id=?1",
-            "DELETE FROM observation_tag WHERE observation_id IN \
-             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
-            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
-            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
-            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
-            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
-            "DELETE FROM relation WHERE domain_id=?1",
-            "DELETE FROM link WHERE domain_id=?1",
-            // Every reference from another domain that named one of these
-            // engrams goes back to pending before the rows go, in whatever
-            // transaction the caller holds, as `delete_engram` does: a `to_id`
-            // naming a row nobody holds would read as resolved forever.
-            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
-            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
-            // -- actor: all - the bodies of every row about to go, named
-            // through them since `engram_content` has no domain of its own.
-            "DELETE FROM engram_content WHERE engram_id IN \
-             (SELECT id FROM engram WHERE domain_id=?1)",
-            "DELETE FROM engram WHERE domain_id=?1",
-            "DELETE FROM tag_alias WHERE domain_id=?1",
-            "DELETE FROM attachment_blob WHERE attachment_id IN \
-             (SELECT id FROM attachment WHERE domain_id=?1)",
-            "DELETE FROM attachment WHERE domain_id=?1",
-            "DELETE FROM reflection_chunk WHERE domain_id=?1",
-            "DELETE FROM reflection WHERE domain_id=?1",
-            "DELETE FROM reflection_asset WHERE domain_id=?1",
-            // Every spelling but the row's own name, which stays with the row.
-            "DELETE FROM domain_spelling WHERE domain_id=?1 \
-             AND spelling <> (SELECT name FROM domain WHERE id=?1)",
-        ] {
-            self.conn.execute(sql, did.clone()).await?;
-        }
-        Ok(())
-    }
-
-    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
-        // Deletes the engram's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        let id = query_first(
-            &self.conn,
-            // The base row at this path. A draft is dropped by its own
-            // actor through `clear_overlay_entry`, never by the sync driver
-            // noticing that a file left disk - the draft was never on disk.
-            "SELECT id FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
-            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
-        )
-        .await?
-        .and_then(|r| cell_i64(&r, 0));
-        if let Some(id) = id {
-            // The scores of every pair this engram is in. Here and in
-            // `clear_domain` only, never in `delete_children`, which every
-            // upsert runs: a full reindex would erase every score.
-            for sql in [
-                DELETE_ENGRAM_CONTRADICTIONS_SQL,
-                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
-            ] {
-                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
-            }
-            self.delete_children(id).await?;
-            // Every reference that named this engram, from any domain and any
-            // actor, goes back to pending in the same transaction: a `to_id`
-            // naming a row nobody holds would read as resolved forever.
-            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
-                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
-            }
-            self.conn
-                .execute(
-                    "DELETE FROM chunk WHERE engram_id=?1",
-                    vec![Value::Integer(id)],
-                )
-                .await?;
-            self.conn
-                .execute(
-                    "DELETE FROM engram_content WHERE engram_id=?1",
-                    vec![Value::Integer(id)],
-                )
-                .await?;
-            // -- actor: all - the row is already named by its id, which the
-            // base-scoped lookup above resolved.
-            self.conn
-                .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()> {
-        // The permalink follows the move only when it was path-derived, so an
-        // explicit frontmatter permalink is preserved across a move.
-        let old_slug = crystalline_core::slugify(from);
-        let new_slug = crystalline_core::slugify(to);
-        self.conn
-            .execute(
-                "UPDATE engram SET path=?1, \
-                 permalink = CASE WHEN permalink=?2 THEN ?3 ELSE permalink END \
-                 WHERE domain_id=?4 AND path=?5 AND actor = ''",
-                vec![
-                    Value::Text(to.to_string()),
-                    Value::Text(old_slug),
-                    Value::Text(new_slug),
-                    Value::Integer(domain.0),
-                    Value::Text(from.to_string()),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn readdress_engram(
-        &self,
-        domain: DomainId,
-        from: &str,
-        to: &str,
-        permalink: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE engram SET path=?1, permalink=?2 \
-                 WHERE domain_id=?3 AND path=?4 AND actor = ''",
-                vec![
-                    Value::Text(to.to_string()),
-                    Value::Text(permalink.to_string()),
-                    Value::Integer(domain.0),
-                    Value::Text(from.to_string()),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
-        if !self.resolve_pending_due("relation", domain).await? {
-            return Ok(0);
-        }
-        let n = self
-            .conn
-            .execute(
-                &resolve_pending_sql("relation"),
-                vec![Value::Integer(domain.0)],
-            )
-            .await?;
-        Ok(n)
-    }
-
-    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
-        // The wikilink twin of resolve_pending_relations over the `link` table,
-        // matching by the same rule. Links carry no rel_type.
-        if !self.resolve_pending_due("link", domain).await? {
-            return Ok(0);
-        }
-        let n = self
-            .conn
-            .execute(&resolve_pending_sql("link"), vec![Value::Integer(domain.0)])
-            .await?;
-        Ok(n)
-    }
-
-    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
-        if actor.is_empty() {
-            return Err(IndexError::Constraint(
-                "a reference pass over an actor's own rows must name that actor; the empty \
-                 actor is the base row's own key"
-                    .to_string(),
-            ));
-        }
-        let mut bound = 0u64;
-        for table in ["relation", "link"] {
-            // What dangles is unbound. A `to_id` naming a row nobody holds any
-            // more is the trace of a draft that went away, and the existence
-            // probe deliberately asks about every actor's rows: whose the
-            // vanished row was does not change that this one now points at
-            // nothing.
-            let dangling = format!(
-                "UPDATE {table} SET to_id = NULL WHERE domain_id = ?1 AND to_id IS NOT NULL \
-                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
-                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
-            );
-            self.conn
-                .execute(
-                    &dangling,
-                    vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
-                )
-                .await?;
-            // Then what is pending is bound, in this actor's own view.
-            let mut params = vec![Value::Integer(domain.0), Value::Text(actor.to_string())];
-            let mut n = 3usize;
-            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
-            let view = reference_match(
-                table,
-                ReferenceCandidates::View {
-                    screen: &actor_screen,
-                },
-            );
-            let sql = format!(
-                "UPDATE {table} SET to_id = {view} \
-                 WHERE {table}.to_id IS NULL AND {table}.domain_id = ?1 \
-                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
-                 AND {view} IS NOT NULL"
-            );
-            bound += self.conn.execute(&sql, params).await?;
-        }
-        Ok(bound)
     }
 
     async fn lookup_id(&self, domain: &str, permalink: &str) -> Result<Option<EngramId>> {
@@ -2809,52 +2239,6 @@ impl Store for TursoStore {
         );
         let rows = query_all(&self.conn, &sql, params).await?;
         Ok(rows.iter().map(descriptor_from_row).collect())
-    }
-
-    async fn replace_tag_aliases(
-        &self,
-        domain: DomainId,
-        pairs: &[(String, String)],
-    ) -> Result<bool> {
-        // A map that already holds exactly these pairs is left alone, so the
-        // refresh every sync runs writes nothing while the MANIFEST is
-        // unchanged.
-        let held = query_all(
-            &self.conn,
-            "SELECT alias, canonical FROM tag_alias WHERE domain_id=?1",
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        let held: std::collections::BTreeMap<String, String> = held
-            .iter()
-            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
-            .collect();
-        if held == crate::store::wanted_tag_aliases(pairs) {
-            return Ok(false);
-        }
-        // Delete then re-insert: the map is fully derived from MANIFEST content,
-        // so a change replaces the domain's rows wholesale and an empty slice
-        // clears them. `INSERT OR IGNORE` drops a duplicate alias (the caller
-        // already deduped first-wins, so this is belt and braces).
-        self.conn
-            .execute(
-                "DELETE FROM tag_alias WHERE domain_id=?1",
-                vec![Value::Integer(domain.0)],
-            )
-            .await?;
-        for (alias, canonical) in pairs {
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO tag_alias(domain_id, alias, canonical) VALUES(?1, ?2, ?3)",
-                    vec![
-                        Value::Integer(domain.0),
-                        Value::Text(alias.clone()),
-                        Value::Text(canonical.clone()),
-                    ],
-                )
-                .await?;
-        }
-        Ok(true)
     }
 
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
@@ -3300,79 +2684,6 @@ impl Store for TursoStore {
         Ok(out)
     }
 
-    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
-        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
-        // now stale.
-        self.invalidate_coverage();
-        let eid = engram_id.0;
-        // Carry over the embedding of any chunk whose fingerprint is unchanged so
-        // an edit only re-embeds the paragraphs that actually changed. The
-        // fingerprint folds in the model id, so a chunk embedded by a different
-        // model does not match and is left for re-embedding.
-        let existing = query_all(
-            &self.conn,
-            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=?1 AND embedding IS NOT NULL",
-            vec![Value::Integer(eid)],
-        )
-        .await?;
-        let mut carry: HashMap<String, (Value, Value, Vec<u8>)> = HashMap::new();
-        for r in &existing {
-            let Some(hash) = cell_text(r, 0) else {
-                continue;
-            };
-            let model = match r.get_value(1) {
-                Ok(Value::Text(s)) => Value::Text(s),
-                _ => Value::Null,
-            };
-            let dims = match r.get_value(2) {
-                Ok(Value::Integer(i)) => Value::Integer(i),
-                _ => Value::Null,
-            };
-            let Ok(Value::Blob(emb)) = r.get_value(3) else {
-                continue;
-            };
-            carry.insert(hash, (model, dims, emb));
-        }
-
-        self.conn
-            .execute(
-                "DELETE FROM chunk WHERE engram_id=?1",
-                vec![Value::Integer(eid)],
-            )
-            .await?;
-
-        // One 7-column multi-row insert for every chunk: a carry hit binds its
-        // preserved model, dims and embedding, a miss binds NULL for all three
-        // and leaves the chunk pending re-embedding.
-        for batch in chunks.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
-            for c in batch {
-                params.push(Value::Integer(eid));
-                params.push(Value::Integer(c.seq));
-                params.push(Value::Text(c.text.clone()));
-                params.push(Value::Text(c.text_hash.clone()));
-                match carry.get(&c.text_hash) {
-                    Some((model, dims, emb)) => {
-                        params.push(model.clone());
-                        params.push(dims.clone());
-                        params.push(Value::Blob(emb.clone()));
-                    }
-                    None => {
-                        params.push(Value::Null);
-                        params.push(Value::Null);
-                        params.push(Value::Null);
-                    }
-                }
-            }
-            let sql = format!(
-                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
-                value_rows(7, batch.len(), None)
-            );
-            self.conn.execute(&sql, params).await?;
-        }
-        Ok(())
-    }
-
     async fn chunks_needing_embedding_in(
         &self,
         table: ChunkTable,
@@ -3440,64 +2751,6 @@ impl Store for TursoStore {
                 text_hash: cell_text(r, 4).unwrap_or_default(),
             })
             .collect())
-    }
-
-    async fn store_embeddings_in(
-        &self,
-        table: ChunkTable,
-        batch: &[EmbeddingRow],
-        model: &str,
-    ) -> Result<()> {
-        // Writes embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        // Validate the whole batch before opening the transaction so a bad row
-        // never leaves earlier rows committed. The transaction then makes the
-        // per-row updates all-or-nothing against a mid-batch database error,
-        // mirroring `wipe`.
-        for row in batch {
-            if row.embedding.len() != row.dims {
-                return Err(IndexError::Invalid(format!(
-                    "embedding length {} does not match declared dims {}",
-                    row.embedding.len(),
-                    row.dims
-                )));
-            }
-        }
-        self.conn.execute("BEGIN", ()).await?;
-        for row in batch {
-            let mut bytes = Vec::with_capacity(row.embedding.len() * 4);
-            for f in &row.embedding {
-                bytes.extend_from_slice(&f.to_le_bytes());
-            }
-            if let Err(e) = self
-                .conn
-                .execute(
-                    chunk_sql(table).store,
-                    vec![
-                        Value::Blob(bytes),
-                        Value::Integer(row.dims as i64),
-                        Value::Text(model.to_string()),
-                        Value::Integer(row.chunk_id),
-                    ],
-                )
-                .await
-            {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                return Err(e.into());
-            }
-        }
-        self.conn.execute("COMMIT", ()).await?;
-        Ok(())
-    }
-
-    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
-        // Clears embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        let n = self
-            .conn
-            .execute(chunk_sql(table).prune, vec![Value::Text(model.to_string())])
-            .await?;
-        Ok(n as usize)
     }
 
     async fn embedding_coverage_in(
@@ -3582,92 +2835,6 @@ impl Store for TursoStore {
                 })
             })
             .collect())
-    }
-
-    async fn replace_contradictions(
-        &self,
-        domain: DomainId,
-        pair: &ScoredPair,
-        cosine: f64,
-        model: &str,
-        scored_at: &str,
-        rows: &[ContradictionRow],
-    ) -> Result<()> {
-        in_transaction(self, async {
-            let key = vec![
-                Value::Integer(pair.a.0),
-                Value::Integer(pair.b.0),
-                Value::Text(model.to_string()),
-            ];
-            self.conn
-                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
-                .await?;
-            self.conn
-                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
-                .await?;
-            let stored = self
-                .conn
-                .execute(
-                    INSERT_CONTRADICTION_PAIR_SQL,
-                    vec![
-                        Value::Integer(domain.0),
-                        Value::Integer(pair.a.0),
-                        Value::Integer(pair.b.0),
-                        Value::Text(pair.checksum_a.clone()),
-                        Value::Text(pair.checksum_b.clone()),
-                        Value::Real(cosine),
-                        Value::Text(model.to_string()),
-                        Value::Text(scored_at.to_string()),
-                    ],
-                )
-                .await?;
-            // Either engram went while the pair was scored: nothing to keep.
-            if stored == 0 {
-                return Ok(());
-            }
-            for row in rows {
-                self.conn
-                    .execute(
-                        "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                        vec![
-                            Value::Integer(domain.0),
-                            Value::Integer(row.a.0),
-                            Value::Integer(row.b.0),
-                            Value::Integer(row.line_a as i64),
-                            Value::Integer(row.line_b as i64),
-                            Value::Text(row.hash_a.clone()),
-                            Value::Text(row.hash_b.clone()),
-                            Value::Text(model.to_string()),
-                            Value::Real(f64::from(row.score_ab)),
-                            Value::Real(f64::from(row.score_ba)),
-                            Value::Real(f64::from(row.similarity)),
-                            Value::Integer(i64::from(row.period)),
-                        ],
-                    )
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
-        in_transaction(self, async {
-            let key = vec![
-                Value::Integer(a.0),
-                Value::Integer(b.0),
-                Value::Text(model.to_string()),
-            ];
-            self.conn
-                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
-                .await?;
-            self.conn
-                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
-                .await?;
-            Ok(())
-        })
-        .await
     }
 
     async fn contradictions(
@@ -3789,34 +2956,6 @@ impl Store for TursoStore {
         Ok(out)
     }
 
-    async fn store_observation_vectors(
-        &self,
-        model: &str,
-        rows: &[ObservationVector],
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        in_transaction(self, async {
-            for row in rows {
-                self.conn
-                    .execute(
-                        "INSERT INTO observation_vector (model, hash, dims, vector) \
-                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model, hash) DO NOTHING",
-                        vec![
-                            Value::Text(model.to_string()),
-                            Value::Text(row.hash.clone()),
-                            Value::Integer(row.vector.len() as i64),
-                            Value::Blob(crate::store::pack_f32_le(&row.vector)),
-                        ],
-                    )
-                    .await?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
     async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>> {
         let rows = query_all(
             &self.conn,
@@ -3825,167 +2964,6 @@ impl Store for TursoStore {
         )
         .await?;
         Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
-    }
-
-    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
-        if hashes.is_empty() {
-            return Ok(0);
-        }
-        in_transaction(self, async {
-            let mut gone = 0u64;
-            for hash in hashes {
-                gone += self
-                    .conn
-                    .execute(
-                        DELETE_OBSERVATION_VECTOR_SQL,
-                        vec![Value::Text(model.to_string()), Value::Text(hash.clone())],
-                    )
-                    .await?;
-            }
-            Ok(gone)
-        })
-        .await
-    }
-
-    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
-        Ok(self
-            .conn
-            .execute(
-                DELETE_OBSERVATION_VECTORS_EXCEPT_SQL,
-                vec![Value::Text(model.to_string())],
-            )
-            .await?)
-    }
-
-    async fn clear_observation_vectors(&self) -> Result<u64> {
-        Ok(self.conn.execute(CLEAR_OBSERVATION_VECTORS_SQL, ()).await?)
-    }
-
-    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
-        in_transaction(self, async {
-            match domains {
-                None => {
-                    for sql in [
-                        CLEAR_ALL_CONTRADICTIONS_SQL,
-                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
-                    ] {
-                        self.conn.execute(sql, ()).await?;
-                    }
-                }
-                Some(ids) => {
-                    for id in ids {
-                        for sql in [
-                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
-                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
-                        ] {
-                            self.conn.execute(sql, vec![Value::Integer(id.0)]).await?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    /// A turso index is this process's own file: nobody else works on it.
-    async fn try_work_claim(&self, _key: &str) -> Result<Option<WorkClaim>> {
-        Ok(Some(WorkClaim::unshared()))
-    }
-
-    async fn wipe(&self) -> Result<()> {
-        // Deletes every chunk, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
-        self.conn.execute("BEGIN", ()).await?;
-        for table in migrations::WIPE_TABLES {
-            if let Err(e) = self.conn.execute(&format!("DELETE FROM {table}"), ()).await {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                return Err(e.into());
-            }
-        }
-        self.conn.execute("COMMIT", ()).await?;
-        self.tag_cache.lock().unwrap().clear();
-        // A wipe deletes every row, which is the biggest single write a store
-        // sees; truncate the WAL back down rather than leaving it to grow
-        // until the next natural checkpoint.
-        self.truncate_wal().await?;
-        Ok(())
-    }
-
-    async fn checkpoint_wal(&self) -> Result<()> {
-        self.truncate_wal().await
-    }
-
-    async fn record_sync(
-        &self,
-        domain: DomainId,
-        when: &str,
-        changed: bool,
-        refresh_before: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                RECORD_SYNC_SQL,
-                vec![
-                    Value::Text(when.to_string()),
-                    Value::Integer(domain.0),
-                    Value::Integer(i64::from(changed)),
-                    Value::Text(refresh_before.to_string()),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
-        // `IN ()` is a syntax error, and an empty configuration is a legitimate
-        // one, so stamping nothing touches no SQL at all.
-        if names.is_empty() {
-            return Ok(());
-        }
-        let mut params: Vec<Value> = vec![Value::Text(when.to_string())];
-        let placeholders: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                params.push(Value::Text((*name).to_string()));
-                format!("?{}", i + 2)
-            })
-            .collect();
-        self.conn
-            .execute(
-                &format!(
-                    "UPDATE domain SET last_registered=?1 WHERE name IN ({})",
-                    placeholders.join(",")
-                ),
-                params,
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE domain SET rebuild_started=?1, rebuild_kind=?2 WHERE id=?3",
-                vec![
-                    Value::Text(when.to_string()),
-                    Value::Text(kind.as_str().to_string()),
-                    Value::Integer(domain.0),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=?1",
-                vec![Value::Integer(domain.0)],
-            )
-            .await?;
-        Ok(())
     }
 
     async fn parse_generation(&self, domain: DomainId) -> Result<u32> {
@@ -3999,39 +2977,6 @@ impl Store for TursoStore {
             .and_then(|r| cell_i64(&r, 0))
             .map(|g| u32::try_from(g).unwrap_or(0))
             .unwrap_or(0))
-    }
-
-    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE domain SET parse_generation=?2 WHERE id=?1",
-                vec![
-                    Value::Integer(domain.0),
-                    Value::Integer(i64::from(generation)),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    fn set_aside_database(&self) -> Option<PathBuf> {
-        self.set_aside.clone()
-    }
-
-    // --- the actor dimension -------------------------------------------------
-
-    async fn upsert_overlay(
-        &self,
-        domain: DomainId,
-        actor: &str,
-        record: &EngramRecord,
-    ) -> Result<EngramId> {
-        if actor.is_empty() {
-            return Err(IndexError::Constraint(
-                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
-            ));
-        }
-        self.upsert_row(domain, actor, record).await
     }
 
     async fn overlay_entry(
@@ -4120,59 +3065,6 @@ impl Store for TursoStore {
                 )
             })
             .collect())
-    }
-
-    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
-        if actor.is_empty() {
-            return Ok(false);
-        }
-        // Deletes the draft's chunks, so the coverage snapshot is now stale.
-        // No contradiction rows to delete: drafts are never scored.
-        self.invalidate_coverage();
-        let id = query_first(
-            &self.conn,
-            "SELECT id FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
-            vec![
-                Value::Integer(domain.0),
-                Value::Text(actor.to_string()),
-                Value::Text(path.to_string()),
-            ],
-        )
-        .await?
-        .and_then(|r| cell_i64(&r, 0));
-        let Some(id) = id else {
-            return Ok(false);
-        };
-        self.delete_children(id).await?;
-        // Every reference that named this draft, from any domain, goes back
-        // to pending in the same transaction, as `delete_engram` does for a
-        // base row: a `to_id` naming a row nobody holds would read as
-        // resolved forever. The author's own references in this domain are
-        // bound again by the engine's re-resolve pass right after.
-        for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
-            self.conn.execute(sql, vec![Value::Integer(id)]).await?;
-        }
-        self.conn
-            .execute(
-                "DELETE FROM chunk WHERE engram_id=?1",
-                vec![Value::Integer(id)],
-            )
-            .await?;
-        self.conn
-            .execute(
-                "DELETE FROM engram_content WHERE engram_id=?1",
-                vec![Value::Integer(id)],
-            )
-            .await?;
-        // -- actor: by id - the row is already named by its id, which the
-        // actor-scoped lookup above resolved, so this statement is inside that
-        // actor's dimension without screening for it again. The census reads
-        // each statement alone, and alone this one names no actor, so it says
-        // here which of the two waivers it holds.
-        self.conn
-            .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
-            .await?;
-        Ok(true)
     }
 
     async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>> {
@@ -4436,6 +3328,1351 @@ impl Store for TursoStore {
         ))
     }
 
+    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT DISTINCT holder_instance_id FROM domain_lock WHERE holder_label=?1 AND heartbeat_at>=?2",
+            vec![
+                Value::Text(label.to_string()),
+                Value::Text(stale_before.to_string()),
+            ],
+        )
+        .await?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT holder_label FROM domain_lock WHERE holder_instance_id=?1 AND holder_label<>'' \
+             UNION SELECT last_host_label FROM domain WHERE last_host_id=?1 AND last_host_label<>''",
+            vec![Value::Text(instance_id.to_string())],
+        )
+        .await?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        let row = query_first(&self.conn, DOMAIN_HOST_SQL, vec![Value::Integer(domain.0)]).await?;
+        Ok(row.map(|r| domain_host_of(&r)))
+    }
+
+    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>> {
+        // One instance owns a Turso database, and its write transaction is
+        // the only writer: nothing can claim in between.
+        self.domain_host(domain).await
+    }
+
+    async fn automation_lease(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+    ) -> Result<Option<AutomationLease>> {
+        let row = query_first(
+            &self.conn,
+            AUTOMATION_LEASE_SQL,
+            vec![Value::Integer(domain.0), Value::Text(loop_kind.to_string())],
+        )
+        .await?;
+        row.map(|r| automation_lease_of(&r)).transpose()
+    }
+
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, records FROM reflection_disclosure WHERE domain_id=?1 ORDER BY path",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
+            .collect())
+    }
+
+    async fn automation_runs(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationRun>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT started_at, ended_at, runner, account, outcome, done, \"left\", \
+             judgment_waiting, summary, pr_url, left_items FROM automation_run \
+             WHERE domain_id=?1 AND loop_kind=?2 ORDER BY id DESC LIMIT ?3",
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(loop_kind.to_string()),
+                Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )
+        .await?;
+        rows.iter().map(automation_run_of).collect()
+    }
+
+    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT last_host_id, last_host_label FROM domain WHERE id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(row.and_then(|r| {
+            let id = cell_text(&r, 0)?;
+            let label = cell_text(&r, 1)
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| id.clone());
+            Some((id, label))
+        }))
+    }
+
+    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool> {
+        let row = query_first(
+            &self.conn,
+            "SELECT EXISTS(SELECT 1 FROM domain_lock WHERE holder_label=?1 AND holder_instance_id<>?2) \
+             OR EXISTS(SELECT 1 FROM domain WHERE last_host_label=?1 AND last_host_id<>?2)",
+            vec![
+                Value::Text(label.to_string()),
+                Value::Text(instance_id.to_string()),
+            ],
+        )
+        .await?;
+        Ok(row.and_then(|r| cell_i64(&r, 0)).unwrap_or(0) != 0)
+    }
+
+    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>> {
+        let row = query_first(&self.conn, HOST_MOVE_SQL, vec![Value::Integer(domain.0)]).await?;
+        Ok(row.and_then(|r| cell_text(&r, 0)))
+    }
+
+    async fn get_asset(
+        &self,
+        table: AssetTable,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<AttachmentRow>> {
+        let row = query_first(
+            &self.conn,
+            asset_sql(table).get,
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(attachment_from_row))
+    }
+
+    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>> {
+        let rows = query_all(
+            &self.conn,
+            asset_sql(table).list,
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(attachment_from_row).collect())
+    }
+
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
+             WHERE a.domain_id=?1 AND a.path=?2",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| match r.get_value(0) {
+            Ok(Value::Blob(b)) => Some(b),
+            _ => None,
+        }))
+    }
+
+    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT path, title, content, sha256, size, modified FROM reflection \
+             WHERE domain_id=?1 AND path=?2",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(reflection_from_row))
+    }
+
+    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>> {
+        // TEXT sorts byte-wise here, the order the Postgres twin pins itself to
+        // with an explicit `COLLATE "C"`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, title, content, sha256, size, modified FROM reflection \
+             WHERE domain_id=?1 ORDER BY path",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(reflection_from_row).collect())
+    }
+
+    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>> {
+        let rows = query_all(
+            &self.conn,
+            REFLECTION_STAMPS_SQL,
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        let mut stamps: Vec<ReflectionStamp> = rows
+            .iter()
+            .map(|r| ReflectionStamp {
+                path: cell_text(r, 0).unwrap_or_default(),
+                title: cell_text(r, 1).unwrap_or_default(),
+                sha256: cell_text(r, 2).unwrap_or_default(),
+                size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
+                modified: cell_text(r, 4).unwrap_or_default(),
+            })
+            .collect();
+        // Byte order, as `list_reflections` answers; sorted here so the
+        // statement stays a plain seek of the domain's rows.
+        stamps.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(stamps)
+    }
+
+    async fn reflection_vector_hits(
+        &self,
+        domain: DomainId,
+        query: &[f32],
+        model: &str,
+    ) -> Result<Vec<SectionVector>> {
+        let coverage = self.reflection_coverage(domain).await?;
+        crate::rank::check_staleness(&coverage, model, query.len())?;
+        let rows = query_all(
+            &self.conn,
+            REFLECTION_VECTOR_SQL,
+            vec![
+                Value::Blob(crate::store::pack_f32_le(query)),
+                Value::Integer(domain.0),
+                Value::Text(model.to_string()),
+                Value::Integer(query.len() as i64),
+            ],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SectionVector {
+                path: cell_text(r, 0).unwrap_or_default(),
+                section_ord: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
+                similarity: 1.0 - cell_real(r, 2).unwrap_or(1.0),
+            })
+            .collect())
+    }
+}
+
+#[async_trait]
+impl Store for TursoStore {
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId> {
+        // Virtual domains have no filesystem root; SQLite keeps `path NOT NULL`,
+        // so an absent path stores the empty string and `kind` discriminates.
+        let path = path.unwrap_or("");
+        let kind = kind_str(kind);
+        // Every sync of every domain comes through here, and almost every
+        // time the row is already exactly this one. Read first and write
+        // nothing then: an upsert that changes nothing still rewrites the
+        // row and appends to the log, on every sync of an idle domain.
+        // Two point reads, no subquery: turso backs a correlated subquery
+        // with an ephemeral table, which creates a temporary directory.
+        let existing = query_first(
+            &self.conn,
+            "SELECT id, path, kind FROM domain WHERE name=?1",
+            vec![Value::Text(name.to_string())],
+        )
+        .await?;
+        if let Some(r) = &existing
+            && let Some(id) = cell_i64(r, 0)
+            && cell_text(r, 1).as_deref() == Some(path)
+            && cell_text(r, 2).as_deref() == Some(kind)
+            && query_first(
+                &self.conn,
+                "SELECT 1 FROM domain_spelling WHERE spelling=?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(DomainId(id));
+        }
+        self.conn
+            .execute(
+                // A new row is stamped with the current parser generation, so
+                // a fresh index never reparses what it has only just parsed; an
+                // existing row keeps the generation it has.
+                "INSERT INTO domain(name, path, kind, parse_generation) VALUES(?1, ?2, ?3, ?4) \
+                 ON CONFLICT(name) DO UPDATE SET path=excluded.path, kind=excluded.kind",
+                vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(path.to_string()),
+                    Value::Text(kind.to_string()),
+                    Value::Integer(i64::from(crystalline_core::PARSE_GENERATION)),
+                ],
+            )
+            .await?;
+        let id = scalar_i64(
+            &self.conn,
+            "SELECT id FROM domain WHERE name=?1",
+            vec![Value::Text(name.to_string())],
+        )
+        .await?;
+        // The row answers to its own name. A spelling another domain already
+        // holds is left with it; the name table's refresh settles precedence.
+        // No transaction of its own: a sync may already be inside one.
+        self.conn
+            .execute(
+                "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                 ON CONFLICT(spelling) DO NOTHING",
+                vec![Value::Text(name.to_string()), Value::Integer(id)],
+            )
+            .await?;
+        Ok(DomainId(id))
+    }
+
+    async fn replace_domain_spellings(
+        &self,
+        spellings: &[(String, DomainId)],
+    ) -> Result<Vec<String>> {
+        let SpellingPlan { rows, scope } = spelling_plan(spellings)?;
+        in_transaction(self, async {
+            for id in &scope {
+                let known = query_first(
+                    &self.conn,
+                    "SELECT id FROM domain WHERE id=?1",
+                    vec![Value::Integer(id.0)],
+                )
+                .await?;
+                if known.is_none() {
+                    return Err(IndexError::Invalid(format!(
+                        "no domain row has id {}; sync the domain before recording its spellings",
+                        id.0
+                    )));
+                }
+            }
+            let before = self.domain_spellings().await?;
+            // The listed domains' spellings go, all but each row's own name.
+            for id in &scope {
+                self.conn
+                    .execute(
+                        "DELETE FROM domain_spelling WHERE domain_id=?1 \
+                         AND spelling <> (SELECT name FROM domain WHERE id=?1)",
+                        vec![Value::Integer(id.0)],
+                    )
+                    .await?;
+            }
+            // The list, each spelling taken for its domain from whoever held it.
+            for (spelling, id) in &rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                         ON CONFLICT(spelling) DO UPDATE SET domain_id=excluded.domain_id",
+                        vec![Value::Text(spelling.clone()), Value::Integer(id.0)],
+                    )
+                    .await?;
+            }
+            // Then every row's own name, last, so a local name wins over any
+            // canonical name or alias on the same spelling - the list's or one
+            // recorded earlier, by this instance or another.
+            let displaced = query_all(
+                &self.conn,
+                "SELECT d.name, d.id FROM domain d WHERE NOT EXISTS \
+                 (SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name AND s.domain_id=d.id)",
+                Vec::new(),
+            )
+            .await?;
+            for r in &displaced {
+                let (Some(name), Some(id)) = (cell_text(r, 0), cell_i64(r, 1)) else {
+                    continue;
+                };
+                self.conn
+                    .execute(
+                        "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                         ON CONFLICT(spelling) DO UPDATE SET domain_id=excluded.domain_id",
+                        vec![Value::Text(name), Value::Integer(id)],
+                    )
+                    .await?;
+            }
+            let after = self.domain_spellings().await?;
+            Ok(changed_spellings(&before, &after))
+        })
+        .await
+    }
+
+    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
+        // -- actor: all - a draft's reference named the spelling too, and binds
+        // again through the actor's own resolve pass.
+        in_transaction(self, async {
+            let mut reset = 0;
+            for table in ["relation", "link"] {
+                reset += self
+                    .conn
+                    .execute(&reset_spelled_references_sql(table, &list), params.clone())
+                    .await?;
+            }
+            Ok(reset)
+        })
+        .await
+    }
+
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64> {
+        if spellings.is_empty() {
+            return Ok(0);
+        }
+        let list = placeholders(1, spellings.len());
+        let params: Vec<Value> = spellings.iter().map(|s| Value::Text(s.clone())).collect();
+        in_transaction(self, async {
+            let mut bound = 0;
+            for table in ["relation", "link"] {
+                bound += self
+                    .conn
+                    .execute(
+                        &resolve_spelled_references_sql(table, &list),
+                        params.clone(),
+                    )
+                    .await?;
+            }
+            Ok(bound)
+        })
+        .await
+    }
+
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>> {
+        if spellings.is_empty() || targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let spelled = placeholders(2, spellings.len());
+        let first = 2 + spellings.len();
+        let targeted = (first..first + targets.len())
+            .map(|i| format!("lower(?{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params: Vec<Value> = vec![Value::Integer(domain.0)];
+        params.extend(spellings.iter().map(|s| Value::Text(s.clone())));
+        params.extend(targets.iter().map(|t| Value::Text(t.clone())));
+        in_transaction(self, async {
+            let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+            for table in ["relation", "link"] {
+                let rows = query_all(
+                    &self.conn,
+                    &count_references_to_sql(table, "?1", &spelled, &targeted),
+                    params.clone(),
+                )
+                .await?;
+                for row in rows {
+                    if let (Some(id), Some(n)) = (cell_i64(&row, 0), cell_i64(&row, 1)) {
+                        *counts.entry(id).or_default() += n as u64;
+                    }
+                }
+                self.conn
+                    .execute(
+                        &resolve_references_to_sql(table, "?1", &spelled, &targeted),
+                        params.clone(),
+                    )
+                    .await?;
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(id, n)| (DomainId(id), n))
+                .collect())
+        })
+        .await
+    }
+
+    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            let old_id = self.domain_id(old).await?;
+            let new_id = self.domain_id(new).await?;
+            match (old_id, new_id) {
+                (Some(_), Some(_)) => return Err(rename_onto_taken_row(old, new)),
+                (Some(id), None) => {
+                    self.conn
+                        .execute(
+                            "UPDATE domain SET name=?2 WHERE id=?1",
+                            vec![Value::Integer(id.0), Value::Text(new.to_string())],
+                        )
+                        .await?;
+                    // The old name stays an alias of the row, so every
+                    // reference spelled with it keeps resolving; one another
+                    // domain holds is left with that domain.
+                    self.conn
+                        .execute(
+                            "INSERT INTO domain_spelling(spelling, domain_id) VALUES(?1, ?2) \
+                             ON CONFLICT(spelling) DO NOTHING",
+                            vec![Value::Text(old.to_string()), Value::Integer(id.0)],
+                        )
+                        .await?;
+                    self.take_spelling_for_rename(new, id).await?;
+                }
+                // Renamed already: make sure the own name is in place, and
+                // leave `old` alone - by now it may be an alias on purpose, or
+                // it was never this row's name and must not become one.
+                (None, Some(id)) => self.take_spelling_for_rename(new, id).await?,
+                (None, None) => {}
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
+        // May delete stray chunk rows, so the coverage snapshot may be stale.
+        self.invalidate_coverage();
+        in_transaction(self, async {
+            // -- actor: all - one actor's draft is content too, so any row of
+            // any actor keeps the domain row.
+            let id = query_first(
+                &self.conn,
+                "SELECT d.id FROM domain d WHERE d.name=?1 \
+                 AND NOT EXISTS (SELECT 1 FROM engram e WHERE e.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attachment a WHERE a.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM reflection r WHERE r.domain_id=d.id) \
+                 AND NOT EXISTS (SELECT 1 FROM reflection_asset f WHERE f.domain_id=d.id)",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?
+            .and_then(|r| cell_i64(&r, 0));
+            let Some(id) = id else {
+                return Ok(false);
+            };
+            // Foreign keys are not enforced here, so every table that names
+            // the row is cleared by hand before the row itself.
+            for sql in [
+                "DELETE FROM domain_spelling WHERE domain_id=?1",
+                // A chunk is not content, so it does not keep the row; it
+                // goes with it (the funnel never leaves one without its page).
+                "DELETE FROM reflection_chunk WHERE domain_id=?1",
+                "DELETE FROM tag_alias WHERE domain_id=?1",
+                "DELETE FROM domain_lock WHERE domain_id=?1",
+                "DELETE FROM automation_lease WHERE domain_id=?1",
+                "DELETE FROM automation_run WHERE domain_id=?1",
+                "DELETE FROM reflection_disclosure WHERE domain_id=?1",
+                "DELETE FROM relation WHERE domain_id=?1",
+                "DELETE FROM link WHERE domain_id=?1",
+                "DELETE FROM domain WHERE id=?1",
+            ] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId> {
+        self.upsert_row(domain, "", record).await
+    }
+
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId> {
+        // Compare-and-swap: if a row exists at this path and the caller supplied
+        // an expected sha that no longer matches the stored one, refuse. The
+        // engine holds the transaction open around this, so the compare and the
+        // subsequent write are one atomic unit. No row at all is an insert,
+        // which nothing guards.
+        if let Some(expected) = expected_sha {
+            self.guarded_compare(domain, &record.path, expected).await?;
+        }
+        self.upsert_engram(domain, record).await
+    }
+
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>> {
+        if !self
+            .guarded_compare(domain, &record.path, expected_sha)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.upsert_engram(domain, record).await.map(Some)
+    }
+
+    async fn clear_domain(&self, domain: DomainId) -> Result<()> {
+        // Deletes this domain's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        // Delete a single domain's engram, attachment and child rows, keeping
+        // the domain row. Child rows first, then chunks, then the engram rows
+        // themselves; attachment blobs before the attachment rows that own
+        // them, and the bodies in `engram_content` before the engram rows they
+        // hang off, which is written out rather than left to a cascade because
+        // foreign keys are not enforced here. `upsert_domain` reuses the id for
+        // a name it has seen, so anything left here would resurface as the next
+        // registration's own.
+        // -- actor: all - a domain's removal takes its drafts with it. Nothing
+        // survives the domain they were drafts of, so these statements name
+        // every actor's rows on purpose; the overlay journal is swept on the
+        // same paths so the rows and their mirror go together.
+        let did = vec![Value::Integer(domain.0)];
+        for sql in [
+            "DELETE FROM contradiction WHERE domain_id=?1",
+            "DELETE FROM contradiction_pair WHERE domain_id=?1",
+            "DELETE FROM observation_tag WHERE observation_id IN \
+             (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
+            "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM relation WHERE domain_id=?1",
+            "DELETE FROM link WHERE domain_id=?1",
+            // Every reference from another domain that named one of these
+            // engrams goes back to pending before the rows go, in whatever
+            // transaction the caller holds, as `delete_engram` does: a `to_id`
+            // naming a row nobody holds would read as resolved forever.
+            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
+            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
+            // -- actor: all - the bodies of every row about to go, named
+            // through them since `engram_content` has no domain of its own.
+            "DELETE FROM engram_content WHERE engram_id IN \
+             (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM engram WHERE domain_id=?1",
+            "DELETE FROM tag_alias WHERE domain_id=?1",
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=?1)",
+            "DELETE FROM attachment WHERE domain_id=?1",
+            "DELETE FROM reflection_chunk WHERE domain_id=?1",
+            "DELETE FROM reflection WHERE domain_id=?1",
+            "DELETE FROM reflection_asset WHERE domain_id=?1",
+            // Every spelling but the row's own name, which stays with the row.
+            "DELETE FROM domain_spelling WHERE domain_id=?1 \
+             AND spelling <> (SELECT name FROM domain WHERE id=?1)",
+        ] {
+            self.conn.execute(sql, did.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
+        // Deletes the engram's chunks, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let id = query_first(
+            &self.conn,
+            // The base row at this path. A draft is dropped by its own
+            // actor through `clear_overlay_entry`, never by the sync driver
+            // noticing that a file left disk - the draft was never on disk.
+            "SELECT id FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?
+        .and_then(|r| cell_i64(&r, 0));
+        if let Some(id) = id {
+            // The scores of every pair this engram is in. Here and in
+            // `clear_domain` only, never in `delete_children`, which every
+            // upsert runs: a full reindex would erase every score.
+            for sql in [
+                DELETE_ENGRAM_CONTRADICTIONS_SQL,
+                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
+            ] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
+            self.delete_children(id).await?;
+            // Every reference that named this engram, from any domain and any
+            // actor, goes back to pending in the same transaction: a `to_id`
+            // naming a row nobody holds would read as resolved forever.
+            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM chunk WHERE engram_id=?1",
+                    vec![Value::Integer(id)],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM engram_content WHERE engram_id=?1",
+                    vec![Value::Integer(id)],
+                )
+                .await?;
+            // -- actor: all - the row is already named by its id, which the
+            // base-scoped lookup above resolved.
+            self.conn
+                .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()> {
+        // The permalink follows the move only when it was path-derived, so an
+        // explicit frontmatter permalink is preserved across a move.
+        let old_slug = crystalline_core::slugify(from);
+        let new_slug = crystalline_core::slugify(to);
+        self.conn
+            .execute(
+                "UPDATE engram SET path=?1, \
+                 permalink = CASE WHEN permalink=?2 THEN ?3 ELSE permalink END \
+                 WHERE domain_id=?4 AND path=?5 AND actor = ''",
+                vec![
+                    Value::Text(to.to_string()),
+                    Value::Text(old_slug),
+                    Value::Text(new_slug),
+                    Value::Integer(domain.0),
+                    Value::Text(from.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE engram SET path=?1, permalink=?2 \
+                 WHERE domain_id=?3 AND path=?4 AND actor = ''",
+                vec![
+                    Value::Text(to.to_string()),
+                    Value::Text(permalink.to_string()),
+                    Value::Integer(domain.0),
+                    Value::Text(from.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
+        if !self.resolve_pending_due("relation", domain).await? {
+            return Ok(0);
+        }
+        let n = self
+            .conn
+            .execute(
+                &resolve_pending_sql("relation"),
+                vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
+        // The wikilink twin of resolve_pending_relations over the `link` table,
+        // matching by the same rule. Links carry no rel_type.
+        if !self.resolve_pending_due("link", domain).await? {
+            return Ok(0);
+        }
+        let n = self
+            .conn
+            .execute(&resolve_pending_sql("link"), vec![Value::Integer(domain.0)])
+            .await?;
+        Ok(n)
+    }
+
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "a reference pass over an actor's own rows must name that actor; the empty \
+                 actor is the base row's own key"
+                    .to_string(),
+            ));
+        }
+        let mut bound = 0u64;
+        for table in ["relation", "link"] {
+            // What dangles is unbound. A `to_id` naming a row nobody holds any
+            // more is the trace of a draft that went away, and the existence
+            // probe deliberately asks about every actor's rows: whose the
+            // vanished row was does not change that this one now points at
+            // nothing.
+            let dangling = format!(
+                "UPDATE {table} SET to_id = NULL WHERE domain_id = ?1 AND to_id IS NOT NULL \
+                 AND engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
+                 AND NOT EXISTS (SELECT 1 FROM engram t WHERE t.id = {table}.to_id)"
+            );
+            self.conn
+                .execute(
+                    &dangling,
+                    vec![Value::Integer(domain.0), Value::Text(actor.to_string())],
+                )
+                .await?;
+            // Then what is pending is bound, in this actor's own view.
+            let mut params = vec![Value::Integer(domain.0), Value::Text(actor.to_string())];
+            let mut n = 3usize;
+            let actor_screen = search::actor_screen_on("e", Some(actor), &mut params, &mut n);
+            let view = reference_match(
+                table,
+                ReferenceCandidates::View {
+                    screen: &actor_screen,
+                },
+            );
+            let sql = format!(
+                "UPDATE {table} SET to_id = {view} \
+                 WHERE {table}.to_id IS NULL AND {table}.domain_id = ?1 \
+                 AND {table}.engram_id IN (SELECT id FROM engram WHERE domain_id = ?1 AND actor = ?2) \
+                 AND {view} IS NOT NULL"
+            );
+            bound += self.conn.execute(&sql, params).await?;
+        }
+        Ok(bound)
+    }
+
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<bool> {
+        // A map that already holds exactly these pairs is left alone, so the
+        // refresh every sync runs writes nothing while the MANIFEST is
+        // unchanged.
+        let held = query_all(
+            &self.conn,
+            "SELECT alias, canonical FROM tag_alias WHERE domain_id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        let held: std::collections::BTreeMap<String, String> = held
+            .iter()
+            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
+            .collect();
+        if held == crate::store::wanted_tag_aliases(pairs) {
+            return Ok(false);
+        }
+        // Delete then re-insert: the map is fully derived from MANIFEST content,
+        // so a change replaces the domain's rows wholesale and an empty slice
+        // clears them. `INSERT OR IGNORE` drops a duplicate alias (the caller
+        // already deduped first-wins, so this is belt and braces).
+        self.conn
+            .execute(
+                "DELETE FROM tag_alias WHERE domain_id=?1",
+                vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        for (alias, canonical) in pairs {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO tag_alias(domain_id, alias, canonical) VALUES(?1, ?2, ?3)",
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Text(alias.clone()),
+                        Value::Text(canonical.clone()),
+                    ],
+                )
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
+        // Deletes and reinserts this engram's chunks, so the coverage snapshot is
+        // now stale.
+        self.invalidate_coverage();
+        let eid = engram_id.0;
+        // Carry over the embedding of any chunk whose fingerprint is unchanged so
+        // an edit only re-embeds the paragraphs that actually changed. The
+        // fingerprint folds in the model id, so a chunk embedded by a different
+        // model does not match and is left for re-embedding.
+        let existing = query_all(
+            &self.conn,
+            "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=?1 AND embedding IS NOT NULL",
+            vec![Value::Integer(eid)],
+        )
+        .await?;
+        let mut carry: HashMap<String, (Value, Value, Vec<u8>)> = HashMap::new();
+        for r in &existing {
+            let Some(hash) = cell_text(r, 0) else {
+                continue;
+            };
+            let model = match r.get_value(1) {
+                Ok(Value::Text(s)) => Value::Text(s),
+                _ => Value::Null,
+            };
+            let dims = match r.get_value(2) {
+                Ok(Value::Integer(i)) => Value::Integer(i),
+                _ => Value::Null,
+            };
+            let Ok(Value::Blob(emb)) = r.get_value(3) else {
+                continue;
+            };
+            carry.insert(hash, (model, dims, emb));
+        }
+
+        self.conn
+            .execute(
+                "DELETE FROM chunk WHERE engram_id=?1",
+                vec![Value::Integer(eid)],
+            )
+            .await?;
+
+        // One 7-column multi-row insert for every chunk: a carry hit binds its
+        // preserved model, dims and embedding, a miss binds NULL for all three
+        // and leaves the chunk pending re-embedding.
+        for batch in chunks.chunks(INSERT_CHUNK) {
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
+            for c in batch {
+                params.push(Value::Integer(eid));
+                params.push(Value::Integer(c.seq));
+                params.push(Value::Text(c.text.clone()));
+                params.push(Value::Text(c.text_hash.clone()));
+                match carry.get(&c.text_hash) {
+                    Some((model, dims, emb)) => {
+                        params.push(model.clone());
+                        params.push(dims.clone());
+                        params.push(Value::Blob(emb.clone()));
+                    }
+                    None => {
+                        params.push(Value::Null);
+                        params.push(Value::Null);
+                        params.push(Value::Null);
+                    }
+                }
+            }
+            let sql = format!(
+                "INSERT INTO chunk(engram_id, seq, text, text_hash, model, dims, embedding) VALUES {}",
+                value_rows(7, batch.len(), None)
+            );
+            self.conn.execute(&sql, params).await?;
+        }
+        Ok(())
+    }
+
+    async fn store_embeddings_in(
+        &self,
+        table: ChunkTable,
+        batch: &[EmbeddingRow],
+        model: &str,
+    ) -> Result<()> {
+        // Writes embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        // Validate the whole batch before opening the transaction so a bad row
+        // never leaves earlier rows committed. The transaction then makes the
+        // per-row updates all-or-nothing against a mid-batch database error,
+        // mirroring `wipe`.
+        for row in batch {
+            if row.embedding.len() != row.dims {
+                return Err(IndexError::Invalid(format!(
+                    "embedding length {} does not match declared dims {}",
+                    row.embedding.len(),
+                    row.dims
+                )));
+            }
+        }
+        self.conn.execute("BEGIN", ()).await?;
+        for row in batch {
+            let mut bytes = Vec::with_capacity(row.embedding.len() * 4);
+            for f in &row.embedding {
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            if let Err(e) = self
+                .conn
+                .execute(
+                    chunk_sql(table).store,
+                    vec![
+                        Value::Blob(bytes),
+                        Value::Integer(row.dims as i64),
+                        Value::Text(model.to_string()),
+                        Value::Integer(row.chunk_id),
+                    ],
+                )
+                .await
+            {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e.into());
+            }
+        }
+        self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
+        // Clears embeddings, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        let n = self
+            .conn
+            .execute(chunk_sql(table).prune, vec![Value::Text(model.to_string())])
+            .await?;
+        Ok(n as usize)
+    }
+
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(pair.a.0),
+                Value::Integer(pair.b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
+                .await?;
+            self.conn
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
+                .await?;
+            let stored = self
+                .conn
+                .execute(
+                    INSERT_CONTRADICTION_PAIR_SQL,
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Integer(pair.a.0),
+                        Value::Integer(pair.b.0),
+                        Value::Text(pair.checksum_a.clone()),
+                        Value::Text(pair.checksum_b.clone()),
+                        Value::Real(cosine),
+                        Value::Text(model.to_string()),
+                        Value::Text(scored_at.to_string()),
+                    ],
+                )
+                .await?;
+            // Either engram went while the pair was scored: nothing to keep.
+            if stored == 0 {
+                return Ok(());
+            }
+            for row in rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        vec![
+                            Value::Integer(domain.0),
+                            Value::Integer(row.a.0),
+                            Value::Integer(row.b.0),
+                            Value::Integer(row.line_a as i64),
+                            Value::Integer(row.line_b as i64),
+                            Value::Text(row.hash_a.clone()),
+                            Value::Text(row.hash_b.clone()),
+                            Value::Text(model.to_string()),
+                            Value::Real(f64::from(row.score_ab)),
+                            Value::Real(f64::from(row.score_ba)),
+                            Value::Real(f64::from(row.similarity)),
+                            Value::Integer(i64::from(row.period)),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(a.0),
+                Value::Integer(b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
+                .await?;
+            self.conn
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            for row in rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO observation_vector (model, hash, dims, vector) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model, hash) DO NOTHING",
+                        vec![
+                            Value::Text(model.to_string()),
+                            Value::Text(row.hash.clone()),
+                            Value::Integer(row.vector.len() as i64),
+                            Value::Blob(crate::store::pack_f32_le(&row.vector)),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        in_transaction(self, async {
+            let mut gone = 0u64;
+            for hash in hashes {
+                gone += self
+                    .conn
+                    .execute(
+                        DELETE_OBSERVATION_VECTOR_SQL,
+                        vec![Value::Text(model.to_string()), Value::Text(hash.clone())],
+                    )
+                    .await?;
+            }
+            Ok(gone)
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .execute(
+                DELETE_OBSERVATION_VECTORS_EXCEPT_SQL,
+                vec![Value::Text(model.to_string())],
+            )
+            .await?)
+    }
+
+    async fn clear_observation_vectors(&self) -> Result<u64> {
+        Ok(self.conn.execute(CLEAR_OBSERVATION_VECTORS_SQL, ()).await?)
+    }
+
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
+        in_transaction(self, async {
+            match domains {
+                None => {
+                    for sql in [
+                        CLEAR_ALL_CONTRADICTIONS_SQL,
+                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
+                    ] {
+                        self.conn.execute(sql, ()).await?;
+                    }
+                }
+                Some(ids) => {
+                    for id in ids {
+                        for sql in [
+                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
+                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
+                        ] {
+                            self.conn.execute(sql, vec![Value::Integer(id.0)]).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// A turso index is this process's own file: nobody else works on it.
+    async fn try_work_claim(&self, _key: &str) -> Result<Option<WorkClaim>> {
+        Ok(Some(WorkClaim::unshared()))
+    }
+
+    async fn wipe(&self) -> Result<()> {
+        // Deletes every chunk, so the coverage snapshot is now stale.
+        self.invalidate_coverage();
+        self.conn.execute("BEGIN", ()).await?;
+        for table in migrations::WIPE_TABLES {
+            if let Err(e) = self.conn.execute(&format!("DELETE FROM {table}"), ()).await {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e.into());
+            }
+        }
+        self.conn.execute("COMMIT", ()).await?;
+        self.tag_cache.lock().unwrap().clear();
+        // A wipe deletes every row, which is the biggest single write a store
+        // sees; truncate the WAL back down rather than leaving it to grow
+        // until the next natural checkpoint.
+        self.truncate_wal().await?;
+        Ok(())
+    }
+
+    async fn checkpoint_wal(&self) -> Result<()> {
+        self.truncate_wal().await
+    }
+
+    async fn record_sync(
+        &self,
+        domain: DomainId,
+        when: &str,
+        changed: bool,
+        refresh_before: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                RECORD_SYNC_SQL,
+                vec![
+                    Value::Text(when.to_string()),
+                    Value::Integer(domain.0),
+                    Value::Integer(i64::from(changed)),
+                    Value::Text(refresh_before.to_string()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // `IN ()` is a syntax error, and an empty configuration is a legitimate
+        // one, so stamping nothing touches no SQL at all.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut params: Vec<Value> = vec![Value::Text(when.to_string())];
+        let placeholders: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                params.push(Value::Text((*name).to_string()));
+                format!("?{}", i + 2)
+            })
+            .collect();
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE domain SET last_registered=?1 WHERE name IN ({})",
+                    placeholders.join(",")
+                ),
+                params,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn begin_rebuild(&self, domain: DomainId, when: &str, kind: RebuildKind) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET rebuild_started=?1, rebuild_kind=?2 WHERE id=?3",
+                vec![
+                    Value::Text(when.to_string()),
+                    Value::Text(kind.as_str().to_string()),
+                    Value::Integer(domain.0),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn end_rebuild(&self, domain: DomainId) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET rebuild_started=NULL, rebuild_kind=NULL WHERE id=?1",
+                vec![Value::Integer(domain.0)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET parse_generation=?2 WHERE id=?1",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Integer(i64::from(generation)),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn set_aside_database(&self) -> Option<PathBuf> {
+        self.set_aside.clone()
+    }
+
+    // --- the actor dimension -------------------------------------------------
+
+    async fn upsert_overlay(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        record: &EngramRecord,
+    ) -> Result<EngramId> {
+        if actor.is_empty() {
+            return Err(IndexError::Constraint(
+                "an overlay entry needs an actor; the empty actor is the base row".to_string(),
+            ));
+        }
+        self.upsert_row(domain, actor, record).await
+    }
+
+    async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool> {
+        if actor.is_empty() {
+            return Ok(false);
+        }
+        // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        // No contradiction rows to delete: drafts are never scored.
+        self.invalidate_coverage();
+        let id = query_first(
+            &self.conn,
+            "SELECT id FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(actor.to_string()),
+                Value::Text(path.to_string()),
+            ],
+        )
+        .await?
+        .and_then(|r| cell_i64(&r, 0));
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        self.delete_children(id).await?;
+        // Every reference that named this draft, from any domain, goes back
+        // to pending in the same transaction, as `delete_engram` does for a
+        // base row: a `to_id` naming a row nobody holds would read as
+        // resolved forever. The author's own references in this domain are
+        // bound again by the engine's re-resolve pass right after.
+        for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+            self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+        }
+        self.conn
+            .execute(
+                "DELETE FROM chunk WHERE engram_id=?1",
+                vec![Value::Integer(id)],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM engram_content WHERE engram_id=?1",
+                vec![Value::Integer(id)],
+            )
+            .await?;
+        // -- actor: by id - the row is already named by its id, which the
+        // actor-scoped lookup above resolved, so this statement is inside that
+        // actor's dimension without screening for it again. The census reads
+        // each statement alone, and alone this one names no actor, so it says
+        // here which of the two waivers it holds.
+        self.conn
+            .execute("DELETE FROM engram WHERE id=?1", vec![Value::Integer(id)])
+            .await?;
+        Ok(true)
+    }
+
     async fn claim_domain_host(
         &self,
         domain: DomainId,
@@ -4504,30 +4741,6 @@ impl Store for TursoStore {
         Ok(n > 0)
     }
 
-    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT DISTINCT holder_instance_id FROM domain_lock WHERE holder_label=?1 AND heartbeat_at>=?2",
-            vec![
-                Value::Text(label.to_string()),
-                Value::Text(stale_before.to_string()),
-            ],
-        )
-        .await?;
-        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
-    }
-
-    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT holder_label FROM domain_lock WHERE holder_instance_id=?1 AND holder_label<>'' \
-             UNION SELECT last_host_label FROM domain WHERE last_host_id=?1 AND last_host_label<>''",
-            vec![Value::Text(instance_id.to_string())],
-        )
-        .await?;
-        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
-    }
-
     async fn release_domain_host(
         &self,
         domain: DomainId,
@@ -4569,17 +4782,6 @@ impl Store for TursoStore {
             )
             .await?;
         Ok(n > 0)
-    }
-
-    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>> {
-        let row = query_first(&self.conn, DOMAIN_HOST_SQL, vec![Value::Integer(domain.0)]).await?;
-        Ok(row.map(|r| domain_host_of(&r)))
-    }
-
-    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>> {
-        // One instance owns a Turso database, and its write transaction is
-        // the only writer: nothing can claim in between.
-        self.domain_host(domain).await
     }
 
     async fn take_automation_lease(
@@ -4747,20 +4949,6 @@ impl Store for TursoStore {
         Ok((n > 0).then_some(lease))
     }
 
-    async fn automation_lease(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-    ) -> Result<Option<AutomationLease>> {
-        let row = query_first(
-            &self.conn,
-            AUTOMATION_LEASE_SQL,
-            vec![Value::Integer(domain.0), Value::Text(loop_kind.to_string())],
-        )
-        .await?;
-        row.map(|r| automation_lease_of(&r)).transpose()
-    }
-
     async fn record_automation_run(
         &self,
         domain: DomainId,
@@ -4809,19 +4997,6 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT path, records FROM reflection_disclosure WHERE domain_id=?1 ORDER BY path",
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
-            .collect())
-    }
-
     async fn set_reflection_disclosures(
         &self,
         domain: DomainId,
@@ -4855,27 +5030,6 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    async fn automation_runs(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-        limit: usize,
-    ) -> Result<Vec<AutomationRun>> {
-        let rows = query_all(
-            &self.conn,
-            "SELECT started_at, ended_at, runner, account, outcome, done, \"left\", \
-             judgment_waiting, summary, pr_url, left_items FROM automation_run \
-             WHERE domain_id=?1 AND loop_kind=?2 ORDER BY id DESC LIMIT ?3",
-            vec![
-                Value::Integer(domain.0),
-                Value::Text(loop_kind.to_string()),
-                Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
-            ],
-        )
-        .await?;
-        rows.iter().map(automation_run_of).collect()
-    }
-
     async fn swap_host_move(
         &self,
         domain: DomainId,
@@ -4887,36 +5041,6 @@ impl Store for TursoStore {
         }
         self.set_host_move(domain, next).await?;
         Ok(true)
-    }
-
-    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>> {
-        let row = query_first(
-            &self.conn,
-            "SELECT last_host_id, last_host_label FROM domain WHERE id=?1",
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        Ok(row.and_then(|r| {
-            let id = cell_text(&r, 0)?;
-            let label = cell_text(&r, 1)
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| id.clone());
-            Some((id, label))
-        }))
-    }
-
-    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool> {
-        let row = query_first(
-            &self.conn,
-            "SELECT EXISTS(SELECT 1 FROM domain_lock WHERE holder_label=?1 AND holder_instance_id<>?2) \
-             OR EXISTS(SELECT 1 FROM domain WHERE last_host_label=?1 AND last_host_id<>?2)",
-            vec![
-                Value::Text(label.to_string()),
-                Value::Text(instance_id.to_string()),
-            ],
-        )
-        .await?;
-        Ok(row.and_then(|r| cell_i64(&r, 0)).unwrap_or(0) != 0)
     }
 
     async fn set_last_domain_host(
@@ -4936,11 +5060,6 @@ impl Store for TursoStore {
             )
             .await?;
         Ok(())
-    }
-
-    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>> {
-        let row = query_first(&self.conn, HOST_MOVE_SQL, vec![Value::Integer(domain.0)]).await?;
-        Ok(row.and_then(|r| cell_text(&r, 0)))
     }
 
     async fn end_rebuild_stamped(&self, domain: DomainId, started: &str) -> Result<()> {
@@ -4999,31 +5118,6 @@ impl Store for TursoStore {
         Ok(n > 0)
     }
 
-    async fn get_asset(
-        &self,
-        table: AssetTable,
-        domain: DomainId,
-        path: &str,
-    ) -> Result<Option<AttachmentRow>> {
-        let row = query_first(
-            &self.conn,
-            asset_sql(table).get,
-            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.as_ref().map(attachment_from_row))
-    }
-
-    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>> {
-        let rows = query_all(
-            &self.conn,
-            asset_sql(table).list,
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        Ok(rows.iter().map(attachment_from_row).collect())
-    }
-
     async fn write_attachment_blob(
         &self,
         domain: DomainId,
@@ -5039,20 +5133,6 @@ impl Store for TursoStore {
             )
             .await?;
         Ok(())
-    }
-
-    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
-        let row = query_first(
-            &self.conn,
-            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
-             WHERE a.domain_id=?1 AND a.path=?2",
-            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.and_then(|r| match r.get_value(0) {
-            Ok(Value::Blob(b)) => Some(b),
-            _ => None,
-        }))
     }
 
     async fn upsert_reflection(&self, domain: DomainId, row: &ReflectionRow) -> Result<()> {
@@ -5093,82 +5173,6 @@ impl Store for TursoStore {
             .execute("DELETE FROM reflection WHERE domain_id=?1 AND path=?2", key)
             .await?;
         Ok(n > 0)
-    }
-
-    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>> {
-        let row = query_first(
-            &self.conn,
-            "SELECT path, title, content, sha256, size, modified FROM reflection \
-             WHERE domain_id=?1 AND path=?2",
-            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
-        )
-        .await?;
-        Ok(row.as_ref().map(reflection_from_row))
-    }
-
-    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>> {
-        // TEXT sorts byte-wise here, the order the Postgres twin pins itself to
-        // with an explicit `COLLATE "C"`.
-        let rows = query_all(
-            &self.conn,
-            "SELECT path, title, content, sha256, size, modified FROM reflection \
-             WHERE domain_id=?1 ORDER BY path",
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        Ok(rows.iter().map(reflection_from_row).collect())
-    }
-
-    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>> {
-        let rows = query_all(
-            &self.conn,
-            REFLECTION_STAMPS_SQL,
-            vec![Value::Integer(domain.0)],
-        )
-        .await?;
-        let mut stamps: Vec<ReflectionStamp> = rows
-            .iter()
-            .map(|r| ReflectionStamp {
-                path: cell_text(r, 0).unwrap_or_default(),
-                title: cell_text(r, 1).unwrap_or_default(),
-                sha256: cell_text(r, 2).unwrap_or_default(),
-                size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
-                modified: cell_text(r, 4).unwrap_or_default(),
-            })
-            .collect();
-        // Byte order, as `list_reflections` answers; sorted here so the
-        // statement stays a plain seek of the domain's rows.
-        stamps.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(stamps)
-    }
-
-    async fn reflection_vector_hits(
-        &self,
-        domain: DomainId,
-        query: &[f32],
-        model: &str,
-    ) -> Result<Vec<SectionVector>> {
-        let coverage = self.reflection_coverage(domain).await?;
-        crate::rank::check_staleness(&coverage, model, query.len())?;
-        let rows = query_all(
-            &self.conn,
-            REFLECTION_VECTOR_SQL,
-            vec![
-                Value::Blob(crate::store::pack_f32_le(query)),
-                Value::Integer(domain.0),
-                Value::Text(model.to_string()),
-                Value::Integer(query.len() as i64),
-            ],
-        )
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| SectionVector {
-                path: cell_text(r, 0).unwrap_or_default(),
-                section_ord: cell_i64(r, 1).unwrap_or(0).max(0) as usize,
-                similarity: 1.0 - cell_real(r, 2).unwrap_or(1.0),
-            })
-            .collect())
     }
 
     async fn replace_reflection_chunks(

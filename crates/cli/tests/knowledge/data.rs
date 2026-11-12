@@ -2678,6 +2678,7 @@ fn a_bare_command_resolves_its_default_paths_under_the_test_home() {
 #[test]
 fn a_sync_without_a_daemon_reparses_a_virtual_domain() {
     use crystalline_core::{PARSE_GENERATION, parse_engram};
+    use crystalline_index::ReadStore;
     use crystalline_index::{DomainKind, EngramRecord, Store, TursoStore};
 
     let work = tempfile::tempdir().unwrap();

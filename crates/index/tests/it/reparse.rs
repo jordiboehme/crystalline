@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crystalline_core::{PARSE_GENERATION, parse_engram};
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, ReparseSeam, ReparseStep, Store,
     TursoStore, apply_scan, reparse_stored_domain, reparse_stored_domain_with, scan_paths,

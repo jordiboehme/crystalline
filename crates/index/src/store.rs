@@ -2848,22 +2848,16 @@ pub fn merge_vocabularies(parts: Vec<Vocabulary>) -> Vocabulary {
     )
 }
 
-/// The backend-agnostic storage interface. All methods are async so a network
-/// backend can implement the same trait.
+/// The reading half of the backend-agnostic storage interface: every method
+/// here only reads, so it may run on a read connection beside the writer
+/// ([`crate::reader`]). All methods are async so a network backend can
+/// implement the same trait.
+///
+/// A method that fills a cache shared with the writer (the embedding coverage
+/// snapshot) keeps its fill only when no write invalidated the cache since its
+/// read began, so a reader on an older snapshot never stores a stale value.
 #[async_trait]
-pub trait Store: Send + Sync {
-    /// Register or update a domain by name, root path and kind, returning its
-    /// id. A file domain passes `Some(path)`; a virtual domain passes `None`,
-    /// since its engrams live in the database with no filesystem root. The name
-    /// is recorded as one of the domain's spellings too, unless another domain
-    /// already holds that spelling.
-    async fn upsert_domain(
-        &self,
-        name: &str,
-        path: Option<&str>,
-        kind: DomainKind,
-    ) -> Result<DomainId>;
-
+pub trait ReadStore: Send + Sync {
     /// The id of a domain the index already holds, or `None` for a name it has
     /// never been told about. A pure read: it registers nothing.
     ///
@@ -2891,113 +2885,6 @@ pub trait Store: Send + Sync {
     /// it.
     #[doc(hidden)]
     async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>>;
-
-    /// Replace the spellings of the domains `spellings` names with exactly
-    /// that list, and answer every spelling whose mapping changed - added,
-    /// removed or now pointing at a different domain - sorted byte-wise.
-    ///
-    /// The replace is scoped to the domain ids the list names, so instances
-    /// sharing one Postgres index never delete each other's canonical names or
-    /// aliases. The engine passes every `(spelling, local name)` pair of its
-    /// name table, and every registered domain is in it through its local name,
-    /// so the scope is exactly the domains this instance registers.
-    ///
-    /// Every domain row keeps its own name as a spelling whether or not the
-    /// list names it, and that name wins over any other claim on the spelling:
-    /// local names always win, which is the name table's first rule. A listed
-    /// spelling another domain holds as a canonical name or alias moves to the
-    /// listed domain. One spelling listed for two domains, or a domain id with
-    /// no row, is [`crate::IndexError::Invalid`] and changes nothing.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`].
-    async fn replace_domain_spellings(
-        &self,
-        spellings: &[(String, DomainId)],
-    ) -> Result<Vec<String>>;
-
-    /// Unbind every relation and link row, every actor's included, whose
-    /// `to_domain` is one of `spellings`, so the next resolve pass binds it
-    /// through what the spelling means now. Answers the number of rows that
-    /// were bound and are not any more.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`]. The resolve passes that follow it are the caller's
-    /// to wrap, as [`crate::resolve_forward_refs`] does.
-    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
-
-    /// Bind every pending relation and link row, in every domain and every
-    /// actor's included, whose `to_domain` is one of `spellings`. Answers the
-    /// number of rows bound. The pass a newly registered domain needs: a
-    /// reference elsewhere that already named it waited pending, and only the
-    /// rows spelled with its names can bind to it, so nothing else is read.
-    ///
-    /// Base candidates, as every resolve pass has: right for a domain that was
-    /// just registered, which holds no drafts and no tombstones yet.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`].
-    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
-
-    /// Bind the pending relation and link rows in every domain but `domain`
-    /// (every actor's rows) whose `to_domain` is one of `spellings` and whose
-    /// target, lowercased, is one of `targets` lowercased, by the base rule
-    /// every resolve pass uses. Answers the number bound per domain, sorted by
-    /// id, domains with none left out. The pass a base write in `domain` needs
-    /// when it adds an engram or changes its permalink or title: `targets`
-    /// are that permalink and that title, `spellings` every name `domain`
-    /// answers to.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`].
-    async fn resolve_references_to(
-        &self,
-        domain: DomainId,
-        spellings: &[String],
-        targets: &[String],
-    ) -> Result<Vec<(DomainId, u64)>>;
-
-    /// Rename a domain row in place: `domain.name` becomes `new` and the id
-    /// stays, so every engram and every bound reference stays attached. The
-    /// row's own spelling follows it in the same transaction (taking `new`
-    /// from any domain that held it as a canonical name or alias, since local
-    /// names win), and `old` stays behind as an alias spelling of the same
-    /// row. `relation.to_domain` and `link.to_domain` keep the text as
-    /// written: a reference spelled `old` resolves through that alias, before
-    /// and after the rename, so no file reads as unresolved. When `new` was
-    /// another domain's spelling, the references bound through it are
-    /// unbound; the caller runs the resolve passes afterwards.
-    ///
-    /// The alias lasts until the next [`Store::replace_domain_spellings`] for
-    /// the row, which keeps only what its list names: the caller records `old`
-    /// among the domain's aliases before that runs.
-    ///
-    /// Idempotent, for a rename that is completed again after a crash: a row
-    /// already named `new` with none named `old` is fine, and so is no row
-    /// under either name (a domain that was never indexed has nothing to
-    /// rename). A different row already named `new` is
-    /// [`crate::IndexError::Constraint`] naming both.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`].
-    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()>;
-
-    /// Drop the domain row named `name` when it holds nothing: no engram row
-    /// of any actor (a draft counts) and no attachment. Its spellings, tag
-    /// aliases, host lock and any stray relation or link rows go with it.
-    /// Answers `true` when a row was dropped, `false` when there is no row
-    /// under the name or the row still holds something, which is left exactly
-    /// as it was.
-    ///
-    /// For a domain nobody registers any more: `domain remove` leaves an
-    /// empty row after [`Store::clear_domain`], and the row would otherwise
-    /// hold the name against a rename or a later adoption. The caller decides
-    /// that the domain is unregistered and not another instance's; this only
-    /// guarantees that nothing with content is ever dropped.
-    ///
-    /// Opens its own transaction: never call it between [`Store::begin`] and
-    /// [`Store::commit`].
-    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool>;
 
     /// Every `(source domain name, engram path)` that names one of `spellings`
     /// as a target domain: through a relation or link row, or through a
@@ -3064,44 +2951,6 @@ pub trait Store: Send + Sync {
         permalinks: &[String],
     ) -> Result<Vec<CitedEngram>>;
 
-    /// Insert or update one engram, replacing its observations, relations, links
-    /// and tags. Returns the engram id. A duplicate permalink (a different path
-    /// already owning the permalink) is a [`crate::IndexError::Constraint`].
-    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId>;
-
-    /// Like [`Store::upsert_engram`], but a compare-and-swap on the stored
-    /// content. When `expected_sha` is `Some` and a row already exists at
-    /// `record.path` whose stored `sha256` differs, this returns
-    /// [`crate::IndexError::StaleEdit`] instead of writing; otherwise it behaves
-    /// exactly like `upsert_engram`. The compare and the write are one atomic
-    /// unit (the engine wraps the call in a transaction). This is the guard that
-    /// makes a stale virtual edit a conflict rather than a silent clobber.
-    async fn upsert_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: Option<&str>,
-    ) -> Result<EngramId>;
-
-    /// Rewrite the base row at `record.path` only if it still exists and still
-    /// carries `expected_sha`, with the same guarded compare as
-    /// [`Store::upsert_engram_checked`]: `Ok(Some(id))` when it was rewritten,
-    /// `Ok(None)` when no row stands at the path any more (deleted or renamed
-    /// since it was read), [`crate::IndexError::StaleEdit`] when one stands
-    /// there with other content. Never inserts, which is what the reparse
-    /// after a parser change needs: it rewrites what it read, and a row that
-    /// vanished meanwhile must stay gone. On Postgres the never-insert
-    /// guarantee holds only inside a transaction: the compare's row lock is
-    /// what keeps a concurrent delete out until the rewrite, and without a
-    /// transaction it is released when the compare statement ends, so a row
-    /// deleted between the compare and the rewrite would be inserted again.
-    async fn update_engram_checked(
-        &self,
-        domain: DomainId,
-        record: &EngramRecord,
-        expected_sha: &str,
-    ) -> Result<Option<EngramId>>;
-
     /// The full markdown content stored for the engram at a domain-relative
     /// path, or `None` when no such row exists. Serves the database read path
     /// (virtual domains and non-host reads) and reads current content for a
@@ -3111,71 +2960,6 @@ pub trait Store: Send + Sync {
     /// Every engram in a domain with its path, permalink, content and checksum,
     /// ordered by path. Streams a whole domain for `domain export`.
     async fn all_engram_contents(&self, domain: DomainId) -> Result<Vec<StoredEngram>>;
-
-    /// Delete every engram (and its child and chunk rows) in a single domain,
-    /// keeping the domain row itself. The scoped clear behind `domain remove`
-    /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
-    /// everything.
-    ///
-    /// The domain's spellings go too, all but its own name: the row stays and
-    /// still answers to that, while a canonical name or former name left behind
-    /// would keep resolving references to a domain nobody registers and would
-    /// hold the spelling against the next domain that claims it.
-    ///
-    /// It also clears the domain's contradiction pairs and line rows, and
-    /// unbinds (`to_id = NULL`) every link and relation row in another domain
-    /// that named one of its engrams, so those references read as pending.
-    ///
-    /// A reindex does not use this, and deliberately: `--full` re-reads and
-    /// re-upserts instead, so rows a reader is using are never absent between
-    /// a clear and the rebuild that would have refilled them, and an unchanged
-    /// chunk keeps its embedding.
-    async fn clear_domain(&self, domain: DomainId) -> Result<()>;
-
-    /// Delete the engram at a domain-relative path and all its child rows.
-    ///
-    /// Every link and relation row that named the deleted engram, in any
-    /// domain and for any actor, is unbound (`to_id = NULL`) in the same
-    /// statements, so it reads as pending until a write at that address binds
-    /// it again. Opens no transaction of its own: the sync driver calls this
-    /// inside one, and the engine's delete wraps its call in one.
-    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()>;
-
-    /// Move an engram from one path to another without reparsing. The permalink
-    /// follows only when it was path-derived.
-    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()>;
-
-    /// Give the base row at `from` a new path and a new permalink in one
-    /// statement, without reparsing, keeping its id.
-    ///
-    /// The move's own rename, beside the sync's [`Store::rename_engram`]: a
-    /// move decides the permalink itself - the path's, the one the engram
-    /// kept, or one the caller named - and writes it into the frontmatter, so
-    /// the row takes exactly that value rather than the path-derived guess.
-    /// The id is what every chunk, embedding and bound reference keys to, so
-    /// keeping it is what makes a rename cheaper than a delete and a create.
-    /// `from` and `to` may be the same path, which is the permalink-only
-    /// rename. The caller has already made sure no other row in the domain
-    /// holds `permalink`; the unique index refuses it otherwise.
-    async fn readdress_engram(
-        &self,
-        domain: DomainId,
-        from: &str,
-        to: &str,
-        permalink: &str,
-    ) -> Result<()>;
-
-    /// Resolve every pending forward reference in a domain in one batch,
-    /// matching the target text against permalink then title within the target
-    /// domain. Returns the number of relations newly resolved.
-    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64>;
-
-    /// Resolve every pending prose wikilink in a domain in one batch, the same
-    /// permalink-then-title match as [`Store::resolve_pending_relations`] but
-    /// over the `link` table. Wikilinks carry no relation type, so a resolved
-    /// link becomes a `links_to` edge in graph traversal. Returns the number of
-    /// links newly resolved.
-    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64>;
 
     // --- lookups -------------------------------------------------------------
     // Repository-level addressing helpers used by the service layer to turn a
@@ -3277,19 +3061,6 @@ pub trait Store: Send + Sync {
         tag: &str,
         domain: Option<&str>,
     ) -> Result<Vec<EngramDescriptor>>;
-
-    /// Replace a domain's derived tag-alias rows with the given folded
-    /// `(alias, canonical)` pairs. Deletes every existing row for the domain,
-    /// then inserts each pair, ignoring a duplicate alias. Called by
-    /// [`crate::sync::refresh_tag_aliases`] on every sync, so an empty slice
-    /// clears the domain's aliases. Both sides are already lowercased by the
-    /// caller; the store never parses markdown. Rows that already say exactly
-    /// this are left alone and nothing is written; answers whether it wrote.
-    async fn replace_tag_aliases(
-        &self,
-        domain: DomainId,
-        pairs: &[(String, String)],
-    ) -> Result<bool>;
 
     /// The distinct folded `(alias, canonical)` tag-alias pairs, optionally
     /// scoped to a set of domain names, ordered by alias then canonical. An
@@ -3405,41 +3176,6 @@ pub trait Store: Send + Sync {
         actor: Option<&str>,
     ) -> Result<Vec<UnresolvedRef>>;
 
-    /// Re-resolve one actor's own references in their own view, and answer how
-    /// many bound.
-    ///
-    /// Two statements per reference table, inside whatever transaction the
-    /// caller has open. First what dangles is unbound: a `to_id` naming a row
-    /// nobody holds any more is the trace of a draft that went away, and
-    /// leaving it would be an edge into nothing. Then what is pending is bound,
-    /// against `ReferenceCandidates::View` - their own drafts first, then the
-    /// base - so the author's links follow their own rows as those rows are
-    /// written, dropped and folded.
-    ///
-    /// Scoped to that actor's rows on purpose: the base resolvers
-    /// ([`Store::resolve_pending_relations`] and its twin) stay exactly as they
-    /// are and keep answering for the domain, because a base row's edges are a
-    /// fact about the domain rather than about a reader.
-    ///
-    /// **A binding is made once and not revisited, and two cases follow from
-    /// that.** A reference bound before its author tombstoned the target stays
-    /// bound, since a tombstone deletes nothing - and that one the reader's own
-    /// screen settles at every surface that reads an edge, because the deleted
-    /// path is where the binding points. The other it does not: a reference
-    /// bound to a base row, whose author LATER writes a page of their own
-    /// answering to the same name at a different path, goes on naming the base
-    /// row. Neither statement here moves it (it does not dangle, and it is not
-    /// pending) and no screen can, because the two pages sit at two addresses.
-    /// A third statement that unbound every bound reference to see whether a
-    /// newer row of the author's would beat it is what that would take, and it
-    /// would rewrite an author's settled links on every write they make. The
-    /// binding is the reading that held when the reference was written, which
-    /// is the honest answer rather than the better one.
-    ///
-    /// An empty `actor` is a [`crate::IndexError::Constraint`], like
-    /// [`Store::upsert_overlay`]: the empty string is the base row's own key.
-    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64>;
-
     /// Run a search and return one page of hits plus the total match count.
     async fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>> {
         self.search_with_candidate_cap(query, LEXICAL_CANDIDATE_CAP)
@@ -3477,12 +3213,6 @@ pub trait Store: Send + Sync {
     /// Return recent engrams matching a filter, newest first.
     async fn recent(&self, filter: &RecentFilter) -> Result<Vec<EngramSummary>>;
 
-    /// Replace an engram's chunk rows with a freshly computed set, carrying over
-    /// the embedding of any chunk whose fingerprint is unchanged so an edit only
-    /// re-embeds the paragraphs that actually changed. Called by the sync engine
-    /// after each upsert.
-    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()>;
-
     /// Return chunks in `table` that need an embedding for the given model:
     /// those with no embedding yet, plus those embedded by a different model (a
     /// model swap). `domains`, when `Some`, restricts the scan to those domains:
@@ -3511,28 +3241,6 @@ pub trait Store: Send + Sync {
         limit: usize,
         after: Option<(i64, i64)>,
     ) -> Result<Vec<ChunkJob>>;
-
-    /// Store a batch of embeddings against their chunks in `table` for the
-    /// given model.
-    async fn store_embeddings_in(
-        &self,
-        table: ChunkTable,
-        batch: &[EmbeddingRow],
-        model: &str,
-    ) -> Result<()>;
-
-    /// Clear the vectors in `table` of every model other than `model`,
-    /// returning how many chunks were cleared.
-    ///
-    /// The embedding lives in columns on the chunk table (`embedding`, `dims`,
-    /// `model`), so this nulls those three and never removes a chunk row: the
-    /// text stays, and every cleared chunk is back in
-    /// [`Store::chunks_needing_embedding_in`] for the active model. Called once
-    /// per table by an embed pass that finds the active model covering every
-    /// chunk of that table, to reclaim the space an install's previous model
-    /// left behind. A user who switches back simply re-embeds; nothing is kept
-    /// for a return trip.
-    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize>;
 
     /// Embedding coverage of `table`: total chunks, embedded chunks and a
     /// per-model breakdown. With `domains` named, only those domains' chunks
@@ -3577,18 +3285,6 @@ pub trait Store: Send + Sync {
         after: Option<(i64, i64)>,
     ) -> Result<Vec<ChunkJob>> {
         self.chunks_needing_embedding_in(ChunkTable::Engram, model, domains, limit, after)
-            .await
-    }
-
-    /// [`Store::store_embeddings_in`] on the engram chunks.
-    async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
-        self.store_embeddings_in(ChunkTable::Engram, batch, model)
-            .await
-    }
-
-    /// [`Store::prune_embeddings_except_in`] on the engram chunks.
-    async fn prune_embeddings_except(&self, model: &str) -> Result<usize> {
-        self.prune_embeddings_except_in(ChunkTable::Engram, model)
             .await
     }
 
@@ -3652,29 +3348,6 @@ pub trait Store: Send + Sync {
         model: &str,
     ) -> Result<Vec<ScoredPair>>;
 
-    /// Record one scoring of `pair` by `model`: the pair row with `cosine` and
-    /// `scored_at`, and its line rows, replacing whatever an earlier scoring
-    /// left, in one transaction. `rows` may be empty: a pair with nothing above
-    /// the store floor is scored with nothing to say and is not asked again
-    /// until an edit moves a checksum. Refuses inside an open `begin`.
-    async fn replace_contradictions(
-        &self,
-        domain: DomainId,
-        pair: &ScoredPair,
-        cosine: f64,
-        model: &str,
-        scored_at: &str,
-        rows: &[ContradictionRow],
-    ) -> Result<()>;
-
-    /// Delete what `model` stored for the pair `a`, `b` (lower id first): its
-    /// pair row and its line rows, in one transaction, through the primary
-    /// keys. The contradiction walk's delete for a pair one of whose engrams is
-    /// past its `valid_to`: with the pair row gone, a window opened again later
-    /// makes the pair pending, not scored with nothing to say. Refuses inside
-    /// an open `begin`.
-    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()>;
-
     /// Every stored line pair in `domain` for `model` whose higher reading
     /// order is at or above `min_score`, ordered by `(a, b, line_a, line_b)`.
     /// The sweep's read: it filters by status, window and line hash itself, so
@@ -3709,6 +3382,536 @@ pub trait Store: Send + Sync {
         hashes: &[String],
     ) -> Result<HashMap<String, Vec<f32>>>;
 
+    /// Every hash with a line vector for `model`, unordered. The pruning read:
+    /// narrow, one short column per row.
+    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>>;
+
+    /// The parser generation ([`crystalline_core::PARSE_GENERATION`]) the
+    /// domain's rows were last derived with: 0 for a domain an upgrade found,
+    /// the current generation for a row created since. A sync that reads an
+    /// older value than the current one reparses the domain whole once.
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32>;
+
+    /// One actor's draft at a domain-relative path, or `None` when that actor
+    /// holds none there. A tombstone is a draft like any other and is returned,
+    /// carrying its flag; a caller deciding what a reader sees reads the flag
+    /// rather than the absence.
+    async fn overlay_entry(
+        &self,
+        domain: DomainId,
+        actor: &str,
+        path: &str,
+    ) -> Result<Option<StoredEngram>>;
+
+    /// Every draft one actor holds in a domain, ordered by path. Tombstones
+    /// included, for the same reason.
+    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
+
+    /// [`Store::overlay_entries`] without the bodies: every draft path one
+    /// actor holds in a domain with its tombstone flag, ordered by path. For a
+    /// caller that only asks where drafts stand, such as the close-folder hint
+    /// on a write receipt, so it never loads a draft's text to learn its path.
+    async fn overlay_paths(&self, domain: DomainId, actor: &str) -> Result<Vec<(String, bool)>>;
+
+    /// How many drafts each actor holds in a domain, ordered by actor. Base
+    /// rows are not counted and an actor holding none is not listed, so an
+    /// empty answer means nobody is drafting here.
+    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>>;
+
+    /// Diagnostics about the open store.
+    async fn store_info(&self) -> Result<StoreInfo>;
+
+    /// Per-domain counts, in registration order.
+    async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    /// Every domain name the index holds, sorted.
+    ///
+    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
+    /// know *which* domains have rows rather than how many rows each has. One
+    /// column of a table with a row per domain, against six correlated counting
+    /// scans per domain - which matters because the serving screen asks this on
+    /// every read, and a domain name is all it wants.
+    async fn domain_names(&self) -> Result<Vec<String>>;
+
+    /// The vocabulary in use: tag, observation-category, relation-type, engram
+    /// `type` and engram `status` usage counts, for one domain or (when
+    /// `domain` is `None`) across every domain.
+    /// An unknown domain name yields empty vectors rather than an error, so a
+    /// caller can probe a domain that holds no engrams yet. The vectors are
+    /// sorted by usage in Rust for cross-backend determinism.
+    ///
+    /// `actor` is who is asking. `None` - every caller that shows a person the
+    /// vocabulary - answers the team's own list, because a tag one author is
+    /// trying out in a draft is not yet the domain's agreement. `Some(a)` reads
+    /// that actor's view, and the one caller that passes it is the sweep's tag
+    /// drift rule, whose finding is about what that author wrote.
+    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary>;
+
+    /// One file's metadata in `table` by path, or `None`.
+    async fn get_asset(
+        &self,
+        table: AssetTable,
+        domain: DomainId,
+        path: &str,
+    ) -> Result<Option<AttachmentRow>>;
+
+    /// Every file of a domain in `table`, ordered by path in byte order (both
+    /// backends pin the collation, so the listing is identical across them).
+    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>>;
+
+    /// [`Store::get_asset`] on the engram attachments.
+    async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>> {
+        self.get_asset(AssetTable::Engram, domain, path).await
+    }
+
+    /// [`Store::list_assets`] on the engram attachments.
+    async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>> {
+        self.list_assets(AssetTable::Engram, domain).await
+    }
+
+    /// An attachment's stored bytes, or `None` when the path has no row or the
+    /// row has no blob (the normal case for a file domain, whose bytes are on
+    /// disk).
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>>;
+
+    /// One reflection's row, or `None`.
+    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>>;
+
+    /// Every reflection row of a domain, ordered by path in byte order.
+    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>>;
+
+    /// Every reflection row of a domain without its text, ordered by path in
+    /// byte order: what the sync's stat prefilter and the move screens read,
+    /// which have no use for the page itself.
+    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>>;
+
+    /// Embedding coverage of one domain's reflection chunks: total chunks,
+    /// embedded chunks and a per-model breakdown, read fresh (never cached).
+    /// A reflection search reads it for its mode decision and its staleness
+    /// gate, so a domain whose pages are not embedded yet answers as text
+    /// while another domain's are. [`Store::embedding_coverage_of`] stays the
+    /// table-wide count that status and the backlog read. This is
+    /// [`Store::embedding_coverage_in`] on the reflection chunks of `domain`.
+    async fn reflection_coverage(&self, domain: DomainId) -> Result<EmbeddingCoverage> {
+        self.embedding_coverage_in(ChunkTable::Reflection, Some(&[domain]))
+            .await
+    }
+
+    /// The vector half of a reflection search (R60): the closest chunk of
+    /// each section of one domain's pages embedded by `model` at
+    /// `query.len()` dims, at most [`crate::rank::SEMANTIC_TOPK`] sections,
+    /// best first, ties on path then section order. Answers
+    /// [`crate::IndexError::StaleEmbeddings`] when the stored reflection vectors
+    /// cannot be compared with the query (`crate::rank::check_staleness`
+    /// over [`Store::reflection_coverage`] of `domain`), so a caller falls
+    /// back to text.
+    async fn reflection_vector_hits(
+        &self,
+        domain: DomainId,
+        query: &[f32],
+        model: &str,
+    ) -> Result<Vec<SectionVector>>;
+
+    /// The labels `instance_id` is recorded under already (on a lock it
+    /// holds, or on a domain it last hosted), each once.
+    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>>;
+
+    /// The instance ids holding a lock under `label` whose heartbeat is not
+    /// older than `stale_before`.
+    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>>;
+
+    /// The current holder of a file domain's host lock, or `None` when unheld.
+    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>>;
+
+    /// [`Store::domain_host`] read for a walk about to apply: inside the
+    /// caller's write transaction the lock row stays as read until it ends
+    /// (`FOR SHARE` on Postgres), so a claim of the domain waits for the
+    /// apply to commit instead of landing in the middle of it. A Turso
+    /// database belongs to one instance, so the plain read is the same.
+    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>>;
+
+    /// The disclosures recorded on `domain`'s Reflection, one entry per
+    /// page: its path inside `reflections/` and its records as the JSON text
+    /// [`Store::set_reflection_disclosures`] stored. Sorted by path.
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
+
+    /// The lease of `loop_kind` on `domain` as stored, a stale one included.
+    async fn automation_lease(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+    ) -> Result<Option<AutomationLease>>;
+
+    /// The newest `limit` runs of `loop_kind` on `domain`, newest first.
+    async fn automation_runs(
+        &self,
+        domain: DomainId,
+        loop_kind: &str,
+        limit: usize,
+    ) -> Result<Vec<AutomationRun>>;
+
+    /// The domain's host move as stored, JSON text, or `None`.
+    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>>;
+
+    /// The instance that last acquired a file domain's host lock, as
+    /// `(instance id, label)`, or `None` when none was recorded. Kept on the
+    /// domain row, so it outlives a release, which deletes the lock row.
+    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>>;
+
+    /// Whether another instance than `instance_id` is recorded under
+    /// `label`, as a lock's holder or as a domain's last host: two instances
+    /// on one machine name, or behind one address, would show the same name,
+    /// so the later one adds a short id ([`crate::instance_label`]).
+    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool>;
+
+    /// The domain's unresolved host move, or `None`.
+    async fn host_move(&self, domain: DomainId) -> Result<Option<HostMove>> {
+        Ok(self
+            .host_move_text(domain)
+            .await?
+            .and_then(|text| parse_host_move(&text)))
+    }
+}
+
+/// The backend-agnostic storage interface: the reads of [`ReadStore`] plus
+/// every write and the transaction verbs. The engine holds one behind a mutex;
+/// code that holds it reads through it too, which is what keeps a read inside
+/// an open transaction, or a read whose answer decides a write, on the writer.
+#[async_trait]
+pub trait Store: ReadStore {
+    /// Register or update a domain by name, root path and kind, returning its
+    /// id. A file domain passes `Some(path)`; a virtual domain passes `None`,
+    /// since its engrams live in the database with no filesystem root. The name
+    /// is recorded as one of the domain's spellings too, unless another domain
+    /// already holds that spelling.
+    async fn upsert_domain(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        kind: DomainKind,
+    ) -> Result<DomainId>;
+
+    /// Replace the spellings of the domains `spellings` names with exactly
+    /// that list, and answer every spelling whose mapping changed - added,
+    /// removed or now pointing at a different domain - sorted byte-wise.
+    ///
+    /// The replace is scoped to the domain ids the list names, so instances
+    /// sharing one Postgres index never delete each other's canonical names or
+    /// aliases. The engine passes every `(spelling, local name)` pair of its
+    /// name table, and every registered domain is in it through its local name,
+    /// so the scope is exactly the domains this instance registers.
+    ///
+    /// Every domain row keeps its own name as a spelling whether or not the
+    /// list names it, and that name wins over any other claim on the spelling:
+    /// local names always win, which is the name table's first rule. A listed
+    /// spelling another domain holds as a canonical name or alias moves to the
+    /// listed domain. One spelling listed for two domains, or a domain id with
+    /// no row, is [`crate::IndexError::Invalid`] and changes nothing.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn replace_domain_spellings(
+        &self,
+        spellings: &[(String, DomainId)],
+    ) -> Result<Vec<String>>;
+
+    /// Unbind every relation and link row, every actor's included, whose
+    /// `to_domain` is one of `spellings`, so the next resolve pass binds it
+    /// through what the spelling means now. Answers the number of rows that
+    /// were bound and are not any more.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`]. The resolve passes that follow it are the caller's
+    /// to wrap, as [`crate::resolve_forward_refs`] does.
+    async fn reset_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Bind every pending relation and link row, in every domain and every
+    /// actor's included, whose `to_domain` is one of `spellings`. Answers the
+    /// number of rows bound. The pass a newly registered domain needs: a
+    /// reference elsewhere that already named it waited pending, and only the
+    /// rows spelled with its names can bind to it, so nothing else is read.
+    ///
+    /// Base candidates, as every resolve pass has: right for a domain that was
+    /// just registered, which holds no drafts and no tombstones yet.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to_spellings(&self, spellings: &[String]) -> Result<u64>;
+
+    /// Bind the pending relation and link rows in every domain but `domain`
+    /// (every actor's rows) whose `to_domain` is one of `spellings` and whose
+    /// target, lowercased, is one of `targets` lowercased, by the base rule
+    /// every resolve pass uses. Answers the number bound per domain, sorted by
+    /// id, domains with none left out. The pass a base write in `domain` needs
+    /// when it adds an engram or changes its permalink or title: `targets`
+    /// are that permalink and that title, `spellings` every name `domain`
+    /// answers to.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn resolve_references_to(
+        &self,
+        domain: DomainId,
+        spellings: &[String],
+        targets: &[String],
+    ) -> Result<Vec<(DomainId, u64)>>;
+
+    /// Rename a domain row in place: `domain.name` becomes `new` and the id
+    /// stays, so every engram and every bound reference stays attached. The
+    /// row's own spelling follows it in the same transaction (taking `new`
+    /// from any domain that held it as a canonical name or alias, since local
+    /// names win), and `old` stays behind as an alias spelling of the same
+    /// row. `relation.to_domain` and `link.to_domain` keep the text as
+    /// written: a reference spelled `old` resolves through that alias, before
+    /// and after the rename, so no file reads as unresolved. When `new` was
+    /// another domain's spelling, the references bound through it are
+    /// unbound; the caller runs the resolve passes afterwards.
+    ///
+    /// The alias lasts until the next [`Store::replace_domain_spellings`] for
+    /// the row, which keeps only what its list names: the caller records `old`
+    /// among the domain's aliases before that runs.
+    ///
+    /// Idempotent, for a rename that is completed again after a crash: a row
+    /// already named `new` with none named `old` is fine, and so is no row
+    /// under either name (a domain that was never indexed has nothing to
+    /// rename). A different row already named `new` is
+    /// [`crate::IndexError::Constraint`] naming both.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn rename_domain_row(&self, old: &str, new: &str) -> Result<()>;
+
+    /// Drop the domain row named `name` when it holds nothing: no engram row
+    /// of any actor (a draft counts) and no attachment. Its spellings, tag
+    /// aliases, host lock and any stray relation or link rows go with it.
+    /// Answers `true` when a row was dropped, `false` when there is no row
+    /// under the name or the row still holds something, which is left exactly
+    /// as it was.
+    ///
+    /// For a domain nobody registers any more: `domain remove` leaves an
+    /// empty row after [`Store::clear_domain`], and the row would otherwise
+    /// hold the name against a rename or a later adoption. The caller decides
+    /// that the domain is unregistered and not another instance's; this only
+    /// guarantees that nothing with content is ever dropped.
+    ///
+    /// Opens its own transaction: never call it between [`Store::begin`] and
+    /// [`Store::commit`].
+    async fn drop_empty_domain_row(&self, name: &str) -> Result<bool>;
+
+    /// Insert or update one engram, replacing its observations, relations, links
+    /// and tags. Returns the engram id. A duplicate permalink (a different path
+    /// already owning the permalink) is a [`crate::IndexError::Constraint`].
+    async fn upsert_engram(&self, domain: DomainId, record: &EngramRecord) -> Result<EngramId>;
+
+    /// Like [`Store::upsert_engram`], but a compare-and-swap on the stored
+    /// content. When `expected_sha` is `Some` and a row already exists at
+    /// `record.path` whose stored `sha256` differs, this returns
+    /// [`crate::IndexError::StaleEdit`] instead of writing; otherwise it behaves
+    /// exactly like `upsert_engram`. The compare and the write are one atomic
+    /// unit (the engine wraps the call in a transaction). This is the guard that
+    /// makes a stale virtual edit a conflict rather than a silent clobber.
+    async fn upsert_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: Option<&str>,
+    ) -> Result<EngramId>;
+
+    /// Rewrite the base row at `record.path` only if it still exists and still
+    /// carries `expected_sha`, with the same guarded compare as
+    /// [`Store::upsert_engram_checked`]: `Ok(Some(id))` when it was rewritten,
+    /// `Ok(None)` when no row stands at the path any more (deleted or renamed
+    /// since it was read), [`crate::IndexError::StaleEdit`] when one stands
+    /// there with other content. Never inserts, which is what the reparse
+    /// after a parser change needs: it rewrites what it read, and a row that
+    /// vanished meanwhile must stay gone. On Postgres the never-insert
+    /// guarantee holds only inside a transaction: the compare's row lock is
+    /// what keeps a concurrent delete out until the rewrite, and without a
+    /// transaction it is released when the compare statement ends, so a row
+    /// deleted between the compare and the rewrite would be inserted again.
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>>;
+
+    /// Delete every engram (and its child and chunk rows) in a single domain,
+    /// keeping the domain row itself. The scoped clear behind `domain remove`
+    /// and the orphaned-row sweep. Contrast [`Store::wipe`], which clears
+    /// everything.
+    ///
+    /// The domain's spellings go too, all but its own name: the row stays and
+    /// still answers to that, while a canonical name or former name left behind
+    /// would keep resolving references to a domain nobody registers and would
+    /// hold the spelling against the next domain that claims it.
+    ///
+    /// It also clears the domain's contradiction pairs and line rows, and
+    /// unbinds (`to_id = NULL`) every link and relation row in another domain
+    /// that named one of its engrams, so those references read as pending.
+    ///
+    /// A reindex does not use this, and deliberately: `--full` re-reads and
+    /// re-upserts instead, so rows a reader is using are never absent between
+    /// a clear and the rebuild that would have refilled them, and an unchanged
+    /// chunk keeps its embedding.
+    async fn clear_domain(&self, domain: DomainId) -> Result<()>;
+
+    /// Delete the engram at a domain-relative path and all its child rows.
+    ///
+    /// Every link and relation row that named the deleted engram, in any
+    /// domain and for any actor, is unbound (`to_id = NULL`) in the same
+    /// statements, so it reads as pending until a write at that address binds
+    /// it again. Opens no transaction of its own: the sync driver calls this
+    /// inside one, and the engine's delete wraps its call in one.
+    async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()>;
+
+    /// Move an engram from one path to another without reparsing. The permalink
+    /// follows only when it was path-derived.
+    async fn rename_engram(&self, domain: DomainId, from: &str, to: &str) -> Result<()>;
+
+    /// Give the base row at `from` a new path and a new permalink in one
+    /// statement, without reparsing, keeping its id.
+    ///
+    /// The move's own rename, beside the sync's [`Store::rename_engram`]: a
+    /// move decides the permalink itself - the path's, the one the engram
+    /// kept, or one the caller named - and writes it into the frontmatter, so
+    /// the row takes exactly that value rather than the path-derived guess.
+    /// The id is what every chunk, embedding and bound reference keys to, so
+    /// keeping it is what makes a rename cheaper than a delete and a create.
+    /// `from` and `to` may be the same path, which is the permalink-only
+    /// rename. The caller has already made sure no other row in the domain
+    /// holds `permalink`; the unique index refuses it otherwise.
+    async fn readdress_engram(
+        &self,
+        domain: DomainId,
+        from: &str,
+        to: &str,
+        permalink: &str,
+    ) -> Result<()>;
+
+    /// Resolve every pending forward reference in a domain in one batch,
+    /// matching the target text against permalink then title within the target
+    /// domain. Returns the number of relations newly resolved.
+    async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64>;
+
+    /// Resolve every pending prose wikilink in a domain in one batch, the same
+    /// permalink-then-title match as [`Store::resolve_pending_relations`] but
+    /// over the `link` table. Wikilinks carry no relation type, so a resolved
+    /// link becomes a `links_to` edge in graph traversal. Returns the number of
+    /// links newly resolved.
+    async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64>;
+
+    /// Replace a domain's derived tag-alias rows with the given folded
+    /// `(alias, canonical)` pairs. Deletes every existing row for the domain,
+    /// then inserts each pair, ignoring a duplicate alias. Called by
+    /// [`crate::sync::refresh_tag_aliases`] on every sync, so an empty slice
+    /// clears the domain's aliases. Both sides are already lowercased by the
+    /// caller; the store never parses markdown. Rows that already say exactly
+    /// this are left alone and nothing is written; answers whether it wrote.
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<bool>;
+
+    /// Re-resolve one actor's own references in their own view, and answer how
+    /// many bound.
+    ///
+    /// Two statements per reference table, inside whatever transaction the
+    /// caller has open. First what dangles is unbound: a `to_id` naming a row
+    /// nobody holds any more is the trace of a draft that went away, and
+    /// leaving it would be an edge into nothing. Then what is pending is bound,
+    /// against `ReferenceCandidates::View` - their own drafts first, then the
+    /// base - so the author's links follow their own rows as those rows are
+    /// written, dropped and folded.
+    ///
+    /// Scoped to that actor's rows on purpose: the base resolvers
+    /// ([`Store::resolve_pending_relations`] and its twin) stay exactly as they
+    /// are and keep answering for the domain, because a base row's edges are a
+    /// fact about the domain rather than about a reader.
+    ///
+    /// **A binding is made once and not revisited, and two cases follow from
+    /// that.** A reference bound before its author tombstoned the target stays
+    /// bound, since a tombstone deletes nothing - and that one the reader's own
+    /// screen settles at every surface that reads an edge, because the deleted
+    /// path is where the binding points. The other it does not: a reference
+    /// bound to a base row, whose author LATER writes a page of their own
+    /// answering to the same name at a different path, goes on naming the base
+    /// row. Neither statement here moves it (it does not dangle, and it is not
+    /// pending) and no screen can, because the two pages sit at two addresses.
+    /// A third statement that unbound every bound reference to see whether a
+    /// newer row of the author's would beat it is what that would take, and it
+    /// would rewrite an author's settled links on every write they make. The
+    /// binding is the reading that held when the reference was written, which
+    /// is the honest answer rather than the better one.
+    ///
+    /// An empty `actor` is a [`crate::IndexError::Constraint`], like
+    /// [`Store::upsert_overlay`]: the empty string is the base row's own key.
+    async fn reresolve_actor_references(&self, domain: DomainId, actor: &str) -> Result<u64>;
+
+    /// Replace an engram's chunk rows with a freshly computed set, carrying over
+    /// the embedding of any chunk whose fingerprint is unchanged so an edit only
+    /// re-embeds the paragraphs that actually changed. Called by the sync engine
+    /// after each upsert.
+    async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()>;
+
+    /// Store a batch of embeddings against their chunks in `table` for the
+    /// given model.
+    async fn store_embeddings_in(
+        &self,
+        table: ChunkTable,
+        batch: &[EmbeddingRow],
+        model: &str,
+    ) -> Result<()>;
+
+    /// Clear the vectors in `table` of every model other than `model`,
+    /// returning how many chunks were cleared.
+    ///
+    /// The embedding lives in columns on the chunk table (`embedding`, `dims`,
+    /// `model`), so this nulls those three and never removes a chunk row: the
+    /// text stays, and every cleared chunk is back in
+    /// [`Store::chunks_needing_embedding_in`] for the active model. Called once
+    /// per table by an embed pass that finds the active model covering every
+    /// chunk of that table, to reclaim the space an install's previous model
+    /// left behind. A user who switches back simply re-embeds; nothing is kept
+    /// for a return trip.
+    async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize>;
+
+    /// [`Store::store_embeddings_in`] on the engram chunks.
+    async fn store_embeddings(&self, batch: &[EmbeddingRow], model: &str) -> Result<()> {
+        self.store_embeddings_in(ChunkTable::Engram, batch, model)
+            .await
+    }
+
+    /// [`Store::prune_embeddings_except_in`] on the engram chunks.
+    async fn prune_embeddings_except(&self, model: &str) -> Result<usize> {
+        self.prune_embeddings_except_in(ChunkTable::Engram, model)
+            .await
+    }
+
+    /// Record one scoring of `pair` by `model`: the pair row with `cosine` and
+    /// `scored_at`, and its line rows, replacing whatever an earlier scoring
+    /// left, in one transaction. `rows` may be empty: a pair with nothing above
+    /// the store floor is scored with nothing to say and is not asked again
+    /// until an edit moves a checksum. Refuses inside an open `begin`.
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()>;
+
+    /// Delete what `model` stored for the pair `a`, `b` (lower id first): its
+    /// pair row and its line rows, in one transaction, through the primary
+    /// keys. The contradiction walk's delete for a pair one of whose engrams is
+    /// past its `valid_to`: with the pair row gone, a window opened again later
+    /// makes the pair pending, not scored with nothing to say. Refuses inside
+    /// an open `begin`.
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()>;
+
     /// Store line vectors for `model`. A (model, hash) already stored keeps
     /// its vector: the same text under the same model is the same vector. One
     /// transaction per call; refuses inside an open `begin`.
@@ -3717,10 +3920,6 @@ pub trait Store: Send + Sync {
         model: &str,
         rows: &[ObservationVector],
     ) -> Result<()>;
-
-    /// Every hash with a line vector for `model`, unordered. The pruning read:
-    /// narrow, one short column per row.
-    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>>;
 
     /// Delete the line vectors of `hashes` under `model` in one transaction,
     /// on the full key like [`Store::observation_vectors_present`]; returns
@@ -3838,12 +4037,6 @@ pub trait Store: Send + Sync {
     /// not finish one.
     async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
 
-    /// The parser generation ([`crystalline_core::PARSE_GENERATION`]) the
-    /// domain's rows were last derived with: 0 for a domain an upgrade found,
-    /// the current generation for a row created since. A sync that reads an
-    /// older value than the current one reparses the domain whole once.
-    async fn parse_generation(&self, domain: DomainId) -> Result<u32>;
-
     /// Record the parser generation a domain's rows were derived with. Called
     /// inside the transaction that commits a whole-domain reparse, so the
     /// stamp moves exactly when that reparse is complete and a run that died
@@ -3897,27 +4090,6 @@ pub trait Store: Send + Sync {
         record: &EngramRecord,
     ) -> Result<EngramId>;
 
-    /// One actor's draft at a domain-relative path, or `None` when that actor
-    /// holds none there. A tombstone is a draft like any other and is returned,
-    /// carrying its flag; a caller deciding what a reader sees reads the flag
-    /// rather than the absence.
-    async fn overlay_entry(
-        &self,
-        domain: DomainId,
-        actor: &str,
-        path: &str,
-    ) -> Result<Option<StoredEngram>>;
-
-    /// Every draft one actor holds in a domain, ordered by path. Tombstones
-    /// included, for the same reason.
-    async fn overlay_entries(&self, domain: DomainId, actor: &str) -> Result<Vec<StoredEngram>>;
-
-    /// [`Store::overlay_entries`] without the bodies: every draft path one
-    /// actor holds in a domain with its tombstone flag, ordered by path. For a
-    /// caller that only asks where drafts stand, such as the close-folder hint
-    /// on a write receipt, so it never loads a draft's text to learn its path.
-    async fn overlay_paths(&self, domain: DomainId, actor: &str) -> Result<Vec<(String, bool)>>;
-
     /// Drop one actor's draft at a path. Returns whether a row was there to
     /// drop, so a caller can tell "cleared" from "there was nothing to clear"
     /// without asking twice.
@@ -3925,40 +4097,6 @@ pub trait Store: Send + Sync {
     /// Opens no transaction of its own: its caller (`clear_row`) holds one, so
     /// the child rows and the unbinding go with the row or not at all.
     async fn clear_overlay_entry(&self, domain: DomainId, actor: &str, path: &str) -> Result<bool>;
-
-    /// How many drafts each actor holds in a domain, ordered by actor. Base
-    /// rows are not counted and an actor holding none is not listed, so an
-    /// empty answer means nobody is drafting here.
-    async fn overlay_counts(&self, domain: DomainId) -> Result<Vec<(String, u64)>>;
-
-    /// Diagnostics about the open store.
-    async fn store_info(&self) -> Result<StoreInfo>;
-
-    /// Per-domain counts, in registration order.
-    async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
-
-    /// Every domain name the index holds, sorted.
-    ///
-    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
-    /// know *which* domains have rows rather than how many rows each has. One
-    /// column of a table with a row per domain, against six correlated counting
-    /// scans per domain - which matters because the serving screen asks this on
-    /// every read, and a domain name is all it wants.
-    async fn domain_names(&self) -> Result<Vec<String>>;
-
-    /// The vocabulary in use: tag, observation-category, relation-type, engram
-    /// `type` and engram `status` usage counts, for one domain or (when
-    /// `domain` is `None`) across every domain.
-    /// An unknown domain name yields empty vectors rather than an error, so a
-    /// caller can probe a domain that holds no engrams yet. The vectors are
-    /// sorted by usage in Rust for cross-backend determinism.
-    ///
-    /// `actor` is who is asking. `None` - every caller that shows a person the
-    /// vocabulary - answers the team's own list, because a tag one author is
-    /// trying out in a draft is not yet the domain's agreement. `Some(a)` reads
-    /// that actor's view, and the one caller that passes it is the sweep's tag
-    /// drift rule, whose finding is about what that author wrote.
-    async fn vocabulary(&self, domain: Option<&str>, actor: Option<&str>) -> Result<Vocabulary>;
 
     // --- attachments ---------------------------------------------------------
     // Binary assets under a domain's `assets/` folder. The metadata row is the
@@ -3982,18 +4120,6 @@ pub trait Store: Send + Sync {
     /// no-op.
     async fn delete_asset(&self, table: AssetTable, domain: DomainId, path: &str) -> Result<bool>;
 
-    /// One file's metadata in `table` by path, or `None`.
-    async fn get_asset(
-        &self,
-        table: AssetTable,
-        domain: DomainId,
-        path: &str,
-    ) -> Result<Option<AttachmentRow>>;
-
-    /// Every file of a domain in `table`, ordered by path in byte order (both
-    /// backends pin the collation, so the listing is identical across them).
-    async fn list_assets(&self, table: AssetTable, domain: DomainId) -> Result<Vec<AttachmentRow>>;
-
     /// [`Store::upsert_asset`] on the engram attachments.
     async fn upsert_attachment(&self, domain: DomainId, row: &AttachmentRow) -> Result<()> {
         self.upsert_asset(AssetTable::Engram, domain, row).await
@@ -4004,27 +4130,12 @@ pub trait Store: Send + Sync {
         self.delete_asset(AssetTable::Engram, domain, path).await
     }
 
-    /// [`Store::get_asset`] on the engram attachments.
-    async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>> {
-        self.get_asset(AssetTable::Engram, domain, path).await
-    }
-
-    /// [`Store::list_assets`] on the engram attachments.
-    async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>> {
-        self.list_assets(AssetTable::Engram, domain).await
-    }
-
     /// Store an attachment's bytes in the index. The metadata row must already
     /// exist, otherwise this is a [`crate::IndexError::Constraint`]: the row is
     /// what names the mime type and the size, so a blob without one would be an
     /// orphan nothing can serve. Only a virtual domain uses this.
     async fn write_attachment_blob(&self, domain: DomainId, path: &str, bytes: &[u8])
     -> Result<()>;
-
-    /// An attachment's stored bytes, or `None` when the path has no row or the
-    /// row has no blob (the normal case for a file domain, whose bytes are on
-    /// disk).
-    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>>;
 
     // --- reflections ---------------------------------------------------------
 
@@ -4034,17 +4145,6 @@ pub trait Store: Send + Sync {
     /// Remove one reflection's row and its chunks. `false` when there was no
     /// row.
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool>;
-
-    /// One reflection's row, or `None`.
-    async fn get_reflection(&self, domain: DomainId, path: &str) -> Result<Option<ReflectionRow>>;
-
-    /// Every reflection row of a domain, ordered by path in byte order.
-    async fn list_reflections(&self, domain: DomainId) -> Result<Vec<ReflectionRow>>;
-
-    /// Every reflection row of a domain without its text, ordered by path in
-    /// byte order: what the sync's stat prefilter and the move screens read,
-    /// which have no use for the page itself.
-    async fn list_reflection_stamps(&self, domain: DomainId) -> Result<Vec<ReflectionStamp>>;
 
     /// Replace one page's chunk rows with a freshly computed set, carrying over
     /// the vector of any chunk whose fingerprint is unchanged, so an edit
@@ -4056,33 +4156,6 @@ pub trait Store: Send + Sync {
         path: &str,
         chunks: &[NewReflectionChunk],
     ) -> Result<()>;
-
-    /// Embedding coverage of one domain's reflection chunks: total chunks,
-    /// embedded chunks and a per-model breakdown, read fresh (never cached).
-    /// A reflection search reads it for its mode decision and its staleness
-    /// gate, so a domain whose pages are not embedded yet answers as text
-    /// while another domain's are. [`Store::embedding_coverage_of`] stays the
-    /// table-wide count that status and the backlog read. This is
-    /// [`Store::embedding_coverage_in`] on the reflection chunks of `domain`.
-    async fn reflection_coverage(&self, domain: DomainId) -> Result<EmbeddingCoverage> {
-        self.embedding_coverage_in(ChunkTable::Reflection, Some(&[domain]))
-            .await
-    }
-
-    /// The vector half of a reflection search (R60): the closest chunk of
-    /// each section of one domain's pages embedded by `model` at
-    /// `query.len()` dims, at most [`crate::rank::SEMANTIC_TOPK`] sections,
-    /// best first, ties on path then section order. Answers
-    /// [`crate::IndexError::StaleEmbeddings`] when the stored reflection vectors
-    /// cannot be compared with the query (`crate::rank::check_staleness`
-    /// over [`Store::reflection_coverage`] of `domain`), so a caller falls
-    /// back to text.
-    async fn reflection_vector_hits(
-        &self,
-        domain: DomainId,
-        query: &[f32],
-        model: &str,
-    ) -> Result<Vec<SectionVector>>;
 
     // --- host locks ----------------------------------------------------------
     // The single-writer-per-file-domain rule for shared-database collaboration.
@@ -4121,14 +4194,6 @@ pub trait Store: Send + Sync {
         now: &str,
     ) -> Result<bool>;
 
-    /// The labels `instance_id` is recorded under already (on a lock it
-    /// holds, or on a domain it last hosted), each once.
-    async fn own_labels(&self, instance_id: &str) -> Result<Vec<String>>;
-
-    /// The instance ids holding a lock under `label` whose heartbeat is not
-    /// older than `stale_before`.
-    async fn live_label_holders(&self, label: &str, stale_before: &str) -> Result<Vec<String>>;
-
     /// Release a lock this instance holds (graceful shutdown, or the end of a
     /// one-shot command's walk): a compare-and-delete on `token`, the one
     /// its claim returned ([`HostClaim::Acquired`]). A no-op when the row
@@ -4155,16 +4220,6 @@ pub trait Store: Send + Sync {
         token: &str,
         previous: &str,
     ) -> Result<bool>;
-
-    /// The current holder of a file domain's host lock, or `None` when unheld.
-    async fn domain_host(&self, domain: DomainId) -> Result<Option<DomainHost>>;
-
-    /// [`Store::domain_host`] read for a walk about to apply: inside the
-    /// caller's write transaction the lock row stays as read until it ends
-    /// (`FOR SHARE` on Postgres), so a claim of the domain waits for the
-    /// apply to commit instead of landing in the middle of it. A Turso
-    /// database belongs to one instance, so the plain read is the same.
-    async fn domain_host_held(&self, domain: DomainId) -> Result<Option<DomainHost>>;
 
     /// Take the lease of `loop_kind` (`reflect` or `evolve`) on `domain`: one
     /// atomic claim that lands when the lease is unheld or its last renewal
@@ -4224,11 +4279,6 @@ pub trait Store: Send + Sync {
         paths: &[String],
     ) -> Result<u64>;
 
-    /// The disclosures recorded on `domain`'s Reflection, one entry per
-    /// page: its path inside `reflections/` and its records as the JSON text
-    /// [`Store::set_reflection_disclosures`] stored. Sorted by path.
-    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
-
     /// Replace the disclosures recorded on one page of `domain`'s
     /// Reflection with `records` (JSON text the engine reads), or drop them
     /// when `records` is `None`.
@@ -4239,13 +4289,6 @@ pub trait Store: Send + Sync {
         records: Option<&str>,
     ) -> Result<()>;
 
-    /// The lease of `loop_kind` on `domain` as stored, a stale one included.
-    async fn automation_lease(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-    ) -> Result<Option<AutomationLease>>;
-
     /// Record one run of `loop_kind` on `domain`, then keep only the newest
     /// `keep` runs of that domain and loop.
     async fn record_automation_run(
@@ -4255,14 +4298,6 @@ pub trait Store: Send + Sync {
         run: &AutomationRun,
         keep: usize,
     ) -> Result<()>;
-
-    /// The newest `limit` runs of `loop_kind` on `domain`, newest first.
-    async fn automation_runs(
-        &self,
-        domain: DomainId,
-        loop_kind: &str,
-        limit: usize,
-    ) -> Result<Vec<AutomationRun>>;
 
     /// Write the domain's host move only when its stored text still is
     /// `expected`, the text the caller read ([`Store::host_move_text`]):
@@ -4276,24 +4311,10 @@ pub trait Store: Send + Sync {
         next: Option<&HostMove>,
     ) -> Result<bool>;
 
-    /// The domain's host move as stored, JSON text, or `None`.
-    async fn host_move_text(&self, domain: DomainId) -> Result<Option<String>>;
-
     /// Clear the domain's rebuild marker only when it still is the one
     /// stamped at `started` ([`Store::begin_rebuild`]): a marker another
     /// run stamped since stays.
     async fn end_rebuild_stamped(&self, domain: DomainId, started: &str) -> Result<()>;
-
-    /// The instance that last acquired a file domain's host lock, as
-    /// `(instance id, label)`, or `None` when none was recorded. Kept on the
-    /// domain row, so it outlives a release, which deletes the lock row.
-    async fn last_domain_host(&self, domain: DomainId) -> Result<Option<(String, String)>>;
-
-    /// Whether another instance than `instance_id` is recorded under
-    /// `label`, as a lock's holder or as a domain's last host: two instances
-    /// on one machine name, or behind one address, would show the same name,
-    /// so the later one adds a short id ([`crate::instance_label`]).
-    async fn label_taken(&self, label: &str, instance_id: &str) -> Result<bool>;
 
     /// Record the instance that just acquired a file domain's host lock.
     async fn set_last_domain_host(
@@ -4302,14 +4323,6 @@ pub trait Store: Send + Sync {
         instance_id: &str,
         label: &str,
     ) -> Result<()>;
-
-    /// The domain's unresolved host move, or `None`.
-    async fn host_move(&self, domain: DomainId) -> Result<Option<HostMove>> {
-        Ok(self
-            .host_move_text(domain)
-            .await?
-            .and_then(|text| parse_host_move(&text)))
-    }
 
     /// Set or (with `None`) clear the domain's host move. Inside an open
     /// write transaction it commits or rolls back with it.
@@ -4322,8 +4335,10 @@ pub trait Store: Send + Sync {
 
     /// Begin a write transaction.
     async fn begin(&self) -> Result<()>;
+
     /// Commit the current write transaction.
     async fn commit(&self) -> Result<()>;
+
     /// Roll back the current write transaction.
     async fn rollback(&self) -> Result<()>;
 }
@@ -4497,6 +4512,18 @@ mod meta_value_tests {
 #[cfg(test)]
 mod tests {
     use super::{ChunkModelCount, ChunkTable, CoverageGroup, EmbeddingCoverage};
+
+    /// Whatever holds the writer can hand it to code that only reads: the
+    /// split costs no call site a second store.
+    #[test]
+    fn a_writer_coerces_to_a_reader() {
+        fn reads(_: &dyn super::ReadStore) {}
+        fn writer(store: &dyn super::Store) {
+            reads(store);
+        }
+        let _ = writer;
+        let _: fn(std::sync::Arc<dyn super::Store>) -> std::sync::Arc<dyn super::ReadStore> = |s| s;
+    }
 
     fn group(model: &str, dims: usize, chunks: usize, embedded: usize) -> CoverageGroup {
         CoverageGroup {

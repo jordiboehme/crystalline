@@ -576,7 +576,7 @@ fn the_merge_refuses_while_a_daemon_from_the_private_folder_runs() {
 /// parser refuses, as an older build might have stored it.
 fn break_engram(index: &Path, domain: &str, permalink: &str) {
     use crystalline_core::parse_engram;
-    use crystalline_index::{DomainKind, EngramRecord, Store, TursoStore};
+    use crystalline_index::{DomainKind, EngramRecord, ReadStore, Store, TursoStore};
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

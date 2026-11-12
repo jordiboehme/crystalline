@@ -2129,14 +2129,14 @@ mod tests {
         let store = crate::TursoStore::open(&path).await.unwrap();
         let domain = crate::DomainId(1);
         assert_eq!(
-            crate::Store::engram_content(&store, domain, "a.md")
+            crate::ReadStore::engram_content(&store, domain, "a.md")
                 .await
                 .unwrap()
                 .as_deref(),
             Some(body_of(3).as_str()),
             "the base row's body reads back through the join"
         );
-        let all = crate::Store::all_engram_contents(&store, domain)
+        let all = crate::ReadStore::all_engram_contents(&store, domain)
             .await
             .unwrap();
         assert_eq!(
@@ -2144,12 +2144,12 @@ mod tests {
             vec![body_of(3).len(), body_of(200_000).len()],
             "every base body in the domain, path-ordered, unchanged"
         );
-        let mine = crate::Store::overlay_entry(&store, domain, "alice", "a.md")
+        let mine = crate::ReadStore::overlay_entry(&store, domain, "alice", "a.md")
             .await
             .unwrap()
             .expect("alice's draft survived the move");
         assert_eq!(mine.content, body_of(64), "and so did her body");
-        let hits = crate::Store::search(
+        let hits = crate::ReadStore::search(
             &store,
             &crate::SearchQuery {
                 text: Some("needle".to_string()),
@@ -2251,7 +2251,7 @@ mod tests {
 
         let store = crate::TursoStore::open(&path).await.unwrap();
         assert_eq!(
-            crate::Store::domain_spellings(&store).await.unwrap(),
+            crate::ReadStore::domain_spellings(&store).await.unwrap(),
             vec![
                 ("eng".to_string(), crate::DomainId(3)),
                 ("ops".to_string(), crate::DomainId(5)),
@@ -2512,7 +2512,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
     async fn v19_backfill_cost_at_50k() {
-        use crate::store::Store;
+        use crate::store::ReadStore;
         const ENGRAMS: i64 = 50_000;
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
@@ -2591,7 +2591,7 @@ mod tests {
     /// aside.
     #[tokio::test]
     async fn v19_fills_engram_meta_value_from_the_stored_metadata() {
-        use crate::store::Store;
+        use crate::store::ReadStore;
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
         let base = serde_json::json!({

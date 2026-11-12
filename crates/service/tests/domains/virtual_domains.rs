@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_index::ReadStore;
 use crystalline_index::{Store, TursoStore};
 use crystalline_service::Scope;
 use crystalline_service::engine::{Engine, EngineError};
