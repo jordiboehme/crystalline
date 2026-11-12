@@ -98,7 +98,7 @@ In a registered domain folder:
 - Engram files, through writes, edits, moves, splits and deletes by an agent or in the web UI. A delete removes the file. There is no recycle bin.
 - `MANIFEST.md`, when a folder is registered that has none.
 - Attachments under `assets/`.
-- Generated `index.md` files, one in every folder that holds knowledge. This happens on its own, after every write and after every sync that picked up outside changes. The pass overwrites any `index.md` whose content differs, a hand-written one included, and removes `index.md` from folders that hold no knowledge. Turn it off with `crystalline config set index.files false`. A read-only daemon skips it.
+- Generated `index.md` files, one in every folder that holds knowledge. This happens on its own, after every write and after every sync that picked up outside changes. The pass overwrites any `index.md` whose content differs in a folder that holds knowledge, a hand-written one included. In a folder that holds no knowledge it removes only a listing it generated itself; an `index.md` you wrote there stays. Turn it off with `crystalline config set index.files false`. A read-only daemon skips it.
 
 A team domain on GitHub also receives the merged content of every pull from its repository.
 

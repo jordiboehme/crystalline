@@ -8,7 +8,10 @@
 //!
 //! The pass is a full-domain regeneration: walk the domain, render every
 //! folder's index file, write only the ones whose content actually changed and
-//! remove an `index.md` from a folder that no longer holds knowledge. That is
+//! remove a generated `index.md` from a folder that no longer holds knowledge.
+//! An `index.md` that does not read as generated
+//! ([`crystalline_core::is_generated_index`]) in such a folder is somebody's
+//! own page and stays. That is
 //! cheaper to reason about than per-folder dirty tracking (one move already
 //! touches three folders plus their ancestors) and idempotent, so a
 //! regeneration that changes nothing leaves every mtime alone and never wakes
@@ -31,7 +34,9 @@ use walkdir::WalkDir;
 pub(crate) struct IndexRefresh {
     /// Index files written because their content changed (or did not exist).
     pub written: usize,
-    /// Index files removed because their folder no longer holds knowledge.
+    /// Generated index files removed because their folder no longer holds
+    /// knowledge. An `index.md` that does not read as generated is never
+    /// removed.
     pub removed: usize,
     /// Index files left untouched because their content was already correct.
     pub unchanged: usize,
@@ -84,6 +89,13 @@ pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
             continue;
         }
         let path = index_path(root, folder);
+        // Only a listing this pass would have written goes. An `index.md` a
+        // person wrote in a folder that holds no knowledge is their page.
+        let generated = std::fs::read_to_string(&path)
+            .is_ok_and(|text| crystalline_core::is_generated_index(&text));
+        if !generated {
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => refresh.removed += 1,
             Err(e) => tracing::warn!("could not remove {}: {e}", path.display()),
@@ -467,6 +479,62 @@ mod tests {
             read(root, "index.md"),
             "---\nokf_version: \"0.2\"\n---\n\n# Contents\n\n* [notes/](notes/)\n"
         );
+    }
+
+    /// A folder that holds no knowledge loses the listing Crystalline wrote,
+    /// and keeps an `index.md` a person wrote.
+    #[test]
+    fn a_hand_written_index_in_a_folder_without_knowledge_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", None));
+        write(root, "gone/b.md", &engram("B", None));
+        refresh(root, ReflectionMode::Off);
+        assert!(root.join("gone/index.md").is_file());
+        std::fs::remove_file(root.join("gone/b.md")).unwrap();
+        let own = "# Our pages\n\nRead these first.\n";
+        write(root, "own/index.md", own);
+
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!(report.removed, 1);
+        assert!(!root.join("gone/index.md").exists());
+        assert_eq!(read(root, "own/index.md"), own);
+        assert_eq!(refresh(root, ReflectionMode::Off).removed, 0);
+    }
+
+    /// A domain with no knowledge at all keeps an `index.md` a person wrote at
+    /// its root.
+    #[test]
+    fn a_hand_written_root_index_in_an_empty_domain_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let own = "# Welcome\n\nNothing here yet.\n";
+        write(root, "index.md", own);
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!((report.written, report.removed), (0, 0));
+        assert_eq!(read(root, "index.md"), own);
+    }
+
+    /// A title written over several lines is listed on one, so the listing
+    /// still reads as generated and goes once its folder is empty.
+    #[test]
+    fn a_listing_with_a_multi_line_title_is_still_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", None));
+        write(
+            root,
+            "sub/b.md",
+            "---\ntype: engram\ntitle: |\n  First line\n  second line\nstatus: current\n---\n\nBody\n",
+        );
+        refresh(root, ReflectionMode::Off);
+        assert_eq!(
+            read(root, "sub/index.md"),
+            "# Contents\n\n* [First line second line](b.md)\n"
+        );
+        std::fs::remove_file(root.join("sub/b.md")).unwrap();
+        assert_eq!(refresh(root, ReflectionMode::Off).removed, 1);
+        assert!(!root.join("sub/index.md").exists());
     }
 
     #[test]
