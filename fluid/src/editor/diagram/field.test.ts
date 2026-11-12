@@ -58,6 +58,7 @@ const {
   carryFences,
   drawUnderCaret,
   POINTER_GRACE_MS,
+  VERDICT_PACE_MS,
 } = await import("./field");
 
 const OK: Verdict = { ok: true, kind: "flowchart", domIds: new Map() };
@@ -86,6 +87,11 @@ function mount(doc: string, dark = false, caret?: number): EditorView {
 
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+/** Past the verdict pace: a body that waited for it has been asked for. */
+const paced = async () => {
+  await new Promise((resolve) => setTimeout(resolve, VERDICT_PACE_MS + 10));
 };
 
 /** Settle `body`: cache it when final, resolve the waiting request. */
@@ -353,6 +359,8 @@ describe("a fence under the caret (R52)", () => {
     }
     expect(states.every((n) => n === 0)).toBe(true);
     expect(v.contentDOM.textContent).toContain("graph LR");
+    // The keys came faster than the pace: the last body is asked for at its end.
+    await paced();
     // The caret leaves: now it draws.
     v.dispatch({ selection: EditorSelection.cursor(v.state.doc.length) });
     expect(v.state.facet(drawnDiagrams)).toEqual([0]);
@@ -520,6 +528,89 @@ describe("a pointer selection (R58)", () => {
   });
 });
 
+describe("the verdict pace (F5)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Types `text` one key at a time at `at`, `gap` ms apart. */
+  function type(v: EditorView, at: number, text: string, gap: number) {
+    for (const [i, char] of [...text].entries()) {
+      v.dispatch({ changes: { from: at + i, insert: char } });
+      vi.advanceTimersByTime(gap);
+    }
+  }
+
+  const bodies = () => kit.requested.map((r) => r.body);
+
+  /** `settle` with an ok verdict, on the faked clock. */
+  async function settleNow(body: string) {
+    kit.settled.set(body, OK);
+    kit.waiting.get(body)?.(OK);
+    kit.waiting.delete(body);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  it("asks for the first body of a burst at once and for its last at the end, none between", () => {
+    const v = mount(fence(SKELETON));
+    const at = v.state.doc.toString().indexOf("B") + 1;
+    type(v, at, "CDEF", 50);
+    expect(bodies()).toEqual([SKELETON, "flowchart TD\n  A --> BC"]);
+    vi.advanceTimersByTime(VERDICT_PACE_MS);
+    expect(bodies()).toEqual([
+      SKELETON,
+      "flowchart TD\n  A --> BC",
+      "flowchart TD\n  A --> BCDEF",
+    ]);
+    // Nothing more is owed.
+    vi.advanceTimersByTime(VERDICT_PACE_MS * 5);
+    expect(kit.requested).toHaveLength(3);
+  });
+
+  it("asks at once again after a quiet spell", () => {
+    const v = mount(fence(SKELETON));
+    const at = v.state.doc.toString().indexOf("B") + 1;
+    v.dispatch({ changes: { from: at, insert: "C" } });
+    vi.advanceTimersByTime(VERDICT_PACE_MS);
+    v.dispatch({ changes: { from: at + 1, insert: "D" } });
+    expect(bodies().at(-1)).toBe("flowchart TD\n  A --> BCD");
+  });
+
+  it("never lets a late verdict of an older body draw over the newer one", async () => {
+    const v = mount(fence(SKELETON));
+    await settleNow(SKELETON);
+    const at = v.state.doc.toString().indexOf("B") + 1;
+    vi.advanceTimersByTime(VERDICT_PACE_MS);
+    type(v, at, "CD", 50);
+    vi.advanceTimersByTime(VERDICT_PACE_MS);
+    const older = "flowchart TD\n  A --> BC";
+    const newer = "flowchart TD\n  A --> BCD";
+    expect(bodies().slice(-2)).toEqual([older, newer]);
+    await settleNow(newer);
+    expect(v.state.field(diagramField).fences.map((f) => f.body)).toEqual([
+      newer,
+    ]);
+    await settleNow(older);
+    expect(v.state.field(diagramField).fences.map((f) => f.body)).toEqual([
+      newer,
+    ]);
+  });
+
+  it("asks nothing once the view is gone", () => {
+    const v = mount(fence(SKELETON));
+    const at = v.state.doc.toString().indexOf("B") + 1;
+    type(v, at, "CD", 50);
+    const asked = kit.requested.length;
+    v.destroy();
+    view = null;
+    vi.advanceTimersByTime(VERDICT_PACE_MS * 2);
+    expect(kit.requested).toHaveLength(asked);
+  });
+});
+
 describe("a verdict the cache evicted", () => {
   it("is asked for again when an edit brings its body back", async () => {
     const v = mount(fence(SKELETON));
@@ -537,7 +628,8 @@ describe("a verdict the cache evicted", () => {
     kit.settled.delete("flowchart TD\n  A --> C");
     const asks = () => kit.requested.filter((r) => r.body === SKELETON).length;
     expect(asks()).toBe(1);
-    // Undo to the old body.
+    // Undo to the old body, past the pace of the edit before it.
+    await paced();
     v.dispatch({ changes: { from: at, to: at + 1, insert: "B" } });
     expect(asks()).toBe(2);
   });

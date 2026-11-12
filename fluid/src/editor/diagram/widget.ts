@@ -108,6 +108,10 @@ interface Box {
   /** Failed tries of the current body. */
   failures: number;
   retry: ReturnType<typeof setTimeout> | null;
+  /** The pace window a render opened (`RENDER_PACE_MS`). */
+  pace: ReturnType<typeof setTimeout> | null;
+  /** Whether a body came inside that window, so its end draws again. */
+  owed: boolean;
   noticeTimer: ReturnType<typeof setTimeout> | null;
   dead: boolean;
   /** CodeMirror's elements for this box: a second one while it hands over. */
@@ -560,6 +564,10 @@ function render(box: Box): void {
   const id = nextRenderId();
   void loadRenderer()
     .then(async ([{ default: mermaid }, { drawnLabels }]) => {
+      // Superseded before its turn: mermaid would draw a body nobody shows.
+      if (token !== box.token || box.dead) {
+        return null;
+      }
       const theme = initializeMermaid(mermaid, dark);
       const rendered = await mermaid.render(id, body);
       return {
@@ -568,7 +576,11 @@ function render(box: Box): void {
       };
     })
     .then(
-      ({ svg, sameTheme }) => {
+      (drawn) => {
+        if (drawn === null) {
+          return;
+        }
+        const { svg, sameTheme } = drawn;
         // Mermaid queues its renders and reads the configuration when a render's
         // turn comes, so one that waited across a theme change drew in the other
         // theme. It is no drawing of this key, for this box or for the cache.
@@ -635,15 +647,18 @@ function draw(box: Box): void {
     // Back to what is on screen: a render still running is out of date.
     box.token += 1;
     box.running = null;
+    box.owed = false;
     return;
   }
   if (box.running === key) {
+    box.owed = false;
     return;
   }
   const cached = drawings.get(key);
   if (cached !== undefined) {
     box.token += 1;
     box.running = null;
+    box.owed = false;
     keep(drawings, key, cached, DRAWINGS_KEPT);
     if (liveIds.has(cached.id)) {
       // The same body in another box on screen: this copy gets an id of its own.
@@ -655,7 +670,48 @@ function draw(box: Box): void {
     return;
   }
   box.failures = 0;
-  render(box);
+  pacedRender(box);
+}
+
+/**
+ * How long a render waits for the next body before it starts (F5). A box with
+ * nothing on screen yet, and the first new body after a quiet spell, render at
+ * once; the bodies of a burst (a peer typing, verdicts landing one after the
+ * other) render once, this long after the last of them, with the drawing on
+ * screen staying meanwhile. Mermaid queues renders, so without it every
+ * intermediate body would be drawn in turn. The same 200 ms as the verdict's
+ * pace (`VERDICT_PACE_MS`), and for the same reason.
+ */
+export const RENDER_PACE_MS = 200;
+
+/** `render`, paced by `RENDER_PACE_MS` once the box shows a drawing. */
+function pacedRender(box: Box): void {
+  if (box.shown === null) {
+    render(box);
+    return;
+  }
+  if (box.pace !== null) {
+    clearTimeout(box.pace);
+    box.owed = true;
+  } else {
+    render(box);
+  }
+  box.pace = setTimeout(() => {
+    box.pace = null;
+    if (box.owed && !box.dead) {
+      box.owed = false;
+      // What the box should show now, not what it was asked to show then.
+      draw(box);
+    }
+  }, RENDER_PACE_MS);
+}
+
+function cancelPace(box: Box): void {
+  if (box.pace !== null) {
+    clearTimeout(box.pace);
+    box.pace = null;
+  }
+  box.owed = false;
 }
 
 function makeBox(view: EditorView, widget: DiagramWidget): Box {
@@ -691,6 +747,8 @@ function makeBox(view: EditorView, widget: DiagramWidget): Box {
     token: 0,
     failures: 0,
     retry: null,
+    pace: null,
+    owed: false,
     noticeTimer: null,
     dead: false,
     claims: 1,
@@ -828,6 +886,7 @@ export class DiagramWidget extends WidgetType {
       byKey.delete(box.key);
     }
     cancelRetry(box);
+    cancelPace(box);
     if (box.noticeTimer !== null) {
       clearTimeout(box.noticeTimer);
     }

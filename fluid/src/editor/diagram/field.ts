@@ -346,8 +346,25 @@ export function fenceIsBehind(state: EditorState, from: number): boolean {
 }
 
 /**
+ * How long an edit waits for the next before the fences' new bodies are
+ * checked (F5). The first edit after a quiet spell is checked at once, so a
+ * single change (a rename, a menu action, one key) draws without delay; the
+ * edits of a burst - fast typing, a peer's keys - are checked once, this long
+ * after the last of them. 200 ms is longer than the gap between two keys of a
+ * typed word, so a word costs two checks rather than one per key, and short
+ * enough that the drawing still follows the text when the hand stops.
+ */
+export const VERDICT_PACE_MS = 200;
+
+/**
  * Asks for every missing verdict, reports the settled ones, and tells the
  * intent when a fence it had drawn is no longer drawn.
+ *
+ * Asks are paced (`VERDICT_PACE_MS`): every intermediate body of a burst would
+ * otherwise get a mermaid parse of its own. While a fence's new body waits,
+ * the drawing of its old body stays, as it does while any verdict is pending.
+ * A verdict is cached by body, so one that arrives late for a body the text
+ * has left draws nothing: only the current body's verdict is ever read.
  */
 export const verdictWatcher = ViewPlugin.fromClass(
   class {
@@ -361,6 +378,10 @@ export const verdictWatcher = ViewPlugin.fromClass(
     readonly asked = new Set<string>();
     gone = false;
     readonly view: EditorView;
+    /** The pace window an ask opened; an edit inside it waits for its end. */
+    pace: ReturnType<typeof setTimeout> | null = null;
+    /** Whether an edit came inside the window, so its end asks again. */
+    owed = false;
 
     constructor(view: EditorView) {
       this.view = view;
@@ -374,7 +395,7 @@ export const verdictWatcher = ViewPlugin.fromClass(
       }
       // A settled verdict (`verdictArrived`) is no reason to ask again.
       if (edited) {
-        this.ask();
+        this.paced();
       }
       const now = new Set(
         update.state.field(diagramField).fences.map((fence) => fence.from),
@@ -393,6 +414,24 @@ export const verdictWatcher = ViewPlugin.fromClass(
           }
         });
       }
+    }
+
+    /** Asks now when the last ask is a window behind, else at the window's end. */
+    paced(): void {
+      if (this.pace !== null) {
+        clearTimeout(this.pace);
+        this.owed = true;
+      } else {
+        this.ask();
+      }
+      this.pace = setTimeout(() => {
+        this.pace = null;
+        if (this.owed && !this.gone) {
+          this.owed = false;
+          // The state as it is now, not as it was when the edit came.
+          this.ask();
+        }
+      }, VERDICT_PACE_MS);
     }
 
     ask(): void {
@@ -421,6 +460,10 @@ export const verdictWatcher = ViewPlugin.fromClass(
 
     destroy(): void {
       this.gone = true;
+      if (this.pace !== null) {
+        clearTimeout(this.pace);
+        this.pace = null;
+      }
     }
   },
 );
