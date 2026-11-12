@@ -40,6 +40,7 @@ import { navigateTo } from "../base";
 import { MemoryRouter, useLocation } from "react-router";
 import { Tooltips } from "../components/primitives";
 import { AgentAccessCard } from "./Profile";
+import { grantEndedText } from "./grantEnded";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -955,6 +956,124 @@ describe("the connected clients card", () => {
     expect(screen.getByText("Never")).toBeInTheDocument();
   });
 
+  it("asks for the ended grants too", async () => {
+    serveAs("editor", {}, { oauth: true });
+    renderApp("/profile");
+
+    await screen.findByRole("heading", { name: "Connected clients" });
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.some(
+          ([path]) => path === "/me/oauth-grants?include_ended=true",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("says once why a client is gone, under the live ones", async () => {
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => [
+          {
+            id: 3,
+            client_id: "coc_live",
+            client_name: "Claude",
+            redirect_host: "claude.ai",
+            created_at: "2026-11-01T00:00:00Z",
+            last_used: null,
+            refresh_expires_at: "2026-12-01T00:00:00Z",
+            ended: null,
+          },
+          {
+            id: 2,
+            client_id: "coc_gone",
+            client_name: "Claude Code",
+            redirect_host: "localhost:33418",
+            created_at: "2026-11-01T00:00:00Z",
+            last_used: "2026-11-11T10:00:00Z",
+            refresh_expires_at: "2026-11-12T13:18:51Z",
+            ended: { at: "2026-11-12T13:18:51Z", reason: "replayed" },
+          },
+          {
+            id: 1,
+            client_id: "coc_old",
+            client_name: "a local agent",
+            redirect_host: "127.0.0.1:51902",
+            created_at: "2026-10-01T00:00:00Z",
+            last_used: null,
+            refresh_expires_at: "2026-11-10T08:00:00Z",
+            ended: { at: "2026-11-10T08:00:00Z", reason: "revoked" },
+          },
+        ],
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Recently ended" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Claude Code \(2026-11-12\): Signed out because an old sign-in token was used again\./,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/a local agent \(2026-11-10\): You revoked it\./),
+    ).toBeInTheDocument();
+    // An ended grant is no row of the table, so it offers no revoke.
+    expect(
+      screen.getByRole("button", { name: "Revoke Claude (#3)" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Revoke Claude Code/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Revoke a local agent/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("still says no client is connected when only ended ones are left", async () => {
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => [
+          {
+            id: 4,
+            client_id: "coc_gone",
+            client_name: "Claude Code",
+            redirect_host: "localhost:33418",
+            created_at: "2026-11-01T00:00:00Z",
+            last_used: null,
+            refresh_expires_at: "2026-11-12T00:00:00Z",
+            ended: { at: "2026-11-12T00:00:00Z", reason: "client_revoked" },
+          },
+        ],
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Claude Code \(2026-11-12\): The client signed out\./),
+    ).toBeInTheDocument();
+  });
+
+  it("has one plain sentence for every reason", () => {
+    expect(grantEndedText("replayed")).toBe(
+      "Signed out because an old sign-in token was used again.",
+    );
+    expect(grantEndedText("revoked")).toBe("You revoked it.");
+    expect(grantEndedText("client_revoked")).toBe("The client signed out.");
+    for (const reason of ["replayed", "revoked", "client_revoked"] as const) {
+      expect(grantEndedText(reason)).not.toMatch(/[\u2013\u2014]/);
+    }
+  });
+
   it("says so when no client is connected yet", async () => {
     serveAs("viewer", {}, { oauth: true });
     renderApp("/profile");
@@ -996,7 +1115,9 @@ describe("the connected clients card", () => {
     expect(screen.queryByText("Claude")).not.toBeInTheDocument();
     // And the gate is on the fetch too, not only the render.
     expect(
-      apiMock.mock.calls.some(([path]) => path === "/me/oauth-grants"),
+      apiMock.mock.calls.some(([path]) =>
+        String(path).startsWith("/me/oauth-grants"),
+      ),
     ).toBe(false);
   });
 

@@ -49,9 +49,13 @@ export async function decideAuthorization(
   });
 }
 
-/** Every client this account has connected through OAuth. Carries no token material. */
+/**
+ * Every client this account has connected through OAuth, followed by the
+ * grants that ended in the last seven days (each with `ended` set, saying
+ * when and why). Carries no token material.
+ */
 export async function fetchOauthGrants(): Promise<OauthGrantInfo[]> {
-  return api<OauthGrantInfo[]>("/me/oauth-grants");
+  return api<OauthGrantInfo[]>("/me/oauth-grants?include_ended=true");
 }
 
 /** Revoke one connected client. Both its access and refresh tokens stop working at once. */
