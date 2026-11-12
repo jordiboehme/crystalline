@@ -1835,6 +1835,7 @@ impl Engine {
             }
         }
         self.rekey_last_synced(old, new);
+        self.rekey_index_memo(old, new);
         self.origin_poller.rename_domain(old, new);
         {
             let mut routing = self.routing_virtual.write().unwrap();

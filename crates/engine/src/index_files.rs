@@ -60,6 +60,35 @@ pub(crate) struct IndexRefresh {
     pub bytes_read: u64,
 }
 
+/// Which paths of a domain a change touched, for the refresh that follows
+/// it.
+#[derive(Debug, Clone)]
+pub(crate) enum Touched {
+    /// These domain-relative, forward-slashed paths changed: each is read
+    /// again whatever its stat says.
+    Paths(Vec<String>),
+}
+
+impl Touched {
+    /// One path changed.
+    pub(crate) fn path(path: &str) -> Touched {
+        Touched::Paths(vec![path.to_string()])
+    }
+
+    /// The paths the refresh reads again whatever their stat says.
+    pub(crate) fn forced(self) -> Vec<String> {
+        match self {
+            Touched::Paths(paths) => paths,
+        }
+    }
+}
+
+/// [`refresh_with`] on an empty memo: every concept file is read.
+#[cfg(test)]
+pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
+    refresh_with(root, mode, &mut ListingMemo::default(), &[])
+}
+
 /// Regenerate every `index.md` under `root`, the filesystem root of a file
 /// domain whose Reflection is in `mode` (the mode in effect, so a pending
 /// engram under `reflections/` is still listed and an effective Reflection's
@@ -70,12 +99,9 @@ pub(crate) struct IndexRefresh {
 /// entry (titled by its filename stem), and a write or removal that fails is
 /// logged and skipped, so a locked or read-only path never fails the write,
 /// move, delete or sync that asked for the regeneration.
-pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
-    refresh_with(root, mode, &mut ListingMemo::default(), &[])
-}
-
-/// [`refresh`] with a memo of the domain's titles and descriptions from the
-/// passes before, which this pass brings up to date. `forced` names the
+///
+/// It takes a memo of the domain's titles and descriptions from the passes
+/// before, which this pass brings up to date. `forced` names the
 /// domain-relative, forward-slashed paths a caller just changed: each is read
 /// again even when its stat still matches the memo. A path that is not a
 /// concept file (a deleted one, a folder) is simply not found by the walk.
@@ -86,6 +112,16 @@ pub(crate) fn refresh_with(
     forced: &[String],
 ) -> IndexRefresh {
     let folders = collect(root, mode, memo, forced);
+    let refresh = write_listings(root, &folders);
+    #[cfg(test)]
+    {
+        memo.last = refresh;
+    }
+    refresh
+}
+
+/// Render, compare, write and remove what the walk asks for.
+fn write_listings(root: &Path, folders: &Walked) -> IndexRefresh {
     let mut refresh = IndexRefresh {
         read: folders.read,
         reused: folders.reused,
@@ -199,6 +235,9 @@ pub(crate) struct ListingMemo {
     root: Option<PathBuf>,
     /// Domain-relative path to what was read there.
     entries: HashMap<String, MemoEntry>,
+    /// What the last pass with this memo did.
+    #[cfg(test)]
+    last: IndexRefresh,
 }
 
 impl ListingMemo {
@@ -206,6 +245,12 @@ impl ListingMemo {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// What the last pass with this memo did.
+    #[cfg(test)]
+    pub(crate) fn last(&self) -> IndexRefresh {
+        self.last
     }
 
     /// About how many bytes of memory the memo holds.
