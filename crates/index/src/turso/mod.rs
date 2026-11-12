@@ -39,11 +39,15 @@ pub use search::{
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use turso::{Builder, Connection, Database, Row, Value};
 
+use crate::reader::{
+    CoverageCache, CoverageGuard, READ_POOL_SIZE, ReadPool, ReaderBackend, read_connections_enabled,
+};
 use crate::store::ReadStore;
 use conn::Conn;
 
@@ -102,7 +106,17 @@ pub struct TursoStore {
     // the above that ran inside the transaction). upsert_engram,
     // upsert_engram_checked and rename_engram never touch the chunk table, so
     // they are not invalidators.
-    coverage_cache: Mutex<HashMap<ChunkTable, EmbeddingCoverage>>,
+    //
+    // Shared with the read connections, which fill it too; see
+    // `CoverageCache` for when a fill is kept.
+    coverage: Arc<CoverageCache>,
+    // `Some` on a read connection: the cache generation it saw before its
+    // read transaction began, which decides whether its coverage fill is
+    // kept. `None` on the writer.
+    reader_generation: Option<AtomicU64>,
+    // The read connections beside this writer, `None` on a reader, on an
+    // in-memory store and with read connections turned off.
+    readers: Option<Arc<ReadPool<TursoStore>>>,
     // The unreadable database this store was opened beside, when
     // `open_resilient` found one and moved it out of the way. `None` for every
     // ordinary open, which is every open but that one.
@@ -162,10 +176,53 @@ impl TursoStore {
         self.claim_own_spelling(spelling, id).await
     }
 
-    /// Open (creating if needed) a store at a filesystem path and migrate it.
+    /// Open (creating if needed) a store at a filesystem path and migrate it,
+    /// with [`READ_POOL_SIZE`] read connections beside the writer unless
+    /// `CRYSTALLINE_READ_CONNECTIONS=0` turns them off.
     pub async fn open(path: &Path) -> Result<TursoStore> {
+        let readers = if read_connections_enabled() {
+            READ_POOL_SIZE
+        } else {
+            0
+        };
+        Self::open_with_readers(path, readers).await
+    }
+
+    /// [`TursoStore::open`] with `readers` read connections, whatever the
+    /// environment says; `0` opens none, and every read then runs on the
+    /// writer.
+    pub async fn open_with_readers(path: &Path, readers: usize) -> Result<TursoStore> {
         let path_str = path.to_string_lossy().to_string();
-        Self::build(&path_str, Some(path_str.clone())).await
+        let mut store = Self::build(&path_str, Some(path_str.clone())).await?;
+        if readers > 0 {
+            let mut slots = Vec::with_capacity(readers);
+            for _ in 0..readers {
+                slots.push(store.reader().await?);
+            }
+            store.readers = Some(Arc::new(ReadPool::new(slots)));
+        }
+        Ok(store)
+    }
+
+    /// One read connection beside this writer: a connection of the same
+    /// database (so it shares the WAL and the page store), refusing writes
+    /// (`query_only`), and sharing the coverage cache.
+    async fn reader(&self) -> Result<TursoStore> {
+        let conn = self._db.connect().map_err(IndexError::from)?;
+        conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
+        conn.execute("PRAGMA query_only = 1", ()).await?;
+        Ok(TursoStore {
+            _db: self._db.clone(),
+            conn: Conn::reader(conn),
+            db_path: self.db_path.clone(),
+            schema_version: self.schema_version,
+            fts_native: self.fts_native,
+            tag_cache: Mutex::new(HashMap::new()),
+            coverage: self.coverage.clone(),
+            reader_generation: Some(AtomicU64::new(0)),
+            readers: None,
+            set_aside: None,
+        })
     }
 
     /// Open an in-memory store, for tests. Nothing is persisted.
@@ -309,7 +366,9 @@ impl TursoStore {
             schema_version,
             fts_native,
             tag_cache: Mutex::new(HashMap::new()),
-            coverage_cache: Mutex::new(HashMap::new()),
+            coverage: Arc::new(CoverageCache::default()),
+            reader_generation: None,
+            readers: None,
             set_aside: None,
         })
     }
@@ -319,8 +378,13 @@ impl TursoStore {
     /// stale. Called by every mutator that can change a chunk's embedding state.
     /// Kept in a tight scope with no await so the std::sync guard never crosses a
     /// suspension point.
-    fn invalidate_coverage(&self) {
-        self.coverage_cache.lock().unwrap().clear();
+    ///
+    /// The returned guard invalidates once more when the write is over (or
+    /// the commit does, inside a transaction), so a read connection that
+    /// filled the cache from the state before the write never leaves that
+    /// value behind.
+    fn invalidate_coverage(&self) -> CoverageGuard<'_> {
+        self.coverage.invalidate()
     }
 
     /// Recompute the embedding coverage snapshot of one chunk table. This is the
@@ -2761,19 +2825,17 @@ impl ReadStore for TursoStore {
         if let Some(domains) = domains {
             return self.compute_coverage_in(table, domains).await;
         }
-        // Fast path in a tight scope so the std::sync guard is dropped before the
-        // recompute await below (clippy::await_holding_lock), tag_cache style.
-        {
-            let cached = self.coverage_cache.lock().unwrap();
-            if let Some(cov) = cached.get(&table) {
-                return Ok(cov.clone());
-            }
+        if let Some(cov) = self.coverage.get(table) {
+            return Ok(cov);
         }
         let cov = self.compute_coverage(table).await?;
-        self.coverage_cache
-            .lock()
-            .unwrap()
-            .insert(table, cov.clone());
+        match &self.reader_generation {
+            Some(seen) => {
+                self.coverage
+                    .fill_from_reader(table, cov.clone(), seen.load(Ordering::Acquire))
+            }
+            None => self.coverage.fill_from_writer(table, cov.clone()),
+        }
         Ok(cov)
     }
 
@@ -3835,7 +3897,7 @@ impl Store for TursoStore {
 
     async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
         // May delete stray chunk rows, so the coverage snapshot may be stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         in_transaction(self, async {
             // -- actor: all - one actor's draft is content too, so any row of
             // any actor keeps the domain row.
@@ -3914,7 +3976,7 @@ impl Store for TursoStore {
 
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
         // Deletes this domain's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         // Delete a single domain's engram, attachment and child rows, keeping
         // the domain row. Child rows first, then chunks, then the engram rows
         // themselves; attachment blobs before the attachment rows that own
@@ -3968,7 +4030,7 @@ impl Store for TursoStore {
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
         // Deletes the engram's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let id = query_first(
             &self.conn,
             // The base row at this path. A draft is dropped by its own
@@ -4184,7 +4246,7 @@ impl Store for TursoStore {
     async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
         // Deletes and reinserts this engram's chunks, so the coverage snapshot is
         // now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let eid = engram_id.0;
         // Carry over the embedding of any chunk whose fingerprint is unchanged so
         // an edit only re-embeds the paragraphs that actually changed. The
@@ -4261,7 +4323,7 @@ impl Store for TursoStore {
         model: &str,
     ) -> Result<()> {
         // Writes embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         // Validate the whole batch before opening the transaction so a bad row
         // never leaves earlier rows committed. The transaction then makes the
         // per-row updates all-or-nothing against a mid-batch database error,
@@ -4304,7 +4366,7 @@ impl Store for TursoStore {
 
     async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
         // Clears embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let n = self
             .conn
             .execute(chunk_sql(table).prune, vec![Value::Text(model.to_string())])
@@ -4493,8 +4555,14 @@ impl Store for TursoStore {
     }
 
     async fn wipe(&self) -> Result<()> {
+        // No read connection runs while every row goes: each one waits until
+        // the wipe is over and then sees the empty index.
+        let _drained = match &self.readers {
+            Some(readers) => Some(readers.drain().await?),
+            None => None,
+        };
         // Deletes every chunk, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         self.conn.execute("BEGIN", ()).await?;
         for table in migrations::WIPE_TABLES {
             if let Err(e) = self.conn.execute(&format!("DELETE FROM {table}"), ()).await {
@@ -4511,8 +4579,17 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    /// A read connection in the middle of a call can keep the WAL from being
+    /// reset; that is no failure of the sync that asked; the next checkpoint
+    /// tries again.
     async fn checkpoint_wal(&self) -> Result<()> {
-        self.truncate_wal().await
+        if let Err(e) = self.truncate_wal().await {
+            if self.readers.is_none() {
+                return Err(e);
+            }
+            tracing::debug!("the WAL checkpoint did not finish beside a reader: {e}");
+        }
+        Ok(())
     }
 
     async fn record_sync(
@@ -4626,7 +4703,7 @@ impl Store for TursoStore {
         }
         // Deletes the draft's chunks, so the coverage snapshot is now stale.
         // No contradiction rows to delete: drafts are never scored.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let id = query_first(
             &self.conn,
             "SELECT id FROM engram WHERE domain_id=?1 AND actor=?2 AND path=?3",
@@ -5160,7 +5237,7 @@ impl Store for TursoStore {
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool> {
         // Takes the page's chunks too (R53), so the coverage snapshot is now
         // stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let key = vec![Value::Integer(domain.0), Value::Text(path.to_string())];
         self.conn
             .execute(
@@ -5183,7 +5260,7 @@ impl Store for TursoStore {
     ) -> Result<()> {
         // Deletes and reinserts this page's chunks, so the coverage snapshot
         // is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let key = vec![Value::Integer(domain.0), Value::Text(path.to_string())];
         // Carry over the vector of any chunk whose fingerprint is unchanged, as
         // `replace_chunks` does within an engram, so an edit re-embeds only the
@@ -5263,23 +5340,86 @@ impl Store for TursoStore {
 
     async fn begin(&self) -> Result<()> {
         self.conn.execute("BEGIN", ()).await?;
+        self.coverage.began();
         crate::reader::txn::opened();
         Ok(())
     }
 
     async fn commit(&self) -> Result<()> {
-        self.conn.execute("COMMIT", ()).await?;
-        crate::reader::txn::closed();
+        let committed = self.conn.execute("COMMIT", ()).await;
+        // A refused COMMIT can leave the transaction open: the caller rolls
+        // it back, and that ends it.
+        if committed.is_ok() || self.conn.is_autocommit() {
+            self.coverage.ended(false);
+            crate::reader::txn::closed();
+        }
+        committed?;
         Ok(())
     }
 
     async fn rollback(&self) -> Result<()> {
         // A rollback reverts any chunk mutation made in the transaction, so a
         // snapshot recomputed mid-transaction must not survive it.
-        self.invalidate_coverage();
+        let rolled_back = self.conn.execute("ROLLBACK", ()).await;
+        self.coverage.ended(true);
         crate::reader::txn::closed();
-        self.conn.execute("ROLLBACK", ()).await?;
+        rolled_back?;
         Ok(())
+    }
+
+    fn read_pool(&self) -> Option<Arc<dyn ReadStore>> {
+        self.readers
+            .clone()
+            .map(|readers| readers as Arc<dyn ReadStore>)
+    }
+}
+
+/// The text a refused temp directory reaches a caller as, through
+/// `IndexError::from`.
+fn tempdir_refusal_text() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        IndexError::from(turso::Error::IoError(
+            std::io::ErrorKind::PermissionDenied,
+            "tempdir",
+        ))
+        .to_string()
+    })
+}
+
+/// A read connection: one read transaction per call, and one more run of the
+/// whole call when the engine refused a temp directory (the read transaction
+/// may be gone then, so the statement alone cannot run again; a read is
+/// idempotent, so the call can).
+#[async_trait]
+impl ReaderBackend for TursoStore {
+    async fn open_read(&self) -> Result<()> {
+        if let Some(seen) = &self.reader_generation {
+            seen.store(self.coverage.generation(), Ordering::Release);
+        }
+        self.conn.execute("BEGIN", ()).await?;
+        Ok(())
+    }
+
+    async fn close_read(&self, ok: bool) {
+        if self.conn.is_autocommit() {
+            return;
+        }
+        let end = if ok { "COMMIT" } else { "ROLLBACK" };
+        if let Err(e) = self.conn.execute(end, ()).await {
+            tracing::debug!("a read transaction did not end cleanly ({end}): {e}");
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+            }
+        }
+    }
+
+    fn retryable(&self, err: &IndexError) -> bool {
+        err.to_string() == tempdir_refusal_text()
+    }
+
+    fn blocking(&self) -> bool {
+        true
     }
 }
 
@@ -5473,6 +5613,129 @@ mod tests {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             context: None,
         }
+    }
+
+    /// A file store with `n` read connections, in a temp folder.
+    async fn with_readers(n: usize) -> (tempfile::TempDir, TursoStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TursoStore::open_with_readers(&dir.path().join("index.db"), n)
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn a_read_connection_refuses_a_write() {
+        let (_dir, store) = with_readers(1).await;
+        let readers = store.readers.clone().unwrap();
+        let lease = readers.lease().await.unwrap();
+        let refused = lease
+            .store()
+            .conn
+            .execute("INSERT INTO domain(name, kind) VALUES('x', 'virtual')", ())
+            .await;
+        assert!(refused.is_err(), "query_only refuses an insert");
+        drop(lease);
+        assert!(store.domain_id("x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_beside_a_live_read_transaction_is_no_failure() {
+        let (_dir, store) = with_readers(1).await;
+        let readers = store.readers.clone().unwrap();
+        let lease = readers.lease().await.unwrap();
+        let reader = lease.store();
+        reader.open_read().await.unwrap();
+        reader.domain_names().await.unwrap();
+        for i in 0..20 {
+            store
+                .upsert_domain(&format!("d{i}"), None, DomainKind::Virtual)
+                .await
+                .unwrap();
+        }
+        store.checkpoint_wal().await.unwrap();
+        // The reader still answers from its own snapshot.
+        assert!(reader.domain_names().await.unwrap().is_empty());
+        reader.close_read(true).await;
+        drop(lease);
+        store.checkpoint_wal().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_coverage_fill_from_a_snapshot_older_than_a_commit_is_not_kept() {
+        let (_dir, store) = with_readers(1).await;
+        let did = store
+            .upsert_domain("d", None, DomainKind::Virtual)
+            .await
+            .unwrap();
+        let id = store
+            .upsert_engram(did, &record_with_observations(Vec::new()))
+            .await
+            .unwrap();
+        let readers = store.readers.clone().unwrap();
+        let lease = readers.lease().await.unwrap();
+        let reader = lease.store();
+        reader.open_read().await.unwrap();
+        // The snapshot is taken before the chunk lands.
+        reader.domain_names().await.unwrap();
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: "body".to_string(),
+                    text_hash: "h".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let stale = reader
+            .embedding_coverage_in(ChunkTable::Engram, None)
+            .await
+            .unwrap();
+        reader.close_read(true).await;
+        drop(lease);
+        assert_eq!(stale.total_chunks, 0, "the reader saw its older snapshot");
+        assert!(
+            store.coverage.get(ChunkTable::Engram).is_none(),
+            "and its answer was not kept for the next caller"
+        );
+        let fresh = store
+            .read_pool()
+            .unwrap()
+            .embedding_coverage_in(ChunkTable::Engram, None)
+            .await
+            .unwrap();
+        assert_eq!(fresh.total_chunks, 1);
+        assert!(store.coverage.get(ChunkTable::Engram).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_wipe_waits_for_the_readers_and_they_see_it_after() {
+        let (_dir, store) = with_readers(2).await;
+        store
+            .upsert_domain("d", None, DomainKind::Virtual)
+            .await
+            .unwrap();
+        let pool = store.read_pool().unwrap();
+        assert_eq!(pool.domain_names().await.unwrap(), vec!["d".to_string()]);
+        store.wipe().await.unwrap();
+        assert!(pool.domain_names().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refused_temp_directory_is_what_a_reader_runs_again() {
+        let refused = IndexError::from(turso::Error::IoError(
+            std::io::ErrorKind::PermissionDenied,
+            "tempdir",
+        ));
+        let store_kind = tempdir_refusal_text();
+        assert_eq!(refused.to_string(), store_kind);
+        let other = IndexError::from(turso::Error::IoError(
+            std::io::ErrorKind::PermissionDenied,
+            "open",
+        ));
+        assert_ne!(other.to_string(), store_kind);
     }
 
     fn record_with_observations(observations: Vec<ObservationRecord>) -> EngramRecord {

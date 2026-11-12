@@ -5,7 +5,7 @@
 //! instead, so a search does not wait for a sync apply and two searches do not
 //! wait for each other:
 //!
-//! - A read pool keeps a few read connections of the backend (turso: more
+//! - [`ReadPool`] keeps a few read connections of the backend (turso: more
 //!   connections of the same database, `query_only`; Postgres: a pool of its
 //!   own with read-only sessions). One call takes one connection and runs in
 //!   one read transaction, so a method sees one state, as it did under the
@@ -21,11 +21,14 @@
 //! [`LockedReader`] it would wait for the lock its own task holds. A debug
 //! build checks that ([`txn`]).
 
+use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use async_trait::async_trait;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
-use crate::store::Store;
+use crate::error::{IndexError, Result};
+use crate::store::{ReadStore, Store};
 
 /// The environment variable that turns read connections off: `0` (or
 /// `false`, `off`, `no`) keeps every read on the writer connection, as before
@@ -225,9 +228,263 @@ mod locked {
     read_store_methods!(delegate_read_store! { [] [LockedReader] [locked_call] });
 }
 
+/// What a backend's read connection does around one call.
+#[async_trait]
+pub(crate) trait ReaderBackend: ReadStore + Send + Sync + 'static {
+    /// Open the call's read transaction.
+    async fn open_read(&self) -> Result<()>;
+    /// End it: commit after a successful call, roll back otherwise. Never
+    /// fails the call; a failure here is logged.
+    async fn close_read(&self, ok: bool);
+    /// Whether a failed call may run once more from the start (the turso
+    /// temp directory refusal).
+    fn retryable(&self, _err: &IndexError) -> bool {
+        false
+    }
+    /// Whether the backend's statements step synchronously on the polling
+    /// thread, so a call should hand its worker off with `block_in_place`.
+    fn blocking(&self) -> bool {
+        false
+    }
+}
+
+/// A fixed set of read connections, one per call.
+pub(crate) struct ReadPool<S> {
+    slots: std::sync::Mutex<Vec<S>>,
+    permits: Semaphore,
+    size: u32,
+}
+
+/// One read connection, taken from the pool for one call.
+pub(crate) struct Lease<'a, S> {
+    pool: &'a ReadPool<S>,
+    store: Option<S>,
+    _permit: SemaphorePermit<'a>,
+}
+
+impl<S> Lease<'_, S> {
+    pub(crate) fn store(&self) -> &S {
+        self.store.as_ref().expect("a lease holds its connection")
+    }
+}
+
+impl<S> Drop for Lease<'_, S> {
+    fn drop(&mut self) {
+        if let Some(s) = self.store.take() {
+            self.pool
+                .slots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(s);
+        }
+    }
+}
+
+impl<S> ReadPool<S> {
+    pub(crate) fn new(slots: Vec<S>) -> ReadPool<S> {
+        let size = slots.len();
+        ReadPool {
+            slots: std::sync::Mutex::new(slots),
+            permits: Semaphore::new(size),
+            size: size as u32,
+        }
+    }
+
+    pub(crate) async fn lease(&self) -> Result<Lease<'_, S>> {
+        let permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| IndexError::Db("the read connections are closed".to_string()))?;
+        let store = self
+            .slots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+            .expect("a permit always finds a free connection");
+        Ok(Lease {
+            pool: self,
+            store: Some(store),
+            _permit: permit,
+        })
+    }
+
+    /// Every permit: no reader runs until the returned permit is dropped.
+    pub(crate) async fn drain(&self) -> Result<SemaphorePermit<'_>> {
+        self.permits
+            .acquire_many(self.size)
+            .await
+            .map_err(|_| IndexError::Db("the read connections are closed".to_string()))
+    }
+}
+
+/// Run `fut` to the end. When `blocking` and the runtime has several workers,
+/// the worker is handed off (`block_in_place`) first, so statements that step
+/// on this thread do not hold up the other tasks queued on it.
+pub(crate) async fn drive<F: Future>(blocking: bool, fut: F) -> F::Output {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if blocking && handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        _ => fut.await,
+    }
+}
+
+macro_rules! pooled_call {
+    ($self:ident, $s:ident, $call:expr) => {{
+        $crate::reader::txn::assert_none_open();
+        let lease = $self.lease().await?;
+        let $s = lease.store();
+        $crate::reader::drive($crate::reader::ReaderBackend::blocking($s), async {
+            let mut retried = false;
+            loop {
+                let out = match $crate::reader::ReaderBackend::open_read($s).await {
+                    Ok(()) => $call.await,
+                    Err(e) => Err(e),
+                };
+                $crate::reader::ReaderBackend::close_read($s, out.is_ok()).await;
+                match out {
+                    Err(e) if !retried && $crate::reader::ReaderBackend::retryable($s, &e) => {
+                        retried = true;
+                        tracing::warn!(
+                            "a read failed on a refused temp directory; running it again"
+                        );
+                    }
+                    other => break other,
+                }
+            }
+        })
+        .await
+    }};
+}
+
+mod pooled {
+    use super::*;
+    use crate::error::Result;
+    use crate::store::*;
+    use crate::sweep::{SpelledRef, UnresolvedRef};
+    use std::collections::{HashMap, HashSet};
+
+    read_store_methods!(delegate_read_store! { [S: ReaderBackend] [ReadPool<S>] [pooled_call] });
+}
+
+/// The embedding coverage snapshot per chunk table, shared by a store's writer
+/// and its read connections.
+///
+/// A reader fills it from the state its read transaction saw, and a writer
+/// may commit a change in the meantime, so a fill is only kept when nothing
+/// was invalidated since the reader looked at [`CoverageCache::generation`]
+/// before it opened its transaction. The writer invalidates when a write
+/// starts (`invalidate`), again when the write has committed (when the
+/// returned guard is dropped outside a transaction, or at `commit`), and
+/// never fills the cache while a change of its own is not committed yet.
+#[derive(Default)]
+pub(crate) struct CoverageCache {
+    state: std::sync::Mutex<CoverageState>,
+    /// The writer has a transaction open (`begin` until `commit`/`rollback`).
+    txn_open: std::sync::atomic::AtomicBool,
+    /// The writer changed embedding state that is not committed yet.
+    dirty: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct CoverageState {
+    generation: u64,
+    tables: std::collections::HashMap<crate::store::ChunkTable, crate::store::EmbeddingCoverage>,
+}
+
+/// Invalidates the cache once more when the write it was taken for is over,
+/// unless that write runs inside a transaction: then `commit` does it.
+#[must_use = "the cache must be invalidated again after the write"]
+pub(crate) struct CoverageGuard<'a>(&'a CoverageCache);
+
+impl Drop for CoverageGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !self.0.txn_open.load(Ordering::Acquire) {
+            self.0.clear();
+            self.0.dirty.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl CoverageCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CoverageState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn clear(&self) {
+        let mut state = self.lock();
+        state.generation += 1;
+        state.tables.clear();
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    pub(crate) fn get(
+        &self,
+        table: crate::store::ChunkTable,
+    ) -> Option<crate::store::EmbeddingCoverage> {
+        self.lock().tables.get(&table).cloned()
+    }
+
+    /// The writer is about to change embedding state.
+    pub(crate) fn invalidate(&self) -> CoverageGuard<'_> {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.clear();
+        CoverageGuard(self)
+    }
+
+    /// The writer opened a transaction.
+    pub(crate) fn began(&self) {
+        self.txn_open
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The writer's transaction ended: committed, or rolled back.
+    pub(crate) fn ended(&self, rolled_back: bool) {
+        use std::sync::atomic::Ordering;
+        self.txn_open.store(false, Ordering::Release);
+        if self.dirty.swap(false, Ordering::AcqRel) || rolled_back {
+            self.clear();
+        }
+    }
+
+    /// A snapshot the writer computed: kept unless the writer holds an
+    /// uncommitted change to embedding state.
+    pub(crate) fn fill_from_writer(
+        &self,
+        table: crate::store::ChunkTable,
+        coverage: crate::store::EmbeddingCoverage,
+    ) {
+        if !self.dirty.load(std::sync::atomic::Ordering::Acquire) {
+            self.lock().tables.insert(table, coverage);
+        }
+    }
+
+    /// A snapshot a reader computed in a transaction it opened at
+    /// `generation`: kept only when nothing was invalidated since.
+    pub(crate) fn fill_from_reader(
+        &self,
+        table: crate::store::ChunkTable,
+        coverage: crate::store::EmbeddingCoverage,
+        generation: u64,
+    ) {
+        let mut state = self.lock();
+        if state.generation == generation {
+            state.tables.insert(table, coverage);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{ChunkTable, EmbeddingCoverage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn the_kill_switch_is_zero_and_its_spellings() {
@@ -264,5 +521,156 @@ mod tests {
         if let Err(e) = outcome {
             std::panic::resume_unwind(e.into_panic());
         }
+    }
+
+    #[test]
+    fn a_reader_fill_from_before_an_invalidation_is_not_kept() {
+        let cache = CoverageCache::default();
+        let seen = cache.generation();
+        // The writer changes embedding state and commits while the reader
+        // computes from its older snapshot.
+        drop(cache.invalidate());
+        cache.fill_from_reader(ChunkTable::Engram, EmbeddingCoverage::default(), seen);
+        assert!(cache.get(ChunkTable::Engram).is_none());
+        // A reader that began after the commit keeps its fill.
+        let seen = cache.generation();
+        cache.fill_from_reader(ChunkTable::Engram, EmbeddingCoverage::default(), seen);
+        assert!(cache.get(ChunkTable::Engram).is_some());
+    }
+
+    #[test]
+    fn a_change_inside_a_transaction_is_not_cached_until_it_commits() {
+        let cache = CoverageCache::default();
+        cache.began();
+        let guard = cache.invalidate();
+        drop(guard);
+        // The writer's own snapshot holds its uncommitted change: not kept.
+        cache.fill_from_writer(ChunkTable::Engram, EmbeddingCoverage::default());
+        assert!(cache.get(ChunkTable::Engram).is_none());
+        // A reader that began before the commit is dropped by the commit.
+        let seen = cache.generation();
+        cache.ended(false);
+        cache.fill_from_reader(ChunkTable::Engram, EmbeddingCoverage::default(), seen);
+        assert!(cache.get(ChunkTable::Engram).is_none());
+        cache.fill_from_writer(ChunkTable::Engram, EmbeddingCoverage::default());
+        assert!(cache.get(ChunkTable::Engram).is_some());
+    }
+
+    /// A backend whose first `fail` calls are refused ("refused", retryable
+    /// when `retryable`), and whose later calls are "answered": an error too,
+    /// so one stand-in serves every method's return type.
+    struct Flaky {
+        calls: AtomicUsize,
+        opened: AtomicUsize,
+        closed: AtomicUsize,
+        fail: usize,
+        retryable: bool,
+    }
+
+    impl Flaky {
+        fn new(fail: usize, retryable: bool) -> Flaky {
+            Flaky {
+                calls: AtomicUsize::new(0),
+                opened: AtomicUsize::new(0),
+                closed: AtomicUsize::new(0),
+                fail,
+                retryable,
+            }
+        }
+
+        fn answer(&self) -> IndexError {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            IndexError::Db(if n < self.fail { "refused" } else { "answered" }.to_string())
+        }
+    }
+
+    #[async_trait]
+    impl ReaderBackend for Flaky {
+        async fn open_read(&self) -> Result<()> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn close_read(&self, _ok: bool) {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn retryable(&self, err: &IndexError) -> bool {
+            self.retryable && err.to_string().contains("refused")
+        }
+    }
+
+    macro_rules! flaky_call {
+        ($self:ident, $s:ident, $call:expr) => {{ Err($self.answer()) }};
+    }
+
+    // The stand-in answers without looking at the arguments.
+    #[allow(unused_variables)]
+    mod flaky {
+        use super::*;
+        use crate::store::*;
+        use crate::sweep::{SpelledRef, UnresolvedRef};
+        use std::collections::{HashMap, HashSet};
+
+        read_store_methods!(delegate_read_store! { [] [Flaky] [flaky_call] });
+    }
+
+    /// `domain_names` through a one-connection pool, and the counts after.
+    async fn through_pool(backend: Flaky) -> (String, [usize; 3]) {
+        let pool = ReadPool::new(vec![backend]);
+        let err = pool.domain_names().await.unwrap_err().to_string();
+        let lease = pool.lease().await.unwrap();
+        let s = lease.store();
+        (
+            err,
+            [
+                s.calls.load(Ordering::SeqCst),
+                s.opened.load(Ordering::SeqCst),
+                s.closed.load(Ordering::SeqCst),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_retryable_refusal_runs_the_whole_read_once_more_and_only_once() {
+        let (err, counts) = through_pool(Flaky::new(1, true)).await;
+        assert!(err.contains("answered"), "{err}");
+        assert_eq!(
+            counts,
+            [2, 2, 2],
+            "two calls, each in a read transaction of its own"
+        );
+
+        let (err, counts) = through_pool(Flaky::new(2, true)).await;
+        assert!(
+            err.contains("refused"),
+            "a second refusal is returned: {err}"
+        );
+        assert_eq!(counts, [2, 2, 2]);
+
+        let (err, counts) = through_pool(Flaky::new(1, false)).await;
+        assert!(
+            err.contains("refused"),
+            "any other error is returned at once: {err}"
+        );
+        assert_eq!(counts, [1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_drain_waits_for_every_reader_and_holds_them_off() {
+        let pool = Arc::new(ReadPool::new(vec![
+            Flaky::new(0, false),
+            Flaky::new(0, false),
+        ]));
+        let lease = pool.lease().await.unwrap();
+        let drained = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let _all = pool.drain().await.unwrap();
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!drained.is_finished(), "the drain waits for the lease");
+        drop(lease);
+        drained.await.unwrap();
+        assert!(pool.lease().await.is_ok());
     }
 }
