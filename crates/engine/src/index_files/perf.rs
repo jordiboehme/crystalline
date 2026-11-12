@@ -249,6 +249,40 @@ fn perf_index_refresh() {
     }
     summary("full pass after one write", times);
     println!("full pass: {reads} files read, {bytes} bytes read per pass");
+
+    // The same with the memo, the touched path forced as the engine does.
+    let mut memo = super::ListingMemo::default();
+    let rss_before = rss_kb();
+    let started = Instant::now();
+    let seeding = super::refresh_with(&root, ReflectionMode::Off, &mut memo, &[]);
+    println!(
+        "memo seeding pass: {:.2} ms, {} files read; memo {} entries, about {} bytes; rss {rss_before:?} kB before, {:?} kB after",
+        started.elapsed().as_secs_f64() * 1000.0,
+        seeding.read,
+        memo.len(),
+        memo.approx_bytes(),
+        rss_kb()
+    );
+    let mut times = Vec::new();
+    let mut worst_reads = 0;
+    let mut bytes = 0;
+    for round in 0..rounds() {
+        let rel = &made[(round * 7919 + 13) % made.len()];
+        retitle(&root, rel, 1000 + round);
+        let started = Instant::now();
+        let report = super::refresh_with(
+            &root,
+            ReflectionMode::Off,
+            &mut memo,
+            std::slice::from_ref(rel),
+        );
+        times.push(started.elapsed());
+        assert_eq!(report.written, 1, "one folder index changes per round");
+        worst_reads = worst_reads.max(report.read);
+        bytes = report.bytes_read;
+    }
+    summary("memo pass after one write", times);
+    println!("memo pass: at most {worst_reads} concept files read, {bytes} bytes read per pass");
 }
 
 fn write_params(i: usize) -> crate::params::WriteParams {

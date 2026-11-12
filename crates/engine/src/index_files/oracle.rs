@@ -13,7 +13,7 @@ use std::path::Path;
 use crystalline_core::ReflectionMode;
 
 use super::perf::Rng;
-use super::refresh;
+use super::{ListingMemo, refresh, refresh_with};
 
 /// The folders the sequence writes into: flat ones, a deep chain, the
 /// domain's attachment folder, a folder the MANIFEST may declare as an
@@ -286,6 +286,34 @@ fn oracle_full_pass_against_itself() {
     for seed in [1, 2, 3] {
         run(seed, 200, &mut |root, mode, _| {
             refresh(root, mode);
+        });
+    }
+}
+
+/// The memo agrees with a full pass after every change, with the touched
+/// paths forced as the engine passes them.
+#[test]
+fn oracle_memo_against_a_full_pass() {
+    for seed in [11, 12, 13] {
+        let mut memo = ListingMemo::default();
+        run(seed, 200, &mut |root, mode, touched| {
+            refresh_with(root, mode, &mut memo, touched);
+        });
+    }
+}
+
+/// More seeds, run by hand.
+#[test]
+#[ignore = "many seeds, run by hand"]
+fn oracle_memo_many_seeds() {
+    let seeds: u64 = std::env::var("CRYSTALLINE_ORACLE_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    for seed in 100..100 + seeds {
+        let mut memo = ListingMemo::default();
+        run(seed, 400, &mut |root, mode, touched| {
+            refresh_with(root, mode, &mut memo, touched);
         });
     }
 }
