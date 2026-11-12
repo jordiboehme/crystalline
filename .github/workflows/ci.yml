@@ -1177,8 +1177,28 @@ jobs:
       - name: Make the binary executable
         run: chmod +x "$CRYSTALLINE_BIN"
 
+      # The browsers are cached per runner OS and Playwright version. System
+      # packages live outside the cache, so a hit still installs those.
+      - name: Read the Playwright version
+        id: playwright
+        run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+        working-directory: fluid
+
+      - name: Cache the browsers
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright.outputs.version }}
+
       - name: Install the browser
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pnpm exec playwright install --with-deps chromium webkit
+        working-directory: fluid
+
+      - name: Install the browser system packages
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium webkit
         working-directory: fluid
 
       # Stands up the daemon on a scratch state directory with the fixture
