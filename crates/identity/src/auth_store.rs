@@ -4255,6 +4255,19 @@ impl AuthStore {
             )
             .await
             .context("pruning the tokens of expired oauth grants")?;
+        // Tokens whose grant went by a path that did not take them along (the
+        // orphan prune in `oauth_access_user`) are inert, since every token
+        // lookup joins `oauth_grants`; they are swept here rather than on the
+        // request path.
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token
+                 WHERE NOT EXISTS
+                     (SELECT 1 FROM oauth_grants g WHERE g.id = oauth_grant_token.grant_id)",
+                (),
+            )
+            .await
+            .context("pruning orphaned oauth tokens")?;
         let removed = self
             .conn
             .execute(
@@ -4720,9 +4733,15 @@ impl AuthStore {
                     return Ok(());
                 }
             }
-            self.end_oauth_grant(id, OauthGrantEndReason::Replayed, now)
+            // A token whose grant is already gone (an orphan the prune has
+            // not swept yet) has nothing left to revoke: a miss.
+            if !self
+                .end_oauth_grant(id, OauthGrantEndReason::Replayed, now)
                 .await
-                .context("revoking a replayed oauth grant")?;
+                .context("revoking a replayed oauth grant")?
+            {
+                return Ok(());
+            }
             outcome = RefreshOutcome::Replayed {
                 grant: id,
                 since_rotation,
@@ -4901,8 +4920,7 @@ impl AuthStore {
     /// be replayed here, and no branch in Rust can forget to check.
     ///
     /// Stamps `last_used` on a hit, and prunes any grant whose account is gone
-    /// (and the tokens of any grant that is gone) on every call that reaches
-    /// the statement - the same defense in depth `mcp_token_user` applies to
+    /// on every call that reaches the statement - the same defense in depth `mcp_token_user` applies to
     /// tokens, for a row reached by some path the issuing transaction does not
     /// cover. A call naming an empty resource returns before it, since such a
     /// call could never have matched a grant anyway.
@@ -4924,15 +4942,6 @@ impl AuthStore {
             )
             .await
             .context("pruning orphaned oauth grants")?;
-        self.conn
-            .execute(
-                "DELETE FROM oauth_grant_token
-                 WHERE NOT EXISTS
-                     (SELECT 1 FROM oauth_grants g WHERE g.id = oauth_grant_token.grant_id)",
-                (),
-            )
-            .await
-            .context("pruning orphaned oauth tokens")?;
         let Some(row) = self
             .query_first(
                 &format!(
