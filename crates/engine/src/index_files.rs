@@ -35,6 +35,10 @@ pub(crate) struct IndexRefresh {
     pub removed: usize,
     /// Index files left untouched because their content was already correct.
     pub unchanged: usize,
+    /// Concept files opened and parsed for their title and description.
+    pub read: usize,
+    /// Bytes those reads returned.
+    pub bytes_read: u64,
 }
 
 /// Regenerate every `index.md` under `root`, the filesystem root of a file
@@ -48,8 +52,12 @@ pub(crate) struct IndexRefresh {
 /// logged and skipped, so a locked or read-only path never fails the write,
 /// move, delete or sync that asked for the regeneration.
 pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
-    let mut refresh = IndexRefresh::default();
     let folders = collect(root, mode);
+    let mut refresh = IndexRefresh {
+        read: folders.read,
+        bytes_read: folders.bytes_read,
+        ..IndexRefresh::default()
+    };
 
     // Every folder that holds knowledge directly or anywhere below it gets an
     // index file; the rest must not keep a stale one.
@@ -94,6 +102,10 @@ struct Walked {
     concepts: BTreeMap<String, Vec<IndexEntry>>,
     /// Folders that already hold an `index.md`.
     existing_indexes: BTreeSet<String>,
+    /// Concept files read for their title and description.
+    read: usize,
+    /// Bytes those reads returned.
+    bytes_read: u64,
 }
 
 impl Walked {
@@ -172,7 +184,9 @@ fn collect(root: &Path, mode: ReflectionMode) -> Walked {
             | PathClass::Reflection(_) => continue,
         }
         let folder = parent_of(&rel).unwrap_or_default();
-        let (title, description) = title_and_description(entry.path());
+        let (title, description, bytes) = title_and_description(entry.path());
+        walked.read += 1;
+        walked.bytes_read += bytes;
         walked
             .concepts
             .entry(folder)
@@ -233,17 +247,20 @@ fn stale_reflection_listings(root: &Path) -> Vec<String> {
 /// One concept's `title` and `description` frontmatter. A file that cannot be
 /// read or parsed yields neither, so the entry falls back to its filename stem
 /// and carries no description clause: an unreadable file still shows up in the
-/// listing rather than silently vanishing from it.
-fn title_and_description(path: &Path) -> (String, Option<String>) {
+/// listing rather than silently vanishing from it. The third value is the
+/// number of bytes read.
+fn title_and_description(path: &Path) -> (String, Option<String>, u64) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (String::new(), None);
+        return (String::new(), None, 0);
     };
+    let bytes = text.len() as u64;
     match crystalline_core::parse_engram(&text) {
         Ok(engram) => (
             engram.frontmatter.title.clone(),
             engram.frontmatter.description.clone(),
+            bytes,
         ),
-        Err(_) => (String::new(), None),
+        Err(_) => (String::new(), None, bytes),
     }
 }
 
@@ -296,6 +313,9 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
+
+#[cfg(test)]
+mod perf;
 
 #[cfg(test)]
 mod tests {
