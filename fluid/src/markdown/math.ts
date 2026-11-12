@@ -80,7 +80,7 @@ function walk(node: MdNode, source: string): void {
     return;
   }
   for (let i = 0; i < kids.length; i += 1) {
-    const kid = kids[i]!;
+    const kid: MdNode = kids[i]!;
     if (kid.type === "code" && kid.lang === "math") {
       kids[i] = { ...kid, type: "math", data: blockData(kid.value ?? "") };
       continue;
