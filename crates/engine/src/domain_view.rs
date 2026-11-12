@@ -1387,8 +1387,7 @@ impl<'a> DomainView<'a> {
         };
         let (domain_id, _) = self.engine.domain_source(domain).await?;
         let entries = {
-            let store = self.engine.store();
-            let store = store.lock().await;
+            let store = self.engine.reader();
             store.overlay_entries(domain_id, actor).await?
         };
         let held: HashMap<&str, &crystalline_index::StoredEngram> = entries
@@ -1435,8 +1434,7 @@ impl<'a> DomainView<'a> {
             Some(d) => {
                 let (domain_id, _) = self.engine.domain_source(domain).await?;
                 let entry = {
-                    let store = self.engine.store();
-                    let store = store.lock().await;
+                    let store = self.engine.reader();
                     store.overlay_entry(domain_id, actor, &d.path).await?
                 };
                 Ok(match entry {
@@ -1460,8 +1458,7 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(desc.id);
         };
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store
             .overlay_entry(desc.domain_id, actor, &desc.path)
             .await?
@@ -2167,8 +2164,7 @@ impl<'a> DomainView<'a> {
     /// can write a reference to a draft only its author can read.
     pub(crate) async fn outbound(&self, desc: &EngramDescriptor) -> Result<Vec<OutboundRef>> {
         let edge_id = self.edge_id(desc).await?;
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store.outbound_refs(edge_id, self.actor()).await?)
     }
 
@@ -2189,8 +2185,7 @@ impl<'a> DomainView<'a> {
         &self,
         domain_id: DomainId,
     ) -> Result<Vec<crystalline_index::UnresolvedRef>> {
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store.unresolved_refs(domain_id, self.actor()).await?)
     }
 
@@ -2203,8 +2198,7 @@ impl<'a> DomainView<'a> {
     /// holds an actor view here is the sweep, whose tag-drift finding is about
     /// what that author wrote.
     pub(crate) async fn vocabulary(&self) -> Result<crystalline_index::Vocabulary> {
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store.vocabulary(Some(&self.domain), self.actor()).await?)
     }
 
@@ -2222,8 +2216,7 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(None);
         };
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store
             .overlay_entry(domain_id, actor, path)
             .await?
@@ -2248,8 +2241,7 @@ impl<'a> DomainView<'a> {
         let Some(actor) = self.actor.as_deref() else {
             return Ok(false);
         };
-        let store = self.engine.store();
-        let store = store.lock().await;
+        let store = self.engine.reader();
         Ok(store.overlay_entry(domain_id, actor, path).await?.is_some())
     }
 

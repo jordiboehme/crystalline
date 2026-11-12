@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::{DomainKind, Store, TursoStore};
-use crystalline_service::params::{SearchParams, WriteParams};
+use crystalline_service::params::{ReadParams, SearchParams, WriteParams};
 use crystalline_service::{Engine, Scope};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 /// How long a read may take beside a held writer before the test calls it
@@ -77,6 +78,20 @@ async fn search(engine: &Engine, query: &str) -> Vec<String> {
         .iter()
         .map(|h| h["permalink"].as_str().unwrap().to_string())
         .collect()
+}
+
+async fn read(engine: &Engine, identifier: &str) -> Value {
+    engine
+        .read_engram(
+            &ReadParams {
+                identifier: identifier.to_string(),
+                domain: Some("open".to_string()),
+                ..ReadParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
 }
 
 /// Run `f` on another task while this one holds the writer with a write
@@ -170,4 +185,91 @@ async fn a_write_then_a_search_in_one_caller_finds_the_new_engram() {
         let hits = search(&engine, "quokka").await;
         assert_eq!(hits.len(), i + 1, "the write before is found: {hits:?}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_answers_while_the_writer_holds_an_open_transaction() {
+    let (_tmp, engine) = engine(4).await;
+    engine
+        .write_engram(&write(
+            "Docking clamps",
+            "The clamps misread below eight degrees.",
+        ))
+        .await
+        .unwrap();
+    let out = {
+        let engine = engine.clone();
+        beside_held_writer(&engine.clone(), async move {
+            read(&engine, "docking-clamps").await
+        })
+        .await
+    };
+    assert_eq!(out["title"], "Docking clamps");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_answers_while_the_writer_holds_an_open_transaction() {
+    let (_tmp, engine) = engine(4).await;
+    engine
+        .write_engram(&write("Docking clamps", "Clamp notes. See [[Thrust cut]]."))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Thrust cut", "Cut thrust on the green tone."))
+        .await
+        .unwrap();
+    let out = {
+        let engine = engine.clone();
+        beside_held_writer(&engine.clone(), async move {
+            engine
+                .build_context(
+                    &crystalline_service::params::ContextParams {
+                        anchor: "crystalline://open/docking-clamps".to_string(),
+                        depth: None,
+                        domains: Vec::new(),
+                        timeframe: None,
+                        max_related: None,
+                    },
+                    &Scope::Unrestricted,
+                )
+                .await
+                .unwrap()
+        })
+        .await
+    };
+    let text = out.to_string();
+    assert!(text.contains("thrust-cut"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_references_after_a_move_are_current() {
+    let (_tmp, engine) = engine(4).await;
+    engine
+        .write_engram(&write("Thrust cut", "Cut thrust on the green tone."))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Docking clamps", "Clamp notes. See [[thrust-cut]]."))
+        .await
+        .unwrap();
+    engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "docking-clamps".to_string(),
+                domain: "open".to_string(),
+                destination: "ops/docking-clamps".to_string(),
+                destination_domain: None,
+                permalink: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let out = read(&engine, "thrust-cut").await;
+    let text = out.to_string();
+    assert!(
+        text.contains("ops/docking-clamps"),
+        "the reader sees the moved source at once: {text}"
+    );
 }

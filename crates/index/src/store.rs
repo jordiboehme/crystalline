@@ -4379,7 +4379,7 @@ pub enum DomainLookup {
 /// domain the reader may not see, which keeps a hidden domain's miss free of
 /// hints.
 pub async fn lookup_in_domain(
-    store: &dyn Store,
+    store: &dyn ReadStore,
     dom: &str,
     identifier: &str,
 ) -> Result<DomainLookup> {

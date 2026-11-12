@@ -8890,7 +8890,7 @@ impl Engine {
         identifier: &str,
         domain: Option<&str>,
     ) -> Result<(EngramDescriptor, ContentSource)> {
-        self.resolve_scoped(identifier, domain, &HashSet::new())
+        self.resolve_scoped(identifier, domain, &HashSet::new(), false)
             .await
     }
 
@@ -8985,7 +8985,9 @@ impl Engine {
             .filter(|name| !hidden.contains(*name))
             .and_then(|name| DomainView::for_read(self, name, hidden, scope).ok());
         let Some(actor) = view.as_ref().and_then(|view| view.actor()) else {
-            let (desc, source) = self.resolve_scoped(identifier, domain, hidden).await?;
+            let (desc, source) = self
+                .resolve_scoped(identifier, domain, hidden, true)
+                .await?;
             // A bare identifier with no domain named reaches here, and by now
             // the domain IS known: the descriptor says which one. So a path
             // this reader has tombstoned is absent for them however they
@@ -9015,7 +9017,7 @@ impl Engine {
         // that rule lives in `DomainView::shadow` rather than here: the write
         // path resolves through the very same function, so what this reader can
         // open at an address is what they can save at it.
-        let base = self.resolve_scoped(identifier, domain, hidden).await;
+        let base = self.resolve_scoped(identifier, domain, hidden, true).await;
         let (desc, source) = view
             .shadow(identifier, base, || {
                 format!("no engram '{}' in domain '{name}'", shown(identifier))
@@ -9040,17 +9042,30 @@ impl Engine {
     /// The bare cross-domain form filters its matches before it counts them, so
     /// a hidden domain neither makes an identifier ambiguous nor gets its name
     /// printed into the ambiguity error.
+    ///
+    /// `on_reader` is set by the read verbs, whose lookup decides no write:
+    /// they ask the engine's reader. Every other caller resolves a target it
+    /// is about to write and asks the writer, as before.
     async fn resolve_scoped(
         &self,
         identifier: &str,
         domain: Option<&str>,
         hidden: &HashSet<String>,
+        on_reader: bool,
     ) -> Result<(EngramDescriptor, ContentSource)> {
+        let writer = if on_reader {
+            None
+        } else {
+            Some(self.store.lock().await)
+        };
+        let store: &dyn ReadStore = match &writer {
+            Some(writer) => &**writer,
+            None => self.reader(),
+        };
         if let Some(url) = CrystallineUrl::parse(identifier) {
             let found = if hidden.contains(&url.domain) {
                 None
             } else {
-                let store = self.store.lock().await;
                 store.find_engram(&url.domain, &url.permalink).await?
             };
             let d = found.ok_or_else(|| {
@@ -9067,8 +9082,7 @@ impl Engine {
             let found = if hidden.contains(dom) {
                 DomainLookup::Missing { suggest: None }
             } else {
-                let store = self.store.lock().await;
-                lookup_in_domain(&*store, dom, identifier).await?
+                lookup_in_domain(store, dom, identifier).await?
             };
             let d = match found {
                 DomainLookup::Found(d) => d,
@@ -9087,9 +9101,8 @@ impl Engine {
         // Bare identifier across all domains, minus the ones this caller may
         // not see. Filtered before the count, so a hidden twin neither turns a
         // single match into an ambiguity nor names itself in the error.
-        let store = self.store.lock().await;
         let mut matches = store.find_engram_any(identifier).await?;
-        drop(store);
+        drop(writer);
         matches.retain(|d| !hidden.contains(&d.domain));
         match matches.len() {
             0 => Err(EngineError::NotFound(format!(
@@ -9268,6 +9281,25 @@ impl Engine {
         source: &ContentSource,
         desc: &EngramDescriptor,
     ) -> Result<String> {
+        self.load_content_from(source, desc, false).await
+    }
+
+    /// [`Engine::load_content`] for a read verb, whose answer decides no
+    /// write: a row is read through the engine's reader.
+    pub(crate) async fn load_content_to_read(
+        &self,
+        source: &ContentSource,
+        desc: &EngramDescriptor,
+    ) -> Result<String> {
+        self.load_content_from(source, desc, true).await
+    }
+
+    async fn load_content_from(
+        &self,
+        source: &ContentSource,
+        desc: &EngramDescriptor,
+        on_reader: bool,
+    ) -> Result<String> {
         if let ContentSource::File { root } = source {
             let abs = join_rel(root, &desc.path);
             match std::fs::read_to_string(&abs) {
@@ -9282,16 +9314,20 @@ impl Engine {
                 Err(_) => {}
             }
         }
-        let store = self.store.lock().await;
-        store
-            .engram_content(desc.domain_id, &desc.path)
-            .await?
-            .ok_or_else(|| {
-                EngineError::NotFound(format!(
-                    "no content stored for '{}' in domain '{}'",
-                    desc.permalink, desc.domain
-                ))
-            })
+        let content = if on_reader {
+            self.reader()
+                .engram_content(desc.domain_id, &desc.path)
+                .await?
+        } else {
+            let store = self.store.lock().await;
+            store.engram_content(desc.domain_id, &desc.path).await?
+        };
+        content.ok_or_else(|| {
+            EngineError::NotFound(format!(
+                "no content stored for '{}' in domain '{}'",
+                desc.permalink, desc.domain
+            ))
+        })
     }
 }
 
