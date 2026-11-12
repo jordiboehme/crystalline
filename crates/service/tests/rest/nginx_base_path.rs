@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use crystalline_service::ui::BASE_TAG;
+use crystalline_service::ui::{BASE_TAG, SHELL_CSP};
 
 fn fluid(path: &str) -> Option<String> {
     let full = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -149,4 +149,45 @@ fn the_dockerfile_defines_the_variable_and_installs_the_script() {
         dockerfile.contains("wget --spider -q http://127.0.0.1${CRYSTALLINE_BASE_PATH}/ || exit 1"),
         "the healthcheck probes the prefixed root, shell form so the variable expands at run time"
     );
+}
+
+/// The lines of the one location block that starts with `head`, up to its
+/// closing brace.
+fn location_block(conf: &str, head: &str) -> Vec<String> {
+    conf.lines()
+        .map(str::trim)
+        .skip_while(|line| !line.starts_with(head))
+        .take_while(|line| *line != "}")
+        .map(str::to_string)
+        .collect()
+}
+
+/// The app shell from the nginx image refuses framing exactly the way the
+/// daemon's own shell does. Every app route lands in the `index.html`
+/// location, the OAuth consent page at `/authorize` among them, so the two
+/// headers belong there, in that block itself: nginx drops inherited
+/// `add_header` lines once a location sets its own.
+#[test]
+fn the_app_shell_refuses_framing_like_the_daemon_does() {
+    let Some(template) = fluid("nginx.conf.template") else {
+        return;
+    };
+    for base in ["", "/crystalline"] {
+        let conf = render(&template, base);
+        let block = location_block(&conf, &format!("location = {base}/index.html"));
+        assert!(
+            block.contains(&format!(
+                "add_header Content-Security-Policy \"{SHELL_CSP}\" always;"
+            )),
+            "{base:?}: {block:?}"
+        );
+        assert!(
+            block.contains(&"add_header X-Frame-Options \"DENY\" always;".to_string()),
+            "{base:?}: {block:?}"
+        );
+        assert!(
+            conf.contains(&format!("try_files $uri {base}/index.html;")),
+            "every other app route falls back into that location"
+        );
+    }
 }
