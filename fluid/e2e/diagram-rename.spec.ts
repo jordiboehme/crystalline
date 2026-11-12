@@ -8,7 +8,7 @@
  * run it the same way (`bash fluid/e2e/run-smoke.sh e2e/diagram-rename.spec.ts`).
  */
 
-import type { Page, WebSocketRoute } from "@playwright/test";
+import type { Locator, Page, WebSocketRoute } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
@@ -30,7 +30,16 @@ async function signIn(page: Page): Promise<void> {
   ).toBeVisible();
 }
 
-async function openEditor(page: Page, content: string): Promise<void> {
+/**
+ * A new engram holding `content`, open in the editor. It is tagged, so it is
+ * valid and no findings line lands above the editor while a journey measures;
+ * `tags: null` leaves the tags out, and its hard error brings that line.
+ */
+async function openEditor(
+  page: Page,
+  content: string,
+  { tags = ["smoke"] }: { tags?: string[] | null } = {},
+): Promise<void> {
   const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
   const csrf = ((await me.json()) as { csrf: string }).csrf;
   unique += 1;
@@ -40,6 +49,7 @@ async function openEditor(page: Page, content: string): Promise<void> {
       headers: { "X-CSRF-Token": csrf },
       data: {
         title: `Diagram rename ${String(Date.now())}${String(unique)}`,
+        ...(tags === null ? {} : { tags }),
         content,
       },
     },
@@ -121,6 +131,38 @@ async function fieldIsFocused(page: Page): Promise<boolean> {
   ) as Promise<boolean>;
 }
 
+interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * The open field's rectangle and the target's, read in one frame. A scratch
+ * engram has no tags, so the findings line lands above the editor a moment after
+ * it opens and moves the drawing down: a box read before the click and a field
+ * read after it can stand that far apart while the field sits right on the box.
+ */
+function fieldAndTarget(
+  target: Locator,
+): Promise<{ field: Rect; target: Rect }> {
+  return target.evaluate((el) => {
+    const open = document.querySelector(".cm-diagram-label-field");
+    if (open === null) throw new Error("no field");
+    const rect = (r: DOMRect) => ({
+      x: r.x,
+      y: r.y,
+      width: r.width,
+      height: r.height,
+    });
+    return {
+      field: rect(open.getBoundingClientRect()),
+      target: rect(el.getBoundingClientRect()),
+    };
+  });
+}
+
 /** Marks the field so a later read can tell it is the same element. */
 const markField = (page: Page) =>
   field(page).evaluate((el) => {
@@ -135,13 +177,11 @@ test("a click opens the field over the box, a name and Enter write it, and it dr
   await openEditor(page, DOC);
   const second = box(page).locator("g.node", { hasText: "Second" });
   await expect(second).toBeVisible();
-  const shape = await second.boundingBox();
   await second.click();
   await expect(field(page)).toBeVisible();
   await expect(field(page)).toHaveAccessibleName("Box name");
   await expect(field(page)).toHaveValue("Second");
-  const place = await field(page).boundingBox();
-  if (shape === null || place === null) throw new Error("no box");
+  const { field: place, target: shape } = await fieldAndTarget(second);
   // Over the box: their middles agree.
   expect(
     Math.abs(place.x + place.width / 2 - (shape.x + shape.width / 2)),
@@ -172,20 +212,32 @@ test("an arrow's field stands at the path's middle, and its label takes the plac
   await openEditor(page, DOC);
   const hit = box(page).locator("[data-hit-for]");
   await expect(hit).toHaveCount(1);
-  const middle = await box(page)
-    .locator('path[data-et="edge"]')
-    .evaluate((el) => {
+  const edge = box(page).locator('path[data-et="edge"]');
+  /** The path's middle on the screen, and the open field's rectangle then. */
+  const middleOf = () =>
+    edge.evaluate((el) => {
       const path = el as SVGGeometryElement;
       const point = path.getPointAtLength(path.getTotalLength() / 2);
       const screen = point.matrixTransform(
         path.getScreenCTM() ?? new DOMMatrix(),
       );
-      return { x: screen.x, y: screen.y };
+      const open = document.querySelector(".cm-diagram-label-field");
+      const r = open?.getBoundingClientRect();
+      return {
+        middle: { x: screen.x, y: screen.y },
+        place:
+          r === undefined
+            ? null
+            : { x: r.x, y: r.y, width: r.width, height: r.height },
+      };
     });
-  await page.mouse.click(middle.x, middle.y);
+  const aim = (await middleOf()).middle;
+  await page.mouse.click(aim.x, aim.y);
   await expect(field(page)).toHaveAccessibleName("Arrow label");
   await expect(field(page)).toHaveValue("");
-  const place = await field(page).boundingBox();
+  // Read again, in one frame with the field: the findings line may have moved
+  // the drawing since the click was aimed.
+  const { middle, place } = await middleOf();
   if (place === null) throw new Error("no field");
   expect(Math.abs(place.x + place.width / 2 - middle.x)).toBeLessThanOrEqual(2);
   expect(Math.abs(place.y + place.height / 2 - middle.y)).toBeLessThanOrEqual(
@@ -609,6 +661,55 @@ test("a composition keeps the page where it is, and its letter is whole", async 
   await expect(field(page)).toHaveValue("Dr가");
 });
 
+test("a line that lands above the editor during a composition: the next scroll leaves the field where it is (N8)", async ({
+  page,
+}) => {
+  // The findings wait until the composition runs; the engram has no tags, so
+  // they bring a line above the editor.
+  let release = () => {};
+  const findings = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/v1/validate", async (route) => {
+    await findings;
+    await route.continue();
+  });
+  await openEditor(page, `Above\n\n${FENCE}\n\n${FILLER}\n`, {
+    tags: null,
+  });
+  await box(page).locator("g.node", { hasText: "Second" }).click();
+  await page.keyboard.type("Dr");
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.imeSetComposition", {
+    text: "ㄱ",
+    selectionStart: 1,
+    selectionEnd: 1,
+  });
+  release();
+  await expect(page.getByText("hard error in this engram")).toBeVisible();
+  // A frame for the page to lay the line out, and one for the hold to see it.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            resolve();
+          });
+        });
+      }),
+  );
+  const settled = (await field(page).boundingBox())?.y ?? 0;
+  const content = await page.locator(".cm-content").boundingBox();
+  await page.mouse.move((content?.x ?? 0) + 100, 400);
+  await page.mouse.wheel(0, 40);
+  await page.waitForTimeout(400);
+  expect(
+    Math.abs(((await field(page).boundingBox())?.y ?? 0) - settled),
+  ).toBeLessThanOrEqual(2);
+  await cdp.send("Input.insertText", { text: "가" });
+  await expect(field(page)).toHaveValue("Dr가");
+});
+
 test("the field keeps its text in the middle of a tall box", async ({
   page,
 }) => {
@@ -618,10 +719,9 @@ test("the field keeps its text in the middle of a tall box", async ({
   );
   const node = box(page).locator("g.node", { hasText: "Second" });
   await expect(node).toBeVisible();
-  const shape = await node.boundingBox();
   await node.click();
-  const place = await field(page).boundingBox();
-  if (shape === null || place === null) throw new Error("no box");
+  await expect(field(page)).toBeVisible();
+  const { field: place, target: shape } = await fieldAndTarget(node);
   expect(place.height).toBeLessThan(shape.height / 2);
   expect(
     Math.abs(place.y + place.height / 2 - (shape.y + shape.height / 2)),

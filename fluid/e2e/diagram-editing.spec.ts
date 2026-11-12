@@ -12,7 +12,7 @@
 
 import { readFileSync } from "node:fs";
 
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "@playwright/test";
 
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
@@ -653,38 +653,53 @@ test("connect mode, then a click elsewhere: Space scrolls the page, Escape still
 const RICH =
   "```mermaid\nflowchart LR\n  subgraph S [Group]\n    P[One] --> Q((Two))\n  end\n  Q --> Q\n  P --> R{Three}\n  P --> R\n  R -. dotted .-> T & U\n  T --> S\n```\n";
 
+/** What one drawing maps: its boxes and arrows, and how many of them can be reached. */
+function mapOf(drawing: Locator) {
+  return drawing.evaluate((diagram) => {
+    const edges = Array.from(diagram.querySelectorAll('path[data-et="edge"]'));
+    return {
+      nodes: diagram.querySelectorAll("g.node").length,
+      nodeButtons: diagram.querySelectorAll('g.node[role="button"]').length,
+      edges: edges.length,
+      edgesWithHit: edges.filter((edge) =>
+        edge.parentElement?.querySelector(
+          `:scope > [data-hit-for="${edge.getAttribute("data-id") ?? ""}"]`,
+        ),
+      ).length,
+    };
+  });
+}
+
+/** Every box a button and every arrow with its hit path. */
+const allMapped = (nodes: number, edges: number) => ({
+  nodes,
+  nodeButtons: nodes,
+  edges,
+  edgesWithHit: edges,
+});
+
 test("every box and every arrow in a drawing is mapped", async ({ page }) => {
   const permalink = await scratch(page, `${BODY}\n${RICH}`);
   await page.goto(`d/${DOMAIN}/e/${permalink}`);
   await page.getByRole("link", { name: "Edit" }).click();
   await expect(page.locator(".cm-diagram svg")).toHaveCount(2);
-  await page.locator(".cm-diagram").nth(1).scrollIntoViewIfNeeded();
-  const counts = await page.evaluate(() =>
-    Array.from(document.querySelectorAll(".cm-diagram")).map((diagram) => {
-      const edges = Array.from(
-        diagram.querySelectorAll('path[data-et="edge"]'),
-      );
-      return {
-        nodes: diagram.querySelectorAll("g.node").length,
-        nodeButtons: diagram.querySelectorAll('g.node[role="button"]').length,
-        edges: edges.length,
-        edgesWithHit: edges.filter((edge) =>
-          edge.parentElement?.querySelector(
-            `:scope > [data-hit-for="${edge.getAttribute("data-id") ?? ""}"]`,
-          ),
-        ).length,
-      };
-    }),
-  );
-  expect(counts.length).toBe(2);
-  for (const row of counts) {
-    expect(row.nodes).toBeGreaterThan(0);
-    expect(row.edges).toBeGreaterThan(0);
-    expect(row.nodeButtons).toBe(row.nodes);
-    expect(row.edgesWithHit).toBe(row.edges);
-  }
-  expect(counts.map((row) => row.nodes)).toEqual([5, 5]);
-  expect(counts.map((row) => row.edges)).toEqual([4, 7]);
+  // CodeMirror keeps only the lines near the window in the page, so a drawing
+  // scrolled far enough away leaves it. Each is read while it is in view, and
+  // found by its boxes, not by its place among the drawings left.
+  const drawing = (label: string) =>
+    page
+      .locator(".cm-diagram")
+      .filter({ has: page.locator("g.node", { hasText: label }) });
+  const first = drawing("Start");
+  const rich = drawing("One");
+  await expect.poll(() => mapOf(first)).toEqual(allMapped(5, 4));
+  await rich.scrollIntoViewIfNeeded();
+  await expect.poll(() => mapOf(rich)).toEqual(allMapped(5, 7));
+  // Back to the top: the box CodeMirror makes again is mapped again.
+  await page.mouse.move(400, 400);
+  await page.mouse.wheel(0, -12_000);
+  await expect(first).toBeInViewport();
+  await expect.poll(() => mapOf(first)).toEqual(allMapped(5, 4));
 });
 
 /** The label's painted colour and its box's, read in the page. */
