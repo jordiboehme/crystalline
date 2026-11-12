@@ -1217,8 +1217,9 @@ pub struct Engine {
     // for one file on disk, keyed by absolute path. See `Engine::write_lock`
     // for what it protects and why a compare-then-write without it is a race
     // two browser tabs can reach. Created lazily, one `tokio::sync::Mutex` per
-    // file ever written through those verbs.
-    write_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // file being written through those verbs; an entry nobody holds or waits
+    // on is pruned (see `WriteLocks`).
+    write_locks: std::sync::Mutex<WriteLocks>,
     // One engram move at a time in this process. A move gathers the engrams
     // that link it before it writes and rewrites them after, so two moves
     // that link each other could each rewrite a file the other one had just
@@ -2628,7 +2629,7 @@ impl Engine {
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: crystalline_index::stale_secs(),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
-            write_locks: std::sync::Mutex::new(HashMap::new()),
+            write_locks: std::sync::Mutex::new(WriteLocks::default()),
             move_lock: tokio::sync::Mutex::new(()),
             #[cfg(any(test, feature = "testing"))]
             moves_waiting: std::sync::atomic::AtomicUsize::new(0),
@@ -10608,6 +10609,63 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
     parse_engram(&source).ok()
 }
 
+/// How many entries [`WriteLocks`] holds before its first prune.
+const WRITE_LOCKS_PRUNE_AT: usize = 256;
+
+/// The per-file write locks, keyed by [`lock_key`], with what keeps the map
+/// from growing with every file a long-lived process ever wrote.
+///
+/// **An entry nobody holds is pruned.** A holder and a waiter each keep a
+/// clone of the entry's `Arc` (taking the mutex needs one), and a clone is
+/// only ever made under the map's own guard, which the prune holds too. So an
+/// entry whose `Arc` is held by the map alone is one nobody holds, nobody waits
+/// on and nobody can reach before the guard is released: dropping it changes
+/// nothing, and the next writer of that file gets a fresh mutex no one else has.
+///
+/// The prune runs when the map reaches `prune_at`, which then moves to twice
+/// what is left (never below [`WRITE_LOCKS_PRUNE_AT`]), so a burst of held
+/// locks costs one walk per doubling rather than one per lookup.
+#[derive(Debug)]
+pub(super) struct WriteLocks {
+    map: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    prune_at: usize,
+}
+
+impl Default for WriteLocks {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            prune_at: WRITE_LOCKS_PRUNE_AT,
+        }
+    }
+}
+
+impl WriteLocks {
+    /// The lock for `key`, created when there is none.
+    fn get(&mut self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let lock = match self.map.get(key) {
+            Some(lock) => lock.clone(),
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                self.map.insert(key.to_string(), lock.clone());
+                lock
+            }
+        };
+        if self.map.len() >= self.prune_at {
+            // The lock just handed out has a second `Arc` now, so it stays.
+            self.map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            self.prune_at = (self.map.len() * 2).max(WRITE_LOCKS_PRUNE_AT);
+        }
+        lock
+    }
+
+    /// How many entries the map holds.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// The [`Engine::write_locks`] key for a file: its canonical path wherever the
 /// filesystem can resolve one, so two spellings of one file - a symlinked
 /// domain root, a `..` segment, a case difference the filesystem folds - share
@@ -12839,6 +12897,60 @@ mod lock_tests {
         let other = engine.write_lock(Path::new("/roots/known/beta.md"));
         assert!(!Arc::ptr_eq(&first, &other), "and it is per file");
         assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// Locks nobody holds are pruned once the map reaches its threshold, and
+    /// the threshold moves with what is left.
+    #[tokio::test]
+    async fn unheld_write_locks_are_pruned() {
+        let engine = engine_with_domains(&["known"]).await;
+        let kept = engine.write_lock(Path::new("/roots/known/kept.md"));
+        for n in 0..WRITE_LOCKS_PRUNE_AT * 3 {
+            drop(engine.write_lock(Path::new(&format!("/roots/known/f{n}.md"))));
+        }
+        let len = engine.write_locks.lock().unwrap().len();
+        assert!(
+            len < WRITE_LOCKS_PRUNE_AT,
+            "the map was pruned of the dropped locks, {len} left"
+        );
+        assert!(
+            Arc::ptr_eq(&kept, &engine.write_lock(Path::new("/roots/known/kept.md"))),
+            "a held lock survives every prune"
+        );
+    }
+
+    /// A lock that is held, and one a writer waits on, both survive a prune and
+    /// stay the lock a fresh lookup answers: pruning never splits a lock.
+    #[tokio::test]
+    async fn a_prune_keeps_held_and_awaited_write_locks() {
+        let engine = Arc::new(engine_with_domains(&["known"]).await);
+        let path = Path::new("/roots/known/busy.md");
+        let held = engine.write_lock(path).lock_owned().await;
+        let waiter = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                let lock = engine.write_lock(Path::new("/roots/known/busy.md"));
+                let _guard = lock.lock().await;
+            })
+        };
+        // The waiter has its `Arc` once it is parked on the mutex.
+        while Arc::strong_count(&engine.write_lock(path)) < 4 {
+            tokio::task::yield_now().await;
+        }
+        for n in 0..WRITE_LOCKS_PRUNE_AT * 2 {
+            drop(engine.write_lock(Path::new(&format!("/roots/known/f{n}.md"))));
+        }
+        let again = engine.write_lock(path);
+        assert!(
+            again.try_lock().is_err(),
+            "the lookup after the prune answers the held mutex"
+        );
+        drop(held);
+        waiter.await.unwrap();
+        assert!(
+            again.try_lock().is_ok(),
+            "and the waiter took and released it"
+        );
     }
 
     /// Two spellings of one file share a lock, which is the point of keying on
