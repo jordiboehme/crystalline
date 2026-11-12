@@ -57,7 +57,7 @@ That endpoint carries MCP over HTTP, the JSON API and the web UI.
 
 - The JSON API and the web UI require an account. A daemon with no account yet lets a caller on loopback create the first admin. On any other bind it asks for a one-time setup token that it prints at startup.
 - MCP over HTTP is open by default (`auth.mcp` is `false`). Any process that can reach the port is served without a token. It can read and write every domain that is not private, and it can change settings, register domains and apply provisioning. On a shared host this includes processes of other users.
-- The `Host` allow-list guards the MCP endpoint, the JSON API and the OAuth endpoints, as a guard against DNS rebinding. By default it allows loopback and the host of `service.public_url`. `service.allowed_hosts` adds more names, so a browser that opens the web UI by another name needs that name listed. The allow-list is not access control: a program that is not a browser can send any `Host`. Accounts and `auth.mcp` keep people and agents out.
+- The `Host` allow-list guards the MCP endpoint, the JSON API and the OAuth endpoints, as a guard against DNS rebinding. By default it allows loopback and the host of `service.public_url`. `service.allowed_hosts` adds more names, so a browser that opens the web UI by another name needs that name listed. The MCP endpoint also refuses a browser `Origin` that does not name one of these hosts. The allow-list is not access control: a program that is not a browser can send any `Host`. Accounts and `auth.mcp` keep people and agents out.
 - There is no built-in TLS. For anything other than localhost, put a TLS terminator in front (see [Web UI from the daemon](deployment.md#web-ui-from-the-daemon)).
 
 How to close it:

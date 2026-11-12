@@ -1,5 +1,5 @@
-//! The `Host` allow-list in front of the JSON API, drawn from
-//! `service.allowed_hosts` the way the MCP transport's own list is.
+//! The `Host` allow-list in front of the JSON API, and the `Origin` allow-list
+//! the MCP transport is given, both drawn from `service.allowed_hosts`.
 //!
 //! The MCP transport has always refused a `Host` that is not loopback or on
 //! `service.allowed_hosts`: that is what stops DNS rebinding, where a web page
@@ -111,6 +111,42 @@ fn public_host(url: &str) -> Option<String> {
     })
 }
 
+/// The browser origins the MCP transport accepts in an `Origin` header, or
+/// `None` when a single `*` in `service.allowed_hosts` turns the `Host` check
+/// off, in which case the `Origin` check stays off too.
+///
+/// Every allowed host becomes an `http` and an `https` origin: with the port
+/// the entry names, or any port where it names none, which is the `Host`
+/// rule's own reading of a portless entry. The host of `service.public_url`
+/// is among them, so a deployment behind a proxy that rewrites the `Host` to
+/// loopback still accepts a browser at its public address. A request with no
+/// `Origin` header is not affected at all: that is every client that is not
+/// a browser.
+///
+/// Every entry carries a port or `:*`, because rmcp warns at startup about an
+/// entry without one.
+pub fn mcp_allowed_origins(
+    allowed_hosts: &[String],
+    public_url: Option<&str>,
+) -> Option<Vec<String>> {
+    let hosts = effective_hosts(allowed_hosts, public_url)?;
+    let mut origins = Vec::new();
+    for entry in hosts.iter().filter_map(|host| AllowedHost::entry(host)) {
+        let host = if entry.host.contains(':') {
+            format!("[{}]", entry.host)
+        } else {
+            entry.host.clone()
+        };
+        let port = entry
+            .port
+            .map_or_else(|| "*".to_string(), |port| port.to_string());
+        for scheme in ["http", "https"] {
+            origins.push(format!("{scheme}://{host}:{port}"));
+        }
+    }
+    Some(origins)
+}
+
 /// The middleware: refuse a request whose `Host` is not allowed with `403`,
 /// before any route or the session guard runs.
 ///
@@ -208,5 +244,53 @@ mod tests {
         assert!(guard.admits(None));
         assert!(!guard.admits(Some("\u{0}")));
         assert!(!guard.admits(Some("")));
+    }
+
+    #[test]
+    fn the_origins_follow_the_hosts_with_explicit_ports() {
+        let origins = mcp_allowed_origins(
+            &hosts(&["muthur.lan", "kb.example:8443"]),
+            Some("https://crystalline.example.com/crystalline"),
+        )
+        .unwrap();
+        for expected in [
+            "http://localhost:*",
+            "https://localhost:*",
+            "http://127.0.0.1:*",
+            "http://[::1]:*",
+            "https://[::1]:*",
+            "http://muthur.lan:*",
+            "https://muthur.lan:*",
+            "http://kb.example:8443",
+            "https://kb.example:8443",
+            "http://crystalline.example.com:*",
+            "https://crystalline.example.com:*",
+        ] {
+            assert!(
+                origins.contains(&expected.to_string()),
+                "{expected} in {origins:?}"
+            );
+        }
+        assert!(
+            origins.iter().all(|origin| origin
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port == "*" || port.parse::<u16>().is_ok())),
+            "every entry carries a port: {origins:?}"
+        );
+    }
+
+    #[test]
+    fn a_star_leaves_the_origins_open() {
+        assert_eq!(mcp_allowed_origins(&hosts(&["*"]), None), None);
+    }
+
+    #[test]
+    fn an_unusable_public_url_adds_nothing() {
+        let base = mcp_allowed_origins(&[], None).unwrap();
+        assert_eq!(
+            mcp_allowed_origins(&[], Some("ftp://x.example")).unwrap(),
+            base
+        );
+        assert_eq!(mcp_allowed_origins(&[], Some("not a url")).unwrap(), base);
     }
 }

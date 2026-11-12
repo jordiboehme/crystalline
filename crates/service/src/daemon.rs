@@ -3751,12 +3751,16 @@ fn describe_hosts(hosts: &[String]) -> String {
     }
 }
 
-/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
-/// and dropping the SSE priming frame. The list comes from
+/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` and
+/// `Origin` guards and dropping the SSE priming frame. Both lists come from
 /// `crate::rest::host_guard`, the resolver the JSON API's own `Host` guard
 /// reads: loopback, the configured hosts and the host of `service.public_url`
 /// (an empty `allowed_hosts` is therefore loopback only, rmcp's own default,
-/// plus that host), while a single `*` turns the guard off.
+/// plus that host), while a single `*` turns both guards off.
+///
+/// The `Origin` guard is rmcp's: a request that carries an `Origin` must name
+/// one of the allowed hosts, over `http` or `https`; a request without one,
+/// which is every client that is not a browser, is not affected.
 ///
 /// The priming frame (SEP-1699: an empty `data:` event carrying only an `id:`
 /// and a `retry:` reconnection hint, sent ahead of the real JSON-RPC response)
@@ -3793,15 +3797,21 @@ fn http_config(
     allowed_hosts: &[String],
     public_url: Option<&str>,
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
-    use crate::rest::host_guard::effective_hosts;
+    use crate::rest::host_guard::{effective_hosts, mcp_allowed_origins};
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
     let base = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
         .with_legacy_session_mode(true)
         .with_max_request_body_bytes(crate::rest::MAX_TOOL_BODY_BYTES);
-    match effective_hosts(allowed_hosts, public_url) {
-        Some(hosts) => base.with_allowed_hosts(hosts),
-        None => base.disable_allowed_hosts(),
+    match (
+        effective_hosts(allowed_hosts, public_url),
+        mcp_allowed_origins(allowed_hosts, public_url),
+    ) {
+        (Some(hosts), Some(origins)) => base
+            .with_allowed_hosts(hosts)
+            .with_allowed_origins(origins)
+            .enforce_origin_validation(),
+        _ => base.disable_allowed_hosts().disable_allowed_origins(),
     }
 }
 
@@ -5019,6 +5029,32 @@ mod tests {
             cfg.allowed_hosts,
             vec!["localhost", "127.0.0.1", "::1", "kb.example"]
         );
+        assert!(
+            cfg.allowed_origins
+                .contains(&"https://kb.example:*".to_string()),
+            "{:?}",
+            cfg.allowed_origins
+        );
+    }
+
+    /// Origin validation is on wherever the `Host` guard is, with an origin
+    /// list drawn from the same hosts, and off together with it under `*`.
+    #[test]
+    fn http_config_validates_the_origin_against_the_same_hosts() {
+        let cfg = http_config(&["muthur.lan".to_string()], None);
+        for origin in [
+            "http://localhost:*",
+            "http://[::1]:*",
+            "https://muthur.lan:*",
+        ] {
+            assert!(
+                cfg.allowed_origins.contains(&origin.to_string()),
+                "{origin} in {:?}",
+                cfg.allowed_origins
+            );
+        }
+        let open = http_config(&["*".to_string()], None);
+        assert!(open.allowed_origins.is_empty());
     }
 
     // classify_event: the raw prefix match must short-circuit before any
