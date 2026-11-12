@@ -2191,12 +2191,36 @@ impl McpServer {
         if run_writes_limited() {
             return Some(RUN_INSTANCE_REFUSAL);
         }
+        (!self.holds_instance_admin(scope)).then_some(INSTANCE_ADMIN_ONLY)
+    }
+
+    /// Whether `scope` holds what the JSON API calls the admin role, read the
+    /// way [`McpServer::refuse_instance_change`] documents its three answers:
+    /// a local stdio session is the machine owner, the legacy open tier keeps
+    /// what it had while `auth.mcp` is off, and an authenticated agent needs
+    /// the instance admin role.
+    fn holds_instance_admin(&self, scope: &Scope) -> bool {
         match scope {
-            Scope::Unrestricted => None,
-            Scope::Anonymous if !self.engine.auth_mcp() => None,
-            Scope::User { admin: true, .. } => None,
-            _ => Some(INSTANCE_ADMIN_ONLY),
+            Scope::Unrestricted => true,
+            Scope::Anonymous => !self.engine.auth_mcp(),
+            Scope::User { admin, .. } => *admin,
+            // Never resolved at the edge (see `Scope::Agent`), and at most an
+            // editor where it is: not an admin.
+            Scope::Agent { .. } => false,
         }
+    }
+
+    /// The gate on [`McpServer::update_domain`]: pulling a team domain's origin
+    /// now is admin only, the same rule `POST /api/v1/domains/{domain}/sync`
+    /// applies, so an agent cannot do over MCP what its account is refused in
+    /// the browser. A pull spends the instance's GitHub API quota, and the
+    /// daemon pulls every team domain on its own schedule anyway.
+    ///
+    /// Unlike [`McpServer::refuse_instance_change`] a headless run is not
+    /// refused here: a pull changes no setting of the instance, and a run that
+    /// acts as an admin may still bring its domain up to date.
+    fn refuse_origin_pull(&self, scope: &Scope) -> Option<&'static str> {
+        (!self.holds_instance_admin(scope)).then_some(PULL_ADMIN_ONLY)
     }
 
     /// Who a write verb over this connection acts as, when this instance
@@ -4507,7 +4531,7 @@ impl McpServer {
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. drafts_merged names your drafts that took the team's change. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then call share_changes with proposal set to the number the feedback is on, which amends that layer and re-bases the layers above it. On forges without stacks that same call updates the one open proposal in place. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. drafts_merged names your drafts that took the team's change. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then call share_changes with proposal set to the number the feedback is on, which amends that layer and re-bases the layers above it. On forges without stacks that same call updates the one open proposal in place. Over HTTP with authenticated agents it needs the instance admin role, like the web API's sync; anyone else is refused and the server's own scheduled pull brings the changes. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -4526,6 +4550,12 @@ impl McpServer {
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
+        }
+        // The role before the name, the way `add_domain` and `provision` order
+        // it: a caller that may not pull is told so whatever it named, so a
+        // hidden domain and an unknown one get the same answer.
+        if let Some(refusal) = self.refuse_origin_pull(&self.scope_of(&ctx)) {
+            return refuse(refusal);
         }
         if let Some(domain) = p.domain.as_deref() {
             self.engine
@@ -6617,6 +6647,11 @@ fn admin_policy_refusal<'a>(
 /// surfaces disagreed. It names the role rather than the person, and it names
 /// the way out, because an agent that reads this has to be able to tell its
 /// user what to ask for.
+/// What `update_domain` answers an authenticated agent whose account is not an
+/// instance admin. Kept free of any domain name, so a refusal says nothing
+/// about which domains exist.
+const PULL_ADMIN_ONLY: &str = "Pulling the team's changes into a domain on demand is reserved for an instance admin, the same rule the web API applies, and the account this session is authenticated as does not hold that role. The server pulls every team domain on its own schedule, so the changes still arrive without this call. origin_status shows each open proposal's review state and its feedback count. Ask an admin to pull when you need the reviewers' comment text sooner.";
+
 const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
 
 /// What `configure` answers on a read-only instance, for every call including

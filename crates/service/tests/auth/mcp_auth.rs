@@ -2462,7 +2462,9 @@ fn without_name(raw: &str, name: &str) -> String {
 /// an unregistered name through to an unscoped lookup, whose refusal listed
 /// every registered domain, private ones included. So a typo read back the
 /// name of `lab`, which this caller is not shown anywhere else. `origin_status`
-/// and `update_domain` are pinned beside them.
+/// is pinned beside them; `update_domain` refuses this editor on its role
+/// before it reads a name, see
+/// [`update_domain_needs_the_admin_role_the_sync_route_needs`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
     let ctx = mcp_team_ctx().await;
@@ -2481,7 +2483,6 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
             serde_json::json!({ "paths": ["lab-note.md"] }),
         ),
         ("origin_status", serde_json::json!({})),
-        ("update_domain", serde_json::json!({})),
     ] {
         let ask = |name: &str| {
             let mut arguments = extra.clone();
@@ -2504,6 +2505,71 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
             "{tool} answers a hidden name exactly like an unknown one"
         );
     }
+}
+
+/// **`update_domain` needs the role `POST /api/v1/domains/{domain}/sync`
+/// needs.** The JSON API lets only an admin pull a team domain's origin on
+/// demand, so an editor's or a viewer's agent is refused the same pull over
+/// MCP. The role is checked before the name, so a hidden domain and an unknown
+/// one get the same refusal, and nothing is pulled into a domain either way.
+/// An admin passes the role gate and is answered on the name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_domain_needs_the_admin_role_the_sync_route_needs() {
+    let ctx = mcp_team_ctx().await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Editor)
+        .await;
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+
+    for who in ["mem", "out", "looker"] {
+        let session = McpTestSession::open(&ctx.addr, Some(&ctx.token_for(who).await)).await;
+        let named = session
+            .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
+            .await;
+        let unknown = session
+            .call_tool("update_domain", serde_json::json!({ "domain": "nope" }))
+            .await;
+        let sweep = session
+            .call_tool("update_domain", serde_json::json!({}))
+            .await;
+        assert!(
+            named.contains("reserved for an instance admin"),
+            "{who} is refused on the role:\n{named}"
+        );
+        // The tool text only: the raw answers differ in their date and
+        // stream event id.
+        let text = |answer: &str| {
+            answer
+                .split("\"text\":")
+                .nth(1)
+                .and_then(|rest| rest.split("\"}").next())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            text(&named),
+            text(&unknown),
+            "{who}: a name changes nothing in the answer"
+        );
+        assert_eq!(
+            text(&named),
+            text(&sweep),
+            "{who}: and neither does naming none"
+        );
+        assert!(!named.contains("lab"), "{who}: the refusal names no domain");
+    }
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "nothing was pulled"
+    );
+
+    let boss = McpTestSession::open(&ctx.addr, Some(&ctx.token_for("boss").await)).await;
+    let unknown = boss
+        .call_tool("update_domain", serde_json::json!({ "domain": "nope" }))
+        .await;
+    assert!(
+        unknown.contains("not registered") && !unknown.contains("instance admin"),
+        "an admin passes the role gate and is answered on the name:\n{unknown}"
+    );
 }
 
 /// **`provision` allow and deny never tell a hidden domain from an unknown

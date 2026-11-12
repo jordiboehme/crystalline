@@ -2014,8 +2014,10 @@ async fn a_github_link_asked_by_an_editor_reads_plain_words() {
     assert!(full.contains("service.public_url"), "{full}");
 }
 
-/// The same sentences on the verbs an editor runs every day: `update_domain` puts
-/// them in a row of its answer, and a share refuses with them.
+/// The same sentences on the verbs an editor runs every day: a share refuses
+/// with them, and `update_domain`, which needs the admin role, refuses an
+/// editor in plain words before it reaches the App. An admin's pull keeps the
+/// fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_verbs_an_editor_runs_read_plain_words_about_the_app() {
     for app in [App::Refused, App::Locked] {
