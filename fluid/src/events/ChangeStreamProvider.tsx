@@ -12,6 +12,13 @@
  * and invalidates everything at once. Nothing is ever written into the
  * cache; the pages refetch what they show.
  *
+ * Search rows are throttled per engram for `modified` (`SEARCH_QUIET_MS`):
+ * a co-editing room saves every few seconds while somebody types, and each
+ * save would refetch every open search in every viewer's tab. The first
+ * modification of an engram still refreshes search at once, the last one of
+ * a run refreshes it when the window closes, and an add, a delete, a move,
+ * a domain event or a reset refreshes it at once as before.
+ *
  * `subscribeToChanges` is a small public seam onto the same stream (Jordi,
  * 2026-09-27): a listener registration usable from anywhere, in any tab,
  * inside the shell or not. It never opens a second connection and never
@@ -48,6 +55,21 @@ export type {
 
 /** How long after the first frame the pending keys wait for company. */
 export const COALESCE_MS = 250;
+
+/**
+ * How long after an engram's modification refreshed search a further one of
+ * the same engram waits before it refreshes search again. Longer than a
+ * room's longest gap between two saves while somebody types (15 s), so a
+ * typing run costs one refresh at its start and one per window after.
+ */
+export const SEARCH_QUIET_MS = 30_000;
+
+/** The rows a `modified` refreshes at most once per `SEARCH_QUIET_MS`. */
+function searchRow(key: QueryKey): boolean {
+  return (
+    key.length === 1 && (key[0] === "search" || key[0] === "title-matches")
+  );
+}
 
 /** What a subscriber outside the shell may hand the stream (M4 C10, C11). */
 export interface StreamSubscription {
@@ -130,6 +152,14 @@ export function ChangeStreamProvider({
   useEffect(() => {
     const pending = new Map<string, QueryKey>();
     let timer: ReturnType<typeof setTimeout> | null = null;
+    /**
+     * Engrams whose `modified` refreshed search inside the last window: the
+     * window's timer, and the search keys a later one in it held back.
+     */
+    const quiet = new Map<
+      string,
+      { timer: ReturnType<typeof setTimeout>; held: QueryKey[] }
+    >();
 
     const flush = () => {
       timer = null;
@@ -155,8 +185,28 @@ export function ChangeStreamProvider({
         }
       }
     };
+    const queue = (keys: QueryKey[]) => {
+      for (const key of keys) {
+        pending.set(JSON.stringify(key), key);
+      }
+      timer ??= setTimeout(flush, COALESCE_MS);
+    };
+    /** Opens the quiet window of `engram`; a key held back in it lands at its end. */
+    const openQuiet = (engram: string) => {
+      const entry = {
+        held: [] as QueryKey[],
+        timer: setTimeout(() => {
+          quiet.delete(engram);
+          if (entry.held.length > 0) {
+            queue(entry.held);
+            openQuiet(engram);
+          }
+        }, SEARCH_QUIET_MS),
+      };
+      quiet.set(engram, entry);
+    };
     const onEvent = (event: ChangeEvent) => {
-      const keys = keysFor(event);
+      let keys = keysFor(event);
       if (keys === "everything") {
         pending.clear();
         if (timer) clearTimeout(timer);
@@ -166,11 +216,22 @@ export function ChangeStreamProvider({
       }
       if (event.event === "engram") {
         recent.note(event.change);
+        if (event.change.kind === "modified") {
+          const engram = `${event.change.domain}\u0000${event.change.permalink}`;
+          const standing = quiet.get(engram);
+          if (standing) {
+            for (const key of keys.filter(searchRow)) {
+              if (!standing.held.some((held) => held[0] === key[0])) {
+                standing.held.push(key);
+              }
+            }
+            keys = keys.filter((key) => !searchRow(key));
+          } else {
+            openQuiet(engram);
+          }
+        }
       }
-      for (const key of keys) {
-        pending.set(JSON.stringify(key), key);
-      }
-      timer ??= setTimeout(flush, COALESCE_MS);
+      queue(keys);
     };
 
     const detach = (hub ?? defaultHub()).attach({
@@ -184,6 +245,10 @@ export function ChangeStreamProvider({
     });
     return () => {
       if (timer) clearTimeout(timer);
+      for (const { timer: quietTimer } of quiet.values()) {
+        clearTimeout(quietTimer);
+      }
+      quiet.clear();
       detach();
     };
   }, [queryClient, hub, ignored, recent]);

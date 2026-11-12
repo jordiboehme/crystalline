@@ -5686,9 +5686,10 @@ impl Engine {
     /// always, so the two never invert; virtual domains take neither, since
     /// their compare-and-swap happens inside a single database statement.
     ///
-    /// The map is never pruned, like [`Engine::origin_locks`]: an entry is a
-    /// path string and an `Arc`, and the set of files a process ever writes is
-    /// bounded by the installation.
+    /// An entry nobody holds or waits on is pruned once the map grows (see
+    /// [`WriteLocks`]), so a long-lived process keeps one entry per file being
+    /// written, not one per file it ever wrote. Pruning never splits a lock: an
+    /// entry is dropped only while its `Arc` is held by the map alone.
     ///
     /// **In-process only.** Two Crystalline processes over one domain root are
     /// not held apart by this; the host-lock machinery governs that.
@@ -5705,11 +5706,7 @@ impl Engine {
         // blocking stat, and every other file's lookup would otherwise queue
         // behind it while it resolves this one's path.
         let key = lock_key(abs);
-        let mut locks = self.write_locks.lock().unwrap();
-        let lock = locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.write_locks.lock().unwrap().get(&key);
         (key, lock)
     }
 
