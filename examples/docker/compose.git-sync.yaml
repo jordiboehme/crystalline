@@ -48,6 +48,16 @@ services:
     command: ["serve", "--read-only"]
     environment:
       CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+      # Every agent that connects over HTTP signs in with a personal MCP
+      # token. Without this, anyone who can reach the port is served with no
+      # sign-in. Read-only stops writes, not reads: they could read every
+      # shared domain. Leave this off only when everyone who can reach the
+      # port may read all of it. The Host allow-list is not access
+      # control, because any program can send "Host: localhost". Give each
+      # agent its own account and token (the token is printed once):
+      #   docker compose -f examples/docker/compose.git-sync.yaml exec crystalline \
+      #     crystalline users add agent-build --role editor --mcp-token build
+      CRYSTALLINE_AUTH_MCP: "true"
     depends_on:
       - git-sync
     ports:

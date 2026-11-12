@@ -1638,6 +1638,12 @@ impl AuthStore {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let db = open_database(path).await?;
+        // Password and token hashes: owner-only on Unix, including a database
+        // that was just created at the umask's mode. Best effort, like the
+        // state folder itself.
+        if let Err(e) = crystalline_core::owner_only::tighten_database(path) {
+            tracing::warn!("could not make {} owner-only: {e}", path.display());
+        }
         let conn = db.connect().context("connecting to the auth database")?;
         // The CLI and the daemon write the same file. Wait rather than fail;
         // every transaction here is a single short statement.
@@ -1922,18 +1928,25 @@ impl AuthStore {
         }
     }
 
-    /// Replace an account's password and revoke every session it holds. Errors
-    /// if the account does not exist, so a mistyped name on the CLI is reported
-    /// rather than silently ignored.
+    /// Replace an account's password and revoke every session, MCP token and
+    /// OAuth grant it holds. Errors if the account does not exist, so a
+    /// mistyped name on the CLI is reported rather than silently ignored.
     ///
     /// The revocation is the point rather than a courtesy. A password is reset
     /// because the old one is no longer trusted, and a session issued under it
     /// never presents a password again: without this, whoever holds a cookie
     /// minted before the reset keeps the account for the rest of the session's
-    /// life, which is exactly the person a reset is meant to evict. Both
-    /// statements are one `BEGIN IMMEDIATE` transaction, so no session from
-    /// before the change can survive it, and a refused change (an account that
-    /// is not there) revokes nothing.
+    /// life, which is exactly the person a reset is meant to evict. The same
+    /// person could have issued an MCP token or connected an OAuth client with
+    /// that session, and neither expires on its own (a token never does, a
+    /// grant keeps rotating), so both go too: every agent of the account has to
+    /// be connected again. All of it is one `BEGIN IMMEDIATE` transaction, so
+    /// no credential from before the change can survive it, and a refused
+    /// change (an account that is not there) revokes nothing.
+    ///
+    /// One credential is outside the transaction's reach: an OAuth code issued
+    /// in the last minute lives in memory, not here, and can still be exchanged
+    /// for a fresh grant until it expires 60 seconds after issue.
     pub async fn set_password(&self, name: &str, password: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
@@ -1954,7 +1967,9 @@ impl AuthStore {
             if changed == 0 {
                 bail!("no such user: '{name}'");
             }
-            self.delete_sessions_of(&name).await
+            self.delete_sessions_of(&name).await?;
+            self.delete_mcp_tokens_of(&name).await?;
+            self.delete_oauth_grants_of(&name).await
         }
         .await;
         self.finish(result).await
@@ -3311,9 +3326,11 @@ impl AuthStore {
 
     /// Delete every MCP token `name` holds. `name` must already be normalized.
     ///
-    /// Called by [`AuthStore::remove_user`] and [`AuthStore::remove_user_force`]
-    /// alongside [`AuthStore::delete_sessions_of`], inside the same transaction,
-    /// so an account's tokens do not outlive it - the same resurrection risk
+    /// Called by [`AuthStore::remove_user`], [`AuthStore::remove_user_force`]
+    /// and [`AuthStore::set_password`] alongside
+    /// [`AuthStore::delete_sessions_of`], inside the same transaction, so an
+    /// account's tokens do not outlive it or the password they were issued
+    /// under - the same resurrection risk
     /// [`AuthStore::remove_user`]'s doc comment describes for sessions applies
     /// here: a token row that outlives its account would be inherited by the
     /// next account to claim the freed name.
@@ -5223,9 +5240,10 @@ impl AuthStore {
     }
 
     /// Drop every OAuth grant of one account, with its tokens and the record
-    /// of its ended grants. Called by both removal paths inside their
-    /// transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
-    /// documents one table over: `oauth_grants` carries no foreign key, so a
+    /// of its ended grants. Called by both removal paths and by
+    /// [`AuthStore::set_password`] inside their transaction, for the reason
+    /// [`AuthStore::delete_mcp_tokens_of`] documents one table over:
+    /// `oauth_grants` carries no foreign key, so a
     /// row that outlived its account would resolve for whoever next claims the
     /// freed name.
     ///
@@ -10802,6 +10820,95 @@ mod tests {
             Ok(Value::Integer(n)) => n,
             other => panic!("unexpected COUNT(*) result: {other:?}"),
         }
+    }
+
+    /// A password reset also ends what an agent was given under the old
+    /// password: the account's MCP tokens and its OAuth grants, access and
+    /// refresh token alike. Another account's credentials are left alone.
+    #[tokio::test]
+    async fn a_password_reset_revokes_mcp_tokens_and_oauth_grants() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let token = store.issue_mcp_token("ada", "agent").await.unwrap();
+        let grant = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let other_token = store.issue_mcp_token("bob", "agent").await.unwrap();
+        let other_grant = store
+            .issue_oauth_grant("bob", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        store.set_password("ada", "a new password").await.unwrap();
+
+        assert!(
+            store.mcp_token_user(&token.token).await.unwrap().is_none(),
+            "the MCP token from before the reset is dead"
+        );
+        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
+        assert!(
+            store
+                .oauth_access_user(&grant.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the OAuth access token from before the reset is dead"
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&grant.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "and its refresh token cannot mint a new one"
+        );
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+
+        assert!(
+            store
+                .mcp_token_user(&other_token.token)
+                .await
+                .unwrap()
+                .is_some(),
+            "another account keeps its MCP token"
+        );
+        assert!(
+            store
+                .oauth_access_user(&other_grant.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "and its OAuth grant"
+        );
+    }
+
+    /// A refused reset revokes nothing: the account that does not exist takes
+    /// no other account's tokens with it, and the transaction rolls back.
+    #[tokio::test]
+    async fn a_refused_password_reset_keeps_every_token() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let token = store.issue_mcp_token("ada", "agent").await.unwrap();
+        let grant = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        assert!(store.set_password("ghost", "pw").await.is_err());
+        assert!(store.mcp_token_user(&token.token).await.unwrap().is_some());
+        assert!(
+            store
+                .oauth_access_user(&grant.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// The audience rule and the expiry, the two properties an access token

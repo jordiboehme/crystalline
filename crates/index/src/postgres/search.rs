@@ -1300,7 +1300,7 @@ pub fn node_hydrate_sql(node_screen: &str, list: &str) -> String {
     format!(
         "SELECT e.id, d.name, e.permalink, e.title, e.engram_type, \
          CASE WHEN jsonb_typeof(e.metadata -> 'salience') = 'number' THEN (e.metadata ->> 'salience')::double precision END, \
-         e.status, e.actor \
+         e.status, e.actor, e.recorded_at \
          FROM engram e JOIN domain d ON d.id=e.domain_id \
          WHERE {node_screen} AND e.id IN ({list}) ORDER BY e.id"
     )
@@ -1445,6 +1445,7 @@ pub(super) async fn neighbors(
                 salience: cell_real(r, 5),
                 status: cell_text(r, 6).unwrap_or_default(),
                 actor: cell_text(r, 7).unwrap_or_default(),
+                recorded_at: cell_text(r, 8),
             });
         }
     }

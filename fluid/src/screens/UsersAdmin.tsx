@@ -120,7 +120,7 @@ function UsersPanel() {
     onSuccess: (_result, { name }) => {
       setNotice({
         kind: "done",
-        text: `Replaced the password for ${name}. Every session it held is signed out.`,
+        text: `Replaced the password for ${name}. Its sessions and agent connections are signed out.`,
       });
       void invalidate();
     },

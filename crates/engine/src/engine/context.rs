@@ -20,8 +20,14 @@ impl Engine {
             EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
-        let max_related = p.max_related.unwrap_or(10);
+        // Clamped like every page size, so a hand-written number cannot ask
+        // for the whole neighbourhood of a glob in one answer.
+        let max_related = p.max_related.unwrap_or(10).min(MAX_PAGE_LIMIT);
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
+        // The same window `recent_activity` reads: an ISO date the related
+        // engram's `recorded_at` must reach. One with no `recorded_at` falls
+        // outside it, as it does there.
+        let recorded_after = p.timeframe.as_deref().and_then(timeframe_cutoff);
 
         // A hidden domain skips the lookup and keeps the branch: a glob over one
         // falls into the same "matched no engrams" an empty glob produces, and a
@@ -114,7 +120,10 @@ impl Engine {
 
         // Output pass: keep seeds in slice (ascending-id) order, then rank the
         // related nodes by spread mass lifted by the salience prior, highest
-        // first with an ascending-id tiebreak, capped at max_related.
+        // first with an ascending-id tiebreak, capped at max_related. The
+        // timeframe is an output filter like the domain filter, for the same
+        // reason: an older engram still conducts mass as a bridge to a recent
+        // one. It never drops a seed, which the caller named.
         let mut seed_nodes: Vec<&GraphNode> = Vec::new();
         let mut related: Vec<(f64, &GraphNode)> = Vec::new();
         for node in &slice.nodes {
@@ -126,6 +135,14 @@ impl Engine {
             if seed_ids.contains(&node.id.0) {
                 seed_nodes.push(node);
             } else {
+                if let Some(after) = &recorded_after
+                    && node
+                        .recorded_at
+                        .as_deref()
+                        .is_none_or(|recorded| recorded < after.as_str())
+                {
+                    continue;
+                }
                 let score = mass.get(&node.id.0).copied().unwrap_or(0.0)
                     * (1.0 + salience_prior(node.salience, weight))
                     * retired_factor(&node.status, retired_weight);

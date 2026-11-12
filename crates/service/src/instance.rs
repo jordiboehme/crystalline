@@ -2365,10 +2365,14 @@ const READINESS_BUDGET: Duration = Duration::from_secs(15);
 /// not within one daemon's lifetime. `None` when the state dir or the file
 /// cannot be prepared: logging must never be the reason a daemon fails to
 /// start.
+///
+/// The log can carry a setup token and request details, so on Unix the file
+/// is owner-only and so is the state folder it lives in (see
+/// [`crystalline_core::owner_only`]).
 pub(crate) fn daemon_log_file() -> Option<File> {
     let path = config::daemon_log_path().ok()?;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok()?;
+        crystalline_core::owner_only::ensure_private_dir(dir).ok()?;
     }
     if std::fs::metadata(&path)
         .map(|m| m.len() > 1024 * 1024)
@@ -2376,11 +2380,7 @@ pub(crate) fn daemon_log_file() -> Option<File> {
     {
         let _ = std::fs::remove_file(&path);
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok()
+    crystalline_core::owner_only::open_private_append(&path).ok()
 }
 
 /// The spawned daemon's stderr: [`daemon_log_file`], or a null stderr when

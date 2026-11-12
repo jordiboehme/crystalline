@@ -101,7 +101,11 @@ const NO_STORE: &str = "no-store";
 /// not `default-src 'none'; sandbox` - the shell still has to fetch its own
 /// scripts, styles and the API it calls, so only framing is refused, nothing
 /// else the page legitimately does.
-const SHELL_CSP: &str = "frame-ancestors 'none'";
+///
+/// The nginx Fluid image sends the same value on its `index.html` location,
+/// and `tests/rest/nginx_base_path.rs` pins the two together.
+#[doc(hidden)]
+pub const SHELL_CSP: &str = "frame-ancestors 'none'";
 
 /// The page a binary with no bundle answers navigations with.
 const NOT_BUILT: &str = "<!doctype html>\n\

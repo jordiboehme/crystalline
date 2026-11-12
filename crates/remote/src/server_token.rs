@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::RemoteError;
 use crate::token::{
     KEYRING_SERVICE, KEYRING_TIMEOUT, KeyringRead, keyring_call_bounded, keyring_read,
-    refuse_real_keychain, refuse_real_keychain_under_test, set_owner_only,
+    refuse_real_keychain, refuse_real_keychain_under_test, write_secret_file,
 };
 
 /// The keychain account prefix, namespaced away from the `github` accounts.
@@ -379,17 +379,7 @@ impl ServerCredentialStore {
             ServerCredentialStore::Keyring { account } => {
                 keyring_write(account, to_json(credential)?).map_err(|e| store_error("save", e))
             }
-            ServerCredentialStore::File { path } => {
-                let json = to_json(credential)?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-                std::fs::write(&tmp, json.as_bytes())?;
-                set_owner_only(&tmp)?;
-                std::fs::rename(&tmp, path)?;
-                Ok(())
-            }
+            ServerCredentialStore::File { path } => write_secret_file(path, &to_json(credential)?),
             ServerCredentialStore::Env { .. } => Err(env_read_only()),
         }
     }

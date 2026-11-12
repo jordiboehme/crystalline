@@ -447,8 +447,9 @@ enum Command {
         /// (on at 127.0.0.1:7411 by default; pass 'off' to disable).
         #[arg(long)]
         http: Option<String>,
-        /// Accept this `Host` header value on the HTTP transport (repeatable).
-        /// Loopback is always allowed; a single `*` allows any Host (quote it).
+        /// Accept this `Host` header value for MCP and the JSON API over HTTP
+        /// (repeatable). Loopback and the host of service.public_url are
+        /// always allowed; a single `*` allows any Host (quote it).
         /// Wins over CRYSTALLINE_SERVICE_ALLOWED_HOSTS and service.allowed_hosts.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
@@ -795,9 +796,13 @@ enum Command {
         /// Restrict the neighborhood to these domains (repeatable).
         #[arg(long)]
         domain: Vec<String>,
-        /// Maximum related engrams beyond the anchors, keeping the top-ranked.
+        /// Maximum related engrams beyond the anchors, keeping the top-ranked
+        /// (at most 100).
         #[arg(long)]
         max_related: Option<usize>,
+        /// Keep only related engrams recorded in this window, such as 7d, 2w or 1y.
+        #[arg(long)]
+        timeframe: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1152,7 +1157,8 @@ enum UsersCommand {
     /// List every account with its role, its Reflection level and whether it
     /// is disabled.
     List,
-    /// Replace an account's password.
+    /// Replace an account's password. Revokes its sessions, MCP tokens and
+    /// OAuth connections.
     Passwd {
         /// The account to change.
         name: String,
@@ -4423,6 +4429,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             depth,
             domain,
             max_related,
+            timeframe,
             config,
         } => (
             "build_context",
@@ -4431,6 +4438,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                 "depth": depth,
                 "domains": opt_vec(domain),
                 "max_related": max_related,
+                "timeframe": timeframe,
             }),
             config,
         ),
