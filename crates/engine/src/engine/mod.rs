@@ -4266,10 +4266,7 @@ impl Engine {
     /// [`Store::domain_names`]: crystalline_index::Store::domain_names
     async fn unregistered_domains(&self) -> Result<HashSet<String>> {
         let known: HashSet<String> = self.known_domain_names().into_iter().collect();
-        let names = {
-            let store = self.store.lock().await;
-            store.domain_names().await?
-        };
+        let names = self.reader().domain_names().await?;
         let unknown: HashSet<String> = names
             .into_iter()
             .filter(|name| !known.contains(name))
@@ -4378,9 +4375,7 @@ impl Engine {
         // filter below is the whole of the rule. A registered domain with no
         // rows yet is absent from the list, which costs nothing - a domain with
         // no rows has nothing to return to any query this list narrows.
-        let store = self.store.lock().await;
-        let names = store.domain_names().await?;
-        drop(store);
+        let names = self.reader().domain_names().await?;
         let visible: Vec<String> = names
             .into_iter()
             .filter(|name| !hidden.contains(name))

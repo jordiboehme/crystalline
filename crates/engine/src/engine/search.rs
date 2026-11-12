@@ -87,11 +87,11 @@ impl Engine {
                 parse_metadata_filters(mf).map_err(|e| EngineError::Invalid(e.to_string()))?;
         }
 
-        // Phase the store lock so it is never held across the provider embed
-        // call, the same discipline as `embed_pending`: fetch the provider once,
-        // hold the store lock only to resolve the effective mode (which reads
-        // embedding coverage), then drop it before embedding the query and
-        // relock for the search. The coverage snapshot can go stale between the
+        // Every read here goes to the engine's reader (a read connection of
+        // its own, or the writer under its lock when the store has none), and
+        // none is held across the provider embed call, the same discipline as
+        // `embed_pending`: fetch the provider once, read the coverage to
+        // resolve the effective mode, embed the query, then search. The coverage snapshot can go stale between the
         // mode decision and the search, an accepted race of the same class as
         // already exists across two separate search calls.
         let provider = self.provider();
@@ -107,15 +107,9 @@ impl Engine {
             ScopedDomains::AsAsked | ScopedDomains::Nothing => None,
         };
         let effective = {
-            let store = self.store.lock().await;
-            self.effective_mode(
-                &*store,
-                requested,
-                text.is_some(),
-                provider.is_some(),
-                named,
-            )
-            .await?
+            let store = self.reader();
+            self.effective_mode(store, requested, text.is_some(), provider.is_some(), named)
+                .await?
         };
         query.mode = effective;
 
@@ -149,8 +143,7 @@ impl Engine {
             query.active_model = Some(self.model_id.clone());
         }
 
-        let store = self.store.lock().await;
-        let page = store.search(&query).await?;
+        let page = self.reader().search(&query).await?;
         Ok(json!({
             "mode": mode_str(effective),
             "total": page.total,
@@ -224,11 +217,9 @@ impl Engine {
             ScopedDomains::Only(domains) => Some(domains),
             ScopedDomains::Nothing => return Ok(Vec::new()),
         };
-        let effective = {
-            let store = self.store.lock().await;
-            self.effective_mode(&*store, SearchMode::Semantic, true, true, None)
-                .await?
-        };
+        let effective = self
+            .effective_mode(self.reader(), SearchMode::Semantic, true, true, None)
+            .await?;
         if !matches!(effective, SearchMode::Semantic) {
             return Ok(Vec::new());
         }
@@ -256,10 +247,7 @@ impl Engine {
             page: 1,
             ..SearchQuery::default()
         };
-        let page = {
-            let store = self.store.lock().await;
-            store.search(&query).await?
-        };
+        let page = self.reader().search(&query).await?;
         Ok(page
             .items
             .into_iter()
@@ -418,7 +406,7 @@ impl Engine {
     /// domains (`Store::search`), so the decision and the gate never disagree.
     async fn effective_mode(
         &self,
-        store: &dyn Store,
+        store: &dyn ReadStore,
         requested: SearchMode,
         has_text: bool,
         has_provider: bool,
