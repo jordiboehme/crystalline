@@ -8,7 +8,9 @@ import { ApiProblem } from "../api/client";
 import { ME_QUERY_KEY } from "../auth/keys";
 import type { StreamSubscription } from "./ChangeStreamProvider";
 import {
+  COALESCE_MS,
   ChangeStreamProvider,
+  SEARCH_QUIET_MS,
   subscribeOn,
   subscribeToChanges,
 } from "./ChangeStreamProvider";
@@ -717,6 +719,94 @@ describe("the change stream in one tab", () => {
     first();
     second();
     error.mockRestore();
+  });
+});
+
+describe("search refreshes while somebody saves in a room", () => {
+  const SEARCH = JSON.stringify(["search"]);
+  const TITLES = JSON.stringify(["title-matches"]);
+
+  /** How often each key was invalidated. */
+  function counts(keys: string[]): (key: string) => number {
+    return (key) => keys.filter((k) => k === key).length;
+  }
+
+  it("refreshes search once for a run of saves of one engram and once after it", async () => {
+    const recording = recordingClient();
+    await mount(recording.client);
+    const source = theSource();
+    // A room saving every 2 s for 20 s.
+    for (let i = 0; i < 10; i++) {
+      act(() => {
+        source.emit("engram", engram("alpha"), `1:${i + 1}`);
+      });
+      await advance(2_000);
+    }
+    let count = counts(recording.keys());
+    expect(count(SEARCH)).toBe(1);
+    expect(count(TITLES)).toBe(1);
+    // The engram's own rows still refresh on every save.
+    expect(count(JSON.stringify(["engram", "eng", "alpha"]))).toBe(10);
+    // The window closes: the held-back refresh lands, once.
+    await advance(SEARCH_QUIET_MS);
+    count = counts(recording.keys());
+    expect(count(SEARCH)).toBe(2);
+    expect(count(TITLES)).toBe(2);
+    // Nothing more is owed.
+    await advance(SEARCH_QUIET_MS * 2);
+    expect(counts(recording.keys())(SEARCH)).toBe(2);
+  });
+
+  it("a lone save refreshes search at once and owes nothing after", async () => {
+    const recording = recordingClient();
+    await mount(recording.client);
+    act(() => {
+      theSource().emit("engram", engram("alpha"), "1:1");
+    });
+    await advance(COALESCE_MS);
+    expect(counts(recording.keys())(SEARCH)).toBe(1);
+    await advance(SEARCH_QUIET_MS * 2);
+    expect(counts(recording.keys())(SEARCH)).toBe(1);
+  });
+
+  it("another engram, an add, a delete and a move refresh search at once", async () => {
+    const recording = recordingClient();
+    await mount(recording.client);
+    const source = theSource();
+    act(() => {
+      source.emit("engram", engram("alpha"), "1:1");
+    });
+    await advance(COALESCE_MS);
+    let expected = 1;
+    for (const [i, change] of [
+      engram("beta"),
+      engram("alpha", "added"),
+      engram("alpha", "deleted"),
+      { ...engram("alpha", "moved"), from: { path: "a.md", permalink: "a" } },
+    ].entries()) {
+      act(() => {
+        source.emit("engram", change, `2:${i + 1}`);
+      });
+      await advance(COALESCE_MS);
+      expected += 1;
+      expect(counts(recording.keys())(SEARCH)).toBe(expected);
+    }
+  });
+
+  it("an unmount drops a held-back refresh", async () => {
+    const recording = recordingClient();
+    const view = await mount(recording.client);
+    const source = theSource();
+    act(() => {
+      source.emit("engram", engram("alpha"), "1:1");
+      source.emit("engram", engram("alpha"), "1:2");
+    });
+    await advance(COALESCE_MS);
+    view.unmount();
+    act(() => {
+      vi.advanceTimersByTime(SEARCH_QUIET_MS * 2);
+    });
+    expect(counts(recording.keys())(SEARCH)).toBe(1);
   });
 });
 
