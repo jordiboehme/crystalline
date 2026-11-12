@@ -269,10 +269,7 @@ impl Engine {
             .to_string();
         let model = self.contradiction_model();
         let scored = match model {
-            Some(m) => {
-                let store = self.store.lock().await;
-                store.scored_pair_count(m.repo).await?
-            }
+            Some(m) => self.reader().scored_pair_count(m.repo).await?,
             None => 0,
         };
         let state = self.contradiction_state.lock().unwrap();
@@ -1319,10 +1316,10 @@ impl Engine {
                 return Claimed::Failed(e.to_string());
             }
         };
-        let scored = {
-            let store = self.store.lock().await;
-            store.contradiction_pairs_scored(w.id, model.repo).await
-        };
+        let scored = self
+            .reader()
+            .contradiction_pairs_scored(w.id, model.repo)
+            .await;
         let scored = match scored {
             Ok(scored) => scored,
             Err(e) => {
@@ -1613,7 +1610,7 @@ impl Engine {
                 continue;
             };
             let (domain_id, stamps) = {
-                let store = self.store.lock().await;
+                let store = self.reader();
                 let Some(domain_id) = store.domain_id(&name).await? else {
                     complete = false;
                     continue;
@@ -1702,12 +1699,10 @@ impl Engine {
                 lines_eligible: lines.eligible,
                 lines_embedded: lines.embedded,
             };
-            let scored = {
-                let store = self.store.lock().await;
-                store
-                    .contradiction_pairs_scored(domain_id, model.repo)
-                    .await?
-            };
+            let scored = self
+                .reader()
+                .contradiction_pairs_scored(domain_id, model.repo)
+                .await?;
             self.delete_expired_pairs(model, &facts, &scored, today)
                 .await;
             // The all-pairs cosine walk and the diff against the stored rows
@@ -1845,8 +1840,11 @@ impl Engine {
         // Only the vectors of the model the floor belongs to.
         let mut vectors: HashMap<String, Vec<f32>> = HashMap::with_capacity(wanted.len());
         for run in wanted.chunks(OBSERVATION_VECTOR_CHUNK) {
-            let store = self.store.lock().await;
-            vectors.extend(store.observation_vectors(&self.model_id, run).await?);
+            vectors.extend(
+                self.reader()
+                    .observation_vectors(&self.model_id, run)
+                    .await?,
+            );
         }
         tokio::task::spawn_blocking(move || {
             let plans: Vec<PairPlan> = pending
@@ -1909,7 +1907,7 @@ impl Engine {
         self.contradiction_fact_walks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (descs, mut vectors) = {
-            let store = self.store.lock().await;
+            let store = self.reader();
             let descs = store.list_engrams(domain, None, None).await?;
             let vectors: HashMap<i64, Vec<f32>> = if with_lead_vectors {
                 store
