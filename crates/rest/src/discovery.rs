@@ -289,9 +289,9 @@ pub struct ContextQuery {
 /// from the extractor, one that is not a `crystalline://` URL is the engine's
 /// own 422, and one pointing at an engram nobody wrote is a 404.
 ///
-/// `timeframe` is not exposed: the engine documents it as advisory in this
-/// version, and a parameter that does not change the answer is not worth a
-/// client learning.
+/// `timeframe` is not exposed here: the MCP tool and the CLI take it, and the
+/// graph view this route serves draws the whole neighbourhood. Adding it is one
+/// query field and a regenerated client when a client wants it.
 #[utoipa::path(
     get,
     path = "/api/v1/context",

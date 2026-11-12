@@ -492,15 +492,20 @@ pub struct ContextParams {
     pub anchor: String,
     /// Traversal depth, 1 to 3. Defaults to 1.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 3))]
     pub depth: Option<u8>,
     /// Restrict the returned neighborhood to these domains.
     #[serde(default, deserialize_with = "null_as_default")]
     pub domains: Vec<String>,
-    /// A recency window such as `7d`; advisory in this version.
+    /// A recency window such as `7d`, `24h`, `2w` or `1y`: only related engrams
+    /// recorded inside it come back (one with no `recorded_at` does not). The
+    /// anchors always come back. Ranking still runs over the whole
+    /// neighbourhood, so an older engram still links a recent one in.
     #[serde(default)]
     pub timeframe: Option<String>,
-    /// Maximum related engrams beyond the anchors, keeping the top-ranked. Defaults to 10.
+    /// Maximum related engrams beyond the anchors, keeping the top-ranked. Defaults to 10, at most 100.
     #[serde(default)]
+    #[schemars(range(max = 100))]
     pub max_related: Option<usize>,
 }
 

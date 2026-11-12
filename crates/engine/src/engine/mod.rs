@@ -12616,6 +12616,7 @@ mod context_rank_tests {
             salience,
             status: "current".to_string(),
             actor: String::new(),
+            recorded_at: None,
         }
     }
 

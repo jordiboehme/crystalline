@@ -795,9 +795,13 @@ enum Command {
         /// Restrict the neighborhood to these domains (repeatable).
         #[arg(long)]
         domain: Vec<String>,
-        /// Maximum related engrams beyond the anchors, keeping the top-ranked.
+        /// Maximum related engrams beyond the anchors, keeping the top-ranked
+        /// (at most 100).
         #[arg(long)]
         max_related: Option<usize>,
+        /// Keep only related engrams recorded in this window, such as 7d, 2w or 1y.
+        #[arg(long)]
+        timeframe: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -4423,6 +4427,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             depth,
             domain,
             max_related,
+            timeframe,
             config,
         } => (
             "build_context",
@@ -4431,6 +4436,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                 "depth": depth,
                 "domains": opt_vec(domain),
                 "max_related": max_related,
+                "timeframe": timeframe,
             }),
             config,
         ),
