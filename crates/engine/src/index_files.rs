@@ -18,7 +18,7 @@
 //! the watcher.
 //!
 //! The walk is cheap; reading every concept for its title and description is
-//! not. So each domain keeps a [`ListingMemo`] between passes: the title and
+//! not. So each domain keeps a `ListingMemo` between passes: the title and
 //! description of every concept file, keyed by the file's stat (length,
 //! modification time and, on Unix, inode and change time). A file whose stat
 //! still matches is not read again. Every write the engine makes goes through
