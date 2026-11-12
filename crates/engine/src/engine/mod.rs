@@ -1211,6 +1211,12 @@ pub struct Engine {
     // (`Store::record_sync`), so an idle domain's stored stamp stays where
     // it was; the domain listing shows the newer of the two.
     last_synced: std::sync::Mutex<HashMap<String, String>>,
+    // What the generated `index.md` refresh of each file domain remembers
+    // between passes, by domain name, behind a per-domain lock: one refresh
+    // of a domain runs at a time, so a pass that started first can never
+    // finish last and write an older listing. See `refresh_index_files`.
+    index_memos:
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::index_files::ListingMemo>>>>,
     // Per-domain lock serializing `origin_add`, `origin_update` and
     // `origin_status` against each other for one domain, so a connect and a
     // pull racing on the same domain never interleave. Created lazily, one
@@ -2634,6 +2640,7 @@ impl Engine {
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: crystalline_index::stale_secs(),
             last_synced: std::sync::Mutex::new(HashMap::new()),
+            index_memos: std::sync::Mutex::new(HashMap::new()),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
             write_locks: std::sync::Mutex::new(WriteLocks::default()),
             move_lock: tokio::sync::Mutex::new(()),
@@ -4020,6 +4027,29 @@ impl Engine {
         if let Some(at) = synced.remove(old) {
             synced.insert(new.to_string(), at);
         }
+    }
+
+    /// Move what the index refresh of `old` remembers to `new`, for a
+    /// rename. The memo checks its root on every pass, so a rename that also
+    /// moved the folder starts it over by itself.
+    pub(crate) fn rekey_index_memo(&self, old: &str, new: &str) {
+        let mut memos = self.index_memos.lock().unwrap();
+        if let Some(memo) = memos.remove(old) {
+            memos.insert(new.to_string(), memo);
+        }
+    }
+
+    /// The memo and lock of `domain`'s index refresh, made on first use.
+    pub(crate) fn index_memo(
+        &self,
+        domain: &str,
+    ) -> Arc<tokio::sync::Mutex<crate::index_files::ListingMemo>> {
+        self.index_memos
+            .lock()
+            .unwrap()
+            .entry(domain.to_string())
+            .or_default()
+            .clone()
     }
 
     /// The time this engine last finished a sync of `domain`, if it did.
@@ -8838,6 +8868,7 @@ impl Engine {
     pub fn forget_domain(&self, name: &str) {
         self.forget_contradiction_domain(name);
         self.last_synced.lock().unwrap().remove(name);
+        self.index_memos.lock().unwrap().remove(name);
         self.bump_reflection_generation(name);
         self.discovered_domains.write().unwrap().remove(name);
         self.mark_names_stale();
@@ -9416,6 +9447,8 @@ mod manifest_rename;
 mod rename_domain;
 mod review_mode;
 pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
+#[cfg(test)]
+mod index_files_tests;
 mod schemas;
 mod search;
 mod sources;
@@ -10892,6 +10925,22 @@ fn dir_is_nonempty(dir: &Path) -> bool {
 /// second walk of the domain.
 fn changed_anything(report: &SyncReport) -> bool {
     report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
+}
+
+/// The paths a sync's refresh of the generated index files reads again
+/// whatever their stat says: every path the apply changed (both ends of a
+/// move) and every file that failed, so a file that turned unparseable is
+/// listed by its stem at once.
+fn touched_by(report: &SyncReport) -> crate::index_files::Touched {
+    let mut paths = Vec::with_capacity(report.changes.len() + report.failed.len());
+    for change in &report.changes {
+        paths.push(change.path.clone());
+        if let Some(from) = &change.from {
+            paths.push(from.clone());
+        }
+    }
+    paths.extend(report.failed.iter().map(|(path, _)| path.clone()));
+    crate::index_files::Touched::Paths(paths)
 }
 
 /// A captured audience on the change bus, released when dropped, so a
@@ -12630,7 +12679,9 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
     async fn after_apply(&self, name: &str, report: &SyncReport) {
         self.engine.bump_after_apply(name, report);
         if changed_anything(report) {
-            self.engine.refresh_index_files(name).await;
+            self.engine
+                .refresh_index_files(name, touched_by(report))
+                .await;
         }
         self.engine.announce_report(name, report, None);
         self.engine.after_host_move_resolved(name, report);

@@ -1027,7 +1027,8 @@ impl Engine {
             .await;
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
-        self.refresh_index_files(&desc.domain).await;
+        self.refresh_index_files(&desc.domain, crate::index_files::Touched::path(&desc.path))
+            .await;
         // One call for both arms, and exactly right there: this tail is
         // reached only when the arm that ran committed its bytes, so a refused
         // edit never schedules a pass for a chunk that was not rewritten.

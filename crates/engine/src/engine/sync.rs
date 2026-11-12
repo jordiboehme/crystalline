@@ -271,7 +271,7 @@ impl Engine {
             self.after_host_move_resolved(name, &report);
             // Files changed under us, so the generated index files follow.
             if changed_anything(&report) {
-                self.refresh_index_files(name).await;
+                self.refresh_index_files(name, touched_by(&report)).await;
             }
             // The files are in; the drafts no file describes come back from the
             // journal. A no-op on every sync but the first one after a rebuild.
@@ -554,7 +554,7 @@ impl Engine {
         // An out-of-band edit the watcher caught changes what the folder's
         // generated index should say.
         if changed_anything(&report) {
-            self.refresh_index_files(name).await;
+            self.refresh_index_files(name, touched_by(&report)).await;
         }
         // An edit of the MANIFEST outside any verb may change the name the
         // domain declares.

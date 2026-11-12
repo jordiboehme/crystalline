@@ -288,7 +288,8 @@ impl Engine {
             .await;
         // The deleted engram must leave its folder's generated index, and an
         // emptied folder loses the index file altogether.
-        self.refresh_index_files(&desc.domain).await;
+        self.refresh_index_files(&desc.domain, crate::index_files::Touched::path(&desc.path))
+            .await;
 
         Ok(json!({
             "domain": desc.domain,

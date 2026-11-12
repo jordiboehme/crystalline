@@ -1089,9 +1089,16 @@ impl Engine {
         }
         // A move empties one folder and fills another, so both ends need their
         // index files back in step; a same-domain move refreshes once.
-        self.refresh_index_files(&p.domain).await;
+        // The linkers it rewrote changed only their bodies, never a title.
         if cross {
-            self.refresh_index_files(&dest_domain).await;
+            self.refresh_index_files(&p.domain, crate::index_files::Touched::path(&src.path))
+                .await;
+            self.refresh_index_files(&dest_domain, crate::index_files::Touched::path(&dest_rel))
+                .await;
+        } else {
+            let both = vec![src.path.clone(), dest_rel.clone()];
+            self.refresh_index_files(&p.domain, crate::index_files::Touched::Paths(both))
+                .await;
         }
 
         // The address the engram answers to at its destination, asked rather

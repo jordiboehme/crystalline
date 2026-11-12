@@ -778,6 +778,13 @@ pub async fn run_serve(
             // gained while the daemon was down, and one resolve pass over
             // every domain for what an index upgrade left pending.
             e.settle_after_initial_sync().await;
+            // The index refresh memo of each file domain fills in its own
+            // task, so neither the embed pass below nor a first write waits
+            // on a walk of every domain.
+            {
+                let e = e.clone();
+                tokio::spawn(async move { e.warm_index_files().await });
+            }
             // Bootstrap env-defined team domains that have no local state
             // yet: the zero-config read-only node's first contact with GitHub.
             // Runs before the embedding provider is built so it is not gated on
