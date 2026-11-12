@@ -330,6 +330,8 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
 mod perf;
 
 #[cfg(test)]
