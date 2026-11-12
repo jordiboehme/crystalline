@@ -107,6 +107,15 @@ async fn an_unchanged_engine_sync_writes_nothing() {
         last_sync(&engine).await.unwrap() > stamped,
         "the listing shows the last sync, not the last change"
     );
+    let status = engine.status_report().await.unwrap();
+    let reported = status["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "notes")
+        .and_then(|d| d["last_sync"].as_str().map(str::to_string))
+        .unwrap();
+    assert!(reported > stamped, "status shows the last sync too");
 
     // The signal sees a real write.
     std::thread::sleep(std::time::Duration::from_millis(1100));

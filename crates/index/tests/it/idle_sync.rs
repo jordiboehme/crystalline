@@ -342,3 +342,74 @@ async fn an_unchanged_sync_writes_nothing_on_postgres() {
         "a sync that changed a file wrote to the index"
     );
 }
+
+/// A walk applied on behalf of the host, as an engine in collaboration mode
+/// on a shared database applies it, checks inside its transaction that the
+/// host lock still names it, and reads the lock row `FOR SHARE` so a take-over
+/// waits for the apply to commit. That share lock is the one mark an unchanged
+/// apply leaves on Postgres: it sets the lock row's `xmax`, and nothing else
+/// moves. Pinned here so the guard stays the only residue.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unchanged_host_walk_only_share_locks_the_lock_row_on_postgres() {
+    let Some(scratch) = crate::pg::scratch("idlew") else {
+        return;
+    };
+    let store = crystalline_index::PostgresStore::open_in_schema(scratch.url(), scratch.name())
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    seed_files(root.path());
+    let domain = store
+        .upsert_domain("d", Some(&root.path().to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let (now, stale) = crystalline_index::claim_window(90);
+    crystalline_index::claim_host_marking_moves(
+        &store, domain, "inst", "inst", &now, &stale, false,
+    )
+    .await
+    .unwrap();
+    // The first walk indexes the domain and ends the host move the claim
+    // marked; the second settles anything left to it.
+    walk(&store, root.path(), domain).await;
+    walk(&store, root.path(), domain).await;
+    let before = pg_fingerprint(scratch.url(), scratch.name()).await;
+    walk(&store, root.path(), domain).await;
+    let after = pg_fingerprint(scratch.url(), scratch.name()).await;
+    let moved: Vec<&str> = before
+        .iter()
+        .zip(after.iter())
+        .filter(|(b, a)| b != a)
+        .map(|(b, _)| b.0.as_str())
+        .collect();
+    assert_eq!(
+        moved,
+        ["domain_lock"],
+        "only the lock row's share lock moved"
+    );
+    let row_version = |print: &[(String, String)]| {
+        let rows = &print.iter().find(|(t, _)| t == "domain_lock").unwrap().1;
+        rows.rsplit_once('/').unwrap().0.to_string()
+    };
+    assert_eq!(
+        row_version(&before),
+        row_version(&after),
+        "the lock row itself was not rewritten, only share-locked"
+    );
+}
+
+#[cfg(feature = "postgres")]
+/// One full walk of `d`, applied on behalf of the host `inst`.
+async fn walk(
+    store: &crystalline_index::PostgresStore,
+    root: &Path,
+    domain: crystalline_index::DomainId,
+) {
+    let stamps = store.file_stamps(domain).await.unwrap();
+    let mut scan = crystalline_index::scan_domain("d", root, stamps, &params(), false)
+        .await
+        .unwrap();
+    scan.walked_by("inst");
+    apply_scan(store, domain, scan).await.unwrap();
+}
