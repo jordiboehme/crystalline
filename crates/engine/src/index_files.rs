@@ -175,7 +175,10 @@ fn collect(root: &Path, mode: ReflectionMode) -> Walked {
                 }
                 continue;
             }
-            PathClass::Engram | PathClass::EngramAsset if name.to_lowercase().ends_with(".md") => {}
+            // A markdown file under the domain's `assets/` folder is an
+            // attachment, never an engram, so it is not listed and the
+            // folder holds no knowledge.
+            PathClass::Engram if name.to_lowercase().ends_with(".md") => {}
             PathClass::Engram
             | PathClass::EngramAsset
             | PathClass::Hidden
@@ -433,6 +436,37 @@ mod tests {
         assert!(!root.join("reflections/guides/index.md").exists());
         assert!(root.join("reflections/own/index.md").is_file());
         assert_eq!(refresh(root, ReflectionMode::Effective).removed, 0);
+    }
+
+    /// A markdown file under the domain's `assets/` folder is an attachment:
+    /// it gets no entry, and the listings an earlier version wrote there go.
+    #[test]
+    fn markdown_under_assets_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "notes/a.md", &engram("A", None));
+        write(root, "assets/readme.md", &engram("Readme", None));
+        write(root, "assets/drafts/sketch.md", &engram("Sketch", None));
+        write(
+            root,
+            "assets/index.md",
+            "# Contents\n\n* [Readme](readme.md)\n* [drafts/](drafts/)\n",
+        );
+        write(
+            root,
+            "assets/drafts/index.md",
+            "# Contents\n\n* [Sketch](sketch.md)\n",
+        );
+
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!(report.removed, 2);
+        assert!(!root.join("assets/index.md").exists());
+        assert!(!root.join("assets/drafts/index.md").exists());
+        assert_eq!(read(root, "notes/index.md"), "# Contents\n\n* [A](a.md)\n");
+        assert_eq!(
+            read(root, "index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Contents\n\n* [notes/](notes/)\n"
+        );
     }
 
     #[test]
