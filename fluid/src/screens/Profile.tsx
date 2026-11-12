@@ -99,6 +99,7 @@ import {
 } from "../components/primitives";
 import { formatDay } from "../format";
 import NotFound from "./NotFound";
+import { grantEndedText } from "./grantEnded";
 import { refreshAfterWrite } from "../query/refreshAfterWrite";
 
 /** How often the identity is asked again while a device flow is running. */
@@ -1585,6 +1586,13 @@ function RevealDialog({
  * `redirect_host`, `created_at`, `last_used` and `refresh_expires_at`, and
  * nothing more, ever.
  *
+ * The listing also carries the grants that ended in the last seven days,
+ * each with `ended` saying when and why. They are drawn under the table as
+ * "Recently ended" with one plain sentence each ({@link grantEndedText}), so
+ * a person whose client was signed out can see why instead of finding the
+ * row gone. The server stops listing them after seven days; there is nothing
+ * to dismiss here.
+ *
  * Nothing here mints a grant. The only way one comes to exist is the
  * authorization code flow at `/authorize`, which is a client's journey, not
  * an action on this screen - this card only ever lists what already happened
@@ -1638,7 +1646,9 @@ export function OauthGrantsCard() {
     return null;
   }
 
-  const rows = grants.data ?? [];
+  const all = grants.data ?? [];
+  const rows = all.filter((grant) => grant.ended == null);
+  const ended = all.filter((grant) => grant.ended != null);
 
   return (
     <section
@@ -1720,6 +1730,20 @@ export function OauthGrantsCard() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {ended.length > 0 && (
+        <div>
+          <h3 className="text-sm font-semibold">Recently ended</h3>
+          <ul className={`mt-1 flex flex-col gap-1 ${MUTED}`}>
+            {ended.map((grant) => (
+              <li key={grant.id}>
+                {grant.client_name} ({formatDay(grant.ended?.at ?? "")}):{" "}
+                {grant.ended ? grantEndedText(grant.ended.reason) : null}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </section>

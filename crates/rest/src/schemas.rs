@@ -131,8 +131,38 @@ pub struct OauthGrantInfo {
     /// RFC 3339, when one of its access tokens last resolved a request.
     pub last_used: Option<String>,
     /// RFC 3339, when the refresh token stops working unless it is rotated
-    /// before then.
+    /// before then. For an ended grant, when it ended.
     pub refresh_expires_at: String,
+    /// Set when the grant has ended and this row is only the record of why,
+    /// listed for seven days; null for a live grant.
+    pub ended: Option<OauthGrantEnded>,
+}
+
+/// When and why a grant ended, so a person can tell why a client is gone.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct OauthGrantEnded {
+    /// RFC 3339, when the grant ended.
+    pub at: String,
+    /// Why it ended.
+    pub reason: OauthGrantEndReason,
+}
+
+/// Why a grant ended. Only the endings a person could not otherwise explain
+/// are recorded: an expired grant was simply not used for thirty days, and a
+/// removed account has nobody left to tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OauthGrantEndReason {
+    /// A rotated refresh token came back after the grace window, the replay
+    /// rule of a refresh.
+    Replayed,
+    /// The account itself revoked it, on its Connected clients card.
+    Revoked,
+    /// The client revoked it with one of its own tokens (RFC 7009), for
+    /// example on sign-out.
+    ClientRevoked,
+    /// The account's password was reset, which signs every client out.
+    PasswordReset,
 }
 
 /// One row of an account's MCP token list, for a management UI or CLI. Never
@@ -660,8 +690,25 @@ mod tests {
                 created_at: s(),
                 last_used: None,
                 refresh_expires_at: s(),
+                ended: None,
             }]),
             published::<super::OauthGrantInfo>()
+        );
+        assert_eq!(
+            keys([auth_store::OauthGrantEnded {
+                at: s(),
+                reason: auth_store::OauthGrantEndReason::Revoked,
+            }]),
+            published::<super::OauthGrantEnded>()
+        );
+        assert_eq!(
+            keys([
+                auth_store::OauthGrantEndReason::Replayed,
+                auth_store::OauthGrantEndReason::Revoked,
+                auth_store::OauthGrantEndReason::ClientRevoked,
+                auth_store::OauthGrantEndReason::PasswordReset,
+            ]),
+            published::<super::OauthGrantEndReason>()
         );
         assert_eq!(
             keys([auth_store::McpTokenInfo {

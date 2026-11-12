@@ -386,6 +386,8 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::Decision,
         oauth::DecisionResponse,
         schemas::OauthGrantInfo,
+        schemas::OauthGrantEnded,
+        schemas::OauthGrantEndReason,
         oauth::TokenForm,
         oauth::RevokeForm,
         oauth::TokenResponse,

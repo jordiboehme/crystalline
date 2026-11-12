@@ -3269,6 +3269,12 @@ async fn rotate_refresh(
             );
             Ok(granted(grant))
         }
+        // The store has logged the reuse with its seconds since rotation; the
+        // client gets its own pair exactly as a rotation hands one out.
+        super::RefreshOutcome::Reissued { grant, .. } => {
+            stamp_client(state, client_id).await;
+            Ok(granted(grant))
+        }
         super::RefreshOutcome::WrongTarget => Err(OauthError::invalid_target(
             "this grant was issued for another resource than the one asked for, and a refresh \
              cannot change what a token is good for - the protected resource metadata names the \

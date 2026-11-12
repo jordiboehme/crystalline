@@ -269,6 +269,23 @@ impl OauthCtx {
             .unwrap();
     }
 
+    /// Move every refresh token rotation an hour into the past, so a rotated
+    /// token presented next is outside the grace window
+    /// (`OAUTH_REFRESH_GRACE_SECS`) and reads as the replay it would be on a
+    /// real deployment an hour later. There is no API for it and there should
+    /// not be.
+    async fn age_rotations(&self) {
+        self.db_conn()
+            .await
+            .execute(
+                "UPDATE oauth_grant_token SET rotated_at = rotated_at - 3600
+                 WHERE rotated_at IS NOT NULL",
+                (),
+            )
+            .await
+            .unwrap();
+    }
+
     /// `GET /oauth/authorize` with `params` as the query, arrived at the way a
     /// browser arrives at it: no cookies, and redirects off so the hop is
     /// asserted rather than walked.
@@ -2353,7 +2370,9 @@ async fn a_refresh_rotates_and_the_old_token_replays_into_a_revoked_grant() {
     assert!(!mcp_opens(&ctx.addr, &access_one).await);
     assert!(mcp_opens(&ctx.addr, &access_two).await);
 
-    // Now the leak: the token that was rotated away comes back.
+    // Now the leak: the token that was rotated away comes back, an hour
+    // later, well past the grace window.
+    ctx.age_rotations().await;
     let replayed = assert_oauth_error(
         ctx.token(&[
             ("grant_type", "refresh_token"),
@@ -2406,6 +2425,44 @@ async fn a_refresh_rotates_and_the_old_token_replays_into_a_revoked_grant() {
     )
     .await;
     assert_eq!(replayed, invented);
+}
+
+/// **Two sessions of one client refreshing with the same token at the same
+/// moment both get a working pair, and the grant lives.** Several windows of
+/// one MCP client share one stored credential; before the grace window the
+/// second refresh read as a replay and signed the person out about once a
+/// day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_refreshing_one_token_both_get_a_pair() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let issued: Value = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let refresh = issued["refresh_token"].as_str().unwrap().to_string();
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh.as_str()),
+        ("client_id", client_id.as_str()),
+    ];
+    let (one, two) = tokio::join!(ctx.token(&form), ctx.token(&form));
+    assert_eq!(one.status(), 200);
+    assert_eq!(two.status(), 200);
+    let one: Value = one.json().await.unwrap();
+    let two: Value = two.json().await.unwrap();
+    assert_ne!(one["refresh_token"], two["refresh_token"]);
+    for pair in [&one, &two] {
+        assert!(mcp_opens(&ctx.addr, pair["access_token"].as_str().unwrap()).await);
+    }
+    assert_eq!(ctx.auth.list_oauth_grants("ada").await.unwrap().len(), 1);
+    // A retry of the very same token a moment later is still inside the
+    // window.
+    assert_eq!(ctx.token(&form).await.status(), 200);
+    assert_eq!(ctx.auth.list_oauth_grants("ada").await.unwrap().len(), 1);
 }
 
 /// **A `resource` on a refresh is judged against the grant's own audience,
@@ -2490,9 +2547,10 @@ async fn a_refresh_resource_is_judged_against_the_grant_and_never_before_a_repla
         "and leaves the credentials the client already holds alive"
     );
 
-    // The predecessor comes back with a foreign resource attached. One extra
-    // form field must not be a way to probe a stolen token without the theft
-    // being noticed.
+    // The predecessor comes back with a foreign resource attached, past the
+    // grace window. One extra form field must not be a way to probe a stolen
+    // token without the theft being noticed.
+    ctx.age_rotations().await;
     assert_oauth_error(
         ctx.token(&[
             ("grant_type", "refresh_token"),
