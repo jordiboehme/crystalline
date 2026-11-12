@@ -358,6 +358,31 @@ async fn an_account_lists_and_revokes_its_own_grants_and_no_others() {
     assert!(bobs_with_ended[0]["ended"].is_null());
 }
 
+/// A password reset signs every client out, and after signing in again the
+/// person reads why on the listing: one `password_reset` record per grant.
+#[tokio::test]
+async fn a_password_reset_is_listed_as_the_reason() {
+    let ctx = RestCtx::with_user("ada", Role::Editor).await;
+    let (_, grant) = grant_for(&ctx.auth, "ada", "http://example.test").await;
+    ctx.auth.set_password("ada", "n3w s3cret").await.unwrap();
+    let again = SessionClient {
+        addr: ctx.client.addr,
+        session: Some(login(ctx.client.addr, "ada", "n3w s3cret").await),
+    };
+    let live = body(again.get("/api/v1/me/oauth-grants").await).await;
+    assert!(live.as_array().unwrap().is_empty(), "{live}");
+    let all = body(
+        again
+            .get("/api/v1/me/oauth-grants?include_ended=true")
+            .await,
+    )
+    .await;
+    let rows = all.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{all}");
+    assert_eq!(rows[0]["id"].as_i64().unwrap(), grant.id);
+    assert_eq!(rows[0]["ended"]["reason"], "password_reset");
+}
+
 /// A replayed refresh token ends the grant, and the record says so: the
 /// listing with `include_ended=true` names the reason.
 #[tokio::test]

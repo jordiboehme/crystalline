@@ -713,6 +713,8 @@ pub enum OauthGrantEndReason {
     /// The client revoked it with one of its own tokens (RFC 7009), for
     /// example on sign-out.
     ClientRevoked,
+    /// The account's password was reset, which signs every client out.
+    PasswordReset,
 }
 
 impl OauthGrantEndReason {
@@ -721,6 +723,7 @@ impl OauthGrantEndReason {
             OauthGrantEndReason::Replayed => "replayed",
             OauthGrantEndReason::Revoked => "revoked",
             OauthGrantEndReason::ClientRevoked => "client_revoked",
+            OauthGrantEndReason::PasswordReset => "password_reset",
         }
     }
 
@@ -729,6 +732,7 @@ impl OauthGrantEndReason {
             "replayed" => Some(OauthGrantEndReason::Replayed),
             "revoked" => Some(OauthGrantEndReason::Revoked),
             "client_revoked" => Some(OauthGrantEndReason::ClientRevoked),
+            "password_reset" => Some(OauthGrantEndReason::PasswordReset),
             _ => None,
         }
     }
@@ -1969,7 +1973,8 @@ impl AuthStore {
             }
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
-            self.delete_oauth_grants_of(&name).await
+            self.end_oauth_grants_of(&name, OauthGrantEndReason::PasswordReset)
+                .await
         }
         .await;
         self.finish(result).await
@@ -5239,9 +5244,61 @@ impl AuthStore {
         Ok(changed)
     }
 
+    /// End every OAuth grant of one account for `reason`, inside the caller's
+    /// transaction, the way a single revoke does: each grant that could
+    /// still refresh gets an ended record, so the Connected clients card
+    /// says why the clients were signed out, and loses its tokens. A grant
+    /// already past its window is dropped without a record, as the prune
+    /// would drop it. The account's earlier ended records stay.
+    ///
+    /// [`AuthStore::set_password`] calls it: a reset is something the person
+    /// should be told about on that card, unlike a removed account, which has
+    /// nobody left to tell and goes through `delete_oauth_grants_of`.
+    async fn end_oauth_grants_of(&self, name: &str, reason: OauthGrantEndReason) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM oauth_grants WHERE user = ?1 AND refresh_expires_at > ?2",
+                vec![Value::Text(name.to_string()), Value::Integer(now)],
+            )
+            .await
+            .with_context(|| format!("reading oauth grants for user '{name}'"))?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("reading oauth grants for user '{name}'"))?
+        {
+            if let Ok(Value::Integer(id)) = row.get_value(0) {
+                ids.push(id);
+            }
+        }
+        drop(rows);
+        for id in ids {
+            self.end_oauth_grant(id, reason, now).await?;
+        }
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token WHERE grant_id IN
+                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing oauth grants for user '{name}'"))?;
+        Ok(())
+    }
+
     /// Drop every OAuth grant of one account, with its tokens and the record
-    /// of its ended grants. Called by both removal paths and by
-    /// [`AuthStore::set_password`] inside their transaction, for the reason
+    /// of its ended grants. Called by both removal paths inside their
+    /// transaction, for the reason
     /// [`AuthStore::delete_mcp_tokens_of`] documents one table over:
     /// `oauth_grants` carries no foreign key, so a
     /// row that outlived its account would resolve for whoever next claims the
@@ -10843,8 +10900,37 @@ mod tests {
             .issue_oauth_grant("bob", &client.client_id, OAUTH_RESOURCE)
             .await
             .unwrap();
+        // An earlier ended grant, whose record the reset must keep.
+        let earlier = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        assert!(store.revoke_oauth_grant("ada", earlier.id).await.unwrap());
 
         store.set_password("ada", "a new password").await.unwrap();
+
+        // The person sees on the Connected clients card why the client was
+        // signed out, and the record of the earlier revoke is still there.
+        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
+        let reasons: Vec<_> = ended
+            .iter()
+            .map(|g| (g.id, g.ended.as_ref().unwrap().reason))
+            .collect();
+        assert_eq!(ended.len(), 2, "{reasons:?}");
+        assert!(reasons.contains(&(grant.id, OauthGrantEndReason::PasswordReset)));
+        assert!(reasons.contains(&(earlier.id, OauthGrantEndReason::Revoked)));
+        assert_eq!(
+            count_rows(&store, "oauth_grant_token").await,
+            1,
+            "only bob's"
+        );
+        assert!(
+            store
+                .list_ended_oauth_grants("bob")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(
             store.mcp_token_user(&token.token).await.unwrap().is_none(),
@@ -10889,6 +10975,22 @@ mod tests {
         );
     }
 
+    /// Removing an account takes its ended-grant records with it: there is
+    /// nobody left to read them, and the name may be claimed again.
+    #[tokio::test]
+    async fn removing_an_account_drops_its_ended_grant_records() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store.set_password("ada", "a new password").await.unwrap();
+        assert_eq!(store.list_ended_oauth_grants("ada").await.unwrap().len(), 1);
+        store.remove_user("ada").await.unwrap();
+        assert_eq!(count_rows(&store, "oauth_grant_ended").await, 0);
+    }
+
     /// A refused reset revokes nothing: the account that does not exist takes
     /// no other account's tokens with it, and the transaction rolls back.
     #[tokio::test]
@@ -10902,6 +11004,13 @@ mod tests {
             .unwrap();
         assert!(store.set_password("ghost", "pw").await.is_err());
         assert!(store.mcp_token_user(&token.token).await.unwrap().is_some());
+        assert!(
+            store
+                .list_ended_oauth_grants("ada")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .oauth_access_user(&grant.access_token, OAUTH_RESOURCE)

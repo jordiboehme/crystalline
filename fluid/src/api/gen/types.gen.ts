@@ -1798,7 +1798,7 @@ export type OauthErrorBody = {
  * are recorded: an expired grant was simply not used for thirty days, and a
  * removed account has nobody left to tell.
  */
-export type OauthGrantEndReason = 'replayed' | 'revoked' | 'client_revoked';
+export type OauthGrantEndReason = 'replayed' | 'revoked' | 'client_revoked' | 'password_reset';
 
 /**
  * When and why a grant ended, so a person can tell why a client is gone.

@@ -99,9 +99,9 @@ fn store_error(e: anyhow::Error) -> ApiError {
                    knowledge. With `include_ended=true` the grants that ended \
                    in the last seven days follow the live ones, newest \
                    first, each with `ended` naming when and why (an old \
-                   refresh token used again, revoked here, or revoked by the \
-                   client), so a person can tell why a client is gone. Such \
-                   a row cannot be revoked again.",
+                   refresh token used again, revoked here, revoked by the \
+                   client, or a password reset), so a person can tell why a \
+                   client is gone. Such a row cannot be revoked again.",
     params(ListQuery),
     responses(
         (status = 200, description = "This account's connected clients.", body = Vec<super::schemas::OauthGrantInfo>),

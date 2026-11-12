@@ -14,5 +14,7 @@ export function grantEndedText(reason: OauthGrantEndReason): string {
       return "You revoked it.";
     case "client_revoked":
       return "The client signed out.";
+    case "password_reset":
+      return "Signed out because the password was reset.";
   }
 }

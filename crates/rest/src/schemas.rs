@@ -161,6 +161,8 @@ pub enum OauthGrantEndReason {
     /// The client revoked it with one of its own tokens (RFC 7009), for
     /// example on sign-out.
     ClientRevoked,
+    /// The account's password was reset, which signs every client out.
+    PasswordReset,
 }
 
 /// One row of an account's MCP token list, for a management UI or CLI. Never
@@ -704,6 +706,7 @@ mod tests {
                 auth_store::OauthGrantEndReason::Replayed,
                 auth_store::OauthGrantEndReason::Revoked,
                 auth_store::OauthGrantEndReason::ClientRevoked,
+                auth_store::OauthGrantEndReason::PasswordReset,
             ]),
             published::<super::OauthGrantEndReason>()
         );

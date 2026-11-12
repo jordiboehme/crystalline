@@ -1069,7 +1069,15 @@ describe("the connected clients card", () => {
     );
     expect(grantEndedText("revoked")).toBe("You revoked it.");
     expect(grantEndedText("client_revoked")).toBe("The client signed out.");
-    for (const reason of ["replayed", "revoked", "client_revoked"] as const) {
+    expect(grantEndedText("password_reset")).toBe(
+      "Signed out because the password was reset.",
+    );
+    for (const reason of [
+      "replayed",
+      "revoked",
+      "client_revoked",
+      "password_reset",
+    ] as const) {
       expect(grantEndedText(reason)).not.toMatch(/[\u2013\u2014]/);
     }
   });

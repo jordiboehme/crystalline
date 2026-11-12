@@ -10789,7 +10789,7 @@
           "settings"
         ],
         "summary": "The caller's own OAuth grants, newest first.",
-        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge. With `include_ended=true` the grants that ended in the last seven days follow the live ones, newest first, each with `ended` naming when and why (an old refresh token used again, revoked here, or revoked by the client), so a person can tell why a client is gone. Such a row cannot be revoked again.",
+        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge. With `include_ended=true` the grants that ended in the last seven days follow the live ones, newest first, each with `ended` naming when and why (an old refresh token used again, revoked here, revoked by the client, or a password reset), so a person can tell why a client is gone. Such a row cannot be revoked again.",
         "operationId": "list_my_oauth_grants",
         "parameters": [
           {
@@ -15420,7 +15420,8 @@
         "enum": [
           "replayed",
           "revoked",
-          "client_revoked"
+          "client_revoked",
+          "password_reset"
         ]
       },
       "OauthGrantEnded": {
