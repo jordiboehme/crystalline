@@ -126,3 +126,22 @@ async fn turso_readers_and_a_write_loop_run_side_by_side() {
     }
     assert_eq!(reader.domain_names().await.unwrap().len(), 200);
 }
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_postgres_reader_answers_beside_the_pinned_transaction_and_sees_only_commits() {
+    let Some(scratch) = crate::pg::scratch("rc") else {
+        return;
+    };
+    let store = crystalline_index::PostgresStore::open_in_schema_with_readers(
+        scratch.url(),
+        scratch.name(),
+        2,
+    )
+    .await
+    .unwrap();
+    let reader = store
+        .read_pool()
+        .expect("a postgres store opens read connections");
+    reader_beside_open_transaction(&store, reader).await;
+}

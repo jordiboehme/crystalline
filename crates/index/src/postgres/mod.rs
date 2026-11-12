@@ -97,8 +97,8 @@ pub use search::{
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
@@ -109,6 +109,9 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
+use crate::reader::{
+    CoverageCache, CoverageGuard, READ_POOL_SIZE, ReadPool, ReaderBackend, read_connections_enabled,
+};
 use crate::store::ReadStore;
 use crate::store::WorkClaim;
 use crate::store::{
@@ -249,10 +252,11 @@ pub struct PostgresStore {
     // text, which changes sqlx's cache key and so guarantees a fresh prepare
     // after every width change; see the module doc for why this exists.
     // `AtomicU64` rather than the `Mutex<_>` used elsewhere because it is only
-    // ever read or bumped, never checked-and-set as part of a larger decision;
-    // `Ordering::Relaxed` is enough since the engine mutex already serializes
-    // all store access, so there is never a concurrent reader to order against.
-    embedding_generation: AtomicU64,
+    // ever read or bumped, never checked-and-set as part of a larger decision.
+    // Shared with the read connections, which run `lead_vectors` beside the
+    // writer and must see a bump the writer made: bumped with `Release`,
+    // read with `Acquire`.
+    embedding_generation: Arc<AtomicU64>,
     // The last computed embedding coverage snapshot per chunk table, shared by
     // effective_mode, the search staleness gate and CLI status so they issue
     // one aggregate scan, not three. A table with no entry recomputes on its
@@ -269,7 +273,16 @@ pub struct PostgresStore {
     // the above that ran inside the transaction). upsert_engram,
     // upsert_engram_checked and rename_engram never touch the chunk table, so
     // they are not invalidators.
-    coverage_cache: Mutex<HashMap<ChunkTable, EmbeddingCoverage>>,
+    //
+    // Shared with the read connections, which fill it too; see
+    // `CoverageCache` for when a fill is kept.
+    coverage: Arc<CoverageCache>,
+    // `Some` on a read connection: the cache generation it saw before its
+    // read transaction began. `None` on the writer.
+    reader_generation: Option<AtomicU64>,
+    // The read connections beside this writer: a pool of their own with
+    // read-only sessions. `None` on a reader and with read connections off.
+    readers: Option<Arc<ReadPool<PostgresStore>>>,
 }
 
 /// A connection handle for one store method: either the pinned transaction
@@ -386,8 +399,12 @@ impl PostgresStore {
     /// connection's default search_path. `max_connections` is small: the engine
     /// mutex plus the pinned-connection transaction model means effective write
     /// concurrency is one, matching Turso.
+    ///
+    /// Beside the writer's pool it opens [`READ_POOL_SIZE`] read connections
+    /// of their own (lazily, read-only sessions) unless
+    /// `CRYSTALLINE_READ_CONNECTIONS=0` turns them off.
     pub async fn open(url: &str) -> Result<PostgresStore> {
-        Self::build(url, None).await
+        Self::build(url, None, default_readers()).await
     }
 
     /// Open a pool at `url`, routing every connection to `schema` (created if
@@ -396,10 +413,20 @@ impl PostgresStore {
     /// the per-test isolation seam for the parity suite; drop it afterwards with
     /// [`PostgresStore::drop_schema`].
     pub async fn open_in_schema(url: &str, schema: &str) -> Result<PostgresStore> {
-        Self::build(url, Some(schema.to_string())).await
+        Self::build(url, Some(schema.to_string()), default_readers()).await
     }
 
-    async fn build(url: &str, schema: Option<String>) -> Result<PostgresStore> {
+    /// [`PostgresStore::open_in_schema`] with `readers` read connections,
+    /// whatever the environment says; `0` opens none.
+    pub async fn open_in_schema_with_readers(
+        url: &str,
+        schema: &str,
+        readers: usize,
+    ) -> Result<PostgresStore> {
+        Self::build(url, Some(schema.to_string()), readers).await
+    }
+
+    async fn build(url: &str, schema: Option<String>, readers: usize) -> Result<PostgresStore> {
         let db_path = sanitize_url(url);
         let mut opts = PgPoolOptions::new().max_connections(4);
         if let Some(s) = schema.clone() {
@@ -427,7 +454,7 @@ impl PostgresStore {
             drop(conn);
         }
         let schema_version = run.version?;
-        Ok(PostgresStore {
+        let mut store = PostgresStore {
             pool,
             tx: TokioMutex::new(None),
             db_path,
@@ -435,9 +462,53 @@ impl PostgresStore {
             schema,
             tag_cache: Mutex::new(HashMap::new()),
             embedding_width: Mutex::new(HashMap::new()),
-            embedding_generation: AtomicU64::new(0),
-            coverage_cache: Mutex::new(HashMap::new()),
-        })
+            embedding_generation: Arc::new(AtomicU64::new(0)),
+            coverage: Arc::new(CoverageCache::default()),
+            reader_generation: None,
+            readers: None,
+        };
+        if readers > 0 {
+            store.readers = Some(Arc::new(store.read_pool_at(url, readers)?));
+        }
+        Ok(store)
+    }
+
+    /// `count` read connections beside this writer: a pool of their own,
+    /// opened lazily, whose sessions are read-only by default and use the
+    /// writer's schema. Each reader is a store of its own whose pinned
+    /// connection is its read transaction's, never the writer's.
+    fn read_pool_at(&self, url: &str, count: usize) -> Result<ReadPool<PostgresStore>> {
+        let mut setup = String::from("SET default_transaction_read_only = on");
+        if let Some(s) = &self.schema {
+            setup.push_str(&format!("; SET search_path TO {}, public", quote_ident(s)));
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(count as u32)
+            .after_connect(move |conn, _meta| {
+                let setup = setup.clone();
+                Box::pin(async move {
+                    sqlx::raw_sql(AssertSqlSafe(setup)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_lazy(url)
+            .map_err(IndexError::from)?;
+        let slots = (0..count)
+            .map(|_| PostgresStore {
+                pool: pool.clone(),
+                tx: TokioMutex::new(None),
+                db_path: self.db_path.clone(),
+                schema_version: self.schema_version,
+                schema: self.schema.clone(),
+                tag_cache: Mutex::new(HashMap::new()),
+                embedding_width: Mutex::new(HashMap::new()),
+                embedding_generation: self.embedding_generation.clone(),
+                coverage: self.coverage.clone(),
+                reader_generation: Some(AtomicU64::new(0)),
+                readers: None,
+            })
+            .collect();
+        Ok(ReadPool::new(slots))
     }
 
     /// Drop every cached embedding coverage snapshot so the next read of any
@@ -445,8 +516,13 @@ impl PostgresStore {
     /// stale. Called by every mutator that can change a chunk's embedding state.
     /// Kept in a tight scope with no await so the std::sync guard never crosses a
     /// suspension point.
-    fn invalidate_coverage(&self) {
-        self.coverage_cache.lock().unwrap().clear();
+    ///
+    /// The returned guard invalidates once more when the write is over (or
+    /// the commit does, inside a transaction), so a read connection that
+    /// filled the cache from the state before the write never leaves that
+    /// value behind.
+    fn invalidate_coverage(&self) -> CoverageGuard<'_> {
+        self.coverage.invalidate()
     }
 
     /// Recompute the embedding coverage snapshot of one chunk table. This is the
@@ -716,7 +792,7 @@ impl PostgresStore {
         Connection::clear_cached_statements(&mut *conn)
             .await
             .map_err(IndexError::from)?;
-        self.embedding_generation.fetch_add(1, Ordering::Relaxed);
+        self.embedding_generation.fetch_add(1, Ordering::Release);
         self.embedding_width.lock().unwrap().insert(table, dims);
         Ok(())
     }
@@ -2861,19 +2937,17 @@ impl ReadStore for PostgresStore {
         if let Some(domains) = domains {
             return self.compute_coverage_in(table, domains).await;
         }
-        // Fast path in a tight scope so the std::sync guard is dropped before the
-        // recompute await below (clippy::await_holding_lock), tag_cache style.
-        {
-            let cached = self.coverage_cache.lock().unwrap();
-            if let Some(cov) = cached.get(&table) {
-                return Ok(cov.clone());
-            }
+        if let Some(cov) = self.coverage.get(table) {
+            return Ok(cov);
         }
         let cov = self.compute_coverage(table).await?;
-        self.coverage_cache
-            .lock()
-            .unwrap()
-            .insert(table, cov.clone());
+        match &self.reader_generation {
+            Some(seen) => {
+                self.coverage
+                    .fill_from_reader(table, cov.clone(), seen.load(Ordering::Acquire))
+            }
+            None => self.coverage.fill_from_writer(table, cov.clone()),
+        }
         Ok(cov)
     }
 
@@ -2887,7 +2961,7 @@ impl ReadStore for PostgresStore {
         // The `/* w{generation} */` comment `lead_vectors_sql` carries is what
         // keeps a resized embedding column out of sqlx's statement cache; see
         // that builder.
-        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let generation = self.embedding_generation.load(Ordering::Acquire);
         let mut params = vec![Param::Int(domain.0), Param::Text(model.to_string())];
         let mut n = 3usize;
         let actor_screen = search::actor_screen_on("e", actor, &mut params, &mut n);
@@ -3959,7 +4033,7 @@ impl Store for PostgresStore {
 
     async fn drop_empty_domain_row(&self, name: &str) -> Result<bool> {
         // May delete stray chunk rows, so the coverage snapshot may be stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         in_transaction(self, async {
             let mut conn = self.acquire().await?;
             let c = conn.as_mut();
@@ -4049,7 +4123,7 @@ impl Store for PostgresStore {
 
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
         // Deletes this domain's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         // Delete a single domain's engram, attachment and child rows, keeping
         // the domain row. Child rows first so the enforced foreign keys are
         // satisfied, attachment blobs before the attachment rows that own them
@@ -4108,7 +4182,7 @@ impl Store for PostgresStore {
 
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()> {
         // Deletes the engram's chunks, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         // The base row at this path. A draft is dropped by its own actor
@@ -4330,7 +4404,7 @@ impl Store for PostgresStore {
     async fn replace_chunks(&self, engram_id: EngramId, chunks: &[NewChunk]) -> Result<()> {
         // Deletes and reinserts this engram's chunks, so the coverage snapshot is
         // now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let eid = engram_id.0;
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
@@ -4351,7 +4425,7 @@ impl Store for PostgresStore {
         // `begin()`), where a failed statement would abort the whole
         // transaction with no way to recover by retrying in place, which is why
         // prevention rather than retry is the fix here.
-        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let generation = self.embedding_generation.load(Ordering::Acquire);
         let carry_sql = format!(
             "SELECT text_hash, model, dims, embedding FROM chunk WHERE engram_id=$1 AND embedding IS NOT NULL /* w{generation} */"
         );
@@ -4419,7 +4493,7 @@ impl Store for PostgresStore {
         model: &str,
     ) -> Result<()> {
         // Writes embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         // Validate the whole batch before any write so a bad row never leaves
         // earlier rows committed.
         for row in batch {
@@ -4473,7 +4547,7 @@ impl Store for PostgresStore {
 
     async fn prune_embeddings_except_in(&self, table: ChunkTable, model: &str) -> Result<usize> {
         // Clears embeddings, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let done = sqlx::query(chunk_sql(table).prune)
             .bind(model)
@@ -4698,7 +4772,7 @@ impl Store for PostgresStore {
 
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         sqlx::query("BEGIN")
@@ -4818,7 +4892,7 @@ impl Store for PostgresStore {
         }
         // Deletes the draft's chunks, so the coverage snapshot is now stale.
         // No contradiction rows to delete: drafts are never scored.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         let id = sqlx::query("SELECT id FROM engram WHERE domain_id=$1 AND actor=$2 AND path=$3")
@@ -5387,7 +5461,7 @@ impl Store for PostgresStore {
     async fn delete_reflection(&self, domain: DomainId, path: &str) -> Result<bool> {
         // Takes the page's chunks too (R53), so the coverage snapshot is now
         // stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         sqlx::query("DELETE FROM reflection_chunk WHERE domain_id=$1 AND path=$2")
@@ -5414,7 +5488,7 @@ impl Store for PostgresStore {
     ) -> Result<()> {
         // Deletes and reinserts this page's chunks, so the coverage snapshot
         // is now stale.
-        self.invalidate_coverage();
+        let _coverage = self.invalidate_coverage();
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
         // Carry over the vector of any chunk whose fingerprint is unchanged, as
@@ -5422,7 +5496,7 @@ impl Store for PostgresStore {
         // `embedding` column, so it carries the `/* w{generation} */` cache-key
         // comment for the reason `replace_chunks`' carry SELECT does (see the
         // module doc).
-        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let generation = self.embedding_generation.load(Ordering::Acquire);
         let carry_sql = format!(
             "SELECT text_hash, model, dims, embedding FROM reflection_chunk \
              WHERE domain_id=$1 AND path=$2 AND embedding IS NOT NULL /* w{generation} */"
@@ -5502,6 +5576,7 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         *guard = Some(c);
+        self.coverage.began();
         crate::reader::txn::opened();
         Ok(())
     }
@@ -5509,11 +5584,12 @@ impl Store for PostgresStore {
     async fn commit(&self) -> Result<()> {
         let mut guard = self.tx.lock().await;
         if let Some(mut c) = guard.take() {
+            let committed = sqlx::query("COMMIT").execute(&mut *c).await;
+            // The connection went back to the pool with the transaction over
+            // either way: a failed COMMIT ends it on the server.
+            self.coverage.ended(committed.is_err());
             crate::reader::txn::closed();
-            sqlx::query("COMMIT")
-                .execute(&mut *c)
-                .await
-                .map_err(IndexError::from)?;
+            committed.map_err(IndexError::from)?;
         }
         Ok(())
     }
@@ -5521,7 +5597,6 @@ impl Store for PostgresStore {
     async fn rollback(&self) -> Result<()> {
         let mut guard = self.tx.lock().await;
         if let Some(mut c) = guard.take() {
-            crate::reader::txn::closed();
             let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
         }
         // A rolled-back tag insert leaves its cached id pointing at a row that no
@@ -5529,8 +5604,15 @@ impl Store for PostgresStore {
         self.tag_cache.lock().unwrap().clear();
         // A rollback also reverts any chunk mutation made in the transaction, so a
         // snapshot recomputed mid-transaction must not survive it.
-        self.invalidate_coverage();
+        self.coverage.ended(true);
+        crate::reader::txn::closed();
         Ok(())
+    }
+
+    fn read_pool(&self) -> Option<Arc<dyn ReadStore>> {
+        self.readers
+            .clone()
+            .map(|readers| readers as Arc<dyn ReadStore>)
     }
 }
 
@@ -5802,6 +5884,49 @@ impl PostgresStore {
     }
 }
 
+/// How many read connections a store opens by default: [`READ_POOL_SIZE`],
+/// or none with `CRYSTALLINE_READ_CONNECTIONS=0`.
+fn default_readers() -> usize {
+    if read_connections_enabled() {
+        READ_POOL_SIZE
+    } else {
+        0
+    }
+}
+
+/// A read connection: each call runs in one read-only repeatable-read
+/// transaction on a connection of the reader pool, pinned in this store's
+/// `tx` for the call, so every statement of a method sees one snapshot and
+/// none ever runs on the writer's open transaction.
+#[async_trait]
+impl ReaderBackend for PostgresStore {
+    async fn open_read(&self) -> Result<()> {
+        if let Some(seen) = &self.reader_generation {
+            seen.store(self.coverage.generation(), Ordering::Release);
+        }
+        let mut c = self.pool.acquire().await.map_err(IndexError::from)?;
+        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *c)
+            .await
+            .map_err(IndexError::from)?;
+        *self.tx.lock().await = Some(c);
+        Ok(())
+    }
+
+    async fn close_read(&self, ok: bool) {
+        let Some(mut c) = self.tx.lock().await.take() else {
+            return;
+        };
+        let end = if ok { "COMMIT" } else { "ROLLBACK" };
+        if let Err(e) = sqlx::query(end).execute(&mut *c).await {
+            tracing::debug!("a read transaction did not end cleanly ({end}): {e}");
+            // A session that may still be in a transaction never serves
+            // another call.
+            drop(c.detach());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The work claim id is fixed: two instances of different builds on one
@@ -5826,6 +5951,48 @@ mod tests {
             work_claim_id(Some("a"), "contradictions:1"),
             work_claim_id(Some("a"), "contradictions:2")
         );
+    }
+
+    /// A read connection's session is read-only and uses the writer's
+    /// schema, and its transaction never is the writer's pinned one.
+    #[tokio::test]
+    async fn a_read_connection_refuses_a_write_and_sees_the_writers_schema() {
+        use super::*;
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let scratch = ScratchSchema::new(&url, "rdo");
+        let store = PostgresStore::open_in_schema_with_readers(&url, scratch.name(), 1)
+            .await
+            .unwrap();
+        store
+            .upsert_domain("one", None, DomainKind::Virtual)
+            .await
+            .unwrap();
+        let readers = store.readers.clone().unwrap();
+        let lease = readers.lease().await.unwrap();
+        let reader = lease.store();
+        reader.open_read().await.unwrap();
+        assert_eq!(
+            reader.domain_names().await.unwrap(),
+            vec!["one".to_string()]
+        );
+        let refused = {
+            let mut conn = reader.acquire().await.unwrap();
+            sqlx::query("INSERT INTO domain(name, kind) VALUES('two', 'virtual')")
+                .execute(conn.as_mut())
+                .await
+        };
+        assert!(
+            refused.is_err(),
+            "a read-only transaction refuses an insert"
+        );
+        reader.close_read(false).await;
+        drop(lease);
+        assert!(store.domain_id("two").await.unwrap().is_none());
     }
 
     /// A line vector whose stored blob disagrees with its `dims` column is
