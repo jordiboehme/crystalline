@@ -15,8 +15,9 @@
 # (CRYSTALLINE_AUTH_MCP below). http://localhost:7411 works out of the box;
 # reaching the daemon by any other name (the crystalline service-name, a LAN
 # host or a reverse proxy) needs that host in
-# CRYSTALLINE_SERVICE_ALLOWED_HOSTS, since the daemon checks the Host header
-# to block DNS rebinding. That check is not access control; the token is.
+# CRYSTALLINE_SERVICE_ALLOWED_HOSTS, for agents and for the web UI alike,
+# since the daemon checks the Host header to block DNS rebinding. That check
+# is not access control; the token is.
 #
 # Start it:
 #   docker compose -f examples/docker/compose.yaml up -d

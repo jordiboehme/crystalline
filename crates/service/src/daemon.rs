@@ -2596,7 +2596,7 @@ fn http_base(
             move || Ok(McpServer::new_http(engine.clone()).with_session_owners(owners.clone()))
         },
         session_manager,
-        http_config(allowed_hosts),
+        http_config(allowed_hosts, config.service_public_url()),
     );
     // The gate wraps the transport rather than the router, which is the whole
     // of its scope: `/health` keeps answering an orchestrator's probe, the JSON
@@ -2629,6 +2629,15 @@ fn http_base(
         // check. Mounted whether or not the API is served.
         .merge(crate::remote_ctl::route(ctl));
     if let Some(rest) = rest {
+        // The same `Host` rule the MCP transport applies, in front of the JSON
+        // API, so a DNS-rebinding page cannot reach it either. A layer on the
+        // nested router rather than inside `rest::router`, so a router built
+        // for a test without a daemon keeps answering requests that carry no
+        // `Host`. See `rest::host_guard`.
+        let rest = rest.layer(axum::middleware::from_fn_with_state(
+            crate::rest::host_guard::HostGuard::new(allowed_hosts, config.service_public_url()),
+            crate::rest::host_guard::check,
+        ));
         router = router.nest("/api/v1", rest);
     }
     Ok((router, service))
@@ -3743,10 +3752,11 @@ fn describe_hosts(hosts: &[String]) -> String {
 }
 
 /// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
-/// and dropping the SSE priming frame. An empty `allowed_hosts` keeps rmcp's
-/// loopback-only default; a single `*` disables the guard (any Host allowed);
-/// otherwise loopback is merged with the configured hosts so local access
-/// never breaks.
+/// and dropping the SSE priming frame. The list comes from
+/// `crate::rest::host_guard`, the resolver the JSON API's own `Host` guard
+/// reads: loopback, the configured hosts and the host of `service.public_url`
+/// (an empty `allowed_hosts` is therefore loopback only, rmcp's own default,
+/// plus that host), while a single `*` turns the guard off.
 ///
 /// The priming frame (SEP-1699: an empty `data:` event carrying only an `id:`
 /// and a `retry:` reconnection hint, sent ahead of the real JSON-RPC response)
@@ -3781,24 +3791,18 @@ fn describe_hosts(hosts: &[String]) -> String {
 /// handler runs.
 fn http_config(
     allowed_hosts: &[String],
+    public_url: Option<&str>,
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
+    use crate::rest::host_guard::effective_hosts;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
     let base = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
         .with_legacy_session_mode(true)
         .with_max_request_body_bytes(crate::rest::MAX_TOOL_BODY_BYTES);
-    if allowed_hosts.iter().any(|h| h == "*") {
-        return base.disable_allowed_hosts();
+    match effective_hosts(allowed_hosts, public_url) {
+        Some(hosts) => base.with_allowed_hosts(hosts),
+        None => base.disable_allowed_hosts(),
     }
-    if allowed_hosts.is_empty() {
-        return base;
-    }
-    let mut hosts = crate::rest::ALWAYS_ALLOWED_HOSTS
-        .iter()
-        .map(|host| host.to_string())
-        .collect::<Vec<_>>();
-    hosts.extend(allowed_hosts.iter().cloned());
-    base.with_allowed_hosts(hosts)
 }
 
 pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -4946,13 +4950,13 @@ mod tests {
 
     #[test]
     fn http_config_empty_keeps_loopback_only_default() {
-        let cfg = http_config(&[]);
+        let cfg = http_config(&[], None);
         assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1", "::1"]);
     }
 
     #[test]
     fn http_config_star_disables_the_guard() {
-        let cfg = http_config(&["*".to_string()]);
+        let cfg = http_config(&["*".to_string()], None);
         assert!(
             cfg.allowed_hosts.is_empty(),
             "an empty allow-list makes rmcp accept any Host"
@@ -4985,7 +4989,7 @@ mod tests {
     /// difference.
     #[test]
     fn http_config_pins_the_session_mode_and_the_body_limit() {
-        let cfg = http_config(&[]);
+        let cfg = http_config(&[], None);
         assert!(
             cfg.legacy_session_mode,
             "legacy clients keep their Mcp-Session-Id routing"
@@ -4999,10 +5003,21 @@ mod tests {
 
     #[test]
     fn http_config_merges_loopback_with_configured_hosts() {
-        let cfg = http_config(&["muthur.lan".to_string()]);
+        let cfg = http_config(&["muthur.lan".to_string()], None);
         assert_eq!(
             cfg.allowed_hosts,
             vec!["localhost", "127.0.0.1", "::1", "muthur.lan"]
+        );
+    }
+
+    /// The host of `service.public_url` is the operator's own name for this
+    /// instance, so the transport answers it like a listed host.
+    #[test]
+    fn http_config_answers_the_public_url_host() {
+        let cfg = http_config(&[], Some("https://kb.example/crystalline"));
+        assert_eq!(
+            cfg.allowed_hosts,
+            vec!["localhost", "127.0.0.1", "::1", "kb.example"]
         );
     }
 

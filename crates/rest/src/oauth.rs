@@ -424,9 +424,9 @@ fn normalize_host(host: &str) -> String {
 /// names none. Written out here rather than borrowed because it is private
 /// upstream; if an rmcp bump changes it, this is the code to diff against.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AllowedHost {
-    host: String,
-    port: Option<u16>,
+pub(crate) struct AllowedHost {
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
 }
 
 impl AllowedHost {
@@ -434,7 +434,7 @@ impl AllowedHost {
     /// authority at all, which matches no entry and is therefore refused - the
     /// same direction [`request_origin`]'s own parse takes, and the same one
     /// the transport takes.
-    fn arriving(value: &str) -> Option<AllowedHost> {
+    pub(crate) fn arriving(value: &str) -> Option<AllowedHost> {
         let value = value.trim();
         if value.is_empty() {
             return None;
@@ -453,7 +453,7 @@ impl AllowedHost {
     /// spelling `ALWAYS_ALLOWED_HOSTS` and rmcp's own default both use - does
     /// not parse as one, while the `[::1]:7411` a client sends does. rmcp
     /// falls back the same way, so the two lists accept the same entries.
-    fn entry(value: &str) -> Option<AllowedHost> {
+    pub(crate) fn entry(value: &str) -> Option<AllowedHost> {
         let value = value.trim();
         if value.is_empty() {
             return None;
@@ -467,7 +467,7 @@ impl AllowedHost {
     /// Whether `self`, an allow-list entry, covers the `Host` of a request.
     /// An entry naming no port covers every port on that host, which is the
     /// transport's rule and the one an operator listing a hostname expects.
-    fn covers(&self, request: &AllowedHost) -> bool {
+    pub(crate) fn covers(&self, request: &AllowedHost) -> bool {
         self.host == request.host && (self.port.is_none() || self.port == request.port)
     }
 }

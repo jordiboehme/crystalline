@@ -57,7 +57,7 @@ That endpoint carries MCP over HTTP, the JSON API and the web UI.
 
 - The JSON API and the web UI require an account. A daemon with no account yet lets a caller on loopback create the first admin. On any other bind it asks for a one-time setup token that it prints at startup.
 - MCP over HTTP is open by default (`auth.mcp` is `false`). Any process that can reach the port is served without a token. It can read and write every domain that is not private, and it can change settings, register domains and apply provisioning. On a shared host this includes processes of other users.
-- The `Host` allow-list guards the MCP endpoint and the OAuth endpoints, loopback only by default, as a guard against DNS rebinding. `service.allowed_hosts` adds more names. A browser reaching the web UI and the JSON API needs no entry; those need an account instead.
+- The `Host` allow-list guards the MCP endpoint, the JSON API and the OAuth endpoints, as a guard against DNS rebinding. By default it allows loopback and the host of `service.public_url`. `service.allowed_hosts` adds more names, so a browser that opens the web UI by another name needs that name listed. The allow-list is not access control: a program that is not a browser can send any `Host`. Accounts and `auth.mcp` keep people and agents out.
 - There is no built-in TLS. For anything other than localhost, put a TLS terminator in front (see [Web UI from the daemon](deployment.md#web-ui-from-the-daemon)).
 
 How to close it:
@@ -85,7 +85,7 @@ With `auth.mcp` off, an agent may set a domain's policies and rule overrides thr
 | `recall.enabled` | The per-prompt hook hands the agent matching engrams | `true` |
 | `skills.serve` | Serves the agent skills over MCP; `auto` skips a stdio session whose harness already has them as files | `auto` |
 | `auth.anonymous` | `true` serves JSON API requests with no identity at viewer level | `false` |
-| `service.allowed_hosts` | Extra `Host` header values the MCP endpoint and the OAuth endpoints accept; `*` accepts any | loopback only |
+| `service.allowed_hosts` | Extra `Host` header values the MCP endpoint, the JSON API and the OAuth endpoints accept; `*` accepts any | loopback and the host of `service.public_url` |
 | `service.ui` | `false` stops serving the web UI | `true` |
 | `service.api` | `false` stops serving the JSON API, and the web UI with it | `true` |
 

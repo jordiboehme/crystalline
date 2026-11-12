@@ -57,8 +57,12 @@ services:
     # The daemon is not published to the host here: Fluid is the only thing
     # that needs it, and it reaches it over this compose network. Publish it
     # too when agents should connect to the MCP endpoint as well, and add the
-    # name they use to CRYSTALLINE_SERVICE_ALLOWED_HOSTS - the MCP transport
-    # validates the Host header (the JSON API Fluid uses does not).
+    # name they use to CRYSTALLINE_SERVICE_ALLOWED_HOSTS. The daemon checks
+    # the Host header on MCP and on the JSON API Fluid forwards to it. Fluid
+    # passes the browser's Host on, so http://localhost works as it is, and
+    # any other name people open Fluid at (muthur.lan, a public host name)
+    # goes into CRYSTALLINE_SERVICE_ALLOWED_HOSTS too, or into
+    # CRYSTALLINE_SERVICE_PUBLIC_URL, whose host is always allowed.
     # ports:
     #   - "7411:7411"
     environment:

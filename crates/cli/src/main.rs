@@ -447,8 +447,9 @@ enum Command {
         /// (on at 127.0.0.1:7411 by default; pass 'off' to disable).
         #[arg(long)]
         http: Option<String>,
-        /// Accept this `Host` header value on the HTTP transport (repeatable).
-        /// Loopback is always allowed; a single `*` allows any Host (quote it).
+        /// Accept this `Host` header value for MCP and the JSON API over HTTP
+        /// (repeatable). Loopback and the host of service.public_url are
+        /// always allowed; a single `*` allows any Host (quote it).
         /// Wins over CRYSTALLINE_SERVICE_ALLOWED_HOSTS and service.allowed_hosts.
         #[arg(long = "allowed-host", value_name = "HOST")]
         allowed_host: Vec<String>,
