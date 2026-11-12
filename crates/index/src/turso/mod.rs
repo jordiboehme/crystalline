@@ -4583,13 +4583,20 @@ impl Store for TursoStore {
     /// reset; that is no failure of the sync that asked; the next checkpoint
     /// tries again.
     async fn checkpoint_wal(&self) -> Result<()> {
-        if let Err(e) = self.truncate_wal().await {
-            if self.readers.is_none() {
-                return Err(e);
+        match self
+            .conn
+            .query_all("PRAGMA wal_checkpoint(TRUNCATE)", vec![])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(turso::Error::Busy(e) | turso::Error::BusySnapshot(e))
+                if self.readers.is_some() =>
+            {
+                tracing::debug!("the WAL checkpoint did not finish beside a reader: {e}");
+                Ok(())
             }
-            tracing::debug!("the WAL checkpoint did not finish beside a reader: {e}");
+            Err(e) => Err(e.into()),
         }
-        Ok(())
     }
 
     async fn record_sync(
