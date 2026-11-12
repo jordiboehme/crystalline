@@ -142,7 +142,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 |---|---|
 | [Personal workstation](docs/deployment.md#personal-workstation) | The default: local folders, agents over stdio, one shared background daemon |
 | [Claude Desktop extension](docs/deployment.md#claude-desktop-extension) | `crystalline install claude-desktop` builds a small extension that connects Claude Desktop to the Crystalline you installed; a Desktop-only bundle with Crystalline inside exists for Mac users of Claude Desktop alone |
-| [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP |
+| [Team server](docs/deployment.md#team-server) | One container on the network, every agent connects over HTTP with its own token |
 | [Web UI from the daemon](docs/deployment.md#web-ui-from-the-daemon) | The browser UI ships built into the binary, on by default at localhost - browse what your agents know with zero extra moving parts, and follow the links they hand you into it |
 | [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | The scale-out variant: nginx replicas in front when one daemon port is not enough |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |

@@ -69,6 +69,15 @@ services:
     # daemon on the host binds the same way, whoever started it.
     environment:
       CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+      # Every agent that connects over HTTP signs in with a personal MCP
+      # token. Without this, anyone who can reach the port is served with no
+      # sign-in: they can read and change every shared domain, register
+      # folders and change settings. The Host allow-list is not access
+      # control, because any program can send "Host: localhost". Give each
+      # agent its own account and token (the token is printed once):
+      #   docker compose -f examples/docker/compose.postgres.yaml exec crystalline \
+      #     crystalline users add agent-build --role editor --mcp-token build
+      CRYSTALLINE_AUTH_MCP: "true"
       CRYSTALLINE_DATABASE_BACKEND: postgres
       CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
     depends_on:
@@ -94,6 +103,7 @@ services:
   #   hostname: crystalline-b
   #   environment:
   #     CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+  #     CRYSTALLINE_AUTH_MCP: "true"
   #     CRYSTALLINE_DATABASE_BACKEND: postgres
   #     CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
   #   depends_on:

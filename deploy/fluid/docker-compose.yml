@@ -63,6 +63,15 @@ services:
     #   - "7411:7411"
     environment:
       CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+      # Every agent that connects over HTTP signs in with a personal MCP
+      # token. Without this, anyone who can reach the port is served with no
+      # sign-in: they can read and change every shared domain, register
+      # folders and change settings. The Host allow-list is not access
+      # control, because any program can send "Host: localhost". Give each
+      # agent its own account and token (the token is printed once):
+      #   docker compose -f deploy/fluid/docker-compose.yml exec crystalline \
+      #     crystalline users add agent-build --role editor --mcp-token build
+      CRYSTALLINE_AUTH_MCP: "true"
       # CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
       # Let anyone who can reach Fluid read without an account, at viewer
       # level. Pair it with --read-only for a published, browsable archive.

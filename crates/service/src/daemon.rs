@@ -415,6 +415,15 @@ pub async fn run_serve(
             tracing::warn!("{line}");
         }
     }
+    // An open MCP tier on a reachable bind is said out loud at every start,
+    // through the same channel as the notices above: stderr for a foreground
+    // serve (and so `docker logs`), daemon.log for a daemonized one.
+    if let Some(line) = http_addr
+        .as_deref()
+        .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
+    {
+        tracing::warn!("{line}");
+    }
     // The state folder holds the index, the accounts database and the log,
     // none of which another account on this machine may read: owner-only on
     // Unix, tightened here for an install from before that rule. Best effort,
@@ -3679,6 +3688,30 @@ fn exposure_override_notice(
     })
 }
 
+/// The startup warning for a daemon that serves MCP over HTTP with no sign-in
+/// on an address other machines can reach: `auth.mcp` off and a bind that is
+/// not loopback, which is the container image's default. `None` otherwise.
+///
+/// A warning, not a refusal: the open tier is the documented default and a
+/// trusted network is a real reason to keep it. What the line does is say out
+/// loud, at every start, what that default means, because the one guard in
+/// front of the open tier (the `Host` allow-list) stops a browser and nothing
+/// else. Loopback is read with [`bind_is_loopback`], the same question the
+/// setup token asks.
+fn open_mcp_warning(addr: &str, auth_mcp: bool) -> Option<String> {
+    if auth_mcp || bind_is_loopback(addr) {
+        return None;
+    }
+    Some(format!(
+        "the HTTP endpoint binds {addr}, which other machines can reach, and auth.mcp is off. \
+         Any client that reaches this port is served over MCP with no sign-in: it can read and \
+         change every shared domain, register folders and change settings. The Host allow-list \
+         is not access control. Turn sign-in on with CRYSTALLINE_AUTH_MCP=true or crystalline \
+         config set auth.mcp true, then give each agent a token with crystalline users mcp-token \
+         <name>"
+    ))
+}
+
 /// Render an HTTP resolution for the notice above: an address, or the words
 /// for a closed endpoint. Not the bare word "off", which reads as a value the
 /// other daemons bind ("that is what every other daemon on this machine
@@ -4825,6 +4858,30 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A daemon that serves MCP with no sign-in on an address other machines
+    /// can reach says so, and names the setting that closes it.
+    #[test]
+    fn an_open_mcp_tier_on_a_reachable_bind_is_warned_about() {
+        let line = open_mcp_warning("0.0.0.0:7411", false).expect("a warning");
+        assert!(line.contains("0.0.0.0:7411"), "{line}");
+        assert!(line.contains("auth.mcp is off"), "{line}");
+        assert!(line.contains("CRYSTALLINE_AUTH_MCP=true"), "{line}");
+        assert!(line.contains("not access control"), "{line}");
+        assert!(open_mcp_warning("192.168.1.20:7411", false).is_some());
+        assert!(open_mcp_warning("[::]:7411", false).is_some());
+        assert!(open_mcp_warning("muthur.lan:7411", false).is_some());
+    }
+
+    /// Loopback is the machine owner's own port, and with `auth.mcp` on every
+    /// agent signs in: neither is warned about.
+    #[test]
+    fn no_warning_on_loopback_or_with_agent_sign_in_on() {
+        for addr in ["127.0.0.1:7411", "localhost:7411", "[::1]:7411"] {
+            assert_eq!(open_mcp_warning(addr, false), None, "{addr}");
+        }
+        assert_eq!(open_mcp_warning("0.0.0.0:7411", true), None);
     }
 
     /// The line names both values and the key, and gives the command that makes
