@@ -248,13 +248,15 @@ async fn rig(settings: &Settings, store: Arc<Mutex<dyn Store>>, db: Option<PathB
     let tmp = tempfile::tempdir().unwrap();
     let started = Instant::now();
     let dir = write_fixture(tmp.path(), settings.seed, settings.engrams);
-    let mut cfg = GlobalConfig::default();
-    cfg.embeddings = Some(EmbeddingsConfig {
-        provider: "remote".to_string(),
-        model: MODEL.to_string(),
-        endpoint: None,
-        api_key_env: None,
-    });
+    let mut cfg = GlobalConfig {
+        embeddings: Some(EmbeddingsConfig {
+            provider: "remote".to_string(),
+            model: MODEL.to_string(),
+            endpoint: None,
+            api_key_env: None,
+        }),
+        ..GlobalConfig::default()
+    };
     cfg.domains
         .insert(DOMAIN.to_string(), DomainEntry::file(dir));
     cfg.service = Some(ServiceConfig {
