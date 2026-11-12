@@ -10789,8 +10789,20 @@
           "settings"
         ],
         "summary": "The caller's own OAuth grants, newest first.",
-        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge.",
+        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge. With `include_ended=true` the grants that ended in the last seven days follow the live ones, newest first, each with `ended` naming when and why (an old refresh token used again, revoked here, or revoked by the client), so a person can tell why a client is gone. Such a row cannot be revoked again.",
         "operationId": "list_my_oauth_grants",
+        "parameters": [
+          {
+            "name": "include_ended",
+            "in": "query",
+            "description": "Also list the grants that ended in the last seven days, after the live\nones, each with `ended` saying when and why. Defaults to false, which\nlists the live grants only.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "example": true
+          }
+        ],
         "responses": {
           "200": {
             "description": "This account's connected clients.",
@@ -15402,6 +15414,33 @@
           }
         }
       },
+      "OauthGrantEndReason": {
+        "type": "string",
+        "description": "Why a grant ended. Only the endings a person could not otherwise explain\nare recorded: an expired grant was simply not used for thirty days, and a\nremoved account has nobody left to tell.",
+        "enum": [
+          "replayed",
+          "revoked",
+          "client_revoked"
+        ]
+      },
+      "OauthGrantEnded": {
+        "type": "object",
+        "description": "When and why a grant ended, so a person can tell why a client is gone.",
+        "required": [
+          "at",
+          "reason"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "RFC 3339, when the grant ended."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/OauthGrantEndReason",
+            "description": "Why it ended."
+          }
+        }
+      },
       "OauthGrantInfo": {
         "type": "object",
         "description": "One row of an account's OAuth grant list: which client is connected, since\nwhen, and until when it may keep refreshing. Never carries a token - only\nhashes are stored, so there is nothing to show back.",
@@ -15426,6 +15465,17 @@
             "type": "string",
             "description": "RFC 3339, when the grant was created."
           },
+          "ended": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OauthGrantEnded",
+                "description": "Set when the grant has ended and this row is only the record of why,\nlisted for seven days; null for a live grant."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "id": {
             "type": "integer",
             "format": "int64",
@@ -15444,7 +15494,7 @@
           },
           "refresh_expires_at": {
             "type": "string",
-            "description": "RFC 3339, when the refresh token stops working unless it is rotated\nbefore then."
+            "description": "RFC 3339, when the refresh token stops working unless it is rotated\nbefore then. For an ended grant, when it ended."
           }
         }
       },

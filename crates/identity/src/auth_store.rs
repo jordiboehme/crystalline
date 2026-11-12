@@ -537,6 +537,46 @@ impl std::fmt::Debug for IssuedOauthGrant {
     }
 }
 
+/// A token pair about to be minted: the two unhashed tokens, which leave
+/// this store only inside an [`IssuedOauthGrant`].
+struct TokenPair {
+    access_token: String,
+    refresh_token: String,
+}
+
+impl TokenPair {
+    fn new() -> TokenPair {
+        TokenPair {
+            access_token: format!("{OAUTH_ACCESS_PREFIX}{}", random_hex()),
+            refresh_token: format!("{OAUTH_REFRESH_PREFIX}{}", random_hex()),
+        }
+    }
+
+    fn issued(&self, id: i64) -> IssuedOauthGrant {
+        IssuedOauthGrant {
+            id,
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
+        }
+    }
+}
+
+/// Whether the audience a refresh asked for (`asked`) is the one the grant
+/// holds in column `column` of `row`. Nothing asked always matches. Fails
+/// closed: a grant whose audience cannot be read is one whose audience
+/// cannot be checked, and answering it with a pair would answer a question
+/// this store does not know the answer to.
+fn audience_matches(row: &Row, column: usize, asked: Option<&str>) -> Result<bool> {
+    let Some(asked) = asked else {
+        return Ok(true);
+    };
+    let Ok(Value::Text(held)) = row.get_value(column) else {
+        bail!("an oauth grant row has an unreadable resource");
+    };
+    Ok(normalize_resource(asked) == normalize_resource(&held))
+}
+
 /// What presenting a refresh token did.
 ///
 /// Four outcomes rather than a `Result<Option<_>>`, because two of them are
@@ -546,17 +586,32 @@ impl std::fmt::Debug for IssuedOauthGrant {
 pub enum RefreshOutcome {
     /// The grant moved along: both tokens are new, the predecessors are dead.
     Rotated(IssuedOauthGrant),
+    /// The token had been rotated less than [`OAUTH_REFRESH_GRACE_SECS`] ago,
+    /// and nothing minted from it has been rotated since, so it got a pair of
+    /// its own: a parallel session of the same client, or a retry after a
+    /// lost answer. The new refresh token is live in its own right, and so is
+    /// the one the first rotation handed out; the grant lives on.
+    Reissued {
+        /// The new pair, exactly as a rotation hands one out.
+        grant: IssuedOauthGrant,
+        /// Seconds between the token's rotation and this presentation.
+        since_rotation: i64,
+    },
     /// Nothing matched - an invented token, one at the wrong registration, one
     /// past its window, or one belonging to an account that can no longer sign
     /// in. Deliberately one outcome for all four, the way
     /// [`AuthStore::mcp_token_user`] answers `None` for all of its misses.
     Unknown,
     /// The token had already been rotated away, so a copy of it outlived the
-    /// rotation. The grant it belonged to is revoked by the time this is
-    /// returned; `grant` is the id it had, for the log line.
+    /// rotation: it came back after [`OAUTH_REFRESH_GRACE_SECS`], or a token
+    /// minted from it has itself been rotated since. The grant it belonged to
+    /// is revoked by the time this is returned; `grant` is the id it had, for
+    /// the log line.
     Replayed {
         /// The id of the grant this replay revoked.
         grant: i64,
+        /// Seconds between the token's rotation and this presentation.
+        since_rotation: i64,
     },
     /// The token is live and the grant is this client's, but the request asked
     /// for a resource the grant does not hold. Nothing was rotated: handing
@@ -586,11 +641,24 @@ impl std::fmt::Debug for RefreshOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RefreshOutcome::Rotated(grant) => f.debug_tuple("Rotated").field(grant).finish(),
+            RefreshOutcome::Reissued {
+                grant,
+                since_rotation,
+            } => f
+                .debug_struct("Reissued")
+                .field("grant", grant)
+                .field("since_rotation", since_rotation)
+                .finish(),
             RefreshOutcome::Unknown => f.write_str("Unknown"),
             RefreshOutcome::WrongTarget => f.write_str("WrongTarget"),
-            RefreshOutcome::Replayed { grant } => {
-                f.debug_struct("Replayed").field("grant", grant).finish()
-            }
+            RefreshOutcome::Replayed {
+                grant,
+                since_rotation,
+            } => f
+                .debug_struct("Replayed")
+                .field("grant", grant)
+                .field("since_rotation", since_rotation)
+                .finish(),
         }
     }
 }
@@ -615,8 +683,55 @@ pub struct OauthGrantInfo {
     /// RFC 3339, when one of its access tokens last resolved a request.
     pub last_used: Option<String>,
     /// RFC 3339, when the refresh token stops working unless it is rotated
-    /// before then.
+    /// before then. For an ended grant, when it ended.
     pub refresh_expires_at: String,
+    /// Set when the grant has ended and this row is only the record of why,
+    /// listed for seven days; null for a live grant.
+    pub ended: Option<OauthGrantEnded>,
+}
+
+/// When and why a grant ended, so a person can tell why a client is gone.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OauthGrantEnded {
+    /// RFC 3339, when the grant ended.
+    pub at: String,
+    /// Why it ended.
+    pub reason: OauthGrantEndReason,
+}
+
+/// Why a grant ended. Only the endings a person could not otherwise explain
+/// are recorded: an expired grant was simply not used for thirty days, and a
+/// removed account has nobody left to tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OauthGrantEndReason {
+    /// A rotated refresh token came back after the grace window, the replay
+    /// rule of a refresh.
+    Replayed,
+    /// The account itself revoked it, on its Connected clients card.
+    Revoked,
+    /// The client revoked it with one of its own tokens (RFC 7009), for
+    /// example on sign-out.
+    ClientRevoked,
+}
+
+impl OauthGrantEndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            OauthGrantEndReason::Replayed => "replayed",
+            OauthGrantEndReason::Revoked => "revoked",
+            OauthGrantEndReason::ClientRevoked => "client_revoked",
+        }
+    }
+
+    fn from_db(s: &str) -> Option<OauthGrantEndReason> {
+        match s {
+            "replayed" => Some(OauthGrantEndReason::Replayed),
+            "revoked" => Some(OauthGrantEndReason::Revoked),
+            "client_revoked" => Some(OauthGrantEndReason::ClientRevoked),
+            _ => None,
+        }
+    }
 }
 
 /// One row of an account's MCP token list, for a management UI or CLI. Never
@@ -1052,7 +1167,12 @@ pub struct AuthStore {
 /// collaborators ([`AuthStore::set_reflection_grant`]), on any domain kept as
 /// files, shared or private. `github_delivery` holds the GitHub App webhook
 /// deliveries of the last day ([`AuthStore::remember_delivery`]), so a
-/// replayed one does no work.
+/// replayed one does no work. `oauth_grant_token` holds every OAuth grant's
+/// token pairs, live and rotated ([`AuthStore::refresh_oauth_grant_at`]
+/// explains the rules); the token columns of `oauth_grants` are kept only so
+/// an older binary still opens the file, and hold placeholders (see
+/// `AuthStore::move_oauth_tokens`). `oauth_grant_ended` records why a grant
+/// ended, for the Connected clients card ([`AuthStore::list_ended_oauth_grants`]).
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1140,6 +1260,30 @@ CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
 CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
 CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
     ON oauth_grants (previous_refresh_hash);
+CREATE TABLE IF NOT EXISTS oauth_grant_token (
+    refresh_hash TEXT PRIMARY KEY,
+    grant_id INTEGER NOT NULL,
+    access_hash TEXT UNIQUE,
+    access_expires_at INTEGER NOT NULL,
+    refresh_expires_at INTEGER NOT NULL,
+    issued_at INTEGER NOT NULL,
+    rotated_at INTEGER,
+    rotated_from TEXT
+);
+CREATE INDEX IF NOT EXISTS oauth_grant_token_grant ON oauth_grant_token (grant_id);
+CREATE INDEX IF NOT EXISTS oauth_grant_token_from ON oauth_grant_token (rotated_from);
+CREATE TABLE IF NOT EXISTS oauth_grant_ended (
+    grant_id INTEGER PRIMARY KEY,
+    user TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    client_name TEXT NOT NULL,
+    redirect_host TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT,
+    ended_at INTEGER NOT NULL,
+    reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS oauth_grant_ended_user ON oauth_grant_ended (user, ended_at);
 CREATE TABLE IF NOT EXISTS overlay_grant (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -1219,6 +1363,49 @@ pub const OAUTH_ACCESS_TTL_SECS: i64 = 3600;
 /// at every rotation, so a client used at all keeps working and one abandoned
 /// for a month has to ask its person again.
 pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a rotated refresh token may still be presented, in seconds, and
+/// get a pair of its own instead of revoking its grant.
+///
+/// Several sessions of one MCP client often share one stored credential, and
+/// when the access token runs out they all refresh with the same refresh
+/// token at nearly the same moment. A client that lost the answer to a
+/// refresh retries with the token it still holds. Without a window both look
+/// exactly like a stolen token coming back, and the grant was revoked about
+/// once a day. Inside the window such a token gets its own fresh pair (see
+/// [`RefreshOutcome::Reissued`]); after it the token is a replay and revokes
+/// the grant, as before. Sixty seconds is far longer than the gap between
+/// two parallel refreshes or a retry, and short enough that a copy of a token
+/// found later still trips the replay rule.
+pub const OAUTH_REFRESH_GRACE_SECS: i64 = 60;
+
+/// How many live refresh tokens one grant may hold at once. Every answer
+/// inside [`OAUTH_REFRESH_GRACE_SECS`] adds one, so a client whose parallel
+/// sessions come and go would collect them without end. At every new token
+/// the oldest live ones past this number are deleted outright: presenting
+/// one later is an unknown token (the session signs in again), never a
+/// replay that would end the whole grant for the others.
+pub const OAUTH_LIVE_TOKENS_KEPT: i64 = 8;
+
+/// How many rotated refresh tokens one grant remembers, newest first. They
+/// are what makes a replay detectable, also two or more rotations back; a
+/// token older than these is forgotten and reads as unknown.
+pub const OAUTH_RETIRED_TOKENS_KEPT: i64 = 8;
+
+/// How long the record of an ended grant is listed on the account's
+/// Connected clients card, in seconds: seven days, long enough that a person
+/// who finds a client signed out on Monday still sees why.
+pub const OAUTH_ENDED_KEPT_SECS: i64 = 7 * 24 * 3600;
+
+/// How many ended-grant records one account keeps at most, newest first.
+pub const OAUTH_ENDED_KEPT_PER_ACCOUNT: i64 = 20;
+
+/// The prefix of the inert values `oauth_grants.access_hash` and
+/// `oauth_grants.refresh_hash` hold since the tokens moved to
+/// `oauth_grant_token`. The two columns are `NOT NULL UNIQUE` in the table an
+/// older binary creates, so they cannot simply be left empty; a token hash is
+/// lowercase hex and never holds a `:`, so no presented token can match one.
+const OAUTH_PLACEHOLDER_PREFIX: &str = "none:";
 
 /// How long a registration that HAS been authorized is kept once it stops
 /// being used, in seconds. Thirty days from the last authorization a person
@@ -1464,11 +1651,95 @@ impl AuthStore {
         // (it names its columns and never reads these two).
         ensure_column(&conn, "users", "reflection TEXT").await?;
         ensure_column(&conn, "domain_member", "reflection TEXT").await?;
-        Ok(AuthStore {
+        let store = AuthStore {
             _db: db,
             conn,
             guard: tokio::sync::Mutex::new(()),
-        })
+        };
+        store.move_oauth_tokens().await?;
+        Ok(store)
+    }
+
+    /// Move every grant's tokens out of `oauth_grants` into
+    /// `oauth_grant_token` (0.32.1). Runs at every open and changes nothing
+    /// once every grant is moved, the same contract as the idempotent
+    /// `SCHEMA`: there is no version counter to consult.
+    ///
+    /// A grant still holding a real hash in `refresh_hash` (anything that is
+    /// not an [`OAUTH_PLACEHOLDER_PREFIX`] value) gets its current pair as a
+    /// live token row, and its `previous_refresh_hash`, when there is one, as
+    /// a rotated row. That rotation happened exactly when the current access
+    /// token was minted, `access_expires_at - OAUTH_ACCESS_TTL_SECS`, so the
+    /// grace window is judged on the true time. Then the grant's own columns
+    /// get placeholders. The same pass picks up a grant an older binary
+    /// created after a downgrade.
+    ///
+    /// The columns are kept rather than dropped on purpose: the table and its
+    /// `previous_refresh_hash` index stay what an older binary's `SCHEMA`
+    /// expects, so a downgraded binary still opens the file. Its OAuth lookups
+    /// then match nothing and the clients sign in again, which is a safe way
+    /// to fail.
+    ///
+    /// One `BEGIN IMMEDIATE`, because the daemon and the CLI open this file
+    /// concurrently and only one of them may move a grant.
+    async fn move_oauth_tokens(&self) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("moving oauth tokens to their own table")?;
+        let result = async {
+            let placeholder = format!("{OAUTH_PLACEHOLDER_PREFIX}%");
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO oauth_grant_token
+                         (refresh_hash, grant_id, access_hash, access_expires_at,
+                          refresh_expires_at, issued_at, rotated_at, rotated_from)
+                     SELECT refresh_hash, id, access_hash, access_expires_at,
+                            refresh_expires_at, access_expires_at - ?2, NULL,
+                            previous_refresh_hash
+                     FROM oauth_grants WHERE refresh_hash NOT LIKE ?1",
+                    vec![
+                        Value::Text(placeholder.clone()),
+                        Value::Integer(OAUTH_ACCESS_TTL_SECS),
+                    ],
+                )
+                .await
+                .context("moving live oauth tokens")?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO oauth_grant_token
+                         (refresh_hash, grant_id, access_hash, access_expires_at,
+                          refresh_expires_at, issued_at, rotated_at, rotated_from)
+                     SELECT previous_refresh_hash, id, NULL, 0, 0, 0,
+                            access_expires_at - ?2, NULL
+                     FROM oauth_grants
+                     WHERE refresh_hash NOT LIKE ?1 AND previous_refresh_hash IS NOT NULL",
+                    vec![
+                        Value::Text(placeholder.clone()),
+                        Value::Integer(OAUTH_ACCESS_TTL_SECS),
+                    ],
+                )
+                .await
+                .context("moving rotated oauth tokens")?;
+            self.conn
+                .execute(
+                    "UPDATE oauth_grants
+                     SET access_hash = ?2 || 'access:' || id,
+                         refresh_hash = ?2 || 'refresh:' || id,
+                         access_expires_at = 0,
+                         previous_refresh_hash = NULL
+                     WHERE refresh_hash NOT LIKE ?1",
+                    vec![
+                        Value::Text(placeholder),
+                        Value::Text(OAUTH_PLACEHOLDER_PREFIX.to_string()),
+                    ],
+                )
+                .await
+                .context("clearing moved oauth token columns")?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
     }
 
     /// Add an account with a password. The name is folded by
@@ -3976,6 +4247,14 @@ impl AuthStore {
     pub async fn prune_oauth_grants(&self) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token WHERE grant_id IN
+                     (SELECT id FROM oauth_grants WHERE refresh_expires_at <= ?1)",
+                vec![Value::Integer(now)],
+            )
+            .await
+            .context("pruning the tokens of expired oauth grants")?;
         let removed = self
             .conn
             .execute(
@@ -3984,6 +4263,15 @@ impl AuthStore {
             )
             .await
             .context("pruning expired oauth grants")?;
+        // The ended-grant records age out on the same schedule: nothing
+        // lists one past its seven days, so nothing needs to keep it.
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_ended WHERE ended_at <= ?1",
+                vec![Value::Integer(now - OAUTH_ENDED_KEPT_SECS)],
+            )
+            .await
+            .context("pruning ended oauth grant records")?;
         Ok(removed as usize)
     }
 
@@ -4056,13 +4344,13 @@ impl AuthStore {
         }
     }
 
-    /// Issue a grant: one row carrying an access token good for an hour and a
-    /// refresh token good for thirty days, both hashed, both bound to `user`,
-    /// `client_id` and `resource`. The returned tokens are the only unhashed
-    /// copies.
+    /// Issue a grant: one row naming the account, the client and the
+    /// resource, plus its first token pair in `oauth_grant_token`: an access
+    /// token good for an hour and a refresh token good for thirty days, both
+    /// hashed. The returned tokens are the only unhashed copies.
     ///
     /// The account check and the registration check share one `BEGIN
-    /// IMMEDIATE` with the insert, for the reason
+    /// IMMEDIATE` with the inserts, for the reason
     /// [`AuthStore::issue_mcp_token`] documents: neither table carries a
     /// foreign key, so without the transaction a concurrent `remove_user` or
     /// prune could leave this grant pointing at nothing.
@@ -4084,8 +4372,7 @@ impl AuthStore {
         if resource.is_empty() {
             bail!("an oauth grant needs a resource to be issued for");
         }
-        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
-        let refresh_token = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let pair = TokenPair::new();
         let now = chrono::Utc::now();
         let issued_at = now.timestamp();
         let created_at = now.to_rfc3339();
@@ -4093,6 +4380,7 @@ impl AuthStore {
         self.begin_immediate()
             .await
             .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
+        let mut id = 0;
         let result = async {
             self.require_live_user(&user).await?;
             if self
@@ -4105,88 +4393,227 @@ impl AuthStore {
             {
                 bail!("no such oauth client: '{client_id}'");
             }
+            // The token columns of `oauth_grants` get inert placeholders: see
+            // `OAUTH_PLACEHOLDER_PREFIX`. The real pair goes to
+            // `oauth_grant_token` just below.
             self.conn
                 .execute(
                     "INSERT INTO oauth_grants
                          (user, client_id, resource, access_hash, access_expires_at,
                           refresh_hash, refresh_expires_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
                     vec![
                         Value::Text(user.clone()),
                         Value::Text(client_id.to_string()),
                         Value::Text(resource.clone()),
-                        Value::Text(token_hash(&access_token)),
-                        Value::Integer(issued_at + OAUTH_ACCESS_TTL_SECS),
-                        Value::Text(token_hash(&refresh_token)),
+                        Value::Text(format!("{OAUTH_PLACEHOLDER_PREFIX}access:{}", random_hex())),
+                        Value::Text(format!(
+                            "{OAUTH_PLACEHOLDER_PREFIX}refresh:{}",
+                            random_hex()
+                        )),
                         Value::Integer(issued_at + OAUTH_REFRESH_TTL_SECS),
                         Value::Text(created_at),
                     ],
                 )
                 .await
                 .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
-            Ok(())
+            // Read inside the transaction, still under `self.guard` and on
+            // this connection: see `issue_mcp_token`'s matching comment.
+            id = self.conn.last_insert_rowid();
+            self.mint_oauth_token(id, &pair, None, issued_at).await
         }
         .await;
         self.finish(result).await?;
-        // Read after commit, still under `self.guard` and on this connection:
-        // see `issue_mcp_token`'s matching comment.
-        let id = self.conn.last_insert_rowid();
-        Ok(IssuedOauthGrant {
-            id,
-            access_token,
-            refresh_token,
-            expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
-        })
+        Ok(pair.issued(id))
     }
 
-    /// Present a refresh token. Either it rotates the grant, or it is a replay
-    /// that revokes it, or it matches nothing.
+    /// Write one new live token pair for grant `id`, inside the caller's
+    /// transaction, and restart the grant's thirty days from `now`.
     ///
-    /// Both lookups and the write they lead to are one `BEGIN IMMEDIATE`, so
-    /// two clients racing the same refresh token cannot both rotate it: the
-    /// loser arrives after the winner's update and finds its token in
-    /// `previous_refresh_hash`, which is a replay by definition and revokes
-    /// the grant. That is the intended answer, not a false positive - two
-    /// holders of one refresh token is exactly what the replay rule is for.
+    /// `rotated_from` is the refresh hash the pair was minted from, `None`
+    /// for a grant's first pair. It is what the grace rule asks about later:
+    /// a token whose successor has itself been rotated is past its grace.
     ///
-    /// The rotation keys on the token, its client and its window, and joins
-    /// `users` so a disabled account rotates nothing (`Unknown`, indistinguishable
-    /// from a miss, and reversible: re-enabling the account hands its grants
-    /// back the way it hands MCP tokens back). Expiry is a comparison inside
-    /// the statement, never a check in Rust after the read.
-    ///
-    /// The replay lookup deliberately keys on the token hash *alone*: a
-    /// rotated token coming back is evidence a copy of it leaked, whoever
-    /// presents it and however long ago the window closed. Only the immediate
-    /// predecessor is detectable - a second rotation overwrites
-    /// `previous_refresh_hash` - which is enough, because a client that keeps
-    /// rotating is the one that holds the live token.
-    ///
-    /// `resource` is what the client asked its next token to be minted for
-    /// (RFC 8707 section 2.2), or `None` when it asked for nothing. It is
-    /// compared against the audience the grant actually holds - never against
-    /// the address this request arrived at, which says nothing about what the
-    /// token in the caller's hand is good for - and a mismatch is
-    /// [`RefreshOutcome::WrongTarget`] with the row untouched.
-    ///
-    /// **The comparison is here rather than in the caller, and inside this
-    /// transaction, because ordering is a security property.** A replayed
-    /// token has no row under `refresh_hash` at all, so a caller that read the
-    /// grant first and refused on `resource` would refuse before the replay
-    /// was ever looked for, and one extra form field would turn the tripwire
-    /// off. The replay branch below therefore runs whatever resource was
-    /// named, and only a token that matched a live row can be refused for its
-    /// audience.
+    /// Then the grant's token set is kept small: live tokens past their own
+    /// thirty days go, the live ones past [`OAUTH_LIVE_TOKENS_KEPT`] (oldest
+    /// first) are deleted outright, and only the newest
+    /// [`OAUTH_RETIRED_TOKENS_KEPT`] rotated ones are remembered.
+    async fn mint_oauth_token(
+        &self,
+        id: i64,
+        pair: &TokenPair,
+        rotated_from: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO oauth_grant_token
+                     (refresh_hash, grant_id, access_hash, access_expires_at,
+                      refresh_expires_at, issued_at, rotated_at, rotated_from)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                vec![
+                    Value::Text(token_hash(&pair.refresh_token)),
+                    Value::Integer(id),
+                    Value::Text(token_hash(&pair.access_token)),
+                    Value::Integer(now + OAUTH_ACCESS_TTL_SECS),
+                    Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                    Value::Integer(now),
+                    rotated_from.map_or(Value::Null, |from| Value::Text(from.to_string())),
+                ],
+            )
+            .await
+            .context("writing an oauth token pair")?;
+        self.conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
+                vec![
+                    Value::Integer(id),
+                    Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                ],
+            )
+            .await
+            .context("restarting an oauth grant's refresh window")?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token
+                 WHERE grant_id = ?1 AND rotated_at IS NULL AND refresh_expires_at <= ?2",
+                vec![Value::Integer(id), Value::Integer(now)],
+            )
+            .await
+            .context("pruning expired oauth tokens")?;
+        let live = self
+            .grant_token_hashes(
+                "SELECT refresh_hash FROM oauth_grant_token
+                 WHERE grant_id = ?1 AND rotated_at IS NULL
+                 ORDER BY issued_at DESC, rowid DESC",
+                id,
+            )
+            .await?;
+        let retired = self
+            .grant_token_hashes(
+                "SELECT refresh_hash FROM oauth_grant_token
+                 WHERE grant_id = ?1 AND rotated_at IS NOT NULL
+                 ORDER BY rotated_at DESC, rowid DESC",
+                id,
+            )
+            .await?;
+        let surplus = live
+            .iter()
+            .skip(OAUTH_LIVE_TOKENS_KEPT as usize)
+            .chain(retired.iter().skip(OAUTH_RETIRED_TOKENS_KEPT as usize));
+        for hash in surplus {
+            self.conn
+                .execute(
+                    "DELETE FROM oauth_grant_token WHERE refresh_hash = ?1",
+                    vec![Value::Text(hash.clone())],
+                )
+                .await
+                .context("pruning old oauth tokens")?;
+        }
+        Ok(())
+    }
+
+    /// The refresh hashes one `SELECT refresh_hash ... WHERE grant_id = ?1`
+    /// statement answers, in its order.
+    async fn grant_token_hashes(&self, sql: &str, id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(sql, vec![Value::Integer(id)])
+            .await
+            .context("reading an oauth grant's tokens")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .context("reading an oauth grant's tokens")?
+        {
+            if let Some(hash) = cell_text(&row, 0) {
+                out.push(hash);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Present a refresh token: it rotates, it gets a pair of its own inside
+    /// the grace window, it is a replay that revokes its grant, or it matches
+    /// nothing. [`AuthStore::refresh_oauth_grant_at`] with the clock read
+    /// now.
     pub async fn refresh_oauth_grant(
         &self,
         refresh_token: &str,
         client_id: &str,
         resource: Option<&str>,
     ) -> Result<RefreshOutcome> {
+        self.refresh_oauth_grant_at(
+            refresh_token,
+            client_id,
+            resource,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+    }
+
+    /// [`AuthStore::refresh_oauth_grant`] at a given instant, unix seconds, so
+    /// a test can step past the grace window without sleeping.
+    ///
+    /// Every grant holds a small set of refresh tokens in `oauth_grant_token`,
+    /// each live or rotated, each with its own access token. The presented
+    /// token decides, in this order:
+    ///
+    /// 1. **Live** for this client, inside its own and the grant's window, on
+    ///    an enabled account: it is rotated. It is marked rotated now, its
+    ///    access token dies on the spot, and a new pair is minted from it
+    ///    ([`RefreshOutcome::Rotated`]).
+    /// 2. **Rotated less than [`OAUTH_REFRESH_GRACE_SECS`] ago**, and no token
+    ///    minted from it has itself been rotated since: it gets a new pair of
+    ///    its own ([`RefreshOutcome::Reissued`]). The pair the first rotation
+    ///    handed out stays live too, so two parallel sessions both keep
+    ///    working. It still has to be this client's grant on an enabled
+    ///    account inside its window, the same checks the live branch makes.
+    /// 3. **Any other rotated token** is a replay and revokes the whole grant
+    ///    ([`RefreshOutcome::Replayed`]): one that came back after the window,
+    ///    one presented by another client, and one whose successor has been
+    ///    rotated in its turn. The last is the token two rotations back: a
+    ///    client that has already refreshed again from the answer does not
+    ///    need the old token any more, so its return is evidence of a copy,
+    ///    even inside the sixty seconds.
+    /// 4. Anything else, a forgotten token among them, is
+    ///    [`RefreshOutcome::Unknown`].
+    ///
+    /// Each new pair gets [`OAUTH_ACCESS_TTL_SECS`] for its access token and
+    /// [`OAUTH_REFRESH_TTL_SECS`] for its refresh token from `now`, and the
+    /// grant's window restarts with it, exactly as a rotation always did.
+    ///
+    /// All lookups and the writes they lead to are one `BEGIN IMMEDIATE`, so
+    /// two requests racing one token are decided one after the other: the
+    /// first rotates and the second, seeing the committed rotation, falls
+    /// into the grace branch.
+    ///
+    /// The replay lookup keys on the token hash alone: a rotated token coming
+    /// back late is evidence a copy of it leaked, whoever presents it.
+    ///
+    /// `resource` is what the client asked its next token to be minted for
+    /// (RFC 8707 section 2.2), or `None` when it asked for nothing. It is
+    /// compared against the audience the grant actually holds - never against
+    /// the address this request arrived at - and a mismatch is
+    /// [`RefreshOutcome::WrongTarget`] with nothing written.
+    ///
+    /// **The comparison is here rather than in the caller, and inside this
+    /// transaction, because ordering is a security property.** A caller that
+    /// read the grant first and refused on `resource` would refuse before the
+    /// replay was ever looked for, and one extra form field would turn the
+    /// tripwire off. So a replay is judged whatever resource was named, and
+    /// only a token that would have been answered with a pair can be refused
+    /// for its audience.
+    pub async fn refresh_oauth_grant_at(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        resource: Option<&str>,
+        now: i64,
+    ) -> Result<RefreshOutcome> {
         let presented = token_hash(refresh_token);
-        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
-        let next_refresh = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
-        let now = chrono::Utc::now().timestamp();
+        let pair = TokenPair::new();
         let _guard = self.guard.lock().await;
         self.begin_immediate()
             .await
@@ -4198,9 +4625,13 @@ impl AuthStore {
         let result = async {
             let live = self
                 .query_first(
-                    "SELECT g.id, g.resource FROM oauth_grants g JOIN users u ON u.name = g.user
-                     WHERE g.refresh_hash = ?1 AND g.client_id = ?2
-                       AND g.refresh_expires_at > ?3 AND u.disabled = 0",
+                    "SELECT t.grant_id, g.resource
+                     FROM oauth_grant_token t
+                     JOIN oauth_grants g ON g.id = t.grant_id
+                     JOIN users u ON u.name = g.user
+                     WHERE t.refresh_hash = ?1 AND t.rotated_at IS NULL
+                       AND g.client_id = ?2 AND g.refresh_expires_at > ?3
+                       AND t.refresh_expires_at > ?3 AND u.disabled = 0",
                     vec![
                         Value::Text(presented.clone()),
                         Value::Text(client_id.to_string()),
@@ -4212,86 +4643,120 @@ impl AuthStore {
                 let Ok(Value::Integer(id)) = row.get_value(0) else {
                     return Ok(());
                 };
-                // Only read when there is something to compare it to, and then
-                // fail closed the way the replay branch does: a grant whose
-                // audience cannot be read is one whose audience cannot be
-                // checked, and rotating it would answer a question this store
-                // does not know the answer to.
-                if let Some(asked) = resource {
-                    let Ok(Value::Text(held)) = row.get_value(1) else {
-                        bail!("an oauth grant row has an unreadable resource");
-                    };
-                    if normalize_resource(asked) != normalize_resource(&held) {
-                        outcome = RefreshOutcome::WrongTarget;
-                        return Ok(());
-                    }
+                if !audience_matches(&row, 1, resource)? {
+                    outcome = RefreshOutcome::WrongTarget;
+                    return Ok(());
                 }
                 self.conn
                     .execute(
-                        "UPDATE oauth_grants
-                         SET access_hash = ?2,
-                             access_expires_at = ?3,
-                             previous_refresh_hash = refresh_hash,
-                             refresh_hash = ?4,
-                             refresh_expires_at = ?5
-                         WHERE id = ?1",
-                        vec![
-                            Value::Integer(id),
-                            Value::Text(token_hash(&access_token)),
-                            Value::Integer(now + OAUTH_ACCESS_TTL_SECS),
-                            Value::Text(token_hash(&next_refresh)),
-                            Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
-                        ],
+                        "UPDATE oauth_grant_token SET rotated_at = ?2, access_hash = NULL
+                         WHERE refresh_hash = ?1",
+                        vec![Value::Text(presented.clone()), Value::Integer(now)],
                     )
                     .await
                     .context("rotating an oauth grant")?;
-                outcome = RefreshOutcome::Rotated(IssuedOauthGrant {
-                    id,
-                    access_token: access_token.clone(),
-                    refresh_token: next_refresh.clone(),
-                    expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
-                });
+                self.mint_oauth_token(id, &pair, Some(&presented), now)
+                    .await?;
+                outcome = RefreshOutcome::Rotated(pair.issued(id));
                 return Ok(());
             }
-            let replayed = self
+            let rotated = self
                 .query_first(
-                    "SELECT id FROM oauth_grants WHERE previous_refresh_hash = ?1",
+                    "SELECT grant_id, rotated_at FROM oauth_grant_token
+                     WHERE refresh_hash = ?1 AND rotated_at IS NOT NULL",
                     vec![Value::Text(presented.clone())],
                 )
                 .await?;
-            if let Some(row) = replayed {
-                // Fails closed, unlike the rotate branch's matching decode: a
-                // grant this store has just proven compromised must not be
-                // left alive by a row it could not read. The whole transaction
-                // rolls back and the caller sees the error.
-                let Ok(Value::Integer(id)) = row.get_value(0) else {
-                    bail!("an oauth grant row has an unreadable id");
-                };
-                self.conn
-                    .execute(
-                        "DELETE FROM oauth_grants WHERE id = ?1",
+            let Some(row) = rotated else {
+                return Ok(());
+            };
+            // Fails closed: a grant this store may have to revoke must not be
+            // left alive by a row it could not read. The whole transaction
+            // rolls back and the caller sees the error.
+            let (Ok(Value::Integer(id)), Ok(Value::Integer(rotated_at))) =
+                (row.get_value(0), row.get_value(1))
+            else {
+                bail!("an oauth token row is unreadable");
+            };
+            let since_rotation = now - rotated_at;
+            let successor_rotated = self
+                .query_first(
+                    "SELECT 1 FROM oauth_grant_token
+                     WHERE rotated_from = ?1 AND rotated_at IS NOT NULL",
+                    vec![Value::Text(presented.clone())],
+                )
+                .await?
+                .is_some();
+            if since_rotation < OAUTH_REFRESH_GRACE_SECS && !successor_rotated {
+                let grant = self
+                    .query_first(
+                        "SELECT g.client_id, g.resource, g.refresh_expires_at, u.disabled
+                         FROM oauth_grants g JOIN users u ON u.name = g.user
+                         WHERE g.id = ?1",
                         vec![Value::Integer(id)],
                     )
-                    .await
-                    .context("revoking a replayed oauth grant")?;
-                outcome = RefreshOutcome::Replayed { grant: id };
+                    .await?;
+                let Some(grant) = grant else {
+                    return Ok(());
+                };
+                // Another client presenting it is not a parallel session of
+                // this one: that stays a replay, below.
+                if cell_text(&grant, 0).as_deref() == Some(client_id) {
+                    let open = matches!(grant.get_value(2), Ok(Value::Integer(at)) if at > now);
+                    let enabled = matches!(grant.get_value(3), Ok(Value::Integer(0)));
+                    if !open || !enabled {
+                        return Ok(());
+                    }
+                    if !audience_matches(&grant, 1, resource)? {
+                        outcome = RefreshOutcome::WrongTarget;
+                        return Ok(());
+                    }
+                    self.mint_oauth_token(id, &pair, Some(&presented), now)
+                        .await?;
+                    outcome = RefreshOutcome::Reissued {
+                        grant: pair.issued(id),
+                        since_rotation,
+                    };
+                    return Ok(());
+                }
             }
+            self.end_oauth_grant(id, OauthGrantEndReason::Replayed, now)
+                .await
+                .context("revoking a replayed oauth grant")?;
+            outcome = RefreshOutcome::Replayed {
+                grant: id,
+                since_rotation,
+            };
             Ok(())
         }
         .await;
         self.finish(result).await?;
-        // Both lines are emitted after the commit, never inside the
+        // The lines are emitted after the commit, never inside the
         // transaction body. A rollback - a disk error, a busy timeout against
         // the CLI holding the write lock - must not leave an audit record
-        // claiming a revocation that did not happen, and a revocation is the
-        // one thing here worth an audit record at all.
+        // claiming a revocation that did not happen. Seconds since rotation
+        // ride both INFO lines, so the grace window can be tuned from a real
+        // deployment's log. No token material, ever.
         match &outcome {
             RefreshOutcome::Rotated(grant) => {
                 tracing::debug!(grant = grant.id, client = %client_id, "rotated an oauth grant");
             }
-            RefreshOutcome::Replayed { grant } => tracing::info!(
+            RefreshOutcome::Reissued {
+                grant,
+                since_rotation,
+            } => tracing::info!(
+                grant = grant.id,
+                client = %client_id,
+                since_rotation_secs = *since_rotation,
+                "a refresh token reused inside the grace window got its own pair"
+            ),
+            RefreshOutcome::Replayed {
+                grant,
+                since_rotation,
+            } => tracing::info!(
                 grant = *grant,
                 client = %client_id,
+                since_rotation_secs = *since_rotation,
                 "a replayed refresh token revoked an oauth grant"
             ),
             // Neither is worth an audit line: a miss is a miss, and a wrong
@@ -4302,11 +4767,132 @@ impl AuthStore {
         Ok(outcome)
     }
 
+    /// End grant `id` inside the caller's transaction: write the record of
+    /// why, then delete the grant and every token it holds.
+    ///
+    /// The record copies the client's name and redirect host instead of
+    /// pointing at the registration, because the client prune may collect
+    /// that registration as soon as its last grant is gone, and the person
+    /// still needs to recognise the client. The account's records are kept
+    /// to [`OAUTH_ENDED_KEPT_SECS`] and [`OAUTH_ENDED_KEPT_PER_ACCOUNT`] here,
+    /// at the one place they grow.
+    ///
+    /// Answers whether a grant was there to end.
+    async fn end_oauth_grant(
+        &self,
+        id: i64,
+        reason: OauthGrantEndReason,
+        now: i64,
+    ) -> Result<bool> {
+        let Some(row) = self
+            .query_first(
+                "SELECT g.user, g.client_id, c.client_name, c.redirect_uris,
+                        g.created_at, g.last_used
+                 FROM oauth_grants g
+                 LEFT JOIN oauth_clients c ON c.client_id = g.client_id
+                 WHERE g.id = ?1",
+                vec![Value::Integer(id)],
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let user = cell_text(&row, 0).unwrap_or_default();
+        let redirect_host = decode_redirect_uris(cell_text(&row, 3).as_deref())
+            .first()
+            .map(|uri| redirect_host(uri))
+            .unwrap_or_default();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO oauth_grant_ended
+                     (grant_id, user, client_id, client_name, redirect_host,
+                      created_at, last_used, ended_at, reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text(user.clone()),
+                    Value::Text(cell_text(&row, 1).unwrap_or_default()),
+                    Value::Text(
+                        cell_text(&row, 2).unwrap_or_else(|| GONE_OAUTH_CLIENT.to_string()),
+                    ),
+                    Value::Text(redirect_host),
+                    Value::Text(cell_text(&row, 4).unwrap_or_default()),
+                    cell_text(&row, 5).map_or(Value::Null, Value::Text),
+                    Value::Integer(now),
+                    Value::Text(reason.as_str().to_string()),
+                ],
+            )
+            .await
+            .context("recording an ended oauth grant")?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token WHERE grant_id = ?1",
+                vec![Value::Integer(id)],
+            )
+            .await
+            .context("deleting an oauth grant's tokens")?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE id = ?1",
+                vec![Value::Integer(id)],
+            )
+            .await
+            .context("deleting an oauth grant")?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_ended WHERE user = ?1 AND ended_at <= ?2",
+                vec![
+                    Value::Text(user.clone()),
+                    Value::Integer(now - OAUTH_ENDED_KEPT_SECS),
+                ],
+            )
+            .await
+            .context("pruning ended oauth grant records")?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT grant_id FROM oauth_grant_ended WHERE user = ?1
+                 ORDER BY ended_at DESC, grant_id DESC",
+                vec![Value::Text(user)],
+            )
+            .await
+            .context("reading ended oauth grant records")?;
+        let mut surplus = Vec::new();
+        let mut seen = 0;
+        while let Some(row) = rows
+            .next()
+            .await
+            .context("reading ended oauth grant records")?
+        {
+            seen += 1;
+            if seen > OAUTH_ENDED_KEPT_PER_ACCOUNT
+                && let Ok(Value::Integer(old)) = row.get_value(0)
+            {
+                surplus.push(old);
+            }
+        }
+        drop(rows);
+        for old in surplus {
+            self.conn
+                .execute(
+                    "DELETE FROM oauth_grant_ended WHERE grant_id = ?1",
+                    vec![Value::Integer(old)],
+                )
+                .await
+                .context("pruning ended oauth grant records")?;
+        }
+        Ok(true)
+    }
+
     /// Resolve an OAuth access token to its account, for one resource. `None`
     /// for an unknown, expired, revoked or wrong-audience token and for a
     /// disabled account - deliberately indistinguishable, the way
     /// [`AuthStore::mcp_token_user`] answers, because the gate sends one
     /// refusal for all of them.
+    ///
+    /// The token is looked up among the grant's live pairs in
+    /// `oauth_grant_token`; a rotated pair has no access hash left, so its
+    /// access token stopped at the rotation.
     ///
     /// `resource` is the origin this request arrived at. It is compared to the
     /// one the grant was issued for after [`normalize_resource`] has taken one
@@ -4315,11 +4901,11 @@ impl AuthStore {
     /// be replayed here, and no branch in Rust can forget to check.
     ///
     /// Stamps `last_used` on a hit, and prunes any grant whose account is gone
-    /// on every call that reaches the statement - the same defense in depth
-    /// `mcp_token_user` applies to tokens, for a row reached by some path the
-    /// issuing transaction does not cover. A call naming an empty resource
-    /// returns before it, since such a call could never have matched a grant
-    /// anyway.
+    /// (and the tokens of any grant that is gone) on every call that reaches
+    /// the statement - the same defense in depth `mcp_token_user` applies to
+    /// tokens, for a row reached by some path the issuing transaction does not
+    /// cover. A call naming an empty resource returns before it, since such a
+    /// call could never have matched a grant anyway.
     pub async fn oauth_access_user(&self, token: &str, resource: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
         let resource = normalize_resource(resource);
@@ -4338,12 +4924,23 @@ impl AuthStore {
             )
             .await
             .context("pruning orphaned oauth grants")?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_token
+                 WHERE NOT EXISTS
+                     (SELECT 1 FROM oauth_grants g WHERE g.id = oauth_grant_token.grant_id)",
+                (),
+            )
+            .await
+            .context("pruning orphaned oauth tokens")?;
         let Some(row) = self
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}, g.id
-                     FROM oauth_grants g JOIN users u ON u.name = g.user
-                     WHERE g.access_hash = ?1 AND g.access_expires_at > ?2 AND g.resource = ?3"
+                     FROM oauth_grant_token t
+                     JOIN oauth_grants g ON g.id = t.grant_id
+                     JOIN users u ON u.name = g.user
+                     WHERE t.access_hash = ?1 AND t.access_expires_at > ?2 AND g.resource = ?3"
                 ),
                 vec![
                     Value::Text(hash),
@@ -4385,7 +4982,8 @@ impl AuthStore {
     /// no longer work by any path, so listing it would show a person a
     /// connection they cannot act on and cannot tell from a live one.
     /// [`AuthStore::prune_oauth_grants`] removes the rows; this is what keeps
-    /// the card honest in between.
+    /// the card honest in between. The record of grants that ended is
+    /// [`AuthStore::list_ended_oauth_grants`].
     pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
@@ -4429,6 +5027,78 @@ impl AuthStore {
                 created_at: cell_text(&row, 4).unwrap_or_default(),
                 last_used: cell_text(&row, 5),
                 refresh_expires_at,
+                ended: None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The grants of `user` that ended in the last [`OAUTH_ENDED_KEPT_SECS`],
+    /// newest first, each with [`OauthGrantInfo::ended`] set to when and why.
+    /// At most [`OAUTH_ENDED_KEPT_PER_ACCOUNT`] of them.
+    ///
+    /// So a person whose client was signed out can read why on the Connected
+    /// clients card instead of finding the row gone. The fields are the ones
+    /// the grant had when it ended; `refresh_expires_at` holds the moment it
+    /// ended, since nothing refreshes it any more.
+    pub async fn list_ended_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
+        self.list_ended_oauth_grants_at(user, chrono::Utc::now().timestamp())
+            .await
+    }
+
+    /// [`AuthStore::list_ended_oauth_grants`] at a given instant, unix
+    /// seconds, for a test that steps past the seven days.
+    pub async fn list_ended_oauth_grants_at(
+        &self,
+        user: &str,
+        now: i64,
+    ) -> Result<Vec<OauthGrantInfo>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT grant_id, client_id, client_name, redirect_host, created_at,
+                        last_used, ended_at, reason
+                 FROM oauth_grant_ended
+                 WHERE user = ?1 AND ended_at > ?2
+                 ORDER BY ended_at DESC, grant_id DESC
+                 LIMIT ?3",
+                vec![
+                    Value::Text(user.clone()),
+                    Value::Integer(now - OAUTH_ENDED_KEPT_SECS),
+                    Value::Integer(OAUTH_ENDED_KEPT_PER_ACCOUNT),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing ended oauth grants for user '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing ended oauth grants for user '{user}'"))?
+        {
+            let (Ok(Value::Integer(id)), Ok(Value::Integer(ended_at))) =
+                (row.get_value(0), row.get_value(6))
+            else {
+                continue;
+            };
+            let Some(reason) = cell_text(&row, 7)
+                .as_deref()
+                .and_then(OauthGrantEndReason::from_db)
+            else {
+                continue;
+            };
+            let at = rfc3339_from_unix(ended_at);
+            out.push(OauthGrantInfo {
+                id,
+                client_id: cell_text(&row, 1).unwrap_or_default(),
+                client_name: cell_text(&row, 2).unwrap_or_default(),
+                redirect_host: cell_text(&row, 3).unwrap_or_default(),
+                created_at: cell_text(&row, 4).unwrap_or_default(),
+                last_used: cell_text(&row, 5),
+                refresh_expires_at: at.clone(),
+                ended: Some(OauthGrantEnded { at, reason }),
             });
         }
         Ok(out)
@@ -4438,53 +5108,90 @@ impl AuthStore {
     /// `false` covers both an unknown id and one belonging to another account,
     /// deliberately indistinguishable so a caller cannot probe for ids.
     ///
-    /// One delete stops both of the grant's tokens at once, which is the whole
-    /// reason a grant is one row rather than a token table plus a refresh
-    /// table.
+    /// One transaction stops every token of the grant at once and writes the
+    /// record of why ([`OauthGrantEndReason::Revoked`]), which the Connected
+    /// clients card lists for a while.
     pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
         let user = normalize_account_name(user)?;
+        let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(
-                "DELETE FROM oauth_grants WHERE id = ?1 AND user = ?2",
-                vec![Value::Integer(id), Value::Text(user.clone())],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
-        if changed > 0 {
+        let result = async {
+            if self
+                .query_first(
+                    "SELECT 1 FROM oauth_grants WHERE id = ?1 AND user = ?2",
+                    vec![Value::Integer(id), Value::Text(user.clone())],
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            self.end_oauth_grant(id, OauthGrantEndReason::Revoked, now)
+                .await
+        }
+        .await;
+        let changed = self
+            .finish(result)
+            .await
+            .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
+        if changed {
             tracing::info!(grant = id, user = %user, "revoked an oauth grant");
         }
-        Ok(changed > 0)
+        Ok(changed)
     }
 
-    /// Revoke the grant `token` belongs to - its access token or its refresh
-    /// token - when it was issued to `client_id`, reporting whether a row went.
+    /// Revoke the grant `token` belongs to - the access token or the refresh
+    /// token of any of its live pairs - when it was issued to `client_id`,
+    /// reporting whether a grant went.
     ///
     /// For RFC 7009 revocation, where a public client presents a token and its
     /// own `client_id` and nothing else. The client must match, so a leaked
     /// token cannot be revoked by a stranger's registration; the endpoint
-    /// answers the same either way, so a caller learns nothing from it.
+    /// answers the same either way, so a caller learns nothing from it. The
+    /// record of why is [`OauthGrantEndReason::ClientRevoked`].
     pub async fn revoke_oauth_grant_by_token(&self, token: &str, client_id: &str) -> Result<bool> {
         let hash = token_hash(token);
+        let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(
-                "DELETE FROM oauth_grants
-                 WHERE (access_hash = ?1 OR refresh_hash = ?1) AND client_id = ?2",
-                vec![Value::Text(hash), Value::Text(client_id.to_string())],
-            )
+        self.begin_immediate()
             .await
             .context("revoking an oauth grant by its token")?;
-        if changed > 0 {
+        let result = async {
+            let Some(row) = self
+                .query_first(
+                    "SELECT t.grant_id FROM oauth_grant_token t
+                     JOIN oauth_grants g ON g.id = t.grant_id
+                     WHERE (t.access_hash = ?1 OR t.refresh_hash = ?1)
+                       AND t.rotated_at IS NULL AND g.client_id = ?2",
+                    vec![Value::Text(hash), Value::Text(client_id.to_string())],
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            let Ok(Value::Integer(id)) = row.get_value(0) else {
+                bail!("an oauth token row has an unreadable grant id");
+            };
+            self.end_oauth_grant(id, OauthGrantEndReason::ClientRevoked, now)
+                .await
+        }
+        .await;
+        let changed = self
+            .finish(result)
+            .await
+            .context("revoking an oauth grant by its token")?;
+        if changed {
             tracing::info!(client_id, "revoked an oauth grant by its token");
         }
-        Ok(changed > 0)
+        Ok(changed)
     }
 
-    /// Drop every OAuth grant of one account. Called by both removal paths
-    /// inside their transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
+    /// Drop every OAuth grant of one account, with its tokens and the record
+    /// of its ended grants. Called by both removal paths inside their
+    /// transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
     /// documents one table over: `oauth_grants` carries no foreign key, so a
     /// row that outlived its account would resolve for whoever next claims the
     /// freed name.
@@ -4500,11 +5207,26 @@ impl AuthStore {
     async fn delete_oauth_grants_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(
+                "DELETE FROM oauth_grant_token WHERE grant_id IN
+                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
+        self.conn
+            .execute(
                 "DELETE FROM oauth_grants WHERE user = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth grants for user '{name}'"))?;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grant_ended WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing ended oauth grants for user '{name}'"))?;
         Ok(())
     }
 
@@ -10008,6 +10730,35 @@ mod tests {
         cell_text(&row, 0).unwrap_or_default()
     }
 
+    /// One text column of the token row a refresh token is stored under.
+    async fn token_text(store: &AuthStore, refresh_token: &str, column: &str) -> Option<String> {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grant_token WHERE refresh_hash = ?1"),
+                vec![Value::Text(token_hash(refresh_token))],
+            )
+            .await
+            .unwrap()
+            .expect("the token row is there");
+        cell_text(&row, 0)
+    }
+
+    /// The same for an integer column, `None` for NULL.
+    async fn token_int(store: &AuthStore, refresh_token: &str, column: &str) -> Option<i64> {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grant_token WHERE refresh_hash = ?1"),
+                vec![Value::Text(token_hash(refresh_token))],
+            )
+            .await
+            .unwrap()
+            .expect("the token row is there");
+        match row.get_value(0) {
+            Ok(Value::Integer(n)) => Some(n),
+            _ => None,
+        }
+    }
+
     async fn count_rows(store: &AuthStore, table: &str) -> i64 {
         let row = store
             .query_first(&format!("SELECT COUNT(*) FROM {table}"), vec![])
@@ -10036,9 +10787,15 @@ mod tests {
         assert!(issued.refresh_token.starts_with(OAUTH_REFRESH_PREFIX));
         assert_eq!(issued.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
         assert_eq!(
-            grant_text(&store, issued.id, "access_hash").await,
-            token_hash(&issued.access_token),
+            token_text(&store, &issued.refresh_token, "access_hash").await,
+            Some(token_hash(&issued.access_token)),
             "only the hash is written, the same way an MCP token is stored"
+        );
+        assert!(
+            grant_text(&store, issued.id, "access_hash")
+                .await
+                .starts_with(OAUTH_PLACEHOLDER_PREFIX),
+            "the grant row's own token columns hold only placeholders"
         );
 
         let user = store
@@ -10100,7 +10857,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+                "UPDATE oauth_grant_token SET access_expires_at = 1 WHERE grant_id = ?1",
                 vec![Value::Integer(issued.id)],
             )
             .await
@@ -10207,10 +10964,22 @@ mod tests {
                 > chrono::Utc::now().timestamp() + OAUTH_REFRESH_TTL_SECS - 60,
             "the new refresh token's thirty days start at the rotation"
         );
+        assert!(
+            token_int(&store, &first.refresh_token, "rotated_at")
+                .await
+                .is_some(),
+            "a rotated row is kept with its rotation time, which is what makes a replay detectable"
+        );
+        assert!(
+            token_text(&store, &first.refresh_token, "access_hash")
+                .await
+                .is_none(),
+            "and its access token is gone"
+        );
         assert_eq!(
-            grant_text(&store, first.id, "previous_refresh_hash").await,
-            token_hash(&first.refresh_token),
-            "the predecessor's hash is kept, which is what makes a replay detectable"
+            token_text(&store, &second.refresh_token, "rotated_from").await,
+            Some(token_hash(&first.refresh_token)),
+            "the successor names what it was minted from"
         );
         assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
     }
@@ -10248,7 +11017,7 @@ mod tests {
             .await
             .unwrap();
         match replay {
-            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
+            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, first.id),
             other => panic!("a rotated refresh token is a replay, got {other:?}"),
         }
         assert!(
@@ -10271,62 +11040,73 @@ mod tests {
         );
         assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
         assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
+        assert_eq!(ended.len(), 1, "the replay is recorded");
+        assert_eq!(
+            ended[0].ended.as_ref().map(|e| e.reason),
+            Some(OauthGrantEndReason::Replayed)
+        );
     }
 
-    /// Only the token a rotation just replaced is a replay. A second rotation
-    /// overwrites `previous_refresh_hash`, so the one before it matches
-    /// nothing at all - which is the behaviour the column can support, and
-    /// enough, because the client that keeps rotating is the one holding the
-    /// live token.
+    /// A token two rotations back is a replay, even inside the grace window.
+    /// The token it was rotated into has itself been rotated, so whoever
+    /// held the answer has moved on and does not need the old token any
+    /// more: its return is evidence of a copy, not of a parallel session.
     #[tokio::test]
-    async fn only_the_immediate_predecessor_of_a_refresh_token_is_a_replay() {
+    async fn a_token_two_rotations_back_is_a_replay() {
         let (_dir, store) = store().await;
         let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
         let first = store
             .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
             .await
             .unwrap();
         let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
+            .refresh_oauth_grant_at(&first.refresh_token, &client.client_id, None, now)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(second) = outcome else {
             panic!("a live refresh token rotates, got {outcome:?}");
         };
         let outcome = store
-            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
+            .refresh_oauth_grant_at(&second.refresh_token, &client.client_id, None, now + 1)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(third) = outcome else {
             panic!("the successor rotates in its turn, got {outcome:?}");
         };
-
-        assert!(
-            matches!(
-                store
-                    .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
-                    .await
-                    .unwrap(),
-                RefreshOutcome::Unknown
-            ),
-            "the token two rotations back is forgotten, not a replay"
-        );
         assert!(
             store
                 .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
                 .await
                 .unwrap()
-                .is_some(),
-            "so the grant is still live"
+                .is_some()
         );
+
         match store
-            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
+            .refresh_oauth_grant_at(&first.refresh_token, &client.client_id, None, now + 2)
             .await
             .unwrap()
         {
-            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
-            other => panic!("the immediate predecessor is the replay, got {other:?}"),
+            RefreshOutcome::Replayed {
+                grant,
+                since_rotation,
+            } => {
+                assert_eq!(grant, first.id);
+                assert_eq!(since_rotation, 2, "seconds since its own rotation");
+            }
+            other => panic!("the token two rotations back is a replay, got {other:?}"),
         }
+        assert!(
+            store
+                .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the replay revoked the grant, the newest pair with it"
+        );
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
     }
 
     /// The three ways a refresh misses without being a replay. None of them
@@ -11037,36 +11817,433 @@ mod tests {
             .unwrap();
     }
 
-    /// The observable consequence of taking the write lock before the lookup:
-    /// one refresh token presented twice rotates once and then replays, at the
-    /// same registration. Two clients racing one token reach the same two
-    /// answers in the same order, because the second only ever sees
-    /// post-commit state.
+    /// Two parallel sessions of one client refresh with the same token: the
+    /// first rotates, the second arrives inside the grace window and gets a
+    /// pair of its own. Both pairs work, both refresh tokens are live, and the
+    /// grant survives. The write lock decides the order, so racing requests
+    /// reach the same two answers.
     #[tokio::test]
-    async fn presenting_one_refresh_token_twice_rotates_then_replays() {
+    async fn two_parallel_refreshes_inside_the_window_both_succeed() {
         let (_dir, store) = store().await;
         let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
         let issued = store
             .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
             .await
             .unwrap();
-        let first = store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+        let (one, two) = tokio::join!(
+            store.refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now),
+            store.refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now),
+        );
+        let mut pairs = Vec::new();
+        let mut reissued = 0;
+        for outcome in [one.unwrap(), two.unwrap()] {
+            match outcome {
+                RefreshOutcome::Rotated(pair) => pairs.push(pair),
+                RefreshOutcome::Reissued {
+                    grant,
+                    since_rotation,
+                } => {
+                    assert_eq!(since_rotation, 0);
+                    reissued += 1;
+                    pairs.push(grant);
+                }
+                other => panic!("both parallel refreshes succeed, got {other:?}"),
+            }
+        }
+        assert_eq!(reissued, 1, "one rotates, the other is reissued");
+        assert_ne!(pairs[0].refresh_token, pairs[1].refresh_token);
+        assert_ne!(pairs[0].access_token, pairs[1].access_token);
+        for pair in &pairs {
+            assert_eq!(pair.id, issued.id, "one grant, not a fork");
+            assert_eq!(pair.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
+            assert!(
+                store
+                    .oauth_access_user(&pair.access_token, OAUTH_RESOURCE)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "each session's access token works"
+            );
+        }
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the rotated token's own access token stopped"
+        );
+        // Each new refresh token is live in its own right.
+        for (i, pair) in pairs.iter().enumerate() {
+            let outcome = store
+                .refresh_oauth_grant_at(&pair.refresh_token, &client.client_id, None, now + 10)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, RefreshOutcome::Rotated(_)),
+                "session {i} rotates its own token, got {outcome:?}"
+            );
+        }
+        assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
+        assert!(
+            store
+                .list_ended_oauth_grants("ada")
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing ended"
+        );
+    }
+
+    /// The same token presented again 60 seconds or more after its rotation
+    /// is a replay: the grant is revoked and the record says why. 59 seconds
+    /// is still inside the window.
+    #[tokio::test]
+    async fn the_same_token_after_the_window_revokes_the_grant() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let outcome = store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(rotated) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+        let outcome = store
+            .refresh_oauth_grant_at(
+                &issued.refresh_token,
+                &client.client_id,
+                None,
+                now + OAUTH_REFRESH_GRACE_SECS - 1,
+            )
             .await
             .unwrap();
         assert!(
-            matches!(first, RefreshOutcome::Rotated(_)),
-            "the first presentation rotates, got {first:?}"
+            matches!(
+                outcome,
+                RefreshOutcome::Reissued {
+                    since_rotation: 59,
+                    ..
+                }
+            ),
+            "59 seconds is inside the window, got {outcome:?}"
         );
         match store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+            .refresh_oauth_grant_at(
+                &issued.refresh_token,
+                &client.client_id,
+                None,
+                now + OAUTH_REFRESH_GRACE_SECS,
+            )
             .await
             .unwrap()
         {
-            RefreshOutcome::Replayed { grant } => assert_eq!(grant, issued.id),
-            other => panic!("the second presentation is a replay, got {other:?}"),
+            RefreshOutcome::Replayed {
+                grant,
+                since_rotation,
+            } => {
+                assert_eq!(grant, issued.id);
+                assert_eq!(since_rotation, OAUTH_REFRESH_GRACE_SECS);
+            }
+            other => panic!("60 seconds after the rotation is a replay, got {other:?}"),
         }
+        assert!(
+            store
+                .oauth_access_user(&rotated.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the whole grant is gone"
+        );
         assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
+        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, issued.id);
+        assert_eq!(ended[0].client_name, "Some Client");
+        assert_eq!(ended[0].redirect_host, "client.example");
+        assert_eq!(
+            ended[0].ended.as_ref().map(|e| e.reason),
+            Some(OauthGrantEndReason::Replayed)
+        );
+    }
+
+    /// Inside the window, the token still has to come from the client it was
+    /// issued to: another client presenting it is a replay, not a parallel
+    /// session. And a disabled account gets nothing, as on the live path.
+    #[tokio::test]
+    async fn the_grace_window_keeps_the_client_and_account_checks() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let stranger = store
+            .register_oauth_client(
+                "Another Client",
+                None,
+                &["https://x.example/cb".to_string()],
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap();
+
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + 1)
+                .await
+                .unwrap(),
+            RefreshOutcome::Unknown
+        ));
+        store.set_disabled("ada", false).await.unwrap();
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(
+                    &issued.refresh_token,
+                    &client.client_id,
+                    Some("https://other.example"),
+                    now + 1
+                )
+                .await
+                .unwrap(),
+            RefreshOutcome::WrongTarget
+        ));
+        assert!(matches!(
+            store
+                .refresh_oauth_grant_at(&issued.refresh_token, &stranger.client_id, None, now + 1)
+                .await
+                .unwrap(),
+            RefreshOutcome::Replayed { .. }
+        ));
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// Every answer inside the window adds a live token, so the set is kept
+    /// small: past `OAUTH_LIVE_TOKENS_KEPT` the oldest live tokens are
+    /// deleted outright (an unknown token later, never a replay), and only
+    /// `OAUTH_RETIRED_TOKENS_KEPT` rotated ones are remembered.
+    #[tokio::test]
+    async fn a_grant_keeps_a_bounded_set_of_tokens() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let now = chrono::Utc::now().timestamp();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now)
+            .await
+            .unwrap();
+        let mut siblings = Vec::new();
+        for i in 0..12 {
+            match store
+                .refresh_oauth_grant_at(&issued.refresh_token, &client.client_id, None, now + i)
+                .await
+                .unwrap()
+            {
+                RefreshOutcome::Reissued { grant, .. } => siblings.push(grant),
+                other => panic!("inside the window, got {other:?}"),
+            }
+        }
+        let row = store
+            .query_first(
+                "SELECT COUNT(*) FROM oauth_grant_token WHERE rotated_at IS NULL",
+                vec![],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(row.get_value(0), Ok(Value::Integer(n)) if n == OAUTH_LIVE_TOKENS_KEPT));
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant_at(
+                        &siblings[0].refresh_token,
+                        &client.client_id,
+                        None,
+                        now + 20
+                    )
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "a live token pushed out of the set is unknown, not a replay"
+        );
+        assert_eq!(count_rows(&store, "oauth_grants").await, 1);
+
+        let mut current = siblings.last().unwrap().clone();
+        for i in 0..12 {
+            match store
+                .refresh_oauth_grant_at(
+                    &current.refresh_token,
+                    &client.client_id,
+                    None,
+                    now + 30 + i,
+                )
+                .await
+                .unwrap()
+            {
+                RefreshOutcome::Rotated(next) => current = next,
+                other => panic!("a live token rotates, got {other:?}"),
+            }
+        }
+        assert!(
+            count_rows(&store, "oauth_grant_token").await
+                <= OAUTH_LIVE_TOKENS_KEPT + OAUTH_RETIRED_TOKENS_KEPT
+        );
+    }
+
+    /// The record of an ended grant: written for a replay (above) and for an
+    /// explicit revoke here, listed newest first, left out after seven days,
+    /// and never carrying a token.
+    #[tokio::test]
+    async fn an_explicit_revoke_is_recorded_and_listed_for_a_while() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let one = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let two = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        assert!(store.revoke_oauth_grant("ada", one.id).await.unwrap());
+        assert!(
+            store
+                .revoke_oauth_grant_by_token(&two.refresh_token, &client.client_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store.revoke_oauth_grant("ada", one.id).await.unwrap(),
+            "an ended grant cannot be revoked again"
+        );
+        assert_eq!(count_rows(&store, "oauth_grant_token").await, 0);
+        let ended = store.list_ended_oauth_grants("ada").await.unwrap();
+        let reasons: Vec<_> = ended
+            .iter()
+            .map(|g| (g.id, g.ended.as_ref().unwrap().reason))
+            .collect();
+        assert!(reasons.contains(&(one.id, OauthGrantEndReason::Revoked)));
+        assert!(reasons.contains(&(two.id, OauthGrantEndReason::ClientRevoked)));
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+        let json = serde_json::to_string(&ended).unwrap();
+        assert!(json.contains("\"reason\":\"revoked\""), "{json}");
+        assert!(!json.contains(OAUTH_ACCESS_PREFIX) && !json.contains(OAUTH_REFRESH_PREFIX));
+
+        let later = chrono::Utc::now().timestamp() + OAUTH_ENDED_KEPT_SECS + 1;
+        assert!(
+            store
+                .list_ended_oauth_grants_at("ada", later)
+                .await
+                .unwrap()
+                .is_empty(),
+            "after seven days the record is no longer listed"
+        );
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_ended_oauth_grants("bob")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A file written before 0.32.1 holds each grant's pair in `oauth_grants`
+    /// itself, with the predecessor in `previous_refresh_hash`. Opening it
+    /// moves both into `oauth_grant_token`: the access token keeps working,
+    /// the refresh token rotates, and the predecessor is still a replay
+    /// (its rotation time is read off the access token's issue, an hour ago
+    /// here, far outside the window).
+    #[tokio::test]
+    async fn an_old_store_with_a_previous_refresh_hash_keeps_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        let access = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
+        let refresh = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let previous = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let id = {
+            let store = AuthStore::open(&path).await.unwrap();
+            let client = oauth_cast(&store).await;
+            let now = chrono::Utc::now().timestamp();
+            // What the 0.32.0 issue and rotation wrote, column by column.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO oauth_grants
+                         (user, client_id, resource, access_hash, access_expires_at,
+                          refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
+                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        Value::Text(client.client_id.clone()),
+                        Value::Text(OAUTH_RESOURCE.to_string()),
+                        Value::Text(token_hash(&access)),
+                        Value::Integer(now + 60),
+                        Value::Text(token_hash(&refresh)),
+                        Value::Text(token_hash(&previous)),
+                        Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .unwrap();
+            store.conn.last_insert_rowid()
+        };
+        let store = AuthStore::open(&path).await.unwrap();
+        // A second open moves nothing twice.
+        drop(store);
+        let store = AuthStore::open(&path).await.unwrap();
+        assert_eq!(count_rows(&store, "oauth_grant_token").await, 2);
+        assert!(
+            grant_text(&store, id, "refresh_hash")
+                .await
+                .starts_with(OAUTH_PLACEHOLDER_PREFIX)
+        );
+        let client_id = store.list_oauth_grants("ada").await.unwrap()[0]
+            .client_id
+            .clone();
+        assert!(
+            store
+                .oauth_access_user(&access, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "the access token minted before the upgrade still resolves"
+        );
+        let outcome = store
+            .refresh_oauth_grant(&refresh, &client_id, None)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(next) = outcome else {
+            panic!("the refresh token minted before the upgrade rotates, got {outcome:?}");
+        };
+        assert_eq!(next.id, id);
+        match store
+            .refresh_oauth_grant(&previous, &client_id, None)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant, .. } => assert_eq!(grant, id),
+            other => panic!("the old predecessor is still a replay, got {other:?}"),
+        }
     }
 
     /// The host on the consent screen and the grant card is a fact a person is

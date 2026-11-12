@@ -22,12 +22,13 @@
 //! - **The anonymous viewer is refused, 401.** It has no account, and a grant
 //!   is issued to one. Logging in is what changes that.
 //!
-//! Revoking deletes the row outright rather than marking it - the same
-//! `AuthStore::revoke_oauth_grant` a disabled or removed account's sweep
-//! already calls - so both of the grant's tokens stop resolving at the MCP
-//! gate at once, on the very next request: the service crate's `mcp_gate`
-//! module's OAuth lookup is a fresh query every time, there is nothing
-//! cached to invalidate.
+//! Revoking deletes the grant and every token it holds outright rather than
+//! marking it, so its tokens stop resolving at the MCP gate at once, on the
+//! very next request: the service crate's `mcp_gate` module's OAuth lookup is
+//! a fresh query every time, there is nothing cached to invalidate. What is
+//! kept is a short record of why it ended (`AuthStore::list_ended_oauth_grants`),
+//! which `include_ended=true` lists for seven days, so a person can see why a
+//! client disappeared.
 //!
 //! Nothing here ever carries a token: the store keeps only hashes, and
 //! [`super::auth_store::OauthGrantInfo`] was never given a field for one.
@@ -35,10 +36,24 @@
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use serde::Deserialize;
+use utoipa::IntoParams;
 
 use super::auth::Identity;
 use super::auth_store::OauthGrantInfo;
-use super::{ApiError, ApiPath, ProblemDetail, RestState};
+use super::{ApiError, ApiPath, ApiQuery, ProblemDetail, RestState};
+
+/// The query string of `GET /me/oauth-grants`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListQuery {
+    /// Also list the grants that ended in the last seven days, after the live
+    /// ones, each with `ended` saying when and why. Defaults to false, which
+    /// lists the live grants only.
+    #[serde(default)]
+    #[param(example = true)]
+    include_ended: Option<bool>,
+}
 
 /// What naming an id that is not one of the caller's grants is told, in one
 /// place because the revoke path produces it without the store failing at
@@ -59,7 +74,8 @@ fn store_error(e: anyhow::Error) -> ApiError {
     ApiError::internal(format!("{e:#}"))
 }
 
-/// `GET /me/oauth-grants` - the caller's own OAuth grants, newest first.
+/// `GET /me/oauth-grants` - the caller's own OAuth grants, newest first,
+/// and with `include_ended=true` the record of the ones that ended lately.
 ///
 /// A pure read, so a read-only instance serves it. Carries no token material:
 /// the store keeps only hashes, so there is nothing to show beyond which
@@ -80,7 +96,13 @@ fn store_error(e: anyhow::Error) -> ApiError {
                    longer refresh is left out rather than shown as dead \
                    weight. Served on a read-only instance like the rest of \
                    this surface: a grant is account state rather than \
-                   knowledge.",
+                   knowledge. With `include_ended=true` the grants that ended \
+                   in the last seven days follow the live ones, newest \
+                   first, each with `ended` naming when and why (an old \
+                   refresh token used again, revoked here, or revoked by the \
+                   client), so a person can tell why a client is gone. Such \
+                   a row cannot be revoked again.",
+    params(ListQuery),
     responses(
         (status = 200, description = "This account's connected clients.", body = Vec<super::schemas::OauthGrantInfo>),
         (
@@ -101,15 +123,24 @@ fn store_error(e: anyhow::Error) -> ApiError {
 pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
+    ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Vec<OauthGrantInfo>>, ApiError> {
     let user = identity.require_account()?;
-    Ok(Json(
-        state
-            .auth
-            .list_oauth_grants(&user.name)
-            .await
-            .map_err(store_error)?,
-    ))
+    let mut grants = state
+        .auth
+        .list_oauth_grants(&user.name)
+        .await
+        .map_err(store_error)?;
+    if query.include_ended.unwrap_or(false) {
+        grants.extend(
+            state
+                .auth
+                .list_ended_oauth_grants(&user.name)
+                .await
+                .map_err(store_error)?,
+        );
+    }
+    Ok(Json(grants))
 }
 
 /// `DELETE /me/oauth-grants/{id}` - revoke one of the caller's own grants,

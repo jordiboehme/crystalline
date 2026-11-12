@@ -3881,7 +3881,8 @@ async fn expire_access_token(path: &std::path::Path, grant: i64) {
     let conn = db.connect().unwrap();
     let touched = conn
         .execute(
-            "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+            "UPDATE oauth_grant_token SET access_expires_at = 1
+             WHERE grant_id = ?1 AND rotated_at IS NULL",
             vec![turso::Value::Integer(grant)],
         )
         .await
