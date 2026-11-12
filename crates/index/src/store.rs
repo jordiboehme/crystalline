@@ -3939,6 +3939,15 @@ pub trait Store: ReadStore {
     /// switch; a domain's own clear stays `clear_domain`.
     async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()>;
 
+    /// The read connections this store opened beside itself, as one
+    /// [`ReadStore`] that runs every call on a connection of its own, or
+    /// `None` when it has none (an in-memory store, read connections turned
+    /// off with `CRYSTALLINE_READ_CONNECTIONS=0`). The engine then reads
+    /// through the writer, under its lock ([`crate::reader::LockedReader`]).
+    fn read_pool(&self) -> Option<std::sync::Arc<dyn ReadStore>> {
+        None
+    }
+
     /// Whether this database may be shared by several instances at once, so
     /// per-instance housekeeping must not delete shared rows.
     fn shares_database(&self) -> bool {

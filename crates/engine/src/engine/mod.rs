@@ -42,6 +42,8 @@ use crystalline_core::{
     domain_name_of_source, is_lower_hyphen, parse_engram, parse_engram_lossless, slash_rel,
     slugify,
 };
+use crystalline_index::ReadStore;
+use crystalline_index::reader::LockedReader;
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, Class, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats,
@@ -924,6 +926,9 @@ struct RoomScreenGate {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
+    // The reads that need no writer guard: the store's read connections, or
+    // the writer under its lock when it has none. See `Engine::reader`.
+    reader: Arc<dyn ReadStore>,
     // The effective config: the file config with the environment overlay
     // applied. Every runtime read goes through this, so the ~30 read sites stay
     // untouched by the file/effective split. Behind a lock (not an immutable
@@ -2519,6 +2524,19 @@ async fn hold_the_load(
     ))
 }
 
+/// The reader an engine over `store` uses: the store's own read connections
+/// when it has some, else [`LockedReader`] over the writer. The store was
+/// just opened, so nothing holds its lock; a lock held anyway reads through
+/// the writer.
+fn reader_for(store: &Arc<Mutex<dyn Store>>) -> Arc<dyn ReadStore> {
+    if let Ok(guard) = store.try_lock()
+        && let Some(pool) = guard.read_pool()
+    {
+        return pool;
+    }
+    Arc::new(LockedReader::new(store.clone()))
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -2538,8 +2556,10 @@ impl Engine {
         // built without `with_env_overlay` behaves exactly as before the split.
         let file_config = config.clone();
         let skills_serve = config.skills_serve();
+        let reader = reader_for(&store);
         Engine {
             store,
+            reader,
             config: std::sync::RwLock::new(config),
             file_config: std::sync::RwLock::new(file_config),
             overlay: EnvOverlay::default(),
@@ -5024,6 +5044,19 @@ impl Engine {
     /// The shared store handle, for the daemon's watcher and embed loop.
     pub fn store(&self) -> Arc<Mutex<dyn Store>> {
         self.store.clone()
+    }
+
+    /// The store for reads that need no writer guard: a read connection of
+    /// the store's own when it opened some, else the writer under its lock.
+    ///
+    /// Only for a read whose answer decides no write under the same guard.
+    /// Code between `begin()` and `commit()` reads through the writer it
+    /// holds; a debug build panics when the task that opened a write
+    /// transaction asks for a reader before it ends it.
+    #[track_caller]
+    pub fn reader(&self) -> &dyn ReadStore {
+        crystalline_index::reader::txn::assert_none_open();
+        &*self.reader
     }
 
     /// The active embedding provider, if one has been installed.

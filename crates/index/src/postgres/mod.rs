@@ -5502,12 +5502,14 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         *guard = Some(c);
+        crate::reader::txn::opened();
         Ok(())
     }
 
     async fn commit(&self) -> Result<()> {
         let mut guard = self.tx.lock().await;
         if let Some(mut c) = guard.take() {
+            crate::reader::txn::closed();
             sqlx::query("COMMIT")
                 .execute(&mut *c)
                 .await
@@ -5519,6 +5521,7 @@ impl Store for PostgresStore {
     async fn rollback(&self) -> Result<()> {
         let mut guard = self.tx.lock().await;
         if let Some(mut c) = guard.take() {
+            crate::reader::txn::closed();
             let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
         }
         // A rolled-back tag insert leaves its cached id pointing at a row that no

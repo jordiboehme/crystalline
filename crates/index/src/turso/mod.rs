@@ -5263,11 +5263,13 @@ impl Store for TursoStore {
 
     async fn begin(&self) -> Result<()> {
         self.conn.execute("BEGIN", ()).await?;
+        crate::reader::txn::opened();
         Ok(())
     }
 
     async fn commit(&self) -> Result<()> {
         self.conn.execute("COMMIT", ()).await?;
+        crate::reader::txn::closed();
         Ok(())
     }
 
@@ -5275,6 +5277,7 @@ impl Store for TursoStore {
         // A rollback reverts any chunk mutation made in the transaction, so a
         // snapshot recomputed mid-transaction must not survive it.
         self.invalidate_coverage();
+        crate::reader::txn::closed();
         self.conn.execute("ROLLBACK", ()).await?;
         Ok(())
     }
