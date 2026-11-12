@@ -312,14 +312,14 @@ pub fn registry() -> Vec<HotStatement> {
             postgres_must_seek: &[],
         },
         HotStatement {
-            // Every apply stamps its domain's last sync.
+            // Every apply that changed its domain stamps the domain's last sync.
             issued_by: "Store::record_sync",
             turso: || crystalline_index::turso::RECORD_SYNC_SQL.to_string(),
             #[cfg(feature = "postgres")]
             postgres: || crystalline_index::postgres::RECORD_SYNC_SQL.to_string(),
-            literals: &["'2026-10-15T00:00:00+00:00'", "1"],
+            literals: &["'2026-10-15T00:00:00+00:00'", "1", "1"],
             #[cfg(feature = "postgres")]
-            literals_pg: None,
+            literals_pg: Some(&["'2026-10-15T00:00:00+00:00'", "1", "true"]),
             scan_expected: &[],
             #[cfg(feature = "postgres")]
             scan_expected_pg: None,

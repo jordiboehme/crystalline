@@ -49,7 +49,7 @@ pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_te
 pub use factory::{open_store, store_location};
 pub use hosting::{
     ACCEPT_DISK_NEEDS_DOMAIN, Claimed, HostLease, claim_host_marking_moves, claim_window,
-    give_back, instance_label, stale_secs,
+    give_back, held_claim, instance_label, stale_secs,
 };
 pub use store::{
     AssetTable, AttachmentRow, AutomationLease, AutomationRun, BrowseLevel, ChunkJob,

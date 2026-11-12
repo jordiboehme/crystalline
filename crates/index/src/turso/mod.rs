@@ -1308,9 +1308,11 @@ fn resolve_pending_sql(table: &str) -> String {
 #[doc(hidden)]
 pub const HOST_MOVE_SQL: &str = "SELECT host_move FROM domain WHERE id=?1";
 
-/// The sync stamp every apply writes: one primary-key seek.
+/// The sync stamp an apply writes when it changed the index, or when the
+/// domain has none yet: one primary-key seek. `?3` is whether it changed.
 #[doc(hidden)]
-pub const RECORD_SYNC_SQL: &str = "UPDATE domain SET last_sync=?1 WHERE id=?2";
+pub const RECORD_SYNC_SQL: &str =
+    "UPDATE domain SET last_sync=?1 WHERE id=?2 AND (?3 = 1 OR last_sync IS NULL)";
 
 /// The on-disk snapshot behind [`Store::file_stamps`].
 ///
@@ -1762,6 +1764,26 @@ impl Store for TursoStore {
         // so an absent path stores the empty string and `kind` discriminates.
         let path = path.unwrap_or("");
         let kind = kind_str(kind);
+        // Every sync of every domain comes through here, and almost every
+        // time the row is already exactly this one. Read first and write
+        // nothing then: an upsert that changes nothing still rewrites the
+        // row and appends to the log, on every sync of an idle domain.
+        let existing = query_first(
+            &self.conn,
+            "SELECT d.id, d.path, d.kind, \
+             EXISTS(SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name) \
+             FROM domain d WHERE d.name=?1",
+            vec![Value::Text(name.to_string())],
+        )
+        .await?;
+        if let Some(r) = &existing
+            && let Some(id) = cell_i64(r, 0)
+            && cell_text(r, 1).as_deref() == Some(path)
+            && cell_text(r, 2).as_deref() == Some(kind)
+            && cell_i64(r, 3) == Some(1)
+        {
+            return Ok(DomainId(id));
+        }
         self.conn
             .execute(
                 // A new row is stamped with the current parser generation, so
@@ -2766,9 +2788,25 @@ impl Store for TursoStore {
         &self,
         domain: DomainId,
         pairs: &[(String, String)],
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // A map that already holds exactly these pairs is left alone, so the
+        // refresh every sync runs writes nothing while the MANIFEST is
+        // unchanged.
+        let held = query_all(
+            &self.conn,
+            "SELECT alias, canonical FROM tag_alias WHERE domain_id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        let held: std::collections::BTreeMap<String, String> = held
+            .iter()
+            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
+            .collect();
+        if held == crate::store::wanted_tag_aliases(pairs) {
+            return Ok(false);
+        }
         // Delete then re-insert: the map is fully derived from MANIFEST content,
-        // so each sync replaces the domain's rows wholesale and an empty slice
+        // so a change replaces the domain's rows wholesale and an empty slice
         // clears them. `INSERT OR IGNORE` drops a duplicate alias (the caller
         // already deduped first-wins, so this is belt and braces).
         self.conn
@@ -2789,7 +2827,7 @@ impl Store for TursoStore {
                 )
                 .await?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
@@ -3851,11 +3889,15 @@ impl Store for TursoStore {
         self.truncate_wal().await
     }
 
-    async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()> {
+    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()> {
         self.conn
             .execute(
                 RECORD_SYNC_SQL,
-                vec![Value::Text(when.to_string()), Value::Integer(domain.0)],
+                vec![
+                    Value::Text(when.to_string()),
+                    Value::Integer(domain.0),
+                    Value::Integer(i64::from(changed)),
+                ],
             )
             .await?;
         Ok(())

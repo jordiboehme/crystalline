@@ -1435,9 +1435,11 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
 #[doc(hidden)]
 pub const HOST_MOVE_SQL: &str = "SELECT host_move FROM domain WHERE id=$1";
 
-/// The sync stamp every apply writes: one primary-key seek.
+/// The sync stamp an apply writes when it changed the index, or when the
+/// domain has none yet: one primary-key seek. `$3` is whether it changed.
 #[doc(hidden)]
-pub const RECORD_SYNC_SQL: &str = "UPDATE domain SET last_sync=$1 WHERE id=$2";
+pub const RECORD_SYNC_SQL: &str =
+    "UPDATE domain SET last_sync=$1 WHERE id=$2 AND ($3 OR last_sync IS NULL)";
 
 /// The on-disk snapshot behind [`Store::file_stamps`].
 ///
@@ -1817,6 +1819,27 @@ impl Store for PostgresStore {
         // A virtual domain stores `path = NULL`; `kind` discriminates on both
         // backends.
         let mut conn = self.acquire().await?;
+        // Every sync of every domain comes through here, and almost every
+        // time the row is already exactly this one. Read first and write
+        // nothing then: the upsert below rewrites the row even when nothing
+        // in it changes, and takes a value from the id sequence even when it
+        // inserts nothing.
+        let existing: Option<(i64, Option<String>, String, bool)> = sqlx::query_as(
+            "SELECT d.id, d.path, d.kind, \
+             EXISTS(SELECT 1 FROM domain_spelling s WHERE s.spelling=d.name) \
+             FROM domain d WHERE d.name=$1",
+        )
+        .bind(name)
+        .fetch_optional(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        if let Some((id, held_path, held_kind, spelled)) = existing
+            && held_path.as_deref() == path
+            && held_kind == kind_str(kind)
+            && spelled
+        {
+            return Ok(DomainId(id));
+        }
         // A new row is stamped with the current parser generation, so a fresh
         // index never reparses what it has only just parsed; an existing row
         // keeps the generation it has.
@@ -2875,14 +2898,27 @@ impl Store for PostgresStore {
         &self,
         domain: DomainId,
         pairs: &[(String, String)],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Delete then re-insert: the map is fully derived from MANIFEST content,
-        // so each sync replaces the domain's rows wholesale and an empty slice
+        // so a change replaces the domain's rows wholesale and an empty slice
         // clears them. `ON CONFLICT DO NOTHING` drops a duplicate alias (the
         // caller already deduped first-wins, so this is belt and braces). Runs on
         // the acquired connection so it stays inside the sync transaction.
         let mut conn = self.acquire().await?;
         let c = conn.as_mut();
+        // A map that already holds exactly these pairs is left alone, so the
+        // refresh every sync runs writes nothing while the MANIFEST is
+        // unchanged.
+        let held: Vec<(String, String)> =
+            sqlx::query_as("SELECT alias, canonical FROM tag_alias WHERE domain_id=$1")
+                .bind(domain.0)
+                .fetch_all(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+        let held: std::collections::BTreeMap<String, String> = held.into_iter().collect();
+        if held == crate::store::wanted_tag_aliases(pairs) {
+            return Ok(false);
+        }
         sqlx::query("DELETE FROM tag_alias WHERE domain_id=$1")
             .bind(domain.0)
             .execute(&mut *c)
@@ -2899,7 +2935,7 @@ impl Store for PostgresStore {
             .await
             .map_err(IndexError::from)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>> {
@@ -4055,11 +4091,12 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()> {
+    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()> {
         let mut conn = self.acquire().await?;
         sqlx::query(RECORD_SYNC_SQL)
             .bind(when)
             .bind(domain.0)
+            .bind(changed)
             .execute(conn.as_mut())
             .await
             .map_err(IndexError::from)?;

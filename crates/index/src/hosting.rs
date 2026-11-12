@@ -219,6 +219,58 @@ pub async fn claim_host_marking_moves(
     }
 }
 
+/// The claim a re-claim would answer when it would change nothing: this
+/// instance already holds `domain`'s lock under `lease`, its heartbeat is at
+/// or after `fresh_since`, and the row already carries the label a claim
+/// would record (and, on a shared database, the domain row already names this
+/// instance as its last host). `None` when any of that is not so, and the
+/// caller claims as usual.
+///
+/// A long-running instance re-claims every domain on every sync, and every
+/// claim writes a new token, so an idle domain synced on each watcher flush
+/// would write its lock row each time. The heartbeat timer keeps a held lock
+/// fresh on its own, so such a re-claim is answered from the row instead,
+/// with nothing written. Only reads run here. The answer's `over` is the
+/// held token, which is what a claim replacing it would name, so a caller
+/// that keeps the lease of its first claim keeps it unchanged. `fresh_since`
+/// must not be before the stale threshold, or a lock another instance may
+/// already take would be treated as held.
+pub async fn held_claim(
+    store: &dyn Store,
+    domain: DomainId,
+    instance_id: &str,
+    label: &str,
+    lease: &HostLease,
+    fresh_since: &str,
+) -> Result<Option<Claimed>> {
+    let Some(holder) = store.domain_host(domain).await? else {
+        return Ok(None);
+    };
+    if holder.instance_id != instance_id
+        || holder.token != lease.token
+        || holder.heartbeat_at.as_str() < fresh_since
+    {
+        return Ok(None);
+    }
+    let label = instance_label(store, label, instance_id).await?;
+    if holder.label != label {
+        return Ok(None);
+    }
+    if store.shares_database()
+        && store.last_domain_host(domain).await? != Some((instance_id.to_string(), label.clone()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(Claimed {
+        claim: HostClaim::Acquired {
+            token: holder.token.clone(),
+        },
+        over: Some(holder.token),
+        label,
+        took_from: None,
+    }))
+}
+
 /// The token of a live claim this instance id holds, if `holder` is one.
 fn live_own_token(
     holder: Option<&DomainHost>,

@@ -504,6 +504,22 @@ pub(crate) fn spelling_plan(spellings: &[(String, DomainId)]) -> Result<Spelling
     })
 }
 
+/// The tag-alias rows [`Store::replace_tag_aliases`] leaves for `pairs`: the
+/// first canonical listed for each alias, as the insert that ignores a
+/// duplicate alias keeps it. A store compares its rows with this before it
+/// writes, so a refresh of an unchanged map writes nothing.
+pub(crate) fn wanted_tag_aliases(
+    pairs: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut wanted = std::collections::BTreeMap::new();
+    for (alias, canonical) in pairs {
+        wanted
+            .entry(alias.clone())
+            .or_insert_with(|| canonical.clone());
+    }
+    wanted
+}
+
 /// Every spelling whose mapping differs between two snapshots of the spelling
 /// table: added, removed or pointing at another domain. Sorted byte-wise.
 pub(crate) fn changed_spellings(
@@ -3248,9 +3264,13 @@ pub trait Store: Send + Sync {
     /// then inserts each pair, ignoring a duplicate alias. Called by
     /// [`crate::sync::refresh_tag_aliases`] on every sync, so an empty slice
     /// clears the domain's aliases. Both sides are already lowercased by the
-    /// caller; the store never parses markdown.
-    async fn replace_tag_aliases(&self, domain: DomainId, pairs: &[(String, String)])
-    -> Result<()>;
+    /// caller; the store never parses markdown. Rows that already say exactly
+    /// this are left alone and nothing is written; answers whether it wrote.
+    async fn replace_tag_aliases(
+        &self,
+        domain: DomainId,
+        pairs: &[(String, String)],
+    ) -> Result<bool>;
 
     /// The distinct folded `(alias, canonical)` tag-alias pairs, optionally
     /// scoped to a set of domain names, ordered by alias then canonical. An
@@ -3735,8 +3755,14 @@ pub trait Store: Send + Sync {
         Ok(())
     }
 
-    /// Record that a domain finished syncing at the given RFC 3339 instant.
-    async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
+    /// Record that a sync of a domain changed its index at the given RFC 3339
+    /// instant. `changed` is whether the sync wrote anything: a sync that
+    /// changed nothing stamps only a domain that carries no stamp yet, so the
+    /// first sync of an empty domain still reads as synced, and every later
+    /// sync of an unchanged domain writes nothing at all. The stamp therefore
+    /// says when the index of the domain last changed through a sync, not
+    /// when the last sync ran; an engine that wants the latter keeps it.
+    async fn record_sync(&self, domain: DomainId, when: &str, changed: bool) -> Result<()>;
 
     /// Record that every named domain was seen registered at the given RFC
     /// 3339 instant, writing `last_registered` on each matching row.

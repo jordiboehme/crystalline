@@ -1206,6 +1206,11 @@ pub struct Engine {
     // short threshold makes multi-instance stale-takeover verification fast).
     heartbeat_secs: i64,
     stale_secs: i64,
+    // When this engine last finished a sync of each domain, RFC 3339, by
+    // domain name. The index stamps a domain only when a sync changed it
+    // (`Store::record_sync`), so an idle domain's stored stamp stays where
+    // it was; the domain listing shows the newer of the two.
+    last_synced: std::sync::Mutex<HashMap<String, String>>,
     // Per-domain lock serializing `origin_add`, `origin_update` and
     // `origin_status` against each other for one domain, so a connect and a
     // pull racing on the same domain never interleave. Created lazily, one
@@ -2627,6 +2632,7 @@ impl Engine {
             leases: std::sync::Mutex::new(HashMap::new()),
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: crystalline_index::stale_secs(),
+            last_synced: std::sync::Mutex::new(HashMap::new()),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
             write_locks: std::sync::Mutex::new(HashMap::new()),
             move_lock: tokio::sync::Mutex::new(()),
@@ -3996,9 +4002,29 @@ impl Engine {
     /// restore ask the Reflection mode, and must not be answered from rows
     /// remembered before the apply. [`Engine::announce_report`] bumps again
     /// afterwards, which costs a refill and also covers its other callers.
+    /// Also notes when the sync finished, for [`Engine::last_sync_of`].
     pub(crate) fn bump_after_apply(&self, domain: &str, report: &SyncReport) {
+        self.last_synced
+            .lock()
+            .unwrap()
+            .insert(domain.to_string(), chrono::Utc::now().to_rfc3339());
         if !report.changes.is_empty() {
             self.bump_reflection_generation(domain);
+        }
+    }
+
+    /// When a domain was last synced, for the listing: the newer of the
+    /// index's stamp, which only a sync that changed the domain moves, and
+    /// the last sync this engine finished.
+    pub(crate) fn last_sync_of(&self, domain: &str, stored: Option<&str>) -> Option<String> {
+        let seen = self.last_synced.lock().unwrap().get(domain).cloned();
+        match (stored, seen) {
+            (Some(stored), Some(seen)) => Some(if seen.as_str() > stored {
+                seen
+            } else {
+                stored.to_string()
+            }),
+            (stored, seen) => seen.or(stored.map(str::to_string)),
         }
     }
 
@@ -5488,25 +5514,61 @@ impl Engine {
             .await?;
         let now = now_offset().to_rfc3339();
         let stale_before = (now_offset() - Duration::seconds(self.stale_secs)).to_rfc3339();
+        // A long-running engine re-claims each domain it syncs, and a domain
+        // it already holds under the lease it keeps, with a heartbeat the
+        // timer keeps fresh, is answered from the lock row with nothing
+        // written: an idle domain synced on every watcher flush must not
+        // rewrite its lock each time. The window is at most half the stale
+        // threshold, so a walk that follows still has the margin a fresh
+        // claim gives it. A one-shot command always claims, so the token it
+        // gives back is its own.
+        let held = if self.is_one_shot() {
+            None
+        } else {
+            self.leases.lock().unwrap().get(name).cloned()
+        };
+        let reclaimed = match &held {
+            Some(lease) => {
+                let fresh = (2 * self.heartbeat_secs).min(self.stale_secs / 2);
+                let fresh_since = (now_offset() - Duration::seconds(fresh)).to_rfc3339();
+                crystalline_index::held_claim(
+                    store,
+                    id,
+                    &self.instance_id,
+                    &self.label,
+                    lease,
+                    &fresh_since,
+                )
+                .await?
+            }
+            None => None,
+        };
         // On a shared database a claim that takes the domain from another
         // instance, or from no known one, also marks a host move: this disk
         // may lack files the previous host wrote, so the complete walks keep
         // the rows they do not see until that is resolved (Task 50).
-        let claimed = crystalline_index::claim_host_marking_moves(
-            store,
-            id,
-            &self.instance_id,
-            &self.label,
-            &now,
-            &stale_before,
-            take_over,
-        )
-        .await?;
+        let claimed = match reclaimed {
+            Some(claimed) => claimed,
+            None => {
+                crystalline_index::claim_host_marking_moves(
+                    store,
+                    id,
+                    &self.instance_id,
+                    &self.label,
+                    &now,
+                    &stale_before,
+                    take_over,
+                )
+                .await?
+            }
+        };
         // The claim's token is kept for the release, the newest one: every
-        // claim writes a new token, a re-claim of a domain held here too. A
-        // re-claim of a lock this engine already holds keeps the claim the
-        // first one replaced, so a one-shot command gives the lock back to
-        // this machine's daemon, not to its own earlier claim.
+        // claim writes a new token, a re-claim of a domain held here too
+        // (unless it was answered from the row above, which keeps the token
+        // and so the lease as it is). A re-claim of a lock this engine
+        // already holds keeps the claim the first one replaced, so a one-shot
+        // command gives the lock back to this machine's daemon, not to its
+        // own earlier claim.
         {
             let mut leases = self.leases.lock().unwrap();
             match claimed.lease() {
