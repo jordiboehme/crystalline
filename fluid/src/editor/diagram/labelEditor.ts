@@ -149,6 +149,10 @@ interface OpenField {
   queued: string;
   /** Where the field stood when a composition began, to hold the page there. */
   lockTop: number | null;
+  /** A scroll came since the last frame, so the hold, not the layout, moved it. */
+  scrolled: boolean;
+  /** The frame that takes the hold along with a move no scroll made. */
+  lockFrame: number | null;
   /** It names a part an add just made, which Escape leaves in place. */
   added: boolean;
 }
@@ -732,6 +736,8 @@ function makeField(
     refused: null,
     queued: "",
     lockTop: null,
+    scrolled: false,
+    lockFrame: null,
     added: false,
   };
   el.addEventListener("input", () => {
@@ -764,6 +770,7 @@ function makeField(
   el.addEventListener("compositionstart", () => {
     open.composing = true;
     open.lockTop = el.getBoundingClientRect().top;
+    followLayout(open);
   });
   el.addEventListener("compositionend", () => {
     open.composing = false;
@@ -784,6 +791,34 @@ function makeField(
     });
   });
   return open;
+}
+
+/**
+ * While the page holds the field, a move that came with no scroll is a line
+ * that landed above the editor (the findings, a notice): the hold takes the
+ * field's new place, so the next scroll does not pull it back (N8). The browser
+ * sends a frame's scroll events before its animation frames, so a frame with a
+ * scroll leaves the hold to `onScroll`.
+ */
+function followLayout(open: OpenField): void {
+  const win = open.el.ownerDocument.defaultView;
+  if (win === null || open.lockFrame !== null) {
+    return;
+  }
+  const step = () => {
+    if (open.lockTop === null) {
+      open.lockFrame = null;
+      return;
+    }
+    if (open.scrolled) {
+      open.scrolled = false;
+    } else if (open.el.isConnected) {
+      open.lockTop = open.el.getBoundingClientRect().top;
+    }
+    open.lockFrame = win.requestAnimationFrame(step);
+  };
+  open.scrolled = false;
+  open.lockFrame = win.requestAnimationFrame(step);
 }
 
 function onFieldBlur(open: OpenField): void {
@@ -1496,6 +1531,7 @@ function armGuards(main: EditorView): () => void {
     if (open?.lockTop === null || open === undefined || !open.el.isConnected) {
       return;
     }
+    open.scrolled = true;
     const moved = open.el.getBoundingClientRect().top - open.lockTop;
     if (Math.abs(moved) < 0.5) {
       return;
