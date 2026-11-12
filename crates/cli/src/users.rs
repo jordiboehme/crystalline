@@ -196,7 +196,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             let password = read_password(password_stdin, None)?;
             store.set_password(&name, &password).await?;
             println!(
-                "Changed the password for '{}' and signed out its sessions.",
+                "Changed the password for '{}'. Its sessions, MCP tokens and OAuth connections are revoked.",
                 stored_name(&name)
             );
         }

@@ -42,6 +42,7 @@ pub mod manifest;
 pub mod manifest_view;
 pub mod markdown;
 pub mod names;
+pub mod owner_only;
 pub mod parse;
 pub mod path;
 pub mod program;

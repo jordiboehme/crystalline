@@ -1923,12 +1923,13 @@ export type OwnerBody = {
 };
 
 /**
- * The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves.
+ * The replacement password. Setting it revokes every session, MCP token and OAuth grant the account holds, this admin's own session included when they reset themselves.
  */
 export type PasswordBody = {
     /**
-     * The replacement password. Setting it revokes every session the account
-     * holds, this admin's own included when they reset themselves.
+     * The replacement password. Setting it revokes every session, MCP token
+     * and OAuth grant the account holds, this admin's own session included
+     * when they reset themselves.
      */
     password: string;
 };

@@ -415,6 +415,24 @@ pub async fn run_serve(
             tracing::warn!("{line}");
         }
     }
+    // An open MCP tier on a reachable bind is said out loud at every start,
+    // through the same channel as the notices above: stderr for a foreground
+    // serve (and so `docker logs`), daemon.log for a daemonized one.
+    if let Some(line) = http_addr
+        .as_deref()
+        .and_then(|addr| open_mcp_warning(addr, loaded.effective.auth_mcp()))
+    {
+        tracing::warn!("{line}");
+    }
+    // The state folder holds the index, the accounts database and the log,
+    // none of which another account on this machine may read: owner-only on
+    // Unix, tightened here for an install from before that rule. Best effort,
+    // since a folder this process cannot change must not stop the start.
+    if let Ok(state) = crystalline_core::config::state_dir() {
+        for problem in crystalline_core::owner_only::secure_state_dir(&state) {
+            tracing::warn!("{problem}");
+        }
+    }
     // Record what this invocation asked to serve before anything can fail on
     // the lock: the refusal below needs it, and so do the record and /health.
     crate::instance::record_serve_intent(crate::instance::ServeIntent {
@@ -2578,7 +2596,7 @@ fn http_base(
             move || Ok(McpServer::new_http(engine.clone()).with_session_owners(owners.clone()))
         },
         session_manager,
-        http_config(allowed_hosts),
+        http_config(allowed_hosts, config.service_public_url()),
     );
     // The gate wraps the transport rather than the router, which is the whole
     // of its scope: `/health` keeps answering an orchestrator's probe, the JSON
@@ -2611,6 +2629,15 @@ fn http_base(
         // check. Mounted whether or not the API is served.
         .merge(crate::remote_ctl::route(ctl));
     if let Some(rest) = rest {
+        // The same `Host` rule the MCP transport applies, in front of the JSON
+        // API, so a DNS-rebinding page cannot reach it either. A layer on the
+        // nested router rather than inside `rest::router`, so a router built
+        // for a test without a daemon keeps answering requests that carry no
+        // `Host`. See `rest::host_guard`.
+        let rest = rest.layer(axum::middleware::from_fn_with_state(
+            crate::rest::host_guard::HostGuard::new(allowed_hosts, config.service_public_url()),
+            crate::rest::host_guard::check,
+        ));
         router = router.nest("/api/v1", rest);
     }
     Ok((router, service))
@@ -3670,6 +3697,30 @@ fn exposure_override_notice(
     })
 }
 
+/// The startup warning for a daemon that serves MCP over HTTP with no sign-in
+/// on an address other machines can reach: `auth.mcp` off and a bind that is
+/// not loopback, which is the container image's default. `None` otherwise.
+///
+/// A warning, not a refusal: the open tier is the documented default and a
+/// trusted network is a real reason to keep it. What the line does is say out
+/// loud, at every start, what that default means, because the one guard in
+/// front of the open tier (the `Host` allow-list) stops a browser and nothing
+/// else. Loopback is read with [`bind_is_loopback`], the same question the
+/// setup token asks.
+fn open_mcp_warning(addr: &str, auth_mcp: bool) -> Option<String> {
+    if auth_mcp || bind_is_loopback(addr) {
+        return None;
+    }
+    Some(format!(
+        "the HTTP endpoint binds {addr}, which other machines can reach, and auth.mcp is off. \
+         Any client that reaches this port is served over MCP with no sign-in: it can read and \
+         change every shared domain, register folders and change settings. The Host allow-list \
+         is not access control. Turn sign-in on with CRYSTALLINE_AUTH_MCP=true or crystalline \
+         config set auth.mcp true, then give each agent a token with crystalline users mcp-token \
+         <name>"
+    ))
+}
+
 /// Render an HTTP resolution for the notice above: an address, or the words
 /// for a closed endpoint. Not the bare word "off", which reads as a value the
 /// other daemons bind ("that is what every other daemon on this machine
@@ -3700,11 +3751,16 @@ fn describe_hosts(hosts: &[String]) -> String {
     }
 }
 
-/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` guard
-/// and dropping the SSE priming frame. An empty `allowed_hosts` keeps rmcp's
-/// loopback-only default; a single `*` disables the guard (any Host allowed);
-/// otherwise loopback is merged with the configured hosts so local access
-/// never breaks.
+/// Build the streamable-HTTP config, applying the DNS-rebinding `Host` and
+/// `Origin` guards and dropping the SSE priming frame. Both lists come from
+/// `crate::rest::host_guard`, the resolver the JSON API's own `Host` guard
+/// reads: loopback, the configured hosts and the host of `service.public_url`
+/// (an empty `allowed_hosts` is therefore loopback only, rmcp's own default,
+/// plus that host), while a single `*` turns both guards off.
+///
+/// The `Origin` guard is rmcp's: a request that carries an `Origin` must name
+/// one of the allowed hosts, over `http` or `https`; a request without one,
+/// which is every client that is not a browser, is not affected.
 ///
 /// The priming frame (SEP-1699: an empty `data:` event carrying only an `id:`
 /// and a `retry:` reconnection hint, sent ahead of the real JSON-RPC response)
@@ -3739,24 +3795,24 @@ fn describe_hosts(hosts: &[String]) -> String {
 /// handler runs.
 fn http_config(
     allowed_hosts: &[String],
+    public_url: Option<&str>,
 ) -> rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig {
+    use crate::rest::host_guard::{effective_hosts, mcp_allowed_origins};
     use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
     let base = StreamableHttpServerConfig::default()
         .with_sse_retry(None)
         .with_legacy_session_mode(true)
         .with_max_request_body_bytes(crate::rest::MAX_TOOL_BODY_BYTES);
-    if allowed_hosts.iter().any(|h| h == "*") {
-        return base.disable_allowed_hosts();
+    match (
+        effective_hosts(allowed_hosts, public_url),
+        mcp_allowed_origins(allowed_hosts, public_url),
+    ) {
+        (Some(hosts), Some(origins)) => base
+            .with_allowed_hosts(hosts)
+            .with_allowed_origins(origins)
+            .enforce_origin_validation(),
+        _ => base.disable_allowed_hosts().disable_allowed_origins(),
     }
-    if allowed_hosts.is_empty() {
-        return base;
-    }
-    let mut hosts = crate::rest::ALWAYS_ALLOWED_HOSTS
-        .iter()
-        .map(|host| host.to_string())
-        .collect::<Vec<_>>();
-    hosts.extend(allowed_hosts.iter().cloned());
-    base.with_allowed_hosts(hosts)
 }
 
 pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -4818,6 +4874,30 @@ mod tests {
         );
     }
 
+    /// A daemon that serves MCP with no sign-in on an address other machines
+    /// can reach says so, and names the setting that closes it.
+    #[test]
+    fn an_open_mcp_tier_on_a_reachable_bind_is_warned_about() {
+        let line = open_mcp_warning("0.0.0.0:7411", false).expect("a warning");
+        assert!(line.contains("0.0.0.0:7411"), "{line}");
+        assert!(line.contains("auth.mcp is off"), "{line}");
+        assert!(line.contains("CRYSTALLINE_AUTH_MCP=true"), "{line}");
+        assert!(line.contains("not access control"), "{line}");
+        assert!(open_mcp_warning("192.168.1.20:7411", false).is_some());
+        assert!(open_mcp_warning("[::]:7411", false).is_some());
+        assert!(open_mcp_warning("muthur.lan:7411", false).is_some());
+    }
+
+    /// Loopback is the machine owner's own port, and with `auth.mcp` on every
+    /// agent signs in: neither is warned about.
+    #[test]
+    fn no_warning_on_loopback_or_with_agent_sign_in_on() {
+        for addr in ["127.0.0.1:7411", "localhost:7411", "[::1]:7411"] {
+            assert_eq!(open_mcp_warning(addr, false), None, "{addr}");
+        }
+        assert_eq!(open_mcp_warning("0.0.0.0:7411", true), None);
+    }
+
     /// The line names both values and the key, and gives the command that makes
     /// the flag's answer the machine's answer. It is a notice: nothing in it
     /// refuses, because a one-off serve on another port is a real thing to want.
@@ -4880,13 +4960,13 @@ mod tests {
 
     #[test]
     fn http_config_empty_keeps_loopback_only_default() {
-        let cfg = http_config(&[]);
+        let cfg = http_config(&[], None);
         assert_eq!(cfg.allowed_hosts, vec!["localhost", "127.0.0.1", "::1"]);
     }
 
     #[test]
     fn http_config_star_disables_the_guard() {
-        let cfg = http_config(&["*".to_string()]);
+        let cfg = http_config(&["*".to_string()], None);
         assert!(
             cfg.allowed_hosts.is_empty(),
             "an empty allow-list makes rmcp accept any Host"
@@ -4919,7 +4999,7 @@ mod tests {
     /// difference.
     #[test]
     fn http_config_pins_the_session_mode_and_the_body_limit() {
-        let cfg = http_config(&[]);
+        let cfg = http_config(&[], None);
         assert!(
             cfg.legacy_session_mode,
             "legacy clients keep their Mcp-Session-Id routing"
@@ -4933,11 +5013,48 @@ mod tests {
 
     #[test]
     fn http_config_merges_loopback_with_configured_hosts() {
-        let cfg = http_config(&["muthur.lan".to_string()]);
+        let cfg = http_config(&["muthur.lan".to_string()], None);
         assert_eq!(
             cfg.allowed_hosts,
             vec!["localhost", "127.0.0.1", "::1", "muthur.lan"]
         );
+    }
+
+    /// The host of `service.public_url` is the operator's own name for this
+    /// instance, so the transport answers it like a listed host.
+    #[test]
+    fn http_config_answers_the_public_url_host() {
+        let cfg = http_config(&[], Some("https://kb.example/crystalline"));
+        assert_eq!(
+            cfg.allowed_hosts,
+            vec!["localhost", "127.0.0.1", "::1", "kb.example"]
+        );
+        assert!(
+            cfg.allowed_origins
+                .contains(&"https://kb.example:*".to_string()),
+            "{:?}",
+            cfg.allowed_origins
+        );
+    }
+
+    /// Origin validation is on wherever the `Host` guard is, with an origin
+    /// list drawn from the same hosts, and off together with it under `*`.
+    #[test]
+    fn http_config_validates_the_origin_against_the_same_hosts() {
+        let cfg = http_config(&["muthur.lan".to_string()], None);
+        for origin in [
+            "http://localhost:*",
+            "http://[::1]:*",
+            "https://muthur.lan:*",
+        ] {
+            assert!(
+                cfg.allowed_origins.contains(&origin.to_string()),
+                "{origin} in {:?}",
+                cfg.allowed_origins
+            );
+        }
+        let open = http_config(&["*".to_string()], None);
+        assert!(open.allowed_origins.is_empty());
     }
 
     // classify_event: the raw prefix match must short-circuit before any

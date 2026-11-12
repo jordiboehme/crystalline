@@ -814,15 +814,61 @@ fn load_file(path: &Path) -> Result<Option<StoredToken>, RemoteError> {
 }
 
 /// The write half of [`save_file`] over already-serialized text, shared with
-/// the App credential store so both lock a secret file down the same way.
+/// the App credential store and the connected-server credential store so all
+/// three lock a secret file down the same way.
+///
+/// On Unix the temp file is created owner-only (`0600`) before a single byte
+/// of the secret goes into it, so there is no moment in which it carries the
+/// umask's mode. `create_new` makes sure that file is a fresh one this call
+/// made: a leftover from a crashed write is removed first, and anything put
+/// in its place in between makes the write fail rather than land in a file
+/// somebody else prepared. Windows is unchanged.
 pub(crate) fn write_secret_file(path: &Path, json: &str) -> Result<(), RemoteError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, json.as_bytes())?;
+    write_owner_only_new(&tmp, json.as_bytes())?;
+    // The mode the file was created with is filtered by the umask, which can
+    // only narrow it; this keeps the file at exactly 0600 whatever the umask
+    // is.
     set_owner_only(&tmp)?;
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Write `bytes` to `tmp` as a file created owner-only, so the secret never
+/// sits in a file with the umask's mode.
+#[cfg(unix)]
+fn write_owner_only_new(tmp: &Path, bytes: &[u8]) -> Result<(), RemoteError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Windows has no mode bit this crate manages, so the file is written the way
+/// it always was.
+#[cfg(not(unix))]
+fn write_owner_only_new(tmp: &Path, bytes: &[u8]) -> Result<(), RemoteError> {
+    std::fs::write(tmp, bytes)?;
     Ok(())
 }
 
@@ -1312,6 +1358,28 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected owner-only permissions, got {mode:o}");
+    }
+
+    /// A temp file a crashed write left behind, at the umask's mode, is not
+    /// reused: the secret goes into a fresh file created owner-only, and no
+    /// temp file stays behind.
+    #[test]
+    #[cfg(unix)]
+    fn a_secret_never_lands_in_a_leftover_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("github-token.json");
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, b"left over").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_secret_file(&path, "{\"secret\":1}").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"secret\":1}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected owner-only permissions, got {mode:o}");
+        assert!(!tmp.exists(), "no temp file stays behind");
     }
 
     #[test]

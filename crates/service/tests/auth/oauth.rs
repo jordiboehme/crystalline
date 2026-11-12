@@ -2423,7 +2423,9 @@ async fn a_refresh_rotates_and_the_old_token_replays_into_a_revoked_grant() {
 /// carrying a foreign `resource` revokes its grant exactly as a bare one does.
 #[tokio::test]
 async fn a_refresh_resource_is_judged_against_the_grant_and_never_before_a_replay() {
-    let ctx = OauthCtx::start().await;
+    // Both names on the allow-list: the JSON API, where the token endpoint
+    // lives, answers only a listed `Host`.
+    let ctx = OauthCtx::start_with_allowed_hosts(&["knowledge.example"]).await;
     ctx.create_user("ada", Role::Editor).await;
     let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
     let issued: Value = ctx

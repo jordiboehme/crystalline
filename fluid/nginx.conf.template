@@ -62,9 +62,20 @@ server {
     # The one file whose name is not content-hashed. It is what names the
     # current chunks, so a stale cached copy is exactly how a browser ends up
     # asking a new deployment for chunks that no longer exist.
+    #
+    # Every app route ends up here, the OAuth consent page at /authorize among
+    # them, so this is also where framing is refused: no other site may show
+    # the app inside a frame and trick a click on it. These are the two headers
+    # the daemon sends on its own app shell (SHELL_CSP in
+    # crates/service/src/ui.rs), and crates/service/tests/rest/nginx_base_path.rs
+    # notices if the two drift apart. nginx drops inherited add_header lines
+    # once a location sets its own, so all three stay in this block, and
+    # `always` keeps them on an error answer too.
     location = ${CRYSTALLINE_BASE_PATH}/index.html {
         rewrite ^ /index.html break;
         add_header Cache-Control "no-store";
+        add_header Content-Security-Policy "frame-ancestors 'none'" always;
+        add_header X-Frame-Options "DENY" always;
         include /etc/nginx/conf.d/crystalline/index*.conf;
     }
 

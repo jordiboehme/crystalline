@@ -12515,7 +12515,7 @@
           "users"
         ],
         "summary": "`POST /users/{name}/password` - replace an account's password, answering\nwith the account as it now stands.",
-        "description": "A distinct route rather than a `PATCH` field: setting a password revokes\nevery session the account holds, in the same transaction as the change -\nthe reset is useless against a compromised account otherwise, since a\ncookie minted before it would keep working for the rest of its life. An\nadmin resetting their own password signs their own other sessions out too,\nthis one included.",
+        "description": "A distinct route rather than a `PATCH` field: setting a password revokes\nevery session, MCP token and OAuth grant the account holds, in the same\ntransaction as the change - the reset is useless against a compromised\naccount otherwise, since a cookie minted before it would keep working for\nthe rest of its life, and a token or grant minted with that cookie would\nkeep an agent connected. An admin resetting their own password signs their\nown other sessions out too, this one included.",
         "operationId": "reset_user_password",
         "parameters": [
           {
@@ -15584,14 +15584,14 @@
       },
       "PasswordBody": {
         "type": "object",
-        "description": "The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves.",
+        "description": "The replacement password. Setting it revokes every session, MCP token and OAuth grant the account holds, this admin's own session included when they reset themselves.",
         "required": [
           "password"
         ],
         "properties": {
           "password": {
             "type": "string",
-            "description": "The replacement password. Setting it revokes every session the account\nholds, this admin's own included when they reset themselves.",
+            "description": "The replacement password. Setting it revokes every session, MCP token\nand OAuth grant the account holds, this admin's own session included\nwhen they reset themselves.",
             "example": "correct horse battery staple"
           }
         }

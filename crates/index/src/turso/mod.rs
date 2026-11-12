@@ -164,7 +164,14 @@ impl TursoStore {
     /// Open (creating if needed) a store at a filesystem path and migrate it.
     pub async fn open(path: &Path) -> Result<TursoStore> {
         let path_str = path.to_string_lossy().to_string();
-        Self::build(&path_str, Some(path_str.clone())).await
+        let store = Self::build(&path_str, Some(path_str.clone())).await?;
+        // Engram text, private domains included: owner-only on Unix, including
+        // a database that was just created at the umask's mode. Best effort,
+        // like the state folder itself.
+        if let Err(e) = crystalline_core::owner_only::tighten_database(path) {
+            tracing::warn!("could not make {} owner-only: {e}", path.display());
+        }
+        Ok(store)
     }
 
     /// Open an in-memory store, for tests. Nothing is persisted.

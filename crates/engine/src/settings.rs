@@ -299,7 +299,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "service.allowed_hosts",
-            doc: "Comma-separated Host header values the HTTP transport accepts (DNS-rebinding guard); loopback is always allowed and a single * allows any Host; the serve --allowed-host flag wins for that one invocation when given, and a serve whose flag disagrees with this value says so at startup (applies at the next daemon start)",
+            doc: "Comma-separated Host header values the HTTP endpoint accepts for MCP and the JSON API (a DNS-rebinding guard, not access control); loopback and the host of service.public_url are always allowed and a single * allows any Host; the serve --allowed-host flag wins for that one invocation when given, and a serve whose flag disagrees with this value says so at startup (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
