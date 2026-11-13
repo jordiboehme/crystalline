@@ -841,11 +841,23 @@ impl Engine {
     /// out of step with its folder is put right on the way. Callers run it
     /// in the background after the startup sync: a write that arrives first
     /// waits for the domain's pass and then finds the memo full.
+    ///
+    /// Only the file domains a full sync walks: the startup snapshot and the
+    /// domains already discovered, never one found only by re-reading the
+    /// configuration file. A refresh resolves its domain by name, and a name
+    /// only the file knows would be discovered there, which arms a watch and
+    /// runs a catch-up sync. A background pass must not be what decides
+    /// whether a domain added by editing the file is indexed, and whether it
+    /// did would depend on when this task ran.
     pub async fn warm_index_files(&self) {
-        for (name, entry) in self.registered_domain_entries() {
-            if entry.is_virtual() {
-                continue;
+        let targets = match self.sync_targets(None) {
+            Ok(targets) => targets,
+            Err(e) => {
+                tracing::warn!("index warm-up did not run: {e}");
+                return;
             }
+        };
+        for (name, _) in targets {
             self.refresh_index_files(&name, Touched::Full).await;
         }
     }
