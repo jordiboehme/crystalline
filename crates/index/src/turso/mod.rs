@@ -4585,10 +4585,19 @@ impl Store for TursoStore {
         Ok(())
     }
 
-    /// A read connection in the middle of a call can keep the WAL from being
-    /// reset; that is no failure of the sync that asked; the next checkpoint
-    /// tries again.
+    /// A read connection inside a call keeps the WAL from being reset, and
+    /// with searches running back to back one always is: measured, a full
+    /// reindex of 20k engrams beside eight searchers left the WAL at 1.5 GiB
+    /// per reindex and never reset it. So the checkpoint first waits for the
+    /// calls in flight to end and holds new ones off (each call is one short
+    /// read transaction), then truncates with no reader in the WAL. A busy
+    /// answer after that is still no failure of the sync that asked; the next
+    /// checkpoint tries again.
     async fn checkpoint_wal(&self) -> Result<()> {
+        let _drained = match &self.readers {
+            Some(readers) => Some(readers.drain().await?),
+            None => None,
+        };
         match self
             .conn
             .query_all("PRAGMA wal_checkpoint(TRUNCATE)", vec![])
@@ -5653,25 +5662,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_checkpoint_beside_a_live_read_transaction_is_no_failure() {
-        let (_dir, store) = with_readers(1).await;
+    async fn a_checkpoint_waits_for_a_live_read_and_then_truncates_the_wal() {
+        let (dir, store) = with_readers(1).await;
+        let store = Arc::new(store);
+        let wal = || {
+            std::fs::metadata(dir.path().join("index.db-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
         let readers = store.readers.clone().unwrap();
-        let lease = readers.lease().await.unwrap();
-        let reader = lease.store();
-        reader.open_read().await.unwrap();
-        reader.domain_names().await.unwrap();
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
+        // A read transaction held open on its own task, as a long search is.
+        let held = tokio::spawn(async move {
+            let lease = readers.lease().await.unwrap();
+            let reader = lease.store();
+            reader.open_read().await.unwrap();
+            reader.domain_names().await.unwrap();
+            opened_tx.send(()).unwrap();
+            end_rx.await.unwrap();
+            // The reader still answers from its own snapshot.
+            let seen = reader.domain_names().await.unwrap().len();
+            reader.close_read(true).await;
+            seen
+        });
+        opened_rx.await.unwrap();
         for i in 0..20 {
             store
                 .upsert_domain(&format!("d{i}"), None, DomainKind::Virtual)
                 .await
                 .unwrap();
         }
-        store.checkpoint_wal().await.unwrap();
-        // The reader still answers from its own snapshot.
-        assert!(reader.domain_names().await.unwrap().is_empty());
-        reader.close_read(true).await;
-        drop(lease);
-        store.checkpoint_wal().await.unwrap();
+        assert!(wal() > 0, "the writes are in the WAL");
+        let checkpoint = {
+            let store = store.clone();
+            tokio::spawn(async move { store.checkpoint_wal().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !checkpoint.is_finished(),
+            "the checkpoint waits for the read"
+        );
+        end_tx.send(()).unwrap();
+        assert_eq!(held.await.unwrap(), 0);
+        checkpoint.await.unwrap().unwrap();
+        assert_eq!(wal(), 0, "with no reader inside, the WAL is truncated");
+        assert_eq!(store.domain_names().await.unwrap().len(), 20);
     }
 
     #[tokio::test]
