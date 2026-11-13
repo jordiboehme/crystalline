@@ -27,7 +27,9 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use crystalline_core::config::{self, EmbeddingsConfig};
 use hf_hub::HFClient;
-use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{
+    Encoding, PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams,
+};
 
 use super::models::{
     Architecture, LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model,
@@ -50,6 +52,22 @@ const MAX_INPUT_TOKENS: usize = 512;
 /// per token is well above any real ratio, so this never cuts a chunk the
 /// chunker produced; it only bounds a caller that skipped chunking.
 const MAX_INPUT_CHARS: usize = MAX_INPUT_TOKENS * 6;
+/// How much attention one forward pass may hold, in rows times the square of
+/// the padded length. The encoder builds a full `seq x seq` score matrix per
+/// head for every row, in f32, and up to three of them are alive at once per
+/// layer, so a pass costs about 144 bytes per unit of this budget on top of
+/// its linear part. Two rows at the 512-token cap is the most one pass may
+/// hold; shorter rows fit more to a pass. A caller's batch is split into
+/// passes under this budget, see [`plan_passes`].
+///
+/// Measured on 512-token chunks (2026-11-13). Memory, Linux container with 2
+/// CPUs: the whole 16-row batch in one pass held about 1.1 GiB on top of the
+/// idle process, four rows about 0.3 GiB, two rows about 0.25 GiB.
+/// Throughput, one process with the pass sizes interleaved: on Linux (2 CPUs)
+/// 16 rows 2.81 to 2.86 chunks/s, four rows 3.27 to 3.35, two rows 3.28 to
+/// 3.41; on Metal 16 rows 5.80 to 6.32, four rows 8.02 to 8.63, two rows 8.76
+/// to 9.37. Only a Mac's CPU preferred four rows (2.17 against 1.60 for two).
+const ATTENTION_BUDGET: usize = 2 * MAX_INPUT_TOKENS * MAX_INPUT_TOKENS;
 
 /// A locally hosted provider, running the model its configuration named.
 pub struct LocalProvider {
@@ -410,8 +428,11 @@ fn build_encoder(
         None => "{}".to_string(),
     };
     let pad = pad_id(&tokenizer, &tokenizer_config_text, config_text)?;
+    // Padding on the right is what lets `embed_texts` cut a shorter pass out
+    // of the batch: the first `len` positions of every row are that row.
     tokenizer.with_padding(Some(PaddingParams {
         strategy: PaddingStrategy::BatchLongest,
+        direction: PaddingDirection::Right,
         pad_id: pad,
         ..PaddingParams::default()
     }));
@@ -499,36 +520,108 @@ fn embed_texts(encoder: &Encoder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         .tokenizer
         .encode_batch(inputs, true)
         .map_err(|e| IndexError::Embedding(format!("tokenizing: {e}")))?;
+    // Each row's real length: its attention mask is 1 up to there and 0 over
+    // the right padding the tokenizer added to reach the batch's longest.
+    let lengths: Vec<usize> = encodings
+        .iter()
+        .map(|e| e.get_attention_mask().iter().filter(|&&m| m != 0).count())
+        .collect();
+    embed_in_passes(&lengths, ATTENTION_BUDGET, |rows, len| {
+        encode_pass(encoder, &encodings, rows, len)
+            .map_err(|e| IndexError::Embedding(format!("inference: {e}")))
+    })
+}
 
-    let batch = encodings.len();
-    let seq_len = encodings.first().map(|e| e.get_ids().len()).unwrap_or(0);
-    let mut ids: Vec<u32> = Vec::with_capacity(batch * seq_len);
-    let mut mask: Vec<u32> = Vec::with_capacity(batch * seq_len);
-    for enc in &encodings {
-        ids.extend_from_slice(enc.get_ids());
-        mask.extend_from_slice(enc.get_attention_mask());
+/// Split a batch into forward passes that each stay under `budget` (rows
+/// times the square of the pass's padded length), run `pass` on each with the
+/// row indices it covers and the length to pad them to, and put the vectors
+/// back in the order of the batch. The rows go to the passes shortest first,
+/// so a pass pads its members to a length close to their own: less padding
+/// is less work, and a long row no longer makes every short one in its batch
+/// pay for the full length.
+fn embed_in_passes<F>(lengths: &[usize], budget: usize, mut pass: F) -> Result<Vec<Vec<f32>>>
+where
+    F: FnMut(&[usize], usize) -> Result<Vec<Vec<f32>>>,
+{
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; lengths.len()];
+    for rows in plan_passes(lengths, budget) {
+        let len = rows.iter().map(|&i| lengths[i]).max().unwrap_or(0);
+        let vectors = pass(&rows, len)?;
+        if vectors.len() != rows.len() {
+            return Err(IndexError::Embedding(format!(
+                "inference returned {} vectors for {} inputs",
+                vectors.len(),
+                rows.len()
+            )));
+        }
+        for (&i, v) in rows.iter().zip(vectors) {
+            out[i] = Some(v);
+        }
     }
+    out.into_iter()
+        .map(|v| v.ok_or_else(|| IndexError::Embedding("an input was not embedded".to_string())))
+        .collect()
+}
 
-    let compute = || -> candle_core::Result<Vec<Vec<f32>>> {
-        let input_ids = Tensor::from_vec(ids, (batch, seq_len), &encoder.device)?;
-        let attention = Tensor::from_vec(mask, (batch, seq_len), &encoder.device)?;
-        let sequence = match &encoder.loaded {
-            Loaded::Bert(model) => {
-                let token_type = input_ids.zeros_like()?;
-                model.forward(&input_ids, &token_type, Some(&attention))?
-            }
-            // ModernBERT has no segment embeddings and takes the raw
-            // (batch, seq) mask: it builds its own 4D additive mask and the
-            // sliding-window band inside `forward`. Do not pre-expand it.
-            Loaded::ModernBert(model) => model.forward(&input_ids, &attention)?,
-        };
-        // (batch, seq, hidden) out of either encoder; the sentence vector is
-        // the [CLS] position (both models' own pooling), then L2 norm.
-        let pooled = cls_pool(&sequence)?;
-        let normalized = normalize_l2(&pooled)?;
-        normalized.to_vec2::<f32>()
+/// The passes for rows of these `lengths`: row indices, shortest first, cut
+/// greedily so that a pass's row count times the square of its longest row
+/// stays within `budget`. A row that alone exceeds the budget (only possible
+/// with a budget under one full-length row) gets a pass of its own, so every
+/// row is embedded.
+fn plan_passes(lengths: &[usize], budget: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&i| lengths[i]);
+    let mut passes: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for i in order {
+        // Sorted ascending, so the row being added is the pass's longest.
+        let len = lengths[i].max(1);
+        if !current.is_empty() && (current.len() + 1) * len * len > budget {
+            passes.push(std::mem::take(&mut current));
+        }
+        current.push(i);
+    }
+    if !current.is_empty() {
+        passes.push(current);
+    }
+    passes
+}
+
+/// One forward pass over the `rows` of a tokenized batch, each cut to its
+/// first `len` positions (the batch is right padded, so that is the row plus
+/// the padding this pass needs). Answers one L2-normalized vector per row, in
+/// the order of `rows`.
+fn encode_pass(
+    encoder: &Encoder,
+    encodings: &[Encoding],
+    rows: &[usize],
+    len: usize,
+) -> candle_core::Result<Vec<Vec<f32>>> {
+    let batch = rows.len();
+    let mut ids: Vec<u32> = Vec::with_capacity(batch * len);
+    let mut mask: Vec<u32> = Vec::with_capacity(batch * len);
+    for &row in rows {
+        let enc = &encodings[row];
+        ids.extend_from_slice(&enc.get_ids()[..len]);
+        mask.extend_from_slice(&enc.get_attention_mask()[..len]);
+    }
+    let input_ids = Tensor::from_vec(ids, (batch, len), &encoder.device)?;
+    let attention = Tensor::from_vec(mask, (batch, len), &encoder.device)?;
+    let sequence = match &encoder.loaded {
+        Loaded::Bert(model) => {
+            let token_type = input_ids.zeros_like()?;
+            model.forward(&input_ids, &token_type, Some(&attention))?
+        }
+        // ModernBERT has no segment embeddings and takes the raw
+        // (batch, seq) mask: it builds its own 4D additive mask and the
+        // sliding-window band inside `forward`. Do not pre-expand it.
+        Loaded::ModernBert(model) => model.forward(&input_ids, &attention)?,
     };
-    compute().map_err(|e| IndexError::Embedding(format!("inference: {e}")))
+    // (batch, seq, hidden) out of either encoder; the sentence vector is
+    // the [CLS] position (both models' own pooling), then L2 norm.
+    let pooled = cls_pool(&sequence)?;
+    let normalized = normalize_l2(&pooled)?;
+    normalized.to_vec2::<f32>()
 }
 
 /// The `[CLS]` position of every row: position 0, which the tokenizer's
@@ -554,9 +647,9 @@ mod tests {
     use hf_hub::HFClient;
 
     use super::{
-        HubFiles, MAX_INPUT_CHARS, build_on_blocking, cached_path, cap_chars, check_files,
-        check_model_type, cls_pool, ensure_files_with, hub_repo, load_encoder_with,
-        load_files_with,
+        ATTENTION_BUDGET, HubFiles, MAX_INPUT_CHARS, MAX_INPUT_TOKENS, build_on_blocking,
+        cached_path, cap_chars, check_files, check_model_type, cls_pool, embed_in_passes,
+        ensure_files_with, hub_repo, load_encoder_with, load_files_with, plan_passes,
     };
     use crate::embed::models::{
         LocalModel, SnapshotChoice, choose_snapshot, lookup_local_model, older_snapshot_warning,
@@ -593,6 +686,74 @@ mod tests {
         assert!(check_model_type(r#"{"model_type": "bert"}"#, bge).is_ok());
         // A config with no model_type at all is a refusal too, not a guess.
         assert!(check_model_type(r#"{}"#, granite).is_err());
+    }
+
+    /// Every pass stays within the budget, every row lands in exactly one
+    /// pass, and a pass holds rows of close lengths (shortest first).
+    #[test]
+    fn a_batch_is_cut_into_passes_under_the_attention_budget() {
+        let lengths = [512, 12, 300, 512, 40, 512, 512, 7, 512, 256, 128, 512];
+        let passes = plan_passes(&lengths, ATTENTION_BUDGET);
+        let mut seen: Vec<usize> = passes.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..lengths.len()).collect::<Vec<_>>());
+        for pass in &passes {
+            let longest = pass.iter().map(|&i| lengths[i]).max().unwrap();
+            assert!(
+                pass.len() * longest * longest <= ATTENTION_BUDGET,
+                "{pass:?} holds {} rows of up to {longest} tokens",
+                pass.len()
+            );
+        }
+        // Shortest first: no pass starts below where the one before ended.
+        for pair in passes.windows(2) {
+            let end = pair[0].iter().map(|&i| lengths[i]).max().unwrap();
+            let start = pair[1].iter().map(|&i| lengths[i]).min().unwrap();
+            assert!(end <= start, "{passes:?}");
+        }
+        // Six full-length rows at two per pass: the short ones share passes,
+        // the long ones need three.
+        assert!(passes.len() >= 3, "{passes:?}");
+    }
+
+    /// A budget below one full-length row still embeds it, in a pass of its
+    /// own, rather than looping or dropping it.
+    #[test]
+    fn a_row_over_the_budget_gets_a_pass_of_its_own() {
+        let full = MAX_INPUT_TOKENS;
+        let passes = plan_passes(&[full, full, 3], full * full - 1);
+        assert_eq!(passes, vec![vec![2], vec![0], vec![1]]);
+        assert_eq!(plan_passes(&[full], ATTENTION_BUDGET), vec![vec![0]]);
+        assert!(plan_passes(&[], ATTENTION_BUDGET).is_empty());
+    }
+
+    /// The vectors come back in the order of the inputs, whatever order the
+    /// passes ran the rows in, and each pass is padded to its own longest row.
+    #[test]
+    fn vectors_come_back_in_the_order_of_the_inputs() {
+        let lengths = [512, 5, 300, 512, 512, 512, 512, 20];
+        let mut calls = Vec::new();
+        let out = embed_in_passes(&lengths, ATTENTION_BUDGET, |rows, len| {
+            assert_eq!(len, rows.iter().map(|&i| lengths[i]).max().unwrap());
+            calls.push(rows.to_vec());
+            Ok(rows.iter().map(|&i| vec![i as f32, len as f32]).collect())
+        })
+        .unwrap();
+        assert!(calls.len() > 1, "the batch was split: {calls:?}");
+        assert_eq!(out.len(), lengths.len());
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v[0], i as f32, "row {i} is in its own place");
+        }
+    }
+
+    /// A pass answering the wrong number of vectors is an error, not a
+    /// silently shifted batch.
+    #[test]
+    fn a_pass_with_a_wrong_vector_count_fails_the_batch() {
+        let err = embed_in_passes(&[10, 20], ATTENTION_BUDGET, |_, _| Ok(vec![vec![0.0]]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1 vectors for 2 inputs"), "{err}");
     }
 
     #[test]
