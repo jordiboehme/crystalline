@@ -631,3 +631,137 @@ fn the_fixture_is_the_same_for_a_seed_and_differs_between_seeds() {
     assert_eq!(PerfEmbedder::embed_one("x"), PerfEmbedder::embed_one("x"));
     assert_eq!(PerfEmbedder::embed_one("x").len(), DIMS);
 }
+
+// --- memory -----------------------------------------------------------------------
+
+/// The WAL file's size in MiB.
+fn wal_mib(db: &Path) -> f64 {
+    let mut name = db.as_os_str().to_os_string();
+    name.push("-wal");
+    std::fs::metadata(PathBuf::from(name))
+        .map(|m| m.len() as f64 / (1 << 20) as f64)
+        .unwrap_or(0.0)
+}
+
+/// How many threads this process has, from `ps -M`.
+fn threads() -> usize {
+    std::process::Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .count()
+                .saturating_sub(1)
+        })
+        .unwrap_or(0)
+}
+
+/// This process's physical footprint in MiB: the memory it dirtied and
+/// still holds, without the clean pages the allocator gave back but the
+/// kernel has not taken yet, which RSS still counts. macOS only.
+#[cfg(target_os = "macos")]
+fn footprint_mib() -> Option<f64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `proc_pid_rusage` writes one `rusage_info_v4` for the flavor
+    // asked, into a buffer of exactly that size.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast(),
+        )
+    };
+    // SAFETY: zeroed, then filled by the call on success.
+    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint as f64 / (1 << 20) as f64)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn footprint_mib() -> Option<f64> {
+    None
+}
+
+/// Memory over repeated full reindexes beside searchers, with the store's
+/// read connections set by `CRYSTALLINE_PERF_READERS` (default 4, 0 for
+/// none). Per round: the peak RSS while it ran, then RSS, the physical
+/// footprint, the WAL and the threads once it settled; then once more after
+/// `CRYSTALLINE_PERF_IDLE_SECS` (default 30) of idle. Fails when the WAL is
+/// left over a few MiB after a round, when the footprint grows from round to
+/// round, or when the threads are not bounded.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement: run it in release mode with --ignored --nocapture"]
+async fn perf_store_memory() {
+    let settings = Settings::from_env();
+    let readers = env_usize("CRYSTALLINE_PERF_READERS", 4);
+    let rounds = env_usize("CRYSTALLINE_PERF_ROUNDS", 3).max(1);
+    let idle = env_usize("CRYSTALLINE_PERF_IDLE_SECS", 30);
+    let searchers = *settings.searchers.last().unwrap();
+    banner("turso memory", &settings);
+    println!("readers={readers} rounds={rounds} searchers={searchers}");
+    let dbdir = tempfile::tempdir().unwrap();
+    let db = dbdir.path().join("index.db");
+    let store = crystalline_index::TursoStore::open_with_readers(&db, readers)
+        .await
+        .unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let rig = Arc::new(rig(&settings, store, Some(db.clone())).await);
+    let state = |label: &str| {
+        let (rss, footprint, wal, threads) = (
+            rss_mib().unwrap_or(0.0),
+            footprint_mib().unwrap_or(0.0),
+            wal_mib(&db),
+            threads(),
+        );
+        println!(
+            "{label:<24} rss={rss:>6.0} MiB  footprint={footprint:>6.0} MiB  wal={wal:>7.1} MiB  threads={threads}"
+        );
+        (footprint, wal, threads)
+    };
+    state("after the fixture");
+    let mut footprints = Vec::new();
+    for round in 1..=rounds {
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut peak = 0f64;
+                while !stop.load(Ordering::Relaxed) {
+                    peak = peak.max(rss_mib().unwrap_or(0.0));
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                peak
+            })
+        };
+        let reindex = {
+            let rig = rig.clone();
+            tokio::spawn(async move { rig.engine.reindex(true).await.unwrap() })
+        };
+        let searches = rig.load(searchers, settings.queries, false).await;
+        reindex.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let peak = peak.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!(
+            "round {round}: {} searches, peak rss={peak:.0} MiB",
+            searches.len()
+        );
+        let (footprint, wal, _) = state(&format!("after round {round}"));
+        assert!(wal < 8.0, "round {round} left the WAL at {wal:.1} MiB");
+        footprints.push(footprint);
+    }
+    tokio::time::sleep(Duration::from_secs(idle as u64)).await;
+    let (_, _, threads) = state(&format!("after {idle} s idle"));
+    if std::env::var("CRYSTALLINE_PERF_VMMAP").is_ok() {
+        let out = std::process::Command::new("vmmap")
+            .args(["--summary", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        println!("{}", String::from_utf8_lossy(&out.stdout));
+    }
+    let (first, last) = (footprints[0], *footprints.last().unwrap());
+    assert!(
+        last <= first + 32.0,
+        "the footprint grew from {first:.0} to {last:.0} MiB over {rounds} rounds"
+    );
+    assert!(threads <= 48, "{threads} threads after the idle hold");
+}
