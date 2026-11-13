@@ -498,7 +498,11 @@ impl<S: ReaderBackend> ReadPool<S> {
                     }))
                     .unwrap_or_else(|_| {
                         // Never leave a read transaction open behind a panic.
-                        store.abandon_read();
+                        // A second panic here still ends only this job, and
+                        // `SlotBack` gives the slot back either way.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            store.abandon_read()
+                        }));
                         Err(panicked())
                     });
                     let _ = tx.send(out);

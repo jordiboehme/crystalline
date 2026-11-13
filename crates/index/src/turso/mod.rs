@@ -5458,6 +5458,28 @@ impl ReaderBackend for TursoStore {
         err.to_string() == tempdir_refusal_text()
     }
 
+    /// Roll back a read transaction a cut-off call left open. turso steps a
+    /// statement on the calling thread, so the `ROLLBACK` is done after one
+    /// poll; a read transaction never waits on a lock to end. Left open, it
+    /// would keep the WAL from being reset after the pool lets a checkpoint
+    /// run, until the slot served its next call.
+    fn abandon_read(&self) {
+        if self.conn.is_autocommit() {
+            return;
+        }
+        let mut rollback = std::pin::pin!(self.conn.execute("ROLLBACK", ()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match rollback.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(Ok(_)) => {}
+            std::task::Poll::Ready(Err(e)) => {
+                tracing::warn!("a cut-off read did not roll back: {e}");
+            }
+            std::task::Poll::Pending => {
+                tracing::warn!("a cut-off read did not roll back at once");
+            }
+        }
+    }
+
     fn blocking(&self) -> bool {
         true
     }
@@ -5739,6 +5761,37 @@ mod tests {
         checkpoint.await.unwrap().unwrap();
         assert_eq!(wal(), 0, "with no reader inside, the WAL is truncated");
         assert_eq!(store.domain_names().await.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn a_read_that_panics_inside_its_transaction_leaves_the_wal_free() {
+        let (dir, store) = with_readers(1).await;
+        let wal = || {
+            std::fs::metadata(dir.path().join("index.db-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        };
+        let readers = store.readers.clone().unwrap();
+        let out = readers
+            .run((), |reader, _| {
+                Box::pin(async move {
+                    reader.domain_names().await?;
+                    panic!("a read that panics inside its transaction");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                })
+            })
+            .await;
+        assert!(out.unwrap_err().to_string().contains("panic"));
+        for i in 0..50 {
+            store
+                .upsert_domain(&format!("d{i}"), None, DomainKind::Virtual)
+                .await
+                .unwrap();
+        }
+        assert!(wal() > 0, "the writes are in the WAL");
+        store.checkpoint_wal().await.unwrap();
+        assert_eq!(wal(), 0, "no reader was left inside a read transaction");
     }
 
     #[tokio::test]
