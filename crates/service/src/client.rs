@@ -2974,13 +2974,12 @@ async fn ctl_exchange(conn: Connection, cmd: Value) -> anyhow::Result<Value> {
 /// The `crystalline mcp` client's log: stderr only, since stdout is the MCP
 /// stdio stream, filtered by RUST_LOG with a default of `warn`.
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .try_init();
+    crate::logging::init_subscriber(
+        std::io::stderr,
+        None,
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+    );
 }
 
 #[cfg(test)]

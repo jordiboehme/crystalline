@@ -1361,6 +1361,7 @@ dependencies = [
  "fs4 1.1.0",
  "insta",
  "libc",
+ "num_cpus",
  "predicates",
  "reqwest",
  "serde",

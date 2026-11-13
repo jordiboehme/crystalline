@@ -2217,6 +2217,9 @@ fn main() -> std::process::ExitCode {
     // else can read or write the environment while it is written. The daemon,
     // the MCP bridge and headless runs are this same binary and pass here too.
     unsafe { crystalline_index::keep_xet_telemetry_off() };
+    // SAFETY: still before any other thread exists (see above), so nothing
+    // reads the environment while `RAYON_NUM_THREADS` is written.
+    unsafe { apply_embed_threads() };
     // Before anything can start a child: on Windows a child would otherwise
     // hold this process's stdout and stderr open after it exits.
     crystalline_service::instance::keep_std_handles_from_children();
@@ -2232,6 +2235,30 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Sizes the embedding threads: candle reads `RAYON_NUM_THREADS`, else on
+/// Linux the affinity mask or the physical core count, which ignores a
+/// cgroup CPU quota. `available_parallelism` honours the quota, so the
+/// smaller of the two is used. See `plan_embed_threads` for the rules.
+///
+/// # Safety
+/// Writes the environment, so it must run before any other thread exists.
+unsafe fn apply_embed_threads() {
+    use crystalline_service::logging::{EMBED_THREADS_VAR, plan_embed_threads, record_thread_plan};
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    let plan = plan_embed_threads(
+        std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        std::env::var(EMBED_THREADS_VAR).ok().as_deref(),
+        available,
+        num_cpus::get_physical(),
+        cfg!(target_os = "macos"),
+    );
+    if let Some(n) = plan.set {
+        // SAFETY: the caller runs this before any other thread exists.
+        unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
+    }
+    record_thread_plan(plan);
 }
 
 fn run() -> anyhow::Result<()> {
@@ -5728,10 +5755,7 @@ fn init_cli_tracing(command: Option<&Command>) {
         },
         _ => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
     };
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(filter)
-        .try_init();
+    crystalline_service::logging::init_subscriber(std::io::stderr, None, filter);
 }
 
 fn run_verify(
