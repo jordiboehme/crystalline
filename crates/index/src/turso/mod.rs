@@ -5432,6 +5432,11 @@ impl ReaderBackend for TursoStore {
         if let Some(seen) = &self.reader_generation {
             seen.store(self.coverage.generation(), Ordering::Release);
         }
+        // A read transaction an earlier call left open (it was cut off by a
+        // panic) is ended first: a new one would be refused inside it.
+        if !self.conn.is_autocommit() {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+        }
         self.conn.execute("BEGIN", ()).await?;
         Ok(())
     }

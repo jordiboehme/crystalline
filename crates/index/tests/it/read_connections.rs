@@ -145,3 +145,86 @@ async fn a_postgres_reader_answers_beside_the_pinned_transaction_and_sees_only_c
         .expect("a postgres store opens read connections");
     reader_beside_open_transaction(&store, reader).await;
 }
+
+/// A read whose caller gives up while it waits on a lock: the reader holds a
+/// read transaction then, and a caller that is gone must not leave it open.
+#[cfg(feature = "postgres")]
+async fn cancel_a_postgres_read(
+    readers: usize,
+) -> (
+    crystalline_index::ScratchSchema,
+    crystalline_index::PostgresStore,
+) {
+    use sqlx::{AssertSqlSafe, Connection};
+    let scratch = crate::pg::scratch("rv").expect("checked by the caller");
+    let store = crystalline_index::PostgresStore::open_in_schema_with_readers(
+        scratch.url(),
+        scratch.name(),
+        readers,
+    )
+    .await
+    .unwrap();
+    store
+        .upsert_domain("a", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let reader = store.read_pool().unwrap();
+    reader.domain_names().await.unwrap();
+    let mut locker = sqlx::PgConnection::connect(scratch.url()).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "BEGIN; LOCK TABLE \"{}\".domain IN ACCESS EXCLUSIVE MODE",
+        scratch.name()
+    )))
+    .execute(&mut locker)
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), reader.domain_names())
+            .await
+            .is_err(),
+        "the read waits on the lock"
+    );
+    sqlx::raw_sql("COMMIT").execute(&mut locker).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    (scratch, store)
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_postgres_read_leaves_no_transaction_behind() {
+    if crate::pg::pg_url().is_none() {
+        return;
+    }
+    let (_scratch, store) = cancel_a_postgres_read(2).await;
+    store
+        .upsert_domain("b", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let reader = store.read_pool().unwrap();
+    for _ in 0..6 {
+        assert_eq!(
+            reader.domain_names().await.unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+            "every read sees the write before it"
+        );
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_postgres_read_does_not_stall_the_only_reader() {
+    if crate::pg::pg_url().is_none() {
+        return;
+    }
+    let (_scratch, store) = cancel_a_postgres_read(1).await;
+    store
+        .upsert_domain("b", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let reader = store.read_pool().unwrap();
+    let names = tokio::time::timeout(Duration::from_secs(5), reader.domain_names())
+        .await
+        .expect("the next read does not wait for a leaked transaction")
+        .unwrap();
+    assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+}

@@ -83,6 +83,9 @@ candle-metal-kernels = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The cancelled-read regression tests in tests/it/read_connections.rs hold a
+# table lock on a connection of their own.
+sqlx = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

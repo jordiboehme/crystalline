@@ -59,35 +59,56 @@ fn enabled_by(value: Option<&str>) -> bool {
 /// reader used inside one. `begin()` of a backend notes the task that opened
 /// it, `commit()` and `rollback()` take the note away. Nothing is kept in a
 /// release build.
+///
+/// A transaction is known by the tokio task that opened it. Code that is not
+/// inside a task (a `#[tokio::test]` body, the CLI's main future, both run by
+/// `block_on`) is known by its thread instead. A task that opens a
+/// transaction and hands it to another task to end is not followed; nothing
+/// here does that.
 pub mod txn {
     #[cfg(debug_assertions)]
     static OPEN: std::sync::Mutex<Vec<tokio::task::Id>> = std::sync::Mutex::new(Vec::new());
 
-    /// The current task opened a write transaction.
+    #[cfg(debug_assertions)]
+    thread_local! {
+        /// Transactions opened outside any task on this thread.
+        static OPEN_OUTSIDE_TASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The current task (or, outside a task, this thread) opened a write
+    /// transaction.
     pub fn opened() {
         #[cfg(debug_assertions)]
-        if let Some(id) = tokio::task::try_id() {
-            OPEN.lock().unwrap_or_else(|p| p.into_inner()).push(id);
+        match tokio::task::try_id() {
+            Some(id) => OPEN.lock().unwrap_or_else(|p| p.into_inner()).push(id),
+            None => OPEN_OUTSIDE_TASKS.with(|n| n.set(n.get() + 1)),
         }
     }
 
-    /// The current task ended its write transaction.
+    /// The current task (or, outside a task, this thread) ended its write
+    /// transaction.
     pub fn closed() {
         #[cfg(debug_assertions)]
-        if let Some(id) = tokio::task::try_id() {
-            let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(i) = open.iter().position(|o| *o == id) {
-                open.swap_remove(i);
+        match tokio::task::try_id() {
+            Some(id) => {
+                let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(i) = open.iter().position(|o| *o == id) {
+                    open.swap_remove(i);
+                }
             }
+            None => OPEN_OUTSIDE_TASKS.with(|n| n.set(n.get().saturating_sub(1))),
         }
     }
 
-    /// Whether the current task has a write transaction open.
+    /// Whether the current task (or, outside a task, this thread) has a
+    /// write transaction open.
     pub fn open_here() -> bool {
         #[cfg(debug_assertions)]
-        if let Some(id) = tokio::task::try_id() {
-            return OPEN.lock().unwrap_or_else(|p| p.into_inner()).contains(&id);
-        }
+        return match tokio::task::try_id() {
+            Some(id) => OPEN.lock().unwrap_or_else(|p| p.into_inner()).contains(&id),
+            None => OPEN_OUTSIDE_TASKS.with(|n| n.get() > 0),
+        };
+        #[cfg(not(debug_assertions))]
         false
     }
 
@@ -248,6 +269,11 @@ pub(crate) trait ReaderBackend: ReadStore + Send + Sync + 'static {
     fn blocking(&self) -> bool {
         false
     }
+    /// Give up a read transaction a call left open without awaiting
+    /// anything: the call was cut off (a panic, a runtime shutting down)
+    /// between `open_read` and `close_read`. The connection must not serve
+    /// another call inside it.
+    fn abandon_read(&self) {}
 }
 
 /// One call's work on a read connection: the store, and the call's own
@@ -261,9 +287,13 @@ type Job<S> = Box<dyn FnOnce(&S, &tokio::runtime::Runtime) + Send>;
 
 /// Where the read connections live.
 enum Slots<S> {
-    /// In the pool, borrowed by the calling task for its call (Postgres,
-    /// whose statements are real I/O the caller's task awaits).
-    InTask(std::sync::Mutex<Vec<S>>),
+    /// In the pool, taken for one call by a task of its own (Postgres,
+    /// whose statements are real I/O a task awaits). The call runs on its
+    /// own task so that a caller that gives up (an HTTP client gone, a
+    /// handler cancelled, a timeout) cannot cut it off between its `BEGIN`
+    /// and its `COMMIT`: a connection given back inside a read transaction
+    /// would answer the next calls from an old snapshot and hold its locks.
+    InTask(Arc<std::sync::Mutex<Vec<S>>>),
     /// Each on a thread of its own, which runs the calls handed to it
     /// (turso, whose statements step synchronously). A call allocates on
     /// that thread, so the allocator's per-thread caches stay with a fixed
@@ -275,6 +305,10 @@ enum Slots<S> {
     Threads {
         free: Arc<std::sync::Mutex<Vec<usize>>>,
         senders: Vec<std::sync::mpsc::Sender<Job<S>>>,
+        /// Joined when the pool is dropped, so the connections (and the
+        /// database file they hold open) are closed by the time the drop
+        /// returns.
+        threads: Vec<std::thread::JoinHandle<()>>,
     },
 }
 
@@ -285,25 +319,51 @@ pub(crate) struct ReadPool<S> {
     size: u32,
 }
 
-/// One read connection of an in-task pool, taken for one call.
-pub(crate) struct Lease<'a, S> {
-    pool: &'a ReadPool<S>,
+/// One read connection of an in-task pool, taken for one call. Given back
+/// when dropped, after any read transaction left open on it is given up,
+/// and only then is its permit released.
+pub(crate) struct Lease<S: ReaderBackend, P> {
+    slots: Arc<std::sync::Mutex<Vec<S>>>,
     store: Option<S>,
-    _permit: SemaphorePermit<'a>,
+    _permit: P,
 }
 
-impl<S> Lease<'_, S> {
+impl<S: ReaderBackend, P> Lease<S, P> {
     pub(crate) fn store(&self) -> &S {
         self.store.as_ref().expect("a lease holds its connection")
     }
 }
 
-impl<S> Drop for Lease<'_, S> {
+impl<S: ReaderBackend, P> Drop for Lease<S, P> {
     fn drop(&mut self) {
-        if let (Some(s), Slots::InTask(slots)) = (self.store.take(), &self.pool.slots) {
-            slots.lock().unwrap_or_else(|p| p.into_inner()).push(s);
+        if let Some(s) = self.store.take() {
+            s.abandon_read();
+            self.slots.lock().unwrap_or_else(|p| p.into_inner()).push(s);
         }
     }
+}
+
+/// Gives a reader thread's connection and its permit back when dropped, so
+/// a panic anywhere in a job, its own panic handler included, never loses
+/// the slot.
+struct SlotBack {
+    free: Arc<std::sync::Mutex<Vec<usize>>>,
+    slot: usize,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for SlotBack {
+    fn drop(&mut self) {
+        // The connection is free again before its permit is.
+        self.free
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(self.slot);
+    }
+}
+
+fn panicked() -> IndexError {
+    IndexError::Db("a read failed with a panic".to_string())
 }
 
 fn closed() -> IndexError {
@@ -319,32 +379,43 @@ impl<S: ReaderBackend> ReadPool<S> {
         let threaded = slots.first().is_some_and(ReaderBackend::blocking);
         let slots = if threaded {
             let mut senders = Vec::with_capacity(size);
+            let mut threads = Vec::with_capacity(size);
             for (n, store) in slots.into_iter().enumerate() {
                 let (tx, rx) = std::sync::mpsc::channel::<Job<S>>();
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                std::thread::Builder::new()
+                let thread = std::thread::Builder::new()
                     .name(format!("crystalline-reader-{n}"))
                     .spawn(move || {
+                        // A job that panics past its own handler ends
+                        // itself, not the thread: its `SlotBack` has given
+                        // the slot back by then.
+                        let run = |job: Job<S>| {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                job(&store, &runtime)
+                            }));
+                        };
                         while let Ok(job) = rx.recv() {
-                            job(&store, &runtime);
+                            run(job);
                             // Work through what is queued, then, idle,
                             // give the allocator's cache on this thread back.
                             while let Ok(job) = rx.try_recv() {
-                                job(&store, &runtime);
+                                run(job);
                             }
                             give_back_freed_memory();
                         }
                     })?;
                 senders.push(tx);
+                threads.push(thread);
             }
             Slots::Threads {
                 free: Arc::new(std::sync::Mutex::new((0..size).collect())),
                 senders,
+                threads,
             }
         } else {
-            Slots::InTask(std::sync::Mutex::new(slots))
+            Slots::InTask(Arc::new(std::sync::Mutex::new(slots)))
         };
         Ok(ReadPool {
             slots,
@@ -353,22 +424,27 @@ impl<S: ReaderBackend> ReadPool<S> {
         })
     }
 
-    /// One connection of an in-task pool, for the calling task. A threaded
-    /// pool hands none out: its connections stay on their threads.
-    pub(crate) async fn lease(&self) -> Result<Lease<'_, S>> {
+    /// One connection of an in-task pool, held until the lease is dropped.
+    /// A threaded pool hands none out: its connections stay on their threads.
+    pub(crate) async fn lease(&self) -> Result<Lease<S, tokio::sync::OwnedSemaphorePermit>> {
         let Slots::InTask(slots) = &self.slots else {
             return Err(IndexError::Db(
                 "a threaded read pool lends no connection".to_string(),
             ));
         };
-        let permit = self.permits.acquire().await.map_err(|_| closed())?;
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| closed())?;
         let store = slots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .pop()
             .ok_or_else(closed)?;
         Ok(Lease {
-            pool: self,
+            slots: slots.clone(),
             store: Some(store),
             _permit: permit,
         })
@@ -399,9 +475,16 @@ impl<S: ReaderBackend> ReadPool<S> {
         match &self.slots {
             Slots::InTask(_) => {
                 let lease = self.lease().await?;
-                attempts(lease.store(), &args, &call).await
+                // On a task of its own, which runs the call to its end
+                // whatever becomes of the caller.
+                tokio::spawn(async move {
+                    let call: &Call<S, O, T> = &call;
+                    attempts(lease.store(), &args, call).await
+                })
+                .await
+                .unwrap_or_else(|_| Err(panicked()))
             }
-            Slots::Threads { free, senders } => {
+            Slots::Threads { free, senders, .. } => {
                 let permit = self
                     .permits
                     .clone()
@@ -414,24 +497,48 @@ impl<S: ReaderBackend> ReadPool<S> {
                     .pop()
                     .ok_or_else(closed)?;
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let free = free.clone();
+                let back = SlotBack {
+                    free: free.clone(),
+                    slot,
+                    _permit: permit,
+                };
                 let job: Job<S> = Box::new(move |store: &S, runtime: &tokio::runtime::Runtime| {
+                    let _back = back;
                     let call: &Call<S, O, T> = &call;
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         runtime.block_on(attempts(store, &args, call))
                     }))
                     .unwrap_or_else(|_| {
                         // Never leave a read transaction open behind a panic.
-                        runtime.block_on(store.close_read(false));
-                        Err(IndexError::Db("a read failed with a panic".to_string()))
+                        store.abandon_read();
+                        Err(panicked())
                     });
                     let _ = tx.send(out);
-                    // The connection is free again before its permit is.
-                    free.lock().unwrap_or_else(|p| p.into_inner()).push(slot);
-                    drop(permit);
                 });
                 senders[slot].send(job).map_err(|_| closed())?;
-                rx.await.map_err(|_| closed())?
+                // A sender dropped without an answer is a job that panicked
+                // past its handler.
+                rx.await.unwrap_or_else(|_| Err(panicked()))
+            }
+        }
+    }
+}
+
+impl<S> Drop for ReadPool<S> {
+    /// Ends the reader threads and waits for them, so their connections
+    /// (and the database file) are closed when the pool is gone. A thread
+    /// ends once its queue is empty, so this waits for at most the reads
+    /// already handed to it. Nothing that runs on a reader thread holds the
+    /// pool, so the wait never waits for itself; it does block the dropping
+    /// thread for those reads, which is only ever the store's own drop.
+    fn drop(&mut self) {
+        if let Slots::Threads {
+            senders, threads, ..
+        } = &mut self.slots
+        {
+            senders.clear();
+            for thread in threads.drain(..) {
+                let _ = thread.join();
             }
         }
     }
@@ -785,6 +892,16 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "a reader was used inside an open write transaction")]
+    async fn a_test_body_with_an_open_write_transaction_is_noted_by_its_thread() {
+        // A `#[tokio::test]` body is no task: the thread stands in for it.
+        assert!(tokio::task::try_id().is_none());
+        txn::opened();
+        txn::assert_none_open();
+    }
+
     #[test]
     fn a_reader_fill_from_before_an_invalidation_is_not_kept() {
         let cache = CoverageCache::default();
@@ -825,6 +942,8 @@ mod tests {
         calls: AtomicUsize,
         opened: AtomicUsize,
         closed: AtomicUsize,
+        abandoned: AtomicUsize,
+        dropped: AtomicUsize,
     }
 
     impl Seen {
@@ -848,6 +967,13 @@ mod tests {
         retryable: bool,
         threaded: bool,
         panics: bool,
+        abandon_panics: bool,
+    }
+
+    impl Drop for Flaky {
+        fn drop(&mut self) {
+            self.seen.dropped.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl Flaky {
@@ -858,6 +984,7 @@ mod tests {
                 retryable,
                 threaded: false,
                 panics: false,
+                abandon_panics: false,
             }
         }
 
@@ -889,6 +1016,12 @@ mod tests {
         }
         fn blocking(&self) -> bool {
             self.threaded
+        }
+        fn abandon_read(&self) {
+            let n = self.seen.abandoned.fetch_add(1, Ordering::SeqCst);
+            if self.abandon_panics && n == 0 {
+                panic!("giving up the read panics too");
+            }
         }
     }
 
@@ -954,12 +1087,50 @@ mod tests {
         let pool = ReadPool::new(vec![flaky]).unwrap();
         let err = pool.domain_names().await.unwrap_err().to_string();
         assert!(err.contains("panic"), "{err}");
-        // The connection's transaction was ended, and the connection serves
-        // the next call.
-        assert_eq!(seen.counts(), [1, 1, 1]);
+        // The cut-off read was given up, and the connection serves the next
+        // call.
+        assert_eq!(seen.abandoned.load(Ordering::SeqCst), 1);
         let err = pool.domain_names().await.unwrap_err().to_string();
         assert!(err.contains("answered"), "{err}");
         assert!(pool.drain().await.is_ok(), "every permit came back");
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_panic_handler_loses_no_reader() {
+        let mut flaky = Flaky::new(0, false).threaded();
+        flaky.panics = true;
+        flaky.abandon_panics = true;
+        let pool = ReadPool::new(vec![flaky]).unwrap();
+        let err = pool.domain_names().await.unwrap_err().to_string();
+        assert!(err.contains("panic"), "{err}");
+        // The one reader thread lives on and its slot came back.
+        let err = pool.domain_names().await.unwrap_err().to_string();
+        assert!(err.contains("answered"), "{err}");
+        assert!(pool.drain().await.is_ok(), "every permit came back");
+    }
+
+    #[tokio::test]
+    async fn an_in_task_read_given_up_by_its_caller_still_ends_its_transaction() {
+        let flaky = Flaky::new(0, false);
+        let seen = flaky.seen.clone();
+        let pool = Arc::new(ReadPool::new(vec![flaky]).unwrap());
+        // The caller is gone at once; the read runs to its end anyway.
+        drop(tokio::time::timeout(std::time::Duration::ZERO, pool.domain_names()).await);
+        let _all = pool.drain().await.unwrap();
+        assert_eq!(
+            seen.counts()[1],
+            seen.counts()[2],
+            "every read it opened it closed"
+        );
+    }
+
+    #[test]
+    fn dropping_a_threaded_pool_closes_its_connections_before_it_returns() {
+        let flaky = Flaky::new(0, false).threaded();
+        let seen = flaky.seen.clone();
+        let pool = ReadPool::new(vec![flaky]).unwrap();
+        drop(pool);
+        assert_eq!(seen.dropped.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

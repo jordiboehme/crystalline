@@ -5905,6 +5905,9 @@ impl ReaderBackend for PostgresStore {
         if let Some(seen) = &self.reader_generation {
             seen.store(self.coverage.generation(), Ordering::Release);
         }
+        // A connection an earlier call left behind is never reused: it may
+        // still be inside that call's read transaction.
+        self.abandon_read();
         let mut c = self.pool.acquire().await.map_err(IndexError::from)?;
         sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(&mut *c)
@@ -5923,6 +5926,19 @@ impl ReaderBackend for PostgresStore {
             tracing::debug!("a read transaction did not end cleanly ({end}): {e}");
             // A session that may still be in a transaction never serves
             // another call.
+            drop(c.detach());
+        }
+    }
+
+    /// Close the session a cut-off call left in `tx` instead of giving it
+    /// back to the pool: sqlx would hand it out again with the read
+    /// transaction still open (it does not track a `BEGIN` sent as plain
+    /// SQL), and its next caller would read an old snapshot.
+    fn abandon_read(&self) {
+        if let Ok(mut tx) = self.tx.try_lock()
+            && let Some(c) = tx.take()
+        {
+            tracing::debug!("a read was cut off inside its transaction; closing its session");
             drop(c.detach());
         }
     }
