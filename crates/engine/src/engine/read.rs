@@ -802,7 +802,7 @@ impl Engine {
         exclude.sort();
         let found = {
             self.reader()
-                .inbound_page(&InboundQuery {
+                .inbound_page(InboundQuery {
                     engram_id: desc.id,
                     domain_id: desc.domain_id,
                     permalink: &desc.permalink,

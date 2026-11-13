@@ -22,6 +22,7 @@
 //! build checks that ([`txn`]).
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -129,7 +130,7 @@ macro_rules! read_store_methods {
             fn tag_aliases(&self, domains: Option<&[String]>) -> Result<Vec<(String, String)>>;
             fn inbound_refs(&self, engram_id: EngramId, domain_id: DomainId, permalink: &str, title: &str) -> Result<Vec<InboundRef>>;
             fn engrams_mentioning(&self, needle: &str) -> Result<Vec<ContentMention>>;
-            fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage>;
+            fn inbound_page(&self, query: InboundQuery<'_>) -> Result<InboundPage>;
             fn outbound_refs(&self, engram_id: EngramId, actor: Option<&str>) -> Result<Vec<OutboundRef>>;
             fn unresolved_refs(&self, domain: DomainId, actor: Option<&str>) -> Result<Vec<UnresolvedRef>>;
             fn search(&self, query: &SearchQuery) -> Result<Page<SearchHit>>;
@@ -183,8 +184,9 @@ macro_rules! read_store_methods {
     };
 }
 
-/// `impl ReadStore for $ty` where every method runs `$wrap!(self, s, call)`,
-/// `call` being the same method on `s`.
+/// `impl ReadStore for $ty` where every method runs
+/// `$wrap!(self, name, (args))`: the wrapper calls the same method with the
+/// same arguments on the store it picks.
 macro_rules! delegate_read_store {
     ([$($gen:tt)*] [$ty:ty] [$wrap:ident]
      $( fn $name:ident(&self $(, $arg:ident : $argty:ty)* $(,)?) -> $ret:ty; )*) => {
@@ -192,7 +194,7 @@ macro_rules! delegate_read_store {
         impl<$($gen)*> $crate::store::ReadStore for $ty {
             $(
                 async fn $name(&self $(, $arg: $argty)*) -> $ret {
-                    $wrap!(self, s, s.$name($($arg),*))
+                    $wrap!(self, $name, ($($arg),*))
                 }
             )*
         }
@@ -210,11 +212,11 @@ impl LockedReader {
 }
 
 macro_rules! locked_call {
-    ($self:ident, $s:ident, $call:expr) => {{
+    ($self:ident, $name:ident, ($($arg:ident),*)) => {{
         txn::assert_none_open();
         let guard = $self.0.lock().await;
-        let $s: &dyn Store = &*guard;
-        $call.await
+        let store: &dyn Store = &*guard;
+        store.$name($($arg),*).await
     }};
 }
 
@@ -242,20 +244,48 @@ pub(crate) trait ReaderBackend: ReadStore + Send + Sync + 'static {
         false
     }
     /// Whether the backend's statements step synchronously on the polling
-    /// thread, so a call should hand its worker off with `block_in_place`.
+    /// thread. Such a connection gets a thread of its own (see [`ReadPool`]).
     fn blocking(&self) -> bool {
         false
     }
 }
 
+/// One call's work on a read connection: the store, and the call's own
+/// arguments it was handed.
+type Call<S, O, T> = dyn for<'s> Fn(&'s S, &'s O) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 's>>
+    + Send
+    + Sync;
+
+/// A job for a reader thread: run on its connection, inside its runtime.
+type Job<S> = Box<dyn FnOnce(&S, &tokio::runtime::Runtime) + Send>;
+
+/// Where the read connections live.
+enum Slots<S> {
+    /// In the pool, borrowed by the calling task for its call (Postgres,
+    /// whose statements are real I/O the caller's task awaits).
+    InTask(std::sync::Mutex<Vec<S>>),
+    /// Each on a thread of its own, which runs the calls handed to it
+    /// (turso, whose statements step synchronously). A call allocates on
+    /// that thread, so the allocator's per-thread caches stay with a fixed
+    /// set of threads; running them on the caller's worker with
+    /// `block_in_place` had tokio rotate workers through ever more threads,
+    /// and each kept its own cache: 344 to 397 MiB of physical footprint
+    /// after a reindex beside eight searchers, against 113 MiB without
+    /// readers and 160 MiB with the calls kept on fixed threads.
+    Threads {
+        free: Arc<std::sync::Mutex<Vec<usize>>>,
+        senders: Vec<std::sync::mpsc::Sender<Job<S>>>,
+    },
+}
+
 /// A fixed set of read connections, one per call.
 pub(crate) struct ReadPool<S> {
-    slots: std::sync::Mutex<Vec<S>>,
-    permits: Semaphore,
+    slots: Slots<S>,
+    permits: Arc<Semaphore>,
     size: u32,
 }
 
-/// One read connection, taken from the pool for one call.
+/// One read connection of an in-task pool, taken for one call.
 pub(crate) struct Lease<'a, S> {
     pool: &'a ReadPool<S>,
     store: Option<S>,
@@ -270,38 +300,73 @@ impl<S> Lease<'_, S> {
 
 impl<S> Drop for Lease<'_, S> {
     fn drop(&mut self) {
-        if let Some(s) = self.store.take() {
-            self.pool
-                .slots
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(s);
+        if let (Some(s), Slots::InTask(slots)) = (self.store.take(), &self.pool.slots) {
+            slots.lock().unwrap_or_else(|p| p.into_inner()).push(s);
         }
     }
 }
 
-impl<S> ReadPool<S> {
-    pub(crate) fn new(slots: Vec<S>) -> ReadPool<S> {
+fn closed() -> IndexError {
+    IndexError::Db("the read connections are closed".to_string())
+}
+
+impl<S: ReaderBackend> ReadPool<S> {
+    /// A pool over `slots`. Connections whose statements step synchronously
+    /// each get a thread of their own (`crystalline-reader-<n>`), which ends
+    /// when the pool is dropped.
+    pub(crate) fn new(slots: Vec<S>) -> std::io::Result<ReadPool<S>> {
         let size = slots.len();
-        ReadPool {
-            slots: std::sync::Mutex::new(slots),
-            permits: Semaphore::new(size),
+        let threaded = slots.first().is_some_and(ReaderBackend::blocking);
+        let slots = if threaded {
+            let mut senders = Vec::with_capacity(size);
+            for (n, store) in slots.into_iter().enumerate() {
+                let (tx, rx) = std::sync::mpsc::channel::<Job<S>>();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                std::thread::Builder::new()
+                    .name(format!("crystalline-reader-{n}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            job(&store, &runtime);
+                            // Work through what is queued, then, idle,
+                            // give the allocator's cache on this thread back.
+                            while let Ok(job) = rx.try_recv() {
+                                job(&store, &runtime);
+                            }
+                            give_back_freed_memory();
+                        }
+                    })?;
+                senders.push(tx);
+            }
+            Slots::Threads {
+                free: Arc::new(std::sync::Mutex::new((0..size).collect())),
+                senders,
+            }
+        } else {
+            Slots::InTask(std::sync::Mutex::new(slots))
+        };
+        Ok(ReadPool {
+            slots,
+            permits: Arc::new(Semaphore::new(size)),
             size: size as u32,
-        }
+        })
     }
 
+    /// One connection of an in-task pool, for the calling task. A threaded
+    /// pool hands none out: its connections stay on their threads.
     pub(crate) async fn lease(&self) -> Result<Lease<'_, S>> {
-        let permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| IndexError::Db("the read connections are closed".to_string()))?;
-        let store = self
-            .slots
+        let Slots::InTask(slots) = &self.slots else {
+            return Err(IndexError::Db(
+                "a threaded read pool lends no connection".to_string(),
+            ));
+        };
+        let permit = self.permits.acquire().await.map_err(|_| closed())?;
+        let store = slots
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .pop()
-            .expect("a permit always finds a free connection");
+            .ok_or_else(closed)?;
         Ok(Lease {
             pool: self,
             store: Some(store),
@@ -309,53 +374,250 @@ impl<S> ReadPool<S> {
         })
     }
 
-    /// Every permit: no reader runs until the returned permit is dropped.
+    /// Every permit: no reader runs until the returned permit is dropped. On
+    /// a threaded pool a permit comes back only when its call has ended on
+    /// its thread, so a caller that gave up waiting does not count as idle.
     pub(crate) async fn drain(&self) -> Result<SemaphorePermit<'_>> {
         self.permits
             .acquire_many(self.size)
             .await
-            .map_err(|_| IndexError::Db("the read connections are closed".to_string()))
+            .map_err(|_| closed())
+    }
+
+    /// Run `call` with `args` on one connection, in one read transaction,
+    /// and once more from the start when the first run failed with an error
+    /// the backend calls retryable.
+    pub(crate) async fn run<T, O, F>(&self, args: O, call: F) -> Result<T>
+    where
+        T: Send + 'static,
+        O: Send + Sync + 'static,
+        F: for<'s> Fn(&'s S, &'s O) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 's>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        match &self.slots {
+            Slots::InTask(_) => {
+                let lease = self.lease().await?;
+                attempts(lease.store(), &args, &call).await
+            }
+            Slots::Threads { free, senders } => {
+                let permit = self
+                    .permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| closed())?;
+                let slot = free
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pop()
+                    .ok_or_else(closed)?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let free = free.clone();
+                let job: Job<S> = Box::new(move |store: &S, runtime: &tokio::runtime::Runtime| {
+                    let call: &Call<S, O, T> = &call;
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(attempts(store, &args, call))
+                    }))
+                    .unwrap_or_else(|_| {
+                        // Never leave a read transaction open behind a panic.
+                        runtime.block_on(store.close_read(false));
+                        Err(IndexError::Db("a read failed with a panic".to_string()))
+                    });
+                    let _ = tx.send(out);
+                    // The connection is free again before its permit is.
+                    free.lock().unwrap_or_else(|p| p.into_inner()).push(slot);
+                    drop(permit);
+                });
+                senders[slot].send(job).map_err(|_| closed())?;
+                rx.await.map_err(|_| closed())?
+            }
+        }
     }
 }
 
-/// Run `fut` to the end. When `blocking` and the runtime has several workers,
-/// the worker is handed off (`block_in_place`) first, so statements that step
-/// on this thread do not hold up the other tasks queued on it.
-pub(crate) async fn drive<F: Future>(blocking: bool, fut: F) -> F::Output {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    match Handle::try_current() {
-        Ok(handle) if blocking && handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(fut))
+/// Give the memory this thread freed back to the allocator's shared pool
+/// and the OS. turso installs mimalloc as the global allocator, and
+/// mimalloc keeps what a thread frees in that thread's own heap: a search
+/// allocates tens of MiB (its candidates, lowered), and each reader thread
+/// kept that much after it went idle. Measured on 20k engrams beside eight
+/// searchers, four readers held 77 to 95 MiB more physical footprint than
+/// no readers; collecting when a reader thread goes idle brings that to the
+/// footprint without readers (134 to 143 MiB against 138 to 155 MiB).
+/// Harmless when another allocator is the global one: mimalloc then has
+/// nothing of this thread's to give back.
+fn give_back_freed_memory() {
+    // SAFETY: `mi_collect` takes no pointers and may be called from any
+    // thread at any time; it only walks this thread's own heap.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
+/// One read transaction around `call`, and a second one when the first
+/// failed retryably.
+async fn attempts<S, O, T>(store: &S, args: &O, call: &Call<S, O, T>) -> Result<T>
+where
+    S: ReaderBackend,
+{
+    let mut retried = false;
+    loop {
+        let out = match store.open_read().await {
+            Ok(()) => call(store, args).await,
+            Err(e) => Err(e),
+        };
+        store.close_read(out.is_ok()).await;
+        match out {
+            Err(e) if !retried && store.retryable(&e) => {
+                retried = true;
+                tracing::warn!("a read failed on a refused temp directory; running it again");
+            }
+            other => return other,
         }
-        _ => fut.await,
+    }
+}
+
+/// A store method's argument, carried to a reader thread as a value of its
+/// own and handed to the method from there.
+pub(crate) trait Arg<'a>: Sized {
+    type Owned: Send + Sync + 'static;
+    fn own(&self) -> Self::Owned;
+    fn view(owned: &'a Self::Owned) -> Self;
+}
+
+macro_rules! copy_args {
+    ($($t:ty),*) => {$(
+        impl<'a> Arg<'a> for $t {
+            type Owned = $t;
+            fn own(&self) -> $t {
+                *self
+            }
+            fn view(owned: &'a $t) -> $t {
+                *owned
+            }
+        }
+    )*};
+}
+
+copy_args!(
+    crate::store::DomainId,
+    crate::store::EngramId,
+    crate::store::ChunkTable,
+    crate::store::AssetTable,
+    usize,
+    u8,
+    f32,
+    Option<(i64, i64)>
+);
+
+impl<'a> Arg<'a> for &'a str {
+    type Owned = String;
+    fn own(&self) -> String {
+        self.to_string()
+    }
+    fn view(owned: &'a String) -> &'a str {
+        owned
+    }
+}
+
+impl<'a> Arg<'a> for Option<&'a str> {
+    type Owned = Option<String>;
+    fn own(&self) -> Option<String> {
+        self.map(str::to_string)
+    }
+    fn view(owned: &'a Option<String>) -> Option<&'a str> {
+        owned.as_deref()
+    }
+}
+
+impl<'a, T: Clone + Send + Sync + 'static> Arg<'a> for &'a [T] {
+    type Owned = Vec<T>;
+    fn own(&self) -> Vec<T> {
+        self.to_vec()
+    }
+    fn view(owned: &'a Vec<T>) -> &'a [T] {
+        owned
+    }
+}
+
+impl<'a, T: Clone + Send + Sync + 'static> Arg<'a> for Option<&'a [T]> {
+    type Owned = Option<Vec<T>>;
+    fn own(&self) -> Option<Vec<T>> {
+        self.map(<[T]>::to_vec)
+    }
+    fn view(owned: &'a Option<Vec<T>>) -> Option<&'a [T]> {
+        owned.as_deref()
+    }
+}
+
+macro_rules! clone_args {
+    ($($t:ty),*) => {$(
+        impl<'a> Arg<'a> for &'a $t {
+            type Owned = $t;
+            fn own(&self) -> $t {
+                (*self).clone()
+            }
+            fn view(owned: &'a $t) -> &'a $t {
+                owned
+            }
+        }
+    )*};
+}
+
+clone_args!(crate::store::SearchQuery, crate::store::RecentFilter);
+
+/// [`crate::store::InboundQuery`]'s fields, owned.
+pub(crate) struct OwnedInboundQuery {
+    engram_id: crate::store::EngramId,
+    domain_id: crate::store::DomainId,
+    permalink: String,
+    title: String,
+    q: Option<String>,
+    rel: Option<String>,
+    exclude_domains: Vec<String>,
+    page: usize,
+    limit: usize,
+}
+
+impl<'a> Arg<'a> for crate::store::InboundQuery<'a> {
+    type Owned = OwnedInboundQuery;
+    fn own(&self) -> OwnedInboundQuery {
+        OwnedInboundQuery {
+            engram_id: self.engram_id,
+            domain_id: self.domain_id,
+            permalink: self.permalink.to_string(),
+            title: self.title.to_string(),
+            q: self.q.map(str::to_string),
+            rel: self.rel.map(str::to_string),
+            exclude_domains: self.exclude_domains.to_vec(),
+            page: self.page,
+            limit: self.limit,
+        }
+    }
+    fn view(owned: &'a OwnedInboundQuery) -> crate::store::InboundQuery<'a> {
+        crate::store::InboundQuery {
+            engram_id: owned.engram_id,
+            domain_id: owned.domain_id,
+            permalink: &owned.permalink,
+            title: &owned.title,
+            q: owned.q.as_deref(),
+            rel: owned.rel.as_deref(),
+            exclude_domains: &owned.exclude_domains,
+            page: owned.page,
+            limit: owned.limit,
+        }
     }
 }
 
 macro_rules! pooled_call {
-    ($self:ident, $s:ident, $call:expr) => {{
+    ($self:ident, $name:ident, ($($arg:ident),*)) => {{
         $crate::reader::txn::assert_none_open();
-        let lease = $self.lease().await?;
-        let $s = lease.store();
-        $crate::reader::drive($crate::reader::ReaderBackend::blocking($s), async {
-            let mut retried = false;
-            loop {
-                let out = match $crate::reader::ReaderBackend::open_read($s).await {
-                    Ok(()) => $call.await,
-                    Err(e) => Err(e),
-                };
-                $crate::reader::ReaderBackend::close_read($s, out.is_ok()).await;
-                match out {
-                    Err(e) if !retried && $crate::reader::ReaderBackend::retryable($s, &e) => {
-                        retried = true;
-                        tracing::warn!(
-                            "a read failed on a refused temp directory; running it again"
-                        );
-                    }
-                    other => break other,
-                }
-            }
-        })
-        .await
+        let args = ($($crate::reader::Arg::own(&$arg),)*);
+        $self
+            .run(args, |store, args| {
+                let ($($arg,)*) = args;
+                store.$name($($crate::reader::Arg::view($arg)),*)
+            })
+            .await
     }};
 }
 
@@ -556,30 +818,59 @@ mod tests {
         assert!(cache.get(ChunkTable::Engram).is_some());
     }
 
-    /// A backend whose first `fail` calls are refused ("refused", retryable
-    /// when `retryable`), and whose later calls are "answered": an error too,
-    /// so one stand-in serves every method's return type.
-    struct Flaky {
+    /// What a [`Flaky`] saw, kept outside it: a threaded pool keeps its
+    /// connections on their threads.
+    #[derive(Default)]
+    struct Seen {
         calls: AtomicUsize,
         opened: AtomicUsize,
         closed: AtomicUsize,
+    }
+
+    impl Seen {
+        fn counts(&self) -> [usize; 3] {
+            [
+                self.calls.load(Ordering::SeqCst),
+                self.opened.load(Ordering::SeqCst),
+                self.closed.load(Ordering::SeqCst),
+            ]
+        }
+    }
+
+    /// A backend whose first `fail` calls are refused ("refused", retryable
+    /// when `retryable`), and whose later calls are "answered": an error too,
+    /// so one stand-in serves every method's return type. `threaded` puts
+    /// it on threads of its own, as a turso connection is; `panics` makes
+    /// its first call panic.
+    struct Flaky {
+        seen: Arc<Seen>,
         fail: usize,
         retryable: bool,
+        threaded: bool,
+        panics: bool,
     }
 
     impl Flaky {
         fn new(fail: usize, retryable: bool) -> Flaky {
             Flaky {
-                calls: AtomicUsize::new(0),
-                opened: AtomicUsize::new(0),
-                closed: AtomicUsize::new(0),
+                seen: Arc::default(),
                 fail,
                 retryable,
+                threaded: false,
+                panics: false,
             }
         }
 
+        fn threaded(mut self) -> Flaky {
+            self.threaded = true;
+            self
+        }
+
         fn answer(&self) -> IndexError {
-            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let n = self.seen.calls.fetch_add(1, Ordering::SeqCst);
+            if self.panics && n == 0 {
+                panic!("a read that panics");
+            }
             IndexError::Db(if n < self.fail { "refused" } else { "answered" }.to_string())
         }
     }
@@ -587,19 +878,22 @@ mod tests {
     #[async_trait]
     impl ReaderBackend for Flaky {
         async fn open_read(&self) -> Result<()> {
-            self.opened.fetch_add(1, Ordering::SeqCst);
+            self.seen.opened.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn close_read(&self, _ok: bool) {
-            self.closed.fetch_add(1, Ordering::SeqCst);
+            self.seen.closed.fetch_add(1, Ordering::SeqCst);
         }
         fn retryable(&self, err: &IndexError) -> bool {
             self.retryable && err.to_string().contains("refused")
         }
+        fn blocking(&self) -> bool {
+            self.threaded
+        }
     }
 
     macro_rules! flaky_call {
-        ($self:ident, $s:ident, $call:expr) => {{ Err($self.answer()) }};
+        ($self:ident, $name:ident, ($($arg:ident),*)) => {{ Err($self.answer()) }};
     }
 
     // The stand-in answers without looking at the arguments.
@@ -615,51 +909,63 @@ mod tests {
 
     /// `domain_names` through a one-connection pool, and the counts after.
     async fn through_pool(backend: Flaky) -> (String, [usize; 3]) {
-        let pool = ReadPool::new(vec![backend]);
+        let seen = backend.seen.clone();
+        let pool = ReadPool::new(vec![backend]).unwrap();
         let err = pool.domain_names().await.unwrap_err().to_string();
-        let lease = pool.lease().await.unwrap();
-        let s = lease.store();
-        (
-            err,
-            [
-                s.calls.load(Ordering::SeqCst),
-                s.opened.load(Ordering::SeqCst),
-                s.closed.load(Ordering::SeqCst),
-            ],
-        )
+        (err, seen.counts())
     }
 
     #[tokio::test]
     async fn a_retryable_refusal_runs_the_whole_read_once_more_and_only_once() {
-        let (err, counts) = through_pool(Flaky::new(1, true)).await;
+        for threaded in [false, true] {
+            let flaky = |fail, retryable| {
+                let f = Flaky::new(fail, retryable);
+                if threaded { f.threaded() } else { f }
+            };
+            let (err, counts) = through_pool(flaky(1, true)).await;
+            assert!(err.contains("answered"), "{err}");
+            assert_eq!(
+                counts,
+                [2, 2, 2],
+                "two calls, each in a read transaction of its own"
+            );
+
+            let (err, counts) = through_pool(flaky(2, true)).await;
+            assert!(
+                err.contains("refused"),
+                "a second refusal is returned: {err}"
+            );
+            assert_eq!(counts, [2, 2, 2]);
+
+            let (err, counts) = through_pool(flaky(1, false)).await;
+            assert!(
+                err.contains("refused"),
+                "any other error is returned at once: {err}"
+            );
+            assert_eq!(counts, [1, 1, 1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_threaded_read_runs_on_a_reader_thread_and_a_panic_there_is_an_error() {
+        let mut flaky = Flaky::new(0, false).threaded();
+        flaky.panics = true;
+        let seen = flaky.seen.clone();
+        let pool = ReadPool::new(vec![flaky]).unwrap();
+        let err = pool.domain_names().await.unwrap_err().to_string();
+        assert!(err.contains("panic"), "{err}");
+        // The connection's transaction was ended, and the connection serves
+        // the next call.
+        assert_eq!(seen.counts(), [1, 1, 1]);
+        let err = pool.domain_names().await.unwrap_err().to_string();
         assert!(err.contains("answered"), "{err}");
-        assert_eq!(
-            counts,
-            [2, 2, 2],
-            "two calls, each in a read transaction of its own"
-        );
-
-        let (err, counts) = through_pool(Flaky::new(2, true)).await;
-        assert!(
-            err.contains("refused"),
-            "a second refusal is returned: {err}"
-        );
-        assert_eq!(counts, [2, 2, 2]);
-
-        let (err, counts) = through_pool(Flaky::new(1, false)).await;
-        assert!(
-            err.contains("refused"),
-            "any other error is returned at once: {err}"
-        );
-        assert_eq!(counts, [1, 1, 1]);
+        assert!(pool.drain().await.is_ok(), "every permit came back");
     }
 
     #[tokio::test]
     async fn a_drain_waits_for_every_reader_and_holds_them_off() {
-        let pool = Arc::new(ReadPool::new(vec![
-            Flaky::new(0, false),
-            Flaky::new(0, false),
-        ]));
+        let pool =
+            Arc::new(ReadPool::new(vec![Flaky::new(0, false), Flaky::new(0, false)]).unwrap());
         let lease = pool.lease().await.unwrap();
         let drained = {
             let pool = pool.clone();

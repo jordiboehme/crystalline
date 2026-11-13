@@ -678,7 +678,7 @@ async fn reference_match_tie_break_prefers_the_lower_id(store: &dyn Store) {
         .unwrap();
 
     let alpha_page = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             engram_id: alpha_target,
             domain_id: domain,
             permalink: "alpha-target",
@@ -692,7 +692,7 @@ async fn reference_match_tie_break_prefers_the_lower_id(store: &dyn Store) {
         .await
         .unwrap();
     let zulu_page = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             engram_id: zulu_target,
             domain_id: domain,
             permalink: "zulu-target",
@@ -3401,7 +3401,7 @@ fn hit_titles(page: &InboundPage) -> Vec<&str> {
 async fn inbound_page_orders_and_summarizes(store: &dyn Store) {
     let (hub, domain) = hub_fixture(store).await;
 
-    let page = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    let page = store.inbound_page(hub_query(hub, domain)).await.unwrap();
 
     assert_eq!(page.total, 7, "seven references point at the hub: {page:?}");
     assert_eq!(
@@ -3455,7 +3455,7 @@ async fn inbound_page_pages(store: &dyn Store) {
     let (hub, domain) = hub_fixture(store).await;
 
     let first = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             limit: 3,
             ..hub_query(hub, domain)
         })
@@ -3469,7 +3469,7 @@ async fn inbound_page_pages(store: &dyn Store) {
     assert_eq!(first.total, 7, "{first:?}");
 
     let second = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             page: 2,
             limit: 3,
             ..hub_query(hub, domain)
@@ -3489,7 +3489,7 @@ async fn inbound_page_pages(store: &dyn Store) {
     );
 
     let last = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             page: 3,
             limit: 3,
             ..hub_query(hub, domain)
@@ -3499,7 +3499,7 @@ async fn inbound_page_pages(store: &dyn Store) {
     assert_eq!(hit_titles(&last), vec!["beta small"], "{last:?}");
 
     let past_the_end = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             page: 9,
             limit: 3,
             ..hub_query(hub, domain)
@@ -3521,7 +3521,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     let (hub, domain) = hub_fixture(store).await;
 
     let cites = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             rel: Some("cites"),
             ..hub_query(hub, domain)
         })
@@ -3540,7 +3540,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     );
 
     let prose = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             rel: Some("links_to"),
             ..hub_query(hub, domain)
         })
@@ -3549,7 +3549,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     assert_eq!(hit_titles(&prose), vec!["Gamma"], "{prose:?}");
 
     let by_title = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("BETA"),
             ..hub_query(hub, domain)
         })
@@ -3563,7 +3563,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     assert_eq!(by_title.total, 2, "{by_title:?}");
 
     let by_path = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("notes/"),
             ..hub_query(hub, domain)
         })
@@ -3576,7 +3576,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     );
 
     let both = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("alpha"),
             rel: Some("cites"),
             ..hub_query(hub, domain)
@@ -3590,7 +3590,7 @@ async fn inbound_page_filters(store: &dyn Store) {
     );
 
     let nothing = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("nobody"),
             ..hub_query(hub, domain)
         })
@@ -3620,7 +3620,7 @@ async fn inbound_page_absurd_bounds(store: &dyn Store) {
     // A page size past `i64`: bounded, and bounded by the set rather than
     // unbounded by a wrapped negative.
     let huge_limit = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             limit: usize::MAX,
             ..hub_query(hub, domain)
         })
@@ -3636,7 +3636,7 @@ async fn inbound_page_absurd_bounds(store: &dyn Store) {
     // A page number past `i64`, whose offset would wrap: an empty page carrying
     // the true total, never the first page's rows.
     let huge_page = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             page: usize::MAX,
             ..hub_query(hub, domain)
         })
@@ -3650,7 +3650,7 @@ async fn inbound_page_absurd_bounds(store: &dyn Store) {
 
     // Both at once, which is where the multiplication overflows.
     let both = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             page: usize::MAX,
             limit: usize::MAX,
             ..hub_query(hub, domain)
@@ -3671,7 +3671,7 @@ async fn inbound_page_escapes(store: &dyn Store) {
     let (hub, domain) = hub_fixture(store).await;
 
     let literal = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("100%"),
             ..hub_query(hub, domain)
         })
@@ -3684,7 +3684,7 @@ async fn inbound_page_escapes(store: &dyn Store) {
     );
 
     let underscore = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             q: Some("alpha_"),
             ..hub_query(hub, domain)
         })
@@ -3715,7 +3715,7 @@ async fn inbound_page_empty(store: &dyn Store) {
         .unwrap();
 
     let page = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             permalink: "lonely",
             title: "Lonely",
             ..hub_query(lonely, domain)
@@ -3741,7 +3741,7 @@ async fn inbound_page_excludes_domains(store: &dyn Store) {
     let hidden = vec!["Zed".to_string()];
 
     let page = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             exclude_domains: &hidden,
             ..hub_query(hub, domain)
         })
@@ -3769,7 +3769,7 @@ async fn inbound_page_excludes_domains(store: &dyn Store) {
     // The exclusion narrows and nothing else: a reader-chosen filter still
     // applies on top of it, over the same reduced set.
     let filtered = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             rel: Some("cites"),
             exclude_domains: &hidden,
             ..hub_query(hub, domain)
@@ -3786,13 +3786,13 @@ async fn inbound_page_excludes_domains(store: &dyn Store) {
     // the one the empty exclusion gives.
     let unrelated = vec!["ghost".to_string()];
     let same = store
-        .inbound_page(&InboundQuery {
+        .inbound_page(InboundQuery {
             exclude_domains: &unrelated,
             ..hub_query(hub, domain)
         })
         .await
         .unwrap();
-    let all = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    let all = store.inbound_page(hub_query(hub, domain)).await.unwrap();
     assert_eq!(same.total, all.total, "{same:?}");
     assert_eq!(hit_titles(&same), hit_titles(&all), "{same:?}");
 }

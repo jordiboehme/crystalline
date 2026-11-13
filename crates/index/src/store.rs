@@ -1751,7 +1751,7 @@ pub struct InboundHit {
 /// The target is spelled the way [`ReadStore::inbound_refs`] spells it - id, domain
 /// and the permalink and title an unresolved reference is text-matched against -
 /// because both walk the same rows and must agree about what points where.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct InboundQuery<'a> {
     /// The engram being pointed at.
     pub engram_id: EngramId,
@@ -3125,7 +3125,7 @@ pub trait ReadStore: Send + Sync {
     /// Ordered by title, then permalink, then domain, then relation, byte-wise
     /// on both backends, so paging is stable and a page boundary never drops or
     /// repeats a row.
-    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage>;
+    async fn inbound_page(&self, query: InboundQuery<'_>) -> Result<InboundPage>;
 
     /// Every relation and prose link that points out of the given engram, each
     /// carrying whether it currently resolves to a target in the index. Ordered

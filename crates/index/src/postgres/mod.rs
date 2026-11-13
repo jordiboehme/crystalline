@@ -508,7 +508,8 @@ impl PostgresStore {
                 readers: None,
             })
             .collect();
-        Ok(ReadPool::new(slots))
+        ReadPool::new(slots)
+            .map_err(|e| IndexError::Db(format!("could not start the read connections: {e}")))
     }
 
     /// Drop every cached embedding coverage snapshot so the next read of any
@@ -2518,7 +2519,7 @@ impl ReadStore for PostgresStore {
             .collect())
     }
 
-    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+    async fn inbound_page(&self, query: InboundQuery<'_>) -> Result<InboundPage> {
         // The Turso twin's query, param for param; see it for what the
         // predicate is and why it is `inbound_refs`'s unchanged. Two things are
         // this backend's own: the relation label is cast to `text` so the union

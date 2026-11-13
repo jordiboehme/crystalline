@@ -36,6 +36,7 @@ postgres = ["dep:sqlx", "dep:pgvector"]
 [dependencies]
 crystalline-core = { workspace = true }
 turso = { workspace = true }
+libmimalloc-sys = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }

@@ -80,6 +80,12 @@ fn placeholders(from: usize, count: usize) -> String {
         .join(",")
 }
 
+/// How many pages a read connection caches, against turso's default of
+/// 2000. Searches scan the whole chunk table, far past any cache; what a
+/// cache helps is the b-tree interior pages of a point read, and 256 pages
+/// hold those. So four readers keep about 4 MiB of pages instead of 32 MiB.
+const READER_CACHE_PAGES: usize = 256;
+
 /// A Turso-backed store. Open one with [`TursoStore::open`].
 pub struct TursoStore {
     // The database handle is retained so the connection stays valid.
@@ -205,7 +211,10 @@ impl TursoStore {
             for _ in 0..readers {
                 slots.push(store.reader().await?);
             }
-            store.readers = Some(Arc::new(ReadPool::new(slots)));
+            let pool = ReadPool::new(slots).map_err(|e| {
+                IndexError::Db(format!("could not start the read connections: {e}"))
+            })?;
+            store.readers = Some(Arc::new(pool));
         }
         Ok(store)
     }
@@ -213,10 +222,14 @@ impl TursoStore {
     /// One read connection beside this writer: a connection of the same
     /// database (so it shares the WAL and the page store), refusing writes
     /// (`query_only`), and sharing the coverage cache.
+    ///
+    /// Its page cache is held to [`READER_CACHE_PAGES`].
     async fn reader(&self) -> Result<TursoStore> {
         let conn = self._db.connect().map_err(IndexError::from)?;
         conn.execute("PRAGMA busy_timeout = 5000", ()).await?;
         conn.execute("PRAGMA query_only = 1", ()).await?;
+        conn.execute(&format!("PRAGMA cache_size = {READER_CACHE_PAGES}"), ())
+            .await?;
         Ok(TursoStore {
             _db: self._db.clone(),
             conn: Conn::reader(conn),
@@ -2433,7 +2446,7 @@ impl ReadStore for TursoStore {
             .collect())
     }
 
-    async fn inbound_page(&self, query: &InboundQuery<'_>) -> Result<InboundPage> {
+    async fn inbound_page(&self, query: InboundQuery<'_>) -> Result<InboundPage> {
         // Every reference pointing at the target, as one narrow projection: the
         // referencing engram's address, its status and the relation it points
         // with. The predicate is `inbound_refs`'s, unchanged, so a total here
@@ -5649,16 +5662,24 @@ mod tests {
     #[tokio::test]
     async fn a_read_connection_refuses_a_write() {
         let (_dir, store) = with_readers(1).await;
-        let readers = store.readers.clone().unwrap();
-        let lease = readers.lease().await.unwrap();
-        let refused = lease
-            .store()
+        // A read connection as the pool opens them.
+        let reader = store.reader().await.unwrap();
+        let refused = reader
             .conn
             .execute("INSERT INTO domain(name, kind) VALUES('x', 'virtual')", ())
             .await;
         assert!(refused.is_err(), "query_only refuses an insert");
-        drop(lease);
         assert!(store.domain_id("x").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_read_connection_caches_few_pages() {
+        let (_dir, store) = with_readers(1).await;
+        let reader = store.reader().await.unwrap();
+        let rows = query_all(&reader.conn, "PRAGMA cache_size", vec![])
+            .await
+            .unwrap();
+        assert_eq!(cell_i64(&rows[0], 0), Some(READER_CACHE_PAGES as i64));
     }
 
     #[tokio::test]
@@ -5671,22 +5692,27 @@ mod tests {
                 .unwrap_or(0)
         };
         let readers = store.readers.clone().unwrap();
-        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
-        let (end_tx, end_rx) = tokio::sync::oneshot::channel::<()>();
-        // A read transaction held open on its own task, as a long search is.
-        let held = tokio::spawn(async move {
-            let lease = readers.lease().await.unwrap();
-            let reader = lease.store();
-            reader.open_read().await.unwrap();
-            reader.domain_names().await.unwrap();
-            opened_tx.send(()).unwrap();
-            end_rx.await.unwrap();
-            // The reader still answers from its own snapshot.
-            let seen = reader.domain_names().await.unwrap().len();
-            reader.close_read(true).await;
-            seen
-        });
-        opened_rx.await.unwrap();
+        let opened = Arc::new(tokio::sync::Notify::new());
+        let end = Arc::new(tokio::sync::Notify::new());
+        // A read held open on its reader thread, as a long search is: one
+        // call, one read transaction, which waits for `end` inside.
+        let held = {
+            let signals = (opened.clone(), end.clone());
+            tokio::spawn(async move {
+                readers
+                    .run(signals, |reader, (opened, end)| {
+                        Box::pin(async move {
+                            reader.domain_names().await?;
+                            opened.notify_one();
+                            end.notified().await;
+                            // Still its own snapshot.
+                            Ok(reader.domain_names().await?.len())
+                        })
+                    })
+                    .await
+            })
+        };
+        opened.notified().await;
         for i in 0..20 {
             store
                 .upsert_domain(&format!("d{i}"), None, DomainKind::Virtual)
@@ -5703,8 +5729,8 @@ mod tests {
             !checkpoint.is_finished(),
             "the checkpoint waits for the read"
         );
-        end_tx.send(()).unwrap();
-        assert_eq!(held.await.unwrap(), 0);
+        end.notify_one();
+        assert_eq!(held.await.unwrap().unwrap(), 0);
         checkpoint.await.unwrap().unwrap();
         assert_eq!(wal(), 0, "with no reader inside, the WAL is truncated");
         assert_eq!(store.domain_names().await.unwrap().len(), 20);
@@ -5721,9 +5747,8 @@ mod tests {
             .upsert_engram(did, &record_with_observations(Vec::new()))
             .await
             .unwrap();
-        let readers = store.readers.clone().unwrap();
-        let lease = readers.lease().await.unwrap();
-        let reader = lease.store();
+        // A read connection as the pool opens them, sharing the cache.
+        let reader = store.reader().await.unwrap();
         reader.open_read().await.unwrap();
         // The snapshot is taken before the chunk lands.
         reader.domain_names().await.unwrap();
@@ -5743,7 +5768,6 @@ mod tests {
             .await
             .unwrap();
         reader.close_read(true).await;
-        drop(lease);
         assert_eq!(stale.total_chunks, 0, "the reader saw its older snapshot");
         assert!(
             store.coverage.get(ChunkTable::Engram).is_none(),
