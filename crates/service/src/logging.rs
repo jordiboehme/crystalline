@@ -66,6 +66,10 @@ where
 /// The variable that sets the embedding thread count.
 pub const EMBED_THREADS_VAR: &str = "CRYSTALLINE_EMBED_THREADS";
 
+/// Set beside `RAYON_NUM_THREADS` when this binary chose the count, so a
+/// daemon the CLI started (which inherits both) names the real source.
+pub const EMBED_THREADS_FROM_VAR: &str = "CRYSTALLINE_EMBED_THREADS_FROM";
+
 /// Where the embedding thread count came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadSource {
@@ -77,6 +81,18 @@ pub enum ThreadSource {
     CpuLimit,
     /// Left to candle (macOS, where it picks the performance cores).
     CandleDefault,
+}
+
+impl ThreadSource {
+    /// The value of `CRYSTALLINE_EMBED_THREADS_FROM` for this source.
+    pub fn marker(&self) -> &'static str {
+        match self {
+            ThreadSource::RayonEnv => "rayon",
+            ThreadSource::EmbedThreadsEnv => "embed-threads",
+            ThreadSource::CpuLimit => "cpu-limit",
+            ThreadSource::CandleDefault => "default",
+        }
+    }
 }
 
 /// What `main` should do about the thread count.
@@ -95,15 +111,22 @@ pub struct ThreadPlan {
 /// (`num_cpus::get_physical`, which does not) and whether this is macOS.
 pub fn plan_embed_threads(
     rayon_env: Option<&str>,
+    from_env: Option<&str>,
     embed_env: Option<&str>,
     available: usize,
     physical: usize,
     is_macos: bool,
 ) -> ThreadPlan {
     if rayon_env.is_some() {
+        // A parent of this binary may have set it; the marker it left says why.
+        let source = match from_env {
+            Some(m) if m == ThreadSource::EmbedThreadsEnv.marker() => ThreadSource::EmbedThreadsEnv,
+            Some(m) if m == ThreadSource::CpuLimit.marker() => ThreadSource::CpuLimit,
+            _ => ThreadSource::RayonEnv,
+        };
         return ThreadPlan {
             set: None,
-            source: ThreadSource::RayonEnv,
+            source,
             warning: None,
         };
     }
@@ -155,14 +178,15 @@ pub fn log_thread_plan() {
     if let Some(warning) = &plan.warning {
         tracing::warn!("{warning}");
     }
-    let (count, origin) = match (&plan.source, plan.set) {
-        (ThreadSource::RayonEnv, _) => (
-            std::env::var("RAYON_NUM_THREADS").unwrap_or_default(),
-            "RAYON_NUM_THREADS",
-        ),
-        (ThreadSource::EmbedThreadsEnv, Some(n)) => (n.to_string(), EMBED_THREADS_VAR),
-        (ThreadSource::CpuLimit, Some(n)) => (n.to_string(), "the CPU limit"),
-        _ => ("automatic".to_string(), "the default of the model runtime"),
+    let count = match plan.set {
+        Some(n) => n.to_string(),
+        None => std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "automatic".to_string()),
+    };
+    let origin = match plan.source {
+        ThreadSource::RayonEnv => "RAYON_NUM_THREADS",
+        ThreadSource::EmbedThreadsEnv => EMBED_THREADS_VAR,
+        ThreadSource::CpuLimit => "the CPU limit",
+        ThreadSource::CandleDefault => "the default of the model runtime",
     };
     tracing::info!("embedding threads: {count} (from {origin})");
 }
@@ -227,13 +251,13 @@ mod tests {
 
     #[test]
     fn rayon_env_wins() {
-        let p = plan_embed_threads(Some("3"), Some("5"), 2, 8, false);
+        let p = plan_embed_threads(Some("3"), None, Some("5"), 2, 8, false);
         assert_eq!((p.set, p.source), (None, ThreadSource::RayonEnv));
     }
 
     #[test]
     fn embed_threads_sets_the_count() {
-        let p = plan_embed_threads(None, Some("4"), 2, 8, false);
+        let p = plan_embed_threads(None, None, Some("4"), 2, 8, false);
         assert_eq!((p.set, p.source), (Some(4), ThreadSource::EmbedThreadsEnv));
         assert!(p.warning.is_none());
     }
@@ -241,7 +265,7 @@ mod tests {
     #[test]
     fn an_invalid_embed_threads_warns_and_falls_back() {
         for bad in ["0", "many", "-2", ""] {
-            let p = plan_embed_threads(None, Some(bad), 2, 8, false);
+            let p = plan_embed_threads(None, None, Some(bad), 2, 8, false);
             assert_eq!((p.set, p.source.clone()), (Some(2), ThreadSource::CpuLimit));
             assert!(p.warning.is_some(), "{bad:?}");
         }
@@ -249,15 +273,31 @@ mod tests {
 
     #[test]
     fn the_default_is_the_smaller_of_quota_and_physical_cores() {
-        assert_eq!(plan_embed_threads(None, None, 2, 8, false).set, Some(2));
-        assert_eq!(plan_embed_threads(None, None, 16, 8, false).set, Some(8));
+        assert_eq!(
+            plan_embed_threads(None, None, None, 2, 8, false).set,
+            Some(2)
+        );
+        assert_eq!(
+            plan_embed_threads(None, None, None, 16, 8, false).set,
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn an_inherited_count_keeps_the_source_its_parent_chose() {
+        let p = plan_embed_threads(Some("2"), Some("cpu-limit"), None, 2, 8, false);
+        assert_eq!((p.set, p.source), (None, ThreadSource::CpuLimit));
+        let p = plan_embed_threads(Some("4"), Some("embed-threads"), None, 2, 8, false);
+        assert_eq!(p.source, ThreadSource::EmbedThreadsEnv);
+        let p = plan_embed_threads(Some("4"), Some("junk"), None, 2, 8, false);
+        assert_eq!(p.source, ThreadSource::RayonEnv);
     }
 
     #[test]
     fn macos_keeps_candles_choice() {
-        let p = plan_embed_threads(None, None, 8, 8, true);
+        let p = plan_embed_threads(None, None, None, 8, 8, true);
         assert_eq!((p.set, p.source), (None, ThreadSource::CandleDefault));
-        let p = plan_embed_threads(None, Some("3"), 8, 8, true);
+        let p = plan_embed_threads(None, None, Some("3"), 8, 8, true);
         assert_eq!(p.set, Some(3));
     }
 }

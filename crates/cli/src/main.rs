@@ -2245,10 +2245,13 @@ fn main() -> std::process::ExitCode {
 /// # Safety
 /// Writes the environment, so it must run before any other thread exists.
 unsafe fn apply_embed_threads() {
-    use crystalline_service::logging::{EMBED_THREADS_VAR, plan_embed_threads, record_thread_plan};
+    use crystalline_service::logging::{
+        EMBED_THREADS_FROM_VAR, EMBED_THREADS_VAR, plan_embed_threads, record_thread_plan,
+    };
     let available = std::thread::available_parallelism().map_or(1, usize::from);
     let plan = plan_embed_threads(
         std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+        std::env::var(EMBED_THREADS_FROM_VAR).ok().as_deref(),
         std::env::var(EMBED_THREADS_VAR).ok().as_deref(),
         available,
         num_cpus::get_physical(),
@@ -2256,7 +2259,10 @@ unsafe fn apply_embed_threads() {
     );
     if let Some(n) = plan.set {
         // SAFETY: the caller runs this before any other thread exists.
-        unsafe { std::env::set_var("RAYON_NUM_THREADS", n.to_string()) };
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", n.to_string());
+            std::env::set_var(EMBED_THREADS_FROM_VAR, plan.source.marker());
+        }
     }
     record_thread_plan(plan);
 }
