@@ -380,6 +380,7 @@ mod seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "postgres")]
     use crate::store::ReadStore;
 
     #[test]

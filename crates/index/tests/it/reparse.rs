@@ -16,7 +16,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crystalline_core::{PARSE_GENERATION, parse_engram};
-use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainId, DomainKind, EngramRecord, FileStamp, ReparseSeam, ReparseStep, Store,
     TursoStore, apply_scan, reparse_stored_domain, reparse_stored_domain_with, scan_paths,
@@ -716,6 +715,7 @@ async fn a_refused_stamp_rolls_the_reparse_back_and_it_repeats_on_postgres() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn a_concurrent_write_survives_the_reparse_on_postgres() {
+    use crystalline_index::ReadStore;
     let Some(scratch) = crate::pg::scratch("rp") else {
         return;
     };

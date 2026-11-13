@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
+#[cfg(feature = "postgres")]
 use crystalline_index::ReadStore;
 use crystalline_index::{Store, TursoStore};
 use crystalline_service::Scope;

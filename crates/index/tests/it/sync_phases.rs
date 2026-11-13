@@ -12,7 +12,6 @@
 
 use std::path::Path;
 
-use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, EngramRecord, FileStamp, SearchQuery, Store, TursoStore, apply_scan,
     scan_domain, sync_domain_with,
@@ -658,6 +657,7 @@ parity!(
 /// survive, rather than the scan seeing zero files and the apply deleting them.
 #[cfg(unix)]
 mod unreadable_root {
+    use crystalline_index::ReadStore;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;

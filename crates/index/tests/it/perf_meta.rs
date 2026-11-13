@@ -8,7 +8,6 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, NoReindexHooks, RebuildKind, SearchOrder, SearchQuery, Store,
     SyncReport, TursoStore, apply_scan, meta_value_union_sql, parse_metadata_filters,
@@ -240,6 +239,7 @@ async fn full_reindex_cost_at_50k_postgres() {
 #[tokio::test]
 #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
 async fn scoped_lexical_plan_at_20k_postgres() {
+    use crystalline_index::ReadStore;
     let Some(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
         .ok()
         .filter(|u| !u.is_empty())

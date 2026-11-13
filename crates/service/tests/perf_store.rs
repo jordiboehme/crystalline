@@ -590,6 +590,7 @@ async fn perf_store_turso() {
     scenario_reindex(&rig, &settings).await;
 }
 
+#[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement: run it in release mode with --ignored --nocapture"]
 async fn perf_store_postgres() {
