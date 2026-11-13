@@ -1380,16 +1380,9 @@ async fn a_failed_store_write_skips_the_pair_and_the_walk_goes_on() {
             .await
             .unwrap();
     }
-    // An open transaction makes `replace_contradictions` refuse. It is
-    // another flow's, opened on a task of its own: the walk below is not
-    // inside it, and its reads go to the read connections as they would.
+    // An open transaction makes `replace_contradictions` refuse.
     let store = engine.store();
-    {
-        let store = store.clone();
-        tokio::spawn(async move { store.lock().await.begin().await.unwrap() })
-            .await
-            .unwrap();
-    }
+    store.lock().await.begin().await.unwrap();
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
         scored(0, 0, 1),

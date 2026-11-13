@@ -60,55 +60,43 @@ fn enabled_by(value: Option<&str>) -> bool {
 /// it, `commit()` and `rollback()` take the note away. Nothing is kept in a
 /// release build.
 ///
-/// A transaction is known by the tokio task that opened it. Code that is not
-/// inside a task (a `#[tokio::test]` body, the CLI's main future, both run by
-/// `block_on`) is known by its thread instead. A task that opens a
-/// transaction and hands it to another task to end is not followed; nothing
-/// here does that.
+/// The limit: a transaction is known only by the tokio task that opened it.
+/// Code that runs outside any task (a `#[tokio::test]` body, the CLI's main
+/// future, both driven by `block_on`) is not checked. Keying that code by its
+/// thread instead was tried and gives false alarms: one future that drives
+/// two flows at once (`tokio::join!` of two engines, as a test does) has one
+/// thread, so one flow's open transaction looked like the other's. The
+/// daemon runs every request on a task of its own, so its paths are checked.
 pub mod txn {
     #[cfg(debug_assertions)]
     static OPEN: std::sync::Mutex<Vec<tokio::task::Id>> = std::sync::Mutex::new(Vec::new());
 
-    #[cfg(debug_assertions)]
-    thread_local! {
-        /// Transactions opened outside any task on this thread.
-        static OPEN_OUTSIDE_TASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    /// The current task (or, outside a task, this thread) opened a write
-    /// transaction.
+    /// The current task opened a write transaction.
     pub fn opened() {
         #[cfg(debug_assertions)]
-        match tokio::task::try_id() {
-            Some(id) => OPEN.lock().unwrap_or_else(|p| p.into_inner()).push(id),
-            None => OPEN_OUTSIDE_TASKS.with(|n| n.set(n.get() + 1)),
+        if let Some(id) = tokio::task::try_id() {
+            OPEN.lock().unwrap_or_else(|p| p.into_inner()).push(id);
         }
     }
 
-    /// The current task (or, outside a task, this thread) ended its write
-    /// transaction.
+    /// The current task ended its write transaction.
     pub fn closed() {
         #[cfg(debug_assertions)]
-        match tokio::task::try_id() {
-            Some(id) => {
-                let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(i) = open.iter().position(|o| *o == id) {
-                    open.swap_remove(i);
-                }
+        if let Some(id) = tokio::task::try_id() {
+            let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(i) = open.iter().position(|o| *o == id) {
+                open.swap_remove(i);
             }
-            None => OPEN_OUTSIDE_TASKS.with(|n| n.set(n.get().saturating_sub(1))),
         }
     }
 
-    /// Whether the current task (or, outside a task, this thread) has a
-    /// write transaction open.
+    /// Whether the current task has a write transaction open. Always false
+    /// outside a task and in a release build.
     pub fn open_here() -> bool {
         #[cfg(debug_assertions)]
-        return match tokio::task::try_id() {
-            Some(id) => OPEN.lock().unwrap_or_else(|p| p.into_inner()).contains(&id),
-            None => OPEN_OUTSIDE_TASKS.with(|n| n.get() > 0),
-        };
-        #[cfg(not(debug_assertions))]
+        if let Some(id) = tokio::task::try_id() {
+            return OPEN.lock().unwrap_or_else(|p| p.into_inner()).contains(&id);
+        }
         false
     }
 
@@ -890,16 +878,6 @@ mod tests {
         if let Err(e) = outcome {
             std::panic::resume_unwind(e.into_panic());
         }
-    }
-
-    #[cfg(debug_assertions)]
-    #[tokio::test]
-    #[should_panic(expected = "a reader was used inside an open write transaction")]
-    async fn a_test_body_with_an_open_write_transaction_is_noted_by_its_thread() {
-        // A `#[tokio::test]` body is no task: the thread stands in for it.
-        assert!(tokio::task::try_id().is_none());
-        txn::opened();
-        txn::assert_none_open();
     }
 
     #[test]
