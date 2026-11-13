@@ -1352,8 +1352,9 @@ impl Engine {
             self.embed_scope(&*store).await?
         };
         // The backlog is walked one keyset page at a time so a large first index
-        // never holds every chunk's text at once. The store lock is held only to
-        // pull a page and to write vectors, never across the embed call.
+        // never holds every chunk's text at once. A page is pulled on the
+        // engine's reader and the vectors are written under the store lock,
+        // never held across the embed call.
         //
         // Every chunk table is walked in turn, engrams first, each with its own
         // keyset cursor: a cursor is a position in one table's ordering and
@@ -1363,8 +1364,7 @@ impl Engine {
             let mut cursor: Option<(i64, i64)> = None;
             loop {
                 let mut jobs = {
-                    let store = self.store.lock().await;
-                    store
+                    self.reader()
                         .chunks_needing_embedding_in(
                             table,
                             &model,

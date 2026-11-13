@@ -81,6 +81,10 @@ const JOURNAL_CAP: usize = 64 << 20;
 pub(crate) struct Conn {
     conn: Connection,
     journal: Mutex<Journal>,
+    /// Whether transactions are journalled for a replay. A read connection
+    /// keeps no journal: it never writes, and its caller runs the whole read
+    /// again instead (see `ReaderBackend` in the `reader` module).
+    journalled: bool,
 }
 
 /// What the connection knows about the explicit transaction it is in.
@@ -177,7 +181,24 @@ impl Conn {
         Conn {
             conn,
             journal: Mutex::new(Journal::Idle),
+            journalled: true,
         }
+    }
+
+    /// Wrap a read connection, which keeps no journal: a refusal that drops
+    /// its read transaction is returned, and the caller runs the read again.
+    pub(crate) fn reader(conn: Connection) -> Conn {
+        Conn {
+            conn,
+            journal: Mutex::new(Journal::Idle),
+            journalled: false,
+        }
+    }
+
+    /// Whether the connection is in autocommit mode (no transaction open). An
+    /// engine that cannot say counts as autocommit.
+    pub(crate) fn is_autocommit(&self) -> bool {
+        self.conn.is_autocommit().unwrap_or(true)
     }
 
     /// The engine's connection, for tests, and only outside a transaction:
@@ -377,7 +398,7 @@ impl Conn {
     ) -> turso::Result<()> {
         let autocommit = self.autocommit().unwrap_or(true);
         let mut journal = self.lock();
-        let Some(was_autocommit) = was_autocommit.filter(|_| !autocommit) else {
+        let Some(was_autocommit) = was_autocommit.filter(|_| !autocommit && self.journalled) else {
             *journal = Journal::Idle;
             return Ok(());
         };
@@ -588,6 +609,7 @@ mod tests {
     use turso::{Builder, Connection, Value};
 
     use super::{Conn, hook, is_tempdir_refusal};
+    use crate::store::ReadStore;
     use crate::store::{DomainKind, Store};
 
     /// Set in the child run of

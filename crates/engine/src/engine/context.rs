@@ -48,8 +48,7 @@ impl Engine {
             .flatten();
         let seeds: Vec<EngramDescriptor> = if url.glob {
             let base = if visible_anchor {
-                let store = self.store.lock().await;
-                store.list_engrams(&url.domain, None, None).await?
+                self.reader().list_engrams(&url.domain, None, None).await?
             } else {
                 Vec::new()
             };
@@ -62,8 +61,9 @@ impl Engine {
             .collect()
         } else {
             let found = if visible_anchor {
-                let store = self.store.lock().await;
-                store.find_engram(&url.domain, &url.permalink).await?
+                self.reader()
+                    .find_engram(&url.domain, &url.permalink)
+                    .await?
             } else {
                 None
             };
@@ -96,7 +96,7 @@ impl Engine {
         // what another domain's edges say. The hop can land anywhere, so the
         // range it asks about is every registered domain.
         let reading = self.reading_actor(scope, &[]);
-        let store = self.store.lock().await;
+        let store = self.reader();
         let mut slice = store.neighbors(&ids, depth, reading.as_deref()).await?;
         // Cut before the ranking, not at output selection like the caller's own
         // `domains` filter below. The two look alike and are not: a presentation
@@ -241,7 +241,7 @@ impl Engine {
         let hidden = self.hidden_for(scope).await?;
         url.domain = self.localize_visible(&url.domain, &hidden).await;
 
-        let store = self.store.lock().await;
+        let store = self.reader();
         // A hidden domain skips the lookup and keeps the branch, so it answers
         // with the same miss a visible domain with nothing in it answers with.
         // See [`Engine::build_context`], which seeds the same way.
@@ -262,7 +262,6 @@ impl Engine {
                 false => Vec::new(),
             }
         };
-        drop(store);
         // See [`Engine::build_context`], which seeds through a view the same
         // way: a domain this reader may not see builds none.
         let view = visible_anchor

@@ -18,6 +18,7 @@ mod perf_meta;
 #[cfg(feature = "postgres")]
 mod pg;
 mod plans;
+mod read_connections;
 mod recovery;
 mod reflection_search;
 mod reindex;

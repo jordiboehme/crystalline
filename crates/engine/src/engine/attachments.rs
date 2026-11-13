@@ -600,7 +600,7 @@ impl Engine {
     /// One peer engram's whole text, frontmatter included, for the referent
     /// count.
     ///
-    /// Deliberately not [`Store::engram_content`] alone. The index keeps only
+    /// Deliberately not [`ReadStore::engram_content`] alone. The index keeps only
     /// the *body* for a file domain (`EngramRecord::from_engram` sets
     /// `content` to `engram.body`; the virtual write path is the one that
     /// stores the whole source), and an `analyzes` claim lives in the

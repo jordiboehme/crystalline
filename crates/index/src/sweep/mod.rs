@@ -909,7 +909,7 @@ impl EngramFacts {
 /// A reference whose domain prefix is one of the spellings a caller asked
 /// about: the input of the finding that flags a link spelled with a name only
 /// this machine uses. The store fills it from
-/// [`crate::Store::spelled_references`], base rows only.
+/// [`crate::ReadStore::spelled_references`], base rows only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpelledRef {
     /// The engram the reference was written in.
@@ -1139,7 +1139,7 @@ pub struct SweepInput {
     pub renames_asked: Vec<String>,
     /// This domain's own references whose written prefix is one of
     /// [`SweepInput::respell`]'s spellings, base rows only, from
-    /// [`crate::Store::spelled_references`]. `V110`'s whole input: a
+    /// [`crate::ReadStore::spelled_references`]. `V110`'s whole input: a
     /// reference here names a domain by a name only this machine uses, and
     /// `respell` says what its canonical name is.
     pub spelled_refs: Vec<SpelledRef>,

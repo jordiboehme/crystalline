@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, SYNC_STAMP_REFRESH, Store, TursoStore, apply_scan, scan_paths,
     sync_domain_with,

@@ -635,6 +635,7 @@ parity!(
 /// path in the report's `failed` list instead of dropping it.
 #[cfg(unix)]
 mod unreadable_path {
+    use crystalline_index::ReadStore;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;

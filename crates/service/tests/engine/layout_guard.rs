@@ -273,6 +273,9 @@ fn reflection_allow_list() -> &'static [(&'static str, &'static [&'static str])]
                 "index/src/store.rs",
                 "index/src/turso/mod.rs",
                 "index/src/postgres/mod.rs",
+                // The read connections' wrapper of every store read, which
+                // hands each call through unchanged.
+                "index/src/reader.rs",
                 "engine/src/engine/reflect.rs",
                 "engine/src/engine/reflection.rs",
                 "engine/src/engine/rename_domain.rs",

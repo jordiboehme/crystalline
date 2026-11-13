@@ -7589,7 +7589,7 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         .await
         .unwrap();
     let did = {
-        use crystalline_index::Store;
+        use crystalline_index::ReadStore;
         let did = other.domain_id("brand").await.unwrap().unwrap();
         assert!(
             other.domain_host(did).await.unwrap().is_none(),
@@ -7632,6 +7632,7 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         .unwrap();
     assert_eq!(result["errors"].as_array().unwrap().len(), 0, "{result}");
     let did = {
+        use crystalline_index::ReadStore;
         use crystalline_index::Store;
         assert_eq!(
             other.domain_host(did).await.unwrap().unwrap().instance_id,
@@ -7677,7 +7678,7 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         "the reason is in the answer: {result}"
     );
     {
-        use crystalline_index::Store;
+        use crystalline_index::ReadStore;
         assert_eq!(
             other.domain_host(did).await.unwrap().unwrap().instance_id,
             "other-instance",

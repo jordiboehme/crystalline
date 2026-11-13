@@ -239,6 +239,7 @@ async fn full_reindex_cost_at_50k_postgres() {
 #[tokio::test]
 #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
 async fn scoped_lexical_plan_at_20k_postgres() {
+    use crystalline_index::ReadStore;
     let Some(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
         .ok()
         .filter(|u| !u.is_empty())
@@ -316,7 +317,7 @@ async fn scoped_lexical_plan_at_20k_postgres() {
 }
 
 /// The filter-only `$contains` searches an ingesting agent runs when a block
-/// changed or went away, on any backend: the whole `Store::search` (the
+/// changed or went away, on any backend: the whole `ReadStore::search` (the
 /// count, the page and the tag hydration), unscoped and scoped to the
 /// domain, as the median of 21 warm runs per case. The target is under
 /// 50 ms.

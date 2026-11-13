@@ -1517,13 +1517,13 @@ impl Engine {
 
     /// The facts of the engrams `wanted` names, by permalink: what a
     /// page's own sources are held against. One index seek per distinct
-    /// permalink under the store lock ([`Store::cited_engrams`] asks a
+    /// permalink under the store lock ([`ReadStore::cited_engrams`] asks a
     /// repeated permalink once), so a page citing a few engrams never pays
     /// for every engram of the domain the way [`Engine::engram_facts`]
     /// does. A permalink no engram holds has no entry, which a source reads
     /// as missing.
     ///
-    /// [`Store::cited_engrams`]: crystalline_index::Store::cited_engrams
+    /// [`ReadStore::cited_engrams`]: crystalline_index::ReadStore::cited_engrams
     pub(crate) async fn cited_facts(
         &self,
         domain_id: DomainId,

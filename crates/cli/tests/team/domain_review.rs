@@ -289,6 +289,7 @@ fn users_add_refuses_a_name_with_drafts_and_discard_drafts_is_the_way_out() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         use crystalline_index::Store as _;
+        use crystalline_index::ReadStore;
         let store = crystalline_index::TursoStore::open(&db).await.unwrap();
         let id = store.domain_id("team").await.unwrap().unwrap();
         let text = "---\ntype: engram\ntitle: Left\npermalink: left\ntags:\n  - team\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Left\n\nLeft behind.\n";
