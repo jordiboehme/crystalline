@@ -28,6 +28,7 @@ mod move_permalink;
 mod name_report;
 mod orphaned_rows;
 mod overwrite_in_place;
+mod read_connections;
 mod read_only_domains;
 mod search_coverage;
 mod similar;

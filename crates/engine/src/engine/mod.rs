@@ -42,6 +42,8 @@ use crystalline_core::{
     domain_name_of_source, is_lower_hyphen, parse_engram, parse_engram_lossless, slash_rel,
     slugify,
 };
+use crystalline_index::ReadStore;
+use crystalline_index::reader::LockedReader;
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, Class, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats,
@@ -100,7 +102,7 @@ where
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
 
-/// How many seed ids one [`Store::neighbors`] call takes during a consolidation
+/// How many seed ids one [`ReadStore::neighbors`] call takes during a consolidation
 /// sweep. The backends inline the seed list into an SQL `IN (...)`, so a whole
 /// domain in one call would build a statement proportional to its size. The
 /// slices are merged afterwards, which is what keeps the resolved degrees
@@ -924,6 +926,9 @@ struct RoomScreenGate {
 /// The shared service engine.
 pub struct Engine {
     store: Arc<Mutex<dyn Store>>,
+    // The reads that need no writer guard: the store's read connections, or
+    // the writer under its lock when it has none. See `Engine::reader`.
+    reader: Arc<dyn ReadStore>,
     // The effective config: the file config with the environment overlay
     // applied. Every runtime read goes through this, so the ~30 read sites stay
     // untouched by the file/effective split. Behind a lock (not an immutable
@@ -2526,6 +2531,19 @@ async fn hold_the_load(
     ))
 }
 
+/// The reader an engine over `store` uses: the store's own read connections
+/// when it has some, else [`LockedReader`] over the writer. The store was
+/// just opened, so nothing holds its lock; a lock held anyway reads through
+/// the writer.
+fn reader_for(store: &Arc<Mutex<dyn Store>>) -> Arc<dyn ReadStore> {
+    if let Ok(guard) = store.try_lock()
+        && let Some(pool) = guard.read_pool()
+    {
+        return pool;
+    }
+    Arc::new(LockedReader::new(store.clone()))
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -2545,8 +2563,10 @@ impl Engine {
         // built without `with_env_overlay` behaves exactly as before the split.
         let file_config = config.clone();
         let skills_serve = config.skills_serve();
+        let reader = reader_for(&store);
         Engine {
             store,
+            reader,
             config: std::sync::RwLock::new(config),
             file_config: std::sync::RwLock::new(file_config),
             overlay: EnvOverlay::default(),
@@ -4260,7 +4280,7 @@ impl Engine {
     /// Asked of the index on every call rather than cached, so a domain removed
     /// or registered while this engine runs takes effect on the next read rather
     /// than at the next restart. It is one column of a table with a row per
-    /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
+    /// domain ([`ReadStore::domain_names`], deliberately not `domain_stats`, whose
     /// per-domain counts this would pay for and never look at).
     ///
     /// "Registered" is [`Engine::registered_domain_names`], all three tiers
@@ -4274,13 +4294,10 @@ impl Engine {
     /// orphan (every installation, once Part B has collected) pays the cheap
     /// in-memory check and no file read at all.
     ///
-    /// [`Store::domain_names`]: crystalline_index::Store::domain_names
+    /// [`ReadStore::domain_names`]: crystalline_index::ReadStore::domain_names
     async fn unregistered_domains(&self) -> Result<HashSet<String>> {
         let known: HashSet<String> = self.known_domain_names().into_iter().collect();
-        let names = {
-            let store = self.store.lock().await;
-            store.domain_names().await?
-        };
+        let names = self.reader().domain_names().await?;
         let unknown: HashSet<String> = names
             .into_iter()
             .filter(|name| !known.contains(name))
@@ -4389,9 +4406,7 @@ impl Engine {
         // filter below is the whole of the rule. A registered domain with no
         // rows yet is absent from the list, which costs nothing - a domain with
         // no rows has nothing to return to any query this list narrows.
-        let store = self.store.lock().await;
-        let names = store.domain_names().await?;
-        drop(store);
+        let names = self.reader().domain_names().await?;
         let visible: Vec<String> = names
             .into_iter()
             .filter(|name| !hidden.contains(name))
@@ -4431,17 +4446,11 @@ impl Engine {
         hidden: &HashSet<String>,
     ) -> Result<crystalline_index::Vocabulary> {
         Ok(match (domain, hidden.is_empty()) {
-            (_, true) => {
-                let store = self.store.lock().await;
-                store.vocabulary(domain, None).await?
-            }
+            (_, true) => self.reader().vocabulary(domain, None).await?,
             (Some(domain), false) if hidden.contains(domain) => {
                 crystalline_index::Vocabulary::default()
             }
-            (Some(domain), false) => {
-                let store = self.store.lock().await;
-                store.vocabulary(Some(domain), None).await?
-            }
+            (Some(domain), false) => self.reader().vocabulary(Some(domain), None).await?,
             (None, false) => {
                 let names = match self.scoped_domains(&[], hidden).await? {
                     ScopedDomains::Only(names) => names,
@@ -4449,12 +4458,11 @@ impl Engine {
                     // `Nothing` means there is no domain to sweep.
                     _ => Vec::new(),
                 };
-                let store = self.store.lock().await;
+                let store = self.reader();
                 let mut parts = Vec::with_capacity(names.len());
                 for name in &names {
                     parts.push(store.vocabulary(Some(name), None).await?);
                 }
-                drop(store);
                 crystalline_index::merge_vocabularies(parts)
             }
         })
@@ -5055,6 +5063,19 @@ impl Engine {
     /// The shared store handle, for the daemon's watcher and embed loop.
     pub fn store(&self) -> Arc<Mutex<dyn Store>> {
         self.store.clone()
+    }
+
+    /// The store for reads that need no writer guard: a read connection of
+    /// the store's own when it opened some, else the writer under its lock.
+    ///
+    /// Only for a read whose answer decides no write under the same guard.
+    /// Code between `begin()` and `commit()` reads through the writer it
+    /// holds; a debug build panics when the task that opened a write
+    /// transaction asks for a reader before it ends it.
+    #[track_caller]
+    pub fn reader(&self) -> &dyn ReadStore {
+        crystalline_index::reader::txn::assert_none_open();
+        &*self.reader
     }
 
     /// The active embedding provider, if one has been installed.
@@ -8894,7 +8915,7 @@ impl Engine {
         identifier: &str,
         domain: Option<&str>,
     ) -> Result<(EngramDescriptor, ContentSource)> {
-        self.resolve_scoped(identifier, domain, &HashSet::new())
+        self.resolve_scoped(identifier, domain, &HashSet::new(), false)
             .await
     }
 
@@ -8989,7 +9010,9 @@ impl Engine {
             .filter(|name| !hidden.contains(*name))
             .and_then(|name| DomainView::for_read(self, name, hidden, scope).ok());
         let Some(actor) = view.as_ref().and_then(|view| view.actor()) else {
-            let (desc, source) = self.resolve_scoped(identifier, domain, hidden).await?;
+            let (desc, source) = self
+                .resolve_scoped(identifier, domain, hidden, true)
+                .await?;
             // A bare identifier with no domain named reaches here, and by now
             // the domain IS known: the descriptor says which one. So a path
             // this reader has tombstoned is absent for them however they
@@ -9019,7 +9042,7 @@ impl Engine {
         // that rule lives in `DomainView::shadow` rather than here: the write
         // path resolves through the very same function, so what this reader can
         // open at an address is what they can save at it.
-        let base = self.resolve_scoped(identifier, domain, hidden).await;
+        let base = self.resolve_scoped(identifier, domain, hidden, true).await;
         let (desc, source) = view
             .shadow(identifier, base, || {
                 format!("no engram '{}' in domain '{name}'", shown(identifier))
@@ -9044,17 +9067,30 @@ impl Engine {
     /// The bare cross-domain form filters its matches before it counts them, so
     /// a hidden domain neither makes an identifier ambiguous nor gets its name
     /// printed into the ambiguity error.
+    ///
+    /// `on_reader` is set by the read verbs, whose lookup decides no write:
+    /// they ask the engine's reader. Every other caller resolves a target it
+    /// is about to write and asks the writer, as before.
     async fn resolve_scoped(
         &self,
         identifier: &str,
         domain: Option<&str>,
         hidden: &HashSet<String>,
+        on_reader: bool,
     ) -> Result<(EngramDescriptor, ContentSource)> {
+        let writer = if on_reader {
+            None
+        } else {
+            Some(self.store.lock().await)
+        };
+        let store: &dyn ReadStore = match &writer {
+            Some(writer) => &**writer,
+            None => self.reader(),
+        };
         if let Some(url) = CrystallineUrl::parse(identifier) {
             let found = if hidden.contains(&url.domain) {
                 None
             } else {
-                let store = self.store.lock().await;
                 store.find_engram(&url.domain, &url.permalink).await?
             };
             let d = found.ok_or_else(|| {
@@ -9071,8 +9107,7 @@ impl Engine {
             let found = if hidden.contains(dom) {
                 DomainLookup::Missing { suggest: None }
             } else {
-                let store = self.store.lock().await;
-                lookup_in_domain(&*store, dom, identifier).await?
+                lookup_in_domain(store, dom, identifier).await?
             };
             let d = match found {
                 DomainLookup::Found(d) => d,
@@ -9091,9 +9126,8 @@ impl Engine {
         // Bare identifier across all domains, minus the ones this caller may
         // not see. Filtered before the count, so a hidden twin neither turns a
         // single match into an ambiguity nor names itself in the error.
-        let store = self.store.lock().await;
         let mut matches = store.find_engram_any(identifier).await?;
-        drop(store);
+        drop(writer);
         matches.retain(|d| !hidden.contains(&d.domain));
         match matches.len() {
             0 => Err(EngineError::NotFound(format!(
@@ -9272,6 +9306,25 @@ impl Engine {
         source: &ContentSource,
         desc: &EngramDescriptor,
     ) -> Result<String> {
+        self.load_content_from(source, desc, false).await
+    }
+
+    /// [`Engine::load_content`] for a read verb, whose answer decides no
+    /// write: a row is read through the engine's reader.
+    pub(crate) async fn load_content_to_read(
+        &self,
+        source: &ContentSource,
+        desc: &EngramDescriptor,
+    ) -> Result<String> {
+        self.load_content_from(source, desc, true).await
+    }
+
+    async fn load_content_from(
+        &self,
+        source: &ContentSource,
+        desc: &EngramDescriptor,
+        on_reader: bool,
+    ) -> Result<String> {
         if let ContentSource::File { root } = source {
             let abs = join_rel(root, &desc.path);
             match std::fs::read_to_string(&abs) {
@@ -9286,16 +9339,20 @@ impl Engine {
                 Err(_) => {}
             }
         }
-        let store = self.store.lock().await;
-        store
-            .engram_content(desc.domain_id, &desc.path)
-            .await?
-            .ok_or_else(|| {
-                EngineError::NotFound(format!(
-                    "no content stored for '{}' in domain '{}'",
-                    desc.permalink, desc.domain
-                ))
-            })
+        let content = if on_reader {
+            self.reader()
+                .engram_content(desc.domain_id, &desc.path)
+                .await?
+        } else {
+            let store = self.store.lock().await;
+            store.engram_content(desc.domain_id, &desc.path).await?
+        };
+        content.ok_or_else(|| {
+            EngineError::NotFound(format!(
+                "no content stored for '{}' in domain '{}'",
+                desc.permalink, desc.domain
+            ))
+        })
     }
 }
 

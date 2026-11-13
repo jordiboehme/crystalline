@@ -232,10 +232,7 @@ impl Engine {
         // lookup, never an upserting one: asking about a domain this index has
         // never seen must not register it.
         let own = DomainView::for_read(self, domain, hidden, scope)?;
-        let domain_id = {
-            let store = self.store.lock().await;
-            store.domain_id(domain).await?
-        };
+        let domain_id = self.reader().domain_id(domain).await?;
         // Whether the reader's own view answers the name ahead of a title
         // match, asked once and only when a title match needs it.
         let mut view_answers: Option<bool> = None;
@@ -400,7 +397,7 @@ impl Engine {
                     p.identifier, desc.domain
                 ))
             })?,
-            None => self.load_content(&source, &desc).await?,
+            None => self.load_content_to_read(&source, &desc).await?,
         };
         // **A co-editing room over this document outranks both.** While one is
         // open the room's text is what the engram says: somebody is typing
@@ -469,8 +466,8 @@ impl Engine {
         // nobody can write a reference to a draft only its author can read.
         let outbound = view.outbound(&desc).await?;
         let inbound = {
-            let store = self.store.lock().await;
-            let mut inbound = store
+            let mut inbound = self
+                .reader()
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;
             // Who points here is answered for the caller asking: a reference
@@ -601,7 +598,7 @@ impl Engine {
             .collect();
         if !paths.is_empty() {
             let mut at: HashMap<String, String> = HashMap::new();
-            let store = self.store.lock().await;
+            let store = self.reader();
             for path in paths {
                 let found = match store.list_engrams(&desc.domain, Some(&path), None).await {
                     Ok(rows) => rows.into_iter().find(|found| found.path == path),
@@ -788,7 +785,7 @@ impl Engine {
         let hidden = self.hidden_for(scope).await?;
         let p = &self.localized(p, &hidden).await;
         let (desc, _) = self
-            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden, true)
             .await?;
         // Clamped rather than refused, the way the listing clamps its own: a
         // hand-written page number below one is answered with the first page,
@@ -804,9 +801,8 @@ impl Engine {
         let mut exclude: Vec<String> = hidden.iter().cloned().collect();
         exclude.sort();
         let found = {
-            let store = self.store.lock().await;
-            store
-                .inbound_page(&InboundQuery {
+            self.reader()
+                .inbound_page(InboundQuery {
                     engram_id: desc.id,
                     domain_id: desc.domain_id,
                     permalink: &desc.permalink,

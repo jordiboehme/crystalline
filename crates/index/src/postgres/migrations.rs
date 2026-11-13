@@ -1973,7 +1973,7 @@ mod tests {
 
     /// One engram's rows, as `(key, value)` in byte order.
     async fn meta_rows_of(store: &crate::PostgresStore, id: i64) -> Vec<(String, String)> {
-        use crate::store::Store;
+        use crate::store::ReadStore;
         store
             .meta_values()
             .await
@@ -2058,12 +2058,12 @@ mod tests {
     }
 
     /// v19 over a v18 schema: the C-collated partial index the close-folder
-    /// probe (`Store::folder_holds_other`) seeks on is there after the store
+    /// probe (`ReadStore::folder_holds_other`) seeks on is there after the store
     /// opens, it is the base rows' alone, a replay of the step is a no-op, and
     /// the probe's own statement reads the index rather than the whole domain.
     #[tokio::test]
     async fn v19_gives_the_folder_probe_a_c_collated_base_path_index() {
-        use crate::Store;
+        use crate::store::ReadStore;
         let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
             return;
         };
@@ -2255,7 +2255,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
     async fn v18_backfill_cost_at_50k() {
-        use crate::store::Store;
+        use crate::store::ReadStore;
         const ENGRAMS: i64 = 50_000;
         let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
             return;

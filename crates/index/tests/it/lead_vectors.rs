@@ -1,4 +1,4 @@
-//! `Store::lead_vectors` on both backends: one row per engram whose first
+//! `ReadStore::lead_vectors` on both backends: one row per engram whose first
 //! chunk carries an embedding for the model asked about, the vector as stored,
 //! ordered by engram id, and nothing for a model that never embedded here.
 //!
@@ -437,3 +437,68 @@ parity!(
     lead_vectors_select_only_the_named_model_parity,
     lead_vectors_select_only_the_named_model
 );
+
+/// The width flip again, with every read on the store's read connections:
+/// they prepare the lead-vector statement on connections of their own, which
+/// the writer's resize never touches, so only the generation the writer
+/// shares with them keeps a stale plan from coming back after the ALTER.
+async fn lead_vectors_on_read_connections_survive_a_width_flip(store: &dyn Store) {
+    let reader = store
+        .read_pool()
+        .expect("the store was opened with read connections");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "alpha.md",
+        &engram("Alpha", "alpha", "stable", "", "alpha body one"),
+    );
+    write(
+        root,
+        "beta.md",
+        &engram("Beta", "beta", "stable", "", "beta body two"),
+    );
+    sync_domain_with(store, "notes", root, &ChunkParams::for_model("m8"))
+        .await
+        .unwrap();
+    let domain = store
+        .upsert_domain("notes", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    for (model, dims) in [("m8", 8), ("m16", 16), ("m8-again", 8)] {
+        embed_all_by_hand(store, model, dims).await;
+        let (a, b) = tokio::join!(
+            reader.lead_vectors(domain, model, None),
+            reader.lead_vectors(domain, model, None)
+        );
+        let a = a.expect("a reader's lead-vector statement survives the width flip");
+        let b = b.expect("on every read connection");
+        assert_eq!(a.len(), 2, "both engrams at {dims}");
+        assert_eq!(a, b);
+        assert!(a.iter().all(|row| row.vector.len() == dims));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lead_vectors_on_read_connections_survive_a_width_flip_parity() {
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TursoStore::open_with_readers(&dir.path().join("index.db"), 2)
+            .await
+            .unwrap();
+        lead_vectors_on_read_connections_survive_a_width_flip(&store).await;
+    }
+    #[cfg(feature = "postgres")]
+    {
+        if let Some(scratch) = crate::pg::scratch("ct") {
+            let store = crystalline_index::PostgresStore::open_in_schema_with_readers(
+                scratch.url(),
+                scratch.name(),
+                2,
+            )
+            .await
+            .expect("open the postgres test schema");
+            lead_vectors_on_read_connections_survive_a_width_flip(&store).await;
+        }
+    }
+}

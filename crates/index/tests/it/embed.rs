@@ -6,10 +6,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use crystalline_index::ReadStore;
 use crystalline_index::embed::estimate_tokens;
 use crystalline_index::{
     ChunkJob, ChunkParams, EMBED_PAGE_SIZE, EmbeddingProvider, IndexError, Result, SearchMode,
-    SearchQuery, Store, TursoStore, chunk_engram, order_jobs_for_batching, run_embedding_pass,
+    SearchQuery, TursoStore, chunk_engram, order_jobs_for_batching, run_embedding_pass,
     run_embedding_pass_with_page, sync_domain_with,
 };
 

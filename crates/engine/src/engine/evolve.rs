@@ -1629,7 +1629,7 @@ impl Engine {
         self.sweep_neighbors(&ids, 1, actor).await
     }
 
-    /// [`Store::neighbors`] over a seed list of any size, merged into one slice.
+    /// [`ReadStore::neighbors`] over a seed list of any size, merged into one slice.
     ///
     /// The seed list is chunked because both backends inline it into an SQL
     /// `IN (...)`, so a whole domain in one call would build a statement

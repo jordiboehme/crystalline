@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use crystalline_index::ReadStore;
 use crystalline_index::{
     ChunkParams, DomainKind, Store, TursoStore, apply_scan, scan_paths, sync_domain,
 };

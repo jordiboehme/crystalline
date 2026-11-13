@@ -27,6 +27,7 @@ pub mod nli;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod rank;
+pub mod reader;
 pub mod reflection;
 mod snippet;
 mod store;
@@ -60,10 +61,10 @@ pub use store::{
     GraphSlice, HitKind, HostClaim, HostMove, InboundHit, InboundPage, InboundQuery, InboundRef,
     LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector, LeaseClaim, LeaseHolder, MetadataFilter,
     NamedCount, NewChunk, NewReflectionChunk, OBSERVATION_VECTOR_CHUNK, ObservationVector,
-    OnlyElsewhere, OutboundRef, Page, PathChecksum, RETIRED_STATUSES, RebuildKind, RecentFilter,
-    ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchOrder, SearchQuery,
-    SectionVector, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, WorkClaim,
-    is_current_status, is_retired_status, lookup_in_domain, merge_vocabularies,
+    OnlyElsewhere, OutboundRef, Page, PathChecksum, RETIRED_STATUSES, ReadStore, RebuildKind,
+    RecentFilter, ReflectionRow, ReflectionStamp, ScoredPair, SearchHit, SearchMode, SearchOrder,
+    SearchQuery, SectionVector, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary,
+    WorkClaim, is_current_status, is_retired_status, lookup_in_domain, merge_vocabularies,
     parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/it/plans.rs` and from

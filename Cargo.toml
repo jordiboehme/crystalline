@@ -37,6 +37,11 @@ clap = { version = "4.6.7", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
 rmcp = "3.9.0"
 turso = "0.8.3"
+# The allocator turso installs as the global one (its default `mimalloc`
+# feature), reached directly only for `mi_collect` on the read connections'
+# threads (crates/index/src/reader.rs). Kept at the version turso's mimalloc
+# links, so both name one copy of the C library.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 candle-core = "0.11.1"
 candle-nn = "0.11.1"
 candle-transformers = "0.11.1"

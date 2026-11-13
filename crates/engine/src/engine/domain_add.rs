@@ -616,7 +616,7 @@ impl Engine {
     /// left it out would tell somebody they hold nothing while a removal is
     /// still theirs to lose.
     ///
-    /// A pure read, and deliberately: [`Store::domain_id`] is the read-only way
+    /// A pure read, and deliberately: [`ReadStore::domain_id`] is the read-only way
     /// to a domain id, so a status call on a read-only instance can ask this
     /// without registering anything. A domain the index holds no row for has no
     /// drafts in it either - a registration nothing has synced yet - and that

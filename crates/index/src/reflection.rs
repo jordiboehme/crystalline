@@ -66,7 +66,7 @@ pub fn search_reflections(rows: &[ReflectionRow], query: &str, limit: usize) -> 
 /// Rank one domain's sections for `query` (R60). A hit is a section, keyed
 /// `(path, section_ord)` across the two halves. `mode` is `Text`, `Semantic`
 /// or `Hybrid`; any other mode ranks as `Text`. `vectors` is the vector half
-/// ([`Store::reflection_vector_hits`]); a vector under `min_similarity` or for
+/// ([`ReadStore::reflection_vector_hits`](crate::ReadStore::reflection_vector_hits)); a vector under `min_similarity` or for
 /// a section no row holds any more is dropped. Ties break on path, then
 /// section order.
 pub fn rank_sections(

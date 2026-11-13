@@ -1669,7 +1669,7 @@ impl Engine {
     /// Refuse a move onto a permalink another engram in the destination domain
     /// already answers to, naming the holder, before anything is written.
     ///
-    /// Asked by permalink alone: [`Store::find_engram`] also matches a title,
+    /// Asked by permalink alone: [`ReadStore::find_engram`] also matches a title,
     /// and an engram titled like the new permalink does not hold the address.
     /// The moved engram itself is not a holder on a same-domain move, since
     /// its row is the one being readdressed.

@@ -6,8 +6,9 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use crystalline_index::ReadStore;
 use crystalline_index::{
-    ChunkParams, EmbeddingProvider, Result, SearchMode, SearchQuery, Store, TursoStore,
+    ChunkParams, EmbeddingProvider, Result, SearchMode, SearchQuery, TursoStore,
     run_embedding_pass, sync_domain_with,
 };
 
