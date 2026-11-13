@@ -153,6 +153,67 @@ async fn the_memo_follows_a_rename_and_goes_with_the_domain() {
     assert!(engine.index_memos.lock().unwrap().is_empty());
 }
 
+/// The warm-up covers the domains this engine serves and nothing it would
+/// only find by re-reading the configuration file. A name resolved there is
+/// discovered, which on a daemon arms a watch and syncs the domain, so a
+/// domain added to the file would be indexed or not depending on whether the
+/// warm-up happened to run after the edit.
+#[tokio::test]
+async fn the_warm_up_never_discovers_a_domain_only_the_file_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("notes");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), MANIFEST).unwrap();
+    let late = tmp.path().join("late");
+    std::fs::create_dir_all(&late).unwrap();
+    std::fs::write(late.join("MANIFEST.md"), MANIFEST.replace("notes", "late")).unwrap();
+    std::fs::write(late.join("note.md"), engram("Late")).unwrap();
+
+    let mut config = GlobalConfig::default();
+    config
+        .domains
+        .insert("notes".to_string(), DomainEntry::file(root.clone()));
+    let path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&path, &config).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        config.clone(),
+        None,
+        Some(path.clone()),
+    );
+    engine.sync(None).await.unwrap();
+    engine.index_memos.lock().unwrap().clear();
+
+    // Registered by editing the file while the engine runs.
+    config
+        .domains
+        .insert("late".to_string(), DomainEntry::file(late.clone()));
+    crystalline_core::config::save_yaml(&path, &config).unwrap();
+
+    engine.warm_index_files().await;
+    assert!(
+        engine.index_memos.lock().unwrap().contains_key("notes"),
+        "the served domain is warmed"
+    );
+    assert!(
+        !engine.index_memos.lock().unwrap().contains_key("late"),
+        "the domain only the file names is left alone"
+    );
+    assert!(
+        !engine
+            .discovered_domains
+            .read()
+            .unwrap()
+            .contains_key("late"),
+        "and is not discovered by the warm-up"
+    );
+    assert!(
+        !late.join("index.md").exists(),
+        "nothing is written into it"
+    );
+}
+
 /// After a start whose sync found nothing changed, the memo is empty and a
 /// write would read every file; the warm-up fills it, so the first write
 /// reads only its own file.
