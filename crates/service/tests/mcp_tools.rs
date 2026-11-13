@@ -3540,6 +3540,128 @@ async fn build_context_retired_neighbor_loses_to_equal_current() {
     }
 }
 
+/// One engram file in `eng`, with `recorded_at` when one is given.
+fn context_fixture(h: &Harness, slug: &str, recorded_at: Option<&str>, body: &str) {
+    let recorded = recorded_at
+        .map(|date| format!("recorded_at: {date}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        h.root.join(format!("eng/{slug}.md")),
+        format!(
+            "---\ntype: engram\ntitle: {slug}\npermalink: {slug}\ntags:\n  - eng\nstatus: stable\n{recorded}---\n\n# {slug}\n\n{body}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// `timeframe` keeps the related engrams recorded inside the window and drops
+/// an older one and one with no date, while the anchor, recorded long ago,
+/// stays; the older engram still bridges the ranking to a recent one behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_timeframe_keeps_recent_related_engrams() {
+    let h = Harness::new(&["eng"]).await;
+    let today = chrono::Utc::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    context_fixture(
+        &h,
+        "seed",
+        Some("2020-01-01"),
+        "- relates_to [[fresh]]\n- relates_to [[stale]]\n- relates_to [[undated]]",
+    );
+    context_fixture(&h, "fresh", Some(&today), "Fresh.");
+    context_fixture(&h, "stale", Some("2020-01-01"), "- relates_to [[behind]]");
+    context_fixture(&h, "undated", None, "Undated.");
+    context_fixture(&h, "behind", Some(&today), "Behind the stale one.");
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let perms = |out: &Value| -> Vec<String> {
+        let mut perms: Vec<String> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["permalink"].as_str().unwrap().to_string())
+            .collect();
+        perms.sort();
+        perms
+    };
+    let all = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/seed", "depth": 2 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        perms(&all),
+        ["behind", "fresh", "seed", "stale", "undated"],
+        "without a timeframe the whole neighbourhood comes back"
+    );
+    let recent = call(
+        peer,
+        "build_context",
+        json!({ "anchor": "crystalline://eng/seed", "depth": 2, "timeframe": "30d" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        perms(&recent),
+        ["behind", "fresh", "seed"],
+        "the window keeps the anchor and the recent engrams: {recent}"
+    );
+    assert_eq!(recent["timeframe"], json!("30d"));
+}
+
+/// `max_related` is clamped at 100 however many related engrams an anchor
+/// has and however many are asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_max_related_is_clamped_at_100() {
+    let h = Harness::new(&["eng"]).await;
+    let links: Vec<String> = (0..105).map(|n| format!("- relates_to [[r{n}]]")).collect();
+    context_fixture(&h, "hub", None, &links.join("\n"));
+    for n in 0..105 {
+        context_fixture(&h, &format!("r{n}"), None, "A spoke.");
+    }
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    let out = call(
+        client.peer(),
+        "build_context",
+        json!({ "anchor": "crystalline://eng/hub", "max_related": 1000 }),
+    )
+    .await
+    .unwrap();
+    let nodes = out["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 101, "the anchor plus 100 related engrams");
+}
+
+/// The schema advertises what the engine clamps to, and the description
+/// teaches the window, so an agent never learns a bound the server ignores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_context_schema_states_its_bounds() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == "build_context")
+        .expect("build_context tool present");
+    let schema = serde_json::to_value(&tool.input_schema).unwrap();
+    let props = &schema["properties"];
+    assert_eq!(props["depth"]["minimum"], json!(1), "{schema}");
+    assert_eq!(props["depth"]["maximum"], json!(3), "{schema}");
+    assert_eq!(props["max_related"]["maximum"], json!(100), "{schema}");
+    let timeframe = props["timeframe"]["description"].as_str().unwrap_or("");
+    assert!(!timeframe.contains("advisory"), "{timeframe}");
+    let description = tool.description.as_deref().unwrap_or("");
+    for needle in ["timeframe", "at most 100", "depth is 1 to 3"] {
+        assert!(description.contains(needle), "{needle} in {description}");
+    }
+}
+
 /// A glob anchor over a shared permalink prefix seeds two engrams at once.
 /// With `max_related: 0` the ranking has no truncation budget for anything
 /// beyond the seeds, so both must still come back - seeds are never subject

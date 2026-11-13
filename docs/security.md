@@ -57,7 +57,7 @@ That endpoint carries MCP over HTTP, the JSON API and the web UI.
 
 - The JSON API and the web UI require an account. A daemon with no account yet lets a caller on loopback create the first admin. On any other bind it asks for a one-time setup token that it prints at startup.
 - MCP over HTTP is open by default (`auth.mcp` is `false`). Any process that can reach the port is served without a token. It can read and write every domain that is not private, and it can change settings, register domains and apply provisioning. On a shared host this includes processes of other users.
-- The `Host` allow-list guards the MCP endpoint and the OAuth endpoints, loopback only by default, as a guard against DNS rebinding. `service.allowed_hosts` adds more names. A browser reaching the web UI and the JSON API needs no entry; those need an account instead.
+- The `Host` allow-list guards the MCP endpoint, the JSON API and the OAuth endpoints, as a guard against DNS rebinding. By default it allows loopback and the host of `service.public_url`. `service.allowed_hosts` adds more names, so a browser that opens the web UI by another name needs that name listed. The MCP endpoint also refuses a browser `Origin` that does not name one of these hosts. The allow-list is not access control: a program that is not a browser can send any `Host`. Accounts and `auth.mcp` keep people and agents out.
 - There is no built-in TLS. For anything other than localhost, put a TLS terminator in front (see [Web UI from the daemon](deployment.md#web-ui-from-the-daemon)).
 
 How to close it:
@@ -85,7 +85,7 @@ With `auth.mcp` off, an agent may set a domain's policies and rule overrides thr
 | `recall.enabled` | The per-prompt hook hands the agent matching engrams | `true` |
 | `skills.serve` | Serves the agent skills over MCP; `auto` skips a stdio session whose harness already has them as files | `auto` |
 | `auth.anonymous` | `true` serves JSON API requests with no identity at viewer level | `false` |
-| `service.allowed_hosts` | Extra `Host` header values the MCP endpoint and the OAuth endpoints accept; `*` accepts any | loopback only |
+| `service.allowed_hosts` | Extra `Host` header values the MCP endpoint, the JSON API and the OAuth endpoints accept; `*` accepts any | loopback and the host of `service.public_url` |
 | `service.ui` | `false` stops serving the web UI | `true` |
 | `service.api` | `false` stops serving the JSON API, and the web UI with it | `true` |
 
@@ -98,7 +98,7 @@ In a registered domain folder:
 - Engram files, through writes, edits, moves, splits and deletes by an agent or in the web UI. A delete removes the file. There is no recycle bin.
 - `MANIFEST.md`, when a folder is registered that has none.
 - Attachments under `assets/`.
-- Generated `index.md` files, one in every folder that holds knowledge. This happens on its own, after every write and after every sync that picked up outside changes. The pass overwrites any `index.md` whose content differs, a hand-written one included, and removes `index.md` from folders that hold no knowledge. Turn it off with `crystalline config set index.files false`. A read-only daemon skips it.
+- Generated `index.md` files, one in every folder that holds knowledge. This happens on its own, after every write and after every sync that picked up outside changes. The pass overwrites any `index.md` whose content differs in a folder that holds knowledge, a hand-written one included. In a folder that holds no knowledge it removes only a listing it generated itself; an `index.md` you wrote there stays. Turn it off with `crystalline config set index.files false`. A read-only daemon skips it.
 
 A team domain on GitHub also receives the merged content of every pull from its repository.
 
@@ -121,6 +121,8 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
   - `origins/`, the state of team domains (with the recorded ids of each repository connected through a GitHub App), and `origins/github-token.json` (plus `origins/github-token-personal-<name>.json` for personal GitHub identities and linked GitHub accounts, and `origins/github-app.json` for a GitHub App) only when the OS keychain cannot be used (on Windows these files get no extra access restriction; on macOS and Linux they are readable by the owner only). A GitHub App saved in the keychain leaves `origins/github-app.present`, which holds only the GitHub host;
   - `overlays/`, the review-mode drafts;
   - `instance-id`, `installs.json` and `hooks/maintenance.json`.
+
+  On macOS and Linux the state folder is readable by its owner only (mode `0700`), and so are both databases with their `-wal` and `-shm` files and `daemon.log` (mode `0600`). The daemon sets these modes when it starts, so an older install is tightened on its first start after an upgrade. On Windows nothing is changed.
 - The GitHub tokens and a saved GitHub App are otherwise kept in the OS keychain (Credential Manager on Windows). An App from the `CRYSTALLINE_GITHUB_APP_*` variables is never written down, and the App's installation tokens are kept in memory only.
 
 Nothing is encrypted at rest. Use disk encryption.

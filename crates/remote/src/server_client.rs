@@ -5,7 +5,10 @@
 //!
 //! The server rotates the refresh token on every use and reads a rotated one
 //! coming back as a stolen credential, which revokes the whole grant
-//! (`AuthStore::refresh_oauth_grant`). The daemon's poller, the CLI and the
+//! (`AuthStore::refresh_oauth_grant`). Since 0.32.1 it forgives a rotated
+//! token that comes back within 60 seconds, but the lock below keeps this
+//! client from leaning on that: one refresh per expiry, not several. The
+//! daemon's poller, the CLI and the
 //! hooks are separate processes that can all find one source's access token
 //! expired at the same moment. So a refresh runs under `refresh.lock` in the
 //! source's host folder, re-reads the stored credential once it holds the

@@ -852,3 +852,56 @@ async fn http_sessions_counts_sessions_rather_than_service_constructions() {
         head_of(&schema_probe)
     );
 }
+
+/// `initialize` with the given `Origin`, or none, over a fresh connection;
+/// the status line is what the tests below read.
+async fn post_with_origin(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
+    let body = init_body("2025-06-18");
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut request = "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n"
+        .to_string();
+    if let Some(origin) = origin {
+        request.push_str(&format!("Origin: {origin}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// **The transport checks a browser's `Origin`, against the same hosts as its
+/// `Host`.** A page on another site that reaches the port (by DNS rebinding
+/// or otherwise) carries its own origin and is refused `403` before any
+/// handler runs. A local page on any port is a loopback origin and passes,
+/// and so does every client that sends no `Origin` at all, which is every
+/// client that is not a browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_origin_is_refused_and_a_missing_one_is_not() {
+    let addr = spawn_router().await;
+    for origin in [
+        None,
+        Some("http://localhost:5173"),
+        Some("http://127.0.0.1:7411"),
+    ] {
+        let answer = post_with_origin(addr, origin).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 200 "),
+            "{origin:?} is served: {answer}"
+        );
+    }
+    for origin in ["http://evil.example", "https://evil.example:7411", "null"] {
+        let answer = post_with_origin(addr, Some(origin)).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 403 "),
+            "{origin} is refused: {answer}"
+        );
+    }
+}

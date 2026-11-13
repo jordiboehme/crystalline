@@ -385,11 +385,13 @@ pub struct PatchBody {
 /// [`Debug`] is hand-written and redacts the password, as on [`CreateBody`].
 #[derive(Deserialize, utoipa::ToSchema)]
 #[schema(description = "The replacement password. Setting it revokes every \
-                        session the account holds, this admin's own included \
-                        when they reset themselves.")]
+                        session, MCP token and OAuth grant the account holds, \
+                        this admin's own session included when they reset \
+                        themselves.")]
 pub struct PasswordBody {
-    /// The replacement password. Setting it revokes every session the account
-    /// holds, this admin's own included when they reset themselves.
+    /// The replacement password. Setting it revokes every session, MCP token
+    /// and OAuth grant the account holds, this admin's own session included
+    /// when they reset themselves.
     #[schema(example = "correct horse battery staple")]
     password: String,
 }
@@ -558,11 +560,12 @@ pub async fn update(
 /// with the account as it now stands.
 ///
 /// A distinct route rather than a `PATCH` field: setting a password revokes
-/// every session the account holds, in the same transaction as the change -
-/// the reset is useless against a compromised account otherwise, since a
-/// cookie minted before it would keep working for the rest of its life. An
-/// admin resetting their own password signs their own other sessions out too,
-/// this one included.
+/// every session, MCP token and OAuth grant the account holds, in the same
+/// transaction as the change - the reset is useless against a compromised
+/// account otherwise, since a cookie minted before it would keep working for
+/// the rest of its life, and a token or grant minted with that cookie would
+/// keep an agent connected. An admin resetting their own password signs their
+/// own other sessions out too, this one included.
 #[utoipa::path(
     post,
     path = "/api/v1/users/{name}/password",

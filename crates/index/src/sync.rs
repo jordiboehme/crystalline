@@ -959,8 +959,9 @@ impl DomainScan {
 /// `stamps` is the recorded [`FileStamp`] per relative path the caller read from
 /// the store before releasing its lock; the scan classifies every file against
 /// it and hands it back inside the [`DomainScan`] so the apply can re-check it.
-/// The walk and hash phases run off-thread and never fail fatally: a file that
-/// cannot be read lands in `report.failed`, not an error.
+/// The walk and hash phases run off-thread (the walk on the blocking pool) and
+/// never fail fatally: a file that cannot be read lands in `report.failed`, not
+/// an error. Only a root that cannot be read is an error.
 ///
 /// `force` is `reindex --full`: the modification-time and size prefilter is
 /// skipped, so every file on disk is hashed, and a file whose content is
@@ -979,6 +980,88 @@ pub async fn scan_domain(
 ) -> Result<DomainScan> {
     let started = Instant::now();
 
+    // The walk reads the disk entry by entry (a directory listing and a stat
+    // each, a read for a threads file), which on a network or synced folder
+    // can take a while: it runs on the blocking pool, not on a runtime worker.
+    let walked = {
+        let name = name.to_string();
+        let root = root.to_path_buf();
+        let shown = root.display().to_string();
+        tokio::task::spawn_blocking(move || walk_domain(&name, &root, stamps))
+            .await
+            .unwrap_or_else(|e| {
+                Err(IndexError::Io {
+                    path: shown,
+                    source: std::io::Error::other(e.to_string()),
+                })
+            })?
+    };
+    let Walked {
+        stamps,
+        reflection,
+        walk,
+        current,
+        assets,
+        reflections,
+        reflection_assets,
+        unread,
+        unread_reflections,
+    } = walked;
+
+    // Deleted candidates: recorded files no longer present on disk. A full walk
+    // sees every recorded path, so deletion detection is domain-wide here.
+    let deleted_paths: Vec<String> = stamps
+        .keys()
+        .filter(|p| !current.contains_key(*p))
+        .cloned()
+        .collect();
+
+    let mut scan = classify_changes(
+        name,
+        root,
+        stamps,
+        current,
+        deleted_paths,
+        Vec::new(),
+        chunk_params,
+        started,
+        force,
+    )
+    .await;
+    // A full walk saw every file under `assets/`, so the apply may delete any
+    // attachment row it did not see.
+    scan.assets = assets;
+    scan.assets_complete = true;
+    scan.ends_rebuild = force;
+    // With the Reflection not in effect the walk finds no reflection, so a
+    // complete walk clears the table: that is how switching off, and a
+    // pending switch, leave no row behind.
+    scan.reflections = reflections;
+    scan.reflection_assets = reflection_assets;
+    scan.reflections_complete = !unread_reflections;
+    scan.reflection = reflection;
+    scan.report.unread += unread;
+    scan.report.reflection_walk = Some(walk);
+    Ok(scan)
+}
+
+/// What [`walk_domain`] found on disk, with the stamps it was handed back.
+struct Walked {
+    stamps: HashMap<String, FileStamp>,
+    reflection: ReflectionMode,
+    walk: ReflectionWalk,
+    current: HashMap<String, Scanned>,
+    assets: Vec<FileCandidate>,
+    reflections: Vec<FileCandidate>,
+    reflection_assets: Vec<FileCandidate>,
+    unread: usize,
+    unread_reflections: bool,
+}
+
+/// The walk half of [`scan_domain`]: every blocking filesystem call it makes
+/// before the hash phase, so the caller can run it on the blocking pool. Errs
+/// only when the root itself cannot be read.
+fn walk_domain(name: &str, root: &Path, stamps: HashMap<String, FileStamp>) -> Result<Walked> {
     // What every path of this domain is: the MANIFEST's in-root artifact
     // folders are pruned with the hidden ones (none when the MANIFEST is
     // absent or unparseable), the reserved `assets/` folder is routed to its
@@ -1143,41 +1226,17 @@ pub async fn scan_domain(
         }
     }
 
-    // Deleted candidates: recorded files no longer present on disk. A full walk
-    // sees every recorded path, so deletion detection is domain-wide here.
-    let deleted_paths: Vec<String> = stamps
-        .keys()
-        .filter(|p| !current.contains_key(*p))
-        .cloned()
-        .collect();
-
-    let mut scan = classify_changes(
-        name,
-        root,
+    Ok(Walked {
         stamps,
+        reflection,
+        walk,
         current,
-        deleted_paths,
-        Vec::new(),
-        chunk_params,
-        started,
-        force,
-    )
-    .await;
-    // A full walk saw every file under `assets/`, so the apply may delete any
-    // attachment row it did not see.
-    scan.assets = assets;
-    scan.assets_complete = true;
-    scan.ends_rebuild = force;
-    // With the Reflection not in effect the walk finds no reflection, so a
-    // complete walk clears the table: that is how switching off, and a
-    // pending switch, leave no row behind.
-    scan.reflections = reflections;
-    scan.reflection_assets = reflection_assets;
-    scan.reflections_complete = !unread_reflections;
-    scan.reflection = reflection;
-    scan.report.unread += unread;
-    scan.report.reflection_walk = Some(walk);
-    Ok(scan)
+        assets,
+        reflections,
+        reflection_assets,
+        unread,
+        unread_reflections,
+    })
 }
 
 /// Scan a specific list of relative paths against a stamp snapshot, the

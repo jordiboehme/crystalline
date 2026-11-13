@@ -1794,6 +1794,27 @@ export type OauthErrorBody = {
 };
 
 /**
+ * Why a grant ended. Only the endings a person could not otherwise explain
+ * are recorded: an expired grant was simply not used for thirty days, and a
+ * removed account has nobody left to tell.
+ */
+export type OauthGrantEndReason = 'replayed' | 'revoked' | 'client_revoked' | 'password_reset';
+
+/**
+ * When and why a grant ended, so a person can tell why a client is gone.
+ */
+export type OauthGrantEnded = {
+    /**
+     * RFC 3339, when the grant ended.
+     */
+    at: string;
+    /**
+     * Why it ended.
+     */
+    reason: OauthGrantEndReason;
+};
+
+/**
  * One row of an account's OAuth grant list: which client is connected, since
  * when, and until when it may keep refreshing. Never carries a token - only
  * hashes are stored, so there is nothing to show back.
@@ -1812,6 +1833,7 @@ export type OauthGrantInfo = {
      * RFC 3339, when the grant was created.
      */
     created_at: string;
+    ended?: OauthGrantEnded | null;
     /**
      * The grant's id, which is what revokes it.
      */
@@ -1827,7 +1849,7 @@ export type OauthGrantInfo = {
     redirect_host: string;
     /**
      * RFC 3339, when the refresh token stops working unless it is rotated
-     * before then.
+     * before then. For an ended grant, when it ended.
      */
     refresh_expires_at: string;
 };
@@ -1923,12 +1945,13 @@ export type OwnerBody = {
 };
 
 /**
- * The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves.
+ * The replacement password. Setting it revokes every session, MCP token and OAuth grant the account holds, this admin's own session included when they reset themselves.
  */
 export type PasswordBody = {
     /**
-     * The replacement password. Setting it revokes every session the account
-     * holds, this admin's own included when they reset themselves.
+     * The replacement password. Setting it revokes every session, MCP token
+     * and OAuth grant the account holds, this admin's own session included
+     * when they reset themselves.
      */
     password: string;
 };
@@ -8173,7 +8196,14 @@ export type RotateMyMcpTokenResponse = RotateMyMcpTokenResponses[keyof RotateMyM
 export type ListMyOauthGrantsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Also list the grants that ended in the last seven days, after the live
+         * ones, each with `ended` saying when and why. Defaults to false, which
+         * lists the live grants only.
+         */
+        include_ended?: boolean;
+    };
     url: '/api/v1/me/oauth-grants';
 };
 

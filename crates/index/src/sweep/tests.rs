@@ -61,6 +61,7 @@ fn node_of(f: &EngramFacts) -> GraphNode {
         salience: f.salience,
         status: f.status.clone(),
         actor: String::new(),
+        recorded_at: None,
     }
 }
 
@@ -857,6 +858,7 @@ fn v102_keeps_a_registered_prefix_on_both_sides_of_the_repair() {
         salience: None,
         status: "stable".to_string(),
         actor: String::new(),
+        recorded_at: None,
     });
 
     let mut reference = unresolved(1, "Incident Response Checklst");

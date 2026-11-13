@@ -188,7 +188,7 @@ export type { DecisionResponse } from "./gen";
  * Never a token - only hashes are stored on the server, so there is nothing
  * to show back.
  */
-export type { OauthGrantInfo } from "./gen";
+export type { OauthGrantEndReason, OauthGrantInfo } from "./gen";
 
 /**
  * One draft handed over by its author: where it stands, whose it is, whether

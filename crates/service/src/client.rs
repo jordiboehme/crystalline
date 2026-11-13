@@ -924,6 +924,12 @@ async fn build_embedded(
         let _ = bg.sync(None).await;
         // As at the daemon's startup, once the first sync has returned.
         bg.settle_after_initial_sync().await;
+        // As at the daemon's startup: the index refresh memo fills in its
+        // own task.
+        {
+            let bg = bg.clone();
+            tokio::spawn(async move { bg.warm_index_files().await });
+        }
         if let Some(provider) = crate::engine::build_provider(&bg_config).await {
             bg.set_provider(provider);
             // Schedule on the worker spawned just above rather than embedding

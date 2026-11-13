@@ -34,6 +34,7 @@ import {
   hostOf,
   NOTICE_MS,
   onDiagramDrawn,
+  RENDER_PACE_MS,
 } from "./widget";
 
 interface Asked {
@@ -93,6 +94,11 @@ function measured(view: EditorView): void {
 
 const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+/** Past the render pace: a body that waited for it is rendered now. */
+const paced = async () => {
+  await new Promise((resolve) => setTimeout(resolve, RENDER_PACE_MS + 10));
 };
 
 async function settle(body: string, verdict: Verdict = OK) {
@@ -366,7 +372,10 @@ describe("a change to the fence", () => {
     await flush();
     const older = renders().at(-1);
     view.dispatch({ changes: { from: at, insert: "Y" } });
+    // Inside the pace the newer body waits; past it, it renders.
     await flush();
+    expect(renders().at(-1)).toBe(older);
+    await paced();
     const newer = renders().at(-1);
     expect(newer).not.toBe(older);
     newer?.resolve(recordedAs(newer.id));
@@ -389,6 +398,7 @@ describe("a change to the fence", () => {
     await vi.waitFor(() => {
       expect(hostOf(view, 5)?.renderedBody()).toContain("XNext");
     });
+    await paced();
     kit.hold.value = true;
     view.dispatch({ changes: { from: at, insert: "Y" } });
     await flush();
@@ -411,7 +421,7 @@ describe("a change to the fence", () => {
     await flush();
     const older = renders().at(-1);
     view.dispatch({ changes: { from: at, insert: "Y" } });
-    await flush();
+    await paced();
     const newer = renders().at(-1);
     expect(newer).not.toBe(older);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -1399,6 +1409,60 @@ describe("the caret and deleting", () => {
   });
 });
 
+describe("the render pace (F5)", () => {
+  /** Renders the drawn layer asked mermaid for, by body. */
+  const bodies = () => renders().map((r) => r.body);
+
+  it("renders the first body of a burst at once and its last at the end, none between", async () => {
+    const view = await drawn();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const before = renders().length;
+    const at = view.state.doc.toString().indexOf("Next");
+    for (const char of "WXYZ") {
+      view.dispatch({ changes: { from: at, insert: char } });
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    expect(renders()).toHaveLength(before + 1);
+    expect(bodies().at(-1)).toContain("WNext");
+    await vi.advanceTimersByTimeAsync(RENDER_PACE_MS);
+    expect(renders()).toHaveLength(before + 2);
+    expect(bodies().at(-1)).toContain("ZYXWNext");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hostOf(view, 5)?.renderedBody()).toContain("ZYXWNext");
+    // Nothing more is owed.
+    await vi.advanceTimersByTimeAsync(RENDER_PACE_MS * 5);
+    expect(renders()).toHaveLength(before + 2);
+  });
+
+  it("renders nothing for a burst that ends where the drawing is", async () => {
+    const view = await drawn();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const at = view.state.doc.toString().indexOf("Next");
+    view.dispatch({ changes: { from: at, insert: "X" } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(hostOf(view, 5)?.renderedBody()).toContain("XNext");
+    const before = renders().length;
+    view.dispatch({ changes: { from: at, insert: "Y" } });
+    view.dispatch({ changes: { from: at, to: at + 1 } });
+    await vi.advanceTimersByTimeAsync(RENDER_PACE_MS * 2);
+    expect(renders()).toHaveLength(before);
+    expect(hostOf(view, 5)?.renderedBody()).toContain("XNext");
+  });
+
+  it("starts no render once the box is gone", async () => {
+    const view = await drawn();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const at = view.state.doc.toString().indexOf("Next");
+    view.dispatch({ changes: { from: at, insert: "X" } });
+    view.dispatch({ changes: { from: at, insert: "Y" } });
+    await vi.advanceTimersByTimeAsync(0);
+    const before = renders().length;
+    view.destroy();
+    await vi.advanceTimersByTimeAsync(RENDER_PACE_MS * 2);
+    expect(renders()).toHaveLength(before);
+  });
+});
+
 describe("trying a render again (R79 N5)", () => {
   const edited = (n: number) => BODY.replace("Next", `Next${String(n)}`);
 
@@ -1416,7 +1480,8 @@ describe("trying a render again (R79 N5)", () => {
     renders().at(-1)?.reject(new Error("no"));
     await vi.advanceTimersByTimeAsync(0);
     edit(view, "Next1", "Next2");
-    await vi.advanceTimersByTimeAsync(0);
+    // Inside the render pace of Next1: Next2 waits for its end.
+    await vi.advanceTimersByTimeAsync(RENDER_PACE_MS);
     const last = renders().at(-1);
     last?.resolve(recordedAs(last.id));
     await vi.advanceTimersByTimeAsync(0);

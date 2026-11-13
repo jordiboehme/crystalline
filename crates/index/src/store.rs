@@ -1401,6 +1401,9 @@ pub struct GraphNode {
     /// meets their own, so a non-empty value means "this is your draft" and is
     /// what the graph verbs mark a node with.
     pub actor: String,
+    /// The engram's `recorded_at` as stored (an ISO date), `None` when it has
+    /// none. What `build_context`'s `timeframe` compares.
+    pub recorded_at: Option<String>,
 }
 
 /// Whether an edge came from a relation bullet or a prose wikilink.

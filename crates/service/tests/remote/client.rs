@@ -1,9 +1,10 @@
 //! The client half, one source at a time: the ctl exchange, the refresh
 //! under its lock, and the cached answers. The refresh tests run against a
-//! stand-in token endpoint that rotates exactly the way
-//! `AuthStore::refresh_oauth_grant` does, so a second use of a rotated refresh
-//! token fails. The last part pins a server that cannot be reached (spec
-//! A8), with short limits and windows so it stays fast.
+//! stand-in token endpoint that rotates the way
+//! `AuthStore::refresh_oauth_grant` does past its grace window, so a second
+//! use of a rotated refresh token fails. The last part pins a server that
+//! cannot be reached (spec A8), with short limits and windows so it stays
+//! fast.
 
 // Later suites use `source`, `save_credential` and `token_source`.
 #![allow(dead_code)]

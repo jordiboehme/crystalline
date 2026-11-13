@@ -1479,7 +1479,9 @@ async fn mcp_ctx_built(
     let mut built = Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
         // An empty temp directory, so nothing here ever reads the developer's
         // real OS keychain looking for a GitHub credential.
-        .with_token_store_dir(root.join("tokens"));
+        .with_token_store_dir(root.join("tokens"))
+        // Origin state under the test's own folder, never the machine's.
+        .with_origins_dir(root.join("origins"));
     if let Some(mock) = &mock {
         built = built.with_origin_provider(mock.clone());
     }
@@ -2504,6 +2506,116 @@ async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
             "{tool} answers a hidden name exactly like an unknown one"
         );
     }
+}
+
+/// Give `lab` an origin state with one open proposal carrying a reviewer's
+/// comment, checked at a fixed time: what a pull leaves behind.
+fn seed_lab_feedback(ctx: &VisibilityCtx) {
+    let mut state = crystalline_remote::state::OriginState::new("acme/lab", "main");
+    state.last_checked = Some(
+        chrono::DateTime::parse_from_rfc3339("2026-11-01T09:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    state.proposals.push(
+        serde_json::from_value(serde_json::json!({
+            "number": 7,
+            "url": "https://github.com/acme/lab/pull/7",
+            "branch": "crystalline/share-7",
+            "title": "Share lab notes",
+            "created_at": "2026-10-30T08:00:00Z",
+            "status": "Open",
+            "files": [],
+            "review_state": "changes_requested",
+            "feedback": [{
+                "author": "ana",
+                "body": "needs a source",
+                "path": null,
+                "line": null,
+                "submitted_at": "2026-10-31T10:00:00Z",
+                "kind": "comment"
+            }]
+        }))
+        .unwrap(),
+    );
+    state
+        .save(&ctx.tmp.path().join("origins").join("lab"))
+        .unwrap();
+}
+
+/// **`update_domain` hands review feedback to a reader, and only an admin's
+/// call starts a pull.** `POST /api/v1/domains/{domain}/sync` is admin only,
+/// so an editor's or a viewer's agent may not start the same pull over MCP.
+/// It still gets the reviewers' comments: the call reads what the last pull
+/// stored, says nothing was pulled and when the repository was last checked,
+/// and never reaches the forge. An admin's call pulls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_domain_shows_a_reader_the_feedback_and_pulls_only_for_an_admin() {
+    let ctx = mcp_team_ctx_with_forge().await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Editor)
+        .await;
+    ctx.add_member(
+        "lab",
+        "looker",
+        crystalline_service::rest::MemberLevel::Viewer,
+    )
+    .await;
+    seed_lab_feedback(&ctx);
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+    for who in ["mem", "looker"] {
+        let session = McpTestSession::open(&ctx.addr, Some(&ctx.token_for(who).await)).await;
+        for args in [
+            serde_json::json!({ "domain": "lab" }),
+            serde_json::json!({}),
+        ] {
+            let answer = session.call_tool("update_domain", args.clone()).await;
+            assert!(
+                answer.contains("needs a source"),
+                "{who} {args}: the comment text is there:\n{answer}"
+            );
+            assert!(
+                answer.contains("only an instance admin can start a new pull")
+                    && answer.contains("2026-11-01T09:30:00Z"),
+                "{who} {args}: the answer says nothing was pulled, and since when:\n{answer}"
+            );
+            // A pull would have gone to the forge double, which holds no
+            // repository, and come back as an error row (see the admin below).
+            assert!(
+                !answer.contains("Could not find the GitHub repository"),
+                "{who} {args}: no pull was started:\n{answer}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "nothing was pulled into the folder"
+    );
+
+    // A caller that may not read the domain is answered as before: a hidden
+    // name is an unregistered one.
+    let out = McpTestSession::open(&ctx.addr, Some(&ctx.token_for("out").await)).await;
+    let hidden = out
+        .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(hidden.contains("not registered"), "{hidden}");
+    assert!(!hidden.contains("needs a source"), "{hidden}");
+
+    // The admin's call starts the pull.
+    let boss = McpTestSession::open(&ctx.addr, Some(&ctx.token_for("boss").await)).await;
+    let pulled = boss
+        .call_tool("update_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        !pulled.contains("only an instance admin can start a new pull"),
+        "{pulled}"
+    );
+    // The forge double holds no repository, so the pull it started comes
+    // back as that domain's error row: proof the call went to the forge.
+    assert!(
+        pulled.contains("Could not find the GitHub repository acme/lab"),
+        "the admin's call started a pull: {pulled}"
+    );
 }
 
 /// **`provision` allow and deny never tell a hidden domain from an unknown
@@ -3881,7 +3993,8 @@ async fn expire_access_token(path: &std::path::Path, grant: i64) {
     let conn = db.connect().unwrap();
     let touched = conn
         .execute(
-            "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+            "UPDATE oauth_grant_token SET access_expires_at = 1
+             WHERE grant_id = ?1 AND rotated_at IS NULL",
             vec![turso::Value::Integer(grant)],
         )
         .await

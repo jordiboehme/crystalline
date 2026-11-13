@@ -1,4 +1,5 @@
 use super::*;
+use crate::index_files::Touched;
 
 impl Engine {
     // --- recent --------------------------------------------------------------
@@ -780,8 +781,17 @@ impl Engine {
     /// logged, never propagated: a generated navigation file is a convenience,
     /// and losing it must never fail the write, move, delete or sync that
     /// triggered the pass.
-    pub(super) async fn refresh_index_files(&self, domain: &str) {
+    ///
+    /// One refresh of a domain runs at a time, behind the domain's memo
+    /// lock, and each reads the disk only after it holds the lock, so the
+    /// last one to finish writes the newest listing. The memo spares the
+    /// pass the read of every concept file whose stat did not change; the
+    /// paths in `touched` are read again in any case.
+    pub(super) async fn refresh_index_files(&self, domain: &str, touched: Touched) {
         if self.read_only || !self.config.read().unwrap().index_files() {
+            // Nothing is kept while the listings are off: a domain changes
+            // unseen meanwhile, and the memory is better given back.
+            self.index_memos.lock().unwrap().clear();
             return;
         }
         let ContentSource::File { root } = self.read_source(domain) else {
@@ -794,15 +804,22 @@ impl Engine {
         if self.writes_refused(domain).await {
             return;
         }
+        let memo = self.index_memo(domain).lock_owned().await;
         // The switch in effect, so the listings follow what the index holds:
         // an engram still waiting under a pending switch keeps its entry. A
         // mode that cannot be read lists the folder, as with the switch off.
         let mode = self.reflection_mode(domain).await.unwrap_or_default();
         let name = domain.to_string();
-        // A full walk plus one read per engram is blocking IO, so it runs on the
-        // blocking pool rather than on a runtime worker.
-        let joined =
-            tokio::task::spawn_blocking(move || crate::index_files::refresh(&root, mode)).await;
+        // A full walk plus one stat per concept file (and a read of each one
+        // the memo cannot vouch for) is blocking IO, so it runs on the
+        // blocking pool rather than on a runtime worker. The memo's guard goes
+        // with it and is released when the pass ends.
+        let forced = touched.forced();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut memo = memo;
+            crate::index_files::refresh_with(&root, mode, &mut memo, &forced)
+        })
+        .await;
         match joined {
             Ok(report) if report.written > 0 || report.removed > 0 => {
                 tracing::debug!(
@@ -813,6 +830,23 @@ impl Engine {
             }
             Ok(_) => {}
             Err(e) => tracing::warn!("index refresh of '{name}' did not run: {e}"),
+        }
+    }
+
+    /// Fill the index refresh memo of every file domain, so the first write
+    /// after a start reads only its own file instead of every concept file
+    /// of its domain. Since a sync that changed nothing skips the refresh,
+    /// the startup sync of an unchanged domain leaves the memo empty; this
+    /// is the pass that fills it. It is an ordinary refresh, so a listing
+    /// out of step with its folder is put right on the way. Callers run it
+    /// in the background after the startup sync: a write that arrives first
+    /// waits for the domain's pass and then finds the memo full.
+    pub async fn warm_index_files(&self) {
+        for (name, entry) in self.registered_domain_entries() {
+            if entry.is_virtual() {
+                continue;
+            }
+            self.refresh_index_files(&name, Touched::Full).await;
         }
     }
 

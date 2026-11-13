@@ -281,12 +281,14 @@ async fn an_account_lists_and_revokes_its_own_grants_and_no_others() {
             "client_id",
             "client_name",
             "created_at",
+            "ended",
             "id",
             "last_used",
             "redirect_host",
             "refresh_expires_at",
         ]
     );
+    assert!(rows[0]["ended"].is_null(), "a live grant has not ended");
     assert_eq!(rows[0]["client_name"], "a hosted client");
     assert_eq!(rows[0]["redirect_host"], "claude.ai");
     assert!(rows[0]["last_used"].is_null(), "never presented yet");
@@ -340,6 +342,76 @@ async fn an_account_lists_and_revokes_its_own_grants_and_no_others() {
     // bob's grant is untouched throughout.
     let bobs_after = body(bob.get("/api/v1/me/oauth-grants").await).await;
     assert_eq!(bobs_after.as_array().unwrap().len(), 1);
+
+    // The revoked grant is kept as a record of why it ended, listed only when
+    // asked for, and only to its own account.
+    let with_ended = body(ctx.get("/api/v1/me/oauth-grants?include_ended=true").await).await;
+    let rows = with_ended.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{with_ended}");
+    assert_eq!(rows[0]["id"].as_i64().unwrap(), ada_grant.id);
+    assert_eq!(rows[0]["client_name"], "a hosted client");
+    assert_eq!(rows[0]["ended"]["reason"], "revoked");
+    assert!(rows[0]["ended"]["at"].is_string());
+    let bobs_with_ended = body(bob.get("/api/v1/me/oauth-grants?include_ended=true").await).await;
+    let bobs_with_ended = bobs_with_ended.as_array().unwrap();
+    assert_eq!(bobs_with_ended.len(), 1);
+    assert!(bobs_with_ended[0]["ended"].is_null());
+}
+
+/// A password reset signs every client out, and after signing in again the
+/// person reads why on the listing: one `password_reset` record per grant.
+#[tokio::test]
+async fn a_password_reset_is_listed_as_the_reason() {
+    let ctx = RestCtx::with_user("ada", Role::Editor).await;
+    let (_, grant) = grant_for(&ctx.auth, "ada", "http://example.test").await;
+    ctx.auth.set_password("ada", "n3w s3cret").await.unwrap();
+    let again = SessionClient {
+        addr: ctx.client.addr,
+        session: Some(login(ctx.client.addr, "ada", "n3w s3cret").await),
+    };
+    let live = body(again.get("/api/v1/me/oauth-grants").await).await;
+    assert!(live.as_array().unwrap().is_empty(), "{live}");
+    let all = body(
+        again
+            .get("/api/v1/me/oauth-grants?include_ended=true")
+            .await,
+    )
+    .await;
+    let rows = all.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{all}");
+    assert_eq!(rows[0]["id"].as_i64().unwrap(), grant.id);
+    assert_eq!(rows[0]["ended"]["reason"], "password_reset");
+}
+
+/// A replayed refresh token ends the grant, and the record says so: the
+/// listing with `include_ended=true` names the reason.
+#[tokio::test]
+async fn a_replayed_grant_is_listed_with_its_reason() {
+    let ctx = RestCtx::with_user("ada", Role::Editor).await;
+    let (client_id, grant) = grant_for(&ctx.auth, "ada", "http://example.test").await;
+    let now = chrono::Utc::now().timestamp();
+    ctx.auth
+        .refresh_oauth_grant_at(&grant.refresh_token, &client_id, None, now - 3600)
+        .await
+        .unwrap();
+    let outcome = ctx
+        .auth
+        .refresh_oauth_grant_at(&grant.refresh_token, &client_id, None, now)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            crystalline_service::rest::RefreshOutcome::Replayed { .. }
+        ),
+        "{outcome:?}"
+    );
+    let live = body(ctx.get("/api/v1/me/oauth-grants").await).await;
+    assert!(live.as_array().unwrap().is_empty(), "{live}");
+    let all = body(ctx.get("/api/v1/me/oauth-grants?include_ended=true").await).await;
+    let rows = all.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{all}");
+    assert_eq!(rows[0]["ended"]["reason"], "replayed");
 }
 
 #[tokio::test]

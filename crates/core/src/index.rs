@@ -85,6 +85,10 @@ impl IndexEntry {
         let title = title.trim();
         let title = if title.is_empty() {
             filename.trim_end_matches(".md").to_string()
+        } else if title.contains(['\n', '\r']) {
+            // A title written over several lines would break the
+            // one-entry-per-line shape, so it is flattened like a description.
+            clean_description(title)
         } else {
             title.to_string()
         };
@@ -224,6 +228,17 @@ mod tests {
         assert!(!is_generated_index("# Contents\n\n"));
         assert!(!is_generated_index("# Guides\n\n* [A](a.md)\n"));
         assert!(!is_generated_index(""));
+    }
+
+    #[test]
+    fn a_multi_line_title_is_listed_on_one_line() {
+        let entry = IndexEntry::file("a.md", "First line\n  second line\n", None);
+        assert_eq!(entry.title, "First line second line");
+        assert!(is_generated_index(&render_index(&[entry], false)));
+        assert_eq!(
+            IndexEntry::file("a.md", "Two  spaces", None).title,
+            "Two  spaces"
+        );
     }
 
     #[test]

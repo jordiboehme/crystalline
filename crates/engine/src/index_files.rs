@@ -8,18 +8,33 @@
 //!
 //! The pass is a full-domain regeneration: walk the domain, render every
 //! folder's index file, write only the ones whose content actually changed and
-//! remove an `index.md` from a folder that no longer holds knowledge. That is
+//! remove a generated `index.md` from a folder that no longer holds knowledge.
+//! An `index.md` that does not read as generated
+//! ([`crystalline_core::is_generated_index`]) in such a folder is somebody's
+//! own page and stays. That is
 //! cheaper to reason about than per-folder dirty tracking (one move already
 //! touches three folders plus their ancestors) and idempotent, so a
 //! regeneration that changes nothing leaves every mtime alone and never wakes
 //! the watcher.
 //!
+//! The walk is cheap; reading every concept for its title and description is
+//! not. So each domain keeps a `ListingMemo` between passes: the title and
+//! description of every concept file, keyed by the file's stat (length,
+//! modification time and, on Unix, inode and change time). A file whose stat
+//! still matches is not read again. Every write the engine makes goes through
+//! a temp file and a rename, so it gets a new inode, and the paths a write or
+//! a sync just touched are passed as forced paths and read whatever their
+//! stat says. Everything else (the walk, which folders hold knowledge, the
+//! render, the compare with the file on disk and the removals) is the same
+//! full pass as without a memo, so a memo only saves reads.
+//!
 //! The reserved names themselves are never indexed (see the sync walk), so
 //! writing these files creates no store rows, no embeddings and no search
 //! hits.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crystalline_core::{
     DomainLayout, IndexEntry, PathClass, ReflectionMode, render_index, slash_rel,
@@ -31,10 +46,52 @@ use walkdir::WalkDir;
 pub(crate) struct IndexRefresh {
     /// Index files written because their content changed (or did not exist).
     pub written: usize,
-    /// Index files removed because their folder no longer holds knowledge.
+    /// Generated index files removed because their folder no longer holds
+    /// knowledge. An `index.md` that does not read as generated is never
+    /// removed.
     pub removed: usize,
     /// Index files left untouched because their content was already correct.
     pub unchanged: usize,
+    /// Concept files opened and parsed for their title and description.
+    pub read: usize,
+    /// Concept files whose title and description came from the memo.
+    pub reused: usize,
+    /// Bytes those reads returned.
+    pub bytes_read: u64,
+}
+
+/// Which paths of a domain a change touched, for the refresh that follows
+/// it.
+#[derive(Debug, Clone)]
+pub(crate) enum Touched {
+    /// These domain-relative, forward-slashed paths changed: each is read
+    /// again whatever its stat says.
+    Paths(Vec<String>),
+    /// No path in particular, as for the warm-up after start. Nothing is
+    /// forced and the memo is kept: the walk takes every file's stat, so a
+    /// file that changed is read again anyway.
+    Full,
+}
+
+impl Touched {
+    /// One path changed.
+    pub(crate) fn path(path: &str) -> Touched {
+        Touched::Paths(vec![path.to_string()])
+    }
+
+    /// The paths the refresh reads again whatever their stat says.
+    pub(crate) fn forced(self) -> Vec<String> {
+        match self {
+            Touched::Paths(paths) => paths,
+            Touched::Full => Vec::new(),
+        }
+    }
+}
+
+/// [`refresh_with`] on an empty memo: every concept file is read.
+#[cfg(test)]
+pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
+    refresh_with(root, mode, &mut ListingMemo::default(), &[])
 }
 
 /// Regenerate every `index.md` under `root`, the filesystem root of a file
@@ -47,9 +104,35 @@ pub(crate) struct IndexRefresh {
 /// entry (titled by its filename stem), and a write or removal that fails is
 /// logged and skipped, so a locked or read-only path never fails the write,
 /// move, delete or sync that asked for the regeneration.
-pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
-    let mut refresh = IndexRefresh::default();
-    let folders = collect(root, mode);
+///
+/// It takes a memo of the domain's titles and descriptions from the passes
+/// before, which this pass brings up to date. `forced` names the
+/// domain-relative, forward-slashed paths a caller just changed: each is read
+/// again even when its stat still matches the memo. A path that is not a
+/// concept file (a deleted one, a folder) is simply not found by the walk.
+pub(crate) fn refresh_with(
+    root: &Path,
+    mode: ReflectionMode,
+    memo: &mut ListingMemo,
+    forced: &[String],
+) -> IndexRefresh {
+    let folders = collect(root, mode, memo, forced);
+    let refresh = write_listings(root, &folders);
+    #[cfg(test)]
+    {
+        memo.last = refresh;
+    }
+    refresh
+}
+
+/// Render, compare, write and remove what the walk asks for.
+fn write_listings(root: &Path, folders: &Walked) -> IndexRefresh {
+    let mut refresh = IndexRefresh {
+        read: folders.read,
+        reused: folders.reused,
+        bytes_read: folders.bytes_read,
+        ..IndexRefresh::default()
+    };
 
     // Every folder that holds knowledge directly or anywhere below it gets an
     // index file; the rest must not keep a stale one.
@@ -76,6 +159,13 @@ pub(crate) fn refresh(root: &Path, mode: ReflectionMode) -> IndexRefresh {
             continue;
         }
         let path = index_path(root, folder);
+        // Only a listing this pass would have written goes. An `index.md` a
+        // person wrote in a folder that holds no knowledge is their page.
+        let generated = std::fs::read_to_string(&path)
+            .is_ok_and(|text| crystalline_core::is_generated_index(&text));
+        if !generated {
+            continue;
+        }
         match std::fs::remove_file(&path) {
             Ok(()) => refresh.removed += 1,
             Err(e) => tracing::warn!("could not remove {}: {e}", path.display()),
@@ -94,6 +184,12 @@ struct Walked {
     concepts: BTreeMap<String, Vec<IndexEntry>>,
     /// Folders that already hold an `index.md`.
     existing_indexes: BTreeSet<String>,
+    /// Concept files read for their title and description.
+    read: usize,
+    /// Concept files whose title and description came from the memo.
+    reused: usize,
+    /// Bytes those reads returned.
+    bytes_read: u64,
 }
 
 impl Walked {
@@ -133,18 +229,110 @@ impl Walked {
     }
 }
 
-/// Walk the domain, reading each concept's title and description.
-fn collect(root: &Path, mode: ReflectionMode) -> Walked {
+/// What the refresh of one domain remembers between passes: the title and
+/// description of each concept file the last walk found, with the stat they
+/// were read under. Only the files the last walk saw are kept, so a deleted
+/// or moved file leaves the memo with the next pass.
+#[derive(Debug, Default)]
+pub(crate) struct ListingMemo {
+    /// The domain root the entries were read under. A pass over another root
+    /// starts from an empty memo.
+    root: Option<PathBuf>,
+    /// Domain-relative path to what was read there.
+    entries: HashMap<String, MemoEntry>,
+    /// What the last pass with this memo did.
+    #[cfg(test)]
+    last: IndexRefresh,
+}
+
+impl ListingMemo {
+    /// How many concept files the memo holds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// What the last pass with this memo did.
+    #[cfg(test)]
+    pub(crate) fn last(&self) -> IndexRefresh {
+        self.last
+    }
+
+    /// About how many bytes of memory the memo holds.
+    #[cfg(test)]
+    pub(crate) fn approx_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<(String, MemoEntry)>() + 1;
+        let strings: usize = self
+            .entries
+            .iter()
+            .map(|(rel, e)| {
+                rel.capacity()
+                    + e.title.capacity()
+                    + e.description.as_ref().map_or(0, String::capacity)
+            })
+            .sum();
+        self.entries.capacity() * slot + strings
+    }
+}
+
+/// One concept file's title and description, as read under `key`.
+#[derive(Debug)]
+struct MemoEntry {
+    key: StatKey,
+    title: String,
+    description: Option<String>,
+}
+
+/// What tells one version of a file from the next without reading it: the
+/// length and the full-precision modification time, and on Unix the inode
+/// (a write through a temp file and a rename gets a new one) and the change
+/// time (any write or `touch` moves it, and it cannot be set back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatKey {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: (i64, i64),
+}
+
+impl StatKey {
+    fn of(meta: &std::fs::Metadata) -> StatKey {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        StatKey {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+            #[cfg(unix)]
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// Walk the domain, taking each concept's title and description from the
+/// memo where its stat still matches and reading it otherwise.
+fn collect(root: &Path, mode: ReflectionMode, memo: &mut ListingMemo, forced: &[String]) -> Walked {
     let mut walked = Walked::default();
+    if memo.root.as_deref() != Some(root) {
+        memo.entries.clear();
+        memo.root = Some(root.to_path_buf());
+    }
+    let forced: HashSet<&str> = forced.iter().map(String::as_str).collect();
+    let mut seen: HashMap<String, MemoEntry> = HashMap::with_capacity(memo.entries.len());
 
     // The same layout the sync walk applies, so the index lists exactly the
     // files Crystalline indexes: no hidden file or folder, none of the
     // artifact folders the MANIFEST provisions from inside this root and,
     // while the Reflection is in effect, nothing under `reflections/`.
     let layout = DomainLayout::at(root, mode);
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !layout.prunes_dir(&slash_rel(root, e.path())));
+    // Only a folder is pruned here; a file the layout leaves out is
+    // classified as such below, so it costs no path string of its own.
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        e.depth() == 0 || !e.file_type().is_dir() || !layout.prunes_dir(&slash_rel(root, e.path()))
+    });
 
     for entry in walker.filter_map(Result::ok) {
         let Some(rel) = rel_path(root, entry.path()) else {
@@ -163,7 +351,10 @@ fn collect(root: &Path, mode: ReflectionMode) -> Walked {
                 }
                 continue;
             }
-            PathClass::Engram | PathClass::EngramAsset if name.to_lowercase().ends_with(".md") => {}
+            // A markdown file under the domain's `assets/` folder is an
+            // attachment, never an engram, so it is not listed and the
+            // folder holds no knowledge.
+            PathClass::Engram if name.to_lowercase().ends_with(".md") => {}
             PathClass::Engram
             | PathClass::EngramAsset
             | PathClass::Hidden
@@ -172,13 +363,48 @@ fn collect(root: &Path, mode: ReflectionMode) -> Walked {
             | PathClass::Reflection(_) => continue,
         }
         let folder = parent_of(&rel).unwrap_or_default();
-        let (title, description) = title_and_description(entry.path());
-        walked
-            .concepts
-            .entry(folder)
-            .or_default()
-            .push(IndexEntry::file(&name, &title, description.as_deref()));
+        // The stat is taken before the read, so a file that changes between
+        // the two is remembered under its older stat and read again next time.
+        let key = entry.metadata().ok().map(|meta| StatKey::of(&meta));
+        let remembered = memo
+            .entries
+            .remove(&rel)
+            .filter(|e| key == Some(e.key) && !forced.contains(rel.as_str()));
+        let listed = match remembered {
+            Some(e) => {
+                walked.reused += 1;
+                let listed = IndexEntry::file(&name, &e.title, e.description.as_deref());
+                seen.insert(rel, e);
+                listed
+            }
+            None => {
+                walked.read += 1;
+                match title_and_description(entry.path()) {
+                    Some((title, description, bytes)) => {
+                        walked.bytes_read += bytes;
+                        let listed = IndexEntry::file(&name, &title, description.as_deref());
+                        // A file that could not be stat'd is not remembered.
+                        if let Some(key) = key {
+                            seen.insert(
+                                rel,
+                                MemoEntry {
+                                    key,
+                                    title,
+                                    description,
+                                },
+                            );
+                        }
+                        listed
+                    }
+                    // A file that cannot be read is listed by its stem and not
+                    // remembered, so it is read again once it can be.
+                    None => IndexEntry::file(&name, "", None),
+                }
+            }
+        };
+        walked.concepts.entry(folder).or_default().push(listed);
     }
+    memo.entries = seen;
 
     // The walk leaves an effective Reflection's folder out, so the listings a
     // pending switch had written there are looked for on their own: each is
@@ -233,18 +459,21 @@ fn stale_reflection_listings(root: &Path) -> Vec<String> {
 /// One concept's `title` and `description` frontmatter. A file that cannot be
 /// read or parsed yields neither, so the entry falls back to its filename stem
 /// and carries no description clause: an unreadable file still shows up in the
-/// listing rather than silently vanishing from it.
-fn title_and_description(path: &Path) -> (String, Option<String>) {
+/// listing rather than silently vanishing from it. The third value is the
+/// number of bytes read; `None` when the file could not be read at all.
+fn title_and_description(path: &Path) -> Option<(String, Option<String>, u64)> {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (String::new(), None);
+        return None;
     };
-    match crystalline_core::parse_engram(&text) {
+    let bytes = text.len() as u64;
+    Some(match crystalline_core::parse_engram(&text) {
         Ok(engram) => (
             engram.frontmatter.title.clone(),
             engram.frontmatter.description.clone(),
+            bytes,
         ),
-        Err(_) => (String::new(), None),
-    }
+        Err(_) => (String::new(), None, bytes),
+    })
 }
 
 /// The absolute path of a folder's index file.
@@ -296,6 +525,11 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
 }
+
+#[cfg(test)]
+mod oracle;
+#[cfg(test)]
+mod perf;
 
 #[cfg(test)]
 mod tests {
@@ -413,6 +647,196 @@ mod tests {
         assert!(!root.join("reflections/guides/index.md").exists());
         assert!(root.join("reflections/own/index.md").is_file());
         assert_eq!(refresh(root, ReflectionMode::Effective).removed, 0);
+    }
+
+    /// A markdown file under the domain's `assets/` folder is an attachment:
+    /// it gets no entry, and the listings an earlier version wrote there go.
+    #[test]
+    fn markdown_under_assets_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "notes/a.md", &engram("A", None));
+        write(root, "assets/readme.md", &engram("Readme", None));
+        write(root, "assets/drafts/sketch.md", &engram("Sketch", None));
+        write(
+            root,
+            "assets/index.md",
+            "# Contents\n\n* [Readme](readme.md)\n* [drafts/](drafts/)\n",
+        );
+        write(
+            root,
+            "assets/drafts/index.md",
+            "# Contents\n\n* [Sketch](sketch.md)\n",
+        );
+
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!(report.removed, 2);
+        assert!(!root.join("assets/index.md").exists());
+        assert!(!root.join("assets/drafts/index.md").exists());
+        assert_eq!(read(root, "notes/index.md"), "# Contents\n\n* [A](a.md)\n");
+        assert_eq!(
+            read(root, "index.md"),
+            "---\nokf_version: \"0.2\"\n---\n\n# Contents\n\n* [notes/](notes/)\n"
+        );
+    }
+
+    /// A folder that holds no knowledge loses the listing Crystalline wrote,
+    /// and keeps an `index.md` a person wrote.
+    #[test]
+    fn a_hand_written_index_in_a_folder_without_knowledge_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", None));
+        write(root, "gone/b.md", &engram("B", None));
+        refresh(root, ReflectionMode::Off);
+        assert!(root.join("gone/index.md").is_file());
+        std::fs::remove_file(root.join("gone/b.md")).unwrap();
+        let own = "# Our pages\n\nRead these first.\n";
+        write(root, "own/index.md", own);
+
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!(report.removed, 1);
+        assert!(!root.join("gone/index.md").exists());
+        assert_eq!(read(root, "own/index.md"), own);
+        assert_eq!(refresh(root, ReflectionMode::Off).removed, 0);
+    }
+
+    /// A domain with no knowledge at all keeps an `index.md` a person wrote at
+    /// its root.
+    #[test]
+    fn a_hand_written_root_index_in_an_empty_domain_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let own = "# Welcome\n\nNothing here yet.\n";
+        write(root, "index.md", own);
+        let report = refresh(root, ReflectionMode::Off);
+        assert_eq!((report.written, report.removed), (0, 0));
+        assert_eq!(read(root, "index.md"), own);
+    }
+
+    /// A title written over several lines is listed on one, so the listing
+    /// still reads as generated and goes once its folder is empty.
+    #[test]
+    fn a_listing_with_a_multi_line_title_is_still_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", None));
+        write(
+            root,
+            "sub/b.md",
+            "---\ntype: engram\ntitle: |\n  First line\n  second line\nstatus: current\n---\n\nBody\n",
+        );
+        refresh(root, ReflectionMode::Off);
+        assert_eq!(
+            read(root, "sub/index.md"),
+            "# Contents\n\n* [First line second line](b.md)\n"
+        );
+        std::fs::remove_file(root.join("sub/b.md")).unwrap();
+        assert_eq!(refresh(root, ReflectionMode::Off).removed, 1);
+        assert!(!root.join("sub/index.md").exists());
+    }
+
+    /// A pass with a memo reads only the files whose stat changed and the
+    /// forced paths, and the memo keeps only the files the walk found.
+    #[test]
+    fn the_memo_reads_only_what_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", None));
+        write(root, "sub/b.md", &engram("B", None));
+        write(root, "sub/c.md", &engram("C", None));
+        let mut memo = ListingMemo::default();
+
+        let first = refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert_eq!((first.read, first.reused, first.written), (3, 0, 2));
+        assert_eq!(memo.len(), 3);
+
+        let second = refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert_eq!((second.read, second.reused, second.written), (0, 3, 0));
+        assert_eq!(second.bytes_read, 0);
+
+        // The engine's write: a temp file renamed over the old one.
+        let tmp = root.join("sub/.b.tmp");
+        std::fs::write(&tmp, engram("B again", None)).unwrap();
+        std::fs::rename(&tmp, root.join("sub/b.md")).unwrap();
+        let third = refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert_eq!((third.read, third.reused, third.written), (1, 2, 1));
+        assert_eq!(
+            read(root, "sub/index.md"),
+            "# Contents\n\n* [B again](b.md)\n* [C](c.md)\n"
+        );
+
+        let forced = refresh_with(root, ReflectionMode::Off, &mut memo, &["a.md".to_string()]);
+        assert_eq!((forced.read, forced.reused), (1, 2));
+
+        std::fs::remove_file(root.join("sub/c.md")).unwrap();
+        refresh_with(
+            root,
+            ReflectionMode::Off,
+            &mut memo,
+            &["sub/c.md".to_string()],
+        );
+        assert_eq!(memo.len(), 2, "a deleted file leaves the memo");
+
+        // Another root starts from nothing.
+        let other = tempfile::tempdir().unwrap();
+        write(other.path(), "a.md", &engram("A", None));
+        let elsewhere = refresh_with(other.path(), ReflectionMode::Off, &mut memo, &[]);
+        assert_eq!((elsewhere.read, elsewhere.reused), (1, 0));
+        assert_eq!(memo.len(), 1);
+    }
+
+    /// The one change a stat cannot see: a rewrite that keeps the length,
+    /// the modification time, the inode and the change time. It cannot be
+    /// made on a normal filesystem, so the test puts the old title into the
+    /// memo under the file's current stat. Without the path forced the memo
+    /// is trusted; forced, the file is read again.
+    #[test]
+    fn a_rewrite_with_the_same_stat_needs_the_path_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("Old title", None));
+        let mut memo = ListingMemo::default();
+        refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        std::fs::write(root.join("a.md"), engram("New title", None)).unwrap();
+        let meta = std::fs::metadata(root.join("a.md")).unwrap();
+        memo.entries.get_mut("a.md").unwrap().key = StatKey::of(&meta);
+
+        refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert!(
+            read(root, "index.md").contains("[Old title](a.md)"),
+            "a same-stat rewrite is the memo's blind spot"
+        );
+
+        let report = refresh_with(root, ReflectionMode::Off, &mut memo, &["a.md".to_string()]);
+        assert_eq!(report.read, 1);
+        assert!(read(root, "index.md").contains("[New title](a.md)"));
+    }
+
+    /// A file that cannot be read is listed by its stem and read again on the
+    /// next pass, once it can be.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_not_remembered() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "locked.md", &engram("Locked", None));
+        let path = root.join("locked.md");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Running as root: nothing is unreadable.
+            return;
+        }
+        let mut memo = ListingMemo::default();
+        refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert!(read(root, "index.md").contains("[locked](locked.md)"));
+        assert_eq!(memo.len(), 0);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let report = refresh_with(root, ReflectionMode::Off, &mut memo, &[]);
+        assert_eq!(report.read, 1);
+        assert!(read(root, "index.md").contains("[Locked](locked.md)"));
     }
 
     #[test]

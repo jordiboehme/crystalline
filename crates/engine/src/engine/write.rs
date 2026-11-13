@@ -942,7 +942,8 @@ impl Engine {
         // new name.
         self.after_source_write(&p.domain, &source, &path).await;
         // The new engram belongs in its folder's generated index.
-        self.refresh_index_files(&p.domain).await;
+        self.refresh_index_files(&p.domain, crate::index_files::Touched::path(&path))
+            .await;
         self.nudge_embed();
 
         Ok(receipt)
@@ -1364,7 +1365,8 @@ impl Engine {
         if let Some(before) = switch_before {
             self.announce_switch_if_moved(&desc.domain, before, change_label(scope));
         }
-        self.refresh_index_files(&desc.domain).await;
+        self.refresh_index_files(&desc.domain, crate::index_files::Touched::path(&desc.path))
+            .await;
         self.nudge_embed();
 
         let mut receipt = json!({
@@ -1775,7 +1777,8 @@ impl Engine {
         if let Some(before) = switch_before {
             self.announce_switch_if_moved(domain, before, actor.clone());
         }
-        self.refresh_index_files(domain).await;
+        self.refresh_index_files(domain, crate::index_files::Touched::path(path))
+            .await;
 
         // Read back after the reindex, exactly as a save does: the index takes
         // the permalink from the restored frontmatter, which need not match

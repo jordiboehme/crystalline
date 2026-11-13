@@ -46,6 +46,7 @@ mod github_link;
 mod github_settings;
 pub mod github_webhook;
 mod graph;
+pub mod host_guard;
 mod identity_links;
 mod kept;
 mod login_throttle;
@@ -385,6 +386,8 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::Decision,
         oauth::DecisionResponse,
         schemas::OauthGrantInfo,
+        schemas::OauthGrantEnded,
+        schemas::OauthGrantEndReason,
         oauth::TokenForm,
         oauth::RevokeForm,
         oauth::TokenResponse,

@@ -194,6 +194,12 @@ impl TursoStore {
     pub async fn open_with_readers(path: &Path, readers: usize) -> Result<TursoStore> {
         let path_str = path.to_string_lossy().to_string();
         let mut store = Self::build(&path_str, Some(path_str.clone())).await?;
+        // Engram text, private domains included: owner-only on Unix, including
+        // a database that was just created at the umask's mode. Best effort,
+        // like the state folder itself.
+        if let Err(e) = crystalline_core::owner_only::tighten_database(path) {
+            tracing::warn!("could not make {} owner-only: {e}", path.display());
+        }
         if readers > 0 {
             let mut slots = Vec::with_capacity(readers);
             for _ in 0..readers {

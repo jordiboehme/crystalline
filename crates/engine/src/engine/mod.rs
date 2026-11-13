@@ -1216,6 +1216,12 @@ pub struct Engine {
     // (`Store::record_sync`), so an idle domain's stored stamp stays where
     // it was; the domain listing shows the newer of the two.
     last_synced: std::sync::Mutex<HashMap<String, String>>,
+    // What the generated `index.md` refresh of each file domain remembers
+    // between passes, by domain name, behind a per-domain lock: one refresh
+    // of a domain runs at a time, so a pass that started first can never
+    // finish last and write an older listing. See `refresh_index_files`.
+    index_memos:
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<crate::index_files::ListingMemo>>>>,
     // Per-domain lock serializing `origin_add`, `origin_update` and
     // `origin_status` against each other for one domain, so a connect and a
     // pull racing on the same domain never interleave. Created lazily, one
@@ -1227,8 +1233,9 @@ pub struct Engine {
     // for one file on disk, keyed by absolute path. See `Engine::write_lock`
     // for what it protects and why a compare-then-write without it is a race
     // two browser tabs can reach. Created lazily, one `tokio::sync::Mutex` per
-    // file ever written through those verbs.
-    write_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    // file being written through those verbs; an entry nobody holds or waits
+    // on is pruned (see `WriteLocks`).
+    write_locks: std::sync::Mutex<WriteLocks>,
     // One engram move at a time in this process. A move gathers the engrams
     // that link it before it writes and rewrites them after, so two moves
     // that link each other could each rewrite a file the other one had just
@@ -2653,8 +2660,9 @@ impl Engine {
             heartbeat_secs: env_secs("CRYSTALLINE_HEARTBEAT_SECS", DEFAULT_HEARTBEAT_SECS),
             stale_secs: crystalline_index::stale_secs(),
             last_synced: std::sync::Mutex::new(HashMap::new()),
+            index_memos: std::sync::Mutex::new(HashMap::new()),
             origin_locks: std::sync::Mutex::new(HashMap::new()),
-            write_locks: std::sync::Mutex::new(HashMap::new()),
+            write_locks: std::sync::Mutex::new(WriteLocks::default()),
             move_lock: tokio::sync::Mutex::new(()),
             #[cfg(any(test, feature = "testing"))]
             moves_waiting: std::sync::atomic::AtomicUsize::new(0),
@@ -4039,6 +4047,29 @@ impl Engine {
         if let Some(at) = synced.remove(old) {
             synced.insert(new.to_string(), at);
         }
+    }
+
+    /// Move what the index refresh of `old` remembers to `new`, for a
+    /// rename. The memo checks its root on every pass, so a rename that also
+    /// moved the folder starts it over by itself.
+    pub(crate) fn rekey_index_memo(&self, old: &str, new: &str) {
+        let mut memos = self.index_memos.lock().unwrap();
+        if let Some(memo) = memos.remove(old) {
+            memos.insert(new.to_string(), memo);
+        }
+    }
+
+    /// The memo and lock of `domain`'s index refresh, made on first use.
+    pub(crate) fn index_memo(
+        &self,
+        domain: &str,
+    ) -> Arc<tokio::sync::Mutex<crate::index_files::ListingMemo>> {
+        self.index_memos
+            .lock()
+            .unwrap()
+            .entry(domain.to_string())
+            .or_default()
+            .clone()
     }
 
     /// The time this engine last finished a sync of `domain`, if it did.
@@ -8858,6 +8889,7 @@ impl Engine {
     pub fn forget_domain(&self, name: &str) {
         self.forget_contradiction_domain(name);
         self.last_synced.lock().unwrap().remove(name);
+        self.index_memos.lock().unwrap().remove(name);
         self.bump_reflection_generation(name);
         self.discovered_domains.write().unwrap().remove(name);
         self.mark_names_stale();
@@ -9472,6 +9504,8 @@ mod manifest_rename;
 mod rename_domain;
 mod review_mode;
 pub(crate) use review_mode::{folder_may_fold_case, page_folds_case};
+#[cfg(test)]
+mod index_files_tests;
 mod schemas;
 mod search;
 mod sources;
@@ -10758,6 +10792,63 @@ fn read_engram_file(root: &Path, rel: &str) -> Option<Engram> {
     parse_engram(&source).ok()
 }
 
+/// How many entries [`WriteLocks`] holds before its first prune.
+const WRITE_LOCKS_PRUNE_AT: usize = 256;
+
+/// The per-file write locks, keyed by [`lock_key`], with what keeps the map
+/// from growing with every file a long-lived process ever wrote.
+///
+/// **An entry nobody holds is pruned.** A holder and a waiter each keep a
+/// clone of the entry's `Arc` (taking the mutex needs one), and a clone is
+/// only ever made under the map's own guard, which the prune holds too. So an
+/// entry whose `Arc` is held by the map alone is one nobody holds, nobody waits
+/// on and nobody can reach before the guard is released: dropping it changes
+/// nothing, and the next writer of that file gets a fresh mutex no one else has.
+///
+/// The prune runs when the map reaches `prune_at`, which then moves to twice
+/// what is left (never below [`WRITE_LOCKS_PRUNE_AT`]), so a burst of held
+/// locks costs one walk per doubling rather than one per lookup.
+#[derive(Debug)]
+pub(super) struct WriteLocks {
+    map: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    prune_at: usize,
+}
+
+impl Default for WriteLocks {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            prune_at: WRITE_LOCKS_PRUNE_AT,
+        }
+    }
+}
+
+impl WriteLocks {
+    /// The lock for `key`, created when there is none.
+    fn get(&mut self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let lock = match self.map.get(key) {
+            Some(lock) => lock.clone(),
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                self.map.insert(key.to_string(), lock.clone());
+                lock
+            }
+        };
+        if self.map.len() >= self.prune_at {
+            // The lock just handed out has a second `Arc` now, so it stays.
+            self.map.retain(|_, lock| Arc::strong_count(lock) > 1);
+            self.prune_at = (self.map.len() * 2).max(WRITE_LOCKS_PRUNE_AT);
+        }
+        lock
+    }
+
+    /// How many entries the map holds.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// The [`Engine::write_locks`] key for a file: its canonical path wherever the
 /// filesystem can resolve one, so two spellings of one file - a symlinked
 /// domain root, a `..` segment, a case difference the filesystem folds - share
@@ -10891,6 +10982,22 @@ fn dir_is_nonempty(dir: &Path) -> bool {
 /// second walk of the domain.
 fn changed_anything(report: &SyncReport) -> bool {
     report.added > 0 || report.updated > 0 || report.deleted > 0 || report.moved > 0
+}
+
+/// The paths a sync's refresh of the generated index files reads again
+/// whatever their stat says: every path the apply changed (both ends of a
+/// move) and every file that failed, so a file that turned unparseable is
+/// listed by its stem at once.
+fn touched_by(report: &SyncReport) -> crate::index_files::Touched {
+    let mut paths = Vec::with_capacity(report.changes.len() + report.failed.len());
+    for change in &report.changes {
+        paths.push(change.path.clone());
+        if let Some(from) = &change.from {
+            paths.push(from.clone());
+        }
+    }
+    paths.extend(report.failed.iter().map(|(path, _)| path.clone()));
+    crate::index_files::Touched::Paths(paths)
 }
 
 /// A captured audience on the change bus, released when dropped, so a
@@ -12629,7 +12736,9 @@ impl ReindexHooks for DaemonReindexHooks<'_> {
     async fn after_apply(&self, name: &str, report: &SyncReport) {
         self.engine.bump_after_apply(name, report);
         if changed_anything(report) {
-            self.engine.refresh_index_files(name).await;
+            self.engine
+                .refresh_index_files(name, touched_by(report))
+                .await;
         }
         self.engine.announce_report(name, report, None);
         self.engine.after_host_move_resolved(name, report);
@@ -12708,6 +12817,7 @@ mod context_rank_tests {
             salience,
             status: "current".to_string(),
             actor: String::new(),
+            recorded_at: None,
         }
     }
 
@@ -12989,6 +13099,60 @@ mod lock_tests {
         let other = engine.write_lock(Path::new("/roots/known/beta.md"));
         assert!(!Arc::ptr_eq(&first, &other), "and it is per file");
         assert_eq!(engine.write_locks.lock().unwrap().len(), 2);
+    }
+
+    /// Locks nobody holds are pruned once the map reaches its threshold, and
+    /// the threshold moves with what is left.
+    #[tokio::test]
+    async fn unheld_write_locks_are_pruned() {
+        let engine = engine_with_domains(&["known"]).await;
+        let kept = engine.write_lock(Path::new("/roots/known/kept.md"));
+        for n in 0..WRITE_LOCKS_PRUNE_AT * 3 {
+            drop(engine.write_lock(Path::new(&format!("/roots/known/f{n}.md"))));
+        }
+        let len = engine.write_locks.lock().unwrap().len();
+        assert!(
+            len < WRITE_LOCKS_PRUNE_AT,
+            "the map was pruned of the dropped locks, {len} left"
+        );
+        assert!(
+            Arc::ptr_eq(&kept, &engine.write_lock(Path::new("/roots/known/kept.md"))),
+            "a held lock survives every prune"
+        );
+    }
+
+    /// A lock that is held, and one a writer waits on, both survive a prune and
+    /// stay the lock a fresh lookup answers: pruning never splits a lock.
+    #[tokio::test]
+    async fn a_prune_keeps_held_and_awaited_write_locks() {
+        let engine = Arc::new(engine_with_domains(&["known"]).await);
+        let path = Path::new("/roots/known/busy.md");
+        let held = engine.write_lock(path).lock_owned().await;
+        let waiter = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                let lock = engine.write_lock(Path::new("/roots/known/busy.md"));
+                let _guard = lock.lock().await;
+            })
+        };
+        // The waiter has its `Arc` once it is parked on the mutex.
+        while Arc::strong_count(&engine.write_lock(path)) < 4 {
+            tokio::task::yield_now().await;
+        }
+        for n in 0..WRITE_LOCKS_PRUNE_AT * 2 {
+            drop(engine.write_lock(Path::new(&format!("/roots/known/f{n}.md"))));
+        }
+        let again = engine.write_lock(path);
+        assert!(
+            again.try_lock().is_err(),
+            "the lookup after the prune answers the held mutex"
+        );
+        drop(held);
+        waiter.await.unwrap();
+        assert!(
+            again.try_lock().is_ok(),
+            "and the waiter took and released it"
+        );
     }
 
     /// Two spellings of one file share a lock, which is the point of keying on

@@ -112,11 +112,16 @@ async fn serve(opts: Options) -> Fixture {
 /// constructor at all, and that the peer address the locality decision rests on
 /// exists on a request the daemon's own `axum::serve` answered.
 async fn serve_production(setup_token: Option<String>) -> Fixture {
+    serve_production_for(setup_token, &[]).await
+}
+
+/// [`serve_production`] with a `service.allowed_hosts` list.
+async fn serve_production_for(setup_token: Option<String>, allowed_hosts: &[String]) -> Fixture {
     let (engine, auth, tmp) = instance(&Options::default()).await;
     let router = http_router(
         engine,
         Arc::new(AtomicUsize::new(0)),
-        &[],
+        allowed_hosts,
         auth.clone(),
         setup_token,
     )
@@ -779,4 +784,119 @@ async fn the_production_router_threads_the_setup_token_to_the_handler() {
         "and no refusal ever echoes a token: {doc}"
     );
     assert_eq!(tokenless.auth.user_count().await.unwrap(), 0);
+}
+
+/// **A DNS-rebinding page cannot claim first-run setup.** Such a page points
+/// its own host name at 127.0.0.1, so its requests arrive from a loopback peer
+/// with no forwarding header, which is exactly what setup trusts. What gives
+/// it away is the `Host` it carries: its own name. The JSON API refuses a
+/// `Host` that is not loopback, not on `service.allowed_hosts` and not the
+/// host of `service.public_url`, the rule the MCP transport applies, so the
+/// page is answered `403` and no account is created.
+#[tokio::test]
+async fn a_rebinding_host_cannot_reach_the_json_api() {
+    let fixture = serve_production_for(None, &[]).await;
+    let port = fixture.addr.port();
+    let body = json!({ "name": "mallory", "password": "chosen-by-the-page" });
+
+    for host in [
+        format!("attacker.example:{port}"),
+        "attacker.example".to_string(),
+    ] {
+        let refused = client()
+            .post(format!("http://{}/api/v1/auth/setup", fixture.addr))
+            .header("host", &host)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 403, "{host}");
+        let detail = problem(refused).await["detail"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(detail.contains("service.allowed_hosts"), "{detail}");
+
+        let probe = client()
+            .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+            .header("host", &host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), 403, "{host}: a read is refused as well");
+    }
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "no account was created"
+    );
+
+    // The machine's own browser, at a loopback name, is served as before.
+    let local = client()
+        .post(format!("http://{}/api/v1/auth/setup", fixture.addr))
+        .header("host", format!("localhost:{port}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(local.status(), 200);
+}
+
+/// A host on `service.allowed_hosts` is served, with any port when the entry
+/// names none, and every other name is still refused.
+#[tokio::test]
+async fn a_listed_host_reaches_the_json_api() {
+    let fixture = serve_production_for(None, &["kb.example".to_string()]).await;
+    let me = |host: String| {
+        let addr = fixture.addr;
+        async move {
+            client()
+                .get(format!("http://{addr}/api/v1/auth/me"))
+                .header("host", host)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let port = fixture.addr.port();
+    assert_eq!(me(format!("kb.example:{port}")).await, 200);
+    assert_eq!(me("KB.example".to_string()).await, 200);
+    assert_eq!(me(format!("127.0.0.1:{port}")).await, 200);
+    assert_eq!(me(format!("other.example:{port}")).await, 403);
+
+    // A single `*` turns the guard off, as it does for MCP.
+    let open = serve_production_for(None, &["*".to_string()]).await;
+    let status = client()
+        .get(format!("http://{}/api/v1/auth/me", open.addr))
+        .header("host", "anything.example")
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+}
+
+/// The GitHub App's webhook is left out of the `Host` check: GitHub delivers
+/// to the public address, and every delivery proves itself with a signature a
+/// web page cannot make. A delivery at an unlisted host reaches the webhook's
+/// own checks, which refuse this unsigned one in their own words, never with
+/// the guard's.
+#[tokio::test]
+async fn the_github_webhook_is_not_held_to_the_host_list() {
+    let fixture = serve_production_for(None, &[]).await;
+    let answer = client()
+        .post(format!("http://{}/api/v1/github/webhook", fixture.addr))
+        .header("host", "crystalline.example.com")
+        .header("x-github-event", "ping")
+        .header("x-github-delivery", "1")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let status = answer.status();
+    let text = answer.text().await.unwrap();
+    assert!(
+        !text.contains("service.allowed_hosts"),
+        "{status}: the guard did not answer: {text}"
+    );
 }
