@@ -165,7 +165,7 @@ fn run_open(
     exit_1_is_missing: bool,
 ) -> Result<(), String> {
     use std::process::Stdio;
-    let output = std::process::Command::new(program)
+    let output = crystalline_core::thread_env::strip_from(&mut std::process::Command::new(program))
         .args(args)
         .arg(file)
         .stdin(Stdio::null())

@@ -23,6 +23,7 @@ mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
 mod line_limit;
+pub mod logging;
 pub mod mcp;
 pub mod mcp_gate;
 pub mod remote_ctl;

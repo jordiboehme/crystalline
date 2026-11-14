@@ -48,12 +48,20 @@ const SHAPING_PREFIXES: &[&str] = &[crate::overlay::DOMAIN_ENV_PREFIX, "CRYSTALL
 
 /// Variables only a client reads for itself: the install channel marker, the
 /// Claude Desktop launcher's version, the binary path the extension pins for
-/// its launcher and the Apple Silicon acceleration switch.
+/// its launcher and the Apple Silicon acceleration switch. The process
+/// tuning variables sit here too: the read connections, the log format and
+/// the embedding threads change how a daemon runs, never what it serves.
+/// The thread marker in particular is set by every process of this binary,
+/// so as a shaping variable it would be "set here" in every shell.
 const CLIENT_ONLY: &[&str] = &[
     crystalline_core::desktop_extension::BINARY_ENV,
     crate::overlay::CHANNEL_ENV,
     crate::overlay::LAUNCHER_VERSION_ENV,
     crystalline_index::ACCELERATION_ENV,
+    crystalline_index::reader::READ_CONNECTIONS_ENV,
+    crate::logging::LOG_FORMAT_VAR,
+    crate::logging::EMBED_THREADS_VAR,
+    crate::logging::EMBED_THREADS_FROM_VAR,
 ];
 
 /// Test seams, never shaping.
@@ -301,6 +309,10 @@ mod tests {
             "CRYSTALLINE_LAUNCHER_VERSION",
             "CRYSTALLINE_BINARY",
             "CRYSTALLINE_ACCELERATION",
+            "CRYSTALLINE_READ_CONNECTIONS",
+            "CRYSTALLINE_LOG_FORMAT",
+            "CRYSTALLINE_EMBED_THREADS",
+            "CRYSTALLINE_EMBED_THREADS_FROM",
             "CRYSTALLINE_NOT_A_SETTING",
             "PATH",
         ] {

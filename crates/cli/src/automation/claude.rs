@@ -96,6 +96,8 @@ pub(super) fn claude_args(cfg: &ClaudeRun) -> Vec<String> {
 /// and the stream as JSON lines.
 pub fn claude_command(cfg: &ClaudeRun) -> std::process::Command {
     let mut command = std::process::Command::new(&cfg.program);
+    // The agent is not Crystalline: it gets no embedding thread variables.
+    crystalline_core::thread_env::strip_from(&mut command);
     command.args(claude_args(cfg));
     command
 }

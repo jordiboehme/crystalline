@@ -244,6 +244,16 @@ pub const RESERVED_VARS: &[&str] = &[
     // because its length floor is a serve rule, so reserved here.
     "CRYSTALLINE_SETUP_TOKEN",
     "CRYSTALLINE_SETUP_TOKEN_FILE",
+    // Read straight from the environment when a store opens
+    // (`crystalline_index::reader`): `0` turns the read connections off.
+    crystalline_index::reader::READ_CONNECTIONS_ENV,
+    // Read in `main` and when logging starts, before the config overlay
+    // loads (`crystalline_service::logging`): the log format, the embedding
+    // thread count and the marker `main` leaves beside `RAYON_NUM_THREADS`
+    // for a daemon it starts.
+    "CRYSTALLINE_LOG_FORMAT",
+    "CRYSTALLINE_EMBED_THREADS",
+    "CRYSTALLINE_EMBED_THREADS_FROM",
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -1428,6 +1438,14 @@ mod tests {
         assert!(is_reserved("CRYSTALLINE_TEST_PACKAGE"));
         assert!(is_reserved("CRYSTALLINE_TEST_DAEMON_TASK"));
         assert!(is_reserved("CRYSTALLINE_TEST_PARENT_PID"));
+        for name in [
+            "CRYSTALLINE_READ_CONNECTIONS",
+            "CRYSTALLINE_LOG_FORMAT",
+            "CRYSTALLINE_EMBED_THREADS",
+            "CRYSTALLINE_EMBED_THREADS_FROM",
+        ] {
+            assert!(is_reserved(name), "{name}");
+        }
     }
 
     #[test]

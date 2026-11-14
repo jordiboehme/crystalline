@@ -356,17 +356,13 @@ pub async fn run_serve(
     // `DEFAULT_LOG_FILTER` when it is unset or does not parse.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
-    let _ = match log_file {
-        Some(file) => tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .with_env_filter(filter)
-            .try_init(),
-        None => tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .try_init(),
-    };
+    match log_file {
+        Some(file) => {
+            crate::logging::init_subscriber(std::sync::Mutex::new(file), Some(false), filter)
+        }
+        None => crate::logging::init_subscriber(std::io::stderr, None, filter),
+    }
+    crate::logging::log_thread_plan();
 
     // The single load chokepoint: parse the environment overlay, resolve the
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer

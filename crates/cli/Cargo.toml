@@ -91,6 +91,7 @@ tempfile = { workspace = true }
 # lifecycle hook logs only when RUST_LOG is set, so a hook with nothing to
 # say says nothing on either stream. The best-effort credential sweeps log a
 # swallowed error at debug, so RUST_LOG=debug finds it.
+num_cpus = "1.17"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

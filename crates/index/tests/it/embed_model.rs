@@ -307,6 +307,62 @@ async fn the_vendored_modernbert_reproduces_the_onnx_reference_vectors() {
     }
 }
 
+/// The provider cuts a batch into passes under an attention budget, shortest
+/// rows first, and puts the vectors back in input order. A mixed batch, in no
+/// particular order and with six rows at the 512-token cap (more than one pass
+/// can hold), has to give every text the vector it gets alone, where nothing
+/// is padded and a full-length text is a pass of one.
+#[tokio::test]
+#[ignore = "downloads the real granite model"]
+async fn a_mixed_batch_split_into_passes_matches_one_text_at_a_time() {
+    require_dedicated_models_dir();
+    let provider = provider_from_config(&local_config()).await.unwrap();
+    let words = [
+        "river", "Zeitung", "ledger", "orbit", "Kaffee", "signal", "harbour", "Wolke", "kernel",
+        "meadow", "Brücke", "lantern", "quarry", "Fenster", "pixel", "thunder",
+    ];
+    // Long enough that the tokenizer truncates it at 512 tokens.
+    let long = |seed: usize| -> String {
+        (0..900)
+            .map(|i| words[(i * 7 + seed * 5 + i / 3) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let texts: Vec<String> = vec![
+        long(1),
+        "short one".to_string(),
+        long(2),
+        "The build uses Node 18 and runs on every push.".to_string(),
+        long(3),
+        long(4),
+        words.join(" ").repeat(6),
+        "Ein kurzer deutscher Satz.".to_string(),
+        long(5),
+        long(6),
+        words.join(", ").repeat(2),
+        "x".to_string(),
+    ];
+    let batched = provider.embed(&texts).await.unwrap();
+    assert_eq!(batched.len(), texts.len());
+    for (i, (text, many)) in texts.iter().zip(&batched).enumerate() {
+        let one = provider
+            .embed(std::slice::from_ref(text))
+            .await
+            .unwrap()
+            .remove(0);
+        let diff = one
+            .iter()
+            .zip(many)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!("input {i}: batch vs alone, max abs diff {diff:.2e}");
+        assert!(
+            diff <= 1e-5,
+            "input {i}: the batch differs from the single call by {diff}"
+        );
+    }
+}
+
 /// Unit vectors, so the dot product is the cosine.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
