@@ -57,6 +57,7 @@ pub mod skills;
 pub mod tags;
 pub mod temporal;
 pub mod text;
+pub mod thread_env;
 pub mod threads;
 pub mod tree;
 pub mod verify;

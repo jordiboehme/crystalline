@@ -410,13 +410,19 @@ impl Drop for EchoOff {
 /// either way.
 pub fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
-    let opened = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let opened = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
+    let opened = crystalline_core::thread_env::strip_from(&mut std::process::Command::new("open"))
+        .arg(url)
         .spawn();
+    #[cfg(target_os = "windows")]
+    let opened =
+        crystalline_core::thread_env::strip_from(&mut std::process::Command::new("rundll32"))
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
-    let opened = std::process::Command::new("xdg-open").arg(url).spawn();
+    let opened =
+        crystalline_core::thread_env::strip_from(&mut std::process::Command::new("xdg-open"))
+            .arg(url)
+            .spawn();
     if let Err(e) = opened {
         tracing::debug!("could not open a browser: {e}");
     }

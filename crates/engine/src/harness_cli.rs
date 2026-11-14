@@ -23,7 +23,7 @@ pub enum CliRun {
 /// for a missing binary is reported as [`CliRun::NotFound`], any other spawn
 /// or wait failure as [`CliRun::Failed`].
 fn run_cli(program: &str, args: &[&str]) -> CliRun {
-    match Command::new(program)
+    match crystalline_core::thread_env::strip_from(&mut Command::new(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -83,7 +83,7 @@ pub fn run_harness_cli_capture(harness: HarnessKind, args: &[&str]) -> CliCaptur
             .split_first()
             .expect("a candidate invocation always names a program");
         let full: Vec<&str> = prefix.iter().chain(args.iter()).copied().collect();
-        let outcome = match Command::new(program)
+        let outcome = match crystalline_core::thread_env::strip_from(&mut Command::new(program))
             .args(&full)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -122,7 +122,7 @@ enum CliOutput {
 /// capturing sibling of [`run_cli`]: stdin is still null, but stdout and
 /// stderr are collected rather than discarded.
 fn run_cli_output(program: &str, args: &[&str]) -> CliOutput {
-    match Command::new(program)
+    match crystalline_core::thread_env::strip_from(&mut Command::new(program))
         .args(args)
         .stdin(Stdio::null())
         .output()

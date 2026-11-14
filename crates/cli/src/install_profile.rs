@@ -549,7 +549,7 @@ fn program_notice(harness: HarnessKind, program: &str) -> Option<String> {
         return install::path_binary_notice();
     }
     let mine = env!("CARGO_PKG_VERSION");
-    let out = std::process::Command::new(program)
+    let out = crystalline_core::thread_env::strip_from(&mut std::process::Command::new(program))
         .arg("--version")
         .output()
         .ok();
