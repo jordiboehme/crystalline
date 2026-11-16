@@ -86,7 +86,7 @@ mod search;
 mod session;
 
 pub use migrations::{
-    INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, apply_locked_set,
+    INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, WIPE_TABLES, apply_locked_set,
 };
 pub use owner::{
     Acquired, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT,

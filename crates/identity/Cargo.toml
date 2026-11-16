@@ -15,6 +15,12 @@ path = "src/lib.rs"
 # The test seam another crate's tests read (the argon2 verification counter
 # in auth_store), and nothing else. Off in every released binary.
 testing = []
+# The Postgres arm of the auth store (`auth_store/pg.rs`): accounts, sessions,
+# tokens and grants in the configured Postgres database. Off here so a
+# `--no-default-features` build of a dependent stays free of sqlx; the service
+# and the CLI turn it on through their own `postgres` feature, and this
+# crate's own tests through the self dev-dependency below.
+postgres = ["dep:sqlx", "crystalline-index/postgres"]
 
 [dependencies]
 # hex_lower (ruled: identity depends on the index for it).
@@ -36,8 +42,12 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 turso = { workspace = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+# This crate's own tests always build the Postgres arm, so
+# `CRYSTALLINE_TEST_AUTH_BACKEND=postgres` can run the suite against it.
+crystalline-identity = { path = ".", features = ["postgres"] }
 futures = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

@@ -73,10 +73,97 @@ use turso::{Builder, Connection, Database, Value};
 mod db;
 #[cfg(test)]
 mod lint;
+#[cfg(feature = "postgres")]
+mod pg;
+#[cfg(feature = "postgres")]
+mod pg_migrations;
 #[cfg(test)]
 mod tests;
 
 use db::{AuthDb, AuthRow};
+#[cfg(feature = "postgres")]
+pub use pg::auth_write_lock;
+#[cfg(feature = "postgres")]
+pub use pg_migrations::{AUTH_MIGRATIONS, AUTH_TABLES};
+
+/// Why an accounts store did not open.
+#[derive(Debug)]
+pub enum AuthOpenError {
+    /// The accounts tables are older than this binary, and this open may not
+    /// migrate them (only the database's owner migrates).
+    Behind {
+        /// The version the tables are at.
+        found: i64,
+        /// The version this binary needs.
+        need: i64,
+    },
+    /// The accounts tables were migrated by a newer Crystalline.
+    TooNew {
+        /// The version the tables are at.
+        found: i64,
+        /// The newest version this binary knows.
+        known: i64,
+    },
+    /// Anything else: the connection, the migration, the file.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for AuthOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthOpenError::Behind { found, need } => write!(
+                f,
+                "the accounts tables are at version {found}, this binary needs {need}"
+            ),
+            AuthOpenError::TooNew { found, known } => write!(
+                f,
+                "the accounts tables are at version {found}, newer than this binary knows ({known}); upgrade Crystalline"
+            ),
+            AuthOpenError::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthOpenError {}
+
+impl From<anyhow::Error> for AuthOpenError {
+    fn from(e: anyhow::Error) -> AuthOpenError {
+        AuthOpenError::Other(e)
+    }
+}
+
+/// The orphan prunes of the four credential lookups: a row whose account no
+/// longer exists (and, for sessions, an expired one). Turso runs each on
+/// every lookup; Postgres runs all four at open and then hourly
+/// ([`AuthStore::prune_orphans_if_due`]).
+const PRUNE_SESSIONS: &str = "DELETE FROM sessions
+                 WHERE expires_at <= ?1
+                    OR NOT EXISTS (SELECT 1 FROM users u WHERE u.name = sessions.user_name)";
+const PRUNE_MCP_TOKENS: &str = "DELETE FROM mcp_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.\"user\")";
+const PRUNE_IDENTITY_LINKS: &str = "DELETE FROM identity_link
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")";
+const PRUNE_OAUTH_GRANTS: &str = "DELETE FROM oauth_grants
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")";
+
+/// On Postgres, the orphans of one name, swept before an account of that
+/// name is created: the hourly prune leaves a window, and an orphan is
+/// exactly what the next account to take the name would inherit.
+const SWEEP_ORPHANS_OF: [&str; 4] = [
+    "DELETE FROM sessions WHERE user_name = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM mcp_tokens WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM identity_link WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+    "DELETE FROM oauth_grants WHERE \"user\" = ?1
+     AND NOT EXISTS (SELECT 1 FROM users u WHERE u.name = ?1)",
+];
+
+/// How old a `last_seen_at` or `last_used` stamp must be before Postgres
+/// writes it again, so the hot path does not write a row on every request.
+/// Turso stamps every time.
+const STAMP_THRESHOLD_SECS: i64 = 60;
 
 /// What a user may do. Ordered least to most privileged; the REST layer maps
 /// each endpoint to the minimum role it accepts.
@@ -1680,6 +1767,73 @@ impl AuthStore {
         Ok(store)
     }
 
+    /// Open the accounts store at `loc`: the Turso file through
+    /// [`AuthStore::open`], or the Postgres database (and schema), migrating
+    /// its accounts tables under the migration lock. `opts` names the
+    /// instance and, in the owner's process, carries the fence every
+    /// connection checks.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+    ) -> Result<AuthStore> {
+        match loc {
+            crystalline_core::config::AccountsLocation::File(path) => AuthStore::open(path).await,
+            crystalline_core::config::AccountsLocation::Postgres(cfg) => {
+                AuthStore::open_postgres(cfg, opts, true)
+                    .await
+                    .map_err(|e| match e {
+                        AuthOpenError::Other(e) => e,
+                        other => anyhow::Error::new(other),
+                    })
+            }
+        }
+    }
+
+    /// [`AuthStore::open_at`] without migrating: on Postgres, accounts
+    /// tables behind this binary are [`AuthOpenError::Behind`] and ahead of
+    /// it [`AuthOpenError::TooNew`], for an opener that does not own the
+    /// database and so may not migrate. A Turso file opens as with
+    /// [`AuthStore::open`].
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_no_migrate(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
+        match loc {
+            crystalline_core::config::AccountsLocation::File(path) => {
+                AuthStore::open(path).await.map_err(AuthOpenError::Other)
+            }
+            crystalline_core::config::AccountsLocation::Postgres(cfg) => {
+                AuthStore::open_postgres(cfg, opts, false).await
+            }
+        }
+    }
+
+    /// The Postgres arm of [`AuthStore::open_at`]: connect, migrate (or
+    /// check the version) and run the first orphan prune. Nothing of the
+    /// Turso open applies: no busy timeout, no column patching, no token
+    /// move, no file checks.
+    #[cfg(feature = "postgres")]
+    async fn open_postgres(
+        cfg: &crystalline_core::config::DatabaseConfig,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        migrate: bool,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
+        let target = crystalline_index::postgres::PgTarget::from_config(cfg)
+            .map_err(|e| AuthOpenError::Other(anyhow::Error::new(e)))?;
+        let pg = Box::pin(pg::PgAuth::open(target, opts.clone(), migrate)).await?;
+        let store = AuthStore {
+            db: AuthDb::Postgres(Box::new(pg)),
+            guard: tokio::sync::Mutex::new(()),
+        };
+        {
+            let _guard = store.guard.lock().await;
+            store.prune_orphans_if_due().await?;
+        }
+        Ok(store)
+    }
+
     /// Move every grant's tokens out of `oauth_grants` into
     /// `oauth_grant_token` (0.32.1). Runs at every open and changes nothing
     /// once every grant is moved, the same contract as the idempotent
@@ -1804,27 +1958,46 @@ impl AuthStore {
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "INSERT INTO users
-                     (name, display, email, role, reflection, pass_hash, disabled, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display.to_string()),
-                    match email {
-                        Some(e) => Value::Text(e.to_string()),
-                        None => Value::Null,
-                    },
-                    Value::Text(role.as_str().to_string()),
-                    reflection.to_db(),
-                    Value::Text(hash),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .with_context(|| format!("adding user '{name}'"))?;
-        Ok(())
+        // On Postgres the insert takes the write lock, so it cannot slip past
+        // `add_first_admin`'s empty-table check, and it sweeps the name's
+        // orphans first. Turso's single writer needs neither.
+        let pg = self.db.is_postgres();
+        if pg {
+            self.db
+                .begin_immediate()
+                .await
+                .with_context(|| format!("adding user '{name}'"))?;
+        }
+        let result = async {
+            self.sweep_orphans_of(&name).await?;
+            self.db
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, reflection, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.to_string()),
+                        match email {
+                            Some(e) => Value::Text(e.to_string()),
+                            None => Value::Null,
+                        },
+                        Value::Text(role.as_str().to_string()),
+                        reflection.to_db(),
+                        Value::Text(hash),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding user '{name}'"))?;
+            Ok(())
+        }
+        .await;
+        if pg {
+            self.db.finish(result).await
+        } else {
+            result
+        }
     }
 
     /// How many accounts exist. Zero is what opens the first-run setup path,
@@ -1871,6 +2044,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("creating the first admin '{name}'"))?;
         let result = async {
+            self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
                     "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
@@ -2389,6 +2563,7 @@ impl AuthStore {
                     ));
                 }
             }
+            self.sweep_orphans_of(&name).await?;
             let inserted = self
                 .db
                 .execute(
@@ -2405,16 +2580,7 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("provisioning user '{name}'"))?;
-            self.db
-                .execute(
-                    "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                    vec![
-                        Value::Text(name.clone()),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
-                .await
-                .context("stamping last_seen_at")?;
+            self.stamp_seen(&name).await?;
             let user = self
                 .db
                 .query_first(
@@ -2451,14 +2617,14 @@ impl AuthStore {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "DELETE FROM identity_link
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")",
-                vec![],
-            )
-            .await
-            .context("pruning orphaned identity links")?;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_IDENTITY_LINKS, vec![])
+                .await
+                .context("pruning orphaned identity links")?;
+        }
         Ok(self
             .db
             .query_first(
@@ -2942,6 +3108,7 @@ impl AuthStore {
                 ));
             }
             let name = self.free_account_name(&base).await?;
+            self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
                     "INSERT INTO users
@@ -3279,15 +3446,14 @@ impl AuthStore {
     pub async fn session_user(&self, token: &str) -> Result<Option<(User, String)>> {
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "DELETE FROM sessions
-                 WHERE expires_at <= ?1
-                    OR NOT EXISTS (SELECT 1 FROM users u WHERE u.name = sessions.user_name)",
-                vec![Value::Integer(now)],
-            )
-            .await
-            .context("pruning expired and orphaned sessions")?;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_SESSIONS, vec![Value::Integer(now)])
+                .await
+                .context("pruning expired and orphaned sessions")?;
+        }
         let Some(row) = self
             .db
             .query_first(
@@ -3307,16 +3473,7 @@ impl AuthStore {
             return Ok(None);
         }
         let csrf = cell_text(&row, 7).unwrap_or_default();
-        self.db
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                vec![
-                    Value::Text(user.name.clone()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .context("stamping last_seen_at")?;
+        self.stamp_seen(&user.name).await?;
         Ok(Some((user, csrf)))
     }
 
@@ -3333,16 +3490,115 @@ impl AuthStore {
     /// given: a name that is nobody stamps nothing, which is not an error.
     pub async fn mark_seen(&self, name: &str) -> Result<()> {
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+        self.stamp_seen(name).await
+    }
+
+    /// Stamp `last_seen_at` of `name` with now. On Postgres only when the
+    /// stamp is missing or older than [`STAMP_THRESHOLD_SECS`].
+    async fn stamp_seen(&self, name: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+        if self.db.is_postgres() {
+            self.db
+                .execute(
+                    "UPDATE users SET last_seen_at = ?2
+                     WHERE name = ?1 AND (last_seen_at IS NULL OR last_seen_at < ?3)",
+                    vec![
+                        Value::Text(name.to_string()),
+                        Value::Text(now.to_rfc3339()),
+                        Value::Text(stamp_cutoff(now)),
+                    ],
+                )
+                .await
+        } else {
+            self.db
+                .execute(
+                    "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                    vec![Value::Text(name.to_string()), Value::Text(now.to_rfc3339())],
+                )
+                .await
+        }
+        .context("stamping last_seen_at")?;
+        Ok(())
+    }
+
+    /// Stamp `last_used` of the row `id` of `table` (`mcp_tokens` or
+    /// `oauth_grants`) with now. On Postgres only when the stamp is missing
+    /// or older than [`STAMP_THRESHOLD_SECS`].
+    async fn stamp_used(&self, table: &'static str, id: i64) -> Result<()> {
+        let now = chrono::Utc::now();
+        let (sql, params) = match (table, self.db.is_postgres()) {
+            ("mcp_tokens", false) => (
+                "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+            ),
+            ("oauth_grants", false) => (
+                "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
+                vec![Value::Integer(id), Value::Text(now.to_rfc3339())],
+            ),
+            ("mcp_tokens", true) => (
+                "UPDATE mcp_tokens SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
                 vec![
-                    Value::Text(name.to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Integer(id),
+                    Value::Text(now.to_rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
                 ],
-            )
+            ),
+            ("oauth_grants", true) => (
+                "UPDATE oauth_grants SET last_used = ?2
+                 WHERE id = ?1 AND (last_used IS NULL OR last_used < ?3)",
+                vec![
+                    Value::Integer(id),
+                    Value::Text(now.to_rfc3339()),
+                    Value::Text(stamp_cutoff(now)),
+                ],
+            ),
+            _ => bail!("no last_used stamp on {table}"),
+        };
+        self.db.execute(sql, params).await?;
+        Ok(())
+    }
+
+    /// The Postgres orphan prune: the four lookup prunes at once, at open
+    /// and then at most hourly. The caller holds `guard`.
+    async fn prune_orphans_if_due(&self) -> Result<()> {
+        if !self.db.prune_due() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.db
+            .execute(PRUNE_SESSIONS, vec![Value::Integer(now)])
             .await
-            .context("stamping last_seen_at")?;
+            .context("pruning expired and orphaned sessions")?;
+        self.db
+            .execute(PRUNE_MCP_TOKENS, vec![])
+            .await
+            .context("pruning orphaned mcp tokens")?;
+        self.db
+            .execute(PRUNE_IDENTITY_LINKS, vec![])
+            .await
+            .context("pruning orphaned identity links")?;
+        self.db
+            .execute(PRUNE_OAUTH_GRANTS, vec![])
+            .await
+            .context("pruning orphaned oauth grants")?;
+        Ok(())
+    }
+
+    /// On Postgres, drop the credentials an account of `name` left behind
+    /// when it vanished other than through [`AuthStore::remove_user`], right
+    /// before an account of that name is created ([`SWEEP_ORPHANS_OF`]).
+    /// Nothing on Turso, whose lookups prune every time.
+    async fn sweep_orphans_of(&self, name: &str) -> Result<()> {
+        if !self.db.is_postgres() {
+            return Ok(());
+        }
+        for sql in SWEEP_ORPHANS_OF {
+            self.db
+                .execute(sql, vec![Value::Text(name.to_string())])
+                .await
+                .with_context(|| format!("sweeping the orphaned credentials of '{name}'"))?;
+        }
         Ok(())
     }
 
@@ -3546,6 +3802,7 @@ impl AuthStore {
             .await
             .with_context(|| format!("adding user '{name}'"))?;
         let result = async {
+            self.sweep_orphans_of(&name).await?;
             self.db
                 .execute(
                     "INSERT INTO users
@@ -3593,14 +3850,14 @@ impl AuthStore {
     pub async fn mcp_token_user(&self, token: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "DELETE FROM mcp_tokens
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.\"user\")",
-                vec![],
-            )
-            .await
-            .context("pruning orphaned mcp tokens")?;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_MCP_TOKENS, vec![])
+                .await
+                .context("pruning orphaned mcp tokens")?;
+        }
         let Some(row) = self
             .db
             .query_first(
@@ -3620,14 +3877,7 @@ impl AuthStore {
             return Ok(None);
         }
         if let Ok(Value::Integer(id)) = row.get_value(7) {
-            self.db
-                .execute(
-                    "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
-                    vec![
-                        Value::Integer(id),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
+            self.stamp_used("mcp_tokens", id)
                 .await
                 .context("stamping an mcp token's last_used")?;
         }
@@ -4169,6 +4419,26 @@ impl AuthStore {
         client_uri: Option<&str>,
         redirect_uris: &[String],
     ) -> Result<OauthClient> {
+        match self
+            .register_oauth_client_within(name, client_uri, redirect_uris, None)
+            .await?
+        {
+            Some(client) => Ok(client),
+            None => bail!("the oauth client registrations are full"),
+        }
+    }
+
+    /// [`AuthStore::register_oauth_client`] under a ceiling: `None` when
+    /// `cap` registrations are already stored. The count and the insert are
+    /// one transaction, so two writers (two processes, or the daemon and a
+    /// command) cannot both take the last place.
+    pub async fn register_oauth_client_within(
+        &self,
+        name: &str,
+        client_uri: Option<&str>,
+        redirect_uris: &[String],
+        cap: Option<usize>,
+    ) -> Result<Option<OauthClient>> {
         if redirect_uris.is_empty() {
             bail!("an oauth client registration needs at least one redirect uri");
         }
@@ -4188,6 +4458,20 @@ impl AuthStore {
             .await
             .context("registering an oauth client")?;
         let result = async {
+            if let Some(cap) = cap {
+                let held = match self
+                    .db
+                    .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
+                    .await?
+                    .map(|row| row.get_value(0))
+                {
+                    Some(Ok(Value::Integer(n))) => n as usize,
+                    _ => bail!("the oauth client registrations could not be counted"),
+                };
+                if held >= cap {
+                    return Ok(false);
+                }
+            }
             self.db
                 .execute(
                     "INSERT INTO oauth_clients
@@ -4205,11 +4489,12 @@ impl AuthStore {
                     ],
                 )
                 .await
-                .context("registering an oauth client")
+                .context("registering an oauth client")?;
+            Ok(true)
         }
         .await;
-        self.db.finish(result).await?;
-        Ok(client)
+        let stored = self.db.finish(result).await?;
+        Ok(stored.then_some(client))
     }
 
     /// One registration by id, or `None` when there is none - which is what an
@@ -4398,15 +4683,15 @@ impl AuthStore {
         Ok(removed as usize)
     }
 
-    /// How many registrations are stored, for the cap the registration
-    /// endpoint enforces. That one caller is the whole of it; nothing reports
-    /// this number on a settings surface.
+    /// How many registrations are stored. The registration endpoint's cap
+    /// counts inside [`AuthStore::register_oauth_client_within`] instead,
+    /// in the transaction of the insert; nothing reports this number on a
+    /// settings surface.
     pub async fn count_oauth_clients(&self) -> Result<usize> {
         let _guard = self.guard.lock().await;
         // A count this method cannot read fails the call rather than reading
-        // as an empty table: the one caller is the ceiling on registration,
-        // the only unauthenticated write here, and a zero there would admit
-        // the very row the ceiling exists to refuse.
+        // as an empty table, as the cap's own count does: a zero there would
+        // admit the very row the ceiling exists to refuse.
         match self
             .db
             .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
@@ -5013,14 +5298,14 @@ impl AuthStore {
         }
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
-        self.db
-            .execute(
-                "DELETE FROM oauth_grants
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")",
-                vec![],
-            )
-            .await
-            .context("pruning orphaned oauth grants")?;
+        if self.db.is_postgres() {
+            self.prune_orphans_if_due().await?;
+        } else {
+            self.db
+                .execute(PRUNE_OAUTH_GRANTS, vec![])
+                .await
+                .context("pruning orphaned oauth grants")?;
+        }
         let Some(row) = self
             .db
             .query_first(
@@ -5046,14 +5331,7 @@ impl AuthStore {
             return Ok(None);
         }
         if let Ok(Value::Integer(id)) = row.get_value(7) {
-            self.db
-                .execute(
-                    "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
-                    vec![
-                        Value::Integer(id),
-                        Value::Text(chrono::Utc::now().to_rfc3339()),
-                    ],
-                )
+            self.stamp_used("oauth_grants", id)
                 .await
                 .context("stamping an oauth grant's last_used")?;
         }
@@ -6691,28 +6969,47 @@ impl AuthStore {
     /// The follow-up existence probe only picks between the two messages -
     /// nothing was written either way - so it does not need to share the
     /// statement's transaction.
+    ///
+    /// On Postgres the statement runs under the write lock: read committed
+    /// lets two guarded edits of two different admins each see the other
+    /// still there, where Turso's single writer decides them one at a time.
     async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
         let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
-        let changed = self
-            .db
-            .execute(sql, vec![Value::Text(name.clone()), value])
-            .await
-            .with_context(|| format!("updating user '{name}'"))?;
-        if changed == 0 {
-            let exists = self
-                .db
-                .query_first(
-                    "SELECT 1 FROM users WHERE name = ?1",
-                    vec![Value::Text(name.clone())],
-                )
-                .await?;
-            if exists.is_some() {
-                return Err(last_admin_error(verb, &name));
-            }
-            bail!("no such user: '{name}'");
+        let pg = self.db.is_postgres();
+        if pg {
+            self.db
+                .begin_immediate()
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
         }
-        Ok(())
+        let result = async {
+            let changed = self
+                .db
+                .execute(sql, vec![Value::Text(name.clone()), value])
+                .await
+                .with_context(|| format!("updating user '{name}'"))?;
+            if changed == 0 {
+                let exists = self
+                    .db
+                    .query_first(
+                        "SELECT 1 FROM users WHERE name = ?1",
+                        vec![Value::Text(name.clone())],
+                    )
+                    .await?;
+                if exists.is_some() {
+                    return Err(last_admin_error(verb, &name));
+                }
+                bail!("no such user: '{name}'");
+            }
+            Ok(())
+        }
+        .await;
+        if pg {
+            self.db.finish(result).await
+        } else {
+            result
+        }
     }
 
     /// Run an `INSERT ... RETURNING id` and give back the new row's id. The id
@@ -6872,6 +7169,14 @@ fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
 /// A unix timestamp column as the RFC 3339 string a person reads. The expiry
 /// columns are integers so every comparison happens in SQL; this is the one
 /// place that turns one back into text, on the way out to a management screen.
+/// The stamp older than which Postgres writes `last_seen_at` or
+/// `last_used` again: [`STAMP_THRESHOLD_SECS`] before `now`, in the same
+/// RFC 3339 UTC form the stamps are written in, so the text comparison is a
+/// time comparison.
+fn stamp_cutoff(now: chrono::DateTime<chrono::Utc>) -> String {
+    (now - chrono::Duration::seconds(STAMP_THRESHOLD_SECS)).to_rfc3339()
+}
+
 fn rfc3339_from_unix(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|when| when.to_rfc3339())

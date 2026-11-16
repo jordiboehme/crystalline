@@ -166,12 +166,13 @@ fn the_keyword_filter_matches_whole_words_before_whitespace() {
 }
 
 /// Every statement goes through the executor: the store never reaches a
-/// connection field of `self` outside `db.rs`.
+/// connection field of `self` outside the executor itself, `db.rs` and its
+/// Postgres arm `pg.rs`.
 #[test]
 fn auth_store_has_no_direct_conn_access() {
     let needle = ["self", ".conn"].concat();
     for (path, text) in store_sources() {
-        if !path.ends_with("auth_store/db.rs") {
+        if !path.ends_with("auth_store/db.rs") && !path.ends_with("auth_store/pg.rs") {
             assert!(!text.contains(&needle), "{needle} in {}", path.display());
         }
     }

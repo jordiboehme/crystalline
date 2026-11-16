@@ -2233,7 +2233,12 @@ async fn a_token_only_account_with_a_taken_name_is_refused_and_issues_nothing() 
         .add_token_only_user("ADA", "Ada", None, Role::Editor, "build")
         .await
         .unwrap_err();
-    assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
+    assert!(
+        format!("{err:#}")
+            .to_lowercase()
+            .contains("unique constraint"),
+        "{err:#}"
+    );
     assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
     let ada = store.user("ada").await.unwrap().unwrap();
     assert_eq!(ada.role, Role::Viewer, "the existing account is untouched");
@@ -2268,7 +2273,12 @@ async fn a_failed_token_issue_leaves_no_account() {
         )
         .await
         .unwrap_err();
-    assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
+    assert!(
+        format!("{err:#}")
+            .to_lowercase()
+            .contains("unique constraint"),
+        "{err:#}"
+    );
     assert!(
         store.user("agent-build").await.unwrap().is_none(),
         "the account was rolled back with the token"
@@ -2328,6 +2338,14 @@ async fn an_orphaned_mcp_token_row_cannot_resolve_and_gets_pruned() {
         .unwrap();
 
     assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+    // Turso prunes on the lookup itself. Postgres prunes at open and then
+    // hourly, and sweeps a name's orphans when an account takes the name.
+    if store.db.is_postgres() {
+        store
+            .add_user("ada", "Ada The Second", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+    }
 
     let remaining = store
         .db
@@ -6507,4 +6525,492 @@ async fn provisioning_writes_run_in_a_transaction() {
         .await
         .unwrap();
     assert_eq!(auth.db.begins(), before + 2);
+}
+
+/// Turso stamps `last_seen_at` and `last_used` on every lookup, as it always
+/// has: the 60 s threshold is the Postgres arm's alone.
+#[tokio::test]
+async fn turso_stamps_on_every_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::open(&dir.path().join("web-auth.db"))
+        .await
+        .unwrap();
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let session = store.create_session("ada", 3600).await.unwrap();
+    store.session_user(&session.token).await.unwrap().unwrap();
+    let first = store.user("ada").await.unwrap().unwrap().last_seen;
+    store.session_user(&session.token).await.unwrap().unwrap();
+    let second = store.user("ada").await.unwrap().unwrap().last_seen;
+    assert!(first.is_some());
+    assert_ne!(first, second, "every lookup stamps on Turso");
+}
+
+/// The Postgres arm's own tests: each runs in a scratch schema of its own
+/// when `CRYSTALLINE_TEST_POSTGRES_URL` is set, whatever
+/// `CRYSTALLINE_TEST_AUTH_BACKEND` names, and skips with a note otherwise.
+mod postgres {
+    use super::*;
+    use crate::auth_store::db::pg_test_store;
+
+    fn pg_url() -> Option<String> {
+        let url = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|u| !u.is_empty());
+        if url.is_none() {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+        }
+        url
+    }
+
+    /// The tables a migration's SQL creates.
+    fn created_tables(sql: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = sql;
+        while let Some(at) = rest.find("CREATE TABLE ") {
+            rest = &rest[at + "CREATE TABLE ".len()..];
+            let name = rest.trim_start_matches("IF NOT EXISTS ");
+            let name: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            out.push(name);
+        }
+        out
+    }
+
+    /// The auth, index and instance tables share a schema, so their names
+    /// must not meet, and a wipe of the index never touches an account or
+    /// the owner row.
+    #[test]
+    fn auth_index_instance_tables_disjoint_and_not_wiped() {
+        use crystalline_index::postgres::{INDEX_SET, INSTANCE_TABLES, WIPE_TABLES};
+        let auth_created: Vec<String> = AUTH_MIGRATIONS
+            .steps
+            .iter()
+            .flat_map(|m| created_tables(m.sql))
+            .collect();
+        let mut listed: Vec<&str> = AUTH_TABLES.to_vec();
+        listed.sort_unstable();
+        let mut created: Vec<&str> = auth_created.iter().map(String::as_str).collect();
+        created.sort_unstable();
+        assert_eq!(
+            listed, created,
+            "AUTH_TABLES lists what the auth set creates"
+        );
+        let index: Vec<String> = INDEX_SET
+            .steps
+            .iter()
+            .flat_map(|m| created_tables(m.sql))
+            .collect();
+        assert!(index.iter().any(|t| t == "engram"), "{index:?}");
+        let ledgers = [AUTH_MIGRATIONS.ledger, INDEX_SET.ledger];
+        for table in AUTH_TABLES.iter().chain(&[AUTH_MIGRATIONS.ledger]) {
+            assert!(
+                !index.iter().any(|t| t == table),
+                "{table} is also an index table"
+            );
+            assert!(
+                !INSTANCE_TABLES.contains(table),
+                "{table} is an instance table"
+            );
+            assert!(!WIPE_TABLES.contains(table), "a wipe would clear {table}");
+        }
+        for table in INSTANCE_TABLES {
+            assert!(!WIPE_TABLES.contains(table), "a wipe would clear {table}");
+        }
+        assert_ne!(ledgers[0], ledgers[1]);
+    }
+
+    /// The write lock mixes in the schema, and it is the `auth-write` key.
+    #[test]
+    fn auth_write_lock_key_is_the_schema_mixed_lock_key() {
+        use crystalline_index::postgres::lock_key;
+        assert_eq!(
+            auth_write_lock(Some("a")),
+            lock_key(Some("a"), "auth-write")
+        );
+        assert_ne!(auth_write_lock(Some("a")), auth_write_lock(Some("b")));
+        assert_ne!(auth_write_lock(None), lock_key(None, "instance-owner"));
+    }
+
+    /// BOOL comes back as `Integer(0 or 1)`, the integer types as `Integer`,
+    /// text as `Text` and a typed NULL as `Null`; a type the store does not
+    /// read is an error, not a guess.
+    #[tokio::test]
+    async fn decoder_maps_bool_to_integer() {
+        let Some(url) = pg_url() else { return };
+        let (store, _guard) = pg_test_store(&url, "dec").await;
+        let row = store
+            .db
+            .query_first(
+                "SELECT true, false, CAST(NULL AS BOOLEAN), CAST(7 AS SMALLINT),
+                        CAST(8 AS INTEGER), CAST(9 AS BIGINT), 'x', ?1 IS NULL",
+                vec![Value::Null],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let cells: Vec<Value> = (0..8).map(|i| row.get_value(i).unwrap()).collect();
+        assert_eq!(
+            cells,
+            vec![
+                Value::Integer(1),
+                Value::Integer(0),
+                Value::Null,
+                Value::Integer(7),
+                Value::Integer(8),
+                Value::Integer(9),
+                Value::Text("x".to_string()),
+                Value::Integer(1),
+            ]
+        );
+        let err = store
+            .db
+            .query("SELECT CAST(1 AS NUMERIC)", vec![])
+            .await
+            .err()
+            .expect("a NUMERIC column is refused");
+        assert!(format!("{err:#}").contains("NUMERIC"), "{err:#}");
+        // A NULL into a BIGINT column is written with the portable cast.
+        store
+            .db
+            .execute(
+                "INSERT INTO github_delivery (id, received_at) VALUES (?1, COALESCE(CAST(?2 AS BIGINT), 5))",
+                vec![Value::Text("d".to_string()), Value::Null],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A password login on Postgres: `password_present` selects a boolean,
+    /// which only works because BOOL decodes to an integer.
+    #[tokio::test]
+    async fn password_login_works_on_postgres() {
+        let Some(url) = pg_url() else { return };
+        let (store, _guard) = pg_test_store(&url, "pwl").await;
+        assert!(store.db.is_postgres());
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        assert!(store.has_password("ada").await.unwrap());
+        let user = store
+            .verify_password("ada", "correct horse")
+            .await
+            .unwrap()
+            .expect("the right password logs in");
+        assert_eq!(user.role, Role::Admin);
+        assert!(
+            store
+                .verify_password("ada", "wrong")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let session = store.create_session("ada", 3600).await.unwrap();
+        let (user, _csrf) = store.session_user(&session.token).await.unwrap().unwrap();
+        assert_eq!(user.name, "ada");
+        store.ensure_user("bob", Role::Viewer, 10).await.unwrap();
+        assert!(!store.has_password("bob").await.unwrap());
+        assert!(store.passwordless_users().await.unwrap().contains("bob"));
+    }
+
+    /// Two stores (a daemon and a `users` command) racing for the first
+    /// admin: exactly one wins, and the table holds one account.
+    #[tokio::test]
+    async fn two_stores_add_first_admin_once() {
+        let Some(url) = pg_url() else { return };
+        for _ in 0..5 {
+            let (a, guard) = pg_test_store(&url, "faa").await;
+            let b = guard.second().await;
+            let (one, two) = tokio::join!(
+                a.add_first_admin("ada", "Ada", "pw12345678"),
+                b.add_first_admin("bob", "Bob", "pw12345678"),
+            );
+            assert!(one.unwrap() ^ two.unwrap(), "exactly one first admin");
+            assert_eq!(a.user_count().await.unwrap(), 1);
+            assert_eq!(a.list_users().await.unwrap()[0].role, Role::Admin);
+        }
+    }
+
+    /// The account cap and the client cap count inside the write lock, so
+    /// two stores never both take the last place.
+    #[tokio::test]
+    async fn user_cap_and_client_cap_hold_under_two_stores() {
+        let Some(url) = pg_url() else { return };
+        for _ in 0..5 {
+            let (a, guard) = pg_test_store(&url, "cap").await;
+            let b = guard.second().await;
+            let (one, two) = tokio::join!(
+                a.ensure_user_created("ada", Role::Viewer, 1),
+                b.ensure_user_created("bob", Role::Viewer, 1),
+            );
+            assert!(
+                one.is_ok() ^ two.is_ok(),
+                "exactly one account under a cap of 1"
+            );
+            let refused = one.err().or(two.err()).unwrap();
+            assert_eq!(
+                StoreRefusal::kind_of(&refused),
+                Some(RefusalKind::CapReached)
+            );
+            assert_eq!(a.user_count().await.unwrap(), 1);
+            let uris = ["https://client.example/cb".to_string()];
+            let (one, two) = tokio::join!(
+                a.register_oauth_client_within("One", None, &uris, Some(1)),
+                b.register_oauth_client_within("Two", None, &uris, Some(1)),
+            );
+            let (one, two) = (one.unwrap(), two.unwrap());
+            assert!(
+                one.is_some() ^ two.is_some(),
+                "exactly one client under a cap of 1"
+            );
+            assert_eq!(a.count_oauth_clients().await.unwrap(), 1);
+        }
+    }
+
+    /// Two stores presenting one refresh token at the same moment: the first
+    /// rotates it, the second, seeing the committed rotation, gets a pair of
+    /// its own inside the grace window.
+    #[tokio::test]
+    async fn concurrent_refresh_gives_one_rotated_one_reissued() {
+        let Some(url) = pg_url() else { return };
+        for _ in 0..5 {
+            let (a, guard) = pg_test_store(&url, "ref").await;
+            let b = guard.second().await;
+            a.add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+            let client = a
+                .register_oauth_client("Client", None, &["https://c.example/cb".to_string()])
+                .await
+                .unwrap();
+            let grant = a
+                .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+                .await
+                .unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let (one, two) = tokio::join!(
+                a.refresh_oauth_grant_at(&grant.refresh_token, &client.client_id, None, now),
+                b.refresh_oauth_grant_at(&grant.refresh_token, &client.client_id, None, now),
+            );
+            let outcomes = [one.unwrap(), two.unwrap()];
+            let rotated = outcomes
+                .iter()
+                .filter(|o| matches!(o, RefreshOutcome::Rotated(_)))
+                .count();
+            let reissued = outcomes
+                .iter()
+                .filter(|o| matches!(o, RefreshOutcome::Reissued { .. }))
+                .count();
+            assert_eq!((rotated, reissued), (1, 1), "{outcomes:?}");
+        }
+    }
+
+    /// On Postgres a lookup stamps `last_seen_at` and `last_used` only when
+    /// the stamp is older than 60 s.
+    #[tokio::test]
+    async fn stamp_skipped_under_60s() {
+        let Some(url) = pg_url() else { return };
+        let (store, _guard) = pg_test_store(&url, "stm").await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let session = store.create_session("ada", 3600).await.unwrap();
+        store.session_user(&session.token).await.unwrap().unwrap();
+        let first = store.user("ada").await.unwrap().unwrap().last_seen;
+        assert!(first.is_some(), "a first sighting is stamped");
+        store.session_user(&session.token).await.unwrap().unwrap();
+        store.mark_seen("ada").await.unwrap();
+        assert_eq!(store.user("ada").await.unwrap().unwrap().last_seen, first);
+        let old = (chrono::Utc::now() - chrono::Duration::seconds(61)).to_rfc3339();
+        store
+            .db
+            .execute(
+                "UPDATE users SET last_seen_at = ?1 WHERE name = 'ada'",
+                vec![Value::Text(old.clone())],
+            )
+            .await
+            .unwrap();
+        store.session_user(&session.token).await.unwrap().unwrap();
+        let moved = store.user("ada").await.unwrap().unwrap().last_seen.unwrap();
+        assert!(moved > old, "{moved} after {old}");
+
+        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
+        store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        let used = store.list_mcp_tokens("ada").await.unwrap()[0]
+            .last_used
+            .clone();
+        assert!(used.is_some());
+        store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        assert_eq!(
+            store.list_mcp_tokens("ada").await.unwrap()[0].last_used,
+            used
+        );
+    }
+
+    /// The write lock is per schema: a transaction held open in one schema
+    /// does not hold up a writer in another, and does hold up a second
+    /// writer in its own.
+    #[tokio::test]
+    async fn auth_write_lock_is_schema_mixed() {
+        let Some(url) = pg_url() else { return };
+        let (a, guard_a) = pg_test_store(&url, "wla").await;
+        let (b, _guard_b) = pg_test_store(&url, "wlb").await;
+        let a2 = guard_a.second().await;
+        a.db.begin_immediate().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b.db.begin_immediate())
+            .await
+            .expect("another schema's writer is not held up")
+            .unwrap();
+        b.db.finish(Ok(())).await.unwrap();
+        let same = tokio::spawn(async move {
+            a2.db.begin_immediate().await.unwrap();
+            a2.db.finish(Ok(())).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!same.is_finished(), "the same schema's writer waits");
+        a.db.finish(Ok(())).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), same)
+            .await
+            .expect("the waiting writer goes ahead once the lock is released")
+            .unwrap();
+    }
+
+    /// A lost connection is replaced on the next statement, but never inside
+    /// a transaction: that one fails and stays failed until it is finished.
+    #[tokio::test]
+    async fn a_lost_connection_reconnects_but_never_inside_a_transaction() {
+        let Some(url) = pg_url() else { return };
+        let (store, guard) = pg_test_store(&url, "rec").await;
+        let killer = guard.second().await;
+        let pid = |row: Option<AuthRow>| match row.unwrap().get_value(0).unwrap() {
+            Value::Integer(n) => n,
+            other => panic!("{other:?}"),
+        };
+        let kill = async |pid: i64| {
+            killer
+                .db
+                .query_first(
+                    "SELECT pg_terminate_backend(CAST(?1 AS INTEGER))",
+                    vec![Value::Integer(pid)],
+                )
+                .await
+                .unwrap();
+        };
+        let first = pid(store
+            .db
+            .query_first("SELECT pg_backend_pid()", vec![])
+            .await
+            .unwrap());
+        kill(first).await;
+        // The first statement after the kill may fail; the one after it
+        // runs on a new connection.
+        let _ = store.db.query_first("SELECT 1", vec![]).await;
+        let second = pid(store
+            .db
+            .query_first("SELECT pg_backend_pid()", vec![])
+            .await
+            .unwrap());
+        assert_ne!(first, second);
+
+        store.db.begin_immediate().await.unwrap();
+        kill(second).await;
+        assert!(store.db.query_first("SELECT 1", vec![]).await.is_err());
+        let err = store
+            .db
+            .query_first("SELECT 1", vec![])
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("inside a transaction"),
+            "{err:#}"
+        );
+        assert!(store.db.finish(Ok(())).await.is_err());
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        assert_eq!(store.user_count().await.unwrap(), 1);
+    }
+
+    /// An opener that may not migrate is told whether the accounts tables
+    /// are behind or ahead of this binary; one that may, migrates, and is
+    /// refused by tables a newer binary wrote.
+    #[tokio::test]
+    async fn no_migrate_open_reports_behind_and_too_new() {
+        use crystalline_core::config::AccountsLocation;
+        use crystalline_index::postgres::PgSessionOptions;
+        let Some(url) = pg_url() else { return };
+        let scratch = crate::auth_store::pg::AuthScratch::new(&url, "nom");
+        let loc = AccountsLocation::Postgres(scratch.config());
+        let opts = PgSessionOptions::default();
+        match AuthStore::open_at_no_migrate(&loc, &opts).await {
+            Err(AuthOpenError::Behind { found: 0, need: 1 }) => {}
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("an unmigrated schema opened"),
+        }
+        let store = AuthStore::open_at(&loc, &opts).await.unwrap();
+        AuthStore::open_at_no_migrate(&loc, &opts).await.unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO auth_schema_migration (version, applied_at) VALUES (99, 'later')",
+                vec![],
+            )
+            .await
+            .unwrap();
+        match AuthStore::open_at_no_migrate(&loc, &opts).await {
+            Err(AuthOpenError::TooNew {
+                found: 99,
+                known: 1,
+            }) => {}
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a newer schema opened"),
+        }
+        let err = AuthStore::open_at(&loc, &opts).await.err().unwrap();
+        assert!(
+            format!("{err:#}").contains("newer than this binary"),
+            "{err:#}"
+        );
+        assert!(scratch.name().starts_with("nom_"));
+    }
+
+    /// The orphan prune runs when a store opens: a session whose account
+    /// vanished is gone once another store opens the schema.
+    #[tokio::test]
+    async fn the_orphan_prune_runs_at_open() {
+        let Some(url) = pg_url() else { return };
+        let (store, guard) = pg_test_store(&url, "opo").await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        store.create_session("ada", 3600).await.unwrap();
+        store
+            .db
+            .execute("DELETE FROM users WHERE name = 'ada'", vec![])
+            .await
+            .unwrap();
+        let count = async |s: &AuthStore| match s
+            .db
+            .query_first("SELECT COUNT(*) FROM sessions", vec![])
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap()
+        {
+            Value::Integer(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(count(&store).await, 1);
+        let other = guard.second().await;
+        assert_eq!(count(&other).await, 0);
+    }
 }
