@@ -7501,14 +7501,11 @@ async fn standalone_on_postgres(
     crystalline_index::PostgresStore::open_in_schema(&url, &schema)
         .await
         .unwrap();
-    let sep = if url.contains('?') { '&' } else { '?' };
     let mut cfg = config(true);
     cfg.database = Some(crystalline_core::config::DatabaseConfig {
         backend: crystalline_core::config::DatabaseBackend::Postgres,
-        url: Some(format!(
-            "{url}{sep}options=-c%20search_path%3D{schema},public"
-        )),
-        schema: None,
+        url: Some(url.clone()),
+        schema: Some(schema.clone()),
     });
     let config_path = tmp.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();

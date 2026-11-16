@@ -27,6 +27,8 @@ struct Env {
     /// The worker threads of every child's runtime (`TOKIO_WORKER_THREADS`),
     /// or the default of one per core.
     workers: Option<&'static str>,
+    /// Extra variables every child gets (`Env::on_postgres`).
+    extra: Vec<(&'static str, String)>,
 }
 
 impl Env {
@@ -54,6 +56,13 @@ impl Env {
         Env::with(tag, "https://huggingface.co", Some("1"))
     }
 
+    /// Point every child at the scratch schema of `pg` through the
+    /// `CRYSTALLINE_DATABASE_*` variables.
+    fn on_postgres(mut self, pg: &PgScratch) -> Env {
+        self.extra = pg.env();
+        self
+    }
+
     fn with(tag: &str, hub: &'static str, workers: Option<&'static str>) -> Env {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -64,7 +73,12 @@ impl Env {
         std::fs::create_dir_all(dir.join("config")).unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();
         std::fs::create_dir_all(dir.join("cache")).unwrap();
-        Env { dir, hub, workers }
+        Env {
+            dir,
+            hub,
+            workers,
+            extra: Vec::new(),
+        }
     }
 
     /// Isolate a child (and, through inheritance, any daemon it spawns) into
@@ -109,6 +123,9 @@ impl Env {
             );
         if let Some(workers) = self.workers {
             cmd.env("TOKIO_WORKER_THREADS", workers);
+        }
+        for (key, value) in &self.extra {
+            cmd.env(key, value);
         }
     }
 
@@ -2116,19 +2133,11 @@ fn two_openers_of_one_postgres_index_never_both_run_a_rename() {
     let Some(pg) = PgScratch::new("renpg") else {
         return;
     };
-    let (url, schema) = (pg.url.clone(), pg.schema.clone());
+    let url = pg.url.clone();
 
-    let env = Env::new("renpg");
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let db_url = format!("{url}{sep}options=-c%20search_path%3D{schema},public");
+    let env = Env::new("renpg").on_postgres(&pg);
     std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
-    std::fs::write(
-        env.config_path(),
-        format!(
-            "database:\n  backend: postgres\n  url: \"{db_url}\"\nservice:\n  response_format: json\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(env.config_path(), "service:\n  response_format: json\n").unwrap();
     env.setup_domain("eng");
     // The store names a Postgres index by host and database, no credentials
     // and no query.
@@ -2173,20 +2182,12 @@ fn a_daemonless_sync_refuses_a_domain_another_instance_hosts_on_postgres() {
     let Some(pg) = PgScratch::new("hostpg") else {
         return;
     };
-    let (url, schema) = (pg.url.clone(), pg.schema.clone());
+    let schema = pg.schema.clone();
     let run_sql = |sql: &str| pg.sql(sql);
 
-    let env = Env::new("hostpg");
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let db_url = format!("{url}{sep}options=-c%20search_path%3D{schema},public");
+    let env = Env::new("hostpg").on_postgres(&pg);
     std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
-    std::fs::write(
-        env.config_path(),
-        format!(
-            "database:\n  backend: postgres\n  url: \"{db_url}\"\nservice:\n  response_format: json\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(env.config_path(), "service:\n  response_format: json\n").unwrap();
     env.setup_domain("eng");
     let config_path = env.config_path();
     let config_arg = config_path.to_str().unwrap();
@@ -2331,7 +2332,7 @@ fn the_embedded_stack_hosts_as_this_machine_and_releases_on_postgres() {
     let Some(pg) = PgScratch::new("embedpg") else {
         return;
     };
-    let (url, schema) = (pg.url.clone(), pg.schema.clone());
+    let schema = pg.schema.clone();
     // `eng`'s lock row as `holder|heartbeat`, or empty when there is none.
     let lock_row = || {
         pg.text(&format!(
@@ -2351,17 +2352,9 @@ fn the_embedded_stack_hosts_as_this_machine_and_releases_on_postgres() {
         }
     };
 
-    let env = Env::new("embedpg");
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let db_url = format!("{url}{sep}options=-c%20search_path%3D{schema},public");
+    let env = Env::new("embedpg").on_postgres(&pg);
     std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
-    std::fs::write(
-        env.config_path(),
-        format!(
-            "database:\n  backend: postgres\n  url: \"{db_url}\"\nservice:\n  response_format: json\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(env.config_path(), "service:\n  response_format: json\n").unwrap();
     env.setup_domain("eng");
     let me = std::fs::read_to_string(env.state_dir().join("instance-id"))
         .expect("domain add claimed as this machine's instance");
@@ -7036,20 +7029,12 @@ fn a_daemonless_command_leaves_no_host_lock_behind_on_postgres() {
     let Some(pg) = PgScratch::new("cmdlock") else {
         return;
     };
-    let (url, schema) = (pg.url.clone(), pg.schema.clone());
+    let schema = pg.schema.clone();
     let run_sql = |sql: &str| pg.sql(sql);
 
-    let env = Env::new("cmdlock");
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let db_url = format!("{url}{sep}options=-c%20search_path%3D{schema},public");
+    let env = Env::new("cmdlock").on_postgres(&pg);
     std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
-    std::fs::write(
-        env.config_path(),
-        format!(
-            "database:\n  backend: postgres\n  url: \"{db_url}\"\nservice:\n  response_format: json\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(env.config_path(), "service:\n  response_format: json\n").unwrap();
     env.setup_domain("eng");
     let config_path = env.config_path();
     let config_arg = config_path.to_str().unwrap();
@@ -7084,6 +7069,34 @@ fn a_daemonless_command_leaves_no_host_lock_behind_on_postgres() {
     ]);
     assert!(ok, "{out}{err}");
     no_lock_left("a write");
+}
+
+/// No test selects its schema through URL `options`: a scratch schema goes
+/// through `database.schema` (`CRYSTALLINE_DATABASE_SCHEMA`, [`PgScratch::env`]).
+#[test]
+fn no_test_selects_a_schema_through_url_options() {
+    // Built in two parts so this file does not match its own scan.
+    let needle = format!("{}{}", "options=", "-c");
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates");
+    let mut stack: Vec<PathBuf> = std::fs::read_dir(&tests)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("tests"))
+        .filter(|p| p.is_dir())
+        .collect();
+    let mut hits = Vec::new();
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && std::fs::read_to_string(&p).is_ok_and(|c| c.contains(&needle))
+            {
+                hits.push(p);
+            }
+        }
+    }
+    assert!(hits.is_empty(), "URL options select a schema in {hits:?}");
 }
 
 /// A Postgres schema of its own for a test against the database at
@@ -7121,6 +7134,16 @@ impl PgScratch {
             );
         }
         Some(pg)
+    }
+
+    /// The variables that point a process at this scratch schema: the
+    /// backend, the plain URL (no `options`) and the schema.
+    fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("CRYSTALLINE_DATABASE_BACKEND", "postgres".to_string()),
+            ("CRYSTALLINE_DATABASE_URL", self.url.clone()),
+            ("CRYSTALLINE_DATABASE_SCHEMA", self.schema.clone()),
+        ]
     }
 
     /// Run `sql` (one or more statements) on a fresh connection.
