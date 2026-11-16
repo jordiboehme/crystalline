@@ -942,3 +942,408 @@ fn accounts_that_do_not_open_stop_the_start_on_postgres() {
         "an accounts file was made"
     );
 }
+
+/// The `command` and `released` columns of `pg`'s owner row as
+/// `command|released`, `command` empty when it is NULL; empty when there is
+/// no row.
+fn owner_command(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT coalesce(command, '') || '|' || (released_at IS NOT NULL)::text FROM {}.instance_owner WHERE id = 1",
+        pg.schema
+    ))
+}
+
+/// The label in `pg`'s owner row: the name the sentences give the owner.
+fn owner_label(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT label FROM {}.instance_owner WHERE id = 1",
+        pg.schema
+    ))
+}
+
+/// How many objects `pg`'s schema holds.
+#[cfg(feature = "postgres")]
+fn schema_objects(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = '{}'",
+        pg.schema
+    ))
+}
+
+/// Run `crystalline <args>` in `env` as an MCP client that sends one
+/// `initialize` and closes stdin: the exit code, stdout and stderr. Gives up
+/// after 60 s, so a bridge that loops fails the test instead of hanging it.
+fn mcp_once(env: &Env, args: &[&str]) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "it", "version": "0" },
+        },
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{initialize}").unwrap();
+    drop(stdin);
+    let pid = child.id() as i32;
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let out = child.wait_with_output().unwrap();
+        let _ = done_tx.send(());
+        out
+    });
+    if done_rx.recv_timeout(Duration::from_secs(60)).is_err() {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let out = waiter.join().unwrap();
+        panic!(
+            "`crystalline {}` did not end within 60s:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = waiter.join().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The error message of the reply to the `initialize` [`mcp_once`] sent.
+fn initialize_error(stdout: &str) -> String {
+    let reply: Value = serde_json::from_str(stdout.lines().next().unwrap_or("null")).unwrap();
+    assert_eq!(reply["id"], 1, "{stdout}");
+    reply["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no initialize error: {stdout}"))
+        .to_string()
+}
+
+/// Without a daemon, a command that would open its own engine on a
+/// database another instance owns is refused before anything opens, on
+/// both openers (the CLI's index route and the engine of a data verb): the
+/// sentence names the active instance and how to run the command there.
+/// `config set` touches no database in this release and still works.
+#[test]
+fn engine_command_without_daemon_refused_when_owned() {
+    let Some(pg) = PgScratch::new("clown") else {
+        return;
+    };
+    let owner_env = Env::new("clowa").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let label = owner_label(&pg);
+
+    let env = Env::new("clowc").on_postgres(&pg);
+    for args in [&["reindex"][..], &["search", "anything"]] {
+        let (ok, out, err) = env.run_full(args);
+        assert!(!ok, "{out}{err}");
+        assert!(
+            err.contains(&format!(
+                "is owned by the active instance {label} (pid {},",
+                owner.pid()
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "for example `kubectl exec <pod> -- crystalline {}`",
+                args.join(" ")
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("could not reach"), "{err}");
+    }
+    let (ok, out, err) = env.run_full(&["config", "set", "service.response_format", "json"]);
+    assert!(ok, "{out}{err}");
+
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert_eq!(owner.get("/ready").unwrap().status().as_u16(), 200);
+}
+
+/// A refused command opens no engine: on an empty schema whose lock the
+/// test's own session holds, it creates nothing, says the holder has not
+/// announced itself, and a read-only report (`status`) opens nothing
+/// either.
+#[cfg(feature = "postgres")]
+#[test]
+fn command_without_daemon_opens_nothing_when_owned() {
+    let Some(pg) = PgScratch::new("clnone") else {
+        return;
+    };
+    let url = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    let holder = runtime.block_on(async {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(key)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn
+    });
+
+    let env = Env::new("clnone").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["reindex"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("is owned by an instance that has not announced itself yet"),
+        "{err}"
+    );
+    let (_, out, err) = env.run_full(&["status"]);
+    assert!(
+        format!("{out}{err}").contains("has not announced itself yet"),
+        "{out}{err}"
+    );
+    assert_eq!(
+        schema_objects(&pg),
+        "0",
+        "a refused command created objects"
+    );
+
+    runtime.block_on(async {
+        use sqlx::Connection;
+        holder.close().await.unwrap();
+    });
+}
+
+/// Without a daemon on a free database, a command claims it for its run:
+/// the owner row names the command while it runs and records the release
+/// when it ends, and the lock is free again. A read-only report never
+/// claims it.
+#[cfg(feature = "postgres")]
+#[test]
+fn reindex_without_daemon_runs_and_releases_when_free() {
+    let Some(pg) = PgScratch::new("clfree") else {
+        return;
+    };
+    let env = Env::new("clfree").on_postgres(&pg);
+    // The first command on the empty schema: its store open creates the
+    // owner table after the claim, and the claim is recorded all the same.
+    env.setup_domain("eng");
+    assert_eq!(owner_command(&pg), "crystalline domain add|true");
+    let (ok, out, err) = env.run_full(&["reindex"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(owner_command(&pg), "crystalline reindex|true");
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT (count(*) = 0)::text FROM pg_locks WHERE locktype = 'advisory' \
+             AND objid::bigint = ({key} & 4294967295)"
+        )),
+        "true",
+        "the database is still held"
+    );
+
+    let (ok, out, err) = env.run_full(&["status"]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        owner_command(&pg),
+        "crystalline reindex|true",
+        "status claimed the database"
+    );
+}
+
+/// A command holding the database (`hold-lock --standalone`, the shape of
+/// a long `crystalline reindex`) makes a `serve` wait as a standby that
+/// names the command, and the standby serves once the command has given
+/// the database back.
+#[test]
+fn serve_waits_while_a_command_holds_then_serves() {
+    let Some(pg) = PgScratch::new("clhold") else {
+        return;
+    };
+    let cmd_env = Env::new("clholdc").on_postgres(&pg);
+    // The owner table, so the command's claim is announced.
+    cmd_env.setup_domain("eng");
+
+    let mut hold = Command::new(bin());
+    cmd_env.apply(&mut hold);
+    let mut hold = hold
+        .args([
+            "hold-lock",
+            "--secs",
+            "6",
+            "--standalone",
+            "crystalline reindex",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(hold.stdout.take().unwrap()),
+        &mut line,
+    )
+    .unwrap();
+    assert_eq!(line.trim(), "holding");
+    assert_eq!(owner_command(&pg), "crystalline reindex|false");
+
+    let env = Env::new("clholds").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_role("standby");
+    let (ok, out, err) = env.run_full(&["status", "--json"]);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        status["owner"]["command"], "crystalline reindex",
+        "{status}"
+    );
+
+    assert!(hold.wait().unwrap().success());
+    serve.wait_ready();
+    assert_eq!(owner_row(&pg), format!("{}|false", instance_id(&env)));
+    assert!(
+        serve
+            .log()
+            .contains("without a grace (the instance before released it)"),
+        "{}",
+        serve.log()
+    );
+}
+
+/// On an owned database an autostart never waits as a standby: `crystalline
+/// mcp` spawns no daemon and gives the owner's sentence as the initialize
+/// error and on its stderr; and a daemon started as an autostart anyway
+/// (the race) exits at once with the lock-held code, even with a bounded
+/// life.
+#[test]
+fn autostart_refused_with_owner_sentence_on_client_stderr() {
+    let Some(pg) = PgScratch::new("clauto") else {
+        return;
+    };
+    let owner_env = Env::new("clautoa").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let label = owner_label(&pg);
+    let sentence = format!("is owned by {label} (since ");
+
+    let env = Env::new("clautoc").on_postgres(&pg);
+    let (code, out, err) = mcp_once(&env, &["mcp"]);
+    assert_ne!(code, Some(0), "{out}{err}");
+    let message = initialize_error(&out);
+    assert!(
+        message.contains(&sentence) && message.contains("this machine does not serve it"),
+        "{message}"
+    );
+    assert!(
+        err.contains(&sentence) && err.contains("this machine does not serve it"),
+        "{err}"
+    );
+    assert!(
+        !env.state_dir().join("daemon.log").exists(),
+        "a daemon was spawned"
+    );
+
+    let log = env.state_dir().with_file_name("autostarted.log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut serve = Serve {
+        child: serve
+            .args(["serve", "--autostarted", "--exit-when-idle"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+        addr: String::new(),
+        log,
+    };
+    assert_eq!(serve.wait_exit(Duration::from_secs(20)), Some(3));
+    let err = serve.log();
+    assert!(
+        err.contains(&sentence) && err.contains("this machine does not serve it"),
+        "{err}"
+    );
+    assert!(!env.info_path().exists(), "the record stayed");
+    assert_eq!(owner.get("/ready").unwrap().status().as_u16(), 200);
+}
+
+/// `crystalline mcp --embedded` on an owned database is refused with the
+/// owner's sentence as the initialize error, not a status server.
+#[test]
+fn embedded_refused_when_owned() {
+    let Some(pg) = PgScratch::new("clemb") else {
+        return;
+    };
+    let owner_env = Env::new("clemba").on_postgres(&pg);
+    let mut owner = Serve::start(&owner_env, None);
+    owner.wait_ready();
+    let label = owner_label(&pg);
+
+    let env = Env::new("clembc").on_postgres(&pg);
+    let (code, out, err) = mcp_once(&env, &["mcp", "--embedded"]);
+    assert_ne!(code, Some(0), "{out}{err}");
+    let message = initialize_error(&out);
+    assert!(
+        message.contains(&format!("is owned by {label} (since "))
+            && message.contains("this machine does not serve it"),
+        "{message}"
+    );
+    assert!(err.contains("this machine does not serve it"), "{err}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// A one-shot command next to a local standby reaches it over the socket
+/// and gets its refusal, which names the active instance; it opens no
+/// engine of its own and the standby keeps waiting.
+#[test]
+fn local_standby_refuses_one_shot_command() {
+    let Some(pg) = PgScratch::new("clsb") else {
+        return;
+    };
+    let (_active_env, _active, standby_env, mut standby) = active_and_standby(&pg, "clsb");
+    let label = owner_label(&pg);
+    for args in [&["reindex"][..], &["search", "anything"]] {
+        let (ok, out, err) = standby_env.run_full(args);
+        assert!(!ok, "{out}{err}");
+        assert!(
+            err.contains(&format!(
+                "this instance is a standby; the active instance is {label}"
+            )),
+            "{err}"
+        );
+    }
+    assert!(standby.alive(), "{}", standby.log());
+    let health: Value = standby.get("/health").unwrap().json().unwrap();
+    assert_eq!(health["role"], "standby");
+    assert!(!standby.log().contains("start: store open"));
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// On Turso the standalone paths are as before: a command without a daemon
+/// opens the index file, and `crystalline mcp --embedded` serves.
+#[test]
+fn standalone_paths_unchanged_on_turso() {
+    let env = Env::new("clturso");
+    env.setup_domain("eng");
+    for args in [&["reindex"][..], &["search", "seed"], &["status"]] {
+        let (ok, out, err) = env.run_full(args);
+        assert!(ok, "{} failed: {out}{err}", args.join(" "));
+        assert!(!err.contains("is owned by"), "{err}");
+    }
+    let (code, out, err) = mcp_once(&env, &["mcp", "--embedded"]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let reply: Value = serde_json::from_str(out.lines().next().unwrap_or("null")).unwrap();
+    assert!(reply["result"].is_object(), "{out}");
+}
