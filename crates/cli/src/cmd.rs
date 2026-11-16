@@ -4014,7 +4014,7 @@ pub async fn connect_github(
         .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string());
 
     // Read before the sign-in, which can take minutes.
-    let account_then = AccountThen::read(identity).await?;
+    let account_then = AccountThen::read(identity, cfg).await?;
     let (access_token, login) = match token {
         Some(pat) => {
             let login = crystalline_remote::github::auth::validate_token(api_url.as_deref(), pat)
@@ -4106,7 +4106,10 @@ struct AccountThen {
 }
 
 impl AccountThen {
-    async fn read(identity: &crystalline_remote::TokenIdentity) -> Result<AccountThen> {
+    async fn read(
+        identity: &crystalline_remote::TokenIdentity,
+        cfg: &crystalline_core::config::GlobalConfig,
+    ) -> Result<AccountThen> {
         let nobody = AccountThen {
             asks: None,
             born: None,
@@ -4117,12 +4120,9 @@ impl AccountThen {
         if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
             return Ok(nobody);
         }
-        let path = config::web_auth_db_path()
-            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-        if !path.exists() {
+        let Some(store) = crystalline_service::existing_accounts_for_cli(cfg).await? else {
             return Ok(nobody);
-        }
-        let store = crystalline_service::rest::AuthStore::open(&path).await?;
+        };
         let born = store.account_born(name).await?;
         Ok(AccountThen {
             asks: Some((store, name.clone())),
@@ -4225,14 +4225,7 @@ impl PersonalApp<'_> {
     /// The accounts database, when this machine has one. Never created
     /// here: a machine without accounts has nothing to link.
     async fn accounts(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
-        let path = config::web_auth_db_path()
-            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(Some(
-            crystalline_service::rest::AuthStore::open(&path).await?,
-        ))
+        crystalline_service::existing_accounts_for_cli(self.cfg).await
     }
 
     /// The accounts database when this connect links an account, `None`
@@ -4261,7 +4254,7 @@ impl PersonalApp<'_> {
         let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
         let accounts = self.link_target().await?;
         // Read before the sign-in, which can take minutes.
-        let account_then = AccountThen::read(self.identity).await?;
+        let account_then = AccountThen::read(self.identity, self.cfg).await?;
         let credentials = app.credentials();
         let auth_base = app.auth_base();
         let grant = device_flow_grant(auth_base, &credentials.client_id, None)

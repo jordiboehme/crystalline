@@ -34,7 +34,16 @@ impl Serve {
 
     /// [`Serve::start`] with `extra` variables for this child only.
     fn start_with(env: &Env, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
-        let addr = format!("127.0.0.1:{}", free_port());
+        Serve::start_bound(env, "127.0.0.1", rust_log, extra)
+    }
+
+    /// [`Serve::start_with`] bound on `host`; requests still go to
+    /// 127.0.0.1. A bind on `0.0.0.0` is one others can reach, where the
+    /// first admin and the setup token are asked of the accounts.
+    fn start_bound(env: &Env, host: &str, rust_log: Option<&str>, extra: &[(&str, &str)]) -> Serve {
+        let port = free_port();
+        let bind = format!("{host}:{port}");
+        let addr = format!("127.0.0.1:{port}");
         let log = env
             .state_dir()
             .with_file_name(format!("serve-{}.log", free_port()));
@@ -49,7 +58,7 @@ impl Serve {
             cmd.env(key, value);
         }
         let child = cmd
-            .args(["serve", "--http", &addr])
+            .args(["serve", "--http", &bind])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
@@ -1561,4 +1570,271 @@ fn standalone_paths_unchanged_on_turso() {
     assert_eq!(code, Some(0), "{out}{err}");
     let reply: Value = serde_json::from_str(out.lines().next().unwrap_or("null")).unwrap();
     assert!(reply["result"].is_object(), "{out}");
+}
+
+/// Run `crystalline <args>` in `env` with `stdin` fed to it: success,
+/// stdout and stderr.
+fn run_with_stdin(env: &Env, args: &[&str], stdin: &str) -> (bool, String, String) {
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `crystalline users add <name> --password-stdin` in `env`, which must
+/// succeed.
+fn users_add(env: &Env, name: &str, password: &str) {
+    let (ok, out, err) = run_with_stdin(
+        env,
+        &["users", "add", name, "--password-stdin"],
+        &format!("{password}\n"),
+    );
+    assert!(ok, "users add {name} failed: {out}{err}");
+}
+
+/// The status a sign-in of `name` with `password` at `serve` gets.
+fn sign_in(serve: &Serve, name: &str, password: &str) -> u16 {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{}/api/v1/auth/login", serve.addr))
+        .json(&serde_json::json!({ "name": name, "password": password }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The version `pg`'s accounts ledger records, `0` without a row.
+fn auth_ledger(pg: &PgScratch) -> String {
+    pg.text(&format!(
+        "SELECT coalesce(max(version), 0)::text FROM {}.auth_schema_migration",
+        pg.schema
+    ))
+}
+
+/// On Postgres the daemon keeps every account in the database: a reachable
+/// `serve` with an admin from the environment creates that admin there,
+/// draws no setup token, signs it in, and no `web-auth.db` appears in its
+/// state directory.
+#[test]
+fn daemon_on_postgres_creates_no_web_auth_db() {
+    let Some(pg) = PgScratch::new("acnofile") else {
+        return;
+    };
+    let env = Env::new("acnofile").on_postgres(&pg);
+    let mut serve = Serve::start_bound(
+        &env,
+        "0.0.0.0",
+        None,
+        &[
+            ("CRYSTALLINE_ADMIN_NAME", "root"),
+            ("CRYSTALLINE_ADMIN_PASSWORD", "root-password"),
+        ],
+    );
+    serve.wait_ready();
+    let log = serve.log();
+    assert!(
+        log.contains("created the first admin 'root' from the environment"),
+        "{log}"
+    );
+    assert!(!log.contains("setup token"), "{log}");
+    assert_eq!(
+        pg.text(&format!("SELECT count(*)::text FROM {}.users", pg.schema)),
+        "1"
+    );
+    assert_eq!(sign_in(&serve, "root", "root-password"), 200);
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "an accounts file was made"
+    );
+}
+
+/// `users add` while a daemon owns the database writes the account into
+/// the database beside it, as a second writer in the role `cli` with no
+/// claim: the daemon signs the new account in at once, and the owner row
+/// is the daemon's still.
+#[test]
+fn users_add_while_daemon_owns_is_seen_at_once() {
+    let Some(pg) = PgScratch::new("acowned") else {
+        return;
+    };
+    let env = Env::new("acowned").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    assert_eq!(sign_in(&serve, "ada", "ada-password"), 401);
+    users_add(&env, "ada", "ada-password");
+    assert_eq!(sign_in(&serve, "ada", "ada-password"), 200);
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "an accounts file was made"
+    );
+}
+
+/// Only an owner migrates the accounts tables: with the ledger stamped
+/// below this binary while a daemon owns the database, `users` is refused
+/// naming both versions and where to run it, and migrates nothing.
+#[test]
+fn users_refused_when_auth_ledger_behind_and_owned() {
+    let Some(pg) = PgScratch::new("acbehind") else {
+        return;
+    };
+    let env = Env::new("acbehind").on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    assert_eq!(auth_ledger(&pg), "1");
+    assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("the accounts tables are at version 0, this binary needs 1")
+            && err.contains("run the command on the active instance")
+            && err.contains("is owned by the active instance"),
+        "{err}"
+    );
+    assert_eq!(
+        auth_ledger(&pg),
+        "0",
+        "a command that does not own migrated"
+    );
+    assert_eq!(owner_command(&pg), "|false", "the owner row changed");
+}
+
+/// With the ledger behind and nobody owning the database, `users` takes it
+/// for the command, migrates the accounts tables and gives it back.
+#[cfg(feature = "postgres")]
+#[test]
+fn users_migrates_when_auth_ledger_behind_and_free() {
+    let Some(pg) = PgScratch::new("acfree") else {
+        return;
+    };
+    let env = Env::new("acfree").on_postgres(&pg);
+    users_add(&env, "ada", "ada-password");
+    assert_eq!(auth_ledger(&pg), "1");
+    let key = crystalline_index::postgres::owner_key(Some(&pg.schema));
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT (count(*) = 0)::text FROM pg_locks WHERE locktype = 'advisory' \
+             AND objid::bigint = ({key} & 4294967295)"
+        )),
+        "true",
+        "the database is still held"
+    );
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+}
+
+/// Accounts tables a newer Crystalline wrote are refused as too new, and
+/// nothing is changed.
+#[test]
+fn users_refused_when_auth_ledger_too_new() {
+    let Some(pg) = PgScratch::new("acnew") else {
+        return;
+    };
+    assert!(pg.sql(&format!(
+        "CREATE TABLE {0}.auth_schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL); \
+         INSERT INTO {0}.auth_schema_migration VALUES (999, '2026-11-16T00:00:00Z')",
+        pg.schema
+    )));
+    let env = Env::new("acnew").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(!ok, "{out}{err}");
+    assert!(
+        err.contains("the accounts tables are at version 999, newer than this binary knows"),
+        "{err}"
+    );
+    assert_eq!(auth_ledger(&pg), "999");
+}
+
+/// An accounts file left in the state directory of an instance on Postgres
+/// is never read: its account does not sign in and is not listed, the file
+/// is left as it was, and the daemon says once that it is not read.
+#[test]
+fn leftover_web_auth_db_not_read_and_warned() {
+    let Some(pg) = PgScratch::new("acleft") else {
+        return;
+    };
+    let turso = Env::new("acleft");
+    users_add(&turso, "old", "old-password");
+    let leftover = turso.state_dir().join("web-auth.db");
+    let before = std::fs::read(&leftover).expect("the accounts file");
+    let env = turso.on_postgres(&pg);
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    let log = serve.log();
+    let warning = format!("the accounts file {} is not read", leftover.display());
+    assert_eq!(log.matches(&warning).count(), 1, "{log}");
+    assert_eq!(sign_in(&serve, "old", "old-password"), 401);
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(ok && !out.contains("old"), "{out}{err}");
+    drop(serve);
+    assert_eq!(
+        std::fs::read(&leftover).unwrap(),
+        before,
+        "the file changed"
+    );
+}
+
+/// A rebuild never takes the accounts with it: on Turso `reindex --wipe`
+/// keeps the accounts file, and on Postgres, where the wipe is refused, the
+/// accounts tables stay through the refusal and through `reindex --full`.
+#[test]
+fn reindex_wipe_keeps_accounts() {
+    let turso = Env::new("acwipet");
+    turso.setup_domain("eng");
+    users_add(&turso, "ada", "ada-password");
+    let (ok, out, err) = turso.run_full(&["reindex", "--wipe"]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = turso.run_full(&["users", "list"]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+
+    let Some(pg) = PgScratch::new("acwipe") else {
+        return;
+    };
+    let env = Env::new("acwipe").on_postgres(&pg);
+    env.setup_domain("eng");
+    users_add(&env, "ada", "ada-password");
+    let (ok, out, err) = env.run_full(&["reindex", "--wipe"]);
+    assert!(!ok && err.contains("refusing to wipe"), "{out}{err}");
+    let (ok, out, err) = env.run_full(&["reindex", "--full"]);
+    assert!(ok, "{out}{err}");
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+}
+
+/// On Turso `users` writes the `web-auth.db` file in the state directory,
+/// as it always did, and a running daemon signs the account in.
+#[test]
+fn users_cli_unchanged_on_turso() {
+    let env = Env::new("acturso");
+    users_add(&env, "ada", "ada-password");
+    assert!(env.state_dir().join("web-auth.db").exists());
+    let (ok, out, err) = env.run_full(&["users", "list"]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+    let mut serve = Serve::start(&env, None);
+    serve.wait_ready();
+    users_add(&env, "bob", "bob-password");
+    assert_eq!(sign_in(&serve, "bob", "bob-password"), 200);
 }

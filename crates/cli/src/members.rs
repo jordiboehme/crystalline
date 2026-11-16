@@ -37,11 +37,12 @@ use crystalline_service::rest::{
 
 use crate::{MembersCommand, ReflectionGrantCommand, VisibilityArg};
 
-/// Open the accounts database in the state directory, the same file
-/// `crystalline users` writes and the daemon reads.
+/// Open the accounts store `crystalline users` writes and the daemon reads:
+/// the file in the state directory, or on Postgres the configured database
+/// ([`crystalline_service::open_accounts_for_cli`]).
 async fn store() -> Result<AuthStore> {
-    let path = crystalline_core::config::web_auth_db_path()?;
-    AuthStore::open(&path).await
+    let loaded = crate::cmd::load(None)?;
+    crystalline_service::open_accounts_for_cli(&loaded.effective).await
 }
 
 /// Resolve a domain name against the global config, exactly as it is spelled
