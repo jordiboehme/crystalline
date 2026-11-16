@@ -84,6 +84,9 @@ mod migrations;
 mod search;
 mod session;
 
+pub use migrations::{
+    INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, apply_locked_set,
+};
 pub use session::{
     OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name, connect_one, lock_key,
     owner_key,
