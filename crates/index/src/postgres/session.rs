@@ -101,12 +101,24 @@ const NO_INSTANCE_TAG: &str = "none";
 /// group of a UUID) are used. The longest result is 45 bytes. The owner key
 /// already mixes in the schema, so the name stays short for any schema.
 pub fn application_name(owner_key: i64, instance_tag: &str, role: PgRole) -> String {
-    let tag: String = instance_tag.chars().take(8).collect();
     format!(
-        "crystalline/{:016x}/{tag}/{}",
-        owner_key as u64,
+        "{}{}/{}",
+        application_prefix(owner_key),
+        short_tag(instance_tag),
         role.as_str()
     )
+}
+
+/// `crystalline/<16 hex of owner_key>/`: what every connection to the
+/// database of `owner_key` carries at the start of its `application_name`.
+pub(crate) fn application_prefix(owner_key: i64) -> String {
+    format!("crystalline/{:016x}/", owner_key as u64)
+}
+
+/// The part of `instance_tag` that goes into `application_name`: its first 8
+/// characters.
+pub(crate) fn short_tag(instance_tag: &str) -> String {
+    instance_tag.chars().take(8).collect()
 }
 
 /// What a connection of the owner's process checks at connect: the lock
@@ -134,11 +146,24 @@ pub struct PgSessionOptions {
 
 /// Where a connection goes: the database URL and the schema every
 /// connection routes to, if one is configured.
+///
+/// Its `Debug` shows only the host, port and database of the URL, never the
+/// credentials or the query string.
+#[derive(Clone)]
 pub struct PgTarget {
     /// The `postgres://` URL.
     pub url: String,
     /// The configured schema; `None` uses the database default.
     pub schema: Option<String>,
+}
+
+impl std::fmt::Debug for PgTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgTarget")
+            .field("url", &super::sanitize_url(&self.url))
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl PgTarget {
@@ -173,10 +198,10 @@ const KEEPALIVES: [(&str, &str); 3] = [
 
 /// The lock connection's `idle_session_timeout`: a session nobody probes for
 /// this long is ended by the server, and its lock with it.
-const LOCK_IDLE_SESSION_TIMEOUT: &str = "15s";
+pub(crate) const LOCK_IDLE_SESSION_TIMEOUT: &str = "15s";
 
 /// The lock connection's `statement_timeout`, the server side of a probe.
-const LOCK_STATEMENT_TIMEOUT: &str = "3s";
+pub(crate) const LOCK_STATEMENT_TIMEOUT: &str = "3s";
 
 /// The connect options of a `role` connection to `t`: the URL's own options,
 /// then the `application_name`, the keepalives and, for [`PgRole::Lock`], the
@@ -347,6 +372,22 @@ mod tests {
             ..cfg
         };
         assert!(PgTarget::from_config(&bad).is_err());
+    }
+
+    /// A target's `Debug` shows where it goes and never the password or the
+    /// query string.
+    #[test]
+    fn target_debug_hides_the_credentials() {
+        let t = PgTarget {
+            url: "postgres://alice:s3cret@db.example:5432/crys?password=other".to_string(),
+            schema: Some("team_a".to_string()),
+        };
+        let shown = format!("{:?}", t.clone());
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("other"), "{shown}");
+        assert!(!shown.contains("alice"), "{shown}");
+        assert!(shown.contains("db.example:5432/crys"), "{shown}");
+        assert!(shown.contains("team_a"), "{shown}");
     }
 
     /// The application name and the keepalives go into every role's connect
@@ -553,7 +594,7 @@ mod tests {
         }
         // A pool's connect retries a failed `after_connect` until its acquire
         // timeout, so a refused pool connection surfaces as a time-out: the
-        // store's own pool after its 30 s, a short test pool at once.
+        // store's own fenced pool after its 5 s, a short test pool at once.
         let Err(err) = short_pool(&t, &o).acquire().await else {
             panic!("a pool connection went ahead");
         };

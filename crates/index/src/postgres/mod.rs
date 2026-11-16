@@ -81,11 +81,18 @@
 //!   simply ages out of the LRU unused.
 
 mod migrations;
+mod owner;
 mod search;
 mod session;
 
 pub use migrations::{
     INDEX_SET, INSTANCE_TABLES, LockedRun, Migration, MigrationSet, apply_locked_set,
+};
+pub use owner::{
+    Acquired, EXIT_MARGIN, FENCE_DETECT_MAX, FenceState, GRACE, LOCK_IDLE_TIMEOUT, OwnerIdentity,
+    OwnerRow, OwnerTimings, PROBE_PERIOD, PROBE_RETRIES, PROBE_TIMEOUT, PgOwner, ProbeAction,
+    ProbeOutcome, ProbeState, STANDBY_POLL, StandbyStatus, TERMINATE_WAIT_MS, TIMING_SCALE_ENV,
+    TakeoverReport, probe_owner, read_owner_row, timing_scale,
 };
 pub use session::{
     OwnerFence, PgRole, PgSessionOptions, PgTarget, application_name, connect_one, lock_key,
@@ -5902,10 +5909,16 @@ impl PostgresStore {
     }
 }
 
+/// How long a pool built with a fence waits for a connection. sqlx retries a
+/// connect its `after_connect` refused until the acquire timeout runs out, so
+/// with its default 30 s a store whose instance lost the database would hang
+/// each statement for half a minute; a fenced store fails fast instead.
+const FENCED_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `pool` with an `after_connect` that runs `first` (if any), then
 /// [`session::prepare_session`], so every new connection of the pool, a
 /// transparent reconnect included, is routed to `schema` and runs the fence
-/// check.
+/// check. A pool with a fence waits at most [`FENCED_ACQUIRE_TIMEOUT`].
 fn with_session_setup(
     pool: PgPoolOptions,
     schema: Option<String>,
@@ -5913,6 +5926,11 @@ fn with_session_setup(
     fence: Option<OwnerFence>,
     first: Option<&'static str>,
 ) -> PgPoolOptions {
+    let pool = if fence.is_some() && pool.get_acquire_timeout() > FENCED_ACQUIRE_TIMEOUT {
+        pool.acquire_timeout(FENCED_ACQUIRE_TIMEOUT)
+    } else {
+        pool
+    };
     pool.after_connect(move |conn, _meta| {
         let schema = schema.clone();
         Box::pin(async move {
