@@ -1,7 +1,8 @@
 name: Build
 
 # The build, sign, notarize and package half of a release. release.yml calls
-# this for a `v*` tag push (and for its manual dry run). All six platform legs
+# this for every release (a call from CI on main or a `v*` tag push) and for
+# its manual dry run. All six platform legs
 # build, the musl legs also make .deb packages and the Windows legs .msi
 # packages.
 #
@@ -9,6 +10,14 @@ name: Build
 # jobs download them by the same names.
 on:
   workflow_call:
+    # The release tag release.yml resolved, or empty for a dry run. It is
+    # passed in because this workflow cannot read it from the ref: in a
+    # release CI starts on main, github.ref is refs/heads/main.
+    inputs:
+      tag:
+        type: string
+        required: false
+        default: ''
     # The signing secrets live in the `release` environment, which the build
     # job below declares for its signing legs. A secret of that environment
     # wins over one passed in here, so the callers' explicit pass only
@@ -164,10 +173,12 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [ -n "${RELEASE_TAG}" ]; then
+            echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
@@ -258,6 +269,7 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           missing=()
@@ -267,7 +279,7 @@ jobs:
           done
           if [ "${#missing[@]}" -eq 0 ]; then
             echo "sign=true" >> "$GITHUB_OUTPUT"
-          elif [ "${#missing[@]}" -eq 6 ] && [ "$GITHUB_REF_TYPE" != "tag" ]; then
+          elif [ "${#missing[@]}" -eq 6 ] && [ -z "${RELEASE_TAG}" ]; then
             echo "::notice::Apple signing secrets are not configured; this dry run produces an UNSIGNED macOS binary"
             echo "sign=false" >> "$GITHUB_OUTPUT"
           else

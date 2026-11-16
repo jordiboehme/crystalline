@@ -1,13 +1,45 @@
 name: Release
 
+# Three ways in, one release tag. The `notes` job below resolves it once and
+# every later job reads its outputs, never the ref:
+#
+# - workflow_call: CI on main calls this after `ci-passed` when the workspace
+#   version has no tag yet (scripts/release-check.sh). The tag comes from the
+#   `tag` input; github.ref and github.event_name are the caller's here
+#   (refs/heads/main, push), so they say nothing about the release. The
+#   publish job creates the tag at the tested commit (github.sha) first.
+# - push of a `v*` tag: the fallback, as before. The tag is the pushed ref.
+# - workflow_dispatch: a dry run. It builds and packages everything and
+#   publishes nothing (publish, images, fluid-image and homebrew skip).
 on:
   push:
     tags:
       - 'v*'
-  # Manual dry run: exercises the full build-and-package matrix without
-  # publishing a GitHub Release (the publish, images and homebrew jobs only
-  # run for a tag push).
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to release, v<version> of the workspace Cargo.toml
+        type: string
+        required: true
+    # By name, as this file passes them on to build.yml, never `inherit`. The
+    # Apple secrets resolve to the `release` environment's copies inside the
+    # signing legs; TAP_GITHUB_TOKEN is the homebrew job's.
+    secrets:
+      APPLE_CERTIFICATE_P12:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_API_KEY_P8:
+        required: false
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_ISSUER_ID:
+        required: false
+      TAP_GITHUB_TOKEN:
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,41 +51,93 @@ permissions:
   contents: read
 
 jobs:
-  # Guards the whole build against a tag with no notes to publish. A tag push
-  # with a missing, empty or motto-less release-notes/<tag>.md would otherwise
-  # sail through the entire build-and-package matrix and fail only at the very
-  # end, in `publish`, when `gh release create` has nothing to point
-  # --notes-file at. `scripts/version-pins.sh` catches the common case (the
-  # release PR forgot the file) earlier still, on main before the tag exists;
-  # this is the backstop for a tag pushed straight, or a tag re-pushed after a
-  # fix.
+  # Resolves the release tag once, for every job below, and guards the whole
+  # build against a tag with no notes to publish. A missing, empty or
+  # motto-less release-notes/<tag>.md would otherwise sail through the entire
+  # build-and-package matrix and fail only at the very end, in `publish`, when
+  # `gh release create` has nothing to point --notes-file at.
+  # `scripts/version-pins.sh` catches the common case (the release PR forgot
+  # the file) earlier still, on the pull request; this is the backstop for a
+  # tag pushed straight, or a tag re-pushed after a fix.
   #
-  # workflow_dispatch has no tag and nothing to check, so the one step below
-  # is a no-op then and the job stays green, which is what keeps a manual dry
-  # run building end to end without a notes file.
+  # Outputs:
+  # - tag: the release tag, or empty for a dry run.
+  # - publish: true when the run publishes (a call or a tag push).
+  # - build: false only when a call finds its tag already at another commit,
+  #   which means another release of this version won the race; then the run
+  #   skips everything after this job and stays green.
+  # - called: true for a call from CI, which has to create the tag.
+  #
+  # workflow_dispatch has no tag and nothing to check, so the notes check is a
+  # no-op then and the job stays green, which is what keeps a manual dry run
+  # building end to end without a notes file.
   notes:
     name: verify the release notes file
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      build: ${{ steps.resolve.outputs.build }}
+      called: ${{ steps.resolve.outputs.called }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: The release notes file exists, is not empty and opens with an H1
+      # inputs.tag is set only by a call. A tag push and a dry run have no
+      # inputs, and in a call GITHUB_REF_TYPE is the caller's (branch).
+      - name: Resolve the release tag
+        id: resolve
         shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
-            echo "not a tag push, nothing to verify"
+          if [ -n "${INPUT_TAG:-}" ]; then
+            tag="$INPUT_TAG"
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::the tag input '$tag' is not of the form vX.Y.Z"
+              exit 1
+            fi
+            version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::the tag input $tag does not match the workspace version $version at $GITHUB_SHA"
+              exit 1
+            fi
+            # The caller checked that the tag is new, but a second push to
+            # main can pass that check while the first release still runs.
+            # The tag at this commit is a re-run and goes on; the tag at
+            # another commit means that release won, so this one stops here.
+            at="$(bash scripts/release-check.sh tag-commit "$tag")"
+            build=true
+            if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+              echo "release: $tag already points at $at, not at $GITHUB_SHA, so another run released it; nothing to do"
+              build=false
+            fi
+            { echo "tag=$tag"; echo "publish=true"; echo "build=$build"; echo "called=true"; } >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            { echo "tag=${GITHUB_REF_NAME}"; echo "publish=true"; echo "build=true"; echo "called=false"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "tag="; echo "publish=false"; echo "build=true"; echo "called=false"; } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: The release notes file exists, is not empty and opens with an H1
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "a dry run, nothing to verify"
             exit 0
           fi
-          file="release-notes/${GITHUB_REF_NAME}.md"
+          file="release-notes/${RELEASE_TAG}.md"
           if [ ! -s "$file" ]; then
-            echo "::error file=$file::$file is missing or empty. Add it and push the tag again (or, if the release PR already merged without it, add the file to main first)."
+            echo "::error file=$file::$file is missing or empty. Add it to main (a merge releases again), or push the tag again after adding it."
             exit 1
           fi
           if ! head -1 "$file" | grep -qE '^# .+'; then
-            echo "::error file=$file::$file must open with an H1 (a line starting with '# ' followed by text), the release's motto. Fix the file and push the tag again."
+            echo "::error file=$file::$file must open with an H1 (a line starting with '# ' followed by text), the release's motto. Fix the file on main (a merge releases again), or push the tag again."
             exit 1
           fi
           echo "release notes: $file"
@@ -65,11 +149,17 @@ jobs:
   build:
     name: build
     needs: notes
+    if: needs.notes.outputs.build == 'true'
     # A local reusable workflow resolves at the commit this run started on,
     # which is what the self-repository syntax `$/` would give too.
     # actionlint 1.7.12 does not parse `$/` yet, so zizmor's self-repository
     # finding is ignored here.
     uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
+    # The tag names the archives and decides whether the Mac legs must sign.
+    # In a call github.ref is the caller's branch, so build.yml cannot read
+    # the tag from the ref itself.
+    with:
+      tag: ${{ needs.notes.outputs.tag }}
     # Only the six Apple secrets, by name, never `inherit`. Once they live in
     # the `release` environment, which build.yml's signing legs declare, the
     # environment's copy wins and these resolve to nothing here; until then
@@ -90,8 +180,10 @@ jobs:
   # Apple secrets the slices are unsigned and there is nothing to verify.
   macos-universal:
     name: universal macOS binary
-    needs: build
+    needs: [notes, build]
     runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ needs.notes.outputs.tag }}
     steps:
       - name: Download macos-arm64 artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -126,7 +218,7 @@ jobs:
           if grep -q 'Authority=Developer ID' <<<"$info"; then
             codesign --verify --strict --verbose=2 --arch arm64 universal/crystalline
             codesign --verify --strict --verbose=2 --arch x86_64 universal/crystalline
-          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          elif [ -n "${RELEASE_TAG}" ]; then
             echo "::error::the macOS slices carry no Developer ID signature, and a tag must ship a signed and notarized binary"
             exit 1
           else
@@ -153,7 +245,7 @@ jobs:
 
   mcpb:
     name: package MCP bundles
-    needs: [build, macos-universal]
+    needs: [notes, build, macos-universal]
     runs-on: ubuntu-latest
     # No tag guard, unlike publish/images/homebrew below: a workflow_dispatch
     # dry run stages, validates and packs the Desktop-only Mac bundle too, it
@@ -179,11 +271,12 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.notes.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            tag="${GITHUB_REF_NAME}"
-            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "${RELEASE_TAG}" ]; then
+            echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           else
             version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
             echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -302,6 +395,7 @@ jobs:
   sbom:
     name: generate the SBOMs
     needs: notes
+    if: needs.notes.outputs.build == 'true'
     runs-on: ubuntu-latest
     # Read only: the tools this job installs never get a token that can write.
     permissions:
@@ -321,10 +415,12 @@ jobs:
       - name: Resolve release version
         id: version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.notes.outputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          if [ -n "${RELEASE_TAG}" ]; then
+            echo "version=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           else
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
@@ -419,11 +515,12 @@ jobs:
 
   publish:
     name: publish release
-    needs: [build, mcpb, sbom]
+    needs: [notes, build, mcpb, sbom]
     runs-on: ubuntu-latest
-    # Only a tag push produces a real GitHub Release; workflow_dispatch stops
-    # after the build matrix above so it can be used as a dry run.
-    if: github.ref_type == 'tag'
+    # Only a tag push or a call from CI produces a real GitHub Release;
+    # workflow_dispatch stops after the build matrix above so it can be used
+    # as a dry run.
+    if: needs.notes.outputs.publish == 'true'
     # The protected `release` environment (main and `v*` tags only).
     environment:
       name: release
@@ -433,6 +530,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    env:
+      TAG: ${{ needs.notes.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -465,8 +564,6 @@ jobs:
       # first, and a missing one stops the release before anything is signed.
       - name: Check the attestation subjects exist
         shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           missing=0
@@ -513,50 +610,50 @@ jobs:
       - name: Attest the macos-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-macos-arm64.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-macos-arm64.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-macos-arm64.tar.gz
-            release/crystalline-claude-desktop-only-${{ github.ref_name }}-macos.mcpb
+            release/crystalline-${{ needs.notes.outputs.tag }}-macos-arm64.tar.gz
+            release/crystalline-claude-desktop-only-${{ needs.notes.outputs.tag }}-macos.mcpb
 
       - name: Attest the macos-intel SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-macos-intel.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-macos-intel.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-macos-intel.tar.gz
-            release/crystalline-claude-desktop-only-${{ github.ref_name }}-macos.mcpb
+            release/crystalline-${{ needs.notes.outputs.tag }}-macos-intel.tar.gz
+            release/crystalline-claude-desktop-only-${{ needs.notes.outputs.tag }}-macos.mcpb
 
       - name: Attest the linux-amd64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-linux-amd64.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-linux-amd64.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-linux-amd64.tar.gz
+            release/crystalline-${{ needs.notes.outputs.tag }}-linux-amd64.tar.gz
             release/crystalline_*_amd64.deb
 
       - name: Attest the linux-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-linux-arm64.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-linux-arm64.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-linux-arm64.tar.gz
+            release/crystalline-${{ needs.notes.outputs.tag }}-linux-arm64.tar.gz
             release/crystalline_*_arm64.deb
 
       - name: Attest the windows-amd64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-windows-amd64.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-windows-amd64.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-windows-amd64.zip
-            release/crystalline-${{ github.ref_name }}-windows-amd64.msi
+            release/crystalline-${{ needs.notes.outputs.tag }}-windows-amd64.zip
+            release/crystalline-${{ needs.notes.outputs.tag }}-windows-amd64.msi
 
       - name: Attest the windows-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-${{ github.ref_name }}-windows-arm64.cdx.json
+          sbom-path: release/crystalline-${{ needs.notes.outputs.tag }}-windows-arm64.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-windows-arm64.zip
-            release/crystalline-${{ github.ref_name }}-windows-arm64.msi
+            release/crystalline-${{ needs.notes.outputs.tag }}-windows-arm64.zip
+            release/crystalline-${{ needs.notes.outputs.tag }}-windows-arm64.msi
 
       # Fluid is embedded in every binary, so its SBOM is attested against
       # every asset that carries one. The archive globs name the tag, which
@@ -564,31 +661,60 @@ jobs:
       - name: Attest the Fluid SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          sbom-path: release/crystalline-fluid-${{ github.ref_name }}.cdx.json
+          sbom-path: release/crystalline-fluid-${{ needs.notes.outputs.tag }}.cdx.json
           subject-path: |
-            release/crystalline-${{ github.ref_name }}-*.tar.gz
-            release/crystalline-${{ github.ref_name }}-*.zip
-            release/crystalline-${{ github.ref_name }}-*.msi
+            release/crystalline-${{ needs.notes.outputs.tag }}-*.tar.gz
+            release/crystalline-${{ needs.notes.outputs.tag }}-*.zip
+            release/crystalline-${{ needs.notes.outputs.tag }}-*.msi
             release/crystalline_*.deb
-            release/crystalline-claude-desktop-only-${{ github.ref_name }}-macos.mcpb
+            release/crystalline-claude-desktop-only-${{ needs.notes.outputs.tag }}-macos.mcpb
+
+      # Only for a call from CI: a tag push brought its tag along. An annotated
+      # tag, like the ones pushed by hand, made through the API because the
+      # checkout keeps no credentials. Its tagger is the workflow's token. A
+      # tag made with that token starts no other workflow, so this run is the
+      # only release of it. The tag already at this commit is a re-run of a
+      # failed publish; at another commit it is an error, never moved.
+      - name: Create the tag at the tested commit
+        if: needs.notes.outputs.called == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          at="$(bash scripts/release-check.sh tag-commit "$TAG")"
+          if [ -n "$at" ]; then
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG already points at $at, not at the tested commit $GITHUB_SHA"
+              exit 1
+            fi
+            echo "release: $TAG already points at $GITHUB_SHA"
+            exit 0
+          fi
+          object="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" \
+            -f tag="$TAG" -f message="$TAG" -f object="$GITHUB_SHA" -f type=commit \
+            --jq .sha)"
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/$TAG" -f sha="$object" > /dev/null
+          echo "release: tagged $GITHUB_SHA as $TAG"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${GITHUB_REF_NAME}" release/* \
-            --title "${GITHUB_REF_NAME}" \
-            --notes-file "release-notes/${GITHUB_REF_NAME}.md"
+          gh release create "${TAG}" release/* \
+            --verify-tag \
+            --title "${TAG}" \
+            --notes-file "release-notes/${TAG}.md"
 
   images:
     name: publish container images
     # sbom too, so a release whose SBOMs failed pushes no image either.
-    needs: [build, sbom]
+    needs: [notes, build, sbom]
     runs-on: ubuntu-latest
-    # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
+    # Same guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
-    if: github.ref_type == 'tag'
+    if: needs.notes.outputs.publish == 'true'
     # The protected `release` environment (main and `v*` tags only).
     environment:
       name: release
@@ -660,6 +786,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/jordiboehme/crystalline
+          # The semver tags read the resolved release tag through `value`:
+          # without it they come from the git ref, which in a call from CI is
+          # refs/heads/main and yields no version tag at all.
           # latest=false everywhere: the default latest=auto appends a bare
           # `latest` to every semver tag list, so the with-model push (which
           # runs last) would silently steal `latest` from the runtime image.
@@ -667,7 +796,7 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},value=${{ needs.notes.outputs.tag }}
             type=raw,value=latest
           labels: |
             org.opencontainers.image.title=Crystalline
@@ -713,7 +842,7 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},suffix=-with-model
+            type=semver,pattern={{version}},value=${{ needs.notes.outputs.tag }},suffix=-with-model
             type=raw,value=with-model
           labels: |
             org.opencontainers.image.title=Crystalline (with model)
@@ -781,11 +910,11 @@ jobs:
   # SBOM job for the same reason.
   fluid-image:
     name: publish the Fluid image
-    needs: [build, sbom]
+    needs: [notes, build, sbom]
     runs-on: ubuntu-latest
-    # Same tag guard as publish and images: workflow_dispatch is a build-matrix
+    # Same guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
-    if: github.ref_type == 'tag'
+    if: needs.notes.outputs.publish == 'true'
     # The protected `release` environment (main and `v*` tags only).
     environment:
       name: release
@@ -822,7 +951,7 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}}
+            type=semver,pattern={{version}},value=${{ needs.notes.outputs.tag }}
             type=raw,value=latest
           labels: |
             org.opencontainers.image.title=Crystalline Fluid
@@ -861,15 +990,17 @@ jobs:
 
   homebrew:
     name: update homebrew tap
-    needs: publish
+    needs: [notes, publish]
     runs-on: ubuntu-latest
-    if: github.ref_type == 'tag'
+    if: needs.notes.outputs.publish == 'true'
     # The protected `release` environment (main and `v*` tags only).
     environment:
       name: release
       deployment: false
     permissions:
       contents: read
+    env:
+      TAG: ${{ needs.notes.outputs.tag }}
     steps:
       - name: Download release checksums
         env:
@@ -877,7 +1008,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/release
-          gh release download "${GITHUB_REF_NAME}" \
+          gh release download "${TAG}" \
             --repo "${GITHUB_REPOSITORY}" \
             --pattern SHA256SUMS --dir /tmp/release
 
@@ -886,7 +1017,6 @@ jobs:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           sums="/tmp/release/SHA256SUMS"
 
