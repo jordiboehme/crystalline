@@ -1,7 +1,8 @@
 //! The Postgres arm of the auth store's executor seam.
 //!
-//! One bare `PgConnection` in the role `auth`, built by the index's shared
-//! session builder ([`connect_one`]), so it carries the instance tag, the
+//! One bare `PgConnection` in the role `auth` (or `cli`, for a command that
+//! writes beside the owner), built by the index's shared session builder
+//! ([`connect_one`]), so it carries the instance tag, the
 //! keepalives, the schema's `search_path` and, in the owner's process, the
 //! fence check. It connects lazily and, after a lost connection, reconnects
 //! on the next call, never inside a transaction: a transaction whose
@@ -62,6 +63,9 @@ struct PgState {
 pub(super) struct PgAuth {
     target: PgTarget,
     opts: PgSessionOptions,
+    /// The role every connection of this store is opened in: `auth` for an
+    /// instance's own store, `cli` for a command writing beside it.
+    role: PgRole,
     /// [`auth_write_lock`] of the target's schema.
     write_lock: i64,
     state: tokio::sync::Mutex<PgState>,
@@ -190,10 +194,14 @@ async fn ledger_version(conn: &mut PgConnection, schema: Option<&str>) -> Result
     Ok(version)
 }
 
-/// A new `auth` connection to `target`, with the idle-in-transaction
+/// A new connection to `target` in `role`, with the idle-in-transaction
 /// backstop set for the session.
-async fn auth_session(target: &PgTarget, opts: &PgSessionOptions) -> Result<PgConnection> {
-    let mut conn = connect_one(target, PgRole::Auth, opts)
+async fn auth_session(
+    target: &PgTarget,
+    role: PgRole,
+    opts: &PgSessionOptions,
+) -> Result<PgConnection> {
+    let mut conn = connect_one(target, role, opts)
         .await
         .context("connecting to the accounts database")?;
     if let Err(e) = sqlx::raw_sql(IDLE_IN_TRANSACTION_TIMEOUT)
@@ -207,17 +215,18 @@ async fn auth_session(target: &PgTarget, opts: &PgSessionOptions) -> Result<PgCo
 }
 
 impl PgAuth {
-    /// Connect to `target` in the role `auth` and, with `migrate`, apply
+    /// Connect to `target` in `role` and, with `migrate`, apply
     /// [`AUTH_MIGRATIONS`] under the migration lock. Without `migrate` the
     /// ledger must be exactly at this binary's version: behind is
     /// [`AuthOpenError::Behind`], ahead is [`AuthOpenError::TooNew`].
     pub(super) async fn open(
         target: PgTarget,
         opts: PgSessionOptions,
+        role: PgRole,
         migrate: bool,
     ) -> std::result::Result<PgAuth, AuthOpenError> {
         let schema = target.schema.clone();
-        let mut conn = auth_session(&target, &opts).await?;
+        let mut conn = auth_session(&target, role, &opts).await?;
         let known = AUTH_MIGRATIONS.steps.last().map_or(0, |m| m.version);
         if migrate {
             let run = apply_locked_set(&mut conn, schema.as_deref(), &AUTH_MIGRATIONS).await;
@@ -246,6 +255,7 @@ impl PgAuth {
             write_lock: auth_write_lock(schema.as_deref()),
             target,
             opts,
+            role,
             state: tokio::sync::Mutex::new(PgState {
                 conn: Some(conn),
                 in_tx: false,
@@ -300,7 +310,7 @@ impl PgAuth {
             if st.in_tx {
                 bail!("the accounts database connection was lost inside a transaction");
             }
-            st.conn = Some(auth_session(&self.target, &self.opts).await?);
+            st.conn = Some(auth_session(&self.target, self.role, &self.opts).await?);
         }
         Ok(st.conn.as_mut().expect("connected just above"))
     }

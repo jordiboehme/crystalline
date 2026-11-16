@@ -1776,16 +1776,27 @@ impl AuthStore {
     /// [`AuthStore::open`], or the Postgres database (and schema), migrating
     /// its accounts tables under the migration lock. `opts` names the
     /// instance and, in the owner's process, carries the fence every
-    /// connection checks.
+    /// connection checks. The connections are in the role `auth`.
     #[cfg(feature = "postgres")]
     pub async fn open_at(
         loc: &crystalline_core::config::AccountsLocation,
         opts: &crystalline_index::postgres::PgSessionOptions,
     ) -> Result<AuthStore> {
+        AuthStore::open_at_as(loc, opts, crystalline_index::postgres::PgRole::Auth).await
+    }
+
+    /// [`AuthStore::open_at`] with the connections in `role`: `cli` for a
+    /// command that writes beside the instance that owns the database.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_as(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
+    ) -> Result<AuthStore> {
         match loc {
             crystalline_core::config::AccountsLocation::File(path) => AuthStore::open(path).await,
             crystalline_core::config::AccountsLocation::Postgres(cfg) => {
-                AuthStore::open_postgres(cfg, opts, true)
+                AuthStore::open_postgres(cfg, opts, role, true)
                     .await
                     .map_err(|e| match e {
                         AuthOpenError::Other(e) => e,
@@ -1805,12 +1816,22 @@ impl AuthStore {
         loc: &crystalline_core::config::AccountsLocation,
         opts: &crystalline_index::postgres::PgSessionOptions,
     ) -> std::result::Result<AuthStore, AuthOpenError> {
+        AuthStore::open_at_no_migrate_as(loc, opts, crystalline_index::postgres::PgRole::Auth).await
+    }
+
+    /// [`AuthStore::open_at_no_migrate`] with the connections in `role`.
+    #[cfg(feature = "postgres")]
+    pub async fn open_at_no_migrate_as(
+        loc: &crystalline_core::config::AccountsLocation,
+        opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
+    ) -> std::result::Result<AuthStore, AuthOpenError> {
         match loc {
             crystalline_core::config::AccountsLocation::File(path) => {
                 AuthStore::open(path).await.map_err(AuthOpenError::Other)
             }
             crystalline_core::config::AccountsLocation::Postgres(cfg) => {
-                AuthStore::open_postgres(cfg, opts, false).await
+                AuthStore::open_postgres(cfg, opts, role, false).await
             }
         }
     }
@@ -1823,11 +1844,12 @@ impl AuthStore {
     async fn open_postgres(
         cfg: &crystalline_core::config::DatabaseConfig,
         opts: &crystalline_index::postgres::PgSessionOptions,
+        role: crystalline_index::postgres::PgRole,
         migrate: bool,
     ) -> std::result::Result<AuthStore, AuthOpenError> {
         let target = crystalline_index::postgres::PgTarget::from_config(cfg)
             .map_err(|e| AuthOpenError::Other(anyhow::Error::new(e)))?;
-        let pg = Box::pin(pg::PgAuth::open(target, opts.clone(), migrate)).await?;
+        let pg = Box::pin(pg::PgAuth::open(target, opts.clone(), role, migrate)).await?;
         let store = AuthStore {
             db: AuthDb::Postgres(Box::new(pg)),
             guard: tokio::sync::Mutex::new(()),

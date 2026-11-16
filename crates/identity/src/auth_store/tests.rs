@@ -7048,6 +7048,56 @@ mod postgres {
         assert!(scratch.name().starts_with("nom_"));
     }
 
+    /// A store opened in the role `cli` names its connections so, the one
+    /// it opens again after a lost connection too.
+    #[tokio::test]
+    async fn a_cli_store_keeps_its_role_across_a_reconnect() {
+        use crystalline_core::config::AccountsLocation;
+        use crystalline_index::postgres::{PgRole, PgSessionOptions};
+        let Some(url) = pg_url() else { return };
+        let scratch = crate::auth_store::pg::AuthScratch::new(&url, "clr");
+        let loc = AccountsLocation::Postgres(scratch.config());
+        let opts = PgSessionOptions::default();
+        let killer = AuthStore::open_at(&loc, &opts).await.unwrap();
+        let store = AuthStore::open_at_no_migrate_as(&loc, &opts, PgRole::Cli)
+            .await
+            .unwrap();
+        let cell = async |sql: &str| {
+            store
+                .db
+                .query_first(sql, vec![])
+                .await
+                .unwrap()
+                .unwrap()
+                .get_value(0)
+                .unwrap()
+        };
+        let name = async || match cell("SELECT current_setting('application_name')").await {
+            Value::Text(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let before = name().await;
+        assert!(before.ends_with("/cli"), "{before}");
+        let Value::Integer(pid) = cell("SELECT pg_backend_pid()").await else {
+            panic!("no backend pid");
+        };
+        killer
+            .db
+            .query_first(
+                "SELECT pg_terminate_backend(CAST(?1 AS INTEGER))",
+                vec![Value::Integer(pid)],
+            )
+            .await
+            .unwrap();
+        let _ = store.db.query_first("SELECT 1", vec![]).await;
+        let after = name().await;
+        assert!(after.ends_with("/cli"), "{after}");
+        let Value::Integer(again) = cell("SELECT pg_backend_pid()").await else {
+            panic!("no backend pid");
+        };
+        assert_ne!(pid, again, "the connection was not replaced");
+    }
+
     /// The orphan prune runs when a store opens: a session whose account
     /// vanished is gone once another store opens the schema.
     #[tokio::test]
