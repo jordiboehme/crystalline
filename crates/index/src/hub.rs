@@ -413,13 +413,18 @@ async fn fetch_files(
     // the file worth a notice and a progress line.
     let cached = is_cached(client, repo).await?;
     if !cached && announce {
-        eprintln!(
+        let line = format!(
             "crystalline: downloading {} {} to {} (first use, about {} MB)...",
             repo.what,
             repo.repo,
             cache_dir.display(),
             repo.download_mb
         );
+        if crystalline_core::log_format::env_wants_json() {
+            tracing::info!("{line}");
+        } else {
+            eprintln!("{line}");
+        }
     }
     let show_progress = !cached && announce && std::io::stderr().is_terminal();
 
