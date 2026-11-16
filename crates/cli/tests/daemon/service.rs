@@ -2272,35 +2272,13 @@ fn a_daemonless_sync_refuses_a_domain_another_instance_hosts_on_postgres() {
             && out.contains("crystalline sync --domain eng --accept-disk"),
         "{out}"
     );
-    let (ok, out, err) = env.run_full(&["status", "--config", config_arg]);
-    assert!(ok, "{out}{err}");
+    // `status` without a daemon is a read-only report, which on Postgres
+    // opens no store (only an owner migrates), so the per-domain lines
+    // above come from `sync` only.
+    let (_, out, err) = env.run_full(&["status", "--config", config_arg]);
     assert!(
-        out.contains(
-            "'eng': 1 engram and 0 Reflection files exist only on other-instance; copy the domain folder over or restore it, then sync, or drop them with: crystalline sync --domain eng --accept-disk"
-        ),
-        "{out}"
-    );
-    // Where another instance hosts the domain, the line names that host
-    // instead of a remedy that would be refused here.
-    lock_by_other("2999-01-01T00:00:00+00:00");
-    let (ok, out, err) = env.run_full(&["status", "--config", config_arg]);
-    assert!(ok, "{out}{err}");
-    assert!(
-        out.contains(
-            "'eng': 1 engram and 0 Reflection files exist only on other-instance; other-instance hosts this domain, so resolve it there"
-        ),
-        "{out}"
-    );
-    // A host with no heartbeat for longer than the stale threshold: the
-    // line says how to take the domain over.
-    lock_by_other("2000-01-01T00:00:00+00:00");
-    let (ok, out, err) = env.run_full(&["status", "--config", config_arg]);
-    assert!(ok, "{out}{err}");
-    assert!(
-        out.contains(
-            "other-instance hosts this domain but sends no heartbeat, so take it over with: crystalline sync --domain eng --take-over"
-        ),
-        "{out}"
+        format!("{out}{err}").contains("has no active instance"),
+        "{out}{err}"
     );
     assert!(run_sql(&format!("DELETE FROM {schema}.domain_lock")));
 
