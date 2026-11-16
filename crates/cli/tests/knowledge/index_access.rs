@@ -28,9 +28,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// The index factory entry points, plus the CLI's own former wrapper around
-/// one. A call to any of these is an index open.
-const OPENERS: &[&str] = &["open_store", "open_standalone", "open_backend"];
+/// The index factory entry points, the service's opener for a command (which
+/// claims a Postgres database first), plus the CLI's own former wrapper
+/// around one. A call to any of these is an index open.
+const OPENERS: &[&str] = &[
+    "open_store",
+    "open_store_for_command",
+    "open_standalone",
+    "open_backend",
+];
 
 /// The concrete store types. Both are `pub use`d from `crystalline_index`, so
 /// a direct constructor call opens an index without touching an opener's name
