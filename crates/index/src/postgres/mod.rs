@@ -5909,16 +5909,10 @@ impl PostgresStore {
     }
 }
 
-/// How long a pool built with a fence waits for a connection. sqlx retries a
-/// connect its `after_connect` refused until the acquire timeout runs out, so
-/// with its default 30 s a store whose instance lost the database would hang
-/// each statement for half a minute; a fenced store fails fast instead.
-const FENCED_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// `pool` with an `after_connect` that runs `first` (if any), then
 /// [`session::prepare_session`], so every new connection of the pool, a
 /// transparent reconnect included, is routed to `schema` and runs the fence
-/// check. A pool with a fence waits at most [`FENCED_ACQUIRE_TIMEOUT`].
+/// check.
 fn with_session_setup(
     pool: PgPoolOptions,
     schema: Option<String>,
@@ -5926,11 +5920,6 @@ fn with_session_setup(
     fence: Option<OwnerFence>,
     first: Option<&'static str>,
 ) -> PgPoolOptions {
-    let pool = if fence.is_some() && pool.get_acquire_timeout() > FENCED_ACQUIRE_TIMEOUT {
-        pool.acquire_timeout(FENCED_ACQUIRE_TIMEOUT)
-    } else {
-        pool
-    };
     pool.after_connect(move |conn, _meta| {
         let schema = schema.clone();
         Box::pin(async move {

@@ -587,7 +587,7 @@ mod tests {
         }
         // A pool's connect retries a failed `after_connect` until its acquire
         // timeout, so a refused pool connection surfaces as a time-out: the
-        // store's own fenced pool after its 5 s, a short test pool at once.
+        // store's own pool after its 30 s, a short test pool at once.
         let Err(err) = short_pool(&t, &o).acquire().await else {
             panic!("a pool connection went ahead");
         };

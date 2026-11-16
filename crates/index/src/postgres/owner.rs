@@ -624,8 +624,9 @@ impl PgOwner {
         self.call(|reply| Request::Announce { reply }).await
     }
 
-    /// The fence the owner-process connections check at connect. Before the
-    /// lock is first taken its `lock_pid` is 0, which no session has, so
+    /// The fence the owner-process connections check at connect. While the
+    /// owner does not hold the lock (before the first acquire, after a
+    /// release or a fence) its `lock_pid` is 0, which no session has, so
     /// every fenced connect is refused.
     pub fn fence(&self) -> OwnerFence {
         OwnerFence {
@@ -724,6 +725,7 @@ impl Worker {
                 // wait) does not leave the lock held behind its back.
                 if let Err(Ok(Acquired::Held { .. })) = reply.send(answer) {
                     self.held = None;
+                    self.lock_pid.store(0, Ordering::Release);
                     self.close_conn().await;
                 }
             }
@@ -930,6 +932,7 @@ impl Worker {
         }
         // Closing the session frees the lock even when the unlock failed.
         self.close_conn().await;
+        self.lock_pid.store(0, Ordering::Release);
         outcome
     }
 
@@ -975,6 +978,7 @@ impl Worker {
         self.held = None;
         self.fenced = true;
         self.conn = None;
+        self.lock_pid.store(0, Ordering::Release);
         self.fence_tx.send_replace(FenceState::Fenced(reason));
     }
 }
@@ -1246,6 +1250,7 @@ mod tests {
             panic!("the watch did not fence");
         };
         assert!(reason.contains("connection was lost"), "{reason}");
+        assert_eq!(a.fence().lock_pid, 0);
         // A fenced owner never takes the database again.
         let Err(err) = a.try_acquire().await else {
             panic!("a fenced owner took the lock again");
@@ -1570,6 +1575,7 @@ mod tests {
             row
         );
         assert_eq!(probe_owner(&t).await.unwrap(), None);
+        assert_eq!(a.fence().lock_pid, 0);
         // A release that was already done does nothing.
         a.release().await.unwrap();
         assert_eq!(*a.fenced().borrow(), FenceState::Holding);
