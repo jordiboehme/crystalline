@@ -458,18 +458,6 @@ impl Holder {
             _ => None,
         }
     }
-
-    /// Whether another machine holds the database under an owner row that
-    /// is announced: not a holder that is still starting.
-    pub(crate) fn announced_elsewhere(&self) -> bool {
-        match self {
-            #[cfg(feature = "postgres")]
-            Holder::Elsewhere {
-                owner: Some(owner), ..
-            } => owner.released_at.is_none(),
-            _ => false,
-        }
-    }
 }
 
 /// Who holds the Postgres database of `cfg`, read on a probe connection

@@ -2400,33 +2400,25 @@ pub(crate) async fn ensure_daemon_with(
             spawn_daemon(options)?;
         }
         // The race: another machine took the database between the look
-        // above and the spawn, and the daemon left with the lock-held code.
-        // Said as soon as that machine has announced itself, not after the
-        // whole budget.
+        // above and the spawn, and the daemon left with the lock-held code
+        // (so it no longer holds the state folder). Said at the next look,
+        // not after the whole budget.
         if let Some(cfg) = &database
             && Instant::now() >= next_look
         {
             next_look = Instant::now() + DATABASE_LOOK_EVERY;
             let holder = crate::claim::holder(cfg).await;
-            if holder.announced_elsewhere()
-                && let Some(message) = holder.not_served_here()
-            {
+            if let Some(message) = another_machines(&holder).await {
                 return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The same race with a holder that never announced itself: another
-    // machine's only while no process of this machine holds the state folder
-    // (a daemon of this machine that is still starting holds it).
-    if let Some(cfg) = &database {
-        let holder = crate::claim::holder(cfg).await;
-        if let Some(message) = holder.not_served_here()
-            && (holder.announced_elsewhere()
-                || matches!(diagnose_holder().await, HolderState::Free))
-        {
-            return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
-        }
+    // The same race, looked at once more when the budget is spent.
+    if let Some(cfg) = &database
+        && let Some(message) = another_machines(&crate::claim::holder(cfg).await).await
+    {
+        return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
     }
     // A holder we refused to touch is the better explanation of the timeout
     // than the generic one: it names the lock file and how to look at whoever
@@ -2452,6 +2444,29 @@ pub(crate) async fn ensure_daemon_with(
 /// How long `ensure_daemon` waits for the daemon it spawned to answer.
 const READINESS_BUDGET: Duration = Duration::from_secs(15);
 
+/// The sentence of a second instance started by mistake, when `holder` is
+/// another machine's: it holds the Postgres database, and no process of this
+/// machine holds the state folder. A daemon of this machine that is starting
+/// holds the folder before it takes the database, and until it has announced
+/// itself the owner row is missing, or is the row of the instance before it
+/// (a crashed owner of another machine, whose sessions it is ending), so
+/// while the folder is held the holder is never called another machine's.
+async fn another_machines(holder: &crate::claim::Holder) -> Option<String> {
+    let message = holder.not_served_here()?;
+    matches!(diagnose_holder().await, HolderState::Free).then_some(message)
+}
+
+/// The refusal when a command of this machine held the database for longer
+/// than `waited`.
+fn local_command_words(command: &str, pid: i64, waited: Duration) -> String {
+    format!(
+        "the command `{command}` (pid {pid}) on this machine holds the database, \
+         and it did not let go within {} s. A daemon starts once it has finished: \
+         wait for it, or stop it, and try again",
+        waited.as_secs().max(1)
+    )
+}
+
 /// How often the readiness wait looks who holds a Postgres database.
 const DATABASE_LOOK_EVERY: Duration = Duration::from_secs(1);
 
@@ -2466,17 +2481,14 @@ async fn refuse_or_wait_for_database(cfg: &config::GlobalConfig) -> anyhow::Resu
     let started = Instant::now();
     loop {
         let holder = crate::claim::holder(cfg).await;
-        if let Some(message) = holder.not_served_here() {
+        if let Some(message) = another_machines(&holder).await {
             return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
         }
         let Some((command, pid)) = holder.local_command() else {
             return Ok(());
         };
         if started.elapsed() >= budget {
-            anyhow::bail!(
-                "the command `{command}` (pid {pid}) on this machine holds the database,                  and it did not let go within {} s. A daemon starts once it has finished:                  wait for it, or stop it, and try again",
-                budget.as_secs().max(1)
-            );
+            anyhow::bail!(local_command_words(&command, pid, budget));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -5817,6 +5829,20 @@ mod tests {
         assert_eq!(
             attach_policy_for("0.25.0", "0.24.0", &here),
             AttachPolicy::Attach
+        );
+    }
+
+    /// The refusal for a command of this machine that holds the database
+    /// reads as one sentence: no run of spaces from a line break.
+    #[test]
+    fn the_local_command_refusal_has_no_runs_of_spaces() {
+        let words = local_command_words("crystalline reindex", 42, Duration::from_secs(30));
+        assert!(!words.contains("  "), "{words}");
+        assert!(
+            words.starts_with(
+                "the command `crystalline reindex` (pid 42) on this machine holds the database, and it did not let go within 30 s."
+            ),
+            "{words}"
         );
     }
 
