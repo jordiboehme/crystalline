@@ -1459,6 +1459,11 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The accounts a rename moves records in when no resolver is installed:
+    // on Postgres a standalone command hands the database's accounts here
+    // before it finishes a rename an earlier run left half done, because the
+    // accounts file in the state directory is never read there.
+    rename_accounts: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
     // Why the resolver above could not be built, on a stack that tried to
     // build one (every serving stack does, before it answers anything) and
     // could not open the accounts store. While it is set and no resolver is,
@@ -2710,6 +2715,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            rename_accounts: std::sync::OnceLock::new(),
             domain_access_unavailable: std::sync::OnceLock::new(),
             domain_access_absent: std::sync::OnceLock::new(),
             github_governor: std::sync::OnceLock::new(),
@@ -3398,6 +3404,14 @@ impl Engine {
     /// possibly different, store.
     pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
         let _ = self.domain_access.set(access);
+    }
+
+    /// Hand a rename the accounts it moves records in, without installing
+    /// them as the resolver: what a standalone command on Postgres does
+    /// before it finishes a rename an earlier run left half done. The
+    /// installed resolver wins when there is one. A second call is ignored.
+    pub fn set_rename_accounts(&self, access: Arc<crate::scope::DomainAccess>) {
+        let _ = self.rename_accounts.set(access);
     }
 
     /// Record that this stack tried to install the private-domain resolver

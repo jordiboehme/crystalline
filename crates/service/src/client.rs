@@ -1265,6 +1265,22 @@ async fn finish_leftover_rename_owned(engine: &Engine) -> Option<Value> {
     }
     match acquire_standalone_ownership("crystalline command finishing an earlier domain rename") {
         Ok(ownership) => {
+            // On Postgres the records the rename moves are in the database
+            // this command claimed, never in an accounts file.
+            let cfg = engine.config();
+            if cfg.database().backend == crystalline_core::config::DatabaseBackend::Postgres {
+                match crate::claim::accounts_location(&cfg) {
+                    Ok(loc) => match crate::claim::open_accounts_for_command(&cfg, &loc).await {
+                        Ok(auth) => engine.set_rename_accounts(Arc::new(
+                            crate::scope::DomainAccess::new(Arc::new(auth)),
+                        )),
+                        Err(e) => tracing::warn!(
+                            "the accounts in the database could not be opened for the rename an earlier run left half done ({e:#})"
+                        ),
+                    },
+                    Err(e) => tracing::warn!("{e:#}"),
+                }
+            }
             engine.set_holds_state_dir(true);
             let finished = engine.finish_leftover_rename().await;
             engine.set_holds_state_dir(false);
@@ -1906,10 +1922,11 @@ pub use crystalline_engine::machine_rename_owner;
 /// is, so the engine refuses a rename and skips a name adoption rather than
 /// running either unchecked; a warning says so once here.
 /// Install the private-domain resolver on a serving stack, over the
-/// accounts store of its configuration (the database on Postgres), and hand the store back for the HTTP surface to
-/// share. Every serving stack calls it before it answers anything: the
-/// daemon (HTTP on or off), the embedded stdio stack and a one-shot tool
-/// run, so a stack knows its readers whether or not anybody signs in here.
+/// accounts store of its configuration (the database on Postgres), and hand
+/// the store back for the HTTP surface to share. Every serving stack calls
+/// it before it answers anything: the daemon (HTTP on or off), the embedded
+/// stdio stack and a one-shot tool run, so a stack knows its readers whether
+/// or not anybody signs in here.
 /// A store that is not there is not created: with no account there is no
 /// private domain, and the engine refuses other domains' sources should the
 /// file appear while it runs.
