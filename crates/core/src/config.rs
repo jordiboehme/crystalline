@@ -1886,6 +1886,39 @@ pub fn web_auth_db_path() -> Result<PathBuf, ConfigError> {
     Ok(state_dir()?.join("web-auth.db"))
 }
 
+/// Where the accounts, sessions, MCP tokens and OAuth grants live: the
+/// `web-auth.db` file in the state directory, or the configured Postgres
+/// database and schema, beside the index.
+#[derive(Clone, Debug)]
+pub enum AccountsLocation {
+    /// A Turso file, `<state_dir>/web-auth.db`.
+    File(PathBuf),
+    /// The Postgres database (and schema) the index uses.
+    Postgres(DatabaseConfig),
+}
+
+impl AccountsLocation {
+    /// The accounts location for `db`: Postgres when `db` names the postgres
+    /// backend, else the `web-auth.db` file in `state_dir`, the same path
+    /// [`web_auth_db_path`] gives for the default state directory.
+    pub fn resolve(db: &DatabaseConfig, state_dir: &Path) -> AccountsLocation {
+        match db.backend {
+            DatabaseBackend::Postgres => AccountsLocation::Postgres(db.clone()),
+            DatabaseBackend::Turso => AccountsLocation::File(state_dir.join("web-auth.db")),
+        }
+    }
+
+    /// Whether accounts may already be stored here: the file exists, or the
+    /// location is Postgres, where it always counts as present (the tables
+    /// are created on the first open).
+    pub fn exists(&self) -> bool {
+        match self {
+            AccountsLocation::File(path) => path.exists(),
+            AccountsLocation::Postgres(_) => true,
+        }
+    }
+}
+
 /// The single-instance lock path, `<state_dir>/service.lock`. Lock only: the
 /// owner holds an exclusive OS lock on this file for its lifetime and the
 /// contents are meaningless. The owner's record lives at [`service_info_path`],
@@ -2008,6 +2041,33 @@ pub fn models_dir_is_user_provided() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Turso keeps the accounts in `web-auth.db` in the state directory;
+    /// Postgres keeps them in the configured database, which always exists.
+    #[test]
+    fn accounts_location_follows_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = AccountsLocation::resolve(&DatabaseConfig::default(), dir.path());
+        match &file {
+            AccountsLocation::File(path) => assert_eq!(path, &dir.path().join("web-auth.db")),
+            other => panic!("{other:?}"),
+        }
+        assert!(!file.exists());
+        std::fs::write(dir.path().join("web-auth.db"), b"").unwrap();
+        assert!(file.exists());
+        let pg = DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some("postgres://u:secret@h/db".to_string()),
+            schema: Some("team_a".to_string()),
+        };
+        let loc = AccountsLocation::resolve(&pg, dir.path());
+        match &loc {
+            AccountsLocation::Postgres(cfg) => assert_eq!(cfg.schema.as_deref(), Some("team_a")),
+            other => panic!("{other:?}"),
+        }
+        assert!(loc.exists());
+        assert!(!format!("{loc:?}").contains("secret"));
+    }
 
     #[test]
     fn the_webhook_debug_render_masks_the_secret_and_keeps_the_url() {
