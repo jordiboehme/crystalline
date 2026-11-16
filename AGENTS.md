@@ -47,6 +47,17 @@ Rust is managed by rustup, installed via Homebrew (`brew install rustup`). Homeb
 
 rustup enforces the `rust-toolchain.toml` pin: inside this repo every proxy resolves to channel 1.99.1 (including clippy and rustfmt) regardless of the default toolchain, and a missing pinned toolchain is downloaded on first use. That file is the authority; if this line and the pin ever disagree, the pin wins and this line is stale.
 
+## Releases
+
+A merge releases; nobody pushes a tag by hand.
+
+- The last pull request of a version carries the release: the version bump (Cargo.toml, fluid/package.json, the three pins in docs/evolve.md, `scripts/version-pins.sh` checks them) and `release-notes/v<version>.md`, opening with an H1 that is the release's motto
+- The branch must be up to date with main before it merges (the `main` ruleset requires it, with `ci-passed` as the required check), so the push to main carries the tree the pull request tested and CI there skips the tests
+- On that push, after `ci-passed`, the `release-check` job in ci.yml runs `scripts/release-check.sh`: a version that is already tagged is a no-op with one line; a new version without its notes file fails the job; a new version with its notes calls `release.yml` with `tag: v<version>`, which creates the annotated tag at the tested commit and publishes the release, the images and the Homebrew formula
+- A failed release is retried with a re-run of the failed jobs of that CI run; the next push to main also retries it, at its own commit, as long as the tag does not exist
+- Pushing a `v*` tag by hand still releases (the fallback), and a manual run of the Release workflow is still a dry run that publishes nothing
+- Try the decision locally with `bash scripts/release-check.sh`
+
 ## Local folders (gitignored)
 
 - `plans/` - implementation plans. Read the newest plan before starting work; store any new plan here
