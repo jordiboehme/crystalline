@@ -1709,9 +1709,9 @@ fn users_refused_when_auth_ledger_behind_and_owned() {
     let (ok, out, err) = env.run_full(&["users", "list"]);
     assert!(!ok, "{out}{err}");
     assert!(
-        err.contains("the accounts tables are at version 0, this binary needs 1")
-            && err.contains("run the command on the active instance")
-            && err.contains("is owned by the active instance"),
+        err.contains("the accounts tables are at version 0, this binary needs 1, and only the instance that owns the database migrates them: the database")
+            && err.contains("is owned by the active instance")
+            && err.matches("Run the command there").count() == 1,
         "{err}"
     );
     assert_eq!(
@@ -1744,6 +1744,14 @@ fn users_migrates_when_auth_ledger_behind_and_free() {
     );
     let (ok, out, err) = env.run_full(&["users", "list"]);
     assert!(ok && out.contains("ada"), "{out}{err}");
+
+    // On a schema that has the index tables, the claim is recorded in the
+    // owner row and given back with `released_at`.
+    env.setup_domain("eng");
+    assert!(pg.sql(&format!("DELETE FROM {}.auth_schema_migration", pg.schema)));
+    users_add(&env, "bob", "bob-password");
+    assert_eq!(auth_ledger(&pg), "1");
+    assert_eq!(owner_command(&pg), "crystalline users add|true");
 }
 
 /// Accounts tables a newer Crystalline wrote are refused as too new, and
@@ -1795,6 +1803,74 @@ fn leftover_web_auth_db_not_read_and_warned() {
         before,
         "the file changed"
     );
+}
+
+/// `domain visibility` and `domain members` write the accounts of the
+/// configuration their `--config` names: with the default configuration on
+/// Turso and the override on Postgres, the acl lands in the database and no
+/// accounts file is made beside the default one.
+#[test]
+fn domain_visibility_writes_the_accounts_of_its_config_override() {
+    let Some(pg) = PgScratch::new("acmem") else {
+        return;
+    };
+    users_add(&Env::new("acmemp").on_postgres(&pg), "ada", "ada-password");
+    let env = Env::new("acmem");
+    let kb = env.state_dir().with_file_name("kb-eng");
+    std::fs::create_dir_all(&kb).unwrap();
+    let config = env.state_dir().with_file_name("pg.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "database:\n  backend: postgres\n  url: {}\n  schema: {}\ndomains:\n  eng:\n    path: {}\n",
+            pg.url,
+            pg.schema,
+            kb.display()
+        ),
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let (ok, out, err) = env.run_full(&[
+        "domain",
+        "visibility",
+        "eng",
+        "private",
+        "--owner",
+        "ada",
+        "--config",
+        config,
+    ]);
+    assert!(ok, "{out}{err}");
+    assert_eq!(
+        pg.text(&format!(
+            "SELECT owner FROM {}.domain_acl WHERE domain = 'eng'",
+            pg.schema
+        )),
+        "ada"
+    );
+    let (ok, out, err) = env.run_full(&["domain", "members", "eng", "list", "--config", config]);
+    assert!(ok && out.contains("ada"), "{out}{err}");
+    assert!(
+        !env.state_dir().join("web-auth.db").exists(),
+        "the default configuration's accounts file was written"
+    );
+}
+
+/// A Postgres daemon starts the GitHub App load before it opens the
+/// accounts, as every other stack that installs domain access does, so the
+/// first request on a governed domain does not find the App unsettled.
+#[test]
+fn daemon_on_postgres_preloads_the_github_app() {
+    let Some(pg) = PgScratch::new("acapp") else {
+        return;
+    };
+    let env = Env::new("acapp").on_postgres(&pg);
+    let mut serve = Serve::start(&env, Some("info,crystalline::start=debug"));
+    serve.wait_ready();
+    let log = serve.log();
+    let preload = log.find("start: github app preload").expect(&log);
+    let opened = log.find("start: store open").expect(&log);
+    assert!(opened < preload, "{log}");
 }
 
 /// A rebuild never takes the accounts with it: on Turso `reindex --wipe`

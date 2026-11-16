@@ -4837,7 +4837,9 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 origin.is_some() && private && cmd::github_app_decides_access(config.as_deref())?;
             let closing = match (private, owner) {
                 (true, Some(owner)) if app_decides => Some(owner.trim().to_lowercase()),
-                (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
+                (true, Some(owner)) => {
+                    Some(members::check_private_owner(&owner, config.as_deref()).await?)
+                }
                 _ => None,
             };
             // The chosen name comes back from the dispatch rather than the

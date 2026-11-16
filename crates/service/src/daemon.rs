@@ -1211,6 +1211,7 @@ async fn open_domain_access(
 ) -> anyhow::Result<Option<Arc<crate::rest::AuthStore>>> {
     #[cfg(feature = "postgres")]
     if let Some(pg) = pg {
+        crate::client::start_github_access(engine);
         let auth = pg.open_accounts(cfg).await.map_err(|e| {
             anyhow::anyhow!(
                 "could not open the accounts in the database {} ({e:#}); on Postgres the accounts live in the database, so this instance does not start without them",

@@ -398,7 +398,7 @@ async fn report_on(cfg: &GlobalConfig) -> anyhow::Result<Option<CommandDbOwner>>
 /// Where the accounts of `cfg` live (spec section A): the `web-auth.db`
 /// file in the state directory on Turso, the configured database on
 /// Postgres.
-pub fn accounts_location(cfg: &GlobalConfig) -> anyhow::Result<AccountsLocation> {
+pub(crate) fn accounts_location(cfg: &GlobalConfig) -> anyhow::Result<AccountsLocation> {
     let state_dir = crystalline_core::config::state_dir()
         .map_err(|e| anyhow::anyhow!("could not resolve the state directory: {e}"))?;
     Ok(AccountsLocation::resolve(&cfg.database(), &state_dir))
@@ -471,11 +471,14 @@ async fn open_cli_accounts_on_postgres(
         Ok(None) => anyhow::bail!("the accounts database is not on Postgres"),
         Err(e) => match e.downcast_ref::<DatabaseOwned>() {
             Some(owned) => anyhow::bail!(
-                "the accounts tables are at version {found}, this binary needs {need}; run the command on the active instance. {owned}"
+                "the accounts tables are at version {found}, this binary needs {need}, and only the instance that owns the database migrates them: {owned}"
             ),
             None => return Err(e),
         },
     };
+    // The command owns the database now: it opens as the owner does, with
+    // the claim's fenced options in the role `auth`, so a lost lock stops
+    // the migration and the writes after it.
     AuthStore::open_at(loc, &claim.session_options()).await
 }
 
