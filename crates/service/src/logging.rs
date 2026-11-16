@@ -2,6 +2,7 @@
 //! because they are needed before the config overlay loads.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -32,6 +33,33 @@ pub fn parse_log_format(value: Option<&str>) -> (LogFormat, Option<String>) {
     }
 }
 
+/// Set once the JSON subscriber is the one installed.
+static JSON_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process logs JSON, so plain stderr lines would break it.
+pub fn json_logs() -> bool {
+    JSON_LOGS.load(Ordering::Relaxed)
+}
+
+/// Prints a console line to stderr, or logs it at info level in JSON mode.
+pub fn console_line(line: &str) {
+    if json_logs() {
+        tracing::info!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+/// Like [`console_line`] for a warning. Text mode prints the
+/// `crystalline warning: ` prefix; JSON mode logs at warn level without it.
+pub fn console_warning(line: &str) {
+    if json_logs() {
+        tracing::warn!("{line}");
+    } else {
+        eprintln!("crystalline warning: {line}");
+    }
+}
+
 /// Installs the global subscriber with the format from the environment.
 /// `ansi` is `Some(false)` for a log file. The first subscriber installed
 /// stays, as with a plain `try_init`.
@@ -58,6 +86,9 @@ where
             }
         }
     };
+    if installed && format == LogFormat::Json {
+        JSON_LOGS.store(true, Ordering::Relaxed);
+    }
     if installed && let Some(warning) = warning {
         tracing::warn!("{warning}");
     }
