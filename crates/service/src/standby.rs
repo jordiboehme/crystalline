@@ -50,20 +50,74 @@ pub(crate) struct PgStart {
     /// then gives the stop future back.
     guard: tokio::task::JoinHandle<Option<StopFuture>>,
     guard_done: tokio::sync::oneshot::Sender<()>,
-    /// The owner row as the predecessor left it, for the takeover.
+    /// The instance id every owner connection is tagged with.
     #[cfg(feature = "postgres")]
-    #[allow(dead_code, reason = "read by the takeover (Task 1.11)")]
-    previous: Option<crystalline_index::postgres::OwnerRow>,
+    instance_id: String,
+    /// The database, as [`crystalline_index::postgres::PgTarget::describe`]
+    /// says it, for the log.
+    #[cfg(feature = "postgres")]
+    database: String,
 }
 
-/// What the daemon keeps after the handover: the owner lock, which goes with
-/// the process.
+/// What the daemon keeps after the handover: the owner lock, held until the
+/// last step of the shutdown gives it back ([`PgHeld::release`]) or the
+/// process exits.
 pub(crate) struct PgHeld {
     #[cfg(feature = "postgres")]
-    _owner: Arc<crystalline_index::postgres::PgOwner>,
+    owner: Arc<crystalline_index::postgres::PgOwner>,
+}
+
+impl PgHeld {
+    /// Give the database back: record `released_at` in the owner row and
+    /// unlock, so a standby takes over without waiting out the grace. The
+    /// last step of a graceful stop; a failure is said in the log, and the
+    /// exit right after frees the lock anyway.
+    pub(crate) async fn release(&self) {
+        #[cfg(feature = "postgres")]
+        if let Err(e) = self.owner.release().await {
+            tracing::warn!("could not release the database ({e}); the exit frees it");
+        }
+    }
 }
 
 impl PgStart {
+    /// The settings every Postgres connection of this owner is built with:
+    /// tagged with the instance id and fenced on the held lock, so a
+    /// connection made after the lock is lost is refused.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn session_options(&self) -> crystalline_index::postgres::PgSessionOptions {
+        crystalline_index::postgres::PgSessionOptions {
+            instance_tag: Some(self.instance_id.clone()),
+            fence: Some(self.owner.fence()),
+        }
+    }
+
+    /// Write the owner row again: on a schema the store open just created
+    /// the table in, the announce right after the lock found none.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn announce(&self) -> anyhow::Result<()> {
+        self.owner.announce().await.map_err(|e| {
+            anyhow::anyhow!(
+                "could not record this instance as the owner of the database {}: {e}",
+                self.database
+            )
+        })
+    }
+
+    /// Open the accounts store in the database this instance owns, with the
+    /// owner's connection settings.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn open_accounts(
+        &self,
+        cfg: &crystalline_core::config::GlobalConfig,
+    ) -> anyhow::Result<crate::rest::AuthStore> {
+        crate::rest::AuthStore::open_at(
+            &crystalline_core::config::AccountsLocation::Postgres(cfg.database()),
+            &self.session_options(),
+        )
+        .await
+    }
+
     /// The early HTTP slot: the full router goes into it once built.
     pub(crate) fn http_slot(&self) -> Option<HttpSlot> {
         self.http.clone()
@@ -91,7 +145,7 @@ impl PgStart {
             listener,
             PgHeld {
                 #[cfg(feature = "postgres")]
-                _owner: self.owner,
+                owner: self.owner,
             },
             stop,
         ))
@@ -132,8 +186,10 @@ mod pg {
 
     use crystalline_core::base::BasePath;
     use crystalline_core::config::{DatabaseBackend, GlobalConfig};
+    use crystalline_index::IndexError;
     use crystalline_index::postgres::{
-        Acquired, OwnerIdentity, OwnerRow, PgOwner, PgTarget, StandbyStatus,
+        Acquired, FenceState, OwnerIdentity, OwnerRow, PgOwner, PgTarget, StandbyStatus,
+        TakeoverReport,
     };
     use interprocess::local_socket::tokio::{Listener as IpcListener, Stream as IpcStream};
     use serde_json::{Value, json};
@@ -630,10 +686,28 @@ mod pg {
         // and (from the takeover on) the grace all run in this window.
         let (guard_done, done) = tokio::sync::oneshot::channel();
         let guard = tokio::spawn(guard_start(stop, shutdown.subscribe(), done, leaving));
+        // From the lock on, a lost lock ends the process with EXIT_FENCED,
+        // during the start as later.
+        tokio::spawn(watch_fence(owner.fenced(), described.clone()));
         if let Some(hold) = start_hold() {
             tracing::info!("test hook: holding the start for {}ms", hold.as_millis());
             tokio::time::sleep(hold).await;
         }
+
+        // The takeover: end the predecessor's sessions and wait out the
+        // grace unless it released cleanly, then say who owns the database.
+        // Both before anything opens a pool, and a failure stops the start.
+        let report = owner
+            .takeover(previous.as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", plain(e)))?;
+        let released = previous.as_ref().is_some_and(|p| p.released_at.is_some());
+        tracing::info!("{}", takeover_line(&described, &report, released));
+        owner.announce().await.map_err(|e| {
+            anyhow::anyhow!(
+                "could not record this instance as the owner of the database {described}: {e}"
+            )
+        })?;
         Ok((
             Some(PgStart {
                 ctl,
@@ -642,10 +716,66 @@ mod pg {
                 owner,
                 guard,
                 guard_done,
-                previous,
+                instance_id: instance_id.to_string(),
+                database: described,
             }),
             None,
         ))
+    }
+
+    /// An index error as its sentence: an `Invalid` one is already written
+    /// for a person (a refused takeover names the grant to give), so it goes
+    /// without the "invalid input" prefix.
+    fn plain(e: IndexError) -> String {
+        match e {
+            IndexError::Invalid(sentence) => sentence,
+            other => other.to_string(),
+        }
+    }
+
+    /// The log line of a takeover: how many sessions of the predecessor it
+    /// ended, and whether it waited out the grace.
+    ///
+    /// `released` says the predecessor recorded a clean release, which is
+    /// when the takeover skips the grace.
+    pub(crate) fn takeover_line(database: &str, report: &TakeoverReport, released: bool) -> String {
+        let waited = if released {
+            "without a grace (the instance before released it)".to_string()
+        } else {
+            format!("after a grace of {}ms", report.waited.as_millis())
+        };
+        let ended = crystalline_core::text::plural(
+            usize::try_from(report.terminated).unwrap_or(usize::MAX),
+            "session",
+            "sessions",
+        );
+        format!(
+            "takeover: this instance owns the database {database}; ended {ended} of the instance before, {waited}"
+        )
+    }
+
+    /// The line a fenced owner logs before it exits.
+    pub(crate) fn fenced_line(database: &str, reason: &str) -> String {
+        format!(
+            "lost ownership of the database {database}; stopping so another instance can take over ({reason}; a connection pooler in transaction mode between Crystalline and Postgres also causes this)"
+        )
+    }
+
+    /// Exit with [`crate::daemon::EXIT_FENCED`] once the owner lock is lost:
+    /// one error line, and none of the departure's steps, whose writes
+    /// (host locks, a checkpoint, a saved sign-in) would race the instance
+    /// that owns the database now.
+    async fn watch_fence(mut fenced: watch::Receiver<FenceState>, database: String) {
+        loop {
+            let state = fenced.borrow_and_update().clone();
+            if let FenceState::Fenced(reason) = state {
+                tracing::error!("{}", fenced_line(&database, &reason));
+                crate::daemon::exit_with(crate::daemon::EXIT_FENCED);
+            }
+            if fenced.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// How a stop leaves before the daemon serves.
@@ -659,6 +789,12 @@ mod pg {
         /// Release the lock when it is held (the release does nothing
         /// otherwise), remove the record, the socket and the lock file, and
         /// exit 0. `phase` names where the stop came, for the log.
+        ///
+        /// The start may still run beside this (a store open, a migration),
+        /// but every connection it opens is fenced on the lock: once the
+        /// lock is given back, a new connection is refused at connect, and
+        /// the instance that takes the database next ends the ones still
+        /// open before it writes anything.
         async fn leave(self, phase: &str, reason: &str) -> ! {
             tracing::info!("{phase}: stopping ({reason})");
             match tokio::time::timeout(RELEASE_WAIT, self.owner.release()).await {
@@ -807,6 +943,29 @@ mod pg {
                 );
                 assert!(standby_refusal(unknown.as_ref()).contains("has not announced itself yet"));
             }
+        }
+
+        /// The takeover line says whether the grace was waited out, and the
+        /// fence line names the database and what a pooler does.
+        #[test]
+        fn the_takeover_and_fence_lines_say_what_happened() {
+            let report = TakeoverReport {
+                terminated: 2,
+                waited: Duration::from_millis(1500),
+            };
+            assert_eq!(
+                takeover_line("db:5432/c, schema a", &report, false),
+                "takeover: this instance owns the database db:5432/c, schema a; ended 2 sessions of the instance before, after a grace of 1500ms"
+            );
+            assert!(
+                takeover_line("x", &report, true)
+                    .ends_with("without a grace (the instance before released it)")
+            );
+            let line = fenced_line("db:5432/c, schema a", "the lock connection was lost");
+            assert!(line.starts_with(
+                "lost ownership of the database db:5432/c, schema a; stopping so another instance can take over (the lock connection was lost;"
+            ));
+            assert!(line.contains("pooler"));
         }
 
         async fn call(router: &axum::Router, path: &str) -> (u16, Option<String>, String) {

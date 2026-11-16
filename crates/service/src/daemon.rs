@@ -540,8 +540,18 @@ pub async fn run_serve(
     )
     .await?;
 
-    let store = open_store_as_owner(&loaded.effective, Some(&db_path)).await?;
+    let store = open_store_for_start(&loaded.effective, Some(&db_path), pg_start.as_ref()).await?;
     start_step("store open");
+    // On a schema the store open just created, the announce after the lock
+    // found no owner table; the row is written now.
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = &pg_start {
+        pg.announce().await?;
+    }
+    // The owner of a Postgres database is its only active instance, so the
+    // host lock of every domain it serves is its own: claimed with take-over,
+    // never waited for until a killed predecessor's heartbeat goes stale.
+    let take_over = take_over || pg_start.is_some();
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
@@ -715,7 +725,7 @@ pub async fn run_serve(
     // reaches every reader of its domain and the backup branch either way.
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
-    let accounts = crate::client::install_domain_access(&engine).await;
+    let accounts = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await;
     // Who may read each env-defined team domain on an instance with a GitHub
     // App, recorded before anything is served so a private one is closed
     // from its first request on. A private record that cannot be written
@@ -1052,8 +1062,8 @@ pub async fn run_serve(
     }
 
     // On Postgres the early responder hands the socket over now, and the
-    // owner lock stays held in `_database` until the process exits.
-    let (listener, _database, mut stop) = match pg_start {
+    // owner lock stays held in `database` until the last shutdown step.
+    let (listener, database, mut stop) = match pg_start {
         Some(pg) => {
             let (listener, held, stop) = pg.hand_over(&shared).await?;
             (listener, Some(held), stop)
@@ -1109,7 +1119,58 @@ pub async fn run_serve(
     // server rotated is saved. The refresh touches no store.
     departure.settle_sign_ins().await;
 
+    // Last, so everything above still wrote as the owner (a saved sign-in
+    // included): `released_at` and the unlock, and a standby takes over
+    // without the grace. Bounded by the same watchdog; a release that never
+    // ends is cut by the exit, which frees the lock without `released_at`.
+    if let Some(database) = &database {
+        departure.step("releasing the database");
+        database.release().await;
+    }
+
     departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// Open the index store for the daemon's start: on Postgres with the owner's
+/// connection settings (each connection tagged with the instance id and
+/// fenced on the held lock), elsewhere as [`open_store_as_owner`] does.
+async fn open_store_for_start(
+    cfg: &GlobalConfig,
+    db: Option<&Path>,
+    pg: Option<&crate::standby::PgStart>,
+) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = pg {
+        return Ok(crystalline_index::open_store_with(
+            &cfg.database(),
+            db,
+            false,
+            &pg.session_options(),
+        )
+        .await?);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = pg;
+    open_store_as_owner(cfg, db).await
+}
+
+/// Open the accounts store the daemon keeps for domain access and the HTTP
+/// surface: in the owned Postgres database with the owner's connection
+/// settings, else the accounts file as [`crate::client::install_domain_access`]
+/// opens it.
+async fn open_domain_access(
+    engine: &Arc<Engine>,
+    cfg: &GlobalConfig,
+    pg: Option<&crate::standby::PgStart>,
+) -> Option<Arc<crate::rest::AuthStore>> {
+    #[cfg(feature = "postgres")]
+    if let Some(pg) = pg {
+        let opened = pg.open_accounts(cfg).await.map_err(|e| format!("{e:#}"));
+        return crate::client::install_opened_domain_access(engine, opened);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = (cfg, pg);
+    crate::client::install_domain_access(engine).await
 }
 
 /// What a departure keeps back for the steps after the sign-in settle (the

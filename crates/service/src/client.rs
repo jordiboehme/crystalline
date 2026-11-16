@@ -1827,6 +1827,17 @@ pub(crate) async fn install_domain_access(
             .map_err(|e| format!("{e:#}")),
         Err(e) => Err(format!("{e:#}")),
     };
+    install_opened_domain_access(engine, opened)
+}
+
+/// [`install_domain_access`] over an accounts store the caller opened (or
+/// failed to open, with the reason): installed as the engine's domain access
+/// and handed back, or, when it did not open, domain access fails closed and
+/// the reason is logged.
+pub(crate) fn install_opened_domain_access(
+    engine: &Arc<Engine>,
+    opened: Result<crate::rest::AuthStore, String>,
+) -> Option<Arc<crate::rest::AuthStore>> {
     match opened {
         Ok(auth) => {
             let auth = Arc::new(auth);
