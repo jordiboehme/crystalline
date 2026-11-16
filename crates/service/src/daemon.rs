@@ -620,10 +620,14 @@ pub async fn run_serve(
     // opened further down, after those two short-lived opens, as before.
     let pg_accounts = match &pg_start {
         Some(pg) => {
+            #[cfg(not(feature = "postgres"))]
+            let _ = pg;
+            let access = open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?;
+            // The one durable-state line (spec section F), after the
+            // accounts opened, and each thing left behind on this disk as
+            // its own warning.
             #[cfg(feature = "postgres")]
             {
-                // The one durable-state line (spec section F), and each
-                // thing left behind on this disk as its own warning.
                 let report =
                     crate::durable::durable_state_of_owner(&loaded.effective, pg.database()).await;
                 tracing::info!("{}", report.startup_line());
@@ -631,9 +635,7 @@ pub async fn run_serve(
                     tracing::warn!("{warning}");
                 }
             }
-            #[cfg(not(feature = "postgres"))]
-            let _ = pg;
-            open_domain_access(&engine, &loaded.effective, pg_start.as_ref()).await?
+            access
         }
         None => None,
     };

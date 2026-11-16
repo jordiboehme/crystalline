@@ -2983,7 +2983,12 @@ async fn status_dispatch(
         // On Postgres, who owns the database and where the accounts live,
         // read from the owner row beside the daemon's own answer.
         let durable = match &loaded {
-            Ok(loaded) => cmd::durable_state_block(&loaded.effective, "active").await,
+            Ok(loaded) => {
+                // A standby was answered above; the daemon's own role,
+                // active when its reply carries none.
+                let role = data["role"].as_str().unwrap_or("active");
+                cmd::durable_state_block(&loaded.effective, role).await
+            }
             Err(_) => None,
         };
         if json {

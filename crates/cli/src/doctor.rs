@@ -895,7 +895,6 @@ fn check_claude_desktop_at(path: &Path, limit: std::time::Duration) -> Option<Cl
     }
 }
 
-/// The `claude desktop` section.
 /// The ownership and durable state block of a Postgres database.
 fn render_durable_state(out: &mut String, block: &serde_json::Value) {
     use std::fmt::Write as _;
@@ -926,6 +925,7 @@ fn render_durable_state(out: &mut String, block: &serde_json::Value) {
     }
 }
 
+/// The `claude desktop` section.
 fn render_claude_desktop(out: &mut String, d: &ClaudeDesktopDoctor) {
     use std::fmt::Write as _;
     let _ = writeln!(out, "claude desktop ({}):", d.record_path);
@@ -2467,6 +2467,8 @@ pub async fn run(
     let kept = check_kept(crate::kept::scan_here(), domain_filter, chrono::Utc::now());
     let case_twins = check_case_twins(cfg);
 
+    // Only an active daemon answers the file-stamp request (a standby
+    // refuses ctl commands), so a daemon route means an active one.
     let role = if matches!(index, IndexAccess::Daemon) {
         "active"
     } else {

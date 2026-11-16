@@ -1971,6 +1971,7 @@ fn status_without_daemon_reports_owner_row() {
     assert_eq!(status["durable_state"]["owner"]["label"], label);
     assert_eq!(status["durable_state"]["accounts"], "postgres");
     assert_eq!(status["durable_state"]["role"], "none");
+    assert!(!out.contains(&url_credentials(&pg)));
     assert!(active.alive());
 }
 
@@ -1994,6 +1995,7 @@ fn doctor_fix_refused_when_owned() {
     let text = format!("{out}{err}");
     assert!(text.contains("ownership and durable state:"), "{text}");
     assert!(text.contains(&format!("owner: {label}")), "{text}");
+    assert!(!text.contains(&url_credentials(&pg)), "{text}");
 }
 
 /// An accounts file left on this disk is named by `doctor` on Postgres, and
@@ -2038,4 +2040,33 @@ fn status_block_absent_on_turso() {
         !format!("{out}{err}").contains("durable state"),
         "{out}{err}"
     );
+}
+
+/// The credentials of `pg`'s URL, `user:password`.
+fn url_credentials(pg: &PgScratch) -> String {
+    pg.url
+        .split('@')
+        .next()
+        .and_then(|head| head.split("//").nth(1))
+        .unwrap()
+        .to_string()
+}
+
+/// A daemonless `status` on a free database reports no owner, succeeds and
+/// opens nothing.
+#[test]
+fn status_on_a_free_database_says_free() {
+    let Some(pg) = PgScratch::new("dsfree") else {
+        return;
+    };
+    let env = Env::new("dsfree").on_postgres(&pg);
+    let (ok, out, err) = env.run_full(&["status"]);
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("Owner: none"), "{out}");
+    let (ok, out, err) = env.run_full(&["status", "--json"]);
+    assert!(ok, "{out}{err}");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["durable_state"]["owner_state"], "free");
+    assert!(!format!("{out}{err}").contains(&url_credentials(&pg)));
+    assert_eq!(schema_objects(&pg), "0", "status opened the store");
 }
