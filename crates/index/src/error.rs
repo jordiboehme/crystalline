@@ -162,6 +162,12 @@ pub enum IndexError {
         /// The newest migration version this binary ships.
         known: i64,
     },
+    /// A write whose commit was sent but whose outcome is unknown: the
+    /// connection broke or the answer did not come in time after the
+    /// `COMMIT` went out. The write may or may not be stored, so a caller
+    /// reads the stored state again instead of assuming either.
+    #[error("{0}")]
+    MaybeStored(String),
 }
 
 /// The opening words of [`IndexError::SchemaTooNew`]'s message. The readers

@@ -33,7 +33,7 @@
 //! and the grace from them.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -540,10 +540,22 @@ pub struct ConfigDoc {
     pub updated_by: String,
 }
 
-/// The configuration document from `table`, when the table exists and has
-/// it. Never creates anything.
-async fn read_config(conn: &mut PgConnection, table: &str) -> Result<Option<ConfigDoc>> {
+/// The configuration document from `table`, when it has one. A missing
+/// table is `None` for a lock-free reader (`required` off) and an error for
+/// the owner's side channel, whose owner migrated before it serves. Never
+/// creates anything.
+async fn read_config(
+    conn: &mut PgConnection,
+    table: &str,
+    required: bool,
+) -> Result<Option<ConfigDoc>> {
     if !table_exists(conn, table).await? {
+        if required {
+            return Err(IndexError::Db(format!(
+                "the configuration table {table} does not exist: the active instance migrates \
+                 the database before it reads its configuration"
+            )));
+        }
         return Ok(None);
     }
     let sql = format!(
@@ -563,24 +575,45 @@ async fn read_config(conn: &mut PgConnection, table: &str) -> Result<Option<Conf
     }))
 }
 
-/// Replace the configuration document in `table` with `body` (JSON text),
-/// saved by `by`. One explicit transaction: a caller that gives up before
-/// the commit leaves nothing written.
-async fn write_config(conn: &mut PgConnection, table: &str, body: &str, by: &str) -> Result<()> {
+/// Open a transaction on `conn` and replace the configuration document in
+/// `table` with `body` (JSON text), saved by `by`, without committing. A
+/// connection dropped before its `COMMIT` leaves nothing written.
+async fn stage_config(conn: &mut PgConnection, table: &str, body: &str, by: &str) -> Result<()> {
     let sql = format!(
         "INSERT INTO {table} (id, body, updated_at, updated_by) \
          VALUES (1, $1::jsonb, now(), $2) \
          ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, \
          updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by"
     );
-    let mut tx = conn.begin().await?;
+    sqlx::raw_sql("BEGIN").execute(&mut *conn).await?;
     sqlx::query(AssertSqlSafe(sql))
         .bind(body)
         .bind(by)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(())
+}
+
+/// The result of a `COMMIT` that was sent: `None` when it did not answer
+/// within [`SIDE_STATEMENT_TIMEOUT`]. The server's own error (a deferred
+/// constraint, a serialization failure) means the transaction was rolled
+/// back, so the write is known not to be stored. A timeout, a broken
+/// connection or any other client-side failure leaves the outcome unknown:
+/// [`IndexError::MaybeStored`].
+fn commit_outcome(answer: Option<std::result::Result<(), sqlx::Error>>) -> Result<()> {
+    match answer {
+        Some(Ok(())) => Ok(()),
+        Some(Err(e)) if matches!(e, sqlx::Error::Database(_)) && !is_broken(&e) => Err(e.into()),
+        Some(Err(e)) => Err(maybe_stored(&e.to_string())),
+        None => Err(maybe_stored("the commit did not answer in time")),
+    }
+}
+
+/// The error of a save whose `COMMIT` went out with no known outcome.
+fn maybe_stored(why: &str) -> IndexError {
+    IndexError::MaybeStored(format!(
+        "the save may have been stored: {why}; read the configuration again to see whether it was"
+    ))
 }
 
 /// The configuration document of `target`, read on a `probe` connection
@@ -588,7 +621,7 @@ async fn write_config(conn: &mut PgConnection, table: &str, body: &str, by: &str
 /// `None` when the table or the row does not exist.
 pub async fn read_config_document(target: &PgTarget) -> Result<Option<ConfigDoc>> {
     let mut conn = connect_one(target, PgRole::Probe, &PgSessionOptions::default()).await?;
-    let doc = read_config(&mut conn, &config_table(target.schema.as_deref())).await;
+    let doc = read_config(&mut conn, &config_table(target.schema.as_deref()), false).await;
     let _ = conn.close().await;
     doc
 }
@@ -621,8 +654,47 @@ enum SideOp {
     Save {
         body: String,
         by: String,
+        gate: CommitGate,
         reply: SideReply<()>,
     },
+}
+
+/// Who decides about a save's `COMMIT` first: the side task, which sends it,
+/// or the caller, who stops waiting. Exactly one of them wins, so a caller
+/// that gave up is told "not stored" only when the commit was never sent.
+#[derive(Clone, Default)]
+struct CommitGate(Arc<AtomicU8>);
+
+impl CommitGate {
+    const PENDING: u8 = 0;
+    const SENT: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// The side task's claim before it sends `COMMIT`: false when the caller
+    /// already gave up, and then no commit is sent.
+    fn send_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::SENT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The caller's claim when it stops waiting: true when no commit was
+    /// sent and none will be, false when the commit is already out.
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 /// A side-channel request and the moment its caller stops waiting.
@@ -648,7 +720,8 @@ fn side_timed_out() -> IndexError {
 /// instance and with a 5 s `statement_timeout`
 /// ([`SIDE_STATEMENT_TIMEOUT`]). It answers only while the owner holds the
 /// lock; the connection is dropped when the lock is released or lost and
-/// after any failed or timed-out request.
+/// after any failed or timed-out request. The owner's `instance_config`
+/// table must exist: the side channel reports a missing one as an error.
 ///
 /// The handle is `Clone` and `Send`. The blocking calls work from any thread
 /// and inside any runtime, except on the owner thread itself: there they
@@ -664,11 +737,14 @@ pub struct SideChannel {
 }
 
 impl SideChannel {
-    /// Send `op` and wait at most `timeout` (plus a short margin for the
-    /// owner thread's verdict) on this thread.
+    /// Send `op` and wait at most `timeout` plus [`SIDE_REPLY_MARGIN`] for
+    /// the owner thread's verdict on this thread. A save's `gate` decides
+    /// what giving up means: nothing stored, or, once its commit is out,
+    /// [`IndexError::MaybeStored`].
     fn blocking<T>(
         &self,
         timeout: Duration,
+        gate: Option<&CommitGate>,
         make: impl FnOnce(SideReply<T>) -> SideOp,
     ) -> Result<T> {
         if std::thread::current().id() == self.owner_thread {
@@ -682,21 +758,28 @@ impl SideChannel {
             op: make(SideReply::Blocking(tx)),
         };
         self.requests.send(request).map_err(|_| thread_gone())?;
-        match rx.recv_timeout(timeout.saturating_add(SIDE_REPLY_MARGIN)) {
-            Ok(answer) => answer,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(side_timed_out()),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(thread_gone()),
+        let gave_up = match rx.recv_timeout(timeout.saturating_add(SIDE_REPLY_MARGIN)) {
+            Ok(answer) => return answer,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => side_timed_out(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => thread_gone(),
+        };
+        match gate {
+            Some(gate) if !gate.abandon() => Err(maybe_stored(
+                "the commit was sent and did not answer in time",
+            )),
+            _ => Err(gave_up),
         }
     }
 
     /// The configuration document, waiting at most `timeout` on this thread.
     /// `None` when there is none yet.
     pub fn load_config_blocking(&self, timeout: Duration) -> Result<Option<ConfigDoc>> {
-        self.blocking(timeout, |reply| SideOp::Load { reply })
+        self.blocking(timeout, None, |reply| SideOp::Load { reply })
     }
 
-    /// The configuration document, bounded by [`SIDE_STATEMENT_TIMEOUT`].
-    /// `None` when there is none yet.
+    /// The configuration document, bounded by [`SIDE_STATEMENT_TIMEOUT`] on
+    /// the owner thread and that plus a 500 ms reply margin here. `None` when
+    /// there is none yet.
     pub async fn load_config(&self) -> Result<Option<ConfigDoc>> {
         let (tx, rx) = oneshot::channel();
         let request = SideRequest {
@@ -706,12 +789,24 @@ impl SideChannel {
             },
         };
         self.requests.send(request).map_err(|_| thread_gone())?;
-        rx.await.map_err(|_| thread_gone())?
+        match tokio::time::timeout(SIDE_STATEMENT_TIMEOUT.saturating_add(SIDE_REPLY_MARGIN), rx)
+            .await
+        {
+            Ok(answer) => answer.map_err(|_| thread_gone())?,
+            Err(_) => Err(side_timed_out()),
+        }
     }
 
-    /// Replace the configuration document with `body`, saved by `by`,
-    /// waiting at most `timeout` on this thread. An error, a timeout
-    /// included, leaves the stored document as it was.
+    /// Replace the configuration document with `body`, saved by `by`, in one
+    /// transaction.
+    ///
+    /// `timeout` bounds the connect, the `BEGIN` and the write. Once the
+    /// `COMMIT` is sent it runs to its end under [`SIDE_STATEMENT_TIMEOUT`],
+    /// and this thread waits for it at most a 500 ms reply margin past
+    /// `timeout`. Every error leaves the stored document as it was, except
+    /// [`IndexError::MaybeStored`]: the commit went out and its outcome is
+    /// unknown (no answer in time, or the connection broke), so the caller
+    /// reads the document again instead of assuming either outcome.
     pub fn save_config_blocking(
         &self,
         body: &serde_json::Value,
@@ -720,7 +815,13 @@ impl SideChannel {
     ) -> Result<()> {
         let body = serde_json::to_string(body)?;
         let by = by.to_string();
-        self.blocking(timeout, |reply| SideOp::Save { body, by, reply })
+        let gate = CommitGate::default();
+        self.blocking(timeout, Some(&gate.clone()), |reply| SideOp::Save {
+            body,
+            by,
+            gate,
+            reply,
+        })
     }
 }
 
@@ -751,8 +852,18 @@ impl Side {
                 self.forget_after(&answer);
                 reply.send(answer);
             }
-            SideOp::Save { body, by, reply } => {
-                let answer = bounded(deadline, self.save(&body, &by)).await;
+            SideOp::Save {
+                body,
+                by,
+                gate,
+                reply,
+            } => {
+                // The caller's deadline bounds the write up to the commit;
+                // the commit itself is never cut off by the client.
+                let answer = match bounded(deadline, self.stage(&body, &by)).await {
+                    Ok(()) => self.commit(&gate).await,
+                    Err(e) => Err(e),
+                };
                 self.forget_after(&answer);
                 reply.send(answer);
             }
@@ -796,12 +907,31 @@ impl Side {
 
     async fn load(&mut self) -> Result<Option<ConfigDoc>> {
         let table = self.table.clone();
-        read_config(self.connection().await?, &table).await
+        read_config(self.connection().await?, &table, true).await
     }
 
-    async fn save(&mut self, body: &str, by: &str) -> Result<()> {
+    async fn stage(&mut self, body: &str, by: &str) -> Result<()> {
         let table = self.table.clone();
-        write_config(self.connection().await?, &table, body, by).await
+        stage_config(self.connection().await?, &table, body, by).await
+    }
+
+    /// Commit the staged save, unless its caller already gave up: then the
+    /// transaction is left open, and dropping the connection rolls it back.
+    async fn commit(&mut self, gate: &CommitGate) -> Result<()> {
+        let Some((conn, _)) = self.conn.as_mut() else {
+            return Err(IndexError::Invalid("no side connection".to_string()));
+        };
+        if !gate.send_commit() {
+            return Err(side_timed_out());
+        }
+        let answer = tokio::time::timeout(
+            SIDE_STATEMENT_TIMEOUT,
+            sqlx::raw_sql("COMMIT").execute(&mut *conn),
+        )
+        .await
+        .ok()
+        .map(|r| r.map(|_| ()));
+        commit_outcome(answer)
     }
 }
 
@@ -2172,7 +2302,7 @@ mod tests {
     /// timeout, and the document stays as it was once the other session
     /// lets go; the next save goes through on a fresh connection.
     #[tokio::test]
-    async fn save_times_out_under_a_held_row_lock() {
+    async fn config_save_times_out_under_a_held_row_lock() {
         let Some(url) = pg_url() else {
             eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
             return;
@@ -2229,6 +2359,184 @@ mod tests {
             .0
             .unwrap();
         assert_eq!(read_config_document(&t).await.unwrap().unwrap().body, third);
+        a.release().await.unwrap();
+    }
+
+    /// An owner whose database is never reached: nothing connects until a
+    /// lock attempt, so its side channel answers without a server.
+    fn unreachable_owner() -> PgOwner {
+        let t = PgTarget {
+            url: "postgres://u@127.0.0.1:1/none".to_string(),
+            schema: Some("side_unit".to_string()),
+        };
+        PgOwner::start_with(t, identity("aaaaaaaa", "a"), fast()).unwrap()
+    }
+
+    /// The answer of a blocking side call made straight from a runtime's
+    /// own thread: the side task's refusal, not a panic or a hang.
+    fn assert_blocking_call_answers(o: &PgOwner) {
+        let started = Instant::now();
+        let answer = o.side().load_config_blocking(Duration::from_secs(5));
+        let Err(IndexError::Invalid(text)) = answer else {
+            panic!("not refused: {answer:?}");
+        };
+        assert!(text.contains("does not hold"), "{text}");
+        let answer =
+            o.side()
+                .save_config_blocking(&serde_json::json!({}), "t", Duration::from_secs(5));
+        assert!(
+            matches!(&answer, Err(IndexError::Invalid(t)) if t.contains("does not hold")),
+            "{answer:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A blocking side call inside a current-thread runtime's body.
+    #[tokio::test]
+    async fn side_channel_blocking_call_in_a_current_thread_runtime() {
+        let o = unreachable_owner();
+        assert_blocking_call_answers(&o);
+    }
+
+    /// A blocking side call inside a multi-thread runtime's worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn side_channel_blocking_call_in_a_multi_thread_runtime() {
+        let o = unreachable_owner();
+        assert_blocking_call_answers(&o);
+    }
+
+    /// The gate lets exactly one side decide: a caller that gave up first
+    /// stops the commit, and a commit sent first makes the caller's give-up
+    /// a "may have been stored".
+    #[test]
+    fn config_commit_gate_decides_once() {
+        let g = CommitGate::default();
+        assert!(g.abandon());
+        assert!(!g.send_commit());
+        let g = CommitGate::default();
+        assert!(g.send_commit());
+        assert!(!g.abandon());
+    }
+
+    /// A commit that answered is stored, one that timed out or lost its
+    /// connection may be stored.
+    #[test]
+    fn config_commit_outcome_classifies_the_unknown() {
+        assert!(commit_outcome(Some(Ok(()))).is_ok());
+        for unknown in [
+            None,
+            Some(Err(sqlx::Error::Io(std::io::Error::other("reset")))),
+            Some(Err(sqlx::Error::WorkerCrashed)),
+        ] {
+            let answer = commit_outcome(unknown);
+            let Err(IndexError::MaybeStored(text)) = answer else {
+                panic!("not uncertain: {answer:?}");
+            };
+            assert!(text.contains("may have been stored"), "{text}");
+        }
+    }
+
+    /// A commit that outlives its caller's patience is reported as maybe
+    /// stored, and it was in fact stored; a commit the server refuses is a
+    /// plain error and stores nothing. A deferred constraint trigger makes
+    /// the commit slow or failing.
+    #[tokio::test]
+    async fn config_commit_outcome_after_the_commit_went_out() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let scratch = ScratchSchema::new(&url, "cfgc");
+        migrate(&url, &scratch).await;
+        let t = target(&url, &scratch);
+        let table = config_table(t.schema.as_deref());
+        let mut c = plain(&t).await;
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE FUNCTION {schema}.cfg_at_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.body ? 'slow' THEN PERFORM pg_sleep(2); END IF; \
+               IF NEW.body ? 'refuse' THEN RAISE EXCEPTION 'refused at commit'; END IF; \
+               RETURN NULL; \
+             END $$; \
+             CREATE CONSTRAINT TRIGGER cfg_at_commit AFTER INSERT OR UPDATE ON {table} \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW \
+             EXECUTE FUNCTION {schema}.cfg_at_commit();",
+            schema = scratch.name()
+        )))
+        .execute(&mut c)
+        .await
+        .unwrap();
+        let a = PgOwner::start_with(t.clone(), identity("aaaaaaaa", "a"), fast()).unwrap();
+        assert!(matches!(
+            a.try_acquire().await.unwrap(),
+            Acquired::Held { .. }
+        ));
+        let save = |body: serde_json::Value, timeout: Duration| {
+            let side = a.side();
+            tokio::task::spawn_blocking(move || side.save_config_blocking(&body, "test", timeout))
+        };
+        let first = serde_json::json!({"n": 1});
+        save(first.clone(), Duration::from_secs(5))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The server refuses at commit: a plain error, nothing stored.
+        let refused = save(serde_json::json!({"refuse": true}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let Err(e) = refused else {
+            panic!("the refused commit succeeded");
+        };
+        assert!(!matches!(e, IndexError::MaybeStored(_)), "{e}");
+        assert!(e.to_string().contains("refused at commit"), "{e}");
+        assert_eq!(read_config_document(&t).await.unwrap().unwrap().body, first);
+
+        // The commit takes 2 s, longer than the caller waits.
+        let slow = serde_json::json!({"slow": true});
+        let started = Instant::now();
+        let answer = save(slow.clone(), Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&answer, Err(IndexError::MaybeStored(_))),
+            "{answer:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut stored = None;
+        for _ in 0..50 {
+            stored = read_config_document(&t).await.unwrap().map(|d| d.body);
+            if stored.as_ref() == Some(&slow) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(stored, Some(slow), "the commit that went out was stored");
+        a.release().await.unwrap();
+    }
+
+    /// The owner's side channel refuses a schema without `instance_config`,
+    /// where the lock-free read answers `None`.
+    #[tokio::test]
+    async fn side_channel_reports_a_missing_config_table() {
+        let Some(url) = pg_url() else {
+            eprintln!("skipped: CRYSTALLINE_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let bare = ScratchSchema::new(&url, "cfgm");
+        let t = target(&url, &bare);
+        let a = PgOwner::start_with(t.clone(), identity("aaaaaaaa", "a"), fast()).unwrap();
+        assert!(matches!(
+            a.try_acquire().await.unwrap(),
+            Acquired::Held { .. }
+        ));
+        let err = a.side().load_config().await.unwrap_err();
+        assert!(err.to_string().contains("instance_config"), "{err}");
+        assert_eq!(read_config_document(&t).await.unwrap(), None);
         a.release().await.unwrap();
     }
 

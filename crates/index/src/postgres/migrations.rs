@@ -3031,7 +3031,7 @@ mod tests {
     /// The instance rows never ride along with a wipe, and every instance
     /// table is one the index set creates.
     #[test]
-    fn wipe_and_instance_tables_disjoint() {
+    fn config_wipe_and_instance_tables_disjoint() {
         let created: String = MIGRATIONS.iter().map(|m| m.sql).collect();
         for t in ["instance_owner", "instance_config"] {
             assert!(INSTANCE_TABLES.contains(&t), "{t} is an instance table");
