@@ -1162,6 +1162,10 @@ pub struct AuthStore {
     /// milliseconds of CPU with no database access, and holding the lock across
     /// it would serialize every login behind every other login.
     guard: tokio::sync::Mutex<()>,
+    /// How many `BEGIN IMMEDIATE` this store has run, so a test can pin that a
+    /// method runs in a transaction.
+    #[cfg(test)]
+    begins: std::sync::atomic::AtomicUsize,
 }
 
 /// Create the tables on first open. `IF NOT EXISTS` throughout, so this is the
@@ -1199,13 +1203,13 @@ CREATE INDEX IF NOT EXISTS sessions_user_name ON sessions (user_name);
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
 CREATE TABLE IF NOT EXISTS mcp_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT NOT NULL,
     created_at TEXT NOT NULL,
     last_used TEXT
 );
-CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (user);
+CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (\"user\");
 CREATE TABLE IF NOT EXISTS domain_acl (
     domain TEXT PRIMARY KEY NOT NULL,
     visibility TEXT NOT NULL,
@@ -1227,14 +1231,14 @@ CREATE INDEX IF NOT EXISTS domain_member_principal
 CREATE TABLE IF NOT EXISTS identity_link (
     issuer TEXT NOT NULL,
     subject TEXT NOT NULL,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     linked_at TEXT NOT NULL,
     linked_by TEXT NOT NULL,
     PRIMARY KEY (issuer, subject)
 );
-CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
+CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (\"user\");
 CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
-    ON identity_link (issuer, user);
+    ON identity_link (issuer, \"user\");
 CREATE TABLE IF NOT EXISTS github_link (
     account TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL, github_id INTEGER NOT NULL,
     login TEXT NOT NULL, linked_at TEXT NOT NULL, token_live INTEGER NOT NULL DEFAULT 1);
@@ -1249,7 +1253,7 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
 );
 CREATE TABLE IF NOT EXISTS oauth_grants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     client_id TEXT NOT NULL,
     resource TEXT NOT NULL,
     access_hash TEXT NOT NULL UNIQUE,
@@ -1260,7 +1264,7 @@ CREATE TABLE IF NOT EXISTS oauth_grants (
     created_at TEXT NOT NULL,
     last_used TEXT
 );
-CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
+CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (\"user\");
 CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
 CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
     ON oauth_grants (previous_refresh_hash);
@@ -1278,7 +1282,7 @@ CREATE INDEX IF NOT EXISTS oauth_grant_token_grant ON oauth_grant_token (grant_i
 CREATE INDEX IF NOT EXISTS oauth_grant_token_from ON oauth_grant_token (rotated_from);
 CREATE TABLE IF NOT EXISTS oauth_grant_ended (
     grant_id INTEGER PRIMARY KEY,
-    user TEXT NOT NULL,
+    \"user\" TEXT NOT NULL,
     client_id TEXT NOT NULL,
     client_name TEXT NOT NULL,
     redirect_host TEXT NOT NULL,
@@ -1287,7 +1291,7 @@ CREATE TABLE IF NOT EXISTS oauth_grant_ended (
     ended_at INTEGER NOT NULL,
     reason TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS oauth_grant_ended_user ON oauth_grant_ended (user, ended_at);
+CREATE INDEX IF NOT EXISTS oauth_grant_ended_user ON oauth_grant_ended (\"user\", ended_at);
 CREATE TABLE IF NOT EXISTS overlay_grant (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
@@ -1670,6 +1674,8 @@ impl AuthStore {
             _db: db,
             conn,
             guard: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            begins: std::sync::atomic::AtomicUsize::new(0),
         };
         store.move_oauth_tokens().await?;
         Ok(store)
@@ -1706,13 +1712,14 @@ impl AuthStore {
             let placeholder = format!("{OAUTH_PLACEHOLDER_PREFIX}%");
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO oauth_grant_token
+                    "INSERT INTO oauth_grant_token
                          (refresh_hash, grant_id, access_hash, access_expires_at,
                           refresh_expires_at, issued_at, rotated_at, rotated_from)
                      SELECT refresh_hash, id, access_hash, access_expires_at,
                             refresh_expires_at, access_expires_at - ?2, NULL,
                             previous_refresh_hash
-                     FROM oauth_grants WHERE refresh_hash NOT LIKE ?1",
+                     FROM oauth_grants WHERE refresh_hash NOT LIKE ?1
+                     ON CONFLICT DO NOTHING",
                     vec![
                         Value::Text(placeholder.clone()),
                         Value::Integer(OAUTH_ACCESS_TTL_SECS),
@@ -1722,13 +1729,14 @@ impl AuthStore {
                 .context("moving live oauth tokens")?;
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO oauth_grant_token
+                    "INSERT INTO oauth_grant_token
                          (refresh_hash, grant_id, access_hash, access_expires_at,
                           refresh_expires_at, issued_at, rotated_at, rotated_from)
                      SELECT previous_refresh_hash, id, NULL, 0, 0, 0,
                             access_expires_at - ?2, NULL
                      FROM oauth_grants
-                     WHERE refresh_hash NOT LIKE ?1 AND previous_refresh_hash IS NOT NULL",
+                     WHERE refresh_hash NOT LIKE ?1 AND previous_refresh_hash IS NOT NULL
+                     ON CONFLICT DO NOTHING",
                     vec![
                         Value::Text(placeholder.clone()),
                         Value::Integer(OAUTH_ACCESS_TTL_SECS),
@@ -1857,21 +1865,27 @@ impl AuthStore {
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
-        let written = self
-            .conn
-            .execute(
-                "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
-                 SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
-                 WHERE NOT EXISTS (SELECT 1 FROM users)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display.to_string()),
-                    Value::Text(hash),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("creating the first admin '{name}'"))?;
+        let result = async {
+            self.conn
+                .execute(
+                    "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                     SELECT ?1, ?2, NULL, 'admin', ?3, 0, ?4
+                     WHERE NOT EXISTS (SELECT 1 FROM users)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.to_string()),
+                        Value::Text(hash),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("creating the first admin '{name}'"))
+        }
+        .await;
+        let written = self.finish(result).await?;
         Ok(written > 0)
     }
 
@@ -2335,66 +2349,74 @@ impl AuthStore {
         let display = name.trim().to_string();
         let name = normalize_new_account_name(name)?;
         let _guard = self.guard.lock().await;
-        let exists = self
-            .query_first(
-                "SELECT 1 FROM users WHERE name = ?1",
-                vec![Value::Text(name.clone())],
-            )
-            .await?
-            .is_some();
-        if !exists {
-            let count = match self
-                .query_first("SELECT COUNT(*) FROM users", vec![])
-                .await?
-                .map(|row| row.get_value(0))
-            {
-                Some(Ok(Value::Integer(n))) => n as usize,
-                _ => 0,
-            };
-            if count >= cap {
-                return Err(refuse(
-                    RefusalKind::CapReached,
-                    format!(
-                        "refusing to provision '{name}': the account cap is reached \
-                         (auth.max_users = {cap}). Remove unused accounts or raise the cap"
-                    ),
-                ));
-            }
-        }
-        let inserted = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO users
-                     (name, display, email, role, pass_hash, disabled, created_at)
-                 VALUES (?1, ?2, NULL, ?3, NULL, 0, ?4)",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(display),
-                    Value::Text(role.as_str().to_string()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("provisioning user '{name}'"))?;
-        self.conn
-            .execute(
-                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text(chrono::Utc::now().to_rfc3339()),
-                ],
-            )
-            .await
-            .context("stamping last_seen_at")?;
-        let user = self
-            .query_first(
-                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
-                vec![Value::Text(name.clone())],
-            )
-            .await?
-            .map(|row| user_from_row(&row))
-            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
-        Ok((user, inserted > 0))
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .is_some();
+            if !exists {
+                let count = match self
+                    .query_first("SELECT COUNT(*) FROM users", vec![])
+                    .await?
+                    .map(|row| row.get_value(0))
+                {
+                    Some(Ok(Value::Integer(n))) => n as usize,
+                    _ => 0,
+                };
+                if count >= cap {
+                    return Err(refuse(
+                        RefusalKind::CapReached,
+                        format!(
+                            "refusing to provision '{name}': the account cap is reached \
+                             (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                        ),
+                    ));
+                }
+            }
+            let inserted = self
+                .conn
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, NULL, ?3, NULL, 0, ?4)
+                     ON CONFLICT DO NOTHING",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display),
+                        Value::Text(role.as_str().to_string()),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("provisioning user '{name}'"))?;
+            self.conn
+                .execute(
+                    "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .context("stamping last_seen_at")?;
+            let user = self
+                .query_first(
+                    &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                    vec![Value::Text(name.clone())],
+                )
+                .await?
+                .map(|row| user_from_row(&row))
+                .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))?;
+            Ok((user, inserted > 0))
+        }
+        .await;
+        self.finish(result).await
     }
 
     /// The account an external provider's `(issuer, subject)` pair names, or
@@ -2421,7 +2443,7 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM identity_link
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.user)",
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.\"user\")",
                 (),
             )
             .await
@@ -2430,7 +2452,7 @@ impl AuthStore {
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED} FROM identity_link l
-                     JOIN users u ON u.name = l.user
+                     JOIN users u ON u.name = l.\"user\"
                      WHERE l.issuer = ?1 AND l.subject = ?2"
                 ),
                 vec![Value::Text(issuer), Value::Text(subject)],
@@ -2522,7 +2544,7 @@ impl AuthStore {
             let changed = self
                 .conn
                 .execute(
-                    "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                    "DELETE FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                     vec![Value::Text(issuer.clone()), Value::Text(user.to_string())],
                 )
                 .await
@@ -2555,7 +2577,7 @@ impl AuthStore {
             .conn
             .query(
                 "SELECT issuer, subject, linked_at, linked_by FROM identity_link
-                 WHERE user = ?1 ORDER BY issuer",
+                 WHERE \"user\" = ?1 ORDER BY issuer",
                 vec![Value::Text(user.clone())],
             )
             .await
@@ -3347,7 +3369,7 @@ impl AuthStore {
     async fn delete_mcp_tokens_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM mcp_tokens WHERE user = ?1",
+                "DELETE FROM mcp_tokens WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -3394,11 +3416,8 @@ impl AuthStore {
                 .await
         }
         .await;
-        self.finish(result).await?;
-        // Read after commit, still under `self.guard` and on this connection,
-        // so nothing else on this connection can insert between the commit
-        // above and this read - same reasoning `rotate_mcp_token` relies on.
-        let id = self.conn.last_insert_rowid();
+        // The id is read inside the transaction, from the insert's RETURNING.
+        let id = self.finish(result).await?;
         Ok(IssuedMcpToken {
             id,
             token,
@@ -3415,21 +3434,19 @@ impl AuthStore {
         hash: &str,
         label: &str,
         created_at: &str,
-    ) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                vec![
-                    Value::Text(user.to_string()),
-                    Value::Text(hash.to_string()),
-                    Value::Text(label.to_string()),
-                    Value::Text(created_at.to_string()),
-                ],
-            )
-            .await
-            .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
-        Ok(())
+    ) -> Result<i64> {
+        self.returned_id(
+            "INSERT INTO mcp_tokens (\"user\", token_hash, label, created_at)
+             VALUES (?1, ?2, ?3, ?4) RETURNING id",
+            vec![
+                Value::Text(user.to_string()),
+                Value::Text(hash.to_string()),
+                Value::Text(label.to_string()),
+                Value::Text(created_at.to_string()),
+            ],
+        )
+        .await
+        .with_context(|| format!("issuing an mcp token for user '{user}'"))
     }
 
     /// Create an account with no password and issue one personal MCP token for
@@ -3522,8 +3539,7 @@ impl AuthStore {
                 .await
         }
         .await;
-        self.finish(result).await?;
-        let id = self.conn.last_insert_rowid();
+        let id = self.finish(result).await?;
         Ok(IssuedMcpToken {
             id,
             token,
@@ -3550,7 +3566,7 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM mcp_tokens
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.user)",
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.\"user\")",
                 (),
             )
             .await
@@ -3559,7 +3575,7 @@ impl AuthStore {
             .query_first(
                 &format!(
                     "SELECT {USER_COLUMNS_JOINED}, m.id
-                     FROM mcp_tokens m JOIN users u ON u.name = m.user
+                     FROM mcp_tokens m JOIN users u ON u.name = m.\"user\"
                      WHERE m.token_hash = ?1"
                 ),
                 vec![Value::Text(hash)],
@@ -3597,7 +3613,7 @@ impl AuthStore {
             .conn
             .query(
                 "SELECT id, label, created_at, last_used FROM mcp_tokens
-                 WHERE user = ?1 ORDER BY created_at DESC, id DESC",
+                 WHERE \"user\" = ?1 ORDER BY created_at DESC, id DESC",
                 vec![Value::Text(user.clone())],
             )
             .await
@@ -3631,7 +3647,7 @@ impl AuthStore {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                "DELETE FROM mcp_tokens WHERE id = ?1 AND \"user\" = ?2",
                 vec![Value::Integer(id), Value::Text(user.clone())],
             )
             .await
@@ -3659,7 +3675,7 @@ impl AuthStore {
         let result = async {
             let row = self
                 .query_first(
-                    "SELECT label FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                    "SELECT label FROM mcp_tokens WHERE id = ?1 AND \"user\" = ?2",
                     vec![Value::Integer(id), Value::Text(user.clone())],
                 )
                 .await?;
@@ -3677,26 +3693,12 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
-            self.conn
-                .execute(
-                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    vec![
-                        Value::Text(user.clone()),
-                        Value::Text(hash.clone()),
-                        Value::Text(label.clone()),
-                        Value::Text(created_at.clone()),
-                    ],
-                )
+            self.insert_mcp_token_row(&user, &hash, &label, &created_at)
                 .await
-                .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
-            Ok(())
+                .with_context(|| format!("rotating an mcp token for user '{user}'"))
         }
         .await;
-        self.finish(result).await?;
-        // Read after commit, still under `self.guard` and on this connection:
-        // see `issue_mcp_token`'s matching comment.
-        let id = self.conn.last_insert_rowid();
+        let id = self.finish(result).await?;
         Ok(IssuedMcpToken { id, token, label })
     }
 
@@ -3727,11 +3729,11 @@ impl AuthStore {
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
+        let id = self
+            .returned_id(
                 "INSERT INTO overlay_grant
                      (domain, path, owner, grantee, token_hash, created_at, expires_at)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6) RETURNING id",
                 vec![
                     Value::Text(domain.to_string()),
                     Value::Text(path.to_string()),
@@ -3746,12 +3748,7 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("minting a draft share-link for '{owner}'"))?;
-        // Read after the insert, still under `self.guard` and on this
-        // connection: see `issue_mcp_token`'s matching comment.
-        Ok(MintedGrant {
-            id: self.conn.last_insert_rowid(),
-            token,
-        })
+        Ok(MintedGrant { id, token })
     }
 
     /// Present a link. `Some` when it opens something for `account`, `None`
@@ -4170,24 +4167,31 @@ impl AuthStore {
         let encoded = serde_json::to_string(&client.redirect_uris)
             .context("encoding an oauth client's redirect uris")?;
         let _guard = self.guard.lock().await;
-        self.conn
-            .execute(
-                "INSERT INTO oauth_clients
-                     (client_id, client_name, client_uri, redirect_uris, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                vec![
-                    Value::Text(client.client_id.clone()),
-                    Value::Text(client.client_name.clone()),
-                    match &client.client_uri {
-                        Some(uri) => Value::Text(uri.clone()),
-                        None => Value::Null,
-                    },
-                    Value::Text(encoded),
-                    Value::Text(client.created_at.clone()),
-                ],
-            )
+        self.begin_immediate()
             .await
             .context("registering an oauth client")?;
+        let result = async {
+            self.conn
+                .execute(
+                    "INSERT INTO oauth_clients
+                         (client_id, client_name, client_uri, redirect_uris, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        Value::Text(client.client_id.clone()),
+                        Value::Text(client.client_name.clone()),
+                        match &client.client_uri {
+                            Some(uri) => Value::Text(uri.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(encoded),
+                        Value::Text(client.created_at.clone()),
+                    ],
+                )
+                .await
+                .context("registering an oauth client")
+        }
+        .await;
+        self.finish(result).await?;
         Ok(client)
     }
 
@@ -4318,7 +4322,7 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM oauth_grant_ended
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grant_ended.user)",
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grant_ended.\"user\")",
                 (),
             )
             .await
@@ -4447,12 +4451,12 @@ impl AuthStore {
             // The token columns of `oauth_grants` get inert placeholders: see
             // `OAUTH_PLACEHOLDER_PREFIX`. The real pair goes to
             // `oauth_grant_token` just below.
-            self.conn
-                .execute(
+            id = self
+                .returned_id(
                     "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
+                         (\"user\", client_id, resource, access_hash, access_expires_at,
                           refresh_hash, refresh_expires_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7) RETURNING id",
                     vec![
                         Value::Text(user.clone()),
                         Value::Text(client_id.to_string()),
@@ -4468,9 +4472,6 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
-            // Read inside the transaction, still under `self.guard` and on
-            // this connection: see `issue_mcp_token`'s matching comment.
-            id = self.conn.last_insert_rowid();
             self.mint_oauth_token(id, &pair, None, issued_at).await
         }
         .await;
@@ -4663,7 +4664,7 @@ impl AuthStore {
                     "SELECT t.grant_id, g.resource
                      FROM oauth_grant_token t
                      JOIN oauth_grants g ON g.id = t.grant_id
-                     JOIN users u ON u.name = g.user
+                     JOIN users u ON u.name = g.\"user\"
                      WHERE t.refresh_hash = ?1 AND t.rotated_at IS NULL
                        AND g.client_id = ?2 AND g.refresh_expires_at > ?3
                        AND t.refresh_expires_at > ?3 AND u.disabled = 0",
@@ -4729,7 +4730,7 @@ impl AuthStore {
                 let grant = self
                     .query_first(
                         "SELECT g.client_id, g.resource, g.refresh_expires_at, u.disabled
-                         FROM oauth_grants g JOIN users u ON u.name = g.user
+                         FROM oauth_grants g JOIN users u ON u.name = g.\"user\"
                          WHERE g.id = ?1",
                         vec![Value::Integer(id)],
                     )
@@ -4851,7 +4852,7 @@ impl AuthStore {
     ) -> Result<bool> {
         let Some(row) = self
             .query_first(
-                "SELECT g.user, g.client_id, c.client_name, c.redirect_uris,
+                "SELECT g.\"user\", g.client_id, c.client_name, c.redirect_uris,
                         g.created_at, g.last_used
                  FROM oauth_grants g
                  LEFT JOIN oauth_clients c ON c.client_id = g.client_id
@@ -4869,10 +4870,19 @@ impl AuthStore {
             .unwrap_or_default();
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO oauth_grant_ended
-                     (grant_id, user, client_id, client_name, redirect_host,
+                "INSERT INTO oauth_grant_ended
+                     (grant_id, \"user\", client_id, client_name, redirect_host,
                       created_at, last_used, ended_at, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (grant_id) DO UPDATE SET
+                     \"user\" = excluded.\"user\",
+                     client_id = excluded.client_id,
+                     client_name = excluded.client_name,
+                     redirect_host = excluded.redirect_host,
+                     created_at = excluded.created_at,
+                     last_used = excluded.last_used,
+                     ended_at = excluded.ended_at,
+                     reason = excluded.reason",
                 vec![
                     Value::Integer(id),
                     Value::Text(user.clone()),
@@ -4905,7 +4915,7 @@ impl AuthStore {
             .context("deleting an oauth grant")?;
         self.conn
             .execute(
-                "DELETE FROM oauth_grant_ended WHERE user = ?1 AND ended_at <= ?2",
+                "DELETE FROM oauth_grant_ended WHERE \"user\" = ?1 AND ended_at <= ?2",
                 vec![
                     Value::Text(user.clone()),
                     Value::Integer(now - OAUTH_ENDED_KEPT_SECS),
@@ -4916,7 +4926,7 @@ impl AuthStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT grant_id FROM oauth_grant_ended WHERE user = ?1
+                "SELECT grant_id FROM oauth_grant_ended WHERE \"user\" = ?1
                  ORDER BY ended_at DESC, grant_id DESC",
                 vec![Value::Text(user)],
             )
@@ -4983,7 +4993,7 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM oauth_grants
-                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.user)",
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.\"user\")",
                 (),
             )
             .await
@@ -4994,7 +5004,7 @@ impl AuthStore {
                     "SELECT {USER_COLUMNS_JOINED}, g.id
                      FROM oauth_grant_token t
                      JOIN oauth_grants g ON g.id = t.grant_id
-                     JOIN users u ON u.name = g.user
+                     JOIN users u ON u.name = g.\"user\"
                      WHERE t.access_hash = ?1 AND t.access_expires_at > ?2 AND g.resource = ?3"
                 ),
                 vec![
@@ -5049,7 +5059,7 @@ impl AuthStore {
                         g.created_at, g.last_used, g.refresh_expires_at
                  FROM oauth_grants g
                  LEFT JOIN oauth_clients c ON c.client_id = g.client_id
-                 WHERE g.user = ?1 AND g.refresh_expires_at > ?2
+                 WHERE g.\"user\" = ?1 AND g.refresh_expires_at > ?2
                  ORDER BY g.created_at DESC, g.id DESC",
                 vec![
                     Value::Text(user.clone()),
@@ -5116,7 +5126,7 @@ impl AuthStore {
                 "SELECT grant_id, client_id, client_name, redirect_host, created_at,
                         last_used, ended_at, reason
                  FROM oauth_grant_ended
-                 WHERE user = ?1 AND ended_at > ?2
+                 WHERE \"user\" = ?1 AND ended_at > ?2
                  ORDER BY ended_at DESC, grant_id DESC
                  LIMIT ?3",
                 vec![
@@ -5176,7 +5186,7 @@ impl AuthStore {
         let result = async {
             if self
                 .query_first(
-                    "SELECT 1 FROM oauth_grants WHERE id = ?1 AND user = ?2",
+                    "SELECT 1 FROM oauth_grants WHERE id = ?1 AND \"user\" = ?2",
                     vec![Value::Integer(id), Value::Text(user.clone())],
                 )
                 .await?
@@ -5259,7 +5269,7 @@ impl AuthStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM oauth_grants WHERE user = ?1 AND refresh_expires_at > ?2",
+                "SELECT id FROM oauth_grants WHERE \"user\" = ?1 AND refresh_expires_at > ?2",
                 vec![Value::Text(name.to_string()), Value::Integer(now)],
             )
             .await
@@ -5281,14 +5291,14 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
-                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                     (SELECT id FROM oauth_grants WHERE \"user\" = ?1)",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
         self.conn
             .execute(
-                "DELETE FROM oauth_grants WHERE user = ?1",
+                "DELETE FROM oauth_grants WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -5316,21 +5326,21 @@ impl AuthStore {
         self.conn
             .execute(
                 "DELETE FROM oauth_grant_token WHERE grant_id IN
-                     (SELECT id FROM oauth_grants WHERE user = ?1)",
+                     (SELECT id FROM oauth_grants WHERE \"user\" = ?1)",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth tokens for user '{name}'"))?;
         self.conn
             .execute(
-                "DELETE FROM oauth_grants WHERE user = ?1",
+                "DELETE FROM oauth_grants WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
             .with_context(|| format!("removing oauth grants for user '{name}'"))?;
         self.conn
             .execute(
-                "DELETE FROM oauth_grant_ended WHERE user = ?1",
+                "DELETE FROM oauth_grant_ended WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -6500,7 +6510,7 @@ impl AuthStore {
         ];
         if let Some(row) = self
             .query_first(
-                "SELECT user FROM identity_link WHERE issuer = ?1 AND subject = ?2",
+                "SELECT \"user\" FROM identity_link WHERE issuer = ?1 AND subject = ?2",
                 pair.clone(),
             )
             .await?
@@ -6515,7 +6525,7 @@ impl AuthStore {
         }
         if self
             .query_first(
-                "SELECT subject FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                "SELECT subject FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                 vec![
                     Value::Text(issuer.to_string()),
                     Value::Text(user.to_string()),
@@ -6534,7 +6544,7 @@ impl AuthStore {
         }
         self.conn
             .execute(
-                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                "INSERT INTO identity_link (issuer, subject, \"user\", linked_at, linked_by)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 vec![
                     Value::Text(issuer.to_string()),
@@ -6578,7 +6588,7 @@ impl AuthStore {
     async fn link_at(&self, issuer: &str, user: &str) -> Result<bool> {
         Ok(self
             .query_first(
-                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND \"user\" = ?2",
                 vec![
                     Value::Text(issuer.to_string()),
                     Value::Text(user.to_string()),
@@ -6593,7 +6603,7 @@ impl AuthStore {
     async fn link_count(&self, user: &str) -> Result<i64> {
         let row = self
             .query_first(
-                "SELECT COUNT(*) FROM identity_link WHERE user = ?1",
+                "SELECT COUNT(*) FROM identity_link WHERE \"user\" = ?1",
                 vec![Value::Text(user.to_string())],
             )
             .await?;
@@ -6639,7 +6649,7 @@ impl AuthStore {
     async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(
-                "DELETE FROM identity_link WHERE user = ?1",
+                "DELETE FROM identity_link WHERE \"user\" = ?1",
                 vec![Value::Text(name.to_string())],
             )
             .await
@@ -6685,6 +6695,9 @@ impl AuthStore {
     /// multi-statement operations here serialize cleanly, which is the whole
     /// point of using one.
     async fn begin_immediate(&self) -> Result<()> {
+        #[cfg(test)]
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.conn
             .execute("BEGIN IMMEDIATE", ())
             .await
@@ -6708,6 +6721,16 @@ impl AuthStore {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
                 Err(e)
             }
+        }
+    }
+
+    /// Run an `INSERT ... RETURNING id` and give back the new row's id. The id
+    /// comes from the statement itself, so it is the right one on any
+    /// connection and inside the caller's transaction, with no second read.
+    async fn returned_id(&self, sql: &str, params: Vec<Value>) -> Result<i64> {
+        match self.query_first(sql, params).await?.map(|r| r.get_value(0)) {
+            Some(Ok(Value::Integer(id))) => Ok(id),
+            _ => bail!("the insert returned no id"),
         }
     }
 
@@ -10293,7 +10316,7 @@ mod tests {
             .unwrap();
         let insert = |subject: &str, user: &str| {
             store.conn.execute(
-                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                "INSERT INTO identity_link (issuer, subject, \"user\", linked_at, linked_by)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 vec![
                     Value::Text("https://idp.example".to_string()),
@@ -12676,13 +12699,12 @@ mod tests {
             let store = AuthStore::open(&path).await.unwrap();
             let client = oauth_cast(&store).await;
             let now = chrono::Utc::now().timestamp();
-            store
-                .conn
-                .execute(
+            let id = store
+                .returned_id(
                     "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
+                         (\"user\", client_id, resource, access_hash, access_expires_at,
                           refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
-                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING id",
                     vec![
                         Value::Text(client.client_id.clone()),
                         Value::Text(OAUTH_RESOURCE.to_string()),
@@ -12696,7 +12718,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            (store.conn.last_insert_rowid(), client.client_id)
+            (id, client.client_id)
         };
         let store = AuthStore::open(&path).await.unwrap();
         let rotated_at = token_int(&store, &previous, "rotated_at").await.unwrap();
@@ -12734,12 +12756,11 @@ mod tests {
             let now = chrono::Utc::now().timestamp();
             // What the 0.32.0 issue and rotation wrote, column by column.
             store
-                .conn
-                .execute(
+                .returned_id(
                     "INSERT INTO oauth_grants
-                         (user, client_id, resource, access_hash, access_expires_at,
+                         (\"user\", client_id, resource, access_hash, access_expires_at,
                           refresh_hash, previous_refresh_hash, refresh_expires_at, created_at)
-                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES ('ada', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING id",
                     vec![
                         Value::Text(client.client_id.clone()),
                         Value::Text(OAUTH_RESOURCE.to_string()),
@@ -12752,8 +12773,7 @@ mod tests {
                     ],
                 )
                 .await
-                .unwrap();
-            store.conn.last_insert_rowid()
+                .unwrap()
         };
         let store = AuthStore::open(&path).await.unwrap();
         // A second open moves nothing twice.
@@ -13476,5 +13496,118 @@ mod tests {
             auth.reflection_grant("eng", "ann").await.unwrap(),
             Some(ReflectionLevel::Reader)
         );
+    }
+
+    // --- portability lint tests: keep these last, the scan stops here ---
+
+    /// The SQL literals of this file above the lint marker, with the quoted
+    /// `"user"` identifier and the `'user'` text value taken out.
+    fn sql_literals_without_quoted_user() -> Vec<String> {
+        let source = include_str!("auth_store.rs");
+        let source = &source[..source.find("// --- portability lint tests").unwrap()];
+        let code: String = source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let mut literals = Vec::new();
+        let mut chars = code.chars().peekable();
+        let mut current: Option<String> = None;
+        while let Some(c) = chars.next() {
+            match (&mut current, c) {
+                (None, '\'') => {
+                    // A char literal such as '"' must not open a string.
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        chars.next();
+                    }
+                }
+                (None, '"') => current = Some(String::new()),
+                (Some(lit), '\\') => match chars.next() {
+                    Some('\n') => {
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    Some(next) => {
+                        lit.push('\\');
+                        lit.push(next);
+                    }
+                    None => {}
+                },
+                (Some(_), '"') => literals.push(current.take().unwrap()),
+                (Some(lit), c) => lit.push(c),
+                (None, _) => {}
+            }
+        }
+        literals
+            .into_iter()
+            .filter(|l| {
+                ["SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE "]
+                    .iter()
+                    .any(|kw| l.contains(kw))
+            })
+            .map(|l| l.replace("\\\"user\\\"", "").replace("'user'", ""))
+            .collect()
+    }
+
+    fn contains_word(text: &str, word: &str) -> bool {
+        text.match_indices(word).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + word.len()..].chars().next();
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
+        })
+    }
+
+    /// `user` is a reserved word on Postgres: every use as a column must be
+    /// the quoted identifier, which SQLite and Turso read the same way.
+    #[test]
+    fn no_bare_user_keyword_in_sql() {
+        let literals = sql_literals_without_quoted_user();
+        assert!(
+            literals.len() > 100,
+            "the scan found only {}",
+            literals.len()
+        );
+        for lit in literals {
+            assert!(
+                !contains_word(&lit, "user"),
+                "a bare user keyword in SQL: {lit}"
+            );
+        }
+    }
+
+    /// `last_insert_rowid` is a SQLite function; an insert reads its id with
+    /// `RETURNING id` instead. Nothing else in this file may name it either.
+    #[test]
+    fn no_last_insert_rowid_in_auth_store() {
+        let source = include_str!("auth_store.rs");
+        let source = &source[..source.find("// --- portability lint tests").unwrap()];
+        assert!(!source.contains(&["last_insert", "_rowid"].concat()));
+        assert!(!source.contains("INSERT OR "));
+    }
+
+    /// The first-admin claim runs inside `BEGIN IMMEDIATE`, as the other
+    /// writes do, so the same text is one transaction on Postgres too.
+    #[tokio::test]
+    async fn add_first_admin_runs_in_a_transaction() {
+        use std::sync::atomic::Ordering;
+        let (_dir, auth) = store().await;
+        let before = auth.begins.load(Ordering::Relaxed);
+        assert!(
+            auth.add_first_admin("root", "Root", "rootpw1234")
+                .await
+                .unwrap()
+        );
+        assert_eq!(auth.begins.load(Ordering::Relaxed), before + 1);
+        let before = auth.begins.load(Ordering::Relaxed);
+        auth.ensure_user("ada", Role::Viewer, usize::MAX)
+            .await
+            .unwrap();
+        auth.register_oauth_client("c", None, &["https://x.test/cb".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(auth.begins.load(Ordering::Relaxed), before + 2);
     }
 }
