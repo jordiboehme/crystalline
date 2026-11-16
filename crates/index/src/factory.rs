@@ -97,7 +97,10 @@ async fn open_postgres(cfg: &DatabaseConfig, resilient: bool) -> Result<Arc<Mute
         .url
         .as_deref()
         .ok_or_else(|| IndexError::Invalid("the postgres backend requires a url".to_string()))?;
-    let store = crate::postgres::PostgresStore::open(url).await?;
+    let store = match cfg.schema.as_deref() {
+        Some(schema) => crate::postgres::PostgresStore::open_in_schema(url, schema).await?,
+        None => crate::postgres::PostgresStore::open(url).await?,
+    };
     let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
     Ok(store)
 }
@@ -195,6 +198,21 @@ mod tests {
             .unwrap();
     }
 
+    /// A schema set while the backend is Turso is ignored: the store opens
+    /// as it always did.
+    #[tokio::test]
+    async fn factory_ignores_schema_on_turso() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let cfg = DatabaseConfig {
+            schema: Some("team_a".to_string()),
+            ..DatabaseConfig::default()
+        };
+        let store = open_store(&cfg, Some(&db), false).await.unwrap();
+        let info = store.lock().await.store_info().await.unwrap();
+        assert_eq!(info.db_path, store_location(&cfg, Some(&db)));
+    }
+
     /// A Postgres location is the url's host, port and database, with the
     /// credentials and the query left out, and `--db` plays no part.
     #[cfg(feature = "postgres")]
@@ -203,6 +221,7 @@ mod tests {
         let cfg = DatabaseConfig {
             backend: DatabaseBackend::Postgres,
             url: Some("postgres://user:secret@db.example:5432/kb?sslmode=require".to_string()),
+            schema: None,
         };
         assert_eq!(
             store_location(&cfg, Some(Path::new("/ignored.db"))).as_deref(),

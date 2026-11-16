@@ -364,6 +364,17 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: database_url_effective,
         },
         SettingSpec {
+            key: "database.schema",
+            doc: "The Postgres schema every connection of this instance uses, a plain lowercase identifier (letters, digits and _, not starting with a digit, at most 63 bytes); unset means the database default. Ignored on the embedded backend. Use this setting, not URL options or a role's search_path, to separate teams on one database (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            operator_only: true,
+            apply: set_database_schema,
+            clear: clear_database_schema,
+            effective: database_schema_effective,
+        },
+        SettingSpec {
             key: "search.salience_weight",
             doc: "How strongly a salient engram is lifted in hybrid ranking, 0.0 to 1.0 (default 0.15); a soft prior that reorders within a relevance band and never filters",
             kind: SettingKind::F64,
@@ -1651,6 +1662,31 @@ fn database_url_effective(config: &GlobalConfig) -> (String, bool) {
     (stored.unwrap_or_default(), is_default)
 }
 
+// --- database.schema ---------------------------------------------------------
+
+fn set_database_schema(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    crystalline_core::config::validate_schema_name(value)
+        .map_err(|e| SettingsError(format!("database.schema: {e}")))?;
+    config
+        .database
+        .get_or_insert_with(DatabaseConfig::default)
+        .schema = Some(value.to_string());
+    Ok(())
+}
+
+fn clear_database_schema(config: &mut GlobalConfig) {
+    if let Some(d) = config.database.as_mut() {
+        d.schema = None;
+    }
+    drop_database_if_empty(config);
+}
+
+fn database_schema_effective(config: &GlobalConfig) -> (String, bool) {
+    let stored = config.database.as_ref().and_then(|d| d.schema.clone());
+    let is_default = stored.is_none();
+    (stored.unwrap_or_default(), is_default)
+}
+
 // --- search.salience_weight --------------------------------------------------
 
 fn set_salience_weight(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -2810,6 +2846,7 @@ mod tests {
                 "skills.serve",
                 "database.backend",
                 "database.url",
+                "database.schema",
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
@@ -2866,6 +2903,7 @@ mod tests {
                 "service.public_url",
                 "database.backend",
                 "database.url",
+                "database.schema",
                 "auth.trusted_header",
                 "auth.anonymous",
                 "auth.mcp",
@@ -2976,6 +3014,7 @@ mod tests {
                     "CRYSTALLINE_DATABASE_BACKEND".to_string()
                 ),
                 ("database.url", "CRYSTALLINE_DATABASE_URL".to_string()),
+                ("database.schema", "CRYSTALLINE_DATABASE_SCHEMA".to_string()),
                 (
                     "search.salience_weight",
                     "CRYSTALLINE_SEARCH_SALIENCE_WEIGHT".to_string()
@@ -3558,7 +3597,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 46);
+        assert_eq!(views.len(), 47);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3580,6 +3619,7 @@ mod tests {
                 "skills.serve",
                 "database.backend",
                 "database.url",
+                "database.schema",
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
@@ -3696,48 +3736,52 @@ mod tests {
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[18];
+        let schema = &views[18];
+        assert_eq!(schema.value, "");
+        assert_eq!(schema.source, SettingSource::Default);
+
+        let salience_weight = &views[19];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[19];
+        let retired_weight = &views[20];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[20];
+        let index_files = &views[21];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let capture_similar = &views[21];
+        let capture_similar = &views[22];
         assert_eq!(capture_similar.value, "true");
         assert_eq!(capture_similar.source, SettingSource::Default);
 
-        let contradictions = &views[22];
+        let contradictions = &views[23];
         assert_eq!(contradictions.key, "evolve.contradictions");
         assert_eq!(contradictions.value, "off");
         assert_eq!(contradictions.source, SettingSource::Default);
 
-        let recall_enabled = &views[23];
+        let recall_enabled = &views[24];
         assert_eq!(recall_enabled.value, "true");
         assert_eq!(recall_enabled.source, SettingSource::Default);
 
-        let recall_limit = &views[24];
+        let recall_limit = &views[25];
         assert_eq!(recall_limit.value, "3");
         assert_eq!(recall_limit.source, SettingSource::Default);
 
-        let recall_min_score = &views[25];
+        let recall_min_score = &views[26];
         assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
-        let identity_actor = &views[27];
+        let identity_actor = &views[28];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[28];
+        let trusted_header = &views[29];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[29];
+        let anonymous = &views[30];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }

@@ -7508,6 +7508,7 @@ async fn standalone_on_postgres(
         url: Some(format!(
             "{url}{sep}options=-c%20search_path%3D{schema},public"
         )),
+        schema: None,
     });
     let config_path = tmp.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();

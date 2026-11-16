@@ -137,6 +137,7 @@ async fn serve(opts: Options) -> Fixture {
         cfg.database = Some(DatabaseConfig {
             backend: DatabaseBackend::Postgres,
             url: Some(MARK_DB_URL.to_string()),
+            schema: None,
         });
         let github = cfg.github.get_or_insert_with(GitHubConfig::default);
         github.api_url = Some(MARK_API_URL.to_string());

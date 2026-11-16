@@ -27,3 +27,39 @@ pub fn pg_url() -> Option<String> {
 pub fn scratch(prefix: &str) -> Option<ScratchSchema> {
     pg_url().map(|url| ScratchSchema::new(&url, prefix))
 }
+
+/// `open_store` routes a Postgres config's `schema` to the connection's
+/// search path: the tables land in the scratch schema and none in `public`.
+#[tokio::test]
+async fn factory_opens_in_the_configured_schema() {
+    use crystalline_core::config::{DatabaseBackend, DatabaseConfig};
+    use sqlx::Connection;
+
+    let Some(scratch) = scratch("factory_schema") else {
+        return;
+    };
+    let cfg = DatabaseConfig {
+        backend: DatabaseBackend::Postgres,
+        url: Some(scratch.url().to_string()),
+        schema: Some(scratch.name().to_string()),
+    };
+    let store = crystalline_index::open_store(&cfg, None, false)
+        .await
+        .unwrap();
+    drop(store);
+
+    let mut raw = sqlx::PgConnection::connect(scratch.url()).await.unwrap();
+    let mut count = async |schema: &str| -> i64 {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema=$1 AND table_name='engram'",
+        )
+        .bind(schema)
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+        n
+    };
+    assert_eq!(count(scratch.name()).await, 1);
+    assert_eq!(count("public").await, 0);
+}
