@@ -11,6 +11,7 @@
 
 pub(crate) mod automation_ctl;
 pub mod automation_trigger;
+pub mod claim;
 pub mod client;
 pub mod control;
 pub mod daemon;
@@ -59,6 +60,10 @@ pub use crystalline_rest::collab;
 /// literal therefore fails CI instead of silently leaving the tool unrouted.
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
+pub use claim::{
+    CommandDbOwner, DatabaseOwned, claim_database_for_command, open_store_for_command,
+    release_command_database, set_command_line,
+};
 pub use client::{
     ROUTING_READ_ONLY_KEY, VirtualRouting, adopt_domain_names_direct, collect_orphaned_domains,
     configure, ctl_if_running, ctl_if_running_passive, ctl_required, ctl_routed,

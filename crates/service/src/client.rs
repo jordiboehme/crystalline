@@ -13,8 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crystalline_remote::ops::DiscardTarget;
 
-use crate::daemon::{Departure, SHUTDOWN_DEADLINE, open_store, resolve_db};
-use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
+use crate::daemon::{Departure, SHUTDOWN_DEADLINE, resolve_db};
+use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone_with_store};
 use crate::instance::{
     Connection, HarnessGate, acquire_ownership, acquire_standalone_ownership, ensure_daemon,
     try_attach,
@@ -274,20 +274,15 @@ pub async fn run_mcp(
 
     // A standby answered: it waits for another instance's database and
     // serves no session, and an in-process server could not take its state
-    // folder either. Its sentence is the initialize error, and the error this
-    // process ends with, so it reaches the client and stderr alike.
+    // folder either. Or the database is owned by an instance elsewhere, so
+    // no daemon was started for it, and an in-process server would be
+    // refused the same way. The sentence is the initialize error, and the
+    // error this process ends with, so it reaches the client and stderr
+    // alike.
     if let Some(Err(e)) = &daemon
-        && let Some(refusal) = e.downcast_ref::<crate::instance::StandbyRefusal>()
+        && let Some(refusal) = final_refusal(e)
     {
-        if let Some(reply) = opener_line
-            .as_deref()
-            .and_then(|line| initialize_error_reply(line, &refusal.0))
-        {
-            let _ = stdout.write_all(reply.as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
-            let _ = stdout.flush().await;
-        }
-        return Err(anyhow::anyhow!("{}", refusal.0));
+        return refuse_session(&mut stdout, opener_line.as_deref(), refusal).await;
     }
 
     // A daemon is up: relay through it. A failed attach or handshake falls
@@ -341,7 +336,16 @@ pub async fn run_mcp(
     // the chain for the Desktop log).
     match build_embedded(db, config_path, read_only, harness_gate).await {
         Ok(stack) => run_embedded_stdio(stack, stdin).await,
+        // Another instance owns the Postgres database: no status server
+        // would help, the client gets the sentence as the initialize error.
+        Err(e) if e.is::<crate::claim::DatabaseOwned>() => {
+            let refusal = e.to_string();
+            refuse_session(&mut stdout, opener_line.as_deref(), refusal).await
+        }
         Err(e) => {
+            // A database this stack claimed before a later step failed goes
+            // back now, not when the stub's session ends.
+            crate::claim::release_command_database().await;
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
@@ -363,6 +367,35 @@ pub async fn run_mcp(
             }
         }
     }
+}
+
+/// The sentence of an attach or start that must not be tried again: a
+/// standby that serves no session, or a Postgres database another instance
+/// owns. Said once and final; any other failure is not one of these.
+fn final_refusal(e: &anyhow::Error) -> Option<String> {
+    if let Some(refusal) = e.downcast_ref::<crate::instance::StandbyRefusal>() {
+        return Some(refusal.0.clone());
+    }
+    e.downcast_ref::<crate::claim::DatabaseOwned>()
+        .map(|owned| owned.message.clone())
+}
+
+/// Answer the client's opener with `refusal` as the initialize error, then
+/// end with it as this process's error, so it reaches stderr too.
+async fn refuse_session<W>(
+    stdout: &mut W,
+    opener_line: Option<&str>,
+    refusal: String,
+) -> anyhow::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(reply) = opener_line.and_then(|line| initialize_error_reply(line, &refusal)) {
+        let _ = stdout.write_all(reply.as_bytes()).await;
+        let _ = stdout.write_all(b"\n").await;
+        let _ = stdout.flush().await;
+    }
+    Err(anyhow::anyhow!("{refusal}"))
 }
 
 /// The oldest Claude Desktop extension launcher this binary works with, as a
@@ -701,6 +734,26 @@ where
 /// already holds one), replay `notifications/initialized`, then answer every
 /// request the restart orphaned with a JSON-RPC error so the client can retry
 /// instead of hanging.
+/// The daemon answered the replayed `initialize` with an error: it will not
+/// serve this session (a standby does that), so the bridge stops trying.
+#[derive(Debug)]
+struct InitRefused(String);
+
+impl std::fmt::Display for InitRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InitRefused {}
+
+impl InitRefused {
+    /// The refusal inside a replay error, when it is one.
+    fn of(e: &std::io::Error) -> Option<&InitRefused> {
+        e.get_ref()?.downcast_ref::<InitRefused>()
+    }
+}
+
 async fn resync<Out, S>(
     relay: &mut RelayState,
     session: &mut Session<S>,
@@ -726,6 +779,14 @@ where
             let is_init_response =
                 msg.get("method").is_none() && msg.get("id").map(|id| id.to_string()) == init_key;
             if is_init_response {
+                if let Some(error) = msg.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the daemon refused the session")
+                        .to_string();
+                    return Err(std::io::Error::other(InitRefused(message)));
+                }
                 break;
             }
             // Anything the daemon volunteers before answering the replayed
@@ -807,12 +868,22 @@ where
             tracing::warn!("daemon connection lost; reconnecting");
             let conn = match ensure_daemon(true, db, config_path, read_only).await {
                 Ok(conn) => conn,
+                // A database another instance owns stays owned: said once,
+                // and the session ends instead of asking again.
+                Err(e) if final_refusal(&e).is_some() => return Err(e),
                 Err(e) => {
                     tracing::warn!("reconnect failed: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
             };
+            // The daemon that came back is a standby: it serves no session,
+            // so the session ends with its sentence.
+            if let Some(refusal) = conn.standby() {
+                return Err(anyhow::Error::new(crate::instance::StandbyRefusal(
+                    refusal.to_string(),
+                )));
+            }
             // Re-sent on every reconnect: the daemon builds a fresh
             // `McpServer` per accepted socket (`daemon.rs`), so a restart
             // would otherwise flip an onboarded harness back to served in the
@@ -824,6 +895,12 @@ where
             match resync(&mut relay, &mut session, &mut stdout).await {
                 Ok(()) => break,
                 Err(e) => {
+                    // The daemon refused the replayed initialize (a standby
+                    // that gave no facts on the pipe answers that way):
+                    // final too.
+                    if let Some(refused) = InitRefused::of(&e) {
+                        return Err(anyhow::anyhow!("{}", refused.0));
+                    }
                     tracing::warn!("session replay failed: {e}");
                     continue;
                 }
@@ -853,6 +930,9 @@ struct EmbeddedStack {
 /// terminal failure leaves [`run_mcp`]'s bounded reader, opener and all, intact for
 /// the degraded stub to serve. The effective read-only mode is the explicit
 /// flag or `service.read_only`.
+/// What the owner row records for an embedded MCP stack.
+const EMBEDDED_COMMAND: &str = "crystalline mcp --embedded";
+
 async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
@@ -864,7 +944,14 @@ async fn build_embedded(
     let loaded = overlay::load(config_path)?;
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db)?;
-    let store = open_store(&loaded.effective, Some(&db_path)).await?;
+    // On Postgres this stack is the database's owner for the session, as a
+    // command is for its run: claimed once, or refused with the owner's name
+    // when another instance has it (spec section O).
+    let claim =
+        crate::claim::claim_database_for_session(&loaded.effective, EMBEDDED_COMMAND).await?;
+    let store =
+        crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(&db_path), false)
+            .await?;
     // A channel the embed worker (spawned below) listens on: connecting an
     // origin mid-session schedules its embedding pass here instead of running
     // it inline, so the connect request returns without waiting on the model.
@@ -1016,6 +1103,9 @@ where
     // its own, is waited for with what is left of the deadline, so a token
     // pair the server rotated is saved.
     departure.settle_sign_ins().await;
+    // The database last, as a daemon gives it back: the sign-in above may
+    // still have written to it.
+    crate::claim::release_command_database().await;
     departure.finish(None)
 }
 
@@ -1130,15 +1220,28 @@ async fn open_standalone_noting(
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
-    let engine = open_standalone(loaded, db_path, want_embeddings)
+    let unreachable = |e: anyhow::Error| {
+        anyhow::anyhow!(crate::instance::index_unreachable_words(
+            &location,
+            &format!("{e:#}"),
+            bypassed
+        ))
+    };
+    // On Postgres the database is claimed for this command first, or the
+    // command is refused before anything opens (spec section L). The refusal
+    // goes out as it is: it names the owner, which the index wording does not.
+    let claim = match crate::claim::claim_for_this_command(&loaded.effective).await {
+        Ok(claim) => claim,
+        Err(e) if e.is::<crate::claim::DatabaseOwned>() => return Err(e),
+        Err(e) => return Err(unreachable(e)),
+    };
+    let store =
+        crate::claim::open_store_as(claim.as_ref(), &loaded.effective, Some(db_path), false)
+            .await
+            .map_err(unreachable)?;
+    let engine = open_standalone_with_store(loaded, store, want_embeddings)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(crate::instance::index_unreachable_words(
-                &location,
-                &format!("{e:#}"),
-                bypassed
-            ))
-        })?
+        .map_err(unreachable)?
         .with_machine_owner_lookup(machine_owner_for_engine());
     if bypassed && note {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
@@ -2710,8 +2813,14 @@ pub async fn virtual_routing_bullets(
     };
     // No rename recovery here: this read-only render takes no ownership of
     // the state directory, so a rename left half done waits for the next
-    // opener that does.
-    match open_standalone(loaded, &db_path, false).await {
+    // opener that does. On Postgres the store opens by the CLI rule: `prompt`
+    // is a read-only report, so an owned database is not opened at all and
+    // the bullets are left out.
+    let Ok(store) = crate::claim::open_store_for_command(config, Some(&db_path), false).await
+    else {
+        return VirtualRouting::default();
+    };
+    match open_standalone_with_store(loaded, store, false).await {
         Ok(engine) => {
             let (bullets, read_only) = engine.virtual_routing().await;
             VirtualRouting { bullets, read_only }
@@ -3624,6 +3733,45 @@ mod tests {
             "nothing from the replayed handshake reaches the client: {out}"
         );
         assert!(relay.outstanding.is_empty());
+        daemon.await.unwrap();
+    }
+
+    /// A daemon that answers the replayed `initialize` with an error (a
+    /// standby that gave no facts on the pipe) ends the replay with its
+    /// sentence as an [`InitRefused`], which the bridge takes as final.
+    #[tokio::test]
+    async fn resync_reports_a_refused_initialize() {
+        let mut relay = RelayState::default();
+        relay.note_client_line(
+            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{}}}"#,
+        );
+        relay.note_server_line(r#"{"jsonrpc":"2.0","id":0,"result":{"serverInfo":{}}}"#);
+
+        let (bridge_side, daemon_side) = tokio::io::duplex(4096);
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let init = lines.next_line().await.unwrap().unwrap();
+            assert!(init.contains("\"initialize\""), "{init}");
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{\"code\":-32000,\"message\":\"this instance is a standby\"}}\n",
+                )
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        });
+
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let e = resync(&mut relay, &mut session, &mut stdout)
+            .await
+            .expect_err("a refused initialize ends the replay");
+        assert_eq!(
+            InitRefused::of(&e).map(|r| r.0.as_str()),
+            Some("this instance is a standby")
+        );
+        assert!(stdout.is_empty(), "nothing reaches the client");
         daemon.await.unwrap();
     }
 

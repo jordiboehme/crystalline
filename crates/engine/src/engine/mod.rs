@@ -10249,16 +10249,28 @@ pub async fn open_standalone(
     db: &Path,
     want_embeddings: bool,
 ) -> anyhow::Result<Engine> {
+    // The factory resolves the backend from the effective `database`, creates
+    // the parent directory for a Turso file and unsizes the concrete store into
+    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
+    let store =
+        crystalline_index::open_store(&loaded.effective.database(), Some(db), false).await?;
+    open_standalone_with_store(loaded, store, want_embeddings).await
+}
+
+/// [`open_standalone`] over a store the caller opened: on Postgres a command
+/// opens it with the settings of the database claim it holds (its tag and
+/// fence), which this crate does not know about.
+pub async fn open_standalone_with_store(
+    loaded: LoadedConfig,
+    store: Arc<Mutex<dyn Store>>,
+    want_embeddings: bool,
+) -> anyhow::Result<Engine> {
     let LoadedConfig {
         path,
         file,
         effective,
         overlay,
     } = loaded;
-    // The factory resolves the backend from the effective `database`, creates
-    // the parent directory for a Turso file and unsizes the concrete store into
-    // a `dyn Store`. `db` is the resolved `--db` override for the Turso arm.
-    let store = crystalline_index::open_store(&effective.database(), Some(db), false).await?;
     // A standalone data command has no `--read-only` flag of its own, so the
     // mode comes purely from the effective `service.read_only` (config or
     // environment); a read-only config refuses CLI writes here the same way the

@@ -159,7 +159,7 @@ impl PgStart {
 /// full instance id (the owner thread tags its own sessions with the same
 /// id, so the takeover spares them) and fenced on the held lock.
 #[cfg(feature = "postgres")]
-fn owner_session_options(
+pub(crate) fn owner_session_options(
     instance_id: &str,
     fence: crystalline_index::postgres::OwnerFence,
 ) -> crystalline_index::postgres::PgSessionOptions {
@@ -181,10 +181,15 @@ pub(crate) fn probes_router(base: crystalline_core::base::BasePath) -> axum::Rou
 /// Without the postgres backend there is no Postgres path: the order of
 /// `run_serve` stays the Turso one.
 #[cfg(not(feature = "postgres"))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same inputs as the postgres start"
+)]
 pub(crate) async fn start_on_postgres(
     _cfg: &crystalline_core::config::GlobalConfig,
     _ownership: &HeldOwnership,
     _instance_id: &str,
+    _autostarted: bool,
     _http_addr: Option<&str>,
     _shutdown: &watch::Sender<bool>,
     stop: StopFuture,
@@ -612,10 +617,21 @@ mod pg {
     /// handover ([`PgStart::hand_over`] gives `stop` back). A stop at any
     /// point leaves the same way: the lock released when held, the record
     /// removed, `farewell` on the console and exit 0.
+    ///
+    /// An `autostarted` daemon never waits: it tries the lock before it
+    /// binds or publishes anything, so no client attaches to it, and when
+    /// the lock is held it logs who owns the database and fails with
+    /// [`crate::instance::LockHeld`], which exits with
+    /// [`crate::instance::EXIT_LOCK_HELD`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the start's own inputs, passed once from run_serve"
+    )]
     pub(crate) async fn start_on_postgres(
         cfg: &GlobalConfig,
         ownership: &HeldOwnership,
         instance_id: &str,
+        autostarted: bool,
         http_addr: Option<&str>,
         shutdown: &watch::Sender<bool>,
         mut stop: StopFuture,
@@ -627,6 +643,30 @@ mod pg {
         }
         let target = PgTarget::from_config(&database).map_err(|e| anyhow::anyhow!("{e}"))?;
         let described = target.describe();
+
+        let me = OwnerIdentity {
+            instance_id: instance_id.to_string(),
+            label: cfg
+                .instance_name()
+                .unwrap_or_else(|| instance_id.to_string()),
+            command: None,
+            version: crystalline_core::VERSION.to_string(),
+        };
+        let owner = Arc::new(PgOwner::start(target, me).map_err(|e| anyhow::anyhow!("{e}"))?);
+        // An autostarted daemon tries the lock first and never waits: a
+        // client spawned it to serve, and a standby would serve it nothing.
+        let first = if autostarted {
+            match owner.try_acquire().await {
+                Ok(Acquired::Busy(row)) => {
+                    let message = crate::claim::pg::not_served_here(&described, row.as_ref());
+                    tracing::error!("{message}");
+                    return Err(anyhow::Error::new(crate::instance::LockHeld { message }));
+                }
+                attempt => Some(attempt),
+            }
+        } else {
+            None
+        };
 
         // Bound and published before anything waits or opens: a client that
         // asks the socket is answered from now on.
@@ -657,21 +697,16 @@ mod pg {
         };
         let ctl = tokio::spawn(standby_ctl(listener, view, shutdown.clone(), handover_rx));
 
-        let me = OwnerIdentity {
-            instance_id: instance_id.to_string(),
-            label: cfg
-                .instance_name()
-                .unwrap_or_else(|| instance_id.to_string()),
-            command: None,
-            version: crystalline_core::VERSION.to_string(),
-        };
-        let owner = Arc::new(PgOwner::start(target, me).map_err(|e| anyhow::anyhow!("{e}"))?);
         let leaving = Leaving {
             owner: owner.clone(),
             ownership: ownership.clone(),
             farewell,
         };
-        let previous = match owner.try_acquire().await {
+        let attempt = match first {
+            Some(attempt) => attempt,
+            None => owner.try_acquire().await,
+        };
+        let previous = match attempt {
             Ok(Acquired::Held { previous, .. }) => previous,
             Ok(Acquired::Busy(row)) => {
                 crate::daemon::set_role(Role::Standby);
@@ -743,7 +778,7 @@ mod pg {
     /// An index error as its sentence: an `Invalid` one is already written
     /// for a person (a refused takeover names the grant to give), so it goes
     /// without the "invalid input" prefix.
-    fn plain(e: IndexError) -> String {
+    pub(crate) fn plain(e: IndexError) -> String {
         match e {
             IndexError::Invalid(sentence) => sentence,
             other => other.to_string(),
@@ -804,7 +839,7 @@ mod pg {
     /// The wait runs on a thread of its own, so a runtime whose workers are
     /// all busy or stuck cannot delay the exit. A watch needs no runtime to
     /// be waited on.
-    fn watch_fence(owner: &PgOwner, database: String) {
+    pub(crate) fn watch_fence(owner: &PgOwner, database: String) {
         let (fenced, watched) = (owner.fenced(), database.clone());
         let spawned = std::thread::Builder::new()
             .name("crystalline-fence".to_string())

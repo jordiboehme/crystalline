@@ -718,8 +718,7 @@ pub(crate) async fn try_attach_displacing_in(
         }
         return (None, None);
     };
-    if attach_policy_for(&facts.version, crystalline_core::VERSION, here) == AttachPolicy::Displace
-    {
+    if displaces(&facts, crystalline_core::VERSION, here) {
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
             facts.version,
@@ -766,6 +765,21 @@ pub(crate) async fn try_attach_displacing_in(
         );
     }
     (conn, None)
+}
+
+/// Whether a client of `own_version` running where `here` says displaces the
+/// daemon that gave `facts`: only an older one ([`attach_policy_for`]), and
+/// never a standby. A standby holds no database work and opens nothing, so
+/// an older one costs nothing, and the newer one spawned in its place would
+/// only wait as a standby itself, or refuse when autostarted. The client
+/// gets the standby's refusal instead.
+fn displaces(
+    facts: &HolderFacts,
+    own_version: &str,
+    here: &crate::runs_in::PackageContext,
+) -> bool {
+    facts.standby.is_none()
+        && attach_policy_for(&facts.version, own_version, here) == AttachPolicy::Displace
 }
 
 /// Attach to a running daemon exactly as it is: a bare pipe connect. Unlike
@@ -2298,6 +2312,16 @@ pub(crate) async fn ensure_daemon_with(
     }
     if !spawn {
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
+    }
+
+    // On Postgres an autostarted daemon never waits as a standby: when
+    // another instance owns the database, the spawn is refused here, with
+    // the owner's name on this client's stderr, before anything starts.
+    // Read without the lock; a look that fails leaves it to the daemon.
+    if let Ok(loaded) = crate::overlay::load(options.config.as_deref())
+        && let Some(message) = crate::claim::owned_elsewhere(&loaded.effective).await
+    {
+        return Err(anyhow::Error::new(crate::claim::DatabaseOwned { message }));
     }
 
     // The daemon we are about to spawn is detached, so its own bind failure
@@ -5733,6 +5757,26 @@ mod tests {
             attach_policy_for("0.25.0", "0.24.0", &here),
             AttachPolicy::Attach
         );
+    }
+
+    /// An older daemon is displaced, an older standby never is.
+    #[test]
+    fn an_older_standby_is_never_displaced() {
+        let here = crate::runs_in::PackageContext::Unpackaged;
+        let mut facts = HolderFacts {
+            pid: 1,
+            version: "0.0.1".to_string(),
+            mcp_line_options: true,
+            runs_in: None,
+            start: None,
+            state_dir: None,
+            config_path: None,
+            http: None,
+            standby: None,
+        };
+        assert!(displaces(&facts, "0.33.0", &here));
+        facts.standby = Some("this instance is a standby".to_string());
+        assert!(!displaces(&facts, "0.33.0", &here));
     }
 
     /// A stand-in for Task Scheduler: `run` starts a scripted daemon on this

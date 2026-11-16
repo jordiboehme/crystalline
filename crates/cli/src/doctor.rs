@@ -2266,10 +2266,18 @@ pub async fn run(
             reason: crystalline_service::client::packaged_local_engine_refusal(),
         };
     } else if db.is_file() {
-        match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
+        // By the CLI rule on Postgres: a report never claims the database
+        // and opens nothing while another instance owns it; `--fix` claims
+        // it or is refused (spec section L).
+        match crystalline_service::open_store_for_command(cfg, Some(&db), false).await {
             Ok(opened) => {
                 index = IndexAccess::Direct;
                 store = Some(opened);
+            }
+            Err(e) if e.is::<crystalline_service::DatabaseOwned>() => {
+                index = IndexAccess::Unavailable {
+                    reason: e.to_string(),
+                };
             }
             // Not an abort. Every check that does not need the index still
             // runs below, and the reason travels in the report as guidance.

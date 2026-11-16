@@ -2293,6 +2293,13 @@ fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
+    // What a Postgres owner row records for this command, and whether it is a
+    // read-only report that never claims the database (spec section L).
+    crystalline_service::set_command_line(
+        &command_label(&words),
+        words.clone(),
+        is_report(cli.command.as_ref()),
+    );
     // Inside Claude Desktop's app package every new file under AppData lands
     // in the package's private copy, so from here on a write there that was
     // not sent to the daemon fails loudly instead of splitting the state.
@@ -2761,6 +2768,10 @@ fn content_or_stdin(content: Option<String>) -> anyhow::Result<String> {
 /// left on their default handling on purpose, so a `SIGTERM` ends this process
 /// without running the ownership drop, exactly as a killed daemon leaves its
 /// record and socket file behind.
+///
+/// With `--standalone` on Postgres it also claims the database as the command
+/// it names, as that command would (spec section L), and gives it back when
+/// the time is up; refused when another instance owns it.
 fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     let _ownership = {
@@ -2771,12 +2782,48 @@ fn hold_lock(secs: u64, standalone: Option<&str>) -> anyhow::Result<()> {
         }
         ownership
     };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    if let Some(command) = standalone {
+        let cfg = cmd::load(None)?.effective;
+        runtime.block_on(crystalline_service::claim_database_for_command(
+            &cfg, command,
+        ))?;
+    }
     // The readiness line: a caller waits for it before treating the lock as
     // held, instead of guessing with a sleep.
     println!("holding");
     std::io::stdout().flush()?;
     std::thread::sleep(std::time::Duration::from_secs(secs));
+    runtime.block_on(crystalline_service::release_command_database());
     Ok(())
+}
+
+/// The command as a Postgres owner row records it: `crystalline` and the
+/// subcommand path (`crystalline reindex`, `crystalline domain add`), never
+/// a value, which could be a secret.
+fn command_label(words: &[String]) -> String {
+    let mut label = "crystalline".to_string();
+    let args = std::iter::once("crystalline".to_string()).chain(words.iter().cloned());
+    if let Ok(matches) = Cli::command().try_get_matches_from(args) {
+        let mut at = &matches;
+        while let Some((name, sub)) = at.subcommand() {
+            label.push(' ');
+            label.push_str(name);
+            at = sub;
+        }
+    }
+    label
+}
+
+/// A read-only report: it reads who owns a Postgres database and never
+/// claims it (`status`, `doctor` without `--fix`, `prompt`).
+fn is_report(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Status { .. } | Command::Prompt { .. } | Command::Doctor { fix: false, .. })
+    )
 }
 
 fn split_commas(s: Option<String>) -> Option<Vec<String>> {
@@ -4636,8 +4683,10 @@ where
                         let out = make().await;
                         // A command without a daemon gives back every host
                         // lock it claimed on a shared database, on every
-                        // path it ends by.
+                        // path it ends by, and then the Postgres database it
+                        // claimed for its run.
                         crystalline_service::engine::release_command_locks_everywhere().await;
+                        crystalline_service::release_command_database().await;
                         out
                     }),
             )
@@ -4694,8 +4743,10 @@ where
                         let out = make().await;
                         // A command without a daemon gives back every host
                         // lock it claimed on a shared database, on every
-                        // path it ends by.
+                        // path it ends by, and then the Postgres database it
+                        // claimed for its run.
                         crystalline_service::engine::release_command_locks_everywhere().await;
+                        crystalline_service::release_command_database().await;
                         out
                     }),
             )

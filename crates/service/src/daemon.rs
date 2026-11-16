@@ -533,6 +533,7 @@ pub async fn run_serve(
         &loaded.effective,
         &ownership,
         &instance_id,
+        autostarted,
         http_addr.as_deref(),
         &shutdown_tx,
         stop,
@@ -4178,13 +4179,6 @@ pub(crate) fn resolve_db(db: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 }
 
-pub(crate) async fn open_store(
-    cfg: &GlobalConfig,
-    db: Option<&Path>,
-) -> anyhow::Result<Arc<TokioMutex<dyn Store>>> {
-    Ok(crystalline_index::open_store(&cfg.database(), db, false).await?)
-}
-
 /// How long a daemon that holds ownership waits for the index database to come
 /// free before it gives up.
 ///
@@ -4203,7 +4197,7 @@ const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 /// How often the owner asks again while it waits.
 const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
 
-/// [`open_store`], for the one caller that holds the ownership lock.
+/// The store open, for the one caller that holds the ownership lock.
 ///
 /// Holding ownership is what makes waiting correct. Another process on the
 /// index file at that point is either a predecessor that has already given up
@@ -4211,7 +4205,7 @@ const STORE_LOCK_POLL: Duration = Duration::from_millis(50);
 /// lets go by itself. A predecessor of this version is gone within moments of
 /// giving up ownership (see [`Departure`]); an older one may still be winding
 /// down its runtime, and the retry is kept for it. Every other caller of
-/// [`open_store`] fails fast, which is right for them: they hold nothing, and
+/// `crystalline_index::open_store` fails fast, which is right for them: they hold nothing, and
 /// the answer they need is who does.
 async fn open_store_as_owner(
     cfg: &GlobalConfig,
