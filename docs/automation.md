@@ -199,7 +199,7 @@ Where the webhook goes is the instance's choice, never the MANIFEST's, since a M
 
 The three settings are for the operator only: `crystalline config set` or the environment, never an agent through `configure`. A URL without a secret never sends, and status says so: nothing unsigned leaves the instance.
 
-Only the instance that may run the loop sends: the Reflection home for reflect, for evolve the evolve home of a team domain, the host lock holder on a shared database, and any instance with its own copy of the domain otherwise. Nothing is sent while the lease is held.
+Only the instance that may run the loop sends: the Reflection home for reflect, for evolve the evolve home of a team domain, the active instance on a PostgreSQL database, and any instance with its own copy of the domain otherwise. Nothing is sent while the lease is held.
 
 When it sends:
 
