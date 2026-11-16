@@ -2820,6 +2820,38 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
     if v.is_empty() { None } else { Some(v) }
 }
 
+/// A standby's `status` as human text: the database it waits for, who owns
+/// it and how long it has waited.
+fn render_standby(data: &serde_json::Value) {
+    println!(
+        "Daemon: standby (pid {}, v{}, up {})",
+        data["pid"].as_u64().unwrap_or(0),
+        data["version"].as_str().unwrap_or("unknown"),
+        format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
+    );
+    println!(
+        "Database: {}",
+        data["database"].as_str().unwrap_or("(unknown)")
+    );
+    let owner = &data["owner"];
+    match owner["label"].as_str() {
+        Some(label) => println!(
+            "Owned by: {label} (pid {}, version {}, since {})",
+            owner["pid"].as_i64().unwrap_or(0),
+            owner["version"].as_str().unwrap_or("unknown"),
+            owner["since"].as_str().unwrap_or("unknown"),
+        ),
+        None => println!("Owned by: an instance that has not announced itself yet"),
+    }
+    println!(
+        "Waiting: {}, it takes over when the database comes free",
+        format_uptime(data["waiting_secs"].as_u64().unwrap_or(0))
+    );
+    if let Some(error) = data["last_error"].as_str() {
+        println!("Last poll failed: {error}");
+    }
+}
+
 /// `status`: report from the daemon over ctl when one is running and no explicit
 /// `--config`/`--db` override was given, else open the index directly. An
 /// override names an exact config and index the running daemon may not serve, so
@@ -2859,6 +2891,16 @@ async fn status_dispatch(
         && let Some(data) =
             crystalline_service::ctl_routed(json!({ "v": 1, "cmd": "status" })).await?
     {
+        // A standby has no index open: its report is who owns the database
+        // it waits for.
+        if data["role"] == "standby" {
+            if json {
+                println!("{data}");
+            } else {
+                render_standby(&data);
+            }
+            return Ok(());
+        }
         let loaded = cmd::load(config.as_deref());
         let config_error = loaded.as_ref().err().map(|e| e.to_string());
         // What this shell would have started against what the daemon says

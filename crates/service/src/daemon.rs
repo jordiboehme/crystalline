@@ -505,7 +505,32 @@ pub async fn run_serve(
     // (see `temp_store::point_at_state_dir`).
     crate::temp_store::sweep_at_startup();
 
+    // The stop signal, made before anything can listen for it: on Postgres
+    // the control socket and the HTTP endpoint answer before the daemon's
+    // shared state exists, and a stop they hear must reach the daemon too.
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    // On Postgres the socket is bound and the record published here, the
+    // HTTP endpoint is bound, and the database is taken, or waited for as a
+    // standby (see `crate::standby`). Every other backend gets `None` and
+    // keeps the order below: the store first, then the socket and the record.
+    let (ownership, pg_start) = crate::standby::start_on_postgres(
+        &loaded.effective,
+        ownership,
+        &instance_id,
+        http_addr.as_deref(),
+        &shutdown_tx,
+        async {
+            tokio::select! {
+                signal = wait_signal() => signal,
+                gone = test_parent_gone() => gone,
+            }
+        },
+        (!daemon_flag).then_some("crystalline stopped"),
+    )
+    .await?;
+
     let store = open_store_as_owner(&loaded.effective, Some(&db_path)).await?;
+    start_step("store open");
     // A channel the engine uses to tell the watcher (spawned below) about a
     // domain registered after this daemon started, so it starts watching that
     // root without a restart. See `Engine::domain_root`'s fresh-config fallback.
@@ -589,11 +614,17 @@ pub async fn run_serve(
 
     // Bind the socket and publish the lock record: this is the readiness point,
     // reached before the provider build and the initial sync so clients attach
-    // fast.
-    let listener = ownership.bind_listener()?;
-    ownership.publish()?;
+    // fast. On Postgres both happened before the store opened.
+    let turso_listener = match &pg_start {
+        Some(_) => None,
+        None => {
+            let listener = ownership.bind_listener()?;
+            ownership.publish()?;
+            start_step("record published");
+            Some(listener)
+        }
+    };
 
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let (sessions_tx, sessions_rx) = watch::channel(0usize);
     let http_sessions = Arc::new(AtomicUsize::new(0));
     let shared = Arc::new(Shared {
@@ -940,8 +971,14 @@ pub async fn run_serve(
         });
     }
 
-    // The HTTP endpoint, which is on unless it was turned off.
-    if let Some(addr) = http_addr.clone() {
+    // The HTTP endpoint, which is on unless it was turned off. On Postgres it
+    // was bound before the store opened (`None` inside when that bind
+    // failed), and the full router goes into its slot.
+    let early_http = pg_start.as_ref().map(crate::standby::PgStart::http_slot);
+    let base = crate::settings::base_path(&loaded.effective);
+    if let Some(addr) = http_addr.clone()
+        && !matches!(early_http, Some(None))
+    {
         let e = engine.clone();
         let sessions = http_sessions.clone();
         let rx = shared.watch();
@@ -969,9 +1006,19 @@ pub async fn run_serve(
                     tracing::warn!(
                         "HTTP endpoint for {addr} could not be built ({err:#}); this is the configuration it was built from rather than the address, and MCP over the socket is unaffected"
                     );
+                    // The early endpoint keeps answering the probes, and
+                    // nothing there says standby any more.
+                    if let Some(Some(slot)) = &early_http {
+                        slot.swap(crate::standby::probes_router(base));
+                    }
                     return;
                 }
             };
+            if let Some(Some(slot)) = early_http {
+                slot.swap(router);
+                set_ready(true);
+                return;
+            }
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(listener) => listener,
                 Err(err) => {
@@ -989,6 +1036,18 @@ pub async fn run_serve(
         });
     }
 
+    // On Postgres the early responder hands the socket over now, and the
+    // owner lock stays held in `_database` until the process exits.
+    let (listener, _database) = match pg_start {
+        Some(pg) => {
+            let (listener, held) = pg.hand_over(&shared).await?;
+            (listener, Some(held))
+        }
+        None => (
+            turso_listener.ok_or_else(|| anyhow::anyhow!("the control socket was never bound"))?,
+            None,
+        ),
+    };
     let accept = tokio::spawn(accept_loop(listener, shared.clone()));
 
     let reason = tokio::select! {
@@ -1197,7 +1256,10 @@ pub(crate) fn exit_with(code: i32) -> ! {
 
 /// Whether this process owns the durable state (`Active`) or waits for it
 /// (`Standby`). Reported in `/health` as `role`.
-#[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby sets it")
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Active,
@@ -1221,13 +1283,42 @@ static ROLE: std::sync::LazyLock<watch::Sender<Role>> =
 /// True once the full router is installed; `/ready` answers 200 only then.
 static READY: AtomicBool = AtomicBool::new(false);
 
-#[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby sets it")
+)]
 pub(crate) fn set_role(role: Role) {
     ROLE.send_replace(role);
 }
 
 pub(crate) fn current_role() -> Role {
     *ROLE.borrow()
+}
+
+/// A receiver of the process-wide role, for a wait that ends when this
+/// instance turns standby.
+#[cfg_attr(
+    not(feature = "postgres"),
+    allow(dead_code, reason = "only the postgres standby waits on it")
+)]
+pub(crate) fn role_watch() -> watch::Receiver<Role> {
+    ROLE.subscribe()
+}
+
+/// Held by every test that changes the process-wide role or readiness, so
+/// two of them never interleave under a test runner that shares one process
+/// between tests.
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The tracing target of the start's order marks ([`start_step`]).
+pub(crate) const START_TARGET: &str = "crystalline::start";
+
+/// Mark a step of the start at debug level under [`START_TARGET`], so a test
+/// can read the order of the store open and the record's publish with
+/// `RUST_LOG=crystalline::start=debug` and nothing else changes.
+pub(crate) fn start_step(step: &str) {
+    tracing::debug!(target: START_TARGET, "start: {step}");
 }
 
 pub(crate) fn set_ready(ready: bool) {
@@ -1244,7 +1335,6 @@ impl HttpSlot {
         Self(Arc::new(std::sync::RwLock::new(router)))
     }
 
-    #[allow(dead_code, reason = "first used by the standby phase (Task 1.10)")]
     pub(crate) fn swap(&self, router: axum::Router) {
         *self
             .0
@@ -1347,35 +1437,7 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     // no options, so both shapes are served.
     let (mode, options) = crate::instance::split_mode_line(&line);
     match mode {
-        "mcp" => {
-            let id = shared.begin_session("mcp");
-            // Refresh the routing cache before this connection initializes so its
-            // instructions reflect the latest virtual MANIFESTs, including edits
-            // made by other instances sharing the database.
-            shared.engine.refresh_routing_cache().await;
-            // The bridge resolved this once at its own startup, from the
-            // `--harness` argument its registration carries and this machine's
-            // install receipt, and re-sends it on every reconnect. The daemon
-            // never re-derives it: its own environment is whoever spawned it
-            // first, and a value re-derived per accepted socket could change
-            // the surface under a live client across a daemon restart.
-            let gate = harness_gate_from_options(&options);
-            let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
-            // The line limit rmcp applies by default, named here from the one
-            // constant the stdio bridge bounds its lines with, so the bridge
-            // never forwards a line this end would drop (see
-            // `crate::line_limit`).
-            let (read, write) = tokio::io::split(stream);
-            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
-                .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
-            match rmcp::serve_server(server, transport).await {
-                Ok(running) => {
-                    let _ = running.waiting().await;
-                }
-                Err(err) => tracing::debug!("mcp session ended during init: {err}"),
-            }
-            shared.end_session(id);
-        }
+        "mcp" => serve_mcp_conn(stream, &options, shared).await,
         "ctl" => {
             // ctl connections are transient operator requests, not agent
             // sessions, so they are deliberately not counted in `sessions`.
@@ -1385,6 +1447,38 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             tracing::debug!("unknown handshake '{other}'");
         }
     }
+}
+
+/// Serve one `mcp` session on a connection whose handshake line carried
+/// `options`.
+pub(crate) async fn serve_mcp_conn(stream: IpcStream, options: &[&str], shared: Arc<Shared>) {
+    let id = shared.begin_session("mcp");
+    // Refresh the routing cache before this connection initializes so its
+    // instructions reflect the latest virtual MANIFESTs, including edits
+    // made by other instances sharing the database.
+    shared.engine.refresh_routing_cache().await;
+    // The bridge resolved this once at its own startup, from the
+    // `--harness` argument its registration carries and this machine's
+    // install receipt, and re-sends it on every reconnect. The daemon
+    // never re-derives it: its own environment is whoever spawned it
+    // first, and a value re-derived per accepted socket could change
+    // the surface under a live client across a daemon restart.
+    let gate = harness_gate_from_options(options);
+    let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
+    // The line limit rmcp applies by default, named here from the one
+    // constant the stdio bridge bounds its lines with, so the bridge
+    // never forwards a line this end would drop (see
+    // `crate::line_limit`).
+    let (read, write) = tokio::io::split(stream);
+    let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
+        .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
+    match rmcp::serve_server(server, transport).await {
+        Ok(running) => {
+            let _ = running.waiting().await;
+        }
+        Err(err) => tracing::debug!("mcp session ended during init: {err}"),
+    }
+    shared.end_session(id);
 }
 
 /// One item on the watcher's debounce channel: a concrete filesystem path from
@@ -1780,19 +1874,31 @@ async fn http_service_at(
 async fn run_http(
     listener: tokio::net::TcpListener,
     router: axum::Router,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let slot = HttpSlot::new(router);
+    set_ready(true);
+    serve_http_slot(listener, slot, shutdown).await
+}
+
+/// Serve whatever router `slot` holds on a bound listener until shutdown, the
+/// way [`run_http`] describes. `/ready` answers 503 again once it returns.
+pub(crate) async fn serve_http_slot(
+    listener: tokio::net::TcpListener,
+    slot: HttpSlot,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // The slot sits behind a fallback service so the connect info the make
     // service puts in the request extensions reaches the router it holds.
-    let slot = HttpSlot::new(router);
-    set_ready(true);
     let outer = axum::Router::new().fallback_service(slot);
-    axum::serve(
+    let served = axum::serve(
         listener,
         outer.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move { wait_true(&mut shutdown).await })
-    .await?;
+    .await;
+    set_ready(false);
+    served?;
     Ok(())
 }
 
@@ -2329,7 +2435,10 @@ pub fn http_router_with_shutdown(
 /// routed again. Returned as a router (one fallback service) so every caller
 /// keeps serving a router. At the root nothing is wrapped, so the router is
 /// the 0.23.0 one.
-fn under_base_path(router: axum::Router, base: crystalline_core::base::BasePath) -> axum::Router {
+pub(crate) fn under_base_path(
+    router: axum::Router,
+    base: crystalline_core::base::BasePath,
+) -> axum::Router {
     if base.is_root() {
         return router;
     }
@@ -2929,15 +3038,7 @@ fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static
 /// list of internal hostnames. It is reported on the ctl `status` reply, which
 /// is reachable only over the local unix socket, and through
 /// `crystalline status`, which reads that reply.
-async fn ready() -> axum::http::StatusCode {
-    if READY.load(Ordering::SeqCst) {
-        axum::http::StatusCode::OK
-    } else {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    }
-}
-
-async fn health() -> axum::Json<Value> {
+pub(crate) async fn health() -> axum::Json<Value> {
     let intent = crate::instance::serve_intent();
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -2952,6 +3053,16 @@ async fn health() -> axum::Json<Value> {
             _ => "unrecorded",
         },
     }))
+}
+
+/// Readiness probe: 200 once the full router serves, 503 before that (a
+/// standby, a start still opening the store) and after the endpoint stopped.
+pub(crate) async fn ready() -> axum::http::StatusCode {
+    if READY.load(Ordering::SeqCst) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Renew this instance's host locks every `secs` seconds until shutdown, so a
@@ -3364,7 +3475,7 @@ fn first_time(flag: &AtomicBool) -> bool {
 
 // --- shutdown + watcher helpers ---------------------------------------------
 
-async fn wait_true(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_true(rx: &mut watch::Receiver<bool>) {
     loop {
         if *rx.borrow() {
             return;
@@ -4173,6 +4284,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_and_health_answer_under_the_base_path() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
         set_ready(true);
         let wrapped = under_base_path(
             probe_router(),
@@ -4184,11 +4296,39 @@ mod tests {
 
     #[tokio::test]
     async fn health_reports_role_active_on_turso() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        set_role(Role::Active);
         let (status, body) = get_status(&probe_router(), "/health").await;
         assert_eq!(status, 200);
         let json: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["role"], "active");
+    }
+
+    /// `/ready` answers 503 until the full router serves and again once the
+    /// endpoint stopped: a standby, a start still opening the store and a
+    /// stopped endpoint are all not ready.
+    #[tokio::test]
+    async fn ready_answers_503_while_not_ready() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        set_ready(false);
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 503);
+        set_ready(true);
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 200);
+        set_ready(false);
+    }
+
+    /// The endpoint that stops turns `/ready` back to 503.
+    #[tokio::test]
+    async fn a_stopped_endpoint_is_not_ready() {
+        let _globals = PROCESS_STATE_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (stop, rx) = watch::channel(false);
+        let served = tokio::spawn(run_http(listener, probe_router(), rx));
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+        served.await.unwrap().unwrap();
+        assert_eq!(get_status(&probe_router(), "/ready").await.0, 503);
     }
 
     #[tokio::test]

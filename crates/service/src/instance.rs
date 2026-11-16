@@ -373,9 +373,18 @@ pub struct Connection {
     /// connection made without asking, which sends the bare line: the safe
     /// direction.
     mcp_line_options: bool,
+    /// The refusal a standby declared in its `holder` answer
+    /// ([`HolderFacts::standby`]): this daemon waits for the database and
+    /// serves no session.
+    standby: Option<String>,
 }
 
 impl Connection {
+    /// The refusal of the standby behind this connection, when it is one.
+    pub fn standby(&self) -> Option<&str> {
+        self.standby.as_deref()
+    }
+
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
     ///
@@ -739,7 +748,12 @@ pub(crate) async fn try_attach_displacing_in(
             ),
         }
     }
-    let conn = connect_socket_at(&sock, facts.mcp_line_options).await;
+    let conn = connect_socket_at(&sock, facts.mcp_line_options)
+        .await
+        .map(|conn| Connection {
+            standby: facts.standby.clone(),
+            ..conn
+        });
     // Said once the attach worked, so a bridge polling for its daemon does
     // not repeat it on every turn.
     if conn.is_some()
@@ -788,6 +802,7 @@ async fn connect_socket_at(sock: &Path, mcp_line_options: bool) -> Option<Connec
         .map(|stream| Connection {
             stream,
             mcp_line_options,
+            standby: None,
         })
 }
 
@@ -827,7 +842,26 @@ pub struct HolderFacts {
     /// mean unknown.
     #[serde(default)]
     pub http: Option<HttpBinding>,
+    /// Set by a standby (Postgres, waiting for another instance to let go
+    /// of the database): the sentence it refuses every session and command
+    /// with. `None` for an active daemon and for one older than 0.33.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standby: Option<String>,
 }
+
+/// A daemon that answered as a standby: the bridge gives its sentence to the
+/// MCP client as the initialize error and stops, instead of falling back to
+/// an in-process server that could not take the state folder either.
+#[derive(Debug)]
+pub struct StandbyRefusal(pub String);
+
+impl std::fmt::Display for StandbyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StandbyRefusal {}
 
 /// What one ctl request over the pipe got back.
 enum Probe {
@@ -857,6 +891,7 @@ async fn ctl_once(sock: &Path, request: &str) -> Probe {
         let stream = Connection {
             stream,
             mcp_line_options: false,
+            standby: None,
         }
         .into_ctl()
         .await
@@ -933,6 +968,7 @@ fn facts_from_record(record: Option<LockInfo>) -> Option<HolderFacts> {
         state_dir: None,
         config_path: None,
         http: Some(record.http),
+        standby: None,
     })
 }
 
@@ -956,6 +992,7 @@ pub(crate) fn facts_from_status(
         state_dir: None,
         config_path: None,
         http: same.map(|r| r.http.clone()),
+        standby: None,
     })
 }
 
@@ -1178,6 +1215,7 @@ async fn ask_to_shut_down(sock: &Path) -> bool {
     let Ok(mut stream) = (Connection {
         stream,
         mcp_line_options: false,
+        standby: None,
     })
     .into_ctl()
     .await
@@ -1528,6 +1566,7 @@ async fn probe_socket_responds() -> bool {
         let mut stream = Connection {
             stream,
             mcp_line_options: false,
+            standby: None,
         }
         .into_ctl()
         .await

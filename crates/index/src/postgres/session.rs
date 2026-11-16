@@ -185,6 +185,17 @@ impl PgTarget {
             schema: cfg.schema.clone(),
         })
     }
+
+    /// The database for people to read: `host:port/db` and the schema, with
+    /// no credentials and no query string, for example
+    /// `db.internal:5432/crystalline, schema team_a`.
+    pub fn describe(&self) -> String {
+        let place = super::sanitize_url(&self.url).unwrap_or_else(|| "(unknown)".to_string());
+        match &self.schema {
+            Some(schema) => format!("{place}, schema {schema}"),
+            None => format!("{place}, default schema"),
+        }
+    }
 }
 
 /// The TCP keepalive startup options every connection carries: the first
@@ -305,6 +316,18 @@ mod tests {
         PgRole::Cli,
         PgRole::Probe,
     ];
+
+    /// A target is described without its credentials or query string.
+    #[test]
+    fn describe_never_shows_credentials() {
+        let t = PgTarget {
+            url: "postgres://ada:secret@db.internal:5432/crystalline?sslmode=require".to_string(),
+            schema: Some("team_a".to_string()),
+        };
+        assert_eq!(t.describe(), "db.internal:5432/crystalline, schema team_a");
+        let t = PgTarget { schema: None, ..t };
+        assert_eq!(t.describe(), "db.internal:5432/crystalline, default schema");
+    }
 
     /// The longest schema and a full UUID tag still fit in the 63 bytes
     /// Postgres keeps, in every role.

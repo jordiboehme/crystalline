@@ -53,7 +53,7 @@ pub fn use_daemon(db: Option<&Path>, config_path: Option<&Path>) -> bool {
 /// after. If the opener was a `server/discover` probe, this error tells the
 /// client we are a legacy server - true only in the sense that we are about to
 /// stop being any kind of server at all.
-fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
+pub(crate) fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
     let msg: Value = serde_json::from_str(opener_line).ok()?;
     let id = msg.get("id")?;
     let reply = serde_json::json!({
@@ -245,6 +245,11 @@ pub async fn run_mcp(
         // as a client while the client is still composing its first request.
         let (opened, daemon) = tokio::join!(read_session_opener(&mut stdin), async {
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
+            if let Some(refusal) = conn.standby() {
+                return Err(anyhow::Error::new(crate::instance::StandbyRefusal(
+                    refusal.to_string(),
+                )));
+            }
             conn.into_mcp(harness_gate.clone())
                 .await
                 .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
@@ -266,6 +271,24 @@ pub async fn run_mcp(
     };
     // Hand the opener back so the serving path reads it as its first line.
     stdin.replay(opener);
+
+    // A standby answered: it waits for another instance's database and
+    // serves no session, and an in-process server could not take its state
+    // folder either. Its sentence is the initialize error, and the error this
+    // process ends with, so it reaches the client and stderr alike.
+    if let Some(Err(e)) = &daemon
+        && let Some(refusal) = e.downcast_ref::<crate::instance::StandbyRefusal>()
+    {
+        if let Some(reply) = opener_line
+            .as_deref()
+            .and_then(|line| initialize_error_reply(line, &refusal.0))
+        {
+            let _ = stdout.write_all(reply.as_bytes()).await;
+            let _ = stdout.write_all(b"\n").await;
+            let _ = stdout.flush().await;
+        }
+        return Err(anyhow::anyhow!("{}", refusal.0));
+    }
 
     // A daemon is up: relay through it. A failed attach or handshake falls
     // through to the embedded path rather than propagating, so an unreachable
