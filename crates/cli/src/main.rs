@@ -2231,7 +2231,11 @@ fn main() -> std::process::ExitCode {
         }
         // What `fn main() -> anyhow::Result<()>` printed, unchanged.
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            if crystalline_service::logging::json_logs() {
+                tracing::error!("Error: {e:?}");
+            } else {
+                eprintln!("Error: {e:?}");
+            }
             std::process::ExitCode::FAILURE
         }
     }

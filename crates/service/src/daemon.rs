@@ -684,43 +684,45 @@ pub async fn run_serve(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !daemon_flag {
-        if std::io::stderr().is_terminal() {
+        if !crate::logging::json_logs() && std::io::stderr().is_terminal() {
             eprintln!("{BANNER}");
         }
-        eprintln!(
+        crate::logging::console_line(&format!(
             "crystalline {} serving on {} (pid {})",
             env!("CARGO_PKG_VERSION"),
             ownership.socket_display(),
             shared.pid
-        );
-        eprintln!("{COPYRIGHT_LINE}");
+        ));
+        crate::logging::console_line(COPYRIGHT_LINE);
         if let Some(addr) = &http_addr {
-            eprintln!("crystalline HTTP endpoint on http://{addr}");
-            eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            crate::logging::console_line(&format!("crystalline HTTP endpoint on http://{addr}"));
+            crate::logging::console_line(&ui_startup_line(&loaded.effective, addr));
             if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
-                eprintln!("crystalline warning: {line}");
+                crate::logging::console_warning(line);
             }
             if let Some(drawn) = &setup_token {
                 let at = setup_address(&loaded.effective, addr);
                 match drawn.shown() {
                     Some(shown) => {
                         for line in setup_token_lines(&at, shown) {
-                            eprintln!("{line}");
+                            crate::logging::console_line(&line);
                         }
                     }
-                    None => eprintln!("{}", configured_setup_line(&at, drawn.var())),
+                    None => crate::logging::console_line(&configured_setup_line(&at, drawn.var())),
                 }
             }
         }
         if let Some(crate::first_admin::CreatedAdmin { line, .. }) = &created_admin {
-            eprintln!("{line}");
+            crate::logging::console_line(line);
         }
         if read_only {
-            eprintln!("crystalline serving read-only: content-mutating tools are disabled");
+            crate::logging::console_line(
+                "crystalline serving read-only: content-mutating tools are disabled",
+            );
         }
         if loaded.effective.domains.is_empty() {
-            eprintln!(
-                "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
+            crate::logging::console_line(
+                "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>",
             );
         }
     } else {
@@ -1162,7 +1164,7 @@ impl Departure {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(slot.take());
         if let Some(line) = farewell {
-            eprintln!("{line}");
+            crate::logging::console_line(line);
         }
         // A window procedure holding WM_ENDSESSION may now let Windows end
         // the session: nothing of the index is in use any more.

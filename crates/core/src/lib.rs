@@ -38,6 +38,7 @@ pub mod kind;
 pub mod layout;
 pub mod line_endings;
 pub mod linked;
+pub mod log_format;
 pub mod manifest;
 pub mod manifest_view;
 pub mod markdown;

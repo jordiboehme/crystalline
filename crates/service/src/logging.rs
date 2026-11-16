@@ -2,34 +2,61 @@
 //! because they are needed before the config overlay loads.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// The variable that picks the log format.
-pub const LOG_FORMAT_VAR: &str = "CRYSTALLINE_LOG_FORMAT";
+pub use crystalline_core::log_format::{LOG_FORMAT_VAR, LogFormat, parse_log_format};
 
-/// How a log line is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogFormat {
-    Text,
-    Json,
+/// Set once the JSON subscriber is the one installed.
+static JSON_LOGS: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process logs JSON, so plain stderr lines would break it.
+pub fn json_logs() -> bool {
+    JSON_LOGS.load(Ordering::Relaxed)
 }
 
-/// Reads a `CRYSTALLINE_LOG_FORMAT` value. `json` and `text` match without
-/// regard to case, unset means text. Any other value keeps text and comes
-/// back with a warning to log once the subscriber is up.
-pub fn parse_log_format(value: Option<&str>) -> (LogFormat, Option<String>) {
-    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("text") => (LogFormat::Text, None),
-        Some("json") => (LogFormat::Json, None),
-        Some(other) => (
-            LogFormat::Text,
-            Some(format!(
-                "{LOG_FORMAT_VAR}={other:?} is not a log format. Use json or text. Logging stays text."
-            )),
-        ),
+/// Prints a console line to stderr, or logs it at info level in JSON mode.
+pub fn console_line(line: &str) {
+    if json_logs() {
+        tracing::info!(target: "crystalline_service::daemon", "{line}");
+    } else {
+        eprintln!("{line}");
     }
+}
+
+/// Like [`console_line`] for a warning. Text mode prints the
+/// `crystalline warning: ` prefix; JSON mode logs at warn level without it.
+pub fn console_warning(line: &str) {
+    if json_logs() {
+        tracing::warn!(target: "crystalline_service::daemon", "{line}");
+    } else {
+        eprintln!("crystalline warning: {line}");
+    }
+}
+
+/// Logs a panic as an error event instead of the default hook's plain
+/// stderr text. The panic itself still unwinds or aborts as before.
+fn install_json_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panic".to_owned());
+        match info.location() {
+            Some(at) => tracing::error!(
+                target: "crystalline",
+                "panic at {}:{}:{}: {message}",
+                at.file(),
+                at.line(),
+                at.column()
+            ),
+            None => tracing::error!(target: "crystalline", "panic: {message}"),
+        }
+    }));
 }
 
 /// Installs the global subscriber with the format from the environment.
@@ -58,6 +85,10 @@ where
             }
         }
     };
+    if installed && format == LogFormat::Json {
+        JSON_LOGS.store(true, Ordering::Relaxed);
+        install_json_panic_hook();
+    }
     if installed && let Some(warning) = warning {
         tracing::warn!("{warning}");
     }

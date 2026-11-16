@@ -4283,6 +4283,75 @@ fn a_foreground_serve_prints_the_copyright_line_to_a_redirected_stderr() {
     let _ = child.wait();
 }
 
+/// With `CRYSTALLINE_LOG_FORMAT=json` a foreground `serve` writes its startup
+/// lines as JSON objects too, so a log collector never reads plain stderr
+/// text as an error. Every line up to the serving, copyright and HTTP lines
+/// must parse and carry a `level`.
+#[test]
+fn a_foreground_serve_writes_its_startup_lines_as_json_when_logs_are_json() {
+    let env = Env::new("jsonbanner");
+    env.setup_domain("eng");
+
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let addr = format!("127.0.0.1:{port}");
+
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    let mut child = serve
+        .env("CRYSTALLINE_LOG_FORMAT", "json")
+        .args(["serve", "--http", &addr, "--config"])
+        .arg(env.config_path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut lines = Vec::new();
+    let wanted = ["serving on", "Copyright", "HTTP endpoint on"];
+    while Instant::now() < deadline
+        && !wanted
+            .iter()
+            .all(|w| lines.iter().any(|l: &String| l.contains(w)))
+    {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) => lines.push(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    for w in wanted {
+        assert!(
+            lines.iter().any(|l| l.contains(w)),
+            "the startup output has a line with {w:?}: {lines:?}"
+        );
+    }
+    for line in &lines {
+        let value: Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("stderr line is not JSON ({e}): {line}"));
+        assert!(
+            value.get("level").is_some_and(Value::is_string),
+            "every JSON line has a level: {line}"
+        );
+    }
+}
+
 /// A flag that contradicts configuration says so at startup, naming both
 /// values and the key, and the daemon serves anyway. This Env sets
 /// CRYSTALLINE_SERVICE_HTTP=false, so `--http <port>` is a real difference.
